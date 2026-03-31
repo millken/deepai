@@ -53,6 +53,11 @@ func main() {
 	if err := registry.Register(builtin.BashTool()); err != nil {
 		log.Fatal(err)
 	}
+	for _, tool := range builtin.FileTools() {
+		if err := registry.Register(tool); err != nil {
+			log.Fatal(err)
+		}
+	}
 	if err := registry.Register(tools.TaskTool(subPool)); err != nil {
 		log.Fatal(err)
 	}
@@ -92,7 +97,7 @@ func main() {
 		Sandbox:     sb,
 		AgentType:   agent.AgentTypeCoder,
 		Model:       modelName,
-		MaxTurns:    3,
+		MaxTurns:    10,
 	})
 
 	var wg sync.WaitGroup
@@ -116,7 +121,7 @@ func main() {
 	})
 
 	// Use a more specific prompt to encourage automatic delegation
-	specificPrompt := "Delegate a short subagent job via the task tool: instruct the subagent to inspect the repository layout and list top-level packages with a 1-2 sentence description for each. Then summarize findings concisely."
+	specificPrompt := "为当前仓库生成一个Makefile，包含build、test和lint命令。请先分析仓库结构，直接生成完整 Makefile 内容并使用 write_file 工具写入 ./Makefile。不要提出澄清问题或等待确认。写入完成后给出简短确认。"
 	result, err := agentRun.Run(runCtx, "demo-session", []models.Message{{
 		ID:        "m1",
 		SessionID: "demo-session",
