@@ -1,8 +1,11 @@
+// Package llm provides the provider-agnostic LLM abstraction used by the agent runtime.
 package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -16,35 +19,8 @@ type LitellmProvider struct {
 	client   *litellm.Client
 }
 
-func NewLitellmProvider(name string) (*LitellmProvider, error) {
-	provider := strings.ToLower(strings.TrimSpace(name))
-	if provider == "" {
-		provider = "openai"
-	}
-
-	// Build provider config from environment variables
-	cfg := litellm.ProviderConfig{}
-	switch provider {
-	case "", "openai":
-		cfg.APIKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-		if cfg.APIKey == "" {
-			return nil, fmt.Errorf("openai api key is not set")
-		}
-	case "siliconflow":
-		cfg.APIKey = strings.TrimSpace(os.Getenv("SILICONFLOW_API_KEY"))
-		if cfg.APIKey == "" {
-			return nil, fmt.Errorf("siliconflow api key is not set")
-		}
-	case "anthropic":
-		cfg.APIKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
-		if cfg.APIKey == "" {
-			return nil, fmt.Errorf("anthropic api key is not set")
-		}
-	default:
-		return nil, fmt.Errorf("unsupported llm provider %q", provider)
-	}
-
-	client, err := litellm.NewWithProvider(provider, cfg)
+func NewLitellmProvider(provider string, cfg litellm.ProviderConfig, opts ...litellm.ClientOption) (*LitellmProvider, error) {
+	client, err := litellm.NewWithProvider(provider, cfg, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("init litellm client: %w", err)
 	}
@@ -75,15 +51,18 @@ func (p *LitellmProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 		msgs = append(msgs, litellm.Message{Role: role, Content: m.Content})
 	}
 
-	litReq := &litellm.Request{Model: req.Model, Messages: msgs}
+	litReq := mapChatReqToLitellmRequest(req, msgs)
 	resp, err := p.client.Chat(ctx, litReq)
 	if err != nil {
 		return ChatResponse{}, err
 	}
 
-	// Map litellm.Response to ChatResponse. We use the content as the AI message.
-	msg := models.Message{Role: models.RoleAI, Content: resp.Content}
-	return ChatResponse{Model: req.Model, Message: msg}, nil
+	msg := models.Message{Role: models.RoleAI, Content: resp.Content, ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
+	var usage Usage
+	if resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0 {
+		usage = Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
+	}
+	return ChatResponse{Model: req.Model, Message: msg, Usage: usage, Stop: resp.FinishReason}, nil
 }
 
 func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, error) {
@@ -108,7 +87,7 @@ func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan S
 		msgs = append(msgs, litellm.Message{Role: role, Content: m.Content})
 	}
 
-	litReq := &litellm.Request{Model: req.Model, Messages: msgs}
+	litReq := mapChatReqToLitellmRequest(req, msgs)
 	stream, err := p.client.Stream(ctx, litReq)
 	if err != nil {
 		return nil, err
@@ -119,15 +98,121 @@ func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan S
 		defer close(ch)
 		defer stream.Close()
 
-		// Collect and emit a single final chunk with the combined content.
-		resp, err := litellm.CollectStream(stream)
+		toolAcc := litellm.NewToolCallAccumulator()
+		var lastUsage *Usage
+
+		resp, err := litellm.CollectStreamWithHandler(stream, func(chunk *litellm.StreamChunk) {
+			if chunk == nil {
+				return
+			}
+
+			if chunk.Content != "" {
+				ch <- StreamChunk{Model: req.Model, Delta: chunk.Content}
+			}
+
+			if chunk.ToolCallDelta != nil {
+				toolAcc.Apply(chunk.ToolCallDelta)
+				if call := toolAcc.Get(chunk.ToolCallDelta.Index); call != nil {
+					ch <- StreamChunk{Model: req.Model, ToolCalls: convertLitellmToolCalls([]litellm.ToolCall{*call})}
+				}
+			}
+
+			if chunk.Usage != nil {
+				lastUsage = &Usage{
+					InputTokens:  chunk.Usage.PromptTokens,
+					OutputTokens: chunk.Usage.CompletionTokens,
+					TotalTokens:  chunk.Usage.TotalTokens,
+				}
+			}
+		})
 		if err != nil {
 			ch <- StreamChunk{Err: err, Done: true}
 			return
 		}
-		msg := models.Message{Role: models.RoleAI, Content: resp.Content}
-		ch <- StreamChunk{Model: req.Model, Message: &msg, Done: true}
+		msg := models.Message{Role: models.RoleAI, Content: resp.Content, ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
+		usage := lastUsage
+		if usage == nil && (resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0) {
+			usage = &Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
+		}
+		ch <- StreamChunk{Model: req.Model, Message: &msg, ToolCalls: msg.ToolCalls, Usage: usage, Stop: resp.FinishReason, Done: true}
 	}()
 
 	return ch, nil
+}
+
+func convertLitellmToolCalls(calls []litellm.ToolCall) []models.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	result := make([]models.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		toolCall := models.ToolCall{ID: call.ID, Name: call.Function.Name}
+		if toolCall.ID == "" && toolCall.Name == "" {
+			continue
+		}
+
+		if strings.TrimSpace(call.Function.Arguments) != "" {
+			var args map[string]any
+			if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err == nil {
+				toolCall.Arguments = args
+			}
+		}
+
+		result = append(result, toolCall)
+	}
+	return result
+}
+
+// mapChatReqToLitellmRequest attempts to copy optional fields from our provider-agnostic
+// ChatRequest into a litellm.Request using reflection. This keeps the adapter resilient
+// to small variations in the litellm.Request shape while still propagating options
+// like Tools, ReasoningEffort, Temperature and MaxTokens when present.
+func mapChatReqToLitellmRequest(req ChatRequest, msgs []litellm.Message) *litellm.Request {
+	r := &litellm.Request{
+		Model:    req.Model,
+		Messages: msgs,
+	}
+
+	// ReasoningEffort
+	// Thinking/Reasoning effort: enable thinking with provided level
+	if req.ReasoningEffort != "" {
+		r.Thinking = &litellm.ThinkingConfig{Type: litellm.ThinkingEnabled, Level: req.ReasoningEffort}
+	}
+
+	// Temperature: litellm.Request expects *float64
+	if req.Temperature != nil {
+		r.Temperature = req.Temperature
+	}
+
+	// MaxTokens
+	if req.MaxTokens != nil {
+		r.MaxTokens = req.MaxTokens
+	}
+
+	// Tools: map our models.Tool -> litellm.Tool (function def)
+	if len(req.Tools) > 0 {
+		tools := make([]litellm.Tool, 0, len(req.Tools))
+		for _, tt := range req.Tools {
+			tools = append(tools, litellm.Tool{
+				Type: "function",
+				Function: litellm.FunctionDef{
+					Name:        tt.Name,
+					Description: tt.Description,
+					Parameters:  tt.InputSchema,
+				},
+			})
+		}
+		r.Tools = tools
+	}
+
+	// allow enabling debug payload logging via DEEPAI_DEBUG
+	if strings.TrimSpace(os.Getenv("DEEPAI_DEBUG")) != "" {
+		// enable request payload hook inside pkg/llm
+		r.OnPayload = func(providerName string, payload []byte) {
+			log.Printf("[litellm payload] provider=%s payload=%s\n", providerName, string(payload))
+		}
+	}
+
+	return r
 }

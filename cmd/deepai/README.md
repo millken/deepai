@@ -22,6 +22,10 @@
 在仓库根目录执行：
 
 ```bash
+export DEEPAI_PROVIDER=openai
+export OPENAI_API_KEY=sk-jhbssaazdxvliteyqvdqfhvmexkteuicymuuieujsdwicxwi
+export OPENAI_BASE_URL=https://api.siliconflow.cn/v1
+export DEEPAI_MODEL=Qwen/Qwen3.5-9B
 go run ./cmd/deepai
 ```
 

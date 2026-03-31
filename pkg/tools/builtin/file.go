@@ -1,3 +1,4 @@
+// Package builtin provides the built-in file and shell-oriented tools.
 package builtin
 
 import (
@@ -43,11 +44,21 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	if !ok {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("content is required")
 	}
+	appendMode, _ := args["append"].(bool)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("mkdir failed: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if appendMode {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("open failed: %w", err)
+		}
+		defer file.Close()
+		if _, err := file.WriteString(content); err != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("append failed: %w", err)
+		}
+	} else if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
 
@@ -61,6 +72,12 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("pattern is required")
 	}
 	pattern = resolveVirtualPath(ctx, pattern)
+	if root, ok := args["root"].(string); ok && strings.TrimSpace(root) != "" {
+		root = resolveVirtualPath(ctx, root)
+		if !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(root, pattern)
+		}
+	}
 
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -80,7 +97,7 @@ func GlobTool() models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"pattern": map[string]any{"type": "string", "description": "Glob pattern (e.g. *.go)"},
-				"root":    map[string]any{"type": "string", "description": "Root directory (default .)"},
+				"root":    map[string]any{"type": "string", "description": "Root directory for relative patterns"},
 			},
 			"required": []any{"pattern"},
 		},

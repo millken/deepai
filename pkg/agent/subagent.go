@@ -23,14 +23,19 @@ type SubagentExecutor struct {
 	model   string
 }
 
-func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox) *SubagentExecutor {
+func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, model ...string) *SubagentExecutor {
 	if registry == nil {
 		registry = tools.NewRegistry()
+	}
+	selectedModel := resolveModel("")
+	if len(model) > 0 {
+		selectedModel = resolveModel(model[0])
 	}
 	return &SubagentExecutor{
 		llm:     provider,
 		tools:   registry,
 		sandbox: sb,
+		model:   selectedModel,
 	}
 }
 
@@ -96,8 +101,8 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}, nil
 }
 
-func NewSubagentPool(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, maxConcurrent int, timeout time.Duration) *subagent.Pool {
-	return subagent.NewPool(NewSubagentExecutor(provider, registry, sb), subagent.PoolConfig{
+func NewSubagentPool(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, maxConcurrent int, timeout time.Duration, model ...string) *subagent.Pool {
+	return subagent.NewPool(NewSubagentExecutor(provider, registry, sb, model...), subagent.PoolConfig{
 		MaxConcurrent: maxConcurrent,
 		Timeout:       timeout,
 	})

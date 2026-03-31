@@ -93,3 +93,16 @@ func TestSandboxTimeout(t *testing.T) {
 		t.Fatalf("Exec() error = %T, want *TimeoutError", err)
 	}
 }
+
+func TestExecDirectTimeout(t *testing.T) {
+	result, err := ExecDirect(context.Background(), "sleep 1", 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ExecDirect() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("ExecDirect() result = nil")
+	}
+	if result.ExitCode() == 0 {
+		t.Fatal("ExecDirect() exit code = 0, want non-zero timeout exit")
+	}
+}

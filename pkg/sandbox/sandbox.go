@@ -1,3 +1,4 @@
+// Package sandbox provides isolated command execution and workspace-bound file access.
 package sandbox
 
 import (
@@ -436,10 +437,16 @@ func helperEnv(base []string, dir string) []string {
 // ExecDirect runs a command without sandbox restrictions (fallback).
 func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result, error) {
 	start := time.Now()
-	execCmd := exec.Command("sh", "-c", cmd)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
 	execCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	done := make(chan struct{})
 	var buf bytes.Buffer
 	execCmd.Stdout = &buf
 	execCmd.Stderr = &buf
@@ -448,16 +455,7 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		return NewResult("", err.Error(), -1, time.Since(start), err), nil
 	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			execCmd.Process.Kill()
-		case <-done:
-		}
-	}()
-
 	err := execCmd.Wait()
-	close(done)
 	duration := time.Since(start)
 
 	exitCode := 0

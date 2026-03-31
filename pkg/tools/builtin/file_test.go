@@ -67,6 +67,45 @@ func TestWriteFileHandlerWritesToResolvedVirtualPath(t *testing.T) {
 	}
 }
 
+func TestWriteFileHandlerAppendsContent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEERFLOW_DATA_ROOT", root)
+
+	threadID := "thread-append-tool"
+	ctx := tools.WithThreadID(context.Background(), threadID)
+	_, err := WriteFileHandler(ctx, models.ToolCall{
+		ID:   "call-append",
+		Name: "write_file",
+		Arguments: map[string]any{
+			"path":    "/mnt/user-data/uploads/out.txt",
+			"content": "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("initial WriteFileHandler() error = %v", err)
+	}
+	_, err = WriteFileHandler(ctx, models.ToolCall{
+		ID:   "call-append-2",
+		Name: "write_file",
+		Arguments: map[string]any{
+			"path":    "/mnt/user-data/uploads/out.txt",
+			"content": " world",
+			"append":  true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("append WriteFileHandler() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, "threads", threadID, "user-data", "uploads", "out.txt"))
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Fatalf("content=%q want hello world", string(data))
+	}
+}
+
 func TestGlobHandlerResolvesVirtualPattern(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("DEERFLOW_DATA_ROOT", root)
@@ -95,5 +134,31 @@ func TestGlobHandlerResolvesVirtualPattern(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "a.txt") || !strings.Contains(result.Content, "b.txt") {
 		t.Fatalf("glob result=%q", result.Content)
+	}
+}
+
+func TestGlobHandlerHonorsRoot(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "nested")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	result, err := GlobHandler(context.Background(), models.ToolCall{
+		ID:   "call-4",
+		Name: "glob",
+		Arguments: map[string]any{
+			"root":    root,
+			"pattern": "nested/*.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("GlobHandler() error = %v", err)
+	}
+	if !strings.Contains(result.Content, "note.txt") {
+		t.Fatalf("glob result=%q, want note.txt", result.Content)
 	}
 }
