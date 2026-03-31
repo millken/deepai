@@ -126,16 +126,21 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 	if len(messages) == 0 {
 		return nil
 	}
+	filteredMessages := filterMessagesForMemory(messages)
+	if len(filteredMessages) == 0 {
+		return nil
+	}
 
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("load memory %q: %w", sessionID, err)
 	}
 
-	update, err := s.extractor.ExtractUpdate(ctx, current, cloneMessages(messages))
+	update, err := s.extractor.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))
 	if err != nil {
 		return err
 	}
+	update = sanitizeUpdateForStorage(update)
 
 	merged := Merge(current, update, sessionID, time.Now().UTC())
 	return s.storage.Save(ctx, merged)

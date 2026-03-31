@@ -22,6 +22,7 @@ type contextKey string
 const (
 	sandboxContextKey  contextKey = "tool_sandbox"
 	threadIDContextKey contextKey = "tool_thread_id"
+	runtimeContextKey  contextKey = "tool_runtime_context"
 )
 
 var toolCallSeq uint64
@@ -46,6 +47,23 @@ func (r *Registry) Register(tool models.Tool) error {
 	}
 	r.tools[tool.Name] = tool
 	return nil
+}
+
+func (r *Registry) Unregister(name string) bool {
+	if r == nil {
+		return false
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.tools[name]; !exists {
+		return false
+	}
+	delete(r.tools, name)
+	return true
 }
 
 func (r *Registry) Get(name string) *models.Tool {
@@ -154,6 +172,44 @@ func ThreadIDFromContext(ctx context.Context) string {
 	}
 	threadID, _ := ctx.Value(threadIDContextKey).(string)
 	return strings.TrimSpace(threadID)
+}
+
+func WithRuntimeContext(ctx context.Context, values map[string]any) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(values) == 0 {
+		return ctx
+	}
+
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		cloned[key] = value
+	}
+	if len(cloned) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, runtimeContextKey, cloned)
+}
+
+func RuntimeContextFromContext(ctx context.Context) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	values, _ := ctx.Value(runtimeContextKey).(map[string]any)
+	if len(values) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (r *Registry) Call(ctx context.Context, name string, args map[string]interface{}, sandbox *Sandbox) (string, error) {

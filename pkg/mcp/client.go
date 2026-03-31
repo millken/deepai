@@ -20,6 +20,42 @@ type Client struct {
 func ConnectStdio(ctx context.Context, name, command string, env []string, args ...string) (*Client, error) {
 	transport := mcptransport.NewStdio(command, env, args...)
 	client := mcpclient.NewClient(transport)
+	return initializeClient(ctx, name, client)
+}
+
+func ConnectSSE(ctx context.Context, name, baseURL string, headers map[string]string, headerFunc func(context.Context) map[string]string) (*Client, error) {
+	options := make([]mcptransport.ClientOption, 0, 1)
+	if len(headers) > 0 {
+		options = append(options, mcptransport.WithHeaders(cloneStringMap(headers)))
+	}
+	if headerFunc != nil {
+		options = append(options, mcptransport.WithHeaderFunc(headerFunc))
+	}
+
+	client, err := mcpclient.NewSSEMCPClient(baseURL, options...)
+	if err != nil {
+		return nil, fmt.Errorf("create sse mcp client: %w", err)
+	}
+	return initializeClient(ctx, name, client)
+}
+
+func ConnectHTTP(ctx context.Context, name, baseURL string, headers map[string]string, headerFunc func(context.Context) map[string]string) (*Client, error) {
+	options := []mcptransport.StreamableHTTPCOption{mcptransport.WithContinuousListening()}
+	if len(headers) > 0 {
+		options = append(options, mcptransport.WithHTTPHeaders(cloneStringMap(headers)))
+	}
+	if headerFunc != nil {
+		options = append(options, mcptransport.WithHTTPHeaderFunc(headerFunc))
+	}
+
+	client, err := mcpclient.NewStreamableHttpClient(baseURL, options...)
+	if err != nil {
+		return nil, fmt.Errorf("create http mcp client: %w", err)
+	}
+	return initializeClient(ctx, name, client)
+}
+
+func initializeClient(ctx context.Context, name string, client *mcpclient.Client) (*Client, error) {
 	if err := client.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start mcp transport: %w", err)
 	}
@@ -37,6 +73,17 @@ func ConnectStdio(ctx context.Context, name, command string, env []string, args 
 		return nil, fmt.Errorf("initialize mcp client: %w", err)
 	}
 	return &Client{name: strings.TrimSpace(name), client: client}, nil
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func (c *Client) Close() error {

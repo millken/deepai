@@ -137,6 +137,144 @@ func TestScheduleUpdateGracefulDegradation(t *testing.T) {
 	}
 }
 
+func TestServiceUpdateFiltersUploadOnlyTurn(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStorage{}
+	extractor := &capturingExtractor{
+		update: Update{
+			User: UserMemory{TopOfMind: "Prefers concise answers"},
+		},
+	}
+	service := NewService(store, extractor)
+
+	const uploadBlock = "<uploaded_files>\nThe following files were uploaded in this message:\n\n- secret.txt (0.0 KB)\n  Path: /mnt/user-data/uploads/secret.txt\n</uploaded_files>"
+	msgs := []models.Message{
+		{
+			ID:        "u1",
+			SessionID: "session-upload",
+			Role:      models.RoleHuman,
+			Content:   uploadBlock,
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			ID:        "a1",
+			SessionID: "session-upload",
+			Role:      models.RoleAI,
+			Content:   "I have read the file.",
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	if err := service.Update(context.Background(), "session-upload", msgs); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	if extractor.called {
+		t.Fatal("extractor should not be called for upload-only turns")
+	}
+	if _, err := store.Load(context.Background(), "session-upload"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load() err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceUpdateStripsUploadBlockBeforeExtractor(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStorage{}
+	extractor := &capturingExtractor{
+		update: Update{
+			User: UserMemory{TopOfMind: "Need a summary"},
+		},
+	}
+	service := NewService(store, extractor)
+
+	const uploadBlock = "<uploaded_files>\nThe following files were uploaded in this message:\n\n- report.pdf (0.0 KB)\n  Path: /mnt/user-data/uploads/report.pdf\n</uploaded_files>"
+	msgs := []models.Message{
+		{
+			ID:        "u1",
+			SessionID: "session-mixed",
+			Role:      models.RoleHuman,
+			Content:   uploadBlock + "\n\nWhat does the report say?",
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			ID:        "a1",
+			SessionID: "session-mixed",
+			Role:      models.RoleAI,
+			Content:   "It summarizes revenue growth.",
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	if err := service.Update(context.Background(), "session-mixed", msgs); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	if !extractor.called {
+		t.Fatal("extractor should be called")
+	}
+	if len(extractor.messages) != 2 {
+		t.Fatalf("extractor messages len = %d", len(extractor.messages))
+	}
+	if strings.Contains(extractor.messages[0].Content, "<uploaded_files>") {
+		t.Fatalf("human content still contains upload block: %q", extractor.messages[0].Content)
+	}
+	if strings.Contains(extractor.messages[0].Content, "/mnt/user-data/uploads/") {
+		t.Fatalf("human content still contains upload path: %q", extractor.messages[0].Content)
+	}
+	if !strings.Contains(extractor.messages[0].Content, "What does the report say?") {
+		t.Fatalf("human content missing real question: %q", extractor.messages[0].Content)
+	}
+}
+
+func TestServiceUpdateStripsUploadMentionsFromMemory(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStorage{}
+	extractor := &capturingExtractor{
+		update: Update{
+			User: UserMemory{
+				TopOfMind: "User is interested in AI. User uploaded a test file for verification. User prefers concise answers.",
+			},
+			Facts: []Fact{
+				{ID: "upload", Content: "User uploaded a file titled secret.txt", Category: "behavior"},
+				{ID: "pref", Content: "User prefers dark mode", Category: "preference"},
+			},
+		},
+	}
+	service := NewService(store, extractor)
+
+	msgs := []models.Message{{
+		ID:        "m1",
+		SessionID: "session-clean",
+		Role:      models.RoleHuman,
+		Content:   "Please remember my preferences.",
+		CreatedAt: time.Now().UTC(),
+	}}
+
+	if err := service.Update(context.Background(), "session-clean", msgs); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	doc, err := store.Load(context.Background(), "session-clean")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if strings.Contains(doc.User.TopOfMind, "uploaded a test file") {
+		t.Fatalf("top of mind still contains upload mention: %q", doc.User.TopOfMind)
+	}
+	if !strings.Contains(doc.User.TopOfMind, "User is interested in AI") {
+		t.Fatalf("top of mind lost legitimate context: %q", doc.User.TopOfMind)
+	}
+	if !strings.Contains(doc.User.TopOfMind, "User prefers concise answers") {
+		t.Fatalf("top of mind lost legitimate preference: %q", doc.User.TopOfMind)
+	}
+	if len(doc.Facts) != 1 || doc.Facts[0].Content != "User prefers dark mode" {
+		t.Fatalf("facts = %#v", doc.Facts)
+	}
+}
+
 func TestPostgresStoreSaveLoadUsesTransaction(t *testing.T) {
 	t.Parallel()
 
@@ -187,6 +325,19 @@ type stubExtractor struct {
 
 func (s *stubExtractor) ExtractUpdate(_ context.Context, _ Document, _ []models.Message) (Update, error) {
 	return s.update, s.err
+}
+
+type capturingExtractor struct {
+	update   Update
+	err      error
+	called   bool
+	messages []models.Message
+}
+
+func (c *capturingExtractor) ExtractUpdate(_ context.Context, _ Document, messages []models.Message) (Update, error) {
+	c.called = true
+	c.messages = cloneMessages(messages)
+	return c.update, c.err
 }
 
 type fakeStorage struct {

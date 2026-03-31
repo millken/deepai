@@ -83,6 +83,28 @@ func TestRegistry_Get(t *testing.T) {
 	}
 }
 
+func TestRegistry_Unregister(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(models.Tool{
+		Name: "remove_me",
+		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	if removed := r.Unregister("remove_me"); !removed {
+		t.Fatal("expected tool to be removed")
+	}
+	if tool := r.Get("remove_me"); tool != nil {
+		t.Fatal("expected tool to be absent after unregister")
+	}
+	if removed := r.Unregister("remove_me"); removed {
+		t.Fatal("expected second unregister to report false")
+	}
+}
+
 func TestRegistry_List(t *testing.T) {
 	r := NewRegistry()
 

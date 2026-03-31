@@ -11,3 +11,11 @@ test:
 # Run linter
 lint:
 	golangci-lint run ./...
+
+upstream:
+# git remote add upstream https://github.com/millken/deepai
+# git checkout -b upstream
+	git checkout upstream
+	git pull upstream
+	git push origin upstream
+	git checkout main
