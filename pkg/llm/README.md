@@ -1,11 +1,11 @@
 # llm 包
 
-`llm` 包定义了与后端语言模型（LLM）交互的抽象接口与适配器，项目中使用 `EinoProvider`（基于 cloudwego/eino）封装 OpenAI 兼容的后端。
+`llm` 包定义了与后端语言模型（LLM）交互的抽象接口与适配器，项目中使用 `LitellmProvider`（基于 github.com/voocel/litellm）封装 OpenAI 兼容的后端。
 
 功能概览
 - 提供统一的 `LLMProvider` 接口用于发起对话请求或流式响应。
 - 定义跨提供者的请求/响应结构：`ChatRequest`、`ChatResponse`、`StreamChunk`、`Usage`。
-- 内置 `EinoProvider`：将业务中通用的 `models.Message`、工具调用等转换为 `eino` 的消息格式并调用模型。
+ - 内置 `LitellmProvider`：将业务中通用的 `models.Message` 转换为 litellm 的消息格式并调用模型。
 
 主要类型
 - `LLMProvider`：接口，方法 `Chat(ctx, req)` 与 `Stream(ctx, req)`。
@@ -14,9 +14,9 @@
 - `StreamChunk`：流式增量数据结构，支持部分文本、工具调用、最终消息与错误信息。
 
 内置提供者
-- `EinoProvider`（实现位于 [pkg/llm/eino.go](pkg/llm/eino.go#L1-L400)）
-  - 通过 `NewEinoProvider(name)` 创建，`name` 支持 `openai`、`siliconflow`、`anthropic` 等（字符串小写比较）。
-  - 使用 cloudwego 的 `eino` OpenAI 组件发送请求并做数据结构转换。
+ - `LitellmProvider`（实现位于 [pkg/llm/eino.go](pkg/llm/eino.go#L1-L400)）
+    - 通过 `NewLitellmProvider(name)` 创建，`name` 支持 `openai`、`siliconflow`、`anthropic` 等（字符串小写比较）。
+    - 使用 `github.com/voocel/litellm` 作为后端客户端。
 
 配置（环境变量）
 - `DEFAULT_LLM_PROVIDER`：`NewProvider("")` 时的默认提供者（例如 `openai`）。
@@ -64,7 +64,7 @@ for chunk := range ch {
 
 扩展建议
 - 若需支持更多后端，可实现新的 `LLMProvider`（例如直接调用 OpenAI 或 Anthropic 官方 SDK），并在 `registry.go` 中扩展 `NewProvider` 的分发逻辑。
-- 可在 `EinoProvider` 中加入自定义中间件、度量采集和重试逻辑以提高可靠性。
+ - 可在 `LitellmProvider` 中加入自定义中间件、度量采集和重试逻辑以提高可靠性。
 
 如需，我可以：
 - 添加更完整的示例程序（`cmd/llm-example`）并把其集成测试加入 `go test`；

@@ -12,7 +12,7 @@ func NewProvider(name string) LLMProvider {
 		provider = strings.TrimSpace(os.Getenv("DEFAULT_LLM_PROVIDER"))
 	}
 
-	p, err := NewEinoProvider(provider)
+	p, err := NewLitellmProvider(provider)
 	if err != nil {
 		return &UnavailableProvider{err: err}
 	}

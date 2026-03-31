@@ -177,16 +177,3 @@ func TestChatResponse(t *testing.T) {
 		t.Errorf("Stop = %s, want 'stop'", resp.Stop)
 	}
 }
-
-func TestPtr(t *testing.T) {
-	val := "test"
-	ptr := ptr(val)
-
-	if ptr == nil {
-		t.Error("ptr should not return nil")
-	}
-
-	if *ptr != val {
-		t.Errorf("*ptr = %s, want %s", *ptr, val)
-	}
-}

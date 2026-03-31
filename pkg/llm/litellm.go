@@ -10,14 +10,13 @@ import (
 	"github.com/voocel/litellm"
 )
 
-// EinoProvider is a thin wrapper around litellm.Client to keep the existing
-// construction function name `NewEinoProvider` used elsewhere in the codebase.
-type EinoProvider struct {
+// LitellmProvider is a thin wrapper around litellm.Client.
+type LitellmProvider struct {
 	provider string
 	client   *litellm.Client
 }
 
-func NewEinoProvider(name string) (*EinoProvider, error) {
+func NewLitellmProvider(name string) (*LitellmProvider, error) {
 	provider := strings.ToLower(strings.TrimSpace(name))
 	if provider == "" {
 		provider = "openai"
@@ -50,10 +49,10 @@ func NewEinoProvider(name string) (*EinoProvider, error) {
 		return nil, fmt.Errorf("init litellm client: %w", err)
 	}
 
-	return &EinoProvider{provider: provider, client: client}, nil
+	return &LitellmProvider{provider: provider, client: client}, nil
 }
 
-func (p *EinoProvider) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+func (p *LitellmProvider) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	if err := req.Validate(); err != nil {
 		return ChatResponse{}, err
 	}
@@ -87,7 +86,7 @@ func (p *EinoProvider) Chat(ctx context.Context, req ChatRequest) (ChatResponse,
 	return ChatResponse{Model: req.Model, Message: msg}, nil
 }
 
-func (p *EinoProvider) Stream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, error) {
+func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
@@ -132,5 +131,3 @@ func (p *EinoProvider) Stream(ctx context.Context, req ChatRequest) (<-chan Stre
 
 	return ch, nil
 }
-
-func ptr[T any](v T) *T { return &v }
