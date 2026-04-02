@@ -1,8 +1,14 @@
-.PHONY: build test lint
+.PHONY: build build-proxy test lint
 
 # Build the project
 build:
+	mkdir -p bin
 	go build -o ./bin/deepai ./cmd/deepai
+
+# Build the proxy server
+build-proxy:
+	mkdir -p bin
+	go build -o ./bin/proxy ./cmd/proxy
 
 # Run tests
 test:
