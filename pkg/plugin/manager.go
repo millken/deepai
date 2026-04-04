@@ -51,32 +51,32 @@ func DefaultManagerConfig() ManagerConfig {
 
 // wrapper wraps a plugin with its state and metadata.
 type wrapper struct {
-	plugin     Plugin
-	manifest   *Manifest
-	state      PluginState
-	config     Config
-	loadedAt   time.Time
-	startedAt  time.Time
-	err        error
+	plugin    Plugin
+	manifest  *Manifest
+	state     PluginState
+	config    Config
+	loadedAt  time.Time
+	startedAt time.Time
+	err       error
 }
 
 // Manager handles plugin lifecycle operations.
 type Manager struct {
-	mu        sync.RWMutex
-	wrappers  map[string]*wrapper
-	loader    *CompositeLoader
-	resolver  *DependencyResolver
-	config    ManagerConfig
-	registry  *Registry
-	logger    *log.Logger
-	events    chan Event
-	done      chan struct{}
+	mu       sync.RWMutex
+	wrappers map[string]*wrapper
+	loader   *CompositeLoader
+	resolver *DependencyResolver
+	config   ManagerConfig
+	registry *Registry
+	logger   *log.Logger
+	events   chan Event
+	done     chan struct{}
 
 	// Hooks for lifecycle notifications
-	onLoad   []func(Event)
-	onStart  []func(Event)
-	onStop   []func(Event)
-	onFail   []func(Event)
+	onLoad  []func(Event)
+	onStart []func(Event)
+	onStop  []func(Event)
+	onFail  []func(Event)
 }
 
 // NewManager creates a new plugin manager.
@@ -230,13 +230,13 @@ func (m *Manager) Discover(ctx context.Context) (map[string]*Manifest, error) {
 		info := p.Info()
 		if _, exists := manifests[info.ID]; !exists {
 			manifests[info.ID] = &Manifest{
-				ID:          info.ID,
-				Name:        info.Name,
-				Version:     info.Version,
-				Description: info.Description,
-				Author:      info.Author,
-				Type:        info.Type,
-				Runtime:     "go",
+				ID:           info.ID,
+				Name:         info.Name,
+				Version:      info.Version,
+				Description:  info.Description,
+				Author:       info.Author,
+				Type:         info.Type,
+				Runtime:      "go",
 				Dependencies: info.Dependencies,
 				Permissions:  info.Permissions,
 			}

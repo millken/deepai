@@ -48,12 +48,12 @@ func (r *DependencyResolver) Resolve(manifests map[string]*Manifest) ([]string, 
 
 // node represents a plugin in the dependency graph.
 type node struct {
-	id          string
-	manifest    *Manifest
-	dependsOn   []string
-	dependents  []string
-	visited     bool
-	inProgress  bool
+	id         string
+	manifest   *Manifest
+	dependsOn  []string
+	dependents []string
+	visited    bool
+	inProgress bool
 }
 
 // buildGraph creates a dependency graph from manifests.
@@ -63,9 +63,9 @@ func buildGraph(manifests map[string]*Manifest) map[string]*node {
 	// Create nodes
 	for id, m := range manifests {
 		graph[id] = &node{
-			id:        id,
-			manifest:  m,
-			dependsOn: make([]string, 0),
+			id:         id,
+			manifest:   m,
+			dependsOn:  make([]string, 0),
 			dependents: make([]string, 0),
 		}
 	}
@@ -192,11 +192,11 @@ func (r *DependencyResolver) CheckDependencies(manifests map[string]*Manifest) [
 
 			if !exists {
 				errors = append(errors, DependencyError{
-					PluginID:    id,
-					Dependency:  dep.ID,
-					Type:        "missing",
-					Required:    dep.Version,
-					Installed:   "",
+					PluginID:   id,
+					Dependency: dep.ID,
+					Type:       "missing",
+					Required:   dep.Version,
+					Installed:  "",
 				})
 				continue
 			}
@@ -217,11 +217,11 @@ func (r *DependencyResolver) CheckDependencies(manifests map[string]*Manifest) [
 
 			if !constraint.Check(version) {
 				errors = append(errors, DependencyError{
-					PluginID:    id,
-					Dependency:  dep.ID,
-					Type:        "version_mismatch",
-					Required:    dep.Version,
-					Installed:   depManifest.Version,
+					PluginID:   id,
+					Dependency: dep.ID,
+					Type:       "version_mismatch",
+					Required:   dep.Version,
+					Installed:  depManifest.Version,
 				})
 			}
 		}

@@ -8,10 +8,10 @@ import (
 
 // Registry provides static plugin registration for built-in plugins.
 type Registry struct {
-	mu       sync.RWMutex
-	plugins  map[string]Plugin
+	mu        sync.RWMutex
+	plugins   map[string]Plugin
 	factories map[string]PluginFactory
-	info     map[string]Info
+	info      map[string]Info
 }
 
 // NewRegistry creates a new plugin registry.

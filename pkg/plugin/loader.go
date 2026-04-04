@@ -466,10 +466,10 @@ func (l *ConfigLoader) Load(ctx context.Context, manifest *Manifest) (Plugin, er
 
 // ConfigPlugin is a plugin defined entirely by configuration.
 type ConfigPlugin struct {
-	info    Info
-	config  Config
-	tools   []ConfigToolDefinition
-	state   PluginState
+	info   Info
+	config Config
+	tools  []ConfigToolDefinition
+	state  PluginState
 }
 
 // ConfigToolDefinition defines a tool via configuration.
@@ -482,13 +482,13 @@ type ConfigToolDefinition struct {
 
 // ConfigExecutor defines how a tool is executed.
 type ConfigExecutor struct {
-	Type       string         `yaml:"type" json:"type"` // http, command, template
-	Command    string         `yaml:"command,omitempty" json:"command,omitempty"`
-	Endpoint   string         `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
-	Method     string         `yaml:"method,omitempty" json:"method,omitempty"`
-	Headers    map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Template   string         `yaml:"template,omitempty" json:"template,omitempty"`
-	Timeout    time.Duration  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Type     string            `yaml:"type" json:"type"` // http, command, template
+	Command  string            `yaml:"command,omitempty" json:"command,omitempty"`
+	Endpoint string            `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
+	Method   string            `yaml:"method,omitempty" json:"method,omitempty"`
+	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Template string            `yaml:"template,omitempty" json:"template,omitempty"`
+	Timeout  time.Duration     `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // NewConfigPlugin creates a new config-based plugin.
