@@ -219,11 +219,11 @@ func (p *Proxy) handleStreamingProxy(
 	resp, err := p.httpClient.Do(upstreamReq)
 	if err != nil {
 		p.emitEvents([]LogEvent{startEvt, reqBodyEvt, {
-			Timestamp:  time.Now().UTC(),
-			Type:       EventDone,
-			ID:         id,
-			Duration:   time.Since(started).Round(time.Millisecond).String(),
-			Error:      err.Error(),
+			Timestamp: time.Now().UTC(),
+			Type:      EventDone,
+			ID:        id,
+			Duration:  time.Since(started).Round(time.Millisecond).String(),
+			Error:     err.Error(),
 		}})
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return

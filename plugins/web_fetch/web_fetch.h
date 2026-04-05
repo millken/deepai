@@ -93,13 +93,16 @@ extern GoUintptr plugin_new(void);
 extern char* plugin_name(void* ptr);
 extern char* plugin_version(void* ptr);
 extern char* plugin_description(void* ptr);
+extern char* plugin_abi_version(void);
 extern char* plugin_type(void* ptr);
 extern void plugin_init(void* ptr, char* configJSON);
 extern void plugin_start(void* ptr);
 extern void plugin_stop(void* ptr);
 extern void plugin_close(void* ptr);
+extern void plugin_free_string(char* s);
+extern void plugin_cancel(void* ptr, GoUint64 callID);
 extern char* plugin_tools(void* ptr);
-extern char* plugin_execute(void* ptr, char* toolName, char* argsJSON);
+extern char* plugin_execute(void* ptr, char* toolName, char* argsJSON, GoUint64 callID);
 
 #ifdef __cplusplus
 }

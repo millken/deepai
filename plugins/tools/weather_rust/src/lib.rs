@@ -5,9 +5,11 @@
 //!
 //! Build with: cargo build --release --crate-type cdylib
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Plugin instance state
@@ -42,21 +44,37 @@ struct WeatherResult {
     condition: String,
 }
 
-/// Global plugin instance (simplified - real implementation should use a map)
-static mut PLUGIN: Option<WeatherPlugin> = None;
+/// Global plugin instance registry (thread-safe).
+/// Each instance is owned by the registry; the host holds a raw pointer.
+static PLUGINS: Mutex<HashMap<usize, Box<WeatherPlugin>>> = Mutex::new(HashMap::new());
+
+/// Retrieve a plugin instance by raw pointer.
+fn get_plugin(ptr: *mut ()) -> Option<*mut WeatherPlugin> {
+    if ptr.is_null() {
+        return None;
+    }
+    let key = ptr as usize;
+    let registry = PLUGINS.lock().ok()?;
+    registry.get(&key).map(|b| &**b as *const WeatherPlugin as *mut WeatherPlugin)
+}
 
 // ============== Exported C Functions ==============
 
 /// Create a new plugin instance
 #[no_mangle]
 pub extern "C" fn plugin_new() -> *mut () {
-    unsafe {
-        PLUGIN = Some(WeatherPlugin {
-            api_key: None,
-            cache_ttl: 300,
-        });
+    let plugin = Box::new(WeatherPlugin {
+        api_key: None,
+        cache_ttl: 300,
+    });
+    let raw = Box::into_raw(plugin) as *mut ();
+    let key = raw as usize;
+    // Reconstruct the Box to store it in the registry.
+    let boxed = unsafe { Box::from_raw(raw as *mut WeatherPlugin) };
+    if let Ok(mut registry) = PLUGINS.lock() {
+        registry.insert(key, boxed);
     }
-    ptr::null_mut() // Return null pointer as instance (simplified)
+    raw
 }
 
 /// Get plugin name
@@ -83,6 +101,14 @@ pub extern "C" fn plugin_description(_ptr: *mut ()) -> *mut c_char {
         .into_raw()
 }
 
+/// ABI version — must match host's CurrentABI ("1.0") or the plugin will be rejected.
+#[no_mangle]
+pub extern "C" fn plugin_abi_version() -> *mut c_char {
+    CString::new("1.0")
+        .unwrap()
+        .into_raw()
+}
+
 /// Get plugin type
 #[no_mangle]
 pub extern "C" fn plugin_type(_ptr: *mut ()) -> *mut c_char {
@@ -93,7 +119,11 @@ pub extern "C" fn plugin_type(_ptr: *mut ()) -> *mut c_char {
 
 /// Initialize plugin with JSON config
 #[no_mangle]
-pub extern "C" fn plugin_init(_ptr: *mut (), config_json: *const c_char) {
+pub extern "C" fn plugin_init(ptr: *mut (), config_json: *const c_char) {
+    let plugin = match get_plugin(ptr) {
+        Some(p) => p,
+        None => return,
+    };
     if config_json.is_null() {
         return;
     }
@@ -102,13 +132,11 @@ pub extern "C" fn plugin_init(_ptr: *mut (), config_json: *const c_char) {
     if let Ok(json_str) = config_str.to_str() {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(json_str) {
             unsafe {
-                if let Some(ref mut plugin) = PLUGIN {
-                    if let Some(api_key) = config.get("api_key").and_then(|v| v.as_str()) {
-                        plugin.api_key = Some(api_key.to_string());
-                    }
-                    if let Some(cache_ttl) = config.get("cache_ttl").and_then(|v| v.as_u64()) {
-                        plugin.cache_ttl = cache_ttl;
-                    }
+                if let Some(api_key) = config.get("api_key").and_then(|v| v.as_str()) {
+                    (*plugin).api_key = Some(api_key.to_string());
+                }
+                if let Some(cache_ttl) = config.get("cache_ttl").and_then(|v| v.as_u64()) {
+                    (*plugin).cache_ttl = cache_ttl;
                 }
             }
         }
@@ -129,10 +157,31 @@ pub extern "C" fn plugin_stop(_ptr: *mut ()) {
 
 /// Close plugin and release resources
 #[no_mangle]
-pub extern "C" fn plugin_close(_ptr: *mut ()) {
-    unsafe {
-        PLUGIN = None;
+pub extern "C" fn plugin_close(ptr: *mut ()) {
+    if ptr.is_null() {
+        return;
     }
+    let key = ptr as usize;
+    if let Ok(mut registry) = PLUGINS.lock() {
+        registry.remove(&key); // Box<WeatherPlugin> is dropped here
+    }
+}
+
+/// Free a C string returned by this plugin's other functions.
+#[no_mangle]
+pub extern "C" fn plugin_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            // Retake ownership and drop (CString::into_raw transfers ownership)
+            let _ = CString::from_raw(s);
+        }
+    }
+}
+
+/// Cancel a specific call by its ID. Weather plugin is synchronous so this is a no-op.
+#[no_mangle]
+pub extern "C" fn plugin_cancel(_ptr: *mut (), _call_id: u64) {
+    // Synchronous plugin — no-op, but required for ABI compliance.
 }
 
 /// Get tool definitions as JSON
@@ -185,9 +234,10 @@ pub extern "C" fn plugin_tools(_ptr: *mut ()) -> *mut c_char {
     CString::new(json).unwrap().into_raw()
 }
 
-/// Execute a tool with JSON arguments, returns JSON result
+/// Execute a tool with JSON arguments, returns JSON result.
+/// The `call_id` parameter identifies this specific call for precise cancellation.
 #[no_mangle]
-pub extern "C" fn plugin_execute(_ptr: *mut (), tool_name: *const c_char, args_json: *const c_char) -> *mut c_char {
+pub extern "C" fn plugin_execute(ptr: *mut (), tool_name: *const c_char, args_json: *const c_char, _call_id: u64) -> *mut c_char {
     let tool = if tool_name.is_null() {
         return error_result("tool_name is null");
     } else {

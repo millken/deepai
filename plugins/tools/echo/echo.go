@@ -96,6 +96,11 @@ func plugin_description(ptr unsafe.Pointer) *C.char {
 	return C.CString("A simple echo tool plugin that repeats messages")
 }
 
+//export plugin_abi_version
+func plugin_abi_version() *C.char {
+	return C.CString("1.0")
+}
+
 //export plugin_type
 func plugin_type(ptr unsafe.Pointer) *C.char {
 	return C.CString("tool")
@@ -145,6 +150,11 @@ func plugin_close(ptr unsafe.Pointer) {
 	delete(plugins, uintptr(ptr))
 }
 
+//export plugin_cancel
+func plugin_cancel(ptr unsafe.Pointer, callID uint64) {
+	// Echo is synchronous and fast; no-op but required for ABI compliance.
+}
+
 //export plugin_tools
 func plugin_tools(ptr unsafe.Pointer) *C.char {
 	p := getPlugin(uintptr(ptr))
@@ -163,7 +173,7 @@ func plugin_tools(ptr unsafe.Pointer) *C.char {
 }
 
 //export plugin_execute
-func plugin_execute(ptr unsafe.Pointer, toolName *C.char, argsJSON *C.char) *C.char {
+func plugin_execute(ptr unsafe.Pointer, toolName *C.char, argsJSON *C.char, callID uint64) *C.char {
 	p := getPlugin(uintptr(ptr))
 	if p == nil {
 		return C.CString(`{"error": "plugin not found"}`)

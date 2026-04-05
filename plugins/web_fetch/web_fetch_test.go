@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -147,7 +148,7 @@ func TestHandleWebFetchErrorHandling(t *testing.T) {
 
 	// Test missing URL
 	args := map[string]interface{}{}
-	_, err := p.handleWebFetch(args)
+	_, err := p.handleWebFetch(context.Background(), args)
 	if err == nil {
 		t.Error("expected error for missing URL")
 	}
@@ -159,7 +160,7 @@ func TestHandleWebFetchErrorHandling(t *testing.T) {
 	args = map[string]interface{}{
 		"url": 123,
 	}
-	_, err = p.handleWebFetch(args)
+	_, err = p.handleWebFetch(context.Background(), args)
 	if err == nil {
 		t.Error("expected error for invalid URL type")
 	}
@@ -170,7 +171,7 @@ func TestHandleWebFetchBatchErrorHandling(t *testing.T) {
 
 	// Test missing URLs
 	args := map[string]interface{}{}
-	_, err := p.handleWebFetchBatch(args)
+	_, err := p.handleWebFetchBatch(context.Background(), args)
 	if err == nil {
 		t.Error("expected error for missing urls")
 	}
@@ -179,7 +180,7 @@ func TestHandleWebFetchBatchErrorHandling(t *testing.T) {
 	args = map[string]interface{}{
 		"urls": []interface{}{},
 	}
-	_, err = p.handleWebFetchBatch(args)
+	_, err = p.handleWebFetchBatch(context.Background(), args)
 	if err == nil {
 		t.Error("expected error for empty urls array")
 	}
@@ -188,7 +189,7 @@ func TestHandleWebFetchBatchErrorHandling(t *testing.T) {
 	args = map[string]interface{}{
 		"urls": "not-an-array",
 	}
-	_, err = p.handleWebFetchBatch(args)
+	_, err = p.handleWebFetchBatch(context.Background(), args)
 	if err == nil {
 		t.Error("expected error for invalid urls type")
 	}
@@ -197,7 +198,7 @@ func TestHandleWebFetchBatchErrorHandling(t *testing.T) {
 func TestExecuteToolUnknownTool(t *testing.T) {
 	p := New()
 
-	_, err := p.executeTool("unknown_tool", map[string]interface{}{})
+	_, err := p.executeTool(context.Background(), "unknown_tool", map[string]interface{}{})
 	if err == nil {
 		t.Error("expected error for unknown tool")
 	}

@@ -38,6 +38,7 @@ type WebFetchPlugin struct {
 	maxContentLength int64
 	tools            []ToolDef
 	httpClient       *http.Client
+	execCalls        map[uint64]context.CancelFunc // per-call cancel functions keyed by call ID
 }
 
 // ToolDef represents a tool definition.
@@ -73,6 +74,7 @@ func New() *WebFetchPlugin {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		execCalls: make(map[uint64]context.CancelFunc),
 		tools: []ToolDef{
 			{
 				Name:        "web_fetch",
@@ -165,6 +167,11 @@ func plugin_description(ptr unsafe.Pointer) *C.char {
 	return C.CString("Web page fetcher with HTTP and headless browser support, plus readability extraction")
 }
 
+//export plugin_abi_version
+func plugin_abi_version() *C.char {
+	return C.CString("1.0")
+}
+
 //export plugin_type
 func plugin_type(ptr unsafe.Pointer) *C.char {
 	return C.CString("tool")
@@ -188,15 +195,25 @@ func plugin_init(ptr unsafe.Pointer, configJSON *C.char) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Apply configuration
-	if backend, ok := config["default_backend"].(string); ok {
+	// Apply configuration with defensive boundary clamping
+	if backend, ok := config["default_backend"].(string); ok && (backend == "http" || backend == "chromedp") {
 		p.defaultBackend = backend
 	}
 	if timeout, ok := config["timeout"].(float64); ok {
+		if timeout < 1 {
+			timeout = 1
+		} else if timeout > 120 {
+			timeout = 120
+		}
 		p.timeout = time.Duration(timeout) * time.Second
 		p.httpClient.Timeout = p.timeout
 	}
 	if maxLen, ok := config["max_content_length"].(float64); ok {
+		if maxLen < 1000 {
+			maxLen = 1000
+		} else if maxLen > 10000000 {
+			maxLen = 10000000
+		}
 		p.maxContentLength = int64(maxLen)
 	}
 }
@@ -213,9 +230,40 @@ func plugin_stop(ptr unsafe.Pointer) {
 
 //export plugin_close
 func plugin_close(ptr unsafe.Pointer) {
+	p := getPlugin(uintptr(ptr))
+	if p == nil {
+		return
+	}
+	// Cancel all in-flight executions to avoid leaking goroutines.
+	p.mu.Lock()
+	for id, cancel := range p.execCalls {
+		cancel()
+		delete(p.execCalls, id)
+	}
+	p.mu.Unlock()
+
 	pluginsMu.Lock()
 	defer pluginsMu.Unlock()
 	delete(plugins, uintptr(ptr))
+}
+
+//export plugin_free_string
+func plugin_free_string(s *C.char) {
+	C.free(unsafe.Pointer(s))
+}
+
+//export plugin_cancel
+func plugin_cancel(ptr unsafe.Pointer, callID uint64) {
+	p := getPlugin(uintptr(ptr))
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if cancel, ok := p.execCalls[callID]; ok {
+		cancel()
+		delete(p.execCalls, callID)
+	}
+	p.mu.Unlock()
 }
 
 //export plugin_tools
@@ -236,11 +284,18 @@ func plugin_tools(ptr unsafe.Pointer) *C.char {
 }
 
 //export plugin_execute
-func plugin_execute(ptr unsafe.Pointer, toolName *C.char, argsJSON *C.char) *C.char {
+func plugin_execute(ptr unsafe.Pointer, toolName *C.char, argsJSON *C.char, callID uint64) *C.char {
 	p := getPlugin(uintptr(ptr))
 	if p == nil {
 		return C.CString(`{"error": "plugin not found"}`)
 	}
+
+	// Set up a per-call cancellable context so plugin_cancel(ptr, callID)
+	// can interrupt exactly this execution.
+	ctx, cancel := context.WithCancel(context.Background())
+	p.mu.Lock()
+	p.execCalls[callID] = cancel
+	p.mu.Unlock()
 
 	tool := C.GoString(toolName)
 	argsStr := C.GoString(argsJSON)
@@ -248,17 +303,29 @@ func plugin_execute(ptr unsafe.Pointer, toolName *C.char, argsJSON *C.char) *C.c
 	args := make(map[string]interface{})
 	if argsStr != "" && argsStr != "{}" {
 		if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+			p.clearExecContext(callID, cancel)
 			return C.CString(`{"error": "invalid args JSON"}`)
 		}
 	}
 
-	result, err := p.executeTool(tool, args)
+	result, err := p.executeTool(ctx, tool, args)
+
+	// Tear down this call's entry.
+	p.clearExecContext(callID, cancel)
+
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error": %q}`, err.Error()))
 	}
 
 	resultJSON, _ := json.Marshal(result)
 	return C.CString(string(resultJSON))
+}
+
+func (p *WebFetchPlugin) clearExecContext(callID uint64, cancel context.CancelFunc) {
+	cancel()
+	p.mu.Lock()
+	delete(p.execCalls, callID)
+	p.mu.Unlock()
 }
 
 // ============== Internal Implementation ==============
@@ -269,18 +336,18 @@ func getPlugin(ptr uintptr) *WebFetchPlugin {
 	return plugins[ptr]
 }
 
-func (p *WebFetchPlugin) executeTool(name string, args map[string]interface{}) (interface{}, error) {
+func (p *WebFetchPlugin) executeTool(ctx context.Context, name string, args map[string]interface{}) (interface{}, error) {
 	switch name {
 	case "web_fetch":
-		return p.handleWebFetch(args)
+		return p.handleWebFetch(ctx, args)
 	case "web_fetch_batch":
-		return p.handleWebFetchBatch(args)
+		return p.handleWebFetchBatch(ctx, args)
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
 }
 
-func (p *WebFetchPlugin) handleWebFetch(args map[string]interface{}) (interface{}, error) {
+func (p *WebFetchPlugin) handleWebFetch(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	urlStr, ok := args["url"].(string)
 	if !ok || urlStr == "" {
 		return nil, fmt.Errorf("url argument is required and must be a string")
@@ -289,7 +356,6 @@ func (p *WebFetchPlugin) handleWebFetch(args map[string]interface{}) (interface{
 	p.mu.RLock()
 	backend := p.defaultBackend
 	timeout := p.timeout
-	maxLen := p.maxContentLength
 	p.mu.RUnlock()
 
 	// Override backend if specified
@@ -313,7 +379,8 @@ func (p *WebFetchPlugin) handleWebFetch(args map[string]interface{}) (interface{
 	var contentType string
 	var err error
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Derive a timeout from the per-call context passed from plugin_execute.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	switch backend {
@@ -326,16 +393,7 @@ func (p *WebFetchPlugin) handleWebFetch(args map[string]interface{}) (interface{
 	}
 
 	if err != nil {
-		return map[string]interface{}{
-			"error":   err.Error(),
-			"url":     urlStr,
-			"backend": backend,
-		}, nil
-	}
-
-	// Check content length
-	if int64(len(htmlContent)) > maxLen {
-		htmlContent = htmlContent[:maxLen]
+		return nil, fmt.Errorf("fetch %s via %s failed: %w", urlStr, backend, err)
 	}
 
 	result := &FetchResult{
@@ -398,7 +456,7 @@ func (p *WebFetchPlugin) handleWebFetch(args map[string]interface{}) (interface{
 	return result, nil
 }
 
-func (p *WebFetchPlugin) handleWebFetchBatch(args map[string]interface{}) (interface{}, error) {
+func (p *WebFetchPlugin) handleWebFetchBatch(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	urlsInterface, ok := args["urls"].([]interface{})
 	if !ok {
 		return nil, fmt.Errorf("urls argument is required and must be an array")
@@ -442,7 +500,7 @@ func (p *WebFetchPlugin) handleWebFetchBatch(args map[string]interface{}) (inter
 				"extract_content": extractContent,
 				"return_html":     false,
 			}
-			result, err := p.handleWebFetch(fetchArgs)
+			result, err := p.handleWebFetch(ctx, fetchArgs)
 			if err != nil {
 				results[idx] = map[string]interface{}{
 					"error": err.Error(),
@@ -480,7 +538,16 @@ func (p *WebFetchPlugin) fetchWithHTTP(ctx context.Context, url string) (string,
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", resp.StatusCode, resp.Header.Get("Content-Type"), fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Limit reads to maxContentLength to avoid buffering huge responses.
+	p.mu.RLock()
+	maxLen := p.maxContentLength
+	p.mu.RUnlock()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLen))
 	if err != nil {
 		return "", resp.StatusCode, resp.Header.Get("Content-Type"), fmt.Errorf("failed to read response body: %w", err)
 	}

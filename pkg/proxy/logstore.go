@@ -60,10 +60,10 @@ type LogEvent struct {
 	ClientID     string `json:"session_id,omitempty"` // source client session (e.g. X-Claude-Code-Session-Id)
 
 	// req_body / resp_body event fields
-	Body       RawBody `json:"body,omitempty"`
-	BodySize   int     `json:"size,omitempty"`
-	BodyFile   string  `json:"body_file,omitempty"`
-	Truncated  bool    `json:"truncated,omitempty"` // true when body exceeded MaxRequestBody and was cut
+	Body      RawBody `json:"body,omitempty"`
+	BodySize  int     `json:"size,omitempty"`
+	BodyFile  string  `json:"body_file,omitempty"`
+	Truncated bool    `json:"truncated,omitempty"` // true when body exceeded MaxRequestBody and was cut
 
 	// delta event fields
 	Text string `json:"text,omitempty"`

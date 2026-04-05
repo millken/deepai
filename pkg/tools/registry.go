@@ -238,6 +238,13 @@ func (r *Registry) Call(ctx context.Context, name string, args map[string]interf
 		}
 		return result.Content, err
 	}
+	if result.Status == models.CallStatusFailed {
+		errMsg := result.Error
+		if errMsg == "" {
+			errMsg = "tool execution failed"
+		}
+		return result.Content, errors.New(errMsg)
+	}
 	return result.Content, nil
 }
 

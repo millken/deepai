@@ -2,3 +2,4 @@ bin/
 *.jsonl
 bodies/
 logs/
+*.so

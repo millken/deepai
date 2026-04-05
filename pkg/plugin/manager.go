@@ -312,11 +312,22 @@ func (m *Manager) Load(ctx context.Context) error {
 func (m *Manager) LoadPlugin(ctx context.Context, manifest *Manifest) error {
 	m.mu.Lock()
 
-	// Check if already loaded
-	if _, exists := m.wrappers[manifest.ID]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("plugin %s already loaded", manifest.ID)
+	// Check if already loaded or currently loading (TOCTOU-safe).
+	if w, exists := m.wrappers[manifest.ID]; exists {
+		if w.state == PluginStateLoaded || w.state == PluginStateRunning || w.state == PluginStateStarting {
+			m.mu.Unlock()
+			return fmt.Errorf("plugin %s already loaded", manifest.ID)
+		}
+		// Previously failed — remove stale entry while still holding the lock.
+		delete(m.wrappers, manifest.ID)
 	}
+
+	// Place a loading placeholder to prevent concurrent loads of the same plugin.
+	m.wrappers[manifest.ID] = &wrapper{
+		manifest: manifest,
+		state:    PluginStateLoaded, // transient: will be overwritten
+	}
+	m.mu.Unlock()
 
 	// Create load context with timeout
 	loadCtx, cancel := context.WithTimeout(ctx, m.config.LoadTimeout)
@@ -327,49 +338,40 @@ func (m *Manager) LoadPlugin(ctx context.Context, manifest *Manifest) error {
 	if registered, ok := m.registry.Get(manifest.ID); ok {
 		p = registered
 	} else {
-		// Release lock before loading (I/O operation)
-		m.mu.Unlock()
 		loaded, err := m.loader.Load(loadCtx, manifest)
-		m.mu.Lock()
-
 		if err != nil {
+			m.mu.Lock()
+			delete(m.wrappers, manifest.ID)
 			m.mu.Unlock()
-			// Emit event without holding lock to prevent deadlock
 			m.emit(EventFailed, manifest.ID, PluginStateFailed, err)
 			return err
 		}
 		p = loaded
 	}
 
-	// Create wrapper
-	w := &wrapper{
+	// Update the placeholder with the loaded plugin.
+	m.mu.Lock()
+	m.wrappers[manifest.ID] = &wrapper{
 		plugin:   p,
 		manifest: manifest,
 		state:    PluginStateLoaded,
 		config:   manifest.Config,
 		loadedAt: time.Now().UTC(),
 	}
-
-	m.wrappers[manifest.ID] = w
 	m.mu.Unlock()
 
-	// Emit event without holding lock to prevent deadlock
 	m.emit(EventLoaded, manifest.ID, PluginStateLoaded, nil)
-
 	return nil
 }
 
 // Start starts a loaded plugin.
 func (m *Manager) Start(ctx context.Context, id string) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	w, exists := m.wrappers[id]
-	m.mu.RUnlock()
-
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("plugin %s not found", id)
 	}
-
-	m.mu.Lock()
 	if w.state == PluginStateRunning {
 		m.mu.Unlock()
 		return nil

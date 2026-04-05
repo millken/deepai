@@ -3,6 +3,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -98,6 +99,55 @@ type Config struct {
 	Settings map[string]any `json:"settings,omitempty" yaml:"settings,omitempty"`
 	// Secrets contains sensitive configuration (not serialized).
 	Secrets map[string]string `json:"-" yaml:"-"`
+}
+
+// UnmarshalYAML implements custom YAML unmarshaling that collects unknown
+// fields into Settings. This allows plugin.yaml to use flat config:
+//
+//	config:
+//	  default_backend: "http"
+//	  timeout: 30
+//
+// instead of nesting under a "settings" key.
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error {
+	var raw map[string]any
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+
+	if v, ok := raw["id"]; ok {
+		c.ID = fmt.Sprintf("%v", v)
+	}
+	if v, ok := raw["enabled"]; ok {
+		c.Enabled, _ = v.(bool)
+	}
+	if v, ok := raw["priority"]; ok {
+		switch val := v.(type) {
+		case int:
+			c.Priority = val
+		case float64:
+			c.Priority = int(val)
+		}
+	}
+	if v, ok := raw["settings"]; ok {
+		if m, ok := v.(map[string]any); ok {
+			c.Settings = m
+		}
+	}
+
+	// Collect unrecognized fields into Settings so they reach plugin_init.
+	known := map[string]bool{
+		"id": true, "enabled": true, "priority": true, "settings": true, "secrets": true,
+	}
+	if c.Settings == nil {
+		c.Settings = make(map[string]any)
+	}
+	for k, v := range raw {
+		if !known[k] {
+			c.Settings[k] = v
+		}
+	}
+	return nil
 }
 
 // Manifest describes a plugin from its plugin.yaml file.

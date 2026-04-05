@@ -46,11 +46,11 @@ func reconstructAnthropicStream(data []byte) []byte {
 			Index int             `json:"index"`
 			Delta json.RawMessage `json:"delta"`
 			Msg   struct {
-				ID      string `json:"id"`
-				Type    string `json:"type"`
-				Role    string `json:"role"`
-				Model   string `json:"model"`
-				Usage   struct {
+				ID    string `json:"id"`
+				Type  string `json:"type"`
+				Role  string `json:"role"`
+				Model string `json:"model"`
+				Usage struct {
 					InputTokens  int `json:"input_tokens"`
 					OutputTokens int `json:"output_tokens"`
 				} `json:"usage"`
@@ -277,9 +277,9 @@ func reconstructOpenAIStream(data []byte) []byte {
 				Content   string `json:"content"`
 				Refusal   string `json:"refusal"`
 				ToolCalls []struct {
-					Index int `json:"index"`
-					ID    string `json:"id"`
-					Type  string `json:"type"`
+					Index    int    `json:"index"`
+					ID       string `json:"id"`
+					Type     string `json:"type"`
 					Function struct {
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"`

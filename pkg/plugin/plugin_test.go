@@ -2,10 +2,61 @@ package plugin
 
 import (
 	"context"
+	"sort"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
+	"gopkg.in/yaml.v3"
 )
+
+func TestRequiredSymbols(t *testing.T) {
+	expected := []string{
+		"plugin_abi_version",
+		"plugin_description",
+		"plugin_free_string",
+		"plugin_name",
+		"plugin_new",
+		"plugin_version",
+	}
+	sorted := make([]string, len(RequiredSymbols))
+	copy(sorted, RequiredSymbols)
+	sort.Strings(sorted)
+	for i, s := range sorted {
+		if i >= len(expected) || s != expected[i] {
+			t.Errorf("RequiredSymbols mismatch: got %v, want %v", sorted, expected)
+			return
+		}
+	}
+	if len(RequiredSymbols) != len(expected) {
+		t.Errorf("RequiredSymbols length = %d, want %d", len(RequiredSymbols), len(expected))
+	}
+}
+
+func TestOptionalSymbols(t *testing.T) {
+	// plugin_free_string was promoted to required — must NOT appear here.
+	for _, sym := range OptionalSymbols {
+		if sym == "plugin_free_string" {
+			t.Error("plugin_free_string must be in RequiredSymbols, not OptionalSymbols")
+		}
+	}
+	idx := sort.SearchStrings(OptionalSymbols, "plugin_free_string")
+	if idx < len(OptionalSymbols) && OptionalSymbols[idx] == "plugin_free_string" {
+		t.Error("plugin_free_string found in OptionalSymbols")
+	}
+}
+
+func TestCurrentABI(t *testing.T) {
+	if CurrentABI == "" {
+		t.Fatal("CurrentABI is empty")
+	}
+	// Must be parseable as major.min.
+	for _, c := range CurrentABI {
+		if !(c >= '0' && c <= '9') && c != '.' {
+			t.Errorf("CurrentABI %q contains non-numeric character", CurrentABI)
+			return
+		}
+	}
+}
 
 // MockPlugin is a test plugin implementation.
 type MockPlugin struct {
@@ -396,4 +447,56 @@ func indexOf(slice []string, item string) int {
 		}
 	}
 	return -1
+}
+
+func TestConfigUnmarshalYAML_FlatConfig(t *testing.T) {
+	input := []byte(`
+id: test-plugin
+enabled: true
+priority: 10
+default_backend: http
+timeout: 30
+max_content_length: 1000000
+`)
+	var cfg Config
+	if err := yaml.Unmarshal(input, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.ID != "test-plugin" {
+		t.Errorf("ID = %q, want %q", cfg.ID, "test-plugin")
+	}
+	if !cfg.Enabled {
+		t.Error("Enabled = false, want true")
+	}
+	if cfg.Priority != 10 {
+		t.Errorf("Priority = %d, want 10", cfg.Priority)
+	}
+	if cfg.Settings["default_backend"] != "http" {
+		t.Errorf("Settings[default_backend] = %v, want %q", cfg.Settings["default_backend"], "http")
+	}
+	if cfg.Settings["timeout"] != 30 {
+		t.Errorf("Settings[timeout] = %v, want 30", cfg.Settings["timeout"])
+	}
+	if cfg.Settings["max_content_length"] != 1000000 {
+		t.Errorf("Settings[max_content_length] = %v, want 1000000", cfg.Settings["max_content_length"])
+	}
+}
+
+func TestConfigUnmarshalYAML_NestedSettings(t *testing.T) {
+	input := []byte(`
+id: test-plugin
+settings:
+  default_backend: http
+  timeout: 30
+`)
+	var cfg Config
+	if err := yaml.Unmarshal(input, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Settings["default_backend"] != "http" {
+		t.Errorf("Settings[default_backend] = %v, want %q", cfg.Settings["default_backend"], "http")
+	}
+	if cfg.Settings["timeout"] != 30 {
+		t.Errorf("Settings[timeout] = %v, want 30", cfg.Settings["timeout"])
+	}
 }

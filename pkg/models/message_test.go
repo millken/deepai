@@ -150,12 +150,12 @@ func TestMessage_Validate(t *testing.T) {
 
 func TestMessage_JSON(t *testing.T) {
 	msg := Message{
-		ID:         "msg_123",
-		SessionID:  "sess_456",
-		Role:       RoleHuman,
-		Content:    "Test content",
-		Metadata:   map[string]string{"key": "value"},
-		CreatedAt:  time.Now(),
+		ID:        "msg_123",
+		SessionID: "sess_456",
+		Role:      RoleHuman,
+		Content:   "Test content",
+		Metadata:  map[string]string{"key": "value"},
+		CreatedAt: time.Now(),
 	}
 
 	data, err := json.Marshal(msg)
@@ -189,10 +189,10 @@ func TestToolCall_Validate(t *testing.T) {
 		{
 			name: "valid tool call",
 			call: ToolCall{
-				ID:       "call_123",
-				Name:     "test",
+				ID:        "call_123",
+				Name:      "test",
 				Arguments: map[string]any{"key": "value"},
-				Status:   CallStatusPending,
+				Status:    CallStatusPending,
 			},
 			wantErr: false,
 		},
@@ -318,11 +318,11 @@ func TestToolResult_Validate(t *testing.T) {
 		{
 			name: "negative duration",
 			result: ToolResult{
-				CallID:    "call_123",
-				ToolName:  "test",
-				Status:    CallStatusCompleted,
-				Content:   "ok",
-				Duration:  -1,
+				CallID:   "call_123",
+				ToolName: "test",
+				Status:   CallStatusCompleted,
+				Content:  "ok",
+				Duration: -1,
 			},
 			wantErr: true,
 		},
