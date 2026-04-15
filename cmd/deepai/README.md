@@ -23,9 +23,9 @@
 
 ```bash
 export DEEPAI_PROVIDER=openai
-export OPENAI_API_KEY=sk-jhbssaazdxvliteyqvdqfhvmexkteuicymuuieujsdwicxwi
-export OPENAI_BASE_URL=https://api.siliconflow.cn/v1
-export DEEPAI_MODEL=Qwen/Qwen3.5-9B
+export OPENAI_API_KEY=tp-cw9j1m7lycrn9sv34pio0ilgqv2tourti3yqltc0yilnfyhw
+export OPENAI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+export DEEPAI_MODEL=mimo-v2-pro
 go run ./cmd/deepai
 ```
 
