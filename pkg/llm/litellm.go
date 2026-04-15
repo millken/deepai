@@ -39,16 +39,7 @@ func (p *LitellmProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 		msgs = append(msgs, litellm.Message{Role: "system", Content: req.SystemPrompt})
 	}
 	for _, m := range req.Messages {
-		role := "assistant"
-		switch m.Role {
-		case models.RoleHuman:
-			role = "user"
-		case models.RoleSystem:
-			role = "system"
-		case models.RoleTool:
-			role = "tool"
-		}
-		msgs = append(msgs, litellm.Message{Role: role, Content: m.Content})
+		msgs = append(msgs, mapMessageToLitellm(m))
 	}
 
 	litReq := mapChatReqToLitellmRequest(req, msgs)
@@ -75,16 +66,7 @@ func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan S
 		msgs = append(msgs, litellm.Message{Role: "system", Content: req.SystemPrompt})
 	}
 	for _, m := range req.Messages {
-		role := "assistant"
-		switch m.Role {
-		case models.RoleHuman:
-			role = "user"
-		case models.RoleSystem:
-			role = "system"
-		case models.RoleTool:
-			role = "tool"
-		}
-		msgs = append(msgs, litellm.Message{Role: role, Content: m.Content})
+		msgs = append(msgs, mapMessageToLitellm(m))
 	}
 
 	litReq := mapChatReqToLitellmRequest(req, msgs)
@@ -162,6 +144,43 @@ func convertLitellmToolCalls(calls []litellm.ToolCall) []models.ToolCall {
 		result = append(result, toolCall)
 	}
 	return result
+}
+
+// mapMessageToLitellm converts a models.Message into a litellm.Message,
+// preserving ToolCalls (assistant) and ToolCallID (tool result).
+func mapMessageToLitellm(m models.Message) litellm.Message {
+	role := "assistant"
+	switch m.Role {
+	case models.RoleHuman:
+		role = "user"
+	case models.RoleSystem:
+		role = "system"
+	case models.RoleTool:
+		role = "tool"
+	}
+
+	lm := litellm.Message{Role: role, Content: m.Content}
+
+	if len(m.ToolCalls) > 0 {
+		lm.ToolCalls = make([]litellm.ToolCall, len(m.ToolCalls))
+		for i, tc := range m.ToolCalls {
+			argsJSON, _ := json.Marshal(tc.Arguments)
+			lm.ToolCalls[i] = litellm.ToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: litellm.FunctionCall{
+					Name:      tc.Name,
+					Arguments: string(argsJSON),
+				},
+			}
+		}
+	}
+
+	if m.ToolResult != nil {
+		lm.ToolCallID = m.ToolResult.CallID
+	}
+
+	return lm
 }
 
 // mapChatReqToLitellmRequest attempts to copy optional fields from our provider-agnostic
