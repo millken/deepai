@@ -373,15 +373,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 func (a *Agent) BuildSystemPrompt(_ context.Context, _ string) string {
 	sections := []string{
 		strings.TrimSpace(a.systemPrompt),
-		"You are running in a ReAct-style loop. Think step by step, call tools when necessary, and stop when you have a complete answer.",
-		// "Tool selection rules — prefer dedicated tools over bash for file operations:\n" +
-		// 	"- list_dir: exploring directory structure (not bash ls)\n" +
-		// 	"- read_file: reading file contents (not bash cat/head/tail)\n" +
-		// 	"- write_file: creating or overwriting files (not bash cat >)\n" +
-		// 	"- edit_file: making targeted edits to existing files (not bash sed/awk)\n" +
-		// 	"- find: finding files by name recursively (not bash find)\n" +
-		// 	"- grep: searching file contents by pattern (not bash grep)\n" +
-		// 	"- bash: only for running commands, building, testing, git, and operations not covered by dedicated tools",
+		"Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.",
 	}
 	if toolDescriptions := a.tools.Descriptions(); strings.TrimSpace(toolDescriptions) != "" {
 		sections = append(sections, "Available Tools:\n"+toolDescriptions)

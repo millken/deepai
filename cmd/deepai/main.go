@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +105,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[subagent] %s: %s\n", evt.Type, evt.Message)
 	})
 
+	// Load DEEPAI.md instructions: global (~/.deepai/DEEPAI.md) + project (.deepai/DEEPAI.md).
+	home, _ := os.UserHomeDir()
+	var deepaiMD string
+	for _, p := range []string{
+		filepath.Join(home, ".deepai", "DEEPAI.md"),
+		filepath.Join(workDir, ".deepai", "DEEPAI.md"),
+	} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		content := strings.TrimSpace(string(data))
+		if content != "" {
+			if deepaiMD != "" {
+				deepaiMD += "\n\n"
+			}
+			deepaiMD += content
+			log.Printf("loaded %s (%d chars)", p, len(content))
+		}
+	}
+
 	// Debug logging: async append to file controlled by env.
 	// - DEEPAI_DEBUG_FILE=path  → write debug logs to specified file
 	// - DEEPAI_DEBUG=1          → write debug logs to /tmp/deepai-debug.log
@@ -168,6 +190,11 @@ func main() {
 		// Append skill descriptions after ApplyAgentType sets the profile prompt.
 		if desc := skillReg.Descriptions(); desc != "" {
 			agentRun.AppendSystemPrompt(desc)
+		}
+
+		// Append DEEPAI.md instructions.
+		if deepaiMD != "" {
+			agentRun.AppendSystemPrompt(deepaiMD)
 		}
 
 		// Inject LLM payload logging into agent when debug is enabled.
