@@ -254,6 +254,9 @@ func registerBuiltins(registry *tools.Registry) {
 	for _, tool := range builtin.FileTools() {
 		mustRegister(registry, tool)
 	}
+	for _, tool := range builtin.WebTools() {
+		mustRegister(registry, tool)
+	}
 }
 
 func mustRegister(registry *tools.Registry, tool models.Tool) {

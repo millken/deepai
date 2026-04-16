@@ -70,7 +70,7 @@ func main() {
 	registry := tools.NewRegistry()
 	for _, tool := range append(
 		[]models.Tool{builtin.BashTool(), clarification.AskClarificationTool(nil), tools.TaskTool(subPool), tools.GitAutoCommitTool(provider)},
-		append(builtin.FileTools(), builtin.GitTools()...)...,
+		append(append(builtin.FileTools(), builtin.GitTools()...), builtin.WebTools()...)...,
 	) {
 		if err := registry.Register(tool); err != nil {
 			logs.Error.Error("register tool failed", "err", err)
