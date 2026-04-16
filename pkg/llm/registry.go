@@ -71,6 +71,13 @@ var supportedProviders = []struct {
 			APIKey: os.Getenv("DEEPSEEK_API_KEY"),
 		},
 	},
+	{
+		name: "openai-compat",
+		config: litellm.ProviderConfig{
+			APIKey:  os.Getenv("OPENAI_COMPAT_API_KEY"),
+			BaseURL: strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")),
+		},
+	},
 }
 
 func NewProvider(name string) LLMProvider {

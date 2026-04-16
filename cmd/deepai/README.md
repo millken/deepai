@@ -55,6 +55,9 @@ export DEEPAI_PROVIDER=openai
 export OPENAI_API_KEY=your-api-key
 export DEEPAI_MODEL=gpt-4
 
+export DEEPAI_PROVIDER=openai-compat
+export OPENAI_COMPAT_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4
+export OPENAI_COMPAT_API_KEY=2844a818197d435a814cd0c51dcec1bc.xxxx
 # 运行
 go run ./cmd/deepai
 ```

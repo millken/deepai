@@ -10,7 +10,20 @@ import (
 	"github.com/millken/deepai/pkg/logs"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/providers"
 )
+
+func init() {
+	litellm.RegisterProviderWithDescriptor(litellm.ProviderDescriptor{
+		Name:       "openai-compat",
+		DefaultURL: "https://api.openai.com",
+		Factory: func(config litellm.ProviderConfig) litellm.Provider {
+			return providers.NewOpenAICompat(config, providers.Compat{
+				ProviderName: "openai-compat",
+			})
+		},
+	})
+}
 
 // LitellmProvider is a thin wrapper around litellm.Client.
 type LitellmProvider struct {
