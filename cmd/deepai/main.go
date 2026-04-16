@@ -104,13 +104,36 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[subagent] %s: %s\n", evt.Type, evt.Message)
 	})
 
+	// Debug logging: async append to file controlled by env.
+	// - DEEPAI_DEBUG_FILE=path  → write debug logs to specified file
+	// - DEEPAI_DEBUG=1          → write debug logs to /tmp/deepai-debug.log
+	// Console always shows brief info; detailed logs go to file only.
+	var debugLog *asyncWriter
+	if debugPath := strings.TrimSpace(os.Getenv("DEEPAI_DEBUG_FILE")); debugPath != "" {
+		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("cannot open debug log %s: %v", debugPath, err)
+		}
+		debugLog = newAsyncWriter(f)
+		defer debugLog.Close()
+		log.Printf("debug log: %s", debugPath)
+	} else if os.Getenv("DEEPAI_DEBUG") != "" {
+		debugPath := os.TempDir() + "/deepai-debug.log"
+		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("cannot open debug log %s: %v", debugPath, err)
+		}
+		debugLog = newAsyncWriter(f)
+		defer debugLog.Close()
+		log.Printf("debug log: %s", debugPath)
+	}
+
 	fmt.Println("deepai interactive mode — type your prompt, Ctrl+D or 'exit' to quit")
 	fmt.Println()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	sessionID := "interactive-session"
 	msgSeq := 0
-	debug := os.Getenv("DEEPAI_DEBUG") != ""
 	var history []models.Message
 
 	for {
@@ -155,20 +178,23 @@ func main() {
 				switch evt.Type {
 				case agent.AgentEventToolCall:
 					if evt.ToolCall != nil {
-						if debug {
+						fmt.Fprintf(os.Stderr, "[tool call] %s(%s)\n", evt.ToolCall.Name, evt.ToolCall.ID)
+						if debugLog != nil {
 							argsJSON, _ := json.Marshal(evt.ToolCall.Arguments)
-							fmt.Fprintf(os.Stderr, "[tool call] %s(%s) %s\n", evt.ToolCall.Name, evt.ToolCall.ID, argsJSON)
-						} else {
-							fmt.Fprintf(os.Stderr, "[tool call] %s(%s)\n", evt.ToolCall.Name, evt.ToolCall.ID)
+							debugLog.Printf("[tool call] %s(%s) %s", evt.ToolCall.Name, evt.ToolCall.ID, argsJSON)
 						}
 					}
 				case agent.AgentEventToolResult:
 					if evt.Result != nil {
 						content := evt.Result.Content
-						if !debug && len(content) > 200 {
-							content = content[:200] + "..."
+						if len(content) > 200 {
+							fmt.Fprintf(os.Stderr, "[tool result] %s...\n", content[:200])
+							if debugLog != nil {
+								debugLog.Printf("[tool result] %s", content)
+							}
+						} else {
+							fmt.Fprintf(os.Stderr, "[tool result] %s\n", content)
 						}
-						fmt.Fprintf(os.Stderr, "[tool result] %s\n", content)
 					}
 				case agent.AgentEventError:
 					fmt.Fprintf(os.Stderr, "[error] %s\n", evt.Err)
@@ -216,6 +242,68 @@ func (c *cliUserInteraction) AskQuestion(_ context.Context, question string, opt
 		return "", scanner.Err()
 	}
 	return scanner.Text(), nil
+}
+
+// asyncWriter performs buffered, non-blocking writes to a file.
+type asyncWriter struct {
+	ch    chan string
+	done  chan struct{}
+	file  *os.File
+	close sync.Once
+}
+
+func newAsyncWriter(f *os.File) *asyncWriter {
+	w := &asyncWriter{
+		ch:   make(chan string, 256),
+		done: make(chan struct{}),
+		file: f,
+	}
+	go w.drain()
+	return w
+}
+
+func (w *asyncWriter) Printf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	select {
+	case w.ch <- msg:
+	default:
+		// drop on overflow — debug logs are best-effort
+	}
+}
+
+func (w *asyncWriter) Close() error {
+	w.close.Do(func() {
+		close(w.ch)
+		<-w.done
+	})
+	return w.file.Close()
+}
+
+func (w *asyncWriter) drain() {
+	defer close(w.done)
+	bw := bufio.NewWriter(w.file)
+	flush := func() {
+		if err := bw.Flush(); err != nil {
+			log.Printf("debug log flush: %v", err)
+		}
+	}
+	defer flush()
+
+	// Periodic flush to ensure logs are readable in real-time.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case msg, ok := <-w.ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintln(bw, msg)
+		case <-ticker.C:
+			flush()
+		}
+	}
 }
 
 type scriptedProvider struct {
