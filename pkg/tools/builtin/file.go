@@ -146,8 +146,10 @@ func FileTools() []models.Tool {
 		ReadFileTool(),
 		WriteFileTool(),
 		EditFileTool(),
+		ListDirTool(),
 		GlobTool(),
 		GrepTool(),
+		FindTool(),
 	}
 }
 

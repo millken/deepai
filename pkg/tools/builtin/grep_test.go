@@ -79,7 +79,7 @@ func TestGrepHandler_CaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestGrepHandler_GlobFilter(t *testing.T) {
+func TestGrepHandler_TypeFilter(t *testing.T) {
 	root := createTestTree(t, map[string]string{
 		"a.go": "func main()",
 		"b.ts": "function hello()",
@@ -92,7 +92,7 @@ func TestGrepHandler_GlobFilter(t *testing.T) {
 		Arguments: map[string]any{
 			"pattern": "func",
 			"path":    root,
-			"glob":    "*.go",
+			"type":    "go",
 		},
 	})
 	if err != nil {
@@ -105,7 +105,7 @@ func TestGrepHandler_GlobFilter(t *testing.T) {
 		t.Errorf("expected a.go match, got: %s", result.Content)
 	}
 	if contains(result.Content, "b.ts") {
-		t.Errorf("should not match b.ts with glob *.go, got: %s", result.Content)
+		t.Errorf("should not match b.ts with type go, got: %s", result.Content)
 	}
 }
 
@@ -234,6 +234,46 @@ func TestGrepHandler_MissingPattern(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when pattern is missing")
+	}
+}
+
+func TestGrepHandler_ContextLines(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"a.txt": "line1\nline2\ntarget line\nline4\nline5",
+	})
+
+	result, err := GrepHandler(context.Background(), models.ToolCall{
+		ID:     "grep-9",
+		Name:   "grep",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"pattern": "target",
+			"path":    root,
+			"context": float64(1),
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("result error: %s", result.Error)
+	}
+	// Should show: line2 (before), target line (match), line4 (after)
+	if !contains(result.Content, "a.txt:2:") {
+		t.Errorf("expected context line 2, got: %s", result.Content)
+	}
+	if !contains(result.Content, "a.txt:3: target line") {
+		t.Errorf("expected match line 3, got: %s", result.Content)
+	}
+	if !contains(result.Content, "a.txt:4:") {
+		t.Errorf("expected context line 4, got: %s", result.Content)
+	}
+	// Should NOT show line1 or line5 (outside context range)
+	if contains(result.Content, "a.txt:1:") {
+		t.Errorf("should not show line1, got: %s", result.Content)
+	}
+	if contains(result.Content, "a.txt:5:") {
+		t.Errorf("should not show line5, got: %s", result.Content)
 	}
 }
 

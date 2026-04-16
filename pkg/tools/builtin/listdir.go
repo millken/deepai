@@ -1,0 +1,85 @@
+package builtin
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/millken/deepai/pkg/models"
+)
+
+type dirEntry struct {
+	Name    string `json:"name"`
+	IsDir   bool   `json:"is_dir"`
+	Size    int64  `json:"size,omitempty"`
+	ModTime string `json:"mod_time,omitempty"`
+}
+
+func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	args := call.Arguments
+	path, _ := args["path"].(string)
+	if strings.TrimSpace(path) == "" {
+		path = "."
+	}
+	path = resolveVirtualPath(ctx, path)
+
+	dirs, err := os.ReadDir(path)
+	if err != nil {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("list dir failed: %w", err)
+	}
+
+	entries := make([]dirEntry, 0, len(dirs))
+	for _, d := range dirs {
+		info, err := d.Info()
+		if err != nil {
+			continue
+		}
+		entries = append(entries, dirEntry{
+			Name:    d.Name(),
+			IsDir:   d.IsDir(),
+			Size:    info.Size(),
+			ModTime: info.ModTime().Format("2006-01-02 15:04"),
+		})
+	}
+
+	// Sort: directories first, then files, alphabetically within each group
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir
+		}
+		return entries[i].Name < entries[j].Name
+	})
+
+	var b strings.Builder
+	for _, e := range entries {
+		prefix := "-rw-"
+		if e.IsDir {
+			prefix = "drw-"
+		}
+		fmt.Fprintf(&b, "%s %8d %s  %s\n", prefix, e.Size, e.ModTime, e.Name)
+	}
+
+	return models.ToolResult{
+		CallID:   call.ID,
+		ToolName: call.Name,
+		Content:  b.String(),
+	}, nil
+}
+
+func ListDirTool() models.Tool {
+	return models.Tool{
+		Name:        "list_dir",
+		Description: "List directory contents with file metadata. Shows files and subdirectories sorted (dirs first). Use this to understand project structure.",
+		Groups:      []string{"builtin", "file_ops"},
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Directory path to list (default: current directory)"},
+			},
+			"required": []any{},
+		},
+		Handler: ListDirHandler,
+	}
+}

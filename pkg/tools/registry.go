@@ -20,10 +20,28 @@ type Sandbox = pkgsandbox.Sandbox
 type contextKey string
 
 const (
-	sandboxContextKey  contextKey = "tool_sandbox"
-	threadIDContextKey contextKey = "tool_thread_id"
-	runtimeContextKey  contextKey = "tool_runtime_context"
+	sandboxContextKey        contextKey = "tool_sandbox"
+	threadIDContextKey       contextKey = "tool_thread_id"
+	runtimeContextKey        contextKey = "tool_runtime_context"
+	userInteractionContextKey contextKey = "tool_user_interaction"
 )
+
+// UserInteraction handles prompting the human user for input.
+// In interactive mode (CLI), this reads from stdin.
+// In non-interactive mode (API/server), this is nil — tools should
+// return guidance for the AI to decide on its own.
+type UserInteraction interface {
+	AskQuestion(ctx context.Context, question string, options []string) (string, error)
+}
+
+func WithUserInteraction(ctx context.Context, ui UserInteraction) context.Context {
+	return context.WithValue(ctx, userInteractionContextKey, ui)
+}
+
+func UserInteractionFromContext(ctx context.Context) UserInteraction {
+	ui, _ := ctx.Value(userInteractionContextKey).(UserInteraction)
+	return ui
+}
 
 var toolCallSeq uint64
 

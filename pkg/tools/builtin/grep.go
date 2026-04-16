@@ -1,7 +1,6 @@
 package builtin
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -36,9 +35,15 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		caseInsensitive = v
 	}
 
-	var filePatterns []string
+	var extFilter map[string]bool
+	if typeArg, ok := args["type"].(string); ok && strings.TrimSpace(typeArg) != "" {
+		extFilter = typeToExts(strings.TrimSpace(typeArg))
+	}
+
+	// glob as fallback for custom patterns
+	var globPatterns []string
 	if globArg, ok := args["glob"].(string); ok && strings.TrimSpace(globArg) != "" {
-		filePatterns = []string{strings.TrimSpace(globArg)}
+		globPatterns = []string{strings.TrimSpace(globArg)}
 	}
 
 	maxResults := 100
@@ -46,12 +51,17 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		maxResults = int(v)
 	}
 
+	contextLines := 0
+	if v, ok := args["context"].(float64); ok && int(v) > 0 {
+		contextLines = int(v)
+	}
+
 	re, err := compileGrepPattern(pattern, caseInsensitive)
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	matches, err := searchDir(path, re, filePatterns, maxResults)
+	matches, err := searchDir(path, re, extFilter, globPatterns, maxResults)
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 	}
@@ -65,8 +75,13 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	}
 
 	var b strings.Builder
-	for _, m := range matches {
-		fmt.Fprintf(&b, "%s:%d: %s\n", m.File, m.Line, m.Content)
+	if contextLines > 0 {
+		// Group matches by file and render with context lines
+		renderMatchesWithContext(&b, matches, contextLines)
+	} else {
+		for _, m := range matches {
+			fmt.Fprintf(&b, "%s:%d: %s\n", m.File, m.Line, m.Content)
+		}
 	}
 
 	truncated := ""
@@ -89,7 +104,7 @@ func compileGrepPattern(pattern string, caseInsensitive bool) (*regexp.Regexp, e
 	return regexp.Compile(flags + pattern)
 }
 
-func searchDir(root string, re *regexp.Regexp, filePatterns []string, maxResults int) ([]grepMatch, error) {
+func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPatterns []string, maxResults int) ([]grepMatch, error) {
 	var matches []grepMatch
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -117,10 +132,17 @@ func searchDir(root string, re *regexp.Regexp, filePatterns []string, maxResults
 			return nil
 		}
 
+		// Apply type-based extension filter
+		if len(extFilter) > 0 {
+			if !extFilter[filepath.Ext(path)] {
+				return nil
+			}
+		}
+
 		// Apply glob filter
-		if len(filePatterns) > 0 {
+		if len(globPatterns) > 0 {
 			matched := false
-			for _, gp := range filePatterns {
+			for _, gp := range globPatterns {
 				if gm, _ := filepath.Match(gp, d.Name()); gm {
 					matched = true
 					break
@@ -143,29 +165,89 @@ func searchDir(root string, re *regexp.Regexp, filePatterns []string, maxResults
 }
 
 func searchFile(path string, re *regexp.Regexp, limit int) ([]grepMatch, error) {
-	f, err := os.Open(path)
+	lines, err := readFileLines(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	var matches []grepMatch
-	scanner := bufio.NewScanner(f)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		if re.MatchString(scanner.Text()) {
+	for i, line := range lines {
+		if re.MatchString(line) {
 			matches = append(matches, grepMatch{
 				File:    path,
-				Line:    lineNum,
-				Content: strings.TrimSpace(scanner.Text()),
+				Line:    i + 1,
+				Content: strings.TrimSpace(line),
 			})
 			if len(matches) >= limit {
 				break
 			}
 		}
 	}
-	return matches, scanner.Err()
+	return matches, nil
+}
+
+// renderMatchesWithContext groups matches by file and renders surrounding lines.
+func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLines int) {
+	type fileRequest struct {
+		path    string
+		matches []grepMatch
+	}
+
+	// Group by file preserving order
+	var files []fileRequest
+	byFile := map[string]*fileRequest{}
+	for _, m := range matches {
+		fr, ok := byFile[m.File]
+		if !ok {
+			files = append(files, fileRequest{path: m.File})
+			fr = &files[len(files)-1]
+			byFile[m.File] = fr
+		}
+		fr.matches = append(fr.matches, m)
+	}
+
+	for i, fr := range files {
+		if i > 0 {
+			b.WriteString("--\n")
+		}
+		lines, err := readFileLines(fr.path)
+		if err != nil {
+			for _, m := range fr.matches {
+				fmt.Fprintf(b, "%s:%d: %s\n", m.File, m.Line, m.Content)
+			}
+			continue
+		}
+
+		// Collect all line numbers to show (match + context), preserving order
+		show := map[int]bool{}
+		for _, m := range fr.matches {
+			for ln := m.Line - contextLines; ln <= m.Line+contextLines; ln++ {
+				if ln >= 1 && ln <= len(lines) {
+					show[ln] = true
+				}
+			}
+		}
+
+		prev := 0
+		for ln := 1; ln <= len(lines); ln++ {
+			if !show[ln] {
+				continue
+			}
+			if prev > 0 && ln > prev+1 {
+				b.WriteString("...\n")
+			}
+			fmt.Fprintf(b, "%s:%d: %s\n", fr.path, ln, strings.TrimSpace(lines[ln-1]))
+			prev = ln
+		}
+	}
+}
+
+func readFileLines(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(string(data), "\n"), nil
 }
 
 // isBinaryExt returns true for file extensions that should be skipped.
@@ -190,14 +272,51 @@ func GrepTool() models.Tool {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"pattern":         map[string]any{"type": "string", "description": "Regex pattern to search for"},
-				"path":            map[string]any{"type": "string", "description": "Directory or file to search in (default: current directory)"},
-				"glob":            map[string]any{"type": "string", "description": "Filter files by glob pattern (e.g. *.go, *.ts)"},
+				"pattern":          map[string]any{"type": "string", "description": "Regex pattern to search for"},
+				"path":             map[string]any{"type": "string", "description": "Directory or file to search in (default: current directory)"},
+				"type":             map[string]any{"type": "string", "description": "Filter by file type: go, py, js, ts, java, rust, c, cpp, rb, php, rs, sql, sh, html, css, json, yaml, xml, md, proto"},
+				"glob":             map[string]any{"type": "string", "description": "Filter files by glob pattern (e.g. *.txt). Use 'type' instead for common languages."},
 				"case_insensitive": map[string]any{"type": "boolean", "description": "Case-insensitive search (default: false)"},
-				"max_results":     map[string]any{"type": "number", "description": "Maximum number of results (default: 100)"},
+				"context":          map[string]any{"type": "number", "description": "Number of context lines before and after each match (default: 0)"},
+				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 100)"},
 			},
 			"required": []any{"pattern"},
 		},
 		Handler: GrepHandler,
 	}
+}
+
+// typeToExts maps a ripgrep-style type name to a set of file extensions.
+func typeToExts(typ string) map[string]bool {
+	m := map[string][]string{
+		"go":    {".go"},
+		"py":    {".py", ".pyi", ".pyw"},
+		"js":    {".js", ".mjs", ".cjs"},
+		"ts":    {".ts", ".tsx", ".mts", ".cts"},
+		"java":  {".java"},
+		"rust":  {".rs"},
+		"rs":    {".rs"},
+		"c":     {".c", ".h"},
+		"cpp":   {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
+		"rb":    {".rb"},
+		"php":   {".php"},
+		"sql":   {".sql"},
+		"sh":    {".sh", ".bash"},
+		"html":  {".html", ".htm"},
+		"css":   {".css", ".scss", ".less"},
+		"json":  {".json"},
+		"yaml":  {".yaml", ".yml"},
+		"xml":   {".xml"},
+		"md":    {".md", ".mdx"},
+		"proto": {".proto"},
+	}
+	exts, ok := m[strings.ToLower(typ)]
+	if !ok {
+		return nil
+	}
+	s := make(map[string]bool, len(exts))
+	for _, e := range exts {
+		s[e] = true
+	}
+	return s
 }

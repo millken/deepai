@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -58,9 +60,16 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	if err := registry.Register(builtin.AskUserQuestionTool()); err != nil {
+		log.Fatal(err)
+	}
 	if err := registry.Register(tools.TaskTool(subPool)); err != nil {
 		log.Fatal(err)
 	}
+
+	// Inject CLI user interaction (stdin/stdout) for ask_user tool.
+	// In non-interactive mode (API server), omit this — the tool will tell the AI to decide on its own.
+	runCtx := tools.WithUserInteraction(ctx, &cliUserInteraction{In: os.Stdin, Out: os.Stdout})
 
 	bashOutput, err := registry.Call(ctx, "bash", map[string]interface{}{
 		"command": "echo hello from bash tool",
@@ -70,7 +79,7 @@ func main() {
 	}
 	fmt.Println("[tool:bash]", bashOutput)
 
-	runCtx := subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+	runCtx = subagent.WithEventSink(runCtx, func(evt subagent.TaskEvent) {
 		fmt.Printf("[subagent] %s: %s\n", evt.Type, evt.Message)
 	})
 
@@ -138,6 +147,26 @@ func main() {
 	if result.Usage != nil {
 		fmt.Printf("usage: input=%d output=%d total=%d\n", result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens)
 	}
+}
+
+// cliUserInteraction implements tools.UserInteraction via stdin/stdout.
+type cliUserInteraction struct {
+	In  io.Reader
+	Out io.Writer
+}
+
+func (c *cliUserInteraction) AskQuestion(_ context.Context, question string, options []string) (string, error) {
+	fmt.Fprintf(c.Out, "\n[agent asks]: %s\n", question)
+	for i, opt := range options {
+		fmt.Fprintf(c.Out, "  %d. %s\n", i+1, opt)
+	}
+	fmt.Fprint(c.Out, "> ")
+
+	scanner := bufio.NewScanner(c.In)
+	if !scanner.Scan() {
+		return "", scanner.Err()
+	}
+	return scanner.Text(), nil
 }
 
 type scriptedProvider struct {
