@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/logs"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
@@ -27,15 +27,15 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// Use current working directory as sandbox root so tools operate on the actual project.
-	// Falls back to a temp dir if not in a project.
 	workDir, err := os.Getwd()
 	if err != nil {
-		log.Fatal(err)
+		logs.Error.Error("getwd failed", "err", err)
+		os.Exit(1)
 	}
 	sb, err := sandbox.New("demo", workDir)
 	if err != nil {
-		log.Fatal(err)
+		logs.Error.Error("sandbox init failed", "err", err)
+		os.Exit(1)
 	}
 	defer sb.Close()
 
@@ -57,46 +57,59 @@ func main() {
 	})
 
 	registry := tools.NewRegistry()
-	if err := registry.Register(builtin.BashTool()); err != nil {
-		log.Fatal(err)
-	}
-	for _, tool := range builtin.FileTools() {
+	for _, tool := range append(
+		[]models.Tool{builtin.BashTool(), clarification.AskClarificationTool(nil), tools.TaskTool(subPool)},
+		builtin.FileTools()...,
+	) {
 		if err := registry.Register(tool); err != nil {
-			log.Fatal(err)
+			logs.Error.Error("register tool failed", "err", err)
+			os.Exit(1)
 		}
 	}
-	if err := registry.Register(clarification.AskClarificationTool(nil)); err != nil {
-		log.Fatal(err)
-	}
-	if err := registry.Register(tools.TaskTool(subPool)); err != nil {
-		log.Fatal(err)
-	}
 
-	// Load skills from standard locations (global + project + plugin)
 	skillReg := skill.NewRegistry()
 	if err := skillReg.LoadAll(workDir, nil); err != nil {
-		log.Printf("warning: skill load failed: %v", err)
+		logs.Warn.Warn("skill load failed", "err", err)
 	}
 	if skillReg.Count() > 0 {
 		if err := registry.Register(skill.SkillToolWithRegistry(skillReg)); err != nil {
-			log.Fatal(err)
+			logs.Error.Error("register skill tool failed", "err", err)
+			os.Exit(1)
 		}
-		log.Printf("loaded %d skills: %s", skillReg.Count(), strings.Join(skillReg.AvailableNames(), ", "))
+		logs.Info.Info("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
 	provName := strings.TrimSpace(os.Getenv("DEEPAI_PROVIDER"))
 	var provider llm.LLMProvider
 	if provName == "" {
 		provider = newScriptedProvider()
-		log.Println("DEEPAI_PROVIDER not set; using scripted provider")
+		logs.Warn.Warn("DEEPAI_PROVIDER not set; using scripted provider")
 	} else {
 		provider = llm.NewProvider(provName)
-		log.Printf("using provider: %s", provName)
+		logs.Info.Info("using provider", "name", provName)
 	}
 
 	modelName := strings.TrimSpace(os.Getenv("DEEPAI_MODEL"))
 	if modelName == "" {
 		modelName = "demo-model"
+	}
+
+	// Configure debug logging to file.
+	var debugPath string
+	if p := strings.TrimSpace(os.Getenv("DEEPAI_DEBUG_FILE")); p != "" {
+		debugPath = p
+	} else if os.Getenv("DEEPAI_DEBUG") != "" {
+		debugPath = os.TempDir() + "/deepai-debug.log"
+	}
+	if debugPath != "" {
+		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			logs.Error.Error("open debug log file failed", "path", debugPath, "err", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		logs.Debug.SetOutput(newAsyncWriter(f))
+		logs.Info.Info("debug logging enabled", "path", debugPath)
 	}
 
 	ui := &cliUserInteraction{In: os.Stdin, Out: os.Stderr}
@@ -105,7 +118,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[subagent] %s: %s\n", evt.Type, evt.Message)
 	})
 
-	// Load DEEPAI.md instructions: global (~/.deepai/DEEPAI.md) + project (.deepai/DEEPAI.md).
+	// Load DEEPAI.md: global + project.
 	home, _ := os.UserHomeDir()
 	var deepaiMD string
 	for _, p := range []string{
@@ -116,35 +129,13 @@ func main() {
 		if err != nil {
 			continue
 		}
-		content := strings.TrimSpace(string(data))
-		if content != "" {
+		if content := strings.TrimSpace(string(data)); content != "" {
 			if deepaiMD != "" {
 				deepaiMD += "\n\n"
 			}
 			deepaiMD += content
-			log.Printf("loaded %s (%d chars)", p, len(content))
+			logs.Info.Info("loaded DEEPAI.md", "path", p, "chars", len(content))
 		}
-	}
-
-	// Debug logging: async append to file controlled by env.
-	// - DEEPAI_DEBUG_FILE=path  → write debug logs to specified file
-	// - DEEPAI_DEBUG=1          → write debug logs to /tmp/deepai-debug.log
-	// Console always shows brief info; detailed logs go to file only.
-	var debugLog *asyncWriter
-	var debugPath string
-	if p := strings.TrimSpace(os.Getenv("DEEPAI_DEBUG_FILE")); p != "" {
-		debugPath = p
-	} else if os.Getenv("DEEPAI_DEBUG") != "" {
-		debugPath = os.TempDir() + "/deepai-debug.log"
-	}
-	if debugPath != "" {
-		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Fatalf("cannot open debug log %s: %v", debugPath, err)
-		}
-		debugLog = newAsyncWriter(f)
-		defer debugLog.Close()
-		log.Printf("debug log: %s", debugPath)
 	}
 
 	fmt.Println("deepai interactive mode — type your prompt, Ctrl+D or 'exit' to quit")
@@ -169,8 +160,9 @@ func main() {
 		}
 
 		msgSeq++
+		logs.Info.Info("--- user turn ---", "turn", msgSeq)
+		logs.Info.Info("user input", "text", input)
 
-		// Append user message to session history
 		history = append(history, models.Message{
 			ID:        fmt.Sprintf("m-%d", msgSeq),
 			SessionID: sessionID,
@@ -178,7 +170,6 @@ func main() {
 			Content:   input,
 		})
 
-		// Create a fresh agent per turn (agents are single-use).
 		agentRun := agent.New(agent.AgentConfig{
 			LLMProvider: provider,
 			Tools:       registry,
@@ -187,21 +178,11 @@ func main() {
 			Model:       modelName,
 		})
 
-		// Append skill descriptions after ApplyAgentType sets the profile prompt.
 		if desc := skillReg.Descriptions(); desc != "" {
 			agentRun.AppendSystemPrompt(desc)
 		}
-
-		// Append DEEPAI.md instructions.
 		if deepaiMD != "" {
 			agentRun.AppendSystemPrompt(deepaiMD)
-		}
-
-		// Inject LLM payload logging into agent when debug is enabled.
-		if debugLog != nil {
-			agentRun.SetOnPayload(func(provider string, payload []byte) {
-				debugLog.Printf("[litellm payload] provider=%s payload=%s", provider, string(payload))
-			})
 		}
 
 		go func() {
@@ -210,25 +191,26 @@ func main() {
 				case agent.AgentEventToolCall:
 					if evt.ToolCall != nil {
 						fmt.Fprintf(os.Stderr, "[tool call] %s(%s)\n", evt.ToolCall.Name, evt.ToolCall.ID)
-						if debugLog != nil {
-							argsJSON, _ := json.Marshal(evt.ToolCall.Arguments)
-							debugLog.Printf("[tool call] %s(%s) %s", evt.ToolCall.Name, evt.ToolCall.ID, argsJSON)
-						}
+						argsJSON, _ := json.Marshal(evt.ToolCall.Arguments)
+						logs.Debug.Printf("[tool call] %s(%s) %s", evt.ToolCall.Name, evt.ToolCall.ID, string(argsJSON))
 					}
 				case agent.AgentEventToolResult:
 					if evt.Result != nil {
 						content := evt.Result.Content
 						if len(content) > 200 {
 							fmt.Fprintf(os.Stderr, "[tool result] %s...\n", content[:200])
-							if debugLog != nil {
-								debugLog.Printf("[tool result] %s", content)
-							}
+							logs.Debug.Printf("[tool result] %s", content)
 						} else {
 							fmt.Fprintf(os.Stderr, "[tool result] %s\n", content)
 						}
 					}
+				case agent.AgentEventTextChunk:
+					if evt.Text != "" {
+						logs.Debug.Printf("[text chunk] %s", evt.Text)
+					}
 				case agent.AgentEventError:
 					fmt.Fprintf(os.Stderr, "[error] %s\n", evt.Err)
+					logs.Error.Error("agent error", "err", evt.Err)
 				}
 			}
 		}()
@@ -239,14 +221,15 @@ func main() {
 			continue
 		}
 
-		// Append agent's messages to history for session continuity
 		history = result.Messages
 
 		if result.FinalOutput != "" {
 			fmt.Fprintf(os.Stderr, "\n%s\n\n", result.FinalOutput)
+			logs.Info.Info("response", "text", result.FinalOutput)
 		}
 		if result.Usage != nil {
 			fmt.Fprintf(os.Stderr, "[usage] in=%d out=%d total=%d\n\n", result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens)
+			logs.Info.Info("usage", "in", result.Usage.InputTokens, "out", result.Usage.OutputTokens, "total", result.Usage.TotalTokens)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -275,17 +258,17 @@ func (c *cliUserInteraction) AskQuestion(_ context.Context, question string, opt
 	return scanner.Text(), nil
 }
 
-// asyncWriter performs buffered, non-blocking writes to a file.
+// asyncWriter wraps a file with buffered, channel-based async writes.
 type asyncWriter struct {
-	ch    chan string
-	done  chan struct{}
-	file  *os.File
-	close sync.Once
+	ch   chan []byte
+	done chan struct{}
+	file *os.File
+	once sync.Once
 }
 
 func newAsyncWriter(f *os.File) *asyncWriter {
 	w := &asyncWriter{
-		ch:   make(chan string, 256),
+		ch:   make(chan []byte, 256),
 		done: make(chan struct{}),
 		file: f,
 	}
@@ -293,17 +276,18 @@ func newAsyncWriter(f *os.File) *asyncWriter {
 	return w
 }
 
-func (w *asyncWriter) Printf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+func (w *asyncWriter) Write(p []byte) (int, error) {
+	cp := make([]byte, len(p))
+	copy(cp, p)
 	select {
-	case w.ch <- msg:
+	case w.ch <- cp:
 	default:
-		// drop on overflow — debug logs are best-effort
 	}
+	return len(p), nil
 }
 
 func (w *asyncWriter) Close() error {
-	w.close.Do(func() {
+	w.once.Do(func() {
 		close(w.ch)
 		<-w.done
 	})
@@ -313,24 +297,19 @@ func (w *asyncWriter) Close() error {
 func (w *asyncWriter) drain() {
 	defer close(w.done)
 	bw := bufio.NewWriter(w.file)
-	flush := func() {
-		if err := bw.Flush(); err != nil {
-			log.Printf("debug log flush: %v", err)
-		}
-	}
-	defer flush()
-
-	// Periodic flush to ensure logs are readable in real-time.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	flush := func() { bw.Flush() }
+	defer flush()
+
 	for {
 		select {
-		case msg, ok := <-w.ch:
+		case data, ok := <-w.ch:
 			if !ok {
 				return
 			}
-			fmt.Fprintln(bw, msg)
+			bw.Write(data)
 		case <-ticker.C:
 			flush()
 		}
@@ -342,9 +321,7 @@ type scriptedProvider struct {
 	step int
 }
 
-func newScriptedProvider() *scriptedProvider {
-	return &scriptedProvider{}
-}
+func newScriptedProvider() *scriptedProvider { return &scriptedProvider{} }
 
 func (p *scriptedProvider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
 	stream, err := p.Stream(ctx, req)
@@ -370,8 +347,7 @@ func (p *scriptedProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-c
 	out := make(chan llm.StreamChunk, 1)
 	go func() {
 		defer close(out)
-		switch step {
-		case 0:
+		if step == 0 {
 			out <- llm.StreamChunk{
 				Model: req.Model,
 				Message: &models.Message{
@@ -385,7 +361,7 @@ func (p *scriptedProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-c
 				},
 				Done: true,
 			}
-		default:
+		} else {
 			out <- llm.StreamChunk{
 				Model: req.Model,
 				Message: &models.Message{

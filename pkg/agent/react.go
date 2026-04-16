@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 
 const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
 const defaultRequestTimeout = 10 * time.Minute
+const maxToolResultInHistory = 8192 // truncate tool results in history to 8KB
 
 var messageSeq uint64
 var agentRequestSeq uint64
@@ -43,7 +45,6 @@ type Agent struct {
 	eventsMu        sync.RWMutex
 	eventsClosed    bool
 	started         bool
-	onPayload       func(provider string, payload []byte)
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -95,12 +96,6 @@ func (a *Agent) AppendSystemPrompt(extra string) {
 	} else {
 		a.systemPrompt = a.systemPrompt + "\n\n" + extra
 	}
-}
-
-// SetOnPayload sets a callback for LLM request payload logging.
-// Must be called before Run.
-func (a *Agent) SetOnPayload(fn func(provider string, payload []byte)) {
-	a.onPayload = fn
 }
 
 // removeSkillDescriptions strips the "Available skills" section from system prompt.
@@ -172,6 +167,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	usage := &Usage{}
 
 	for turn := 0; ; turn++ {
+		slog.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
 		// Safety valve: hard turn cap (0 = unlimited)
 		if a.maxTurns > 0 && turn >= a.maxTurns {
 			err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
@@ -198,7 +194,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
 			SystemPrompt:    a.BuildSystemPrompt(ctx, sessionID),
-			OnPayload:       a.onPayload,
 		}
 
 		stream, err := a.llm.Stream(ctx, req)
@@ -255,6 +250,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			accumulateUsage(usage, streamUsage)
 		}
 
+		slog.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
 		assistantMetadata := map[string]string{"stop_reason": stopReason}
 		if streamUsage != nil {
 			if raw, err := json.Marshal(streamUsage); err == nil {
@@ -330,7 +326,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				if m, ok := result.Data["system_prompt"]; ok {
 					if sp, _ := m.(string); sp != "" {
 						a.removeSkillDescriptions()
-							a.AppendSystemPrompt(sp)
+						a.AppendSystemPrompt(sp)
 					}
 				}
 			}
@@ -374,9 +370,6 @@ func (a *Agent) BuildSystemPrompt(_ context.Context, _ string) string {
 	sections := []string{
 		strings.TrimSpace(a.systemPrompt),
 		"Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.",
-	}
-	if toolDescriptions := a.tools.Descriptions(); strings.TrimSpace(toolDescriptions) != "" {
-		sections = append(sections, "Available Tools:\n"+toolDescriptions)
 	}
 	return strings.Join(sections, "\n\n")
 }
@@ -484,7 +477,14 @@ func toolMessageContent(result models.ToolResult) string {
 	if result.Error != "" {
 		return result.Error
 	}
-	return result.Content
+	return truncateForHistory(result.Content)
+}
+
+func truncateForHistory(s string) string {
+	if len(s) <= maxToolResultInHistory {
+		return s
+	}
+	return s[:maxToolResultInHistory] + fmt.Sprintf("\n... [truncated: showing %d of %d bytes]", maxToolResultInHistory, len(s))
 }
 
 func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {

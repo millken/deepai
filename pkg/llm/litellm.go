@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/millken/deepai/pkg/logs"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/voocel/litellm"
 )
@@ -232,9 +233,9 @@ func mapChatReqToLitellmRequest(req ChatRequest, msgs []litellm.Message) *litell
 		r.Tools = tools
 	}
 
-	// Propagate OnPayload callback from ChatRequest.
-	if req.OnPayload != nil {
-		r.OnPayload = req.OnPayload
+	// Log request payload via slog.
+	r.OnPayload = func(providerName string, payload []byte) {
+		logs.Debug.Printf("provider=%s payload=%q", providerName, string(payload))
 	}
 
 	return r
