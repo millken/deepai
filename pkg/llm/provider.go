@@ -24,6 +24,7 @@ type ChatRequest struct {
 	MaxTokens       *int              `json:"max_tokens,omitempty"`
 	SystemPrompt    string            `json:"system_prompt,omitempty"`
 	OnChunk         func(StreamChunk) `json:"-"`
+	OnPayload       func(provider string, payload []byte) `json:"-"`
 }
 
 // ChatResponse is the normalized provider response.

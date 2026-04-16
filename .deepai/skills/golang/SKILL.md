@@ -16,9 +16,13 @@ Enable this skill when:
 
 ## Reference Materials
 
-Load as needed using `read_file`:
-- **Error prevention**: read_file `${SKILL_DIR}/references/common-mistakes.md`
-- **Code quality**: read_file `${SKILL_DIR}/references/effective-go.md`
+### Common Mistakes
+
+!`cat "$SKILL_DIR/references/common-mistakes.md"`
+
+### Effective Go Essentials
+
+!`cat "$SKILL_DIR/references/effective-go.md"`
 
 ## Key Rules
 

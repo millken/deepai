@@ -43,6 +43,7 @@ type Agent struct {
 	eventsMu        sync.RWMutex
 	eventsClosed    bool
 	started         bool
+	onPayload       func(provider string, payload []byte)
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -93,6 +94,22 @@ func (a *Agent) AppendSystemPrompt(extra string) {
 		a.systemPrompt = extra
 	} else {
 		a.systemPrompt = a.systemPrompt + "\n\n" + extra
+	}
+}
+
+// SetOnPayload sets a callback for LLM request payload logging.
+// Must be called before Run.
+func (a *Agent) SetOnPayload(fn func(provider string, payload []byte)) {
+	a.onPayload = fn
+}
+
+// removeSkillDescriptions strips the "Available skills" section from system prompt.
+// Called after a skill is loaded since the descriptions are no longer needed.
+func (a *Agent) removeSkillDescriptions() {
+	const marker = "Available skills (use the matching skill when the user request fits):"
+	idx := strings.Index(a.systemPrompt, marker)
+	if idx > 0 {
+		a.systemPrompt = strings.TrimSpace(a.systemPrompt[:idx])
 	}
 }
 
@@ -181,6 +198,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
 			SystemPrompt:    a.BuildSystemPrompt(ctx, sessionID),
+			OnPayload:       a.onPayload,
 		}
 
 		stream, err := a.llm.Stream(ctx, req)
@@ -304,6 +322,17 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			result.Duration = time.Since(toolStarted)
 			if result.CompletedAt.IsZero() {
 				result.CompletedAt = time.Now().UTC()
+			}
+
+			// If a skill was loaded, inject its body into the system prompt
+			// so it doesn't need to be repeated in every turn's history.
+			if result.ToolName == "skill" {
+				if m, ok := result.Data["system_prompt"]; ok {
+					if sp, _ := m.(string); sp != "" {
+						a.removeSkillDescriptions()
+							a.AppendSystemPrompt(sp)
+					}
+				}
 			}
 
 			runMessages = append(runMessages, models.Message{

@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
@@ -234,12 +232,9 @@ func mapChatReqToLitellmRequest(req ChatRequest, msgs []litellm.Message) *litell
 		r.Tools = tools
 	}
 
-	// allow enabling debug payload logging via DEEPAI_DEBUG
-	if strings.TrimSpace(os.Getenv("DEEPAI_DEBUG")) != "" {
-		// enable request payload hook inside pkg/llm
-		r.OnPayload = func(providerName string, payload []byte) {
-			log.Printf("[litellm payload] provider=%s payload=%s\n", providerName, string(payload))
-		}
+	// Propagate OnPayload callback from ChatRequest.
+	if req.OnPayload != nil {
+		r.OnPayload = req.OnPayload
 	}
 
 	return r

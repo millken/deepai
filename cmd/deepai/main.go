@@ -109,16 +109,13 @@ func main() {
 	// - DEEPAI_DEBUG=1          → write debug logs to /tmp/deepai-debug.log
 	// Console always shows brief info; detailed logs go to file only.
 	var debugLog *asyncWriter
-	if debugPath := strings.TrimSpace(os.Getenv("DEEPAI_DEBUG_FILE")); debugPath != "" {
-		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Fatalf("cannot open debug log %s: %v", debugPath, err)
-		}
-		debugLog = newAsyncWriter(f)
-		defer debugLog.Close()
-		log.Printf("debug log: %s", debugPath)
+	var debugPath string
+	if p := strings.TrimSpace(os.Getenv("DEEPAI_DEBUG_FILE")); p != "" {
+		debugPath = p
 	} else if os.Getenv("DEEPAI_DEBUG") != "" {
-		debugPath := os.TempDir() + "/deepai-debug.log"
+		debugPath = os.TempDir() + "/deepai-debug.log"
+	}
+	if debugPath != "" {
 		f, err := os.OpenFile(debugPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.Fatalf("cannot open debug log %s: %v", debugPath, err)
@@ -171,6 +168,13 @@ func main() {
 		// Append skill descriptions after ApplyAgentType sets the profile prompt.
 		if desc := skillReg.Descriptions(); desc != "" {
 			agentRun.AppendSystemPrompt(desc)
+		}
+
+		// Inject LLM payload logging into agent when debug is enabled.
+		if debugLog != nil {
+			agentRun.SetOnPayload(func(provider string, payload []byte) {
+				debugLog.Printf("[litellm payload] provider=%s payload=%s", provider, string(payload))
+			})
 		}
 
 		go func() {

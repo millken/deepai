@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -12,18 +13,18 @@ import (
 func SkillTool(executor *Executor) models.Tool {
 	return models.Tool{
 		Name:        "skill",
-		Description: "调用专业技能。当用户请求匹配某个技能时使用。",
+		Description: "Invoke a specialized skill. Use when the user request matches a skill's domain.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"name": map[string]any{
 					"type":        "string",
-					"description": "技能名称",
+					"description": "Skill name",
 					"enum":        executor.registry.AvailableNames(),
 				},
 				"arguments": map[string]any{
 					"type":        "string",
-					"description": "传递给技能的参数",
+					"description": "Arguments to pass to the skill",
 				},
 			},
 			"required": []string{"name"},
@@ -68,7 +69,11 @@ func makeSkillHandler(executor *Executor) models.ToolHandler {
 			CallID:   call.ID,
 			ToolName: call.Name,
 			Status:   models.CallStatusCompleted,
-			Content:  cfg.SystemPrompt,
+			Content:  fmt.Sprintf("Skill %q loaded.", name),
+			Data: map[string]any{
+				"skill_name":    name,
+				"system_prompt": cfg.SystemPrompt,
+			},
 			Duration: time.Since(start),
 		}, nil
 	}
