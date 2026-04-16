@@ -2,8 +2,6 @@ package skill
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -66,36 +64,11 @@ func makeSkillHandler(executor *Executor) models.ToolHandler {
 			}, nil
 		}
 
-		// Return the rendered system prompt content as the result.
-		// The caller (agent framework) should use this to configure and run the agent.
-		var parts []string
-		parts = append(parts, fmt.Sprintf("技能 %s 已加载", name))
-		if cfg.RunInSubagent {
-			parts = append(parts, fmt.Sprintf("运行模式: subagent (%s)", cfg.AgentType))
-		}
-		if len(cfg.AllowedTools) > 0 {
-			parts = append(parts, fmt.Sprintf("免审批工具: %s", strings.Join(cfg.AllowedTools, ", ")))
-		}
-		if cfg.Model != "" {
-			parts = append(parts, fmt.Sprintf("模型: %s", cfg.Model))
-		}
-
 		return models.ToolResult{
 			CallID:   call.ID,
 			ToolName: call.Name,
 			Status:   models.CallStatusCompleted,
-			Content:  strings.Join(parts, "\n"),
-			Data: map[string]any{
-				"skill_name":      name,
-				"system_prompt":   cfg.SystemPrompt,
-				"allowed_tools":   cfg.AllowedTools,
-				"model":           cfg.Model,
-				"max_turns":       cfg.MaxTurns,
-				"temperature":     cfg.Temperature,
-				"effort":          cfg.Effort,
-				"run_in_subagent": cfg.RunInSubagent,
-				"agent_type":      cfg.AgentType,
-			},
+			Content:  cfg.SystemPrompt,
 			Duration: time.Since(start),
 		}, nil
 	}

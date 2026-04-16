@@ -59,7 +59,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Coder",
 		Description:  "Profile for code generation, debugging, and implementation tasks.",
 		SystemPrompt: coderSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task"},
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task", "skill"},
 		MaxTurns:     0,
 		Temperature:  0.1,
 	},

@@ -17,6 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/tools/builtin"
@@ -68,6 +69,18 @@ func main() {
 	}
 	if err := registry.Register(tools.TaskTool(subPool)); err != nil {
 		log.Fatal(err)
+	}
+
+	// Load skills from standard locations (global + project + plugin)
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadAll(workDir, nil); err != nil {
+		log.Printf("warning: skill load failed: %v", err)
+	}
+	if skillReg.Count() > 0 {
+		if err := registry.Register(skill.SkillToolWithRegistry(skillReg)); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("loaded %d skills: %s", skillReg.Count(), strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
 	provName := strings.TrimSpace(os.Getenv("DEEPAI_PROVIDER"))
@@ -131,6 +144,11 @@ func main() {
 			AgentType:   agent.AgentTypeCoder,
 			Model:       modelName,
 		})
+
+		// Append skill descriptions after ApplyAgentType sets the profile prompt.
+		if desc := skillReg.Descriptions(); desc != "" {
+			agentRun.AppendSystemPrompt(desc)
+		}
 
 		go func() {
 			for evt := range agentRun.Events() {

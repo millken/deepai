@@ -161,6 +161,15 @@ func mapMessageToLitellm(m models.Message) litellm.Message {
 
 	lm := litellm.Message{Role: role, Content: m.Content}
 
+	// Ensure content is never empty — providers reject empty content for tool/assistant messages.
+	if strings.TrimSpace(lm.Content) == "" {
+		if role == "tool" {
+			lm.Content = "(tool returned empty output)"
+		} else if role == "assistant" && len(m.ToolCalls) == 0 {
+			lm.Content = "(no response text)"
+		}
+	}
+
 	if len(m.ToolCalls) > 0 {
 		lm.ToolCalls = make([]litellm.ToolCall, len(m.ToolCalls))
 		for i, tc := range m.ToolCalls {

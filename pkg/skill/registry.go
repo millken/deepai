@@ -283,7 +283,7 @@ func (r *Registry) DescriptionsFiltered(filePath string) string {
 	defer r.mu.RUnlock()
 
 	var buf strings.Builder
-	buf.WriteString("可用技能（当用户请求匹配某个技能时，主动使用该技能）：\n")
+	buf.WriteString("Available skills (use the matching skill when the user request fits):\n")
 
 	var skills []*Skill
 	for _, s := range r.skills {

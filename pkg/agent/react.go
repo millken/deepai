@@ -82,6 +82,20 @@ func New(cfg AgentConfig) *Agent {
 	}
 }
 
+// AppendSystemPrompt appends extra text to the agent's system prompt.
+// Must be called before Run.
+func (a *Agent) AppendSystemPrompt(extra string) {
+	extra = strings.TrimSpace(extra)
+	if extra == "" {
+		return
+	}
+	if a.systemPrompt == "" {
+		a.systemPrompt = extra
+	} else {
+		a.systemPrompt = a.systemPrompt + "\n\n" + extra
+	}
+}
+
 func cloneRegistryWithPresentFileTool(base *tools.Registry, presentFiles *tools.PresentFileRegistry) *tools.Registry {
 	cloned := tools.NewRegistry()
 	if base != nil {
@@ -331,6 +345,14 @@ func (a *Agent) BuildSystemPrompt(_ context.Context, _ string) string {
 	sections := []string{
 		strings.TrimSpace(a.systemPrompt),
 		"You are running in a ReAct-style loop. Think step by step, call tools when necessary, and stop when you have a complete answer.",
+		// "Tool selection rules — prefer dedicated tools over bash for file operations:\n" +
+		// 	"- list_dir: exploring directory structure (not bash ls)\n" +
+		// 	"- read_file: reading file contents (not bash cat/head/tail)\n" +
+		// 	"- write_file: creating or overwriting files (not bash cat >)\n" +
+		// 	"- edit_file: making targeted edits to existing files (not bash sed/awk)\n" +
+		// 	"- find: finding files by name recursively (not bash find)\n" +
+		// 	"- grep: searching file contents by pattern (not bash grep)\n" +
+		// 	"- bash: only for running commands, building, testing, git, and operations not covered by dedicated tools",
 	}
 	if toolDescriptions := a.tools.Descriptions(); strings.TrimSpace(toolDescriptions) != "" {
 		sections = append(sections, "Available Tools:\n"+toolDescriptions)
