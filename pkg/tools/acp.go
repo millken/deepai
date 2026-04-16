@@ -140,9 +140,9 @@ func invokeACPAgentCommand(ctx context.Context, cfg ACPAgentConfig, prompt, thre
 }
 
 func ACPWorkspaceDir(threadID string) (string, error) {
-	root := strings.TrimSpace(os.Getenv("DEERFLOW_DATA_ROOT"))
+	root := strings.TrimSpace(os.Getenv("DEEPAI_DATA_ROOT"))
 	if root == "" {
-		root = filepath.Join(os.TempDir(), "deerflow-go-data")
+		root = filepath.Join(os.TempDir(), "deepai-go-data")
 	}
 	root, err := filepath.Abs(root)
 	if err != nil {
@@ -205,9 +205,9 @@ func threadDataRootFromThreadID(threadID string) string {
 	if threadID == "" {
 		return ""
 	}
-	root := strings.TrimSpace(os.Getenv("DEERFLOW_DATA_ROOT"))
+	root := strings.TrimSpace(os.Getenv("DEEPAI_DATA_ROOT"))
 	if root == "" {
-		root = filepath.Join(os.TempDir(), "deerflow-go-data")
+		root = filepath.Join(os.TempDir(), "deepai-go-data")
 	}
 	return filepath.Join(root, "threads", threadID, "user-data")
 }
@@ -257,9 +257,9 @@ func buildACPEnv(cfg ACPAgentConfig, prompt string) []string {
 	for _, key := range keys {
 		env = append(env, key+"="+os.ExpandEnv(cfg.Env[key]))
 	}
-	env = append(env, "DEERFLOW_ACP_PROMPT="+prompt)
+	env = append(env, "DEEPAI_ACP_PROMPT="+prompt)
 	if strings.TrimSpace(cfg.Model) != "" {
-		env = append(env, "DEERFLOW_ACP_MODEL="+strings.TrimSpace(cfg.Model))
+		env = append(env, "DEEPAI_ACP_MODEL="+strings.TrimSpace(cfg.Model))
 	}
 	return env
 }

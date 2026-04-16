@@ -162,9 +162,9 @@ func resolveVirtualPath(ctx context.Context, path string) string {
 	if threadID == "" {
 		return path
 	}
-	root := strings.TrimSpace(os.Getenv("DEERFLOW_DATA_ROOT"))
+	root := strings.TrimSpace(os.Getenv("DEEPAI_DATA_ROOT"))
 	if root == "" {
-		root = filepath.Join(os.TempDir(), "deerflow-go-data")
+		root = filepath.Join(os.TempDir(), "deepai-go-data")
 	}
 	suffix := strings.TrimPrefix(path, "/mnt/user-data/")
 	return filepath.Join(root, "threads", threadID, "user-data", filepath.FromSlash(suffix))

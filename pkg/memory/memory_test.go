@@ -23,7 +23,7 @@ func TestMerge(t *testing.T) {
 	current := Document{
 		SessionID: "session-1",
 		User: UserMemory{
-			WorkContext: "Working on deerflow-go",
+			WorkContext: "Working on deepai-go",
 		},
 		Facts: []Fact{
 			{ID: "pref-editor", Content: "Prefers vim", Category: "preference", Confidence: 0.7, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)},
@@ -36,12 +36,12 @@ func TestMerge(t *testing.T) {
 		},
 		Facts: []Fact{
 			{ID: "pref-editor", Content: "Prefers neovim", Category: "preference", Confidence: 0.9},
-			{ID: "project-main", Content: "Building deerflow-go memory service", Category: "project", Confidence: 0.8},
+			{ID: "project-main", Content: "Building deepai-go memory service", Category: "project", Confidence: 0.8},
 		},
 	}
 
 	got := Merge(current, update, "session-1", now)
-	if got.User.WorkContext != "Working on deerflow-go" {
+	if got.User.WorkContext != "Working on deepai-go" {
 		t.Fatalf("work context = %q", got.User.WorkContext)
 	}
 	if got.User.TopOfMind != "Ship the memory service" {
@@ -62,14 +62,14 @@ func TestServiceUpdateAndInject(t *testing.T) {
 	extractor := &stubExtractor{
 		update: Update{
 			User: UserMemory{
-				WorkContext: "Maintains deerflow-go",
+				WorkContext: "Maintains deepai-go",
 				TopOfMind:   "Memory reliability",
 			},
 			History: HistoryMemory{
 				RecentMonths: "Rebuilding the agent runtime in Go",
 			},
 			Facts: []Fact{
-				{ID: "project", Content: "Owns deerflow-go", Category: "project", Confidence: 0.95},
+				{ID: "project", Content: "Owns deepai-go", Category: "project", Confidence: 0.95},
 			},
 			Source: "session-42",
 		},
@@ -80,7 +80,7 @@ func TestServiceUpdateAndInject(t *testing.T) {
 		ID:        "m1",
 		SessionID: "session-42",
 		Role:      models.RoleHuman,
-		Content:   "I'm rebuilding deerflow-go and memory reliability matters most.",
+		Content:   "I'm rebuilding deepai-go and memory reliability matters most.",
 		CreatedAt: time.Now().UTC(),
 	}}
 
@@ -92,12 +92,12 @@ func TestServiceUpdateAndInject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if doc.User.WorkContext != "Maintains deerflow-go" {
+	if doc.User.WorkContext != "Maintains deepai-go" {
 		t.Fatalf("work context = %q", doc.User.WorkContext)
 	}
 
 	injected := service.Inject(context.Background(), "session-42")
-	if !strings.Contains(injected, "## User Memory") || !strings.Contains(injected, "Owns deerflow-go") {
+	if !strings.Contains(injected, "## User Memory") || !strings.Contains(injected, "Owns deepai-go") {
 		t.Fatalf("Inject() = %q", injected)
 	}
 }

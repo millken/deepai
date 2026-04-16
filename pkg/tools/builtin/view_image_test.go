@@ -13,7 +13,7 @@ import (
 
 func TestViewImageHandlerResolvesThreadVirtualPath(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-view-image"
 	target := filepath.Join(root, "threads", threadID, "user-data", "uploads", "pixel.png")
@@ -54,7 +54,7 @@ func TestViewImageHandlerResolvesThreadVirtualPath(t *testing.T) {
 
 func TestViewImageHandlerRejectsUnsupportedExtension(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-view-image-bad"
 	target := filepath.Join(root, "threads", threadID, "user-data", "uploads", "notes.txt")

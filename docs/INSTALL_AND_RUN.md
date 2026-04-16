@@ -1,7 +1,7 @@
 **安装与运行指南**
 
 **目标**
-本指南说明如何在本地或容器中构建、配置并启动 deerflow-go 项目的主要服务（LangGraph/Gateway/Agent），以及常见故障排查步骤。
+本指南说明如何在本地或容器中构建、配置并启动 deepai-go 项目的主要服务（LangGraph/Gateway/Agent），以及常见故障排查步骤。
 
 **前提条件**
 - 操作系统：Linux（推荐内核支持 Landlock，如果需要 sandbox 安全隔离）
@@ -10,7 +10,7 @@
 - 可选：bubblewrap (`bwrap`)（用于 sandbox），Docker（可选容器部署）
 
 **环境变量（常用）**
-- `DATABASE_URL`：Postgres 连接字符串，例如 `postgres://user:pass@localhost:5432/deerflow?sslmode=disable`
+- `DATABASE_URL`：Postgres 连接字符串，例如 `postgres://user:pass@localhost:5432/deepai?sslmode=disable`
 - `EINO_API_KEY` / `OPENAI_API_KEY`：LLM 提供者需要的 API Key
 - `PORT` 或二进制的 `--addr` 参数：监听地址（例 `:8080`）
 - 其他：`MCP_*` 前缀的配置（当使用 MCP 外部工具时）
@@ -71,7 +71,7 @@ DEFAULT_LLM_MODEL=qwen/Qwen3.5-9B
 1. 获取代码：
 ```
 git clone <repo-url>
-cd deerflow-go
+cd deepai-go
 ```
 2. 下载依赖并整理模块：
 ```
@@ -94,7 +94,7 @@ go build -o bin/agent ./cmd/agent
 **数据库迁移与初始化**
 1. 启动本地 Postgres（或使用已有数据库），并导出 `DATABASE_URL`：
 ```
-export DATABASE_URL=postgres://user:pass@localhost:5432/deerflow?sslmode=disable
+export DATABASE_URL=postgres://user:pass@localhost:5432/deepai?sslmode=disable
 ```
 2. 运行迁移（使用 `cmd/checkpoint`）：
 ```
@@ -130,11 +130,11 @@ go run ./cmd/agent run --help
 **使用 Docker**
 1. 构建镜像：
 ```
-docker build -t deerflow-go .
+docker build -t deepai-go .
 ```
 2. 运行（使用 `.env` 传参）：
 ```
-docker run -p 8080:8080 --env-file .env deerflow-go
+docker run -p 8080:8080 --env-file .env deepai-go
 ```
 3. 使用 `docker-compose`（若仓库提供 `docker-compose.yml`）：
 ```

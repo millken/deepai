@@ -61,7 +61,24 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	matches, err := searchDir(path, re, extFilter, globPatterns, maxResults)
+	// Support searching a single file directly
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("stat failed: %w", statErr)
+	}
+	var matches []grepMatch
+	if !info.IsDir() {
+		fileMatches, ferr := searchFile(path, re, maxResults)
+		if ferr != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("search failed: %w", ferr)
+		}
+		matches = fileMatches
+	} else {
+		matches, err = searchDir(path, re, extFilter, globPatterns, maxResults)
+		if err != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
+		}
+	}
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 	}
@@ -115,8 +132,8 @@ func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPa
 			return filepath.SkipDir
 		}
 
-		// Skip hidden dirs and common non-code dirs
-		if d.IsDir() {
+		// Skip hidden dirs and common non-code dirs (but not the root itself)
+		if d.IsDir() && path != root {
 			name := d.Name()
 			if name == ".git" || name == "node_modules" || name == "vendor" || name == "__pycache__" || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir

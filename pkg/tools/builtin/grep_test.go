@@ -223,6 +223,26 @@ func TestGrepHandler_MaxResults(t *testing.T) {
 	}
 }
 
+func TestGrepHandler_SearchDotDir(t *testing.T) {
+	// Ensure grep works when path is "." (the bug was that WalkDir's root entry "."
+	// matched HasPrefix(name, ".") and skipped the entire tree).
+	result, err := GrepHandler(context.Background(), models.ToolCall{
+		ID:     "grep-dot",
+		Name:   "grep",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"pattern": "func main",
+			"path":    ".",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Content == "No matches found." {
+		t.Fatal("expected matches when searching '.' but got none")
+	}
+}
+
 func TestGrepHandler_MissingPattern(t *testing.T) {
 	_, err := GrepHandler(context.Background(), models.ToolCall{
 		ID:     "grep-8",

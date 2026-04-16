@@ -36,10 +36,10 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 			return filepath.SkipDir
 		}
 
-		// Skip hidden dirs and common non-code dirs
-		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == "__pycache__" || strings.HasPrefix(name, ".") {
+		// Skip hidden dirs and common non-code dirs (but not the root itself)
+		if d.IsDir() && fp != path {
+			dirName := d.Name()
+			if dirName == ".git" || dirName == "node_modules" || dirName == "vendor" || dirName == "__pycache__" || strings.HasPrefix(dirName, ".") {
 				return filepath.SkipDir
 			}
 		}

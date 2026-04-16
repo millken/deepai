@@ -27,7 +27,7 @@ const (
 	defaultModelRef        = "openai/gpt-4o"
 	defaultShutdownTimeout = 15 * time.Second
 	defaultMaxTurns        = 8
-	defaultSandboxRoot     = "/tmp/deerflow-gateway-sandbox"
+	defaultSandboxRoot     = "/tmp/deepai-gateway-sandbox"
 )
 
 type Config struct {

@@ -24,13 +24,14 @@ import (
 
 func main() {
 	ctx := context.Background()
-	baseDir, err := os.MkdirTemp("", "deepai-demo-*")
+
+	// Use current working directory as sandbox root so tools operate on the actual project.
+	// Falls back to a temp dir if not in a project.
+	workDir, err := os.Getwd()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(baseDir)
-
-	sb, err := sandbox.New("demo", baseDir)
+	sb, err := sandbox.New("demo", workDir)
 	if err != nil {
 		log.Fatal(err)
 	}

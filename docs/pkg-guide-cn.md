@@ -1,4 +1,4 @@
-# deerflow-go 包指南
+# deepai-go 包指南
 
 方法说明：我通过公共 GitHub API 检查了相关仓库的元数据与近期活动，并查看了 `pkg.go.dev` 的搜索/结果页面来判断包的可见性。原始请求包含 `gh search`，但在此环境中 `gh` 未经认证，无法直接查询 GitHub，因此未使用 `gh`。
 
@@ -9,7 +9,7 @@
 - 推荐理由：
   - 这是我当前找到的最合适的 Go 方案，作为单一多提供商客户端层，已包含对 OpenAI 与 Claude 的集成，并支持流式与工具调用功能。
   - OpenAI 适配器支持自定义 `BaseURL`，这使得像 SiliconFlow 这样的兼容 OpenAI 的提供商无需分叉客户端即可使用。
-  - 比起轻量单厂商 SDK，它更适合 deerflow-go，因为你的项目需要同时支持多个提供商。
+  - 比起轻量单厂商 SDK，它更适合 deepai-go，因为你的项目需要同时支持多个提供商。
   - Eino 生态活跃且面向生产环境，而我看到的其他统一 Go LLM SDK 要么规模更小，要么过于新。
 - 证据：
   - `cloudwego/eino-ext` 的 README 列出了对 OpenAI 与 Claude 的 ChatModel 支持。
@@ -60,7 +60,7 @@
   - 最近提交：2026-03-28
 - 注意事项：
   - 该方案比简单的 exec 辅助更重，且以 Linux/容器为中心。
-  - 如果 deerflow-go 仅需超时与基本 RLIMIT，标准库 `os/exec` 配合 `golang.org/x/sys/unix` 会更简单。
+  - 如果 deepai-go 仅需超时与基本 RLIMIT，标准库 `os/exec` 配合 `golang.org/x/sys/unix` 会更简单。
   - 我未发现单一轻量库能同时优雅地提供超时、内存限制、syscall 过滤与文件系统隔离。
 
 ## 4. MCP 客户端
@@ -108,7 +108,7 @@
 - 推荐理由：
   - 对于服务器端的 SSE，通常不需要额外依赖：使用 `net/http`，正确设置头并 flush 即可。
   - 这是 Go 生态中最经过考验的 HTTP 实现。
-  - 对于 deerflow-go，可使流式路径保持简单、可观测且依赖少。
+  - 对于 deepai-go，可使流式路径保持简单、可观测且依赖少。
 - 证据：
   - `pkg.go.dev/net/http` 显示其为标准库（发布于 2026-03-06），被 1,769,979 个包导入。
   - 关于 SSE 的包搜索也出现了若干基于 `net/http` 的辅助库，但没有一个比直接使用标准库更合适用于服务器端流。
@@ -137,7 +137,7 @@
   - 最近提交：2025-12-10
 - 注意事项：
   - Cobra 较比极简的 flag 驱动 CLI 更重。
-  - 如果 deerflow-go 最终只有非常小的命令面，标准库 `flag` 或 `urfave/cli` 会更加轻量。
+  - 如果 deepai-go 最终只有非常小的命令面，标准库 `flag` 或 `urfave/cli` 会更加轻量。
 
 ## 8. 配置 / 环境变量
 **推荐：caarlos0/env/v11**
@@ -160,7 +160,7 @@
 
 ## 总结
 
-如果今天要为 deerflow-go 选型，我会选择以下栈：
+如果今天要为 deepai-go 选型，我会选择以下栈：
 
 - LLM 客户端：`cloudwego/eino-ext`
 - Agent 框架：`cloudwego/eino`

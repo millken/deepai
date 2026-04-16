@@ -13,7 +13,7 @@ import (
 
 func TestReadFileHandlerResolvesThreadVirtualPath(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-file-tool"
 	target := filepath.Join(root, "threads", threadID, "user-data", "uploads", "notes.txt")
@@ -42,7 +42,7 @@ func TestReadFileHandlerResolvesThreadVirtualPath(t *testing.T) {
 
 func TestWriteFileHandlerWritesToResolvedVirtualPath(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-write-tool"
 	ctx := tools.WithThreadID(context.Background(), threadID)
@@ -69,7 +69,7 @@ func TestWriteFileHandlerWritesToResolvedVirtualPath(t *testing.T) {
 
 func TestWriteFileHandlerAppendsContent(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-append-tool"
 	ctx := tools.WithThreadID(context.Background(), threadID)
@@ -108,7 +108,7 @@ func TestWriteFileHandlerAppendsContent(t *testing.T) {
 
 func TestGlobHandlerResolvesVirtualPattern(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	threadID := "thread-glob-tool"
 	dir := filepath.Join(root, "threads", threadID, "user-data", "uploads")

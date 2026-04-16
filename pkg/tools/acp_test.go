@@ -12,7 +12,7 @@ import (
 
 func TestInvokeACPAgentToolUsesPerThreadWorkspace(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	tool := InvokeACPAgentTool(map[string]ACPAgentConfig{
 		"demo": {
@@ -20,7 +20,7 @@ func TestInvokeACPAgentToolUsesPerThreadWorkspace(t *testing.T) {
 			Command:     "sh",
 			Args: []string{
 				"-c",
-				"printf '%s' \"$DEERFLOW_ACP_PROMPT\" > result.txt; printf 'done from %s' \"$PWD\"",
+				"printf '%s' \"$DEEPAI_ACP_PROMPT\" > result.txt; printf 'done from %s' \"$PWD\"",
 			},
 		},
 	})
@@ -57,7 +57,7 @@ func TestInvokeACPAgentToolUsesPerThreadWorkspace(t *testing.T) {
 
 func TestResolveVirtualPathMapsACPWorkspace(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("DEERFLOW_DATA_ROOT", root)
+	t.Setenv("DEEPAI_DATA_ROOT", root)
 
 	ctx := WithThreadID(context.Background(), "thread-acp-2")
 	got := ResolveVirtualPath(ctx, "/mnt/acp-workspace/out/report.txt")

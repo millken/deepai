@@ -30,14 +30,20 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("list dir failed: %w", err)
 	}
 
+	showAll, _ := args["all"].(bool)
+
 	entries := make([]dirEntry, 0, len(dirs))
 	for _, d := range dirs {
+		name := d.Name()
+		if !showAll && strings.HasPrefix(name, ".") {
+			continue
+		}
 		info, err := d.Info()
 		if err != nil {
 			continue
 		}
 		entries = append(entries, dirEntry{
-			Name:    d.Name(),
+			Name:    name,
 			IsDir:   d.IsDir(),
 			Size:    info.Size(),
 			ModTime: info.ModTime().Format("2006-01-02 15:04"),
@@ -77,6 +83,7 @@ func ListDirTool() models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{"type": "string", "description": "Directory path to list (default: current directory)"},
+				"all":  map[string]any{"type": "boolean", "description": "Show hidden entries like .claude, .git (default: false)"},
 			},
 			"required": []any{},
 		},
