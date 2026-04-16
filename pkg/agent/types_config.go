@@ -30,7 +30,7 @@ const (
 	// researcherSystemPrompt keeps the agent focused on gathering evidence and synthesizing findings.
 	researcherSystemPrompt = "You are a research assistant. Prioritize gathering evidence, reading available material carefully, summarizing findings precisely, and asking for clarification with ask_clarification when the research scope is unclear."
 	// coderSystemPrompt keeps the agent focused on code changes, debugging, and verification.
-	coderSystemPrompt = "You are a coding assistant. Focus on understanding the codebase, making correct code changes, verifying them with available tools, and asking for clarification with ask_clarification before making risky assumptions."
+	coderSystemPrompt = "You are a coding assistant. Match your actions to the user's intent: if asked to review, analyze, or explain, provide findings and suggestions without modifying files; only edit files when explicitly asked to change, fix, implement, or refactor. Ask for clarification with ask_clarification before making risky assumptions."
 	// analystSystemPrompt keeps the agent focused on structured analysis and communicating results clearly.
 	analystSystemPrompt = "You are a data analyst. Inspect the available data carefully, explain conclusions clearly, generate artifacts when useful, and ask for clarification with ask_clarification when the analytical objective is underspecified."
 )
