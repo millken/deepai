@@ -17,10 +17,11 @@ import (
 var subagentMessageSeq uint64
 
 type SubagentExecutor struct {
-	llm     llm.LLMProvider
-	tools   *tools.Registry
-	sandbox *sandbox.Sandbox
-	model   string
+	llm           llm.LLMProvider
+	tools         *tools.Registry
+	sandbox       *sandbox.Sandbox
+	model         string
+	contextWindow int
 }
 
 func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, model ...string) *SubagentExecutor {
@@ -37,6 +38,14 @@ func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb 
 		sandbox: sb,
 		model:   selectedModel,
 	}
+}
+
+// WithContextWindow sets the context window for subagents.
+func (e *SubagentExecutor) WithContextWindow(n int) *SubagentExecutor {
+	if e != nil {
+		e.contextWindow = n
+	}
+	return e
 }
 
 func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
@@ -56,6 +65,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		Model:          e.model,
 		Sandbox:        e.sandbox,
 		RequestTimeout: task.Config.Timeout,
+		ContextWindow:  e.contextWindow,
 	})
 
 	eventsDone := make(chan struct{})
@@ -101,8 +111,10 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}, nil
 }
 
-func NewSubagentPool(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, maxConcurrent int, timeout time.Duration, model ...string) *subagent.Pool {
-	return subagent.NewPool(NewSubagentExecutor(provider, registry, sb, model...), subagent.PoolConfig{
+// NewSubagentPool creates a pool with a SubagentExecutor.
+// Chain WithContextWindow on the result of NewSubagentExecutor if needed.
+func NewSubagentPool(executor *SubagentExecutor, maxConcurrent int, timeout time.Duration) *subagent.Pool {
+	return subagent.NewPool(executor, subagent.PoolConfig{
 		MaxConcurrent: maxConcurrent,
 		Timeout:       timeout,
 	})

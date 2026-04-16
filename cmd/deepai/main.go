@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -39,22 +40,32 @@ func main() {
 	}
 	defer sb.Close()
 
-	subPool := subagent.NewPool(subagent.FuncExecutor(func(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
-		emit(subagent.TaskEvent{Type: "task_running", TaskID: task.ID, Description: task.Description, Message: "subagent is analyzing the task"})
-		time.Sleep(50 * time.Millisecond)
-		return subagent.ExecutionResult{
-			Result: fmt.Sprintf("subagent[%s] completed: %s", task.Type, task.Prompt),
-			Messages: []models.Message{{
-				ID:        "subagent-message-1",
-				SessionID: task.ID,
-				Role:      models.RoleAI,
-				Content:   "subagent finished successfully",
-			}},
-		}, nil
-	}), subagent.PoolConfig{
-		MaxConcurrent: 1,
-		Timeout:       30 * time.Second,
-	})
+	provName := strings.TrimSpace(os.Getenv("DEEPAI_PROVIDER"))
+	var provider llm.LLMProvider
+	if provName == "" {
+		provider = newScriptedProvider()
+		logs.Warn.Warn("DEEPAI_PROVIDER not set; using scripted provider")
+	} else {
+		provider = llm.NewProvider(provName)
+		logs.Info.Info("using provider", "name", provName)
+	}
+
+	modelName := strings.TrimSpace(os.Getenv("DEEPAI_MODEL"))
+	if modelName == "" {
+		modelName = "demo-model"
+	}
+
+	contextWindow := 0
+	if v := strings.TrimSpace(os.Getenv("DEEPAI_CONTEXT_WINDOW")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			contextWindow = n
+		}
+	}
+
+	subExecutor := agent.NewSubagentExecutor(provider, nil, sb, modelName).WithContextWindow(contextWindow)
+	subPool := agent.NewSubagentPool(subExecutor, 1, 30*time.Second)
+
+	// Configure debug logging
 
 	registry := tools.NewRegistry()
 	for _, tool := range append(
@@ -77,21 +88,6 @@ func main() {
 			os.Exit(1)
 		}
 		logs.Info.Info("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
-	}
-
-	provName := strings.TrimSpace(os.Getenv("DEEPAI_PROVIDER"))
-	var provider llm.LLMProvider
-	if provName == "" {
-		provider = newScriptedProvider()
-		logs.Warn.Warn("DEEPAI_PROVIDER not set; using scripted provider")
-	} else {
-		provider = llm.NewProvider(provName)
-		logs.Info.Info("using provider", "name", provName)
-	}
-
-	modelName := strings.TrimSpace(os.Getenv("DEEPAI_MODEL"))
-	if modelName == "" {
-		modelName = "demo-model"
 	}
 
 	// Configure debug logging to file.
@@ -170,12 +166,13 @@ func main() {
 			Content:   input,
 		})
 
-		agentRun := agent.New(agent.AgentConfig{
-			LLMProvider: provider,
-			Tools:       registry,
-			Sandbox:     sb,
-			AgentType:   agent.AgentTypeCoder,
-			Model:       modelName,
+	agentRun := agent.New(agent.AgentConfig{
+			LLMProvider:   provider,
+			Tools:         registry,
+			Sandbox:       sb,
+			AgentType:     agent.AgentTypeCoder,
+			Model:         modelName,
+			ContextWindow: contextWindow,
 		})
 
 		if desc := skillReg.Descriptions(); desc != "" {

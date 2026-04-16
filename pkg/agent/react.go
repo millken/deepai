@@ -45,6 +45,12 @@ type Agent struct {
 	eventsMu        sync.RWMutex
 	eventsClosed    bool
 	started         bool
+
+	// Context compaction
+	contextWindow       int
+	compactionThreshold float64
+	compactionKeepTail  int
+	lastInputTokens     int
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -81,6 +87,9 @@ func New(cfg AgentConfig) *Agent {
 		maxTokensBudget: cfg.MaxTokensBudget,
 		requestTimeout:  requestTimeout,
 		events:          make(chan AgentEvent, 128),
+		contextWindow:       cfg.ContextWindow,
+		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
+		compactionKeepTail:  resolveCompactionKeepTail(cfg.CompactionKeepTail),
 	}
 }
 
@@ -186,6 +195,32 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
 			return nil, err
 		}
+
+		// Context compaction: compress old messages when approaching context window.
+		if a.contextWindow > 0 {
+			estimated := estimateTokens(runMessages, a.systemPrompt, a.lastInputTokens)
+			ratio := float64(estimated) / float64(a.contextWindow)
+			if ratio >= a.compactionThreshold {
+				before := len(runMessages)
+				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
+				if didCompact {
+					slog.Debug("context compaction", "turn", turn, "before", before, "after", len(compacted), "estimated_tokens", estimated, "ratio", fmt.Sprintf("%.2f", ratio))
+					runMessages = compacted
+					emit(AgentEvent{
+						Type: AgentEventCompact,
+						CompactStats: &CompactStats{
+							MessagesBefore: before,
+							MessagesAfter:  len(compacted),
+							InputTokens:    estimated,
+							ContextWindow:  a.contextWindow,
+							Ratio:          ratio,
+						},
+					})
+					a.lastInputTokens = 0
+				}
+			}
+		}
+
 		req := llm.ChatRequest{
 			Model:           a.model,
 			Messages:        runMessages,
@@ -248,6 +283,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 		if streamUsage != nil {
 			accumulateUsage(usage, streamUsage)
+			if streamUsage.InputTokens > 0 {
+				a.lastInputTokens = streamUsage.InputTokens
+			}
 		}
 
 		slog.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)

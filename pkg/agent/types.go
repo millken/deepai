@@ -39,6 +39,11 @@ type AgentConfig struct {
 	MaxTokens       *int
 	Sandbox         *sandbox.Sandbox
 	RequestTimeout  time.Duration
+
+	// Context compaction
+	ContextWindow        int     // model context window in tokens; 0 = no compaction
+	CompactionThreshold  float64 // fraction of ContextWindow to trigger compaction (default 0.75)
+	CompactionKeepTail   int     // number of recent messages to preserve (default 6)
 }
 
 type TimeoutError struct {
@@ -67,6 +72,7 @@ const (
 	AgentEventToolCallEnd   AgentEventType = "tool_call_end"
 	AgentEventEnd           AgentEventType = "end"
 	AgentEventError         AgentEventType = "error"
+	AgentEventCompact       AgentEventType = "compact"
 )
 
 type ToolCallEvent struct {
@@ -104,4 +110,14 @@ type AgentEvent struct {
 	Usage     *Usage             `json:"usage,omitempty"`
 	Err       string             `json:"error,omitempty"`
 	Error     *AgentError        `json:"error_detail,omitempty"`
+	CompactStats *CompactStats   `json:"compact_stats,omitempty"`
+}
+
+// CompactStats describes the outcome of a context compaction pass.
+type CompactStats struct {
+	MessagesBefore int     `json:"messages_before"`
+	MessagesAfter  int     `json:"messages_after"`
+	InputTokens    int     `json:"input_tokens"`
+	ContextWindow  int     `json:"context_window"`
+	Ratio          float64 `json:"ratio"`
 }
