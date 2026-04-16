@@ -30,7 +30,8 @@ type AgentConfig struct {
 	Tools           *tools.Registry
 	PresentFiles    *tools.PresentFileRegistry
 	AgentType       AgentType
-	MaxTurns        int
+	MaxTurns        int  // safety valve: hard cap on turns (0 = unlimited)
+	MaxTokensBudget int  // total token budget across all turns (0 = unlimited)
 	Model           string
 	ReasoningEffort string
 	SystemPrompt    string

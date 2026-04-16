@@ -12,15 +12,12 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-func TestAgentConfig_Defaults(t *testing.T) {
-	cfg := AgentConfig{
-		MaxTurns: 0,
-	}
-
+func TestAgentConfig_DefaultMaxTurns(t *testing.T) {
+	cfg := AgentConfig{}
 	agent := New(cfg)
-
-	if agent.maxTurns != defaultMaxTurns {
-		t.Errorf("Expected default MaxTurns=%d, got %d", defaultMaxTurns, agent.maxTurns)
+	// 0 = unlimited (no hard turn cap)
+	if agent.maxTurns != 0 {
+		t.Errorf("Expected default MaxTurns=0 (unlimited), got %d", agent.maxTurns)
 	}
 }
 
@@ -28,19 +25,24 @@ func TestAgentConfig_CustomMaxTurns(t *testing.T) {
 	cfg := AgentConfig{
 		MaxTurns: 20,
 	}
-
 	agent := New(cfg)
-
 	if agent.maxTurns != 20 {
 		t.Errorf("Expected MaxTurns=20, got %d", agent.maxTurns)
 	}
 }
 
-func TestAgent_Events(t *testing.T) {
+func TestAgentConfig_TokenBudget(t *testing.T) {
 	cfg := AgentConfig{
-		MaxTurns: 5,
+		MaxTokensBudget: 50000,
 	}
+	agent := New(cfg)
+	if agent.maxTokensBudget != 50000 {
+		t.Errorf("Expected MaxTokensBudget=50000, got %d", agent.maxTokensBudget)
+	}
+}
 
+func TestAgent_Events(t *testing.T) {
+	cfg := AgentConfig{}
 	agent := New(cfg)
 	events := agent.Events()
 
@@ -50,10 +52,7 @@ func TestAgent_Events(t *testing.T) {
 }
 
 func TestAgent_Run_NoLLMProvider(t *testing.T) {
-	cfg := AgentConfig{
-		MaxTurns: 5,
-	}
-
+	cfg := AgentConfig{}
 	agent := New(cfg)
 	_, err := agent.Run(context.Background(), "session_1", []models.Message{
 		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "Hello"},
@@ -75,8 +74,7 @@ func TestAgent_New_WithTools(t *testing.T) {
 	})
 
 	cfg := AgentConfig{
-		MaxTurns: 5,
-		Tools:    registry,
+		Tools: registry,
 	}
 
 	agent := New(cfg)
@@ -88,7 +86,6 @@ func TestAgent_New_WithTools(t *testing.T) {
 
 func TestAgent_BuildSystemPrompt(t *testing.T) {
 	cfg := AgentConfig{
-		MaxTurns:     5,
 		SystemPrompt: "custom system prompt",
 	}
 
@@ -106,10 +103,7 @@ func TestAgent_BuildSystemPrompt(t *testing.T) {
 }
 
 func TestAgent_emit(t *testing.T) {
-	cfg := AgentConfig{
-		MaxTurns: 5,
-	}
-
+	cfg := AgentConfig{}
 	agent := New(cfg)
 
 	agent.emit(AgentEvent{
@@ -120,7 +114,6 @@ func TestAgent_emit(t *testing.T) {
 }
 
 func TestResolveModel(t *testing.T) {
-	// Clear the environment variable first
 	os.Unsetenv("DEFAULT_LLM_MODEL")
 
 	tests := []struct {
@@ -217,9 +210,6 @@ func TestApplyAgentType(t *testing.T) {
 	}
 	if cfg.SystemPrompt == "" {
 		t.Fatal("ApplyAgentType() did not set system prompt")
-	}
-	if cfg.MaxTurns <= 0 {
-		t.Fatal("ApplyAgentType() did not set max turns")
 	}
 	if cfg.Temperature == nil {
 		t.Fatal("ApplyAgentType() did not set temperature")

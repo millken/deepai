@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
@@ -60,34 +62,16 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	if err := registry.Register(builtin.AskUserQuestionTool()); err != nil {
+	if err := registry.Register(clarification.AskClarificationTool(nil)); err != nil {
 		log.Fatal(err)
 	}
 	if err := registry.Register(tools.TaskTool(subPool)); err != nil {
 		log.Fatal(err)
 	}
 
-	// Inject CLI user interaction (stdin/stdout) for ask_user tool.
-	// In non-interactive mode (API server), omit this — the tool will tell the AI to decide on its own.
-	runCtx := tools.WithUserInteraction(ctx, &cliUserInteraction{In: os.Stdin, Out: os.Stdout})
-
-	bashOutput, err := registry.Call(ctx, "bash", map[string]interface{}{
-		"command": "echo hello from bash tool",
-	}, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("[tool:bash]", bashOutput)
-
-	runCtx = subagent.WithEventSink(runCtx, func(evt subagent.TaskEvent) {
-		fmt.Printf("[subagent] %s: %s\n", evt.Type, evt.Message)
-	})
-
-	// Create real provider from env (DEEPAI_PROVIDER). Falls back to scripted provider for local demos.
 	provName := strings.TrimSpace(os.Getenv("DEEPAI_PROVIDER"))
 	var provider llm.LLMProvider
 	if provName == "" {
-		// no provider configured -> use scripted provider
 		provider = newScriptedProvider()
 		log.Println("DEEPAI_PROVIDER not set; using scripted provider")
 	} else {
@@ -100,53 +84,99 @@ func main() {
 		modelName = "demo-model"
 	}
 
-	agentRun := agent.New(agent.AgentConfig{
-		LLMProvider: provider,
-		Tools:       registry,
-		Sandbox:     sb,
-		AgentType:   agent.AgentTypeCoder,
-		Model:       modelName,
-		MaxTurns:    10,
+	ui := &cliUserInteraction{In: os.Stdin, Out: os.Stderr}
+	runCtx := tools.WithUserInteraction(ctx, ui)
+	runCtx = subagent.WithEventSink(runCtx, func(evt subagent.TaskEvent) {
+		fmt.Fprintf(os.Stderr, "[subagent] %s: %s\n", evt.Type, evt.Message)
 	})
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		for evt := range agentRun.Events() {
-			switch evt.Type {
-			case agent.AgentEventToolCall:
-				if evt.ToolCall != nil {
-					fmt.Printf("[event] tool call: %s %s\n", evt.ToolCall.Name, evt.ToolCall.ID)
-				}
-			case agent.AgentEventToolResult:
-				if evt.Result != nil {
-					fmt.Printf("[event] tool result: %s\n", evt.Result.Content)
-				}
-			case agent.AgentEventEnd:
-				fmt.Printf("[event] agent end: %s\n", evt.Text)
-			case agent.AgentEventError:
-				fmt.Printf("[event] error: %s\n", evt.Err)
-			}
+	fmt.Println("deepai interactive mode — type your prompt, Ctrl+D or 'exit' to quit")
+	fmt.Println()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	sessionID := "interactive-session"
+	msgSeq := 0
+	debug := os.Getenv("DEEPAI_DEBUG") != ""
+	var history []models.Message
+
+	for {
+		fmt.Fprint(os.Stderr, "> ")
+		if !scanner.Scan() {
+			break
 		}
-	})
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+		if input == "exit" || input == "quit" {
+			break
+		}
 
-	// Use a more specific prompt to encourage automatic delegation
-	specificPrompt := "为当前仓库生成一个Makefile，包含build、test和lint命令。请先分析仓库结构，直接生成完整 Makefile 内容并使用 write_file 工具写入 ./Makefile。不要提出澄清问题或等待确认。写入完成后给出简短确认。"
-	result, err := agentRun.Run(runCtx, "demo-session", []models.Message{{
-		ID:        "m1",
-		SessionID: "demo-session",
-		Role:      models.RoleHuman,
-		Content:   specificPrompt,
-	}})
-	if err != nil {
-		log.Fatal(err)
-	}
-	wg.Wait()
+		msgSeq++
 
-	fmt.Println("\n[agent final output]")
-	fmt.Println(result.FinalOutput)
-	if result.Usage != nil {
-		fmt.Printf("usage: input=%d output=%d total=%d\n", result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens)
+		// Append user message to session history
+		history = append(history, models.Message{
+			ID:        fmt.Sprintf("m-%d", msgSeq),
+			SessionID: sessionID,
+			Role:      models.RoleHuman,
+			Content:   input,
+		})
+
+		// Create a fresh agent per turn (agents are single-use).
+		agentRun := agent.New(agent.AgentConfig{
+			LLMProvider: provider,
+			Tools:       registry,
+			Sandbox:     sb,
+			AgentType:   agent.AgentTypeCoder,
+			Model:       modelName,
+		})
+
+		go func() {
+			for evt := range agentRun.Events() {
+				switch evt.Type {
+				case agent.AgentEventToolCall:
+					if evt.ToolCall != nil {
+						if debug {
+							argsJSON, _ := json.Marshal(evt.ToolCall.Arguments)
+							fmt.Fprintf(os.Stderr, "[tool call] %s(%s) %s\n", evt.ToolCall.Name, evt.ToolCall.ID, argsJSON)
+						} else {
+							fmt.Fprintf(os.Stderr, "[tool call] %s(%s)\n", evt.ToolCall.Name, evt.ToolCall.ID)
+						}
+					}
+				case agent.AgentEventToolResult:
+					if evt.Result != nil {
+						content := evt.Result.Content
+						if !debug && len(content) > 200 {
+							content = content[:200] + "..."
+						}
+						fmt.Fprintf(os.Stderr, "[tool result] %s\n", content)
+					}
+				case agent.AgentEventError:
+					fmt.Fprintf(os.Stderr, "[error] %s\n", evt.Err)
+				}
+			}
+		}()
+
+		result, err := agentRun.Run(runCtx, sessionID, history)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
+			continue
+		}
+
+		// Append agent's messages to history for session continuity
+		history = result.Messages
+
+		if result.FinalOutput != "" {
+			fmt.Fprintf(os.Stderr, "\n%s\n\n", result.FinalOutput)
+		}
+		if result.Usage != nil {
+			fmt.Fprintf(os.Stderr, "[usage] in=%d out=%d total=%d\n\n", result.Usage.InputTokens, result.Usage.OutputTokens, result.Usage.TotalTokens)
+		}
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "[error] reading input: %v\n", err)
+	}
+	fmt.Fprintln(os.Stderr, "bye.")
 }
 
 // cliUserInteraction implements tools.UserInteraction via stdin/stdout.

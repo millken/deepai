@@ -17,7 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-const defaultMaxTurns = 8
+const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
 const defaultRequestTimeout = 10 * time.Minute
 
 var messageSeq uint64
@@ -35,6 +35,7 @@ type Agent struct {
 	temperature     *float64
 	maxTokens       *int
 	maxTurns        int
+	maxTokensBudget int
 	requestTimeout  time.Duration
 	events          chan AgentEvent
 	requests        sync.Map
@@ -75,6 +76,7 @@ func New(cfg AgentConfig) *Agent {
 		temperature:     cfg.Temperature,
 		maxTokens:       cfg.MaxTokens,
 		maxTurns:        maxTurns,
+		maxTokensBudget: cfg.MaxTokensBudget,
 		requestTimeout:  requestTimeout,
 		events:          make(chan AgentEvent, 128),
 	}
@@ -138,7 +140,25 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	runMessages := append([]models.Message(nil), messages...)
 	usage := &Usage{}
 
-	for turn := 0; turn < a.maxTurns; turn++ {
+	for turn := 0; ; turn++ {
+		// Safety valve: hard turn cap (0 = unlimited)
+		if a.maxTurns > 0 && turn >= a.maxTurns {
+			err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
+			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
+			return nil, err
+		}
+
+		// Token budget check
+		if a.maxTokensBudget > 0 && usage.TotalTokens >= a.maxTokensBudget {
+			err := fmt.Errorf("agent exceeded token budget (%d/%d)", usage.TotalTokens, a.maxTokensBudget)
+			agentErr := &AgentError{
+				Code:       "token_budget_exceeded",
+				Message:    err.Error(),
+				Suggestion: "Increase token budget or simplify the request.",
+			}
+			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
+			return nil, err
+		}
 		req := llm.ChatRequest{
 			Model:           a.model,
 			Messages:        runMessages,
@@ -305,10 +325,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 		}
 	}
-
-	err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
-	emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-	return nil, err
 }
 
 func (a *Agent) BuildSystemPrompt(_ context.Context, _ string) string {
@@ -538,6 +554,9 @@ func newAgentError(err error) *AgentError {
 	case strings.Contains(strings.ToLower(err.Error()), "max turns"):
 		agentErr.Code = "max_turns_exceeded"
 		agentErr.Suggestion = "Increase max turns or simplify the request."
+	case strings.Contains(strings.ToLower(err.Error()), "token budget"):
+		agentErr.Code = "token_budget_exceeded"
+		agentErr.Suggestion = "Increase token budget or simplify the request."
 	case strings.Contains(strings.ToLower(err.Error()), "api key"):
 		agentErr.Code = "provider_auth"
 		agentErr.Suggestion = "Verify the provider credentials and base URL."

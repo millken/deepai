@@ -42,7 +42,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Balanced assistant profile for general tasks.",
 		SystemPrompt: generalPurposeSystemPrompt,
 		DefaultTools: nil,
-		MaxTurns:     defaultMaxTurns,
+		MaxTurns:     0,
 		Temperature:  0.2,
 	},
 	AgentTypeResearch: {
@@ -50,8 +50,8 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Researcher",
 		Description:  "Profile for research, reading, and synthesis tasks.",
 		SystemPrompt: researcherSystemPrompt,
-		DefaultTools: []string{"read_file", "glob", "present_file", "ask_clarification", "task"},
-		MaxTurns:     10,
+		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task"},
+		MaxTurns:     0,
 		Temperature:  0.1,
 	},
 	AgentTypeCoder: {
@@ -59,8 +59,8 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Coder",
 		Description:  "Profile for code generation, debugging, and implementation tasks.",
 		SystemPrompt: coderSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "glob", "present_file", "ask_clarification", "task"},
-		MaxTurns:     12,
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task"},
+		MaxTurns:     0,
 		Temperature:  0.1,
 	},
 	AgentTypeAnalyst: {
@@ -68,8 +68,8 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Analyst",
 		Description:  "Profile for structured analysis and artifact generation.",
 		SystemPrompt: analystSystemPrompt,
-		DefaultTools: []string{"read_file", "write_file", "glob", "present_file", "ask_clarification"},
-		MaxTurns:     10,
+		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification"},
+		MaxTurns:     0,
 		Temperature:  0.15,
 	},
 }
@@ -97,9 +97,6 @@ func ApplyAgentType(cfg *AgentConfig, t AgentType) error {
 
 	profile := GetAgentTypeConfig(t)
 	cfg.AgentType = profile.Type
-	if cfg.MaxTurns <= 0 {
-		cfg.MaxTurns = profile.MaxTurns
-	}
 	if strings.TrimSpace(cfg.SystemPrompt) == "" {
 		cfg.SystemPrompt = profile.SystemPrompt
 	}
