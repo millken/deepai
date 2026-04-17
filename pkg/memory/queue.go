@@ -12,7 +12,6 @@ import (
 
 const (
 	defaultQueueSize = 128
-	queueWorkerCount = 1 // single worker to serialize per-key updates
 )
 
 // jobType classifies the kind of async memory update.

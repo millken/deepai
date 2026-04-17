@@ -174,9 +174,15 @@ func (s *Service) LoadScope(ctx context.Context, scope Scope) (Document, error) 
 }
 
 // Save persists a document directly (used by memory tool).
+// Acquires the session lock to avoid racing with async updates.
 func (s *Service) Save(ctx context.Context, doc Document) error {
 	if s == nil || s.storage == nil {
 		return errors.New("memory storage is not configured")
+	}
+	if doc.SessionID != "" {
+		mu := s.getSessionLock(doc.SessionID)
+		mu.Lock()
+		defer mu.Unlock()
 	}
 	return s.storage.Save(ctx, doc)
 }
@@ -282,8 +288,6 @@ func (s *Service) UpdateScopeWith(ctx context.Context, scope Scope, messages []m
 	return s.UpdateWith(ctx, scope.Key(), messages, ext)
 }
 
-
-
 // UpdateWithFactSource is like UpdateWith but overrides the fact source
 // for all new facts in this update. Pass "" for factSource to use default behavior.
 func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, messages []models.Message, ext Extractor, factSource string) error {
@@ -332,8 +336,6 @@ func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, me
 	return s.storage.Save(ctx, merged)
 }
 
-
-
 // UpdateScopeWithSkillUsage performs a user-scope memory update and records skill
 // usage in a single Load+Save cycle, avoiding concurrent-write data loss.
 func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, messages []models.Message, ext Extractor, skillName string) error {
@@ -356,13 +358,15 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 
 	captured := s.captureFlushVersion(sessionID)
 
-	// Step 1: Run LLM extraction (may take time, do before loading doc).
+	// Load doc once (session lock held, no concurrent modification).
+	current, err := s.storage.Load(ctx, sessionID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("load memory %q: %w", sessionID, err)
+	}
+
+	// Run LLM extraction against loaded doc.
 	var update Update
 	if ext != nil && len(filteredMessages) > 0 {
-		current, err := s.storage.Load(ctx, sessionID)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			return fmt.Errorf("load memory %q: %w", sessionID, err)
-		}
 		extracted, err := ext.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))
 		if err != nil {
 			return err
@@ -370,11 +374,7 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 		update = sanitizeUpdateForStorage(extracted)
 	}
 
-	// Step 2: Load fresh doc, merge LLM extraction + skill usage, save once.
-	current, err := s.storage.Load(ctx, sessionID)
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("load memory %q: %w", sessionID, err)
-	}
+	// Merge LLM extraction + skill usage, save once.
 
 	source := factSourceFromMessages(filteredMessages)
 	if skillName != "" {
@@ -431,6 +431,10 @@ func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillN
 		return nil
 	}
 
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	factID := "skill-usage:" + skillName
 	factContent := "用户使用了 /" + skillName + " 技能"
 
@@ -464,8 +468,6 @@ func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillN
 	current.UpdatedAt = now
 	return s.storage.Save(ctx, current)
 }
-
-
 
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
 	return s.InjectWithContext(ctx, sessionID, "", "")
