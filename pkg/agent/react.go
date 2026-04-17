@@ -457,15 +457,20 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string) string 
 	sections := []string{strings.TrimSpace(a.systemPrompt)}
 
 	if a.memoryService != nil {
+		// Determine active source for memory fence.
+		activeSource := ""
+		if skillName := a.ActiveSkill(); skillName != "" {
+			activeSource = "skill:" + skillName
+		}
 		// Inject user-level memory (cross-session) first if userID is set.
 		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
-			if userMem := a.memoryService.InjectScope(ctx, memory.UserScope(uid)); userMem != "" {
+			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), a.systemPrompt, activeSource); userMem != "" {
 				sections = append(sections, userMem)
 			}
 		}
 		// Inject session-level memory.
 		if strings.TrimSpace(sessionID) != "" {
-			if injection := a.memoryService.InjectWithContext(ctx, sessionID, a.systemPrompt); injection != "" {
+			if injection := a.memoryService.InjectWithContext(ctx, sessionID, a.systemPrompt, activeSource); injection != "" {
 				sections = append(sections, injection)
 			}
 		}

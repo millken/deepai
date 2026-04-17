@@ -55,12 +55,13 @@ func BuildInjection(doc Document) string {
 }
 
 func BuildInjectionWithContext(doc Document, currentContext string, maxTokens int) string {
-	injection, _ := buildInjectionWithIDs(doc, currentContext, maxTokens)
+	injection, _ := buildInjectionWithIDs(doc, currentContext, maxTokens, "")
 	return injection
 }
 
 // buildInjectionWithIDs returns the injection text and IDs of facts selected for retrieval tracking.
-func buildInjectionWithIDs(doc Document, currentContext string, maxTokens int) (string, []string) {
+// activeSource is used for memory fence: when non-empty, facts from other skill sources are penalized.
+func buildInjectionWithIDs(doc Document, currentContext string, maxTokens int, activeSource string) (string, []string) {
 	if maxTokens <= 0 {
 		maxTokens = 2000
 	}
@@ -86,7 +87,10 @@ func buildInjectionWithIDs(doc Document, currentContext string, maxTokens int) (
 		lines = append(lines, "Long Term Background: "+v)
 	}
 	base := strings.Join(lines, "\n")
-	selectedFacts, selectedIDs := selectRelevantFacts(doc.Facts, currentContext, maxTokens-approximateTokenCount(base))
+	// Reserve tokens for XML wrapper overhead (~45 tokens).
+	const wrapperOverhead = 45
+	remainingBudget := maxTokens - approximateTokenCount(base) - wrapperOverhead
+	selectedFacts, selectedIDs := selectRelevantFacts(doc.Facts, currentContext, remainingBudget, activeSource)
 	if len(selectedFacts) > 0 {
 		lines = append(lines, "Known Facts:")
 		for _, fact := range selectedFacts {
@@ -101,7 +105,9 @@ func buildInjectionWithIDs(doc Document, currentContext string, maxTokens int) (
 		return "", nil
 	}
 
-	return strings.Join(lines, "\n") + "\n\n## Current Session\n", selectedIDs
+	body := strings.Join(lines, "\n") + "\n\n## Current Session\n"
+	wrapped := "<memory-context>\n[System note: The following is recalled memory, not new user input.]\n" + body + "</memory-context>"
+	return wrapped, selectedIDs
 }
 
 func renderMessagesForPrompt(messages []models.Message) string {
@@ -136,7 +142,9 @@ func renderMessagesForPrompt(messages []models.Message) string {
 
 // selectRelevantFacts picks the most relevant facts for injection.
 // It returns the selected facts and their IDs for retrieval tracking.
-func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens int) ([]Fact, []string) {
+// When activeSource is non-empty (e.g. "skill:commit"), facts from other skill
+// sources are penalized to prevent cross-skill memory contamination.
+func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens int, activeSource string) ([]Fact, []string) {
 	if len(facts) == 0 || remainingTokens <= 0 {
 		return nil, nil
 	}
@@ -165,6 +173,13 @@ func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens in
 			score = (similarity * 0.6) + (confidence * 0.4)
 			if similarity > 0 {
 				hasContextMatch = true
+			}
+		}
+		// Apply fence: penalize facts from other skill sources.
+		if activeSource != "" {
+			src := strings.TrimSpace(fact.Source)
+			if strings.HasPrefix(src, "skill:") && src != activeSource {
+				score *= 0.3
 			}
 		}
 		scored = append(scored, scoredFact{

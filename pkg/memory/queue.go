@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -44,12 +45,16 @@ type updateJob struct {
 // ensuring that multiple updates for the same session are merged rather
 // than racing.
 type UpdateQueue struct {
-	svc     *Service
-	ch      chan updateJob
-	done    chan struct{}
-	mu      sync.Mutex // protects pendingSeq
-	pendingSeq map[string]uint64 // dedup key → latest sequence number
-	seq     uint64
+	svc           *Service
+	ch            chan updateJob
+	done          chan struct{}
+	mu            sync.Mutex    // protects pendingSeq
+	pendingSeq    map[string]uint64 // dedup key → latest sequence number
+	flushVersion  sync.Map      // "update:"+sessionID → uint64 ; bumped on sync flush
+	seq           uint64
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	closeErr      error // first Close result; returned on subsequent calls
 }
 
 // newUpdateQueue creates and starts the queue.
@@ -58,25 +63,29 @@ func newUpdateQueue(svc *Service, size int) *UpdateQueue {
 		size = defaultQueueSize
 	}
 	q := &UpdateQueue{
-		svc:        svc,
-		ch:         make(chan updateJob, size),
-		done:       make(chan struct{}),
-		pendingSeq: make(map[string]uint64),
+		svc:           svc,
+		ch:            make(chan updateJob, size),
+		done:          make(chan struct{}),
+		pendingSeq:    make(map[string]uint64),
 	}
 	go q.run()
 	return q
 }
 
 // Close drains the queue and stops the worker. Blocks until all pending
-// jobs are processed or the context is cancelled.
+// jobs are processed or the context is cancelled. Safe to call multiple times;
+// subsequent calls return the same error as the first invocation.
 func (q *UpdateQueue) Close(ctx context.Context) error {
-	close(q.ch)
-	select {
-	case <-q.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	q.closeOnce.Do(func() {
+		q.closed.Store(true)
+		close(q.ch)
+		select {
+		case <-q.done:
+		case <-ctx.Done():
+			q.closeErr = ctx.Err()
+		}
+	})
+	return q.closeErr
 }
 
 // submitTimeout is the maximum time to wait when the queue is full.
@@ -85,7 +94,11 @@ const submitTimeout = 2 * time.Second
 // submit enqueues a job. If a job with the same dedup key is already pending,
 // the new job replaces it (last-writer-wins coalescing).
 // Blocks up to submitTimeout if the queue is full to avoid silent data loss.
+// Silently drops the job if the queue is closed or the timeout expires.
 func (q *UpdateQueue) submit(job updateJob) {
+	if q.closed.Load() {
+		return
+	}
 	key := q.dedupKey(job)
 
 	q.mu.Lock()
@@ -97,6 +110,18 @@ func (q *UpdateQueue) submit(job updateJob) {
 	q.mu.Unlock()
 
 	// Block briefly if full; only drop after timeout.
+	// Use recover() to handle TOCTOU race: closed.Load() may return false
+	// just before Close() calls close(q.ch), causing a send-on-closed-channel panic.
+	defer func() {
+		if r := recover(); r != nil {
+			q.svc.logf("update queue submit recovered panic (channel closed): %v", r)
+			if key != "" {
+				q.mu.Lock()
+				delete(q.pendingSeq, key)
+				q.mu.Unlock()
+			}
+		}
+	}()
 	select {
 	case q.ch <- job:
 		return
@@ -110,8 +135,8 @@ func (q *UpdateQueue) submit(job updateJob) {
 	}
 }
 
-// cancelPending removes any pending dedup entry for the given dedup key,
-// so that when the queued job executes, it will be skipped by the worker.
+// cancelPending removes any pending dedup entry for the given dedup key
+// and bumps the flush version so in-flight tasks detect staleness.
 func (q *UpdateQueue) cancelPending(key string) {
 	if key == "" {
 		return
@@ -119,6 +144,40 @@ func (q *UpdateQueue) cancelPending(key string) {
 	q.mu.Lock()
 	delete(q.pendingSeq, key)
 	q.mu.Unlock()
+	// Bump flush version so in-flight tasks for this session detect staleness.
+	if strings.HasPrefix(key, "update:") {
+		for {
+			v, loaded := q.flushVersion.LoadOrStore(key, uint64(1))
+			if !loaded {
+				return
+			}
+			if q.flushVersion.CompareAndSwap(key, v, v.(uint64)+1) {
+				return
+			}
+		}
+	}
+}
+
+// captureFlushVersion returns the current flush version for a session.
+// Call this at the start of an update, then check isFlushStale before Save.
+func (q *UpdateQueue) captureFlushVersion(sessionID string) uint64 {
+	key := "update:" + sessionID
+	v, _ := q.flushVersion.Load(key)
+	if v == nil {
+		return 0
+	}
+	return v.(uint64)
+}
+
+// isFlushStale returns true if the flush version has been bumped since capture,
+// meaning a newer sync flush has superseded this in-flight update.
+func (q *UpdateQueue) isFlushStale(sessionID string, captured uint64) bool {
+	key := "update:" + sessionID
+	v, _ := q.flushVersion.Load(key)
+	if v == nil {
+		return captured != 0
+	}
+	return v.(uint64) != captured
 }
 
 func (q *UpdateQueue) dedupKey(job updateJob) string {

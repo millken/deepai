@@ -248,7 +248,7 @@ func TestBuildInjectionWithContextPrioritizesRelevantFacts(t *testing.T) {
 		},
 	}
 
-	injected := BuildInjectionWithContext(doc, "Need help debugging deerflow-go gateway compatibility.", 40)
+	injected := BuildInjectionWithContext(doc, "Need help debugging deerflow-go gateway compatibility.", 200)
 	if !strings.Contains(injected, "Maintains deerflow-go gateway compatibility with DeerFlow UI.") {
 		t.Fatalf("expected relevant fact in injection: %q", injected)
 	}
@@ -283,7 +283,7 @@ func TestBuildInjectionWithContextFallsBackToConfidenceOrder(t *testing.T) {
 		},
 	}
 
-	injected := BuildInjectionWithContext(doc, "", 12)
+	injected := BuildInjectionWithContext(doc, "", 55)
 	if !strings.Contains(injected, "Prefers concise technical answers in reviews.") {
 		t.Fatalf("expected highest confidence fact in injection: %q", injected)
 	}

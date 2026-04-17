@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -80,6 +81,7 @@ type Service struct {
 	logger        *log.Logger
 	updateTimeout time.Duration
 	queue         *UpdateQueue
+	sessionMu     sync.Map // sessionID → *sync.Mutex ; serializes Update-to-Save per session
 }
 
 func NewService(storage Storage, extractor Extractor) *Service {
@@ -117,11 +119,37 @@ func (s *Service) Close(ctx context.Context) error {
 
 // CancelPendingUpdates removes any queued update for the given session,
 // preventing stale async jobs from overwriting a subsequent synchronous flush.
+// Acquires the session lock to ensure no in-flight task is between capture and Save.
 func (s *Service) CancelPendingUpdates(sessionID string) {
 	if s == nil || s.queue == nil {
 		return
 	}
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
 	s.queue.cancelPending("update:" + sessionID)
+}
+
+func (s *Service) getSessionLock(sessionID string) *sync.Mutex {
+	mu, _ := s.sessionMu.LoadOrStore(sessionID, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
+// captureFlushVersion returns the current flush generation for a session.
+// The caller should pass the returned value to isFlushStale before Save.
+func (s *Service) captureFlushVersion(sessionID string) uint64 {
+	if s == nil || s.queue == nil {
+		return 0
+	}
+	return s.queue.captureFlushVersion(sessionID)
+}
+
+// isFlushStale returns true if a newer sync flush has occurred since capture.
+func (s *Service) isFlushStale(sessionID string, captured uint64) bool {
+	if s == nil || s.queue == nil {
+		return false
+	}
+	return s.queue.isFlushStale(sessionID, captured)
 }
 
 func (s *Service) AutoMigrate(ctx context.Context) error {
@@ -174,6 +202,15 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 		return nil
 	}
 
+	// Per-session lock serializes capture-through-Save, eliminating the race
+	// window between stale check and Save where a concurrent flush could be
+	// overwritten. CancelPendingUpdates also acquires this lock.
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	captured := s.captureFlushVersion(sessionID)
+
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("load memory %q: %w", sessionID, err)
@@ -186,6 +223,9 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 	update = sanitizeUpdateForStorage(update)
 
 	merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(filteredMessages), time.Now().UTC())
+	if s.isFlushStale(sessionID, captured) {
+		return nil
+	}
 	return s.storage.Save(ctx, merged)
 }
 
@@ -213,6 +253,12 @@ func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []m
 		return nil
 	}
 
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	captured := s.captureFlushVersion(sessionID)
+
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("load memory %q: %w", sessionID, err)
@@ -225,6 +271,9 @@ func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []m
 	update = sanitizeUpdateForStorage(update)
 
 	merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(filteredMessages), time.Now().UTC())
+	if s.isFlushStale(sessionID, captured) {
+		return nil
+	}
 	return s.storage.Save(ctx, merged)
 }
 
@@ -255,6 +304,12 @@ func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, me
 		return nil
 	}
 
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	captured := s.captureFlushVersion(sessionID)
+
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("load memory %q: %w", sessionID, err)
@@ -271,6 +326,9 @@ func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, me
 		source = factSourceFromMessages(filteredMessages)
 	}
 	merged := MergeWithFactSource(current, update, sessionID, source, time.Now().UTC())
+	if s.isFlushStale(sessionID, captured) {
+		return nil
+	}
 	return s.storage.Save(ctx, merged)
 }
 
@@ -290,8 +348,15 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 		return errors.New("memory storage is not configured")
 	}
 
-	// Step 1: Run LLM extraction (may take time, do before loading doc).
 	filteredMessages := filterMessagesForMemory(messages)
+
+	mu := s.getSessionLock(sessionID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	captured := s.captureFlushVersion(sessionID)
+
+	// Step 1: Run LLM extraction (may take time, do before loading doc).
 	var update Update
 	if ext != nil && len(filteredMessages) > 0 {
 		current, err := s.storage.Load(ctx, sessionID)
@@ -312,6 +377,9 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 	}
 
 	source := factSourceFromMessages(filteredMessages)
+	if skillName != "" {
+		source = "skill:" + skillName
+	}
 	merged := MergeWithFactSource(current, update, sessionID, source, time.Now().UTC())
 
 	// Append skill usage fact (idempotent by fact ID).
@@ -345,6 +413,9 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 		}
 	}
 
+	if s.isFlushStale(sessionID, captured) {
+		return nil
+	}
 	return s.storage.Save(ctx, merged)
 }
 
@@ -397,14 +468,14 @@ func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillN
 
 
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
-	return s.InjectWithContext(ctx, sessionID, "")
+	return s.InjectWithContext(ctx, sessionID, "", "")
 }
 
 func (s *Service) InjectScope(ctx context.Context, scope Scope) string {
-	return s.InjectScopeWithContext(ctx, scope, "")
+	return s.InjectScopeWithContext(ctx, scope, "", "")
 }
 
-func (s *Service) InjectWithContext(ctx context.Context, sessionID string, currentContext string) string {
+func (s *Service) InjectWithContext(ctx context.Context, sessionID string, currentContext string, activeSource string) string {
 	if s == nil || s.storage == nil || strings.TrimSpace(sessionID) == "" {
 		return ""
 	}
@@ -416,15 +487,15 @@ func (s *Service) InjectWithContext(ctx context.Context, sessionID string, curre
 		}
 		return ""
 	}
-	injection, retrievedIDs := buildInjectionWithIDs(doc, currentContext, 2000)
+	injection, retrievedIDs := buildInjectionWithIDs(doc, currentContext, 2000, activeSource)
 	if len(retrievedIDs) > 0 {
 		s.scheduleRetrievalIncrement(sessionID, retrievedIDs)
 	}
 	return injection
 }
 
-func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, currentContext string) string {
-	return s.InjectWithContext(ctx, scope.Key(), currentContext)
+func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, currentContext string, activeSource string) string {
+	return s.InjectWithContext(ctx, scope.Key(), currentContext, activeSource)
 }
 
 
