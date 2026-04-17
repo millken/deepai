@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/voocel/litellm"
 )
@@ -76,6 +77,10 @@ var supportedProviders = []struct {
 		config: litellm.ProviderConfig{
 			APIKey:  os.Getenv("OPENAI_COMPAT_API_KEY"),
 			BaseURL: strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")),
+			Resilience: litellm.ResilienceConfig{
+				ConnectTimeout: 10 * time.Second,
+				MaxRetries:     1,
+			},
 		},
 	},
 }

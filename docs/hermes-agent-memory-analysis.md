@@ -571,7 +571,7 @@ Schedule(scope, messages)
 | 上下文感知注入 | 全量(小) | cosine 筛选 + token 预算 | **已同步** |
 | Scope 多级作用域 | 用户/会话 | session/user/group/agent | **已同步** |
 | 记忆容量限制 | 硬字符上限 | token 预算筛选 | **已同步** |
-| 跨会话记忆 | 全局用户级 | UserScope | **已同步** |
+| 跨会话记忆 | 全局用户级 | UserScope 基础设施已同步，注入/更新行为未接线 | 待建（阶段四） |
 | 记忆注入系统提示词 | 冻结快照 | `BuildInjectionWithContext` **未接入 Agent** | **未接线** |
 | "该记住什么" 行为指导 | Schema + MEMORY_GUIDANCE | LLM 提示词基本指导 | 需新建 |
 | Nudge 机制 | 每 10 轮后台审查 | 无 | 需新建 |
@@ -629,43 +629,88 @@ BuildSystemPrompt 变更：
 
 #### 1.2 每轮结束后异步更新记忆
 
-在 Agent.Run 完成后（return 之前），调用 `ScheduleUpdate`。
+在 Agent.Run 完成后（return 之前），调用 `ScheduleUpdateWith`。
 
 ```
 Run() 变更：
   在 return RunResult 之前：
-    if a.memoryService != nil {
-        a.memoryService.ScheduleUpdate(sessionID, runMessages)
+    if a.memoryService != nil && a.memoryExtractor != nil {
+        a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
     }
 ```
 
 **文件变更**：
-- `pkg/agent/react.go` — 在 AgentEventEnd 返回前调用 ScheduleUpdate
+- `pkg/agent/react.go` — 在 AgentEventEnd 返回前调用 `ScheduleUpdateWith`
 
 #### 1.3 运行时初始化记忆
 
-两条入口路径都需要初始化 memory.Service：
+两条入口路径都需要初始化 memory.Service。
 
+> **关键问题**：Gateway 的 provider/model 是**按请求动态解析**的（`server.go:201-214`），
+> 不同请求可能使用不同模型。但 `LLMClient`（extractor）在创建时就绑定了 provider + model。
+> 如果在 Server 启动时创建一个固定 extractor，记忆提取会与实际对话模型脱钩。
+>
+> **选定方案：在 AgentConfig 中传入 extractor**，Agent.Run 结束时直接使用传入的 extractor，
+> 不依赖 Service 的固定实例。
+>
+> ```go
+> // 1. AgentConfig 新增字段
+> type AgentConfig struct {
+>     // ... 现有字段
+>     MemoryService   *memory.Service   // 用于 Inject
+>     MemoryExtractor memory.Extractor   // 用于更新，按请求构造
+> }
+>
+> // 2. Agent.Run 结束时使用传入的 extractor
+> if a.memoryService != nil && a.memoryExtractor != nil {
+>     // Service 新增方法：接受外部 extractor 的异步更新
+>     a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
+> }
+>
+> // 3. Service 新增方法（与 ScheduleUpdate 平行，只是 extractor 来源不同）
+> func (s *Service) ScheduleUpdateWith(sessionID string, messages []models.Message, ext Extractor) {
+>     cloned := cloneMessages(messages)
+>     go func() {
+>         ctx, cancel := context.WithTimeout(context.Background(), s.updateTimeout)
+>         defer cancel()
+>         current, _ := s.storage.Load(ctx, sessionID)
+>         update, err := ext.ExtractUpdate(ctx, current, cloned)
+>         if err != nil { s.logf(...); return }
+>         update = sanitizeUpdateForStorage(update)
+>         merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(cloned), time.Now().UTC())
+>         s.storage.Save(ctx, merged)
+>     }()
+> }
+> ```
+
+**公共逻辑**（存储部分可在启动时创建一次）：
 ```
-公共逻辑（可提取为 pkg/memory/bridge.go 或类似）：
   + databaseURL := os.Getenv("DEEPAI_DATABASE_URL")
   + memStore, _ := memory.OpenStore(ctx, databaseURL)  // 支持 PG/SQLite/FileStore
-  + memExtractor := memory.NewLLMClient(provider, modelName)
-  + memService := memory.NewService(memStore, memExtractor)
-
-CLI 入口 (cmd/deepai/main.go)：
-  + 初始化 memService，传入每次创建的 AgentConfig
-
-Gateway 入口 (pkg/gateway/server.go)：
-  + server 初始化时创建 memService
-  + 每个 chat 请求构建 AgentConfig 时传入 memService
+  + memService := memory.NewService(memStore, nil)      // extractor 由请求侧提供
 ```
 
-**效果**：完成最基础的闭环——每轮对话后提取记忆，下次对话注入系统提示词。CLI 和 Gateway 行为一致。
+**CLI 入口 (cmd/deepai/main.go)**：
+```
+  + extractor := memory.NewLLMClient(provider, modelName)
+  + AgentConfig 中传入 MemoryService: memService, MemoryExtractor: extractor
+```
+
+**Gateway 入口 (pkg/gateway/server.go + handlers.go)**：
+```
+  + Server 启动时创建 memService（固定存储）
+  + 每个请求在 newRuntime() 中：用当前请求的 provider/model 构造 extractor
+  + extractor := memory.NewLLMClient(providerFor(req.Model), modelName)
+  + AgentConfig 中传入 MemoryService: s.memService, MemoryExtractor: extractor
+```
+
+**效果**：完成最基础的闭环——每轮对话后提取记忆，下次对话注入系统提示词。
+CLI 和 Gateway 行为一致，且记忆提取始终使用与主对话相同的模型。
+后续文档中所有记忆更新调用均使用 `ScheduleUpdateWith`。
 
 ---
 
-### 阶段二：记忆工具 + 容量控制
+### 阶段二：基础能力 + 主路径接线
 
 **目标**：让 Agent 能主动操作记忆，引入容量上限防止无限增长。
 
@@ -717,7 +762,7 @@ func MemoryTool(memService *memory.Service) models.Tool {
 - `replace_fact` → 按 ID 更新 content/category
 - `remove_fact` → 按 ID 删除
 - `read` → 返回当前所有 Fact 的摘要
-- User/History 字段不通过工具直接修改，仍由 LLM Extractor 在 `ScheduleUpdate` 中维护
+- User/History 字段不通过工具直接修改，仍由 LLM Extractor 在 `ScheduleUpdateWith` 中维护
 - 避免了字符串匹配 replace 的脆弱性，与 `Merge` 的 ID-based 合并逻辑一致
 
 #### 2.2 容量上限
@@ -750,7 +795,7 @@ const (
 
 ---
 
-### 阶段三：Nudge + Flush + 压缩前保存
+### 阶段三：sessionStore 扩展 + Nudge/Flush
 
 **目标**：覆盖"该记住什么"的所有场景。
 
@@ -763,34 +808,49 @@ const (
 **方案：将 nudge 计数器存在 session metadata 中**。
 
 ```go
-// 不放在 Agent 结构体，而是通过 session 级别追踪
-
-// CLI 路径：计数器在 main.go 的 history 外层维护
+// CLI 路径：计数器在 main.go 的 history 外层维护（简单直接）
 type cliSession struct {
     history           []models.Message
     turnsSinceMemory  int       // 跨 Agent 实例累积
     memoryNudgeInterval int     // 默认 10
 }
+```
 
-// Gateway 路径：计数器存在 session store 的 metadata 中
-// session.Metadata["memory_nudge_count"] = "3"
+> **Gateway 路径的关键障碍**：当前 `sessionStore` 接口只有 `Load/Save`（`server.go:60-63`），
+> 且 `saveSession` 重建 Session 时不携带 Metadata（`handlers.go:239-247`）。
+> 这意味着即使用 `session.Metadata["memory_nudge_count"]` 存入，下次请求也读不回来。
+>
+> **解决方案**：在接入记忆前，先扩展 Gateway 的 session 存储链：
+> 1. `sessionStore.Load` 返回完整 `models.Session`（包含 Metadata），而非仅 `[]models.Message`
+> 2. `saveSession` 保留 Metadata（merge 而非重建）
+> 3. 此改动是阶段二/三的前置条件，必须先于 Nudge 实现
+
+```go
+// 修正后的 sessionStore 接口
+type sessionStore interface {
+    LoadSession(ctx context.Context, sessionID string) (models.Session, error)  // 返回完整 Session
+    SaveSession(ctx context.Context, session models.Session) error
+}
+
+// nudge 计数器通过 session.Metadata 读写
+// 保存时 merge: metadata["memory_nudge_count"] = strconv.Itoa(count)
+// 加载时读取: count, _ := strconv.Atoi(session.Metadata["memory_nudge_count"])
 ```
 
 每次 Agent.Run 返回后，在调用侧检查：
 ```go
 session.turnsSinceMemory++
 if session.turnsSinceMemory >= session.memoryNudgeInterval {
-    // 后台审查：复用 Extractor 做一次额外 Update
-    go memService.Update(ctx, sessionID, recentMessages)
+    // 后台审查：复用当前请求的 extractor（通过 ScheduleUpdateWith）
+    // extractor 需要在请求上下文中传递下来（CLI 从外层结构体取，Gateway 从 prepareRun 返回值取）
+    go memService.ScheduleUpdateWith(sessionID, recentMessages, extractor)
     session.turnsSinceMemory = 0
 }
+// 保存回 session.Metadata
 ```
 
 如果 Agent 在本轮主动使用了 `memory` 工具（通过检查 result.Messages 中的 tool_call），
 则重置计数器。
-
-**备选方案**（更简洁但需要新抽象）：将计数器封装在 `memory.Service` 本身，
-通过 `Service.OnTurnEnd(sessionID, usedMemoryTool bool)` 方法管理。
 
 #### 3.2 后台 Nudge 实现
 
@@ -799,11 +859,14 @@ if session.turnsSinceMemory >= session.memoryNudgeInterval {
 ```
 nudgeMemoryReview:
   1. 取最近 N 条消息（非全部历史）
-  2. 调用 LLM（可用更便宜模型）执行 ExtractUpdate
-  3. 如果有更新，调用 Service.Update 保存
+  2. 复用当前请求的 extractor（或构造一个便宜模型的 extractor）
+  3. 调用 ScheduleUpdateWith(sessionID, recentMessages, extractor) 保存
 ```
 
-复用现有的 `Extractor` 接口——nudge 本质上就是一次额外的 `Update` 调用，只是触发方式不同。
+复用现有的 `Extractor` 接口——nudge 本质上就是一次额外的 `ScheduleUpdateWith` 调用，
+只是触发方式不同。extractor 来源：
+- **CLI**：直接复用 `cliSession` 持有的 extractor（与主对话同模型）
+- **Gateway**：从请求上下文传递，或用默认 model 构造一个专门的 nudge extractor
 
 #### 3.3 压缩前 Flush
 
@@ -813,8 +876,8 @@ nudgeMemoryReview:
 // pkg/agent/react.go — compaction 分支中
 if ratio >= a.compactionThreshold {
     // 新增：压缩前先保存记忆
-    if a.memoryService != nil {
-        a.memoryService.ScheduleUpdate(sessionID, runMessages)
+    if a.memoryService != nil && a.memoryExtractor != nil {
+        a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
     }
     compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
     // ...
@@ -826,14 +889,14 @@ if ratio >= a.compactionThreshold {
 在 `Run()` 返回 `RunResult` 之前（正常结束路径）：
 ```go
 // 确保最终状态被持久化
-if a.memoryService != nil {
-    a.memoryService.ScheduleUpdate(sessionID, runMessages)
+if a.memoryService != nil && a.memoryExtractor != nil {
+    a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
 }
 ```
 
 ---
 
-### 阶段四：会话搜索 + 记忆老化
+### 阶段四：跨会话 + 搜索 + 老化
 
 **目标**：实现跨会话召回和自动清理。
 
@@ -902,14 +965,42 @@ func buildSystemPromptWithMemory(memService, sessionID, userID string) string {
 
 **更新时同时更新两个 Scope**：
 ```go
-// ScheduleUpdate 同时更新会话级和用户级
-memService.ScheduleUpdate(sessionID, messages)
+// 会话级更新：用当前请求的 extractor
+memService.ScheduleUpdateWith(sessionID, messages, extractor)
+
+// 用户级更新：同一个 extractor，异步执行
 if userID != "" {
-    memService.ScheduleScopeUpdate(UserScope(userID), messages)
+    go func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        // 需要新增 UpdateScopeWith（与 UpdateWith 平行的 Scope 版本）
+        memService.UpdateScopeWith(ctx, UserScope(userID), messages, extractor)
+    }()
 }
 ```
 
-**优势**：零 schema 变更，利用已有的 Scope 基础设施。
+**前置条件：新增 `UpdateScopeWith`**：
+```go
+// pkg/memory/memory.go 新增
+func (s *Service) UpdateScopeWith(ctx context.Context, scope Scope, messages []models.Message, ext Extractor) error {
+    return s.UpdateWith(ctx, scope.Key(), messages, ext)
+}
+
+// UpdateWith 是 Update 的 extractor-external 版本（不依赖 Service.extractor）
+func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []models.Message, ext Extractor) error {
+    // 与 Update 相同逻辑，但用传入的 ext 替代 s.extractor
+    filtered := filterMessagesForMemory(messages)
+    if len(filtered) == 0 { return nil }
+    current, _ := s.storage.Load(ctx, sessionID)
+    update, err := ext.ExtractUpdate(ctx, current, cloneMessages(filtered))
+    if err != nil { return err }
+    update = sanitizeUpdateForStorage(update)
+    merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(filtered), time.Now().UTC())
+    return s.storage.Save(ctx, merged)
+}
+```
+
+这样所有更新路径统一为显式传入 extractor，`Service.extractor` 字段在 Gateway 场景下可安全为 nil。
 
 #### 4.3 记忆老化
 
@@ -961,21 +1052,37 @@ func ScanContent(content string) error { ... }
   │   ✓ 同步测试文件（6→16 个测试）
   │   ✓ 新增 modernc.org/sqlite 依赖
   │
-阶段二（接线 + 记忆工具）── 2-3 天
-  │   Agent 接入记忆注入 + ScheduleUpdate
-  │   CLI 启动初始化 memory.Service
-  │   memory 工具 (add/replace/remove/read)
-  │   MEMORY_GUIDANCE 行为指导
+阶段二（基础能力 + 主路径接线）── 2-3 天
   │
-阶段三（Nudge/Flush）── 2-3 天
-  │   Nudge 计数器 + 后台审查
-  │   压缩前 Flush
-  │   会话结束 Flush
+  │ 2a. Service 层扩展
+  │     ✓ UpdateWith / UpdateScopeWith / ScheduleUpdateWith
+  │     ✓ AgentConfig 新增 MemoryService + MemoryExtractor
   │
-阶段四（搜索/老化）── 3-5 天
-      PostgreSQL tsvector 会话搜索
-      记忆老化 + 信任评分
-      安全扫描
+  │ 2b. CLI + Gateway 主路径
+  │     ✓ CLI: 初始化 memService + extractor, 注入系统提示词, 每轮结束 ScheduleUpdateWith
+  │     ✓ Gateway: server 持有 memStore, 每请求构造 extractor, 注入 + ScheduleUpdateWith
+  │     ✓ MEMORY_GUIDANCE 行为指导
+  │
+  │ 2c. memory 工具
+  │     ✓ add_fact / replace_fact / remove_fact / read (Fact ID-based)
+  │     ✓ 容量上限
+  │
+阶段三（sessionStore 扩展 + Nudge/Flush）── 2-3 天
+  │
+  │ 3a. sessionStore 扩展（Nudge 的前置条件）
+  │     ✓ sessionStore.LoadSession → 返回完整 Session（含 Metadata）
+  │     ✓ saveSession 保留 Metadata（merge 而非重建）
+  │
+  │ 3b. Nudge + Flush
+  │     ✓ Nudge 计数器存 session.Metadata, 跨请求累积
+  │     ✓ 压缩前 ScheduleUpdateWith
+  │     ✓ 会话结束 ScheduleUpdateWith
+  │
+阶段四（跨会话 + 搜索 + 老化）── 3-5 天
+      ✓ UserScope 注入/更新（UpdateScopeWith）
+      ✓ PostgreSQL tsvector 会话搜索（仅 PG 后端）
+      ✓ 记忆老化 + 信任评分
+      ✓ 安全扫描
 ```
 
 ---
@@ -1042,5 +1149,8 @@ DeepAI 方案：Extractor.ExtractUpdate → 单次 LLM 调用 → JSON 输出 �
 5. ~~memory 工具用 memory/user 桶~~ → **直接操作 Fact（ID-based）**（对齐三段式数据模型）
 6. ~~HistoryMemory 两字段~~ → **三字段**（`RecentMonths` + `EarlierContext` + `LongTermBackground`）
 7. ~~InjectWithContext 四参数~~ → **三参数** `(ctx, sessionID, currentContext string)`（token 预算硬编码 2000）
+8. ~~Gateway 用固定 extractor~~ → **选定方案：AgentConfig 传入 extractor + Service 新增 ScheduleUpdateWith**（`server.go:201-214` provider/model 按请求解析；所有后续调用统一用 `ScheduleUpdateWith`）
+9. ~~Nudge 存 session metadata~~ → **先扩展 sessionStore**（当前 `sessionStore.Load` 只返回 `[]models.Message`，`saveSession` 不携带 Metadata，`server.go:60-63` + `handlers.go:239-247`）
+10. ~~ScheduleScopeUpdate 已存在~~ → **不存在**，且 `UpdateScope`/`Update` 依赖 `Service.extractor`（Gateway 场景为 nil）；需新增 `UpdateWith` + `UpdateScopeWith` + `ScheduleUpdateWith` 三个方法，全部显式接受外部 extractor
 
 **当前进度**：三大问题中"需要时怎么找到"的基础能力已通过原版同步解决。剩余集中在"该记住什么"（触发机制）和"过时怎么清理"（老化策略）两个方向。
