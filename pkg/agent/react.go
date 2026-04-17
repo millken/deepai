@@ -57,6 +57,9 @@ type Agent struct {
 	memoryService   *memory.Service
 	memoryExtractor memory.Extractor
 	memoryUserID    string
+
+	// Skill tracking for memory source tagging
+	activeSkill atomic.Value // stores string
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -104,6 +107,19 @@ func New(cfg AgentConfig) *Agent {
 
 // AppendSystemPrompt appends extra text to the agent's system prompt.
 // Must be called before Run.
+// ActiveSkill returns the name of the currently active skill, or "" if none.
+func (a *Agent) ActiveSkill() string {
+	if a == nil {
+		return ""
+	}
+	v := a.activeSkill.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
 func (a *Agent) AppendSystemPrompt(extra string) {
 	extra = strings.TrimSpace(extra)
 	if extra == "" {
@@ -156,6 +172,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	a.started = true
 	a.runMu.Unlock()
 	defer a.closeEvents()
+
+	// Reset skill tracking for this run.
+	a.activeSkill.Store("")
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -212,7 +231,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			if ratio >= a.compactionThreshold {
 				// Flush memory before compaction to preserve info that would be lost.
 				if a.memoryService != nil && a.memoryExtractor != nil {
-					a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
+					if skillName := a.ActiveSkill(); skillName != "" {
+						a.memoryService.ScheduleUpdateWithFactSource(sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
+					} else {
+						a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
+					}
 				}
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
@@ -378,6 +401,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					if sp, _ := m.(string); sp != "" {
 						a.removeSkillDescriptions()
 						a.AppendSystemPrompt(sp)
+					}
+				}
+				// Track active skill for memory source tagging.
+				if skillName, ok := result.Data["skill_name"]; ok {
+					if name, _ := skillName.(string); name != "" {
+						a.activeSkill.Store(name)
 					}
 				}
 			}

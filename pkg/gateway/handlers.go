@@ -100,7 +100,7 @@ func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, er
 		return chatResponse{}, err
 	}
 
-	session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata)
+	session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata, runAgent)
 
 	resp := chatResponse{
 		SessionID:    req.SessionID,
@@ -166,7 +166,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 			Usage:        result.Usage,
 			MessageCount: len(result.Messages),
 		}
-		session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata)
+		session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata, runAgent)
 		if saveErr := s.saveSession(r.Context(), req, result.Messages, session.Metadata); saveErr != nil {
 			outcomes <- outcome{err: saveErr}
 			return
@@ -256,18 +256,29 @@ func (s *Server) saveSession(ctx context.Context, req chatRequest, messages []mo
 
 // updateMemoryAndNudge runs a scheduled memory update and manages the nudge counter
 // in session metadata. Also updates UserScope if userID is non-empty. Returns the updated metadata.
-func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []models.Message, ext memory.Extractor, metadata map[string]string) map[string]string {
+func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []models.Message, ext memory.Extractor, metadata map[string]string, runAgent *agent.Agent) map[string]string {
 	if s.memService == nil || ext == nil {
 		return metadata
 	}
 
 	// Update user-level memory (cross-session) if userID is set.
+	// Merge skill usage recording into the same update cycle to avoid concurrent-write races.
 	if userID != "" {
+		skillName := ""
+		if runAgent != nil {
+			skillName = runAgent.ActiveSkill()
+		}
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := s.memService.UpdateScopeWith(ctx, memory.UserScope(userID), messages, ext); err != nil {
-				s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
+			if skillName != "" {
+				if err := s.memService.UpdateScopeWithSkillUsage(ctx, memory.UserScope(userID), messages, ext, skillName); err != nil {
+					s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
+				}
+			} else {
+				if err := s.memService.UpdateScopeWith(ctx, memory.UserScope(userID), messages, ext); err != nil {
+					s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
+				}
 			}
 		}()
 	}
@@ -287,8 +298,17 @@ func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []model
 	}
 	// Schedule async update; skip when memory tool was used (it already saved).
 	if !usedMemory {
-		s.memService.ScheduleUpdateWith(sessionID, messages, ext)
+		if runAgent != nil {
+			if skillName := runAgent.ActiveSkill(); skillName != "" {
+				s.memService.ScheduleUpdateWithFactSource(sessionID, messages, ext, "skill:"+skillName)
+			} else {
+				s.memService.ScheduleUpdateWith(sessionID, messages, ext)
+			}
+		} else {
+				s.memService.ScheduleUpdateWith(sessionID, messages, ext)
+		}
 	}
+
 	metadata["memory_nudge_count"] = strconv.Itoa(count)
 	return metadata
 }

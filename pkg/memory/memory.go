@@ -257,6 +257,199 @@ func (s *Service) ScheduleUpdate(sessionID string, messages []models.Message) {
 	}()
 }
 
+// UpdateWithFactSource is like UpdateWith but overrides the fact source
+// for all new facts in this update. Pass "" for factSource to use default behavior.
+func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, messages []models.Message, ext Extractor, factSource string) error {
+	if s == nil {
+		return errors.New("memory service is nil")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("session id is required")
+	}
+	if s.storage == nil {
+		return errors.New("memory storage is not configured")
+	}
+	if ext == nil {
+		return errors.New("memory extractor is required")
+	}
+	filteredMessages := filterMessagesForMemory(messages)
+	if len(filteredMessages) == 0 {
+		return nil
+	}
+
+	current, err := s.storage.Load(ctx, sessionID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("load memory %q: %w", sessionID, err)
+	}
+
+	update, err := ext.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))
+	if err != nil {
+		return err
+	}
+	update = sanitizeUpdateForStorage(update)
+
+	source := strings.TrimSpace(factSource)
+	if source == "" {
+		source = factSourceFromMessages(filteredMessages)
+	}
+	merged := MergeWithFactSource(current, update, sessionID, source, time.Now().UTC())
+	return s.storage.Save(ctx, merged)
+}
+
+// ScheduleUpdateWithFactSource is like ScheduleUpdateWith but overrides the fact source.
+func (s *Service) ScheduleUpdateWithFactSource(sessionID string, messages []models.Message, ext Extractor, factSource string) {
+	if s == nil || s.storage == nil || ext == nil || len(messages) == 0 {
+		return
+	}
+
+	timeout := s.updateTimeout
+	if timeout <= 0 {
+		timeout = defaultUpdateTimeout
+	}
+	cloned := cloneMessages(messages)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		if err := s.UpdateWithFactSource(ctx, sessionID, cloned, ext, factSource); err != nil {
+			s.logf("async update with fact source failed for session %s: %v", sessionID, err)
+		}
+	}()
+}
+
+// UpdateScopeWithSkillUsage performs a user-scope memory update and records skill
+// usage in a single Load+Save cycle, avoiding concurrent-write data loss.
+func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, messages []models.Message, ext Extractor, skillName string) error {
+	if s == nil {
+		return errors.New("memory service is nil")
+	}
+	sessionID := scope.Key()
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("scope key is required")
+	}
+	if s.storage == nil {
+		return errors.New("memory storage is not configured")
+	}
+
+	// Step 1: Run LLM extraction (may take time, do before loading doc).
+	filteredMessages := filterMessagesForMemory(messages)
+	var update Update
+	if ext != nil && len(filteredMessages) > 0 {
+		current, err := s.storage.Load(ctx, sessionID)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("load memory %q: %w", sessionID, err)
+		}
+		extracted, err := ext.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))
+		if err != nil {
+			return err
+		}
+		update = sanitizeUpdateForStorage(extracted)
+	}
+
+	// Step 2: Load fresh doc, merge LLM extraction + skill usage, save once.
+	current, err := s.storage.Load(ctx, sessionID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("load memory %q: %w", sessionID, err)
+	}
+
+	source := factSourceFromMessages(filteredMessages)
+	merged := MergeWithFactSource(current, update, sessionID, source, time.Now().UTC())
+
+	// Append skill usage fact (idempotent by fact ID).
+	skillName = strings.TrimSpace(skillName)
+	if skillName != "" {
+		factID := "skill-usage:" + skillName
+		found := false
+		for _, f := range merged.Facts {
+			if f.ID == factID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			factContent := "用户使用了 /" + skillName + " 技能"
+			if scanErr := ScanContent(factContent); scanErr != nil {
+				s.logf("skill usage fact blocked by security for %s: %v", skillName, scanErr)
+			} else {
+				now := time.Now().UTC()
+				merged.Facts = append(merged.Facts, Fact{
+					ID:         factID,
+					Content:    factContent,
+					Category:   "skill_usage",
+					Confidence: 1.0,
+					Source:     "skill:" + skillName,
+					CreatedAt:  now,
+					UpdatedAt:  now,
+				})
+				merged.UpdatedAt = now
+			}
+		}
+	}
+
+	return s.storage.Save(ctx, merged)
+}
+
+// RecordSkillUsage saves a fact recording that a skill was used.
+// Idempotent per (sessionID, skillName) — skips if already recorded.
+func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillName string) error {
+	if s == nil || s.storage == nil {
+		return errors.New("memory service or storage is nil")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	skillName = strings.TrimSpace(skillName)
+	if sessionID == "" || skillName == "" {
+		return nil
+	}
+
+	factID := "skill-usage:" + skillName
+	factContent := "用户使用了 /" + skillName + " 技能"
+
+	current, err := s.storage.Load(ctx, sessionID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("load memory for skill usage %q: %w", sessionID, err)
+	}
+
+	// Dedup: skip if already recorded.
+	for _, f := range current.Facts {
+		if f.ID == factID {
+			return nil
+		}
+	}
+
+	if err := ScanContent(factContent); err != nil {
+		return fmt.Errorf("skill usage fact blocked by security: %w", err)
+	}
+
+	now := time.Now().UTC()
+	current.SessionID = sessionID
+	current.Facts = append(current.Facts, Fact{
+		ID:         factID,
+		Content:    factContent,
+		Category:   "skill_usage",
+		Confidence: 1.0,
+		Source:     "skill:" + skillName,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	})
+	current.UpdatedAt = now
+	return s.storage.Save(ctx, current)
+}
+
+// ScheduleRecordSkillUsage is the async fire-and-forget variant of RecordSkillUsage.
+func (s *Service) ScheduleRecordSkillUsage(sessionID string, skillName string) {
+	if s == nil || s.storage == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(skillName) == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.RecordSkillUsage(ctx, sessionID, skillName); err != nil {
+			s.logf("record skill usage failed for session %s skill %s: %v", sessionID, skillName, err)
+		}
+	}()
+}
+
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
 	return s.InjectWithContext(ctx, sessionID, "")
 }
