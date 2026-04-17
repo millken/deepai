@@ -261,26 +261,18 @@ func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []model
 		return metadata
 	}
 
-	// Update user-level memory (cross-session) if userID is set.
-	// Merge skill usage recording into the same update cycle to avoid concurrent-write races.
+	// Update user-level memory (cross-session) via the update queue.
 	if userID != "" {
 		skillName := ""
 		if runAgent != nil {
 			skillName = runAgent.ActiveSkill()
 		}
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if skillName != "" {
-				if err := s.memService.UpdateScopeWithSkillUsage(ctx, memory.UserScope(userID), messages, ext, skillName); err != nil {
-					s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
-				}
-			} else {
-				if err := s.memService.UpdateScopeWith(ctx, memory.UserScope(userID), messages, ext); err != nil {
-					s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
-				}
-			}
-		}()
+		scope := memory.UserScope(userID)
+		if skillName != "" {
+			s.memService.ScheduleScopeUpdateWithSkill(scope, messages, ext, skillName)
+		} else {
+			s.memService.ScheduleUpdateWith(scope.Key(), messages, ext)
+		}
 	}
 
 	if metadata == nil {

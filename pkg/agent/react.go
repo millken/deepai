@@ -229,13 +229,20 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			estimated := estimateTokens(runMessages, a.systemPrompt, a.lastInputTokens)
 			ratio := float64(estimated) / float64(a.contextWindow)
 			if ratio >= a.compactionThreshold {
-				// Flush memory before compaction to preserve info that would be lost.
+				// Flush memory synchronously before compaction to guarantee no data loss.
+				// This blocks while the LLM extracts, but compaction is infrequent
+				// and losing information is worse than the latency cost.
 				if a.memoryService != nil && a.memoryExtractor != nil {
+					// Cancel any queued update for this session so the
+					// stale async job won't overwrite our sync flush.
+					a.memoryService.CancelPendingUpdates(sessionID)
+					flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
 					if skillName := a.ActiveSkill(); skillName != "" {
-						a.memoryService.ScheduleUpdateWithFactSource(sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
+						_ = a.memoryService.UpdateWithFactSource(flushCtx, sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
 					} else {
-						a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
+						_ = a.memoryService.UpdateWith(flushCtx, sessionID, runMessages, a.memoryExtractor)
 					}
+					flushCancel()
 				}
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)

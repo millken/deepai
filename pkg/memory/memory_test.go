@@ -311,15 +311,13 @@ func TestScheduleUpdateGracefulDegradation(t *testing.T) {
 		CreatedAt: time.Now().UTC(),
 	}})
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		if strings.Contains(buf.String(), "async update failed") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected async failure log, got %q", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Close the queue to drain pending jobs.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = service.Close(ctx)
+
+	if !strings.Contains(buf.String(), "async update failed") {
+		t.Fatalf("expected async failure log, got %q", buf.String())
 	}
 
 	if _, err := store.Load(context.Background(), "session-err"); !errors.Is(err, ErrNotFound) {

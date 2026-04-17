@@ -79,15 +79,18 @@ type Service struct {
 	extractor     Extractor
 	logger        *log.Logger
 	updateTimeout time.Duration
+	queue         *UpdateQueue
 }
 
 func NewService(storage Storage, extractor Extractor) *Service {
-	return &Service{
+	svc := &Service{
 		storage:       storage,
 		extractor:     extractor,
 		logger:        log.New(os.Stderr, "memory: ", log.LstdFlags),
 		updateTimeout: defaultUpdateTimeout,
 	}
+	svc.queue = newUpdateQueue(svc, defaultQueueSize)
+	return svc
 }
 
 func (s *Service) WithLogger(logger *log.Logger) *Service {
@@ -102,6 +105,23 @@ func (s *Service) WithUpdateTimeout(timeout time.Duration) *Service {
 		s.updateTimeout = timeout
 	}
 	return s
+}
+
+// Close drains the update queue and releases resources.
+func (s *Service) Close(ctx context.Context) error {
+	if s == nil || s.queue == nil {
+		return nil
+	}
+	return s.queue.Close(ctx)
+}
+
+// CancelPendingUpdates removes any queued update for the given session,
+// preventing stale async jobs from overwriting a subsequent synchronous flush.
+func (s *Service) CancelPendingUpdates(sessionID string) {
+	if s == nil || s.queue == nil {
+		return
+	}
+	s.queue.cancelPending("update:" + sessionID)
 }
 
 func (s *Service) AutoMigrate(ctx context.Context) error {
@@ -213,49 +233,7 @@ func (s *Service) UpdateScopeWith(ctx context.Context, scope Scope, messages []m
 	return s.UpdateWith(ctx, scope.Key(), messages, ext)
 }
 
-// ScheduleUpdateWith runs UpdateWith in the background and never propagates errors.
-func (s *Service) ScheduleUpdateWith(sessionID string, messages []models.Message, ext Extractor) {
-	if s == nil || s.storage == nil || ext == nil || len(messages) == 0 {
-		return
-	}
 
-	timeout := s.updateTimeout
-	if timeout <= 0 {
-		timeout = defaultUpdateTimeout
-	}
-	cloned := cloneMessages(messages)
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
-		if err := s.UpdateWith(ctx, sessionID, cloned, ext); err != nil {
-			s.logf("async update with failed for session %s: %v", sessionID, err)
-		}
-	}()
-}
-
-// ScheduleUpdate runs memory extraction in the background and never propagates errors.
-func (s *Service) ScheduleUpdate(sessionID string, messages []models.Message) {
-	if s == nil || s.storage == nil || s.extractor == nil || len(messages) == 0 {
-		return
-	}
-
-	timeout := s.updateTimeout
-	if timeout <= 0 {
-		timeout = defaultUpdateTimeout
-	}
-	cloned := cloneMessages(messages)
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
-		if err := s.Update(ctx, sessionID, cloned); err != nil {
-			s.logf("async update failed for session %s: %v", sessionID, err)
-		}
-	}()
-}
 
 // UpdateWithFactSource is like UpdateWith but overrides the fact source
 // for all new facts in this update. Pass "" for factSource to use default behavior.
@@ -296,27 +274,7 @@ func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, me
 	return s.storage.Save(ctx, merged)
 }
 
-// ScheduleUpdateWithFactSource is like ScheduleUpdateWith but overrides the fact source.
-func (s *Service) ScheduleUpdateWithFactSource(sessionID string, messages []models.Message, ext Extractor, factSource string) {
-	if s == nil || s.storage == nil || ext == nil || len(messages) == 0 {
-		return
-	}
 
-	timeout := s.updateTimeout
-	if timeout <= 0 {
-		timeout = defaultUpdateTimeout
-	}
-	cloned := cloneMessages(messages)
-
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
-		if err := s.UpdateWithFactSource(ctx, sessionID, cloned, ext, factSource); err != nil {
-			s.logf("async update with fact source failed for session %s: %v", sessionID, err)
-		}
-	}()
-}
 
 // UpdateScopeWithSkillUsage performs a user-scope memory update and records skill
 // usage in a single Load+Save cycle, avoiding concurrent-write data loss.
@@ -436,19 +394,7 @@ func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillN
 	return s.storage.Save(ctx, current)
 }
 
-// ScheduleRecordSkillUsage is the async fire-and-forget variant of RecordSkillUsage.
-func (s *Service) ScheduleRecordSkillUsage(sessionID string, skillName string) {
-	if s == nil || s.storage == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(skillName) == "" {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := s.RecordSkillUsage(ctx, sessionID, skillName); err != nil {
-			s.logf("record skill usage failed for session %s skill %s: %v", sessionID, skillName, err)
-		}
-	}()
-}
+
 
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
 	return s.InjectWithContext(ctx, sessionID, "")
@@ -481,21 +427,7 @@ func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, curre
 	return s.InjectWithContext(ctx, scope.Key(), currentContext)
 }
 
-// scheduleRetrievalIncrement asynchronously increments RetrievalCount for facts
-// that were selected during injection. Uses atomic storage-layer update to avoid
-// load-modify-save races.
-func (s *Service) scheduleRetrievalIncrement(sessionID string, factIDs []string) {
-	if s == nil || s.storage == nil || len(factIDs) == 0 {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := s.storage.IncrementRetrievalCounts(ctx, sessionID, factIDs); err != nil {
-			s.logf("increment retrieval counts failed for session %s: %v", sessionID, err)
-		}
-	}()
-}
+
 
 func Merge(current Document, update Update, sessionID string, now time.Time) Document {
 	return MergeWithFactSource(current, update, sessionID, "", now)

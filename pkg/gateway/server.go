@@ -144,6 +144,13 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 		cleanupFns = append(cleanupFns, memStore.Close)
 		memService = memory.NewService(memStore, nil)
+		// Register memService.Close AFTER memStore.Close so that on reversed
+		// cleanup the queue drains first, then the underlying store closes.
+		cleanupFns = append(cleanupFns, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = memService.Close(ctx)
+		})
 		if err := memService.AutoMigrate(context.Background()); err != nil {
 			cfg.Logger.Printf("memory auto-migrate warning: %v", err)
 		}
