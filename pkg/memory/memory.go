@@ -15,6 +15,12 @@ import (
 
 const defaultUpdateTimeout = 30 * time.Second
 
+// Capacity limits for memory content.
+const (
+	MaxFactsPerSession = 30   // Maximum facts per session
+	MaxFactContentLen  = 500  // Maximum characters per fact content
+)
+
 // Document is the durable memory snapshot for a single session.
 type Document struct {
 	SessionID string        `json:"session_id"`
@@ -38,13 +44,15 @@ type HistoryMemory struct {
 }
 
 type Fact struct {
-	ID         string    `json:"id"`
-	Content    string    `json:"content"`
-	Category   string    `json:"category,omitempty"`
-	Confidence float64   `json:"confidence,omitempty"`
-	Source     string    `json:"source,omitempty"`
-	CreatedAt  time.Time `json:"created_at,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at,omitempty"`
+	ID            string    `json:"id"`
+	Content       string    `json:"content"`
+	Category      string    `json:"category,omitempty"`
+	Confidence    float64   `json:"confidence,omitempty"`
+	Source        string    `json:"source,omitempty"`
+	RetrievalCount int      `json:"retrieval_count,omitempty"`
+	HelpfulCount  int      `json:"helpful_count,omitempty"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
 }
 
 // Update is the incremental output returned by the memory LLM.
@@ -59,6 +67,7 @@ type Storage interface {
 	AutoMigrate(ctx context.Context) error
 	Load(ctx context.Context, sessionID string) (Document, error)
 	Save(ctx context.Context, doc Document) error
+	IncrementRetrievalCounts(ctx context.Context, sessionID string, factIDs []string) error
 }
 
 type Extractor interface {
@@ -116,6 +125,14 @@ func (s *Service) LoadScope(ctx context.Context, scope Scope) (Document, error) 
 	return s.Load(ctx, scope.Key())
 }
 
+// Save persists a document directly (used by memory tool).
+func (s *Service) Save(ctx context.Context, doc Document) error {
+	if s == nil || s.storage == nil {
+		return errors.New("memory storage is not configured")
+	}
+	return s.storage.Save(ctx, doc)
+}
+
 func (s *Service) Update(ctx context.Context, sessionID string, messages []models.Message) error {
 	if s == nil {
 		return errors.New("memory service is nil")
@@ -154,6 +171,68 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 
 func (s *Service) UpdateScope(ctx context.Context, scope Scope, messages []models.Message) error {
 	return s.Update(ctx, scope.Key(), messages)
+}
+
+// UpdateWith performs a memory update using an externally provided extractor.
+// Unlike Update, it does not depend on the Service's own extractor field.
+func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []models.Message, ext Extractor) error {
+	if s == nil {
+		return errors.New("memory service is nil")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return errors.New("session id is required")
+	}
+	if s.storage == nil {
+		return errors.New("memory storage is not configured")
+	}
+	if ext == nil {
+		return errors.New("memory extractor is required")
+	}
+	filteredMessages := filterMessagesForMemory(messages)
+	if len(filteredMessages) == 0 {
+		return nil
+	}
+
+	current, err := s.storage.Load(ctx, sessionID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("load memory %q: %w", sessionID, err)
+	}
+
+	update, err := ext.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))
+	if err != nil {
+		return err
+	}
+	update = sanitizeUpdateForStorage(update)
+
+	merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(filteredMessages), time.Now().UTC())
+	return s.storage.Save(ctx, merged)
+}
+
+// UpdateScopeWith is the scope variant of UpdateWith.
+func (s *Service) UpdateScopeWith(ctx context.Context, scope Scope, messages []models.Message, ext Extractor) error {
+	return s.UpdateWith(ctx, scope.Key(), messages, ext)
+}
+
+// ScheduleUpdateWith runs UpdateWith in the background and never propagates errors.
+func (s *Service) ScheduleUpdateWith(sessionID string, messages []models.Message, ext Extractor) {
+	if s == nil || s.storage == nil || ext == nil || len(messages) == 0 {
+		return
+	}
+
+	timeout := s.updateTimeout
+	if timeout <= 0 {
+		timeout = defaultUpdateTimeout
+	}
+	cloned := cloneMessages(messages)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		if err := s.UpdateWith(ctx, sessionID, cloned, ext); err != nil {
+			s.logf("async update with failed for session %s: %v", sessionID, err)
+		}
+	}()
 }
 
 // ScheduleUpdate runs memory extraction in the background and never propagates errors.
@@ -198,11 +277,31 @@ func (s *Service) InjectWithContext(ctx context.Context, sessionID string, curre
 		}
 		return ""
 	}
-	return BuildInjectionWithContext(doc, currentContext, 2000)
+	injection, retrievedIDs := buildInjectionWithIDs(doc, currentContext, 2000)
+	if len(retrievedIDs) > 0 {
+		s.scheduleRetrievalIncrement(sessionID, retrievedIDs)
+	}
+	return injection
 }
 
 func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, currentContext string) string {
 	return s.InjectWithContext(ctx, scope.Key(), currentContext)
+}
+
+// scheduleRetrievalIncrement asynchronously increments RetrievalCount for facts
+// that were selected during injection. Uses atomic storage-layer update to avoid
+// load-modify-save races.
+func (s *Service) scheduleRetrievalIncrement(sessionID string, factIDs []string) {
+	if s == nil || s.storage == nil || len(factIDs) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.storage.IncrementRetrievalCounts(ctx, sessionID, factIDs); err != nil {
+			s.logf("increment retrieval counts failed for session %s: %v", sessionID, err)
+		}
+	}()
 }
 
 func Merge(current Document, update Update, sessionID string, now time.Time) Document {
@@ -298,6 +397,10 @@ func mergeFacts(existing, incoming []Fact, defaultSource string, now time.Time) 
 		if fact.ID == "" || fact.Content == "" {
 			continue
 		}
+		// Security: skip facts with dangerous content.
+		if err := ScanContent(fact.Content); err != nil {
+			continue
+		}
 		if fact.Confidence < 0 {
 			fact.Confidence = 0
 		}
@@ -332,7 +435,50 @@ func mergeFacts(existing, incoming []Fact, defaultSource string, now time.Time) 
 		return merged[i].UpdatedAt.After(merged[j].UpdatedAt)
 	})
 
-	return merged
+	return evictLowScoreFacts(merged, now)
+}
+
+// factScore computes an aging score for eviction ranking.
+// Higher score = more valuable, less likely to be evicted.
+// Formula: confidence * (1 + helpfulRatio) * recencyFactor
+func factScore(f Fact, now time.Time) float64 {
+	confidence := f.Confidence
+	if confidence <= 0 {
+		confidence = 0.1
+	}
+	helpfulRatio := 0.0
+	if f.RetrievalCount > 0 {
+		helpfulRatio = float64(f.HelpfulCount) / float64(f.RetrievalCount)
+	}
+	// Recency decay: half-life of 30 days.
+	ageDays := now.Sub(f.UpdatedAt).Hours() / 24
+	recency := 1.0 / (1.0 + ageDays/30.0)
+	return confidence * (1.0 + helpfulRatio) * recency
+}
+
+// evictLowScoreFacts trims facts to MaxFactsPerSession by removing the lowest-scored.
+func evictLowScoreFacts(facts []Fact, now time.Time) []Fact {
+	if len(facts) <= MaxFactsPerSession {
+		return facts
+	}
+	keep := MaxFactsPerSession
+	if keep <= 0 {
+		keep = 30
+	}
+	// Preserve newest facts (already sorted by UpdatedAt desc), evict from the tail.
+	candidateStart := keep / 2 // Always keep the top half by recency.
+	candidates := facts[candidateStart:]
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return factScore(candidates[i], now) > factScore(candidates[j], now)
+	})
+	remaining := keep - candidateStart
+	if remaining > len(candidates) {
+		remaining = len(candidates)
+	}
+	result := make([]Fact, 0, keep)
+	result = append(result, facts[:candidateStart]...)
+	result = append(result, candidates[:remaining]...)
+	return result
 }
 
 func cloneMessages(messages []models.Message) []models.Message {

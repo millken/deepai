@@ -17,6 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/logs"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
@@ -55,6 +56,26 @@ func main() {
 		modelName = "demo-model"
 	}
 
+	// Memory service initialization
+	var memService *memory.Service
+	var memExtractor memory.Extractor
+	if databaseURL := strings.TrimSpace(os.Getenv("DEEPAI_DATABASE_URL")); databaseURL != "" {
+		memStore, err := memory.OpenStore(ctx, databaseURL)
+		if err != nil {
+			logs.Error.Error("memory store init failed", "err", err)
+			os.Exit(1)
+		}
+		defer memStore.Close()
+		memService = memory.NewService(memStore, nil)
+		if err := memService.AutoMigrate(ctx); err != nil {
+			logs.Warn.Warn("memory auto-migrate failed", "err", err)
+		}
+	}
+	if memService != nil {
+		memExtractor = memory.NewLLMClient(provider, modelName)
+		logs.Info.Info("memory service enabled")
+	}
+
 	contextWindow := 0
 	if v := strings.TrimSpace(os.Getenv("DEEPAI_CONTEXT_WINDOW")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -74,6 +95,12 @@ func main() {
 	) {
 		if err := registry.Register(tool); err != nil {
 			logs.Error.Error("register tool failed", "err", err)
+			os.Exit(1)
+		}
+	}
+	if memService != nil {
+		if err := registry.Register(builtin.MemoryTool(memService)); err != nil {
+			logs.Error.Error("register memory tool failed", "err", err)
 			os.Exit(1)
 		}
 	}
@@ -140,6 +167,8 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	sessionID := "interactive-session"
 	msgSeq := 0
+	turnsSinceMemory := 0
+	const memoryNudgeInterval = 10
 	var history []models.Message
 
 	for {
@@ -167,12 +196,14 @@ func main() {
 		})
 
 	agentRun := agent.New(agent.AgentConfig{
-			LLMProvider:   provider,
-			Tools:         registry,
-			Sandbox:       sb,
-			AgentType:     agent.AgentTypeCoder,
-			Model:         modelName,
-			ContextWindow: contextWindow,
+			LLMProvider:     provider,
+			Tools:           registry,
+			Sandbox:         sb,
+			AgentType:       agent.AgentTypeCoder,
+			Model:           modelName,
+			ContextWindow:   contextWindow,
+			MemoryService:   memService,
+			MemoryExtractor: memExtractor,
 		})
 
 		if desc := skillReg.Descriptions(); desc != "" {
@@ -216,6 +247,22 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 			continue
+		}
+
+		if memService != nil && memExtractor != nil {
+			used := usedMemoryTool(result.Messages)
+			if used {
+				turnsSinceMemory = 0
+			} else {
+				turnsSinceMemory++
+			}
+			if turnsSinceMemory >= memoryNudgeInterval {
+				turnsSinceMemory = 0
+				logs.Debug.Printf("[memory nudge] triggered after %d turns", memoryNudgeInterval)
+			}
+			if !used {
+				memService.ScheduleUpdateWith(sessionID, result.Messages, memExtractor)
+			}
 		}
 
 		history = result.Messages
@@ -370,4 +417,16 @@ func (p *scriptedProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-c
 		}
 	}()
 	return out, nil
+}
+
+// usedMemoryTool checks if the agent invoked the memory tool in the given messages.
+func usedMemoryTool(messages []models.Message) bool {
+	for _, msg := range messages {
+		for _, call := range msg.ToolCalls {
+			if call.Name == "memory" {
+				return true
+			}
+		}
+	}
+	return false
 }

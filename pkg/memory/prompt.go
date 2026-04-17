@@ -55,6 +55,12 @@ func BuildInjection(doc Document) string {
 }
 
 func BuildInjectionWithContext(doc Document, currentContext string, maxTokens int) string {
+	injection, _ := buildInjectionWithIDs(doc, currentContext, maxTokens)
+	return injection
+}
+
+// buildInjectionWithIDs returns the injection text and IDs of facts selected for retrieval tracking.
+func buildInjectionWithIDs(doc Document, currentContext string, maxTokens int) (string, []string) {
 	if maxTokens <= 0 {
 		maxTokens = 2000
 	}
@@ -80,7 +86,7 @@ func BuildInjectionWithContext(doc Document, currentContext string, maxTokens in
 		lines = append(lines, "Long Term Background: "+v)
 	}
 	base := strings.Join(lines, "\n")
-	selectedFacts := selectRelevantFacts(doc.Facts, currentContext, maxTokens-approximateTokenCount(base))
+	selectedFacts, selectedIDs := selectRelevantFacts(doc.Facts, currentContext, maxTokens-approximateTokenCount(base))
 	if len(selectedFacts) > 0 {
 		lines = append(lines, "Known Facts:")
 		for _, fact := range selectedFacts {
@@ -92,10 +98,10 @@ func BuildInjectionWithContext(doc Document, currentContext string, maxTokens in
 		}
 	}
 	if len(lines) == 1 {
-		return ""
+		return "", nil
 	}
 
-	return strings.Join(lines, "\n") + "\n\n## Current Session\n"
+	return strings.Join(lines, "\n") + "\n\n## Current Session\n", selectedIDs
 }
 
 func renderMessagesForPrompt(messages []models.Message) string {
@@ -128,9 +134,11 @@ func renderMessagesForPrompt(messages []models.Message) string {
 	return out
 }
 
-func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens int) []Fact {
+// selectRelevantFacts picks the most relevant facts for injection.
+// It returns the selected facts and their IDs for retrieval tracking.
+func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens int) ([]Fact, []string) {
 	if len(facts) == 0 || remainingTokens <= 0 {
-		return nil
+		return nil, nil
 	}
 
 	type scoredFact struct {
@@ -193,6 +201,7 @@ func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens in
 	})
 
 	selected := make([]Fact, 0, len(scored))
+	selectedIDs := make([]string, 0, len(scored))
 	usedTokens := 0
 	for _, item := range scored {
 		line := item.fact.Content
@@ -206,9 +215,10 @@ func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens in
 			break
 		}
 		selected = append(selected, item.fact)
+		selectedIDs = append(selectedIDs, item.fact.ID)
 		usedTokens += cost
 	}
-	return selected
+	return selected, selectedIDs
 }
 
 func approximateTokenCount(text string) int {

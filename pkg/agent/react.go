@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/tools"
@@ -51,6 +52,11 @@ type Agent struct {
 	compactionThreshold float64
 	compactionKeepTail  int
 	lastInputTokens     int
+
+	// Memory integration
+	memoryService   *memory.Service
+	memoryExtractor memory.Extractor
+	memoryUserID    string
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -90,6 +96,9 @@ func New(cfg AgentConfig) *Agent {
 		contextWindow:       cfg.ContextWindow,
 		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
 		compactionKeepTail:  resolveCompactionKeepTail(cfg.CompactionKeepTail),
+		memoryService:       cfg.MemoryService,
+		memoryExtractor:     cfg.MemoryExtractor,
+		memoryUserID:        cfg.MemoryUserID,
 	}
 }
 
@@ -201,6 +210,10 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			estimated := estimateTokens(runMessages, a.systemPrompt, a.lastInputTokens)
 			ratio := float64(estimated) / float64(a.contextWindow)
 			if ratio >= a.compactionThreshold {
+				// Flush memory before compaction to preserve info that would be lost.
+				if a.memoryService != nil && a.memoryExtractor != nil {
+					a.memoryService.ScheduleUpdateWith(sessionID, runMessages, a.memoryExtractor)
+				}
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 				if didCompact {
@@ -404,11 +417,25 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	}
 }
 
-func (a *Agent) BuildSystemPrompt(_ context.Context, _ string) string {
-	sections := []string{
-		strings.TrimSpace(a.systemPrompt),
-		"Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.",
+func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string) string {
+	sections := []string{strings.TrimSpace(a.systemPrompt)}
+
+	if a.memoryService != nil {
+		// Inject user-level memory (cross-session) first if userID is set.
+		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
+			if userMem := a.memoryService.InjectScope(ctx, memory.UserScope(uid)); userMem != "" {
+				sections = append(sections, userMem)
+			}
+		}
+		// Inject session-level memory.
+		if strings.TrimSpace(sessionID) != "" {
+			if injection := a.memoryService.InjectWithContext(ctx, sessionID, a.systemPrompt); injection != "" {
+				sections = append(sections, injection)
+			}
+		}
 	}
+
+	sections = append(sections, "Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.")
 	return strings.Join(sections, "\n\n")
 }
 

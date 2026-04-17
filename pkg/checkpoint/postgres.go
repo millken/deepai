@@ -37,6 +37,11 @@ create table if not exists messages (
 
 create index if not exists idx_messages_session
 	on messages(session_id, created_at);
+
+alter table messages add column if not exists tsv tsvector
+	generated always as (to_tsvector('simple', coalesce(content, ''))) stored;
+create index if not exists idx_messages_tsv
+	on messages using gin(tsv);
 `
 
 var ErrNotFound = errors.New("checkpoint record not found")
@@ -510,6 +515,53 @@ func (s *PostgresStore) DeleteMessages(ctx context.Context, sessionID string) er
 		return fmt.Errorf("delete messages for session %q: %w", sessionID, err)
 	}
 	return nil
+}
+
+// SearchMessagesResult holds a single search hit.
+type SearchMessagesResult struct {
+	SessionID string    `json:"session_id"`
+	MessageID string    `json:"message_id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// SearchMessages performs full-text search across all messages using the tsvector column.
+// It returns messages matching the query, grouped by session, up to limit results.
+func (s *PostgresStore) SearchMessages(ctx context.Context, query string, limit int) ([]SearchMessagesResult, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+
+	tsquery := " plainto_tsquery('simple', $1)"
+	sql := `select session_id, id, role, content, created_at
+		from messages
+		where tsv @@ ` + tsquery + `
+		order by ts_rank(tsv, ` + tsquery + `) desc, created_at desc
+		limit $2`
+
+	rows, err := s.db.Query(ctx, sql, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchMessagesResult
+	for rows.Next() {
+		var r SearchMessagesResult
+		if err := rows.Scan(&r.SessionID, &r.MessageID, &r.Role, &r.Content, &r.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan search result: %w", err)
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	return results, nil
 }
 
 func upsertSession(ctx context.Context, q interface {

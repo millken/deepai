@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/tools"
@@ -44,6 +45,11 @@ type AgentConfig struct {
 	ContextWindow        int     // model context window in tokens; 0 = no compaction
 	CompactionThreshold  float64 // fraction of ContextWindow to trigger compaction (default 0.75)
 	CompactionKeepTail   int     // number of recent messages to preserve (default 6)
+
+	// Memory integration
+	MemoryService   *memory.Service   // used for Inject into system prompt
+	MemoryExtractor memory.Extractor  // per-request extractor (matches the LLM model of the current request)
+	MemoryUserID    string            // user ID for cross-session UserScope memory (empty = disabled)
 }
 
 type TimeoutError struct {

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 )
 
@@ -88,7 +90,7 @@ func decodeChatRequest(w http.ResponseWriter, r *http.Request) (chatRequest, err
 }
 
 func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, error) {
-	history, modelName, runAgent, err := s.prepareRun(ctx, req)
+	history, modelName, runAgent, ext, session, err := s.prepareRun(ctx, req)
 	if err != nil {
 		return chatResponse{}, err
 	}
@@ -97,6 +99,8 @@ func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, er
 	if err != nil {
 		return chatResponse{}, err
 	}
+
+	session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata)
 
 	resp := chatResponse{
 		SessionID:    req.SessionID,
@@ -107,7 +111,7 @@ func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, er
 		MessageCount: len(result.Messages),
 	}
 
-	if err := s.saveSession(ctx, req, result.Messages); err != nil {
+	if err := s.saveSession(ctx, req, result.Messages, session.Metadata); err != nil {
 		return chatResponse{}, err
 	}
 	return resp, nil
@@ -120,7 +124,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 		return
 	}
 
-	history, modelName, runAgent, err := s.prepareRun(r.Context(), req)
+	history, modelName, runAgent, ext, session, err := s.prepareRun(r.Context(), req)
 	if err != nil {
 		writeError(w, errStatus(err), err)
 		return
@@ -162,7 +166,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 			Usage:        result.Usage,
 			MessageCount: len(result.Messages),
 		}
-		if saveErr := s.saveSession(r.Context(), req, result.Messages); saveErr != nil {
+		session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata)
+		if saveErr := s.saveSession(r.Context(), req, result.Messages, session.Metadata); saveErr != nil {
 			outcomes <- outcome{err: saveErr}
 			return
 		}
@@ -205,17 +210,18 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 	}
 }
 
-func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Message, string, *agent.Agent, error) {
-	history, err := s.store.Load(ctx, req.SessionID)
+func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Message, string, *agent.Agent, memory.Extractor, models.Session, error) {
+	session, err := s.store.LoadSession(ctx, req.SessionID)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, nil, models.Session{}, err
 	}
 
-	runAgent, modelName, err := s.newRuntime(firstNonEmpty(req.Model, s.cfg.DefaultModel), req.Tools)
+	runAgent, modelName, ext, err := s.newRuntime(firstNonEmpty(req.Model, s.cfg.DefaultModel), req.Tools, req.UserID)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, nil, models.Session{}, err
 	}
 
+	history := session.Messages
 	if req.SystemPrompt != "" {
 		history = append(history, models.Message{
 			ID:        newMessageID("system"),
@@ -233,18 +239,58 @@ func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Mess
 		CreatedAt: time.Now().UTC(),
 	})
 
-	return history, modelName, runAgent, nil
+	return history, modelName, runAgent, ext, session, nil
 }
 
-func (s *Server) saveSession(ctx context.Context, req chatRequest, messages []models.Message) error {
+func (s *Server) saveSession(ctx context.Context, req chatRequest, messages []models.Message, metadata map[string]string) error {
 	return s.store.Save(ctx, models.Session{
 		ID:        req.SessionID,
 		UserID:    req.UserID,
 		State:     models.SessionStateActive,
 		Messages:  messages,
+		Metadata:  metadata,
 		CreatedAt: firstCreatedAt(messages),
 		UpdatedAt: time.Now().UTC(),
 	})
+}
+
+// updateMemoryAndNudge runs a scheduled memory update and manages the nudge counter
+// in session metadata. Also updates UserScope if userID is non-empty. Returns the updated metadata.
+func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []models.Message, ext memory.Extractor, metadata map[string]string) map[string]string {
+	if s.memService == nil || ext == nil {
+		return metadata
+	}
+
+	// Update user-level memory (cross-session) if userID is set.
+	if userID != "" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := s.memService.UpdateScopeWith(ctx, memory.UserScope(userID), messages, ext); err != nil {
+				s.cfg.Logger.Printf("memory: user-scope update failed for %s: %v", userID, err)
+			}
+		}()
+	}
+
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	count, _ := strconv.Atoi(metadata["memory_nudge_count"])
+	usedMemory := usedMemoryTool(messages)
+	if usedMemory {
+		count = 0
+	} else {
+		count++
+	}
+	if count >= 10 {
+		count = 0
+	}
+	// Schedule async update; skip when memory tool was used (it already saved).
+	if !usedMemory {
+		s.memService.ScheduleUpdateWith(sessionID, messages, ext)
+	}
+	metadata["memory_nudge_count"] = strconv.Itoa(count)
+	return metadata
 }
 
 func enqueueEvent(ch chan<- sseEvent, evt sseEvent) {
@@ -294,4 +340,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func usedMemoryTool(messages []models.Message) bool {
+	for _, msg := range messages {
+		for _, call := range msg.ToolCalls {
+			if call.Name == "memory" {
+				return true
+			}
+		}
+	}
+	return false
 }

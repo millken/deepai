@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 	"strings"
@@ -722,6 +723,26 @@ type fakeStorage struct {
 
 func (f *fakeStorage) AutoMigrate(context.Context) error { return nil }
 
+func (f *fakeStorage) IncrementRetrievalCounts(_ context.Context, sessionID string, factIDs []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	doc, ok := f.docs[sessionID]
+	if !ok {
+		return nil
+	}
+	idSet := make(map[string]struct{}, len(factIDs))
+	for _, id := range factIDs {
+		idSet[id] = struct{}{}
+	}
+	for i := range doc.Facts {
+		if _, ok := idSet[doc.Facts[i].ID]; ok {
+			doc.Facts[i].RetrievalCount++
+		}
+	}
+	f.docs[sessionID] = doc
+	return nil
+}
+
 func (f *fakeStorage) Load(_ context.Context, sessionID string) (Document, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -761,6 +782,8 @@ func (f *fakeMemoryDB) Exec(_ context.Context, sql string, arguments ...any) (pg
 	switch {
 	case strings.Contains(sql, "create table if not exists memories"):
 		return pgconn.NewCommandTag("MIGRATE"), nil
+	case strings.Contains(sql, "update memory_facts set retrieval_count"):
+		return pgconn.NewCommandTag("UPDATE 0"), nil
 	default:
 		return pgconn.CommandTag{}, errors.New("unexpected exec without transaction")
 	}
@@ -776,7 +799,7 @@ func (f *fakeMemoryDB) Query(_ context.Context, sql string, args ...any) (rows, 
 		}
 		data := make([][]any, 0, len(doc.Facts))
 		for _, fact := range doc.Facts {
-			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.CreatedAt, fact.UpdatedAt})
+			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.CreatedAt, fact.UpdatedAt})
 		}
 		return &fakeRows{data: data}, nil
 	}
@@ -831,13 +854,15 @@ func (f *fakeMemoryTx) Exec(_ context.Context, sql string, arguments ...any) (pg
 		sessionID := arguments[0].(string)
 		doc := f.db.memories[sessionID]
 		doc.Facts = append(doc.Facts, Fact{
-			ID:         arguments[1].(string),
-			Content:    arguments[2].(string),
-			Category:   arguments[3].(string),
-			Confidence: arguments[4].(float64),
-			Source:     arguments[5].(string),
-			CreatedAt:  arguments[6].(time.Time),
-			UpdatedAt:  arguments[7].(time.Time),
+			ID:             arguments[1].(string),
+			Content:        arguments[2].(string),
+			Category:       arguments[3].(string),
+			Confidence:     arguments[4].(float64),
+			Source:         arguments[5].(string),
+			RetrievalCount: arguments[6].(int),
+			HelpfulCount:   arguments[7].(int),
+			CreatedAt:      arguments[8].(time.Time),
+			UpdatedAt:      arguments[9].(time.Time),
 		})
 		f.db.memories[sessionID] = doc
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
@@ -909,6 +934,8 @@ func (r *fakeRows) Scan(dest ...any) error {
 			*v = row[i].(string)
 		case *float64:
 			*v = row[i].(float64)
+		case *int:
+			*v = row[i].(int)
 		case *time.Time:
 			*v = row[i].(time.Time)
 		default:
@@ -920,4 +947,76 @@ func (r *fakeRows) Scan(dest ...any) error {
 
 func normalizeSQL(sql string) string {
 	return strings.Join(strings.Fields(strings.ToLower(sql)), " ")
+}
+
+func TestEvictLowScoreFacts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	facts := make([]Fact, 40)
+	for i := range facts {
+		facts[i] = Fact{
+			ID:         fmt.Sprintf("fact-%02d", i),
+			Content:    fmt.Sprintf("Fact content number %d", i),
+			Category:   "test",
+			Confidence: 0.5,
+			UpdatedAt:  now.Add(-time.Duration(i) * time.Hour),
+			CreatedAt:  now.Add(-time.Duration(i) * time.Hour),
+		}
+	}
+
+	evicted := evictLowScoreFacts(facts, now)
+	if len(evicted) != MaxFactsPerSession {
+		t.Fatalf("expected %d facts after eviction, got %d", MaxFactsPerSession, len(evicted))
+	}
+
+	// Newest facts (lowest index) should be preserved.
+	ids := make(map[string]bool, len(evicted))
+	for _, f := range evicted {
+		ids[f.ID] = true
+	}
+	for i := 0; i < MaxFactsPerSession/2; i++ {
+		if !ids[fmt.Sprintf("fact-%02d", i)] {
+			t.Fatalf("expected newest fact-%02d to survive eviction", i)
+		}
+	}
+}
+
+func TestEvictLowScoreFactsBelowLimit(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	facts := []Fact{
+		{ID: "a", Content: "A", Confidence: 0.9, UpdatedAt: now, CreatedAt: now},
+		{ID: "b", Content: "B", Confidence: 0.8, UpdatedAt: now, CreatedAt: now},
+	}
+
+	evicted := evictLowScoreFacts(facts, now)
+	if len(evicted) != 2 {
+		t.Fatalf("expected no eviction, got %d facts", len(evicted))
+	}
+}
+
+func TestFactScoreFavorsRetrieved(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	unused := Fact{ID: "a", Confidence: 0.8, UpdatedAt: now, CreatedAt: now}
+	retrieved := Fact{ID: "b", Confidence: 0.8, RetrievalCount: 10, HelpfulCount: 8, UpdatedAt: now, CreatedAt: now}
+
+	if factScore(retrieved, now) <= factScore(unused, now) {
+		t.Fatalf("retrieved+helpful fact should score higher: %v vs %v", factScore(retrieved, now), factScore(unused, now))
+	}
+}
+
+func TestFactScoreDecaysOverTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	recent := Fact{ID: "a", Confidence: 0.8, UpdatedAt: now, CreatedAt: now}
+	old := Fact{ID: "b", Confidence: 0.8, UpdatedAt: now.Add(-60 * 24 * time.Hour), CreatedAt: now.Add(-60 * 24 * time.Hour)}
+
+	if factScore(old, now) >= factScore(recent, now) {
+		t.Fatalf("recent fact should score higher than old: %v vs %v", factScore(recent, now), factScore(old, now))
+	}
 }

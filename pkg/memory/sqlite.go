@@ -31,6 +31,9 @@ create table if not exists memory_facts (
 	content text not null,
 	category text not null default '',
 	confidence real not null default 0,
+	source text not null default '',
+	retrieval_count integer not null default 0,
+	helpful_count integer not null default 0,
 	created_at text not null,
 	updated_at text not null,
 	primary key (session_id, id)
@@ -80,6 +83,16 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, sqliteSchemaSQL); err != nil {
 		return fmt.Errorf("migrate sqlite memory schema: %w", err)
+	}
+	// Incremental migrations for existing databases (ALTER TABLE is idempotent-safe via ignore).
+	// SQLite ignores ALTER TABLE ADD COLUMN if the column already exists in newer versions.
+	for _, ddl := range []string{
+		"alter table memory_facts add column source text not null default ''",
+		"alter table memory_facts add column retrieval_count integer not null default 0",
+		"alter table memory_facts add column helpful_count integer not null default 0",
+	} {
+		// Ignore "duplicate column name" errors for existing databases.
+		_, _ = s.db.ExecContext(ctx, ddl)
 	}
 	return nil
 }
@@ -134,6 +147,27 @@ func (s *SQLiteStore) Save(ctx context.Context, doc Document) error {
 	return nil
 }
 
+func (s *SQLiteStore) IncrementRetrievalCounts(ctx context.Context, sessionID string, factIDs []string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return nil
+	}
+	placeholders := strings.Repeat(",?", len(factIDs)-1)
+	args := make([]any, 0, 1+len(factIDs))
+	args = append(args, sessionID)
+	for _, id := range factIDs {
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx,
+		`update memory_facts set retrieval_count = retrieval_count + 1 where session_id = ? and id in (?`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("increment retrieval counts for session %q: %w", sessionID, err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) upsertDocument(ctx context.Context, execer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, doc Document) error {
@@ -167,9 +201,9 @@ func (s *SQLiteStore) insertFact(ctx context.Context, execer interface {
 		return err
 	}
 	_, err := execer.ExecContext(ctx, `
-		insert into memory_facts (session_id, id, content, category, confidence, created_at, updated_at)
-		values (?, ?, ?, ?, ?, ?, ?)
-	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, formatDBTime(fact.CreatedAt), formatDBTime(fact.UpdatedAt))
+		insert into memory_facts (session_id, id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, formatDBTime(fact.CreatedAt), formatDBTime(fact.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("insert fact %q for session %q: %w", fact.ID, sessionID, err)
 	}
@@ -178,7 +212,7 @@ func (s *SQLiteStore) insertFact(ctx context.Context, execer interface {
 
 func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		select id, content, category, confidence, created_at, updated_at
+		select id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at
 		from memory_facts
 		where session_id = ?
 		order by updated_at desc, id asc
@@ -195,7 +229,7 @@ func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, 
 			createdAt string
 			updatedAt string
 		)
-		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan facts for memory %q: %w", sessionID, err)
 		}
 		fact.CreatedAt, err = parseDBTime(createdAt)

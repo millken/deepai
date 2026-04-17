@@ -16,6 +16,7 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/checkpoint"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/tools"
@@ -45,6 +46,7 @@ type Server struct {
 	store           sessionStore
 	tools           *tools.Registry
 	sandbox         *sandbox.Sandbox
+	memService      *memory.Service
 	providerMu      sync.Mutex
 	providers       map[string]llm.LLMProvider
 	providerFactory func(string) (llm.LLMProvider, error)
@@ -58,7 +60,7 @@ type Server struct {
 }
 
 type sessionStore interface {
-	Load(ctx context.Context, sessionID string) ([]models.Message, error)
+	LoadSession(ctx context.Context, sessionID string) (models.Session, error)
 	Save(ctx context.Context, session models.Session) error
 }
 
@@ -69,6 +71,28 @@ type memoryStore struct {
 
 type postgresSessionStore struct {
 	store *checkpoint.PostgresStore
+}
+
+// postgresSearchAdapter adapts checkpoint.PostgresStore.SearchMessages to builtin.MessageSearcher.
+type postgresSearchAdapter struct {
+	store *checkpoint.PostgresStore
+}
+
+func (a postgresSearchAdapter) SearchMessages(ctx context.Context, query string, limit int) ([]builtin.SearchHit, error) {
+	results, err := a.store.SearchMessages(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	hits := make([]builtin.SearchHit, len(results))
+	for i, r := range results {
+		hits[i] = builtin.SearchHit{
+			SessionID: r.SessionID,
+			MessageID: r.MessageID,
+			Role:      r.Role,
+			Content:   r.Content,
+		}
+	}
+	return hits, nil
 }
 
 var messageSeq uint64
@@ -109,17 +133,54 @@ func NewServer(cfg Config) (*Server, error) {
 		cleanupFns = append(cleanupFns, pgStore.Close)
 	}
 
+	var memService *memory.Service
+	if memDBURL := strings.TrimSpace(cfg.DatabaseURL); memDBURL != "" {
+		memStore, err := memory.OpenStore(context.Background(), memDBURL)
+		if err != nil {
+			for _, fn := range cleanupFns {
+				fn()
+			}
+			return nil, fmt.Errorf("create memory store: %w", err)
+		}
+		cleanupFns = append(cleanupFns, memStore.Close)
+		memService = memory.NewService(memStore, nil)
+		if err := memService.AutoMigrate(context.Background()); err != nil {
+			cfg.Logger.Printf("memory auto-migrate warning: %v", err)
+		}
+	}
+
 	s := &Server{
 		cfg:             cfg,
 		logger:          cfg.Logger,
 		store:           store,
 		tools:           registry,
 		sandbox:         sb,
+		memService:      memService,
 		providers:       make(map[string]llm.LLMProvider),
 		providerFactory: defaultProviderFactory,
 		cleanupFns:      cleanupFns,
 		startedAt:       time.Now().UTC(),
 		shutdownTimeout: cfg.ShutdownTimeout,
+	}
+
+	if memService != nil {
+		if err := registry.Register(builtin.MemoryTool(memService)); err != nil {
+			for _, fn := range cleanupFns {
+				fn()
+			}
+			return nil, fmt.Errorf("register memory tool: %w", err)
+		}
+	}
+
+	if pgS, ok := store.(*postgresSessionStore); ok {
+		if err := registry.Register(builtin.SessionSearchTool(
+			postgresSearchAdapter{store: pgS.store},
+		)); err != nil {
+			for _, fn := range cleanupFns {
+				fn()
+			}
+			return nil, fmt.Errorf("register session search tool: %w", err)
+		}
 	}
 
 	s.httpServer = &http.Server{
@@ -198,20 +259,35 @@ func (s *Server) routes() http.Handler {
 	return s.withMiddleware(mux)
 }
 
-func (s *Server) newRuntime(modelRef string, allowedTools []string) (*agent.Agent, string, error) {
+func (s *Server) newRuntime(modelRef string, allowedTools []string, userID string) (*agent.Agent, string, memory.Extractor, error) {
 	providerName, modelName := splitModelRef(modelRef)
 	provider, err := s.providerFor(providerName)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
-	return agent.New(agent.AgentConfig{
+	cfg := agent.AgentConfig{
 		LLMProvider: provider,
 		Tools:       s.tools.Restrict(allowedTools),
 		Sandbox:     s.sandbox,
 		MaxTurns:    defaultMaxTurns,
 		Model:       modelName,
-	}), modelName, nil
+	}
+
+	var ext memory.Extractor
+	if s.memService != nil {
+		cfg.MemoryService = s.memService
+		ext = memory.NewLLMClient(provider, modelName)
+		cfg.MemoryExtractor = ext
+		cfg.MemoryUserID = userID
+	}
+
+	return agent.New(cfg), modelName, ext, nil
+}
+
+// userIDFromContext extracts the user ID from the chat request for memory scoping.
+func userIDForRequest(req chatRequest) string {
+	return strings.TrimSpace(req.UserID)
 }
 
 func (s *Server) providerFor(name string) (llm.LLMProvider, error) {
@@ -269,15 +345,30 @@ func newMemoryStore() *memoryStore {
 	return &memoryStore{sessions: make(map[string]models.Session)}
 }
 
-func (s *memoryStore) Load(_ context.Context, sessionID string) ([]models.Message, error) {
+func (s *memoryStore) LoadSession(_ context.Context, sessionID string) (models.Session, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	session, ok := s.sessions[sessionID]
 	if !ok {
-		return nil, nil
+		return models.Session{ID: sessionID, Metadata: map[string]string{}}, nil
 	}
-	return append([]models.Message(nil), session.Messages...), nil
+	return cloneSession(session), nil
+}
+
+func cloneSession(s models.Session) models.Session {
+	c := s
+	if s.Messages != nil {
+		c.Messages = make([]models.Message, len(s.Messages))
+		copy(c.Messages, s.Messages)
+	}
+	if s.Metadata != nil {
+		c.Metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	return c
 }
 
 func (s *memoryStore) Save(_ context.Context, session models.Session) error {
@@ -287,15 +378,15 @@ func (s *memoryStore) Save(_ context.Context, session models.Session) error {
 	return nil
 }
 
-func (s *postgresSessionStore) Load(ctx context.Context, sessionID string) ([]models.Message, error) {
+func (s *postgresSessionStore) LoadSession(ctx context.Context, sessionID string) (models.Session, error) {
 	session, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
+			return models.Session{ID: sessionID, Metadata: map[string]string{}}, nil
 		}
-		return nil, err
+		return models.Session{}, err
 	}
-	return session.Messages, nil
+	return session, nil
 }
 
 func (s *postgresSessionStore) Save(ctx context.Context, session models.Session) error {

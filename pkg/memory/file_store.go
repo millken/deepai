@@ -122,6 +122,30 @@ func (s *FileStore) Delete(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+func (s *FileStore) IncrementRetrievalCounts(ctx context.Context, sessionID string, factIDs []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return nil
+	}
+	doc, err := s.Load(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	idSet := make(map[string]struct{}, len(factIDs))
+	for _, id := range factIDs {
+		idSet[id] = struct{}{}
+	}
+	for i := range doc.Facts {
+		if _, ok := idSet[doc.Facts[i].ID]; ok {
+			doc.Facts[i].RetrievalCount++
+		}
+	}
+	return s.Save(ctx, doc)
+}
+
 func (s *FileStore) documentPath(sessionID string) (string, error) {
 	if s == nil || strings.TrimSpace(s.root) == "" {
 		return "", errors.New("file store is not initialized")
