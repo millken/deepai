@@ -2,7 +2,6 @@ package commands
 
 import (
 	"log/slog"
-	"os"
 
 	"github.com/millken/deepai/pkg/logs"
 	"github.com/spf13/cobra"
@@ -18,11 +17,12 @@ func New() *cobra.Command {
 		SilenceUsage:      true, // Don't show usage on errors
 		DisableAutoGenTag: true,
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			level := slog.LevelInfo
 			if verbose {
-				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+				level = slog.LevelDebug
 			}
 			cleanup, err := logs.Setup(logs.Config{
-				Level:     slog.LevelInfo,
+				Level:     level,
 				DebugFile: "deepai-debug.log",
 			})
 			if err != nil {
