@@ -28,10 +28,13 @@ create table if not exists memory_facts (
 	content text not null,
 	category text not null default '',
 	confidence double precision not null default 0,
+	source text not null default '',
 	created_at timestamptz not null,
 	updated_at timestamptz not null,
 	primary key (session_id, id)
 );
+
+alter table memory_facts add column if not exists source text not null default '';
 
 create index if not exists idx_memory_facts_session_updated
 	on memory_facts(session_id, updated_at desc, id asc);
@@ -230,6 +233,21 @@ func (s *PostgresStore) Save(ctx context.Context, doc Document) error {
 	return nil
 }
 
+func (s *PostgresStore) Delete(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("memory session_id is required")
+	}
+	tag, err := s.db.Exec(ctx, `delete from memories where session_id = $1`, sessionID)
+	if err != nil {
+		return fmt.Errorf("delete memory %q: %w", sessionID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func upsertDocument(ctx context.Context, q interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }, doc Document) error {
@@ -264,9 +282,9 @@ func insertFact(ctx context.Context, q interface {
 		return err
 	}
 	_, err := q.Exec(ctx, `
-		insert into memory_facts (session_id, id, content, category, confidence, created_at, updated_at)
-		values ($1, $2, $3, $4, $5, $6, $7)
-	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.CreatedAt, fact.UpdatedAt)
+		insert into memory_facts (session_id, id, content, category, confidence, source, created_at, updated_at)
+		values ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.CreatedAt, fact.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("insert fact %q for session %q: %w", fact.ID, sessionID, err)
 	}
@@ -275,7 +293,7 @@ func insertFact(ctx context.Context, q interface {
 
 func (s *PostgresStore) listFacts(ctx context.Context, sessionID string) ([]Fact, error) {
 	rows, err := s.db.Query(ctx, `
-		select id, content, category, confidence, created_at, updated_at
+		select id, content, category, confidence, source, created_at, updated_at
 		from memory_facts
 		where session_id = $1
 		order by updated_at desc, id asc
@@ -288,7 +306,7 @@ func (s *PostgresStore) listFacts(ctx context.Context, sessionID string) ([]Fact
 	var facts []Fact
 	for rows.Next() {
 		var fact Fact
-		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
+		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan facts for memory %q: %w", sessionID, err)
 		}
 		facts = append(facts, fact)
@@ -362,6 +380,7 @@ func prepareFact(fact *Fact) error {
 	fact.ID = strings.TrimSpace(fact.ID)
 	fact.Content = strings.TrimSpace(fact.Content)
 	fact.Category = strings.TrimSpace(fact.Category)
+	fact.Source = strings.TrimSpace(fact.Source)
 	if fact.ID == "" {
 		return errors.New("memory fact id is required")
 	}

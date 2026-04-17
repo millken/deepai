@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/millken/deepai/pkg/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/millken/deepai/pkg/models"
 )
 
 func TestMerge(t *testing.T) {
@@ -23,7 +24,7 @@ func TestMerge(t *testing.T) {
 	current := Document{
 		SessionID: "session-1",
 		User: UserMemory{
-			WorkContext: "Working on deepai-go",
+			WorkContext: "Working on deerflow-go",
 		},
 		Facts: []Fact{
 			{ID: "pref-editor", Content: "Prefers vim", Category: "preference", Confidence: 0.7, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)},
@@ -34,24 +35,64 @@ func TestMerge(t *testing.T) {
 		User: UserMemory{
 			TopOfMind: "Ship the memory service",
 		},
+		History: HistoryMemory{
+			LongTermBackground: "Maintains long-lived agent infrastructure.",
+		},
 		Facts: []Fact{
 			{ID: "pref-editor", Content: "Prefers neovim", Category: "preference", Confidence: 0.9},
-			{ID: "project-main", Content: "Building deepai-go memory service", Category: "project", Confidence: 0.8},
+			{ID: "project-main", Content: "Building deerflow-go memory service", Category: "project", Confidence: 0.8},
 		},
 	}
 
 	got := Merge(current, update, "session-1", now)
-	if got.User.WorkContext != "Working on deepai-go" {
+	if got.User.WorkContext != "Working on deerflow-go" {
 		t.Fatalf("work context = %q", got.User.WorkContext)
 	}
 	if got.User.TopOfMind != "Ship the memory service" {
 		t.Fatalf("top of mind = %q", got.User.TopOfMind)
+	}
+	if got.History.LongTermBackground != "Maintains long-lived agent infrastructure." {
+		t.Fatalf("long term background = %q", got.History.LongTermBackground)
 	}
 	if len(got.Facts) != 2 {
 		t.Fatalf("facts len = %d", len(got.Facts))
 	}
 	if got.Facts[0].ID != "pref-editor" || got.Facts[0].Content != "Prefers neovim" {
 		t.Fatalf("merged fact = %#v", got.Facts[0])
+	}
+	if got.Facts[0].Source != "session-1" {
+		t.Fatalf("merged fact source = %q", got.Facts[0].Source)
+	}
+	if got.Facts[1].Source != "session-1" {
+		t.Fatalf("new fact source = %q", got.Facts[1].Source)
+	}
+}
+
+func TestScopeKeyPreservesLegacySessionIDs(t *testing.T) {
+	t.Parallel()
+
+	scope := SessionScope("thread-1")
+	if got := scope.Key(); got != "thread-1" {
+		t.Fatalf("Key() = %q, want %q", got, "thread-1")
+	}
+	parsed := ParseScopeKey("thread-1")
+	if parsed.Type != ScopeSession || parsed.ID != "thread-1" || parsed.Namespace != "" {
+		t.Fatalf("ParseScopeKey() = %+v", parsed)
+	}
+}
+
+func TestScopeKeyEncodesNonSessionScopes(t *testing.T) {
+	t.Parallel()
+
+	scope := GroupScope("workspace/a")
+	scope.Namespace = "project"
+	key := scope.Key()
+	if !strings.HasPrefix(key, "__scope__:") {
+		t.Fatalf("Key() = %q", key)
+	}
+	parsed := ParseScopeKey(key)
+	if parsed.Type != ScopeGroup || parsed.ID != "workspace/a" || parsed.Namespace != "project" {
+		t.Fatalf("ParseScopeKey() = %+v", parsed)
 	}
 }
 
@@ -62,14 +103,15 @@ func TestServiceUpdateAndInject(t *testing.T) {
 	extractor := &stubExtractor{
 		update: Update{
 			User: UserMemory{
-				WorkContext: "Maintains deepai-go",
+				WorkContext: "Maintains deerflow-go",
 				TopOfMind:   "Memory reliability",
 			},
 			History: HistoryMemory{
-				RecentMonths: "Rebuilding the agent runtime in Go",
+				RecentMonths:       "Rebuilding the agent runtime in Go",
+				LongTermBackground: "Maintains agent systems over multiple releases",
 			},
 			Facts: []Fact{
-				{ID: "project", Content: "Owns deepai-go", Category: "project", Confidence: 0.95},
+				{ID: "project", Content: "Owns deerflow-go", Category: "project", Confidence: 0.95},
 			},
 			Source: "session-42",
 		},
@@ -80,7 +122,7 @@ func TestServiceUpdateAndInject(t *testing.T) {
 		ID:        "m1",
 		SessionID: "session-42",
 		Role:      models.RoleHuman,
-		Content:   "I'm rebuilding deepai-go and memory reliability matters most.",
+		Content:   "I'm rebuilding deerflow-go and memory reliability matters most.",
 		CreatedAt: time.Now().UTC(),
 	}}
 
@@ -92,13 +134,160 @@ func TestServiceUpdateAndInject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if doc.User.WorkContext != "Maintains deepai-go" {
+	if doc.User.WorkContext != "Maintains deerflow-go" {
 		t.Fatalf("work context = %q", doc.User.WorkContext)
 	}
 
 	injected := service.Inject(context.Background(), "session-42")
-	if !strings.Contains(injected, "## User Memory") || !strings.Contains(injected, "Owns deepai-go") {
+	if !strings.Contains(injected, "## User Memory") || !strings.Contains(injected, "Owns deerflow-go") {
 		t.Fatalf("Inject() = %q", injected)
+	}
+	if !strings.Contains(injected, "Long Term Background: Maintains agent systems over multiple releases") {
+		t.Fatalf("Inject() missing long term background: %q", injected)
+	}
+}
+
+func TestServiceUpdateUsesConversationThreadAsDefaultFactSourceForAgentMemory(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStorage{}
+	extractor := &stubExtractor{
+		update: Update{
+			Facts: []Fact{
+				{ID: "pref", Content: "Prefers terse review summaries.", Category: "preference", Confidence: 0.9},
+			},
+		},
+	}
+
+	service := NewService(store, extractor)
+	msgs := []models.Message{{
+		ID:        "m1",
+		SessionID: "thread-agent-review",
+		Role:      models.RoleHuman,
+		Content:   "Review this patch and keep it terse.",
+		CreatedAt: time.Now().UTC(),
+	}}
+
+	if err := service.Update(context.Background(), "agent:code-reviewer", msgs); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	doc, err := store.Load(context.Background(), "agent:code-reviewer")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(doc.Facts) != 1 {
+		t.Fatalf("facts len = %d want 1", len(doc.Facts))
+	}
+	if got := doc.Facts[0].Source; got != "thread-agent-review" {
+		t.Fatalf("fact source = %q want %q", got, "thread-agent-review")
+	}
+	if got := doc.Source; got != "agent:code-reviewer" {
+		t.Fatalf("document source = %q want %q", got, "agent:code-reviewer")
+	}
+}
+
+func TestFileStoreDelete(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate() error = %v", err)
+	}
+
+	doc := Document{
+		SessionID: "agent:code-reviewer",
+		Source:    "agent:code-reviewer",
+		User:      UserMemory{TopOfMind: "Keep reviews terse."},
+	}
+	if err := store.Save(context.Background(), doc); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	if err := store.Delete(context.Background(), doc.SessionID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := store.Load(context.Background(), doc.SessionID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load() after delete error = %v want ErrNotFound", err)
+	}
+	if err := store.Delete(context.Background(), doc.SessionID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete() missing doc error = %v want ErrNotFound", err)
+	}
+}
+
+func TestBuildInjectionWithContextPrioritizesRelevantFacts(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	doc := Document{
+		SessionID: "session-relevance",
+		User: UserMemory{
+			WorkContext: "Maintains deerflow-go compatibility.",
+		},
+		Facts: []Fact{
+			{
+				ID:         "cooking",
+				Content:    "Likes collecting vintage cookware and recipe books.",
+				Category:   "personal",
+				Confidence: 0.98,
+				CreatedAt:  now.Add(-2 * time.Hour),
+				UpdatedAt:  now.Add(-2 * time.Hour),
+			},
+			{
+				ID:         "deerflow",
+				Content:    "Maintains deerflow-go gateway compatibility with DeerFlow UI.",
+				Category:   "project",
+				Confidence: 0.75,
+				CreatedAt:  now.Add(-time.Hour),
+				UpdatedAt:  now.Add(-time.Hour),
+			},
+		},
+	}
+
+	injected := BuildInjectionWithContext(doc, "Need help debugging deerflow-go gateway compatibility.", 40)
+	if !strings.Contains(injected, "Maintains deerflow-go gateway compatibility with DeerFlow UI.") {
+		t.Fatalf("expected relevant fact in injection: %q", injected)
+	}
+	if strings.Contains(injected, "Likes collecting vintage cookware") {
+		t.Fatalf("expected unrelated fact to be trimmed first: %q", injected)
+	}
+}
+
+func TestBuildInjectionWithContextFallsBackToConfidenceOrder(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC)
+	doc := Document{
+		SessionID: "session-confidence",
+		Facts: []Fact{
+			{
+				ID:         "lower",
+				Content:    "Uses Go for the project runtime.",
+				Category:   "project",
+				Confidence: 0.60,
+				CreatedAt:  now.Add(-time.Hour),
+				UpdatedAt:  now.Add(-time.Hour),
+			},
+			{
+				ID:         "higher",
+				Content:    "Prefers concise technical answers in reviews.",
+				Category:   "preference",
+				Confidence: 0.95,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			},
+		},
+	}
+
+	injected := BuildInjectionWithContext(doc, "", 12)
+	if !strings.Contains(injected, "Prefers concise technical answers in reviews.") {
+		t.Fatalf("expected highest confidence fact in injection: %q", injected)
+	}
+	if strings.Contains(injected, "Uses Go for the project runtime.") {
+		t.Fatalf("expected lower-confidence fact to be excluded under tight budget: %q", injected)
 	}
 }
 
@@ -237,6 +426,9 @@ func TestServiceUpdateStripsUploadMentionsFromMemory(t *testing.T) {
 			User: UserMemory{
 				TopOfMind: "User is interested in AI. User uploaded a test file for verification. User prefers concise answers.",
 			},
+			History: HistoryMemory{
+				LongTermBackground: "User uploaded onboarding docs. User values durable project context.",
+			},
 			Facts: []Fact{
 				{ID: "upload", Content: "User uploaded a file titled secret.txt", Category: "behavior"},
 				{ID: "pref", Content: "User prefers dark mode", Category: "preference"},
@@ -273,6 +465,83 @@ func TestServiceUpdateStripsUploadMentionsFromMemory(t *testing.T) {
 	if len(doc.Facts) != 1 || doc.Facts[0].Content != "User prefers dark mode" {
 		t.Fatalf("facts = %#v", doc.Facts)
 	}
+	if doc.History.LongTermBackground != "User values durable project context" {
+		t.Fatalf("long term background = %q", doc.History.LongTermBackground)
+	}
+}
+
+func TestServiceUpdateExcludesIntermediateAIToolCallMessages(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStorage{}
+	extractor := &capturingExtractor{
+		update: Update{
+			User: UserMemory{TopOfMind: "Prefers direct answers"},
+		},
+	}
+	service := NewService(store, extractor)
+
+	msgs := []models.Message{
+		{
+			ID:        "u1",
+			SessionID: "session-tools",
+			Role:      models.RoleHuman,
+			Content:   "Search for the latest release notes.",
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			ID:        "a1",
+			SessionID: "session-tools",
+			Role:      models.RoleAI,
+			Content:   "Calling search tool",
+			ToolCalls: []models.ToolCall{{
+				ID:          "call-1",
+				Name:        "search",
+				Status:      models.CallStatusCompleted,
+				RequestedAt: time.Now().UTC(),
+				StartedAt:   time.Now().UTC(),
+				CompletedAt: time.Now().UTC(),
+			}},
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			ID:        "t1",
+			SessionID: "session-tools",
+			Role:      models.RoleTool,
+			ToolResult: &models.ToolResult{
+				CallID:      "call-1",
+				ToolName:    "search",
+				Status:      models.CallStatusCompleted,
+				Content:     "Search results",
+				CompletedAt: time.Now().UTC(),
+			},
+			CreatedAt: time.Now().UTC(),
+		},
+		{
+			ID:        "a2",
+			SessionID: "session-tools",
+			Role:      models.RoleAI,
+			Content:   "Here are the latest release notes.",
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	if err := service.Update(context.Background(), "session-tools", msgs); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	if !extractor.called {
+		t.Fatal("extractor should be called")
+	}
+	if len(extractor.messages) != 2 {
+		t.Fatalf("extractor messages len = %d want=2", len(extractor.messages))
+	}
+	if got := extractor.messages[0].Content; got != "Search for the latest release notes." {
+		t.Fatalf("first extractor message = %q", got)
+	}
+	if got := extractor.messages[1].Content; got != "Here are the latest release notes." {
+		t.Fatalf("second extractor message = %q", got)
+	}
 }
 
 func TestPostgresStoreSaveLoadUsesTransaction(t *testing.T) {
@@ -288,7 +557,8 @@ func TestPostgresStoreSaveLoadUsesTransaction(t *testing.T) {
 			WorkContext: "Go rewrite",
 		},
 		History: HistoryMemory{
-			EarlierContext: "Original Python implementation",
+			EarlierContext:     "Original Python implementation",
+			LongTermBackground: "Maintains the project across rewrites",
 		},
 		Facts: []Fact{
 			{ID: "language", Content: "Uses Go", Category: "project", Confidence: 0.99},
@@ -313,8 +583,113 @@ func TestPostgresStoreSaveLoadUsesTransaction(t *testing.T) {
 	if got.User.WorkContext != doc.User.WorkContext {
 		t.Fatalf("loaded user memory = %#v", got.User)
 	}
+	if got.History.LongTermBackground != doc.History.LongTermBackground {
+		t.Fatalf("loaded history memory = %#v", got.History)
+	}
 	if len(got.Facts) != 1 || got.Facts[0].ID != "language" {
 		t.Fatalf("loaded facts = %#v", got.Facts)
+	}
+}
+
+func TestFileStoreSaveLoadRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewFileStore(filepath.Join(t.TempDir(), "memory"))
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	doc := Document{
+		SessionID: "agent:code-reviewer",
+		User: UserMemory{
+			WorkContext: "Reviewing backend compatibility",
+		},
+		History: HistoryMemory{
+			LongTermBackground: "Maintains DeerFlow-compatible runtimes.",
+		},
+		Facts: []Fact{
+			{ID: "pref", Content: "Prefers concrete bug reports", Category: "preference", Confidence: 0.9, CreatedAt: now, UpdatedAt: now},
+		},
+		Source:    "agent:code-reviewer",
+		UpdatedAt: now,
+	}
+
+	if err := store.Save(context.Background(), doc); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	got, err := store.Load(context.Background(), doc.SessionID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.SessionID != doc.SessionID {
+		t.Fatalf("session_id = %q want %q", got.SessionID, doc.SessionID)
+	}
+	if got.User.WorkContext != doc.User.WorkContext {
+		t.Fatalf("workContext = %q want %q", got.User.WorkContext, doc.User.WorkContext)
+	}
+	if got.History.LongTermBackground != doc.History.LongTermBackground {
+		t.Fatalf("longTermBackground = %q want %q", got.History.LongTermBackground, doc.History.LongTermBackground)
+	}
+	if len(got.Facts) != 1 || got.Facts[0].Content != "Prefers concrete bug reports" {
+
+		t.Fatalf("facts = %#v", got.Facts)
+	}
+}
+
+func TestSQLiteStoreSaveLoad(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, err := OpenStore(ctx, filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatalf("OpenStore() error = %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 4, 5, 12, 0, 0, 0, time.UTC)
+	doc := Document{
+		SessionID: "sqlite-memory",
+		User: UserMemory{
+			TopOfMind: "Ship single-file deploy",
+		},
+		Facts: []Fact{
+			{ID: "deploy", Content: "Uses sqlite for lightweight persistence", Category: "project", Confidence: 0.9, CreatedAt: now, UpdatedAt: now},
+		},
+		UpdatedAt: now,
+	}
+
+	if err := store.Save(ctx, doc); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	got, err := store.Load(ctx, doc.SessionID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.User.TopOfMind != doc.User.TopOfMind {
+		t.Fatalf("top_of_mind = %q", got.User.TopOfMind)
+	}
+	if len(got.Facts) != 1 || got.Facts[0].ID != "deploy" {
+		t.Fatalf("facts = %#v", got.Facts)
+	}
+}
+
+func TestFileStoreLoadMissingReturnsNotFound(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore() error = %v", err)
+	}
+
+	_, err = store.Load(context.Background(), "missing-session")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load() err = %v want ErrNotFound", err)
 	}
 }
 
@@ -401,7 +776,7 @@ func (f *fakeMemoryDB) Query(_ context.Context, sql string, args ...any) (rows, 
 		}
 		data := make([][]any, 0, len(doc.Facts))
 		for _, fact := range doc.Facts {
-			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.CreatedAt, fact.UpdatedAt})
+			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.CreatedAt, fact.UpdatedAt})
 		}
 		return &fakeRows{data: data}, nil
 	}
@@ -460,8 +835,9 @@ func (f *fakeMemoryTx) Exec(_ context.Context, sql string, arguments ...any) (pg
 			Content:    arguments[2].(string),
 			Category:   arguments[3].(string),
 			Confidence: arguments[4].(float64),
-			CreatedAt:  arguments[5].(time.Time),
-			UpdatedAt:  arguments[6].(time.Time),
+			Source:     arguments[5].(string),
+			CreatedAt:  arguments[6].(time.Time),
+			UpdatedAt:  arguments[7].(time.Time),
 		})
 		f.db.memories[sessionID] = doc
 		return pgconn.NewCommandTag("INSERT 0 1"), nil

@@ -32,8 +32,9 @@ type UserMemory struct {
 }
 
 type HistoryMemory struct {
-	RecentMonths   string `json:"recentMonths,omitempty"`
-	EarlierContext string `json:"earlierContext,omitempty"`
+	RecentMonths       string `json:"recentMonths,omitempty"`
+	EarlierContext     string `json:"earlierContext,omitempty"`
+	LongTermBackground string `json:"longTermBackground,omitempty"`
 }
 
 type Fact struct {
@@ -41,6 +42,7 @@ type Fact struct {
 	Content    string    `json:"content"`
 	Category   string    `json:"category,omitempty"`
 	Confidence float64   `json:"confidence,omitempty"`
+	Source     string    `json:"source,omitempty"`
 	CreatedAt  time.Time `json:"created_at,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at,omitempty"`
 }
@@ -110,6 +112,10 @@ func (s *Service) Load(ctx context.Context, sessionID string) (Document, error) 
 	return s.storage.Load(ctx, sessionID)
 }
 
+func (s *Service) LoadScope(ctx context.Context, scope Scope) (Document, error) {
+	return s.Load(ctx, scope.Key())
+}
+
 func (s *Service) Update(ctx context.Context, sessionID string, messages []models.Message) error {
 	if s == nil {
 		return errors.New("memory service is nil")
@@ -142,8 +148,12 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 	}
 	update = sanitizeUpdateForStorage(update)
 
-	merged := Merge(current, update, sessionID, time.Now().UTC())
+	merged := MergeWithFactSource(current, update, sessionID, factSourceFromMessages(filteredMessages), time.Now().UTC())
 	return s.storage.Save(ctx, merged)
+}
+
+func (s *Service) UpdateScope(ctx context.Context, scope Scope, messages []models.Message) error {
+	return s.Update(ctx, scope.Key(), messages)
 }
 
 // ScheduleUpdate runs memory extraction in the background and never propagates errors.
@@ -169,6 +179,14 @@ func (s *Service) ScheduleUpdate(sessionID string, messages []models.Message) {
 }
 
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
+	return s.InjectWithContext(ctx, sessionID, "")
+}
+
+func (s *Service) InjectScope(ctx context.Context, scope Scope) string {
+	return s.InjectScopeWithContext(ctx, scope, "")
+}
+
+func (s *Service) InjectWithContext(ctx context.Context, sessionID string, currentContext string) string {
 	if s == nil || s.storage == nil || strings.TrimSpace(sessionID) == "" {
 		return ""
 	}
@@ -180,10 +198,18 @@ func (s *Service) Inject(ctx context.Context, sessionID string) string {
 		}
 		return ""
 	}
-	return BuildInjection(doc)
+	return BuildInjectionWithContext(doc, currentContext, 2000)
+}
+
+func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, currentContext string) string {
+	return s.InjectWithContext(ctx, scope.Key(), currentContext)
 }
 
 func Merge(current Document, update Update, sessionID string, now time.Time) Document {
+	return MergeWithFactSource(current, update, sessionID, "", now)
+}
+
+func MergeWithFactSource(current Document, update Update, sessionID string, factSource string, now time.Time) Document {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -209,6 +235,9 @@ func Merge(current Document, update Update, sessionID string, now time.Time) Doc
 	if v := strings.TrimSpace(update.History.EarlierContext); v != "" {
 		merged.History.EarlierContext = v
 	}
+	if v := strings.TrimSpace(update.History.LongTermBackground); v != "" {
+		merged.History.LongTermBackground = v
+	}
 	if v := strings.TrimSpace(update.Source); v != "" {
 		merged.Source = v
 	}
@@ -216,18 +245,37 @@ func Merge(current Document, update Update, sessionID string, now time.Time) Doc
 		merged.Source = merged.SessionID
 	}
 
-	merged.Facts = mergeFacts(current.Facts, update.Facts, now)
+	defaultFactSource := strings.TrimSpace(factSource)
+	if defaultFactSource == "" {
+		defaultFactSource = merged.Source
+	}
+	merged.Facts = mergeFacts(current.Facts, update.Facts, defaultFactSource, now)
 	merged.UpdatedAt = now
 	return merged
 }
 
-func mergeFacts(existing, incoming []Fact, now time.Time) []Fact {
+func factSourceFromMessages(messages []models.Message) string {
+	for _, msg := range messages {
+		source := strings.TrimSpace(msg.SessionID)
+		if source != "" {
+			return source
+		}
+	}
+	return ""
+}
+
+func mergeFacts(existing, incoming []Fact, defaultSource string, now time.Time) []Fact {
 	index := make(map[string]int, len(existing))
 	merged := make([]Fact, 0, len(existing)+len(incoming))
+	defaultSource = strings.TrimSpace(defaultSource)
 
 	for _, fact := range existing {
 		if strings.TrimSpace(fact.ID) == "" || strings.TrimSpace(fact.Content) == "" {
 			continue
+		}
+		fact.Source = strings.TrimSpace(fact.Source)
+		if fact.Source == "" {
+			fact.Source = defaultSource
 		}
 		if fact.CreatedAt.IsZero() {
 			fact.CreatedAt = now
@@ -243,6 +291,10 @@ func mergeFacts(existing, incoming []Fact, now time.Time) []Fact {
 		fact.ID = strings.TrimSpace(fact.ID)
 		fact.Content = strings.TrimSpace(fact.Content)
 		fact.Category = strings.TrimSpace(fact.Category)
+		fact.Source = strings.TrimSpace(fact.Source)
+		if fact.Source == "" {
+			fact.Source = defaultSource
+		}
 		if fact.ID == "" || fact.Content == "" {
 			continue
 		}
