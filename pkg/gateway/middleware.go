@@ -34,7 +34,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 		started := time.Now()
 		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
-		s.logger.Printf("%s %s status=%d duration=%s request_id=%s", r.Method, r.URL.Path, rw.status, time.Since(started).Round(time.Millisecond), requestIDFromContext(r.Context()))
+		s.logger.Info("request", "method", r.Method, "path", r.URL.Path, "status", rw.status, "duration", time.Since(started).Round(time.Millisecond), "request_id", requestIDFromContext(r.Context()))
 	})
 }
 
@@ -60,7 +60,7 @@ func (s *Server) withRecover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				s.logger.Printf("panic request_id=%s err=%v", requestIDFromContext(r.Context()), recovered)
+				s.logger.Error("panic", "request_id", requestIDFromContext(r.Context()), "err", recovered)
 				writeError(w, http.StatusInternalServerError, fmt.Errorf("internal server error"))
 			}
 		}()

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -30,7 +30,6 @@ type UpstreamConfig struct {
 // Config holds proxy configuration.
 type Config struct {
 	Addr            string
-	Logger          *log.Logger
 	ShutdownTimeout time.Duration
 	MaxRequestBody  int64
 	OpenAI          UpstreamConfig
@@ -42,7 +41,7 @@ type Config struct {
 type Proxy struct {
 	cfg          Config
 	httpServer   *http.Server
-	logger       *log.Logger
+	logger       *slog.Logger
 	store        EventStore
 	storeMu      sync.RWMutex
 	httpClient   *http.Client
@@ -59,12 +58,9 @@ type contextKey string
 const requestIDKey contextKey = "request_id"
 
 // NewProxy creates a new Proxy with the given configuration.
-func NewProxy(cfg Config) (*Proxy, error) {
+func NewProxy(logger *slog.Logger, cfg Config) (*Proxy, error) {
 	if strings.TrimSpace(cfg.Addr) == "" {
 		cfg.Addr = defaultAddr
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = log.New(os.Stderr, "proxy ", log.LstdFlags)
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = defaultShutdownTimeout
@@ -75,7 +71,7 @@ func NewProxy(cfg Config) (*Proxy, error) {
 
 	p := &Proxy{
 		cfg:    cfg,
-		logger: cfg.Logger,
+		logger: logger,
 		store:  NewMemoryEventStore(),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
@@ -112,7 +108,7 @@ func (p *Proxy) logWorker() {
 	for batch := range p.logCh {
 		store := p.getStore()
 		if err := store.Append(context.Background(), batch...); err != nil {
-			p.logger.Printf("proxy log save failed: %v", err)
+			p.logger.Error("proxy log save failed", "err", err)
 		}
 	}
 }
@@ -144,7 +140,7 @@ func (p *Proxy) ListenAndServe() error {
 	if p == nil || p.httpServer == nil {
 		return errors.New("proxy server is not initialized")
 	}
-	p.logger.Printf("proxy listening on %s", p.httpServer.Addr)
+	p.logger.Info("proxy listening", "addr", p.httpServer.Addr)
 	err := p.httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -205,16 +201,17 @@ func (p *Proxy) withLogging(next http.Handler) http.Handler {
 		if debugHeaders {
 			for k, vv := range r.Header {
 				for _, v := range vv {
-					p.logger.Printf("[debug] header %s: %s", k, v)
+					p.logger.Debug("header", "key", k, "value", v)
 				}
 			}
 		}
 		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
-		p.logger.Printf("%s %s status=%d duration=%s request_id=%s",
-			r.Method, r.URL.Path, rw.status,
-			time.Since(started).Round(time.Millisecond),
-			requestIDFromCtx(r.Context()))
+		p.logger.Info("request",
+			"method", r.Method, "path", r.URL.Path,
+			"status", rw.status,
+			"duration", time.Since(started).Round(time.Millisecond),
+			"request_id", requestIDFromCtx(r.Context()))
 	})
 }
 
@@ -222,7 +219,7 @@ func (p *Proxy) withRecover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				p.logger.Printf("panic request_id=%s err=%v", requestIDFromCtx(r.Context()), rec)
+				p.logger.Error("panic", "request_id", requestIDFromCtx(r.Context()), "err", rec)
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
 		}()
@@ -240,7 +237,7 @@ func (p *Proxy) emitEvents(events []LogEvent) {
 	select {
 	case p.logCh <- events:
 	default:
-		p.logger.Printf("proxy log channel full, dropping %d events", len(events))
+		p.logger.Warn("proxy log channel full, dropping events", "count", len(events))
 	}
 }
 

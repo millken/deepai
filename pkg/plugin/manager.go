@@ -3,7 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -68,7 +68,7 @@ type Manager struct {
 	resolver *DependencyResolver
 	config   ManagerConfig
 	registry *Registry
-	logger   *log.Logger
+	logger   *slog.Logger
 	events   chan Event
 	done     chan struct{}
 
@@ -80,7 +80,7 @@ type Manager struct {
 }
 
 // NewManager creates a new plugin manager.
-func NewManager(cfg ManagerConfig) *Manager {
+func NewManager(logger *slog.Logger, cfg ManagerConfig) *Manager {
 	if cfg.LoadTimeout == 0 {
 		cfg.LoadTimeout = 30 * time.Second
 	}
@@ -97,14 +97,14 @@ func NewManager(cfg ManagerConfig) *Manager {
 		resolver: NewDependencyResolver(),
 		config:   cfg,
 		registry: globalRegistry,
-		logger:   log.New(os.Stderr, "[plugin] ", log.LstdFlags),
+		logger:   logger,
 		events:   make(chan Event, 256),
 		done:     make(chan struct{}),
 	}
 }
 
 // SetLogger configures a custom logger.
-func (m *Manager) SetLogger(logger *log.Logger) *Manager {
+func (m *Manager) SetLogger(logger *slog.Logger) *Manager {
 	if logger != nil {
 		m.logger = logger
 	}
@@ -269,7 +269,7 @@ func (m *Manager) discoverDir(dir string) (map[string]*Manifest, error) {
 
 		var manifest Manifest
 		if err := yaml.Unmarshal(data, &manifest); err != nil {
-			m.logger.Printf("parse manifest %s: %v", manifestPath, err)
+			m.logger.Warn("parse manifest failed", "name", manifestPath, "err", err)
 			continue
 		}
 
@@ -300,7 +300,7 @@ func (m *Manager) Load(ctx context.Context) error {
 			if m.config.Strict {
 				return fmt.Errorf("load %s: %w", id, err)
 			}
-			m.logger.Printf("load plugin %s: %v", id, err)
+			m.logger.Warn("load plugin failed", "name", id, "err", err)
 			continue
 		}
 	}
@@ -429,7 +429,7 @@ func (m *Manager) StartAll(ctx context.Context) error {
 	// Resolve dependency order
 	order, err := m.resolver.Resolve(manifests)
 	if err != nil {
-		m.logger.Printf("dependency resolution failed: %v, starting in arbitrary order", err)
+		m.logger.Warn("dependency resolution failed", "err", err)
 		// Fallback: start in arbitrary order
 		m.mu.RLock()
 		order = make([]string, 0, len(m.wrappers))
@@ -462,7 +462,7 @@ func (m *Manager) StartAll(ctx context.Context) error {
 					if m.config.Strict {
 						return err
 					}
-					m.logger.Printf("start %s: %v", id, err)
+					m.logger.Warn("start failed", "name", id, "err", err)
 				}
 				return nil
 			})
@@ -559,7 +559,7 @@ func (m *Manager) StopAll(ctx context.Context) error {
 		id := id // capture
 		g.Go(func() error {
 			if err := m.Stop(gctx, id); err != nil {
-				m.logger.Printf("stop %s: %v", id, err)
+				m.logger.Warn("stop failed", "name", id, "err", err)
 			}
 			return nil // Don't fail on stop errors
 		})
@@ -707,7 +707,7 @@ func (m *Manager) ExecuteHook(ctx context.Context, point HookPoint, hctx *HookCo
 			if ctx.Err() == context.DeadlineExceeded {
 				err = fmt.Errorf("hook %s timeout after %v", point, hookTimeout)
 			}
-			m.logger.Printf("hook %s plugin %s: %v", point, p.Info().ID, err)
+			m.logger.Warn("hook failed", "hook", point, "name", p.Info().ID, "err", err)
 			if m.config.Strict {
 				return err
 			}

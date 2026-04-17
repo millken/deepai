@@ -31,6 +31,7 @@ type Agent struct {
 	llm             llm.LLMProvider
 	tools           *tools.Registry
 	sandbox         *sandbox.Sandbox
+	logger          *slog.Logger
 	agentType       AgentType
 	model           string
 	reasoningEffort string
@@ -86,6 +87,7 @@ func New(cfg AgentConfig) *Agent {
 		llm:             cfg.LLMProvider,
 		tools:           registry,
 		sandbox:         cfg.Sandbox,
+		logger:          slog.Default().With("component", "agent"),
 		agentType:       cfg.AgentType,
 		model:           resolveModel(cfg.Model),
 		reasoningEffort: strings.TrimSpace(cfg.ReasoningEffort),
@@ -204,7 +206,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	usage := &Usage{}
 
 	for turn := 0; ; turn++ {
-		slog.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
+		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
 		// Safety valve: hard turn cap (0 = unlimited)
 		if a.maxTurns > 0 && turn >= a.maxTurns {
 			err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
@@ -247,7 +249,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 				if didCompact {
-					slog.Debug("context compaction", "turn", turn, "before", before, "after", len(compacted), "estimated_tokens", estimated, "ratio", fmt.Sprintf("%.2f", ratio))
+					a.logger.Debug("context compaction", "turn", turn, "before", before, "after", len(compacted), "estimated_tokens", estimated, "ratio", fmt.Sprintf("%.2f", ratio))
 					runMessages = compacted
 					emit(AgentEvent{
 						Type: AgentEventCompact,
@@ -331,7 +333,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 		}
 
-		slog.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
+		a.logger.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
 		assistantMetadata := map[string]string{"stop_reason": stopReason}
 		if streamUsage != nil {
 			if raw, err := json.Marshal(streamUsage); err == nil {

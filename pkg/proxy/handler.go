@@ -13,7 +13,7 @@ import (
 func (p *Proxy) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
-		p.logger.Printf("health encode error: %v", err)
+		p.logger.Error("health encode error", "err", err)
 	}
 }
 
@@ -132,7 +132,7 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := w.Write(respBody); err != nil {
-		p.logger.Printf("write response error request_id=%s err=%v", id, err)
+		p.logger.Error("write response error", "request_id", id, "err", err)
 	}
 
 	// Emit response body + done events.

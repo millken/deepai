@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"testing"
 
@@ -231,7 +232,7 @@ func TestManager(t *testing.T) {
 	// Create manager
 	cfg := DefaultManagerConfig()
 	cfg.AutoLoad = false
-	m := NewManager(cfg)
+	m := NewManager(slog.Default(), cfg)
 	m.SetRegistry(r)
 
 	ctx := context.Background()
@@ -297,7 +298,7 @@ func TestManagerHooks(t *testing.T) {
 	r.Register(hp)
 
 	cfg := DefaultManagerConfig()
-	m := NewManager(cfg)
+	m := NewManager(slog.Default(), cfg)
 	m.SetRegistry(r)
 
 	ctx := context.Background()

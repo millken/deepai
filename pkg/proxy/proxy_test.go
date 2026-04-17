@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -132,7 +133,7 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc) *testEnv {
 	t.Cleanup(upstream.Close)
 
 	store := NewMemoryEventStore()
-	p, err := NewProxy(Config{
+	p, err := NewProxy(slog.Default(), Config{
 		Addr:           ":0",
 		OpenAI:         UpstreamConfig{BaseURL: upstream.URL, APIKey: "sk-test-openai"},
 		Anthropic:      UpstreamConfig{BaseURL: upstream.URL, APIKey: "sk-test-anthropic"},
@@ -631,7 +632,7 @@ func TestFileEventStoreWithProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p, _ := NewProxy(Config{
+	p, _ := NewProxy(slog.Default(), Config{
 		Addr:           ":0",
 		OpenAI:         UpstreamConfig{BaseURL: upstream.URL, APIKey: "sk-test"},
 		MaxRequestBody: 1 << 20,

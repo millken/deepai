@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -18,7 +18,7 @@ type PostgresEventStoreConfig struct {
 	BatchSize     int           // auto-flush threshold (default 100)
 	RequestsTable string        // default "proxy_requests"
 	EventsTable   string        // default "proxy_events"
-	Logger        *log.Logger   // optional logger for flush errors
+	Logger        *slog.Logger   // optional logger for flush errors
 }
 
 // PostgresEventStore implements EventStore backed by PostgreSQL.
@@ -238,7 +238,7 @@ func (s *PostgresEventStore) flushLoop() {
 			s.mu.Unlock()
 			if len(batch) > 0 {
 				if err := s.flush(context.Background(), batch); err != nil {
-					s.logf("postgres flush error: %v (%d events dropped)", err, len(batch))
+					s.logf("postgres flush error", "err", err, "dropped", len(batch))
 				}
 			}
 		case <-s.done:
@@ -316,7 +316,7 @@ func (s *PostgresEventStore) GetTimeline(ctx context.Context, id string) ([]LogE
 			`SELECT req_body, resp_body FROM %s WHERE id = $1`, s.cfg.RequestsTable)
 		if err := s.pool.QueryRow(ctx, bodySQL, id).Scan(&reqBody, &respBody); err != nil {
 			// Body enrichment is best-effort; log but don't fail.
-			s.logf("postgres: load bodies for %s: %v", id, err)
+			s.logf("postgres: load bodies failed", "id", id, "err", err)
 		}
 
 		for i := range events {
@@ -361,7 +361,7 @@ func (s *PostgresEventStore) Close() error {
 		if len(batch) > 0 {
 			flushErr = s.flush(context.Background(), batch)
 			if flushErr != nil {
-				s.logf("postgres close flush error: %v (%d events dropped)", flushErr, len(batch))
+				s.logf("postgres close flush error", "err", flushErr, "dropped", len(batch))
 			}
 		}
 	})
@@ -369,9 +369,9 @@ func (s *PostgresEventStore) Close() error {
 	return flushErr
 }
 
-func (s *PostgresEventStore) logf(format string, args ...any) {
+func (s *PostgresEventStore) logf(msg string, args ...any) {
 	if s.cfg.Logger != nil {
-		s.cfg.Logger.Printf(format, args...)
+		s.cfg.Logger.Warn(msg, args...)
 	}
 }
 

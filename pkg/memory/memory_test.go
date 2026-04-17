@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -118,7 +118,7 @@ func TestServiceUpdateAndInject(t *testing.T) {
 		},
 	}
 
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 	msgs := []models.Message{{
 		ID:        "m1",
 		SessionID: "session-42",
@@ -160,7 +160,7 @@ func TestServiceUpdateUsesConversationThreadAsDefaultFactSourceForAgentMemory(t 
 		},
 	}
 
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 	msgs := []models.Message{{
 		ID:        "m1",
 		SessionID: "thread-agent-review",
@@ -299,8 +299,7 @@ func TestScheduleUpdateGracefulDegradation(t *testing.T) {
 	extractor := &stubExtractor{err: errors.New("llm exploded")}
 	buf := &bytes.Buffer{}
 
-	service := NewService(store, extractor).
-		WithLogger(log.New(buf, "", 0)).
+	service := NewService(slog.New(slog.NewTextHandler(buf, nil)), store, extractor).
 		WithUpdateTimeout(200 * time.Millisecond)
 
 	service.ScheduleUpdate("session-err", []models.Message{{
@@ -334,7 +333,7 @@ func TestServiceUpdateFiltersUploadOnlyTurn(t *testing.T) {
 			User: UserMemory{TopOfMind: "Prefers concise answers"},
 		},
 	}
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 
 	const uploadBlock = "<uploaded_files>\nThe following files were uploaded in this message:\n\n- secret.txt (0.0 KB)\n  Path: /mnt/user-data/uploads/secret.txt\n</uploaded_files>"
 	msgs := []models.Message{
@@ -375,7 +374,7 @@ func TestServiceUpdateStripsUploadBlockBeforeExtractor(t *testing.T) {
 			User: UserMemory{TopOfMind: "Need a summary"},
 		},
 	}
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 
 	const uploadBlock = "<uploaded_files>\nThe following files were uploaded in this message:\n\n- report.pdf (0.0 KB)\n  Path: /mnt/user-data/uploads/report.pdf\n</uploaded_files>"
 	msgs := []models.Message{
@@ -434,7 +433,7 @@ func TestServiceUpdateStripsUploadMentionsFromMemory(t *testing.T) {
 			},
 		},
 	}
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 
 	msgs := []models.Message{{
 		ID:        "m1",
@@ -478,7 +477,7 @@ func TestServiceUpdateExcludesIntermediateAIToolCallMessages(t *testing.T) {
 			User: UserMemory{TopOfMind: "Prefers direct answers"},
 		},
 	}
-	service := NewService(store, extractor)
+	service := NewService(slog.Default(), store, extractor)
 
 	msgs := []models.Message{
 		{
@@ -1023,7 +1022,7 @@ func TestRecordSkillUsage(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeStorage{docs: map[string]Document{}}
-	svc := NewService(store, nil)
+	svc := NewService(slog.Default(), store, nil)
 
 	ctx := context.Background()
 	err := svc.RecordSkillUsage(ctx, "sess-1", "commit")
@@ -1085,7 +1084,7 @@ func TestRecordSkillUsageSecurity(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeStorage{docs: map[string]Document{}}
-	svc := NewService(store, nil)
+	svc := NewService(slog.Default(), store, nil)
 
 	ctx := context.Background()
 	// Skill name containing injection attempt should be blocked.
@@ -1106,7 +1105,7 @@ func TestUpdateWithFactSource(t *testing.T) {
 			},
 		},
 	}
-	svc := NewService(store, extractor)
+	svc := NewService(slog.Default(), store, extractor)
 
 	msgs := []models.Message{
 		{Role: models.RoleHuman, Content: "Hello", SessionID: "sess-1"},

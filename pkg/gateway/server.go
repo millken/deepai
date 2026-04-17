@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,14 +34,14 @@ type Config struct {
 	Addr            string
 	DatabaseURL     string
 	DefaultModel    string
-	Logger          *log.Logger
+	Logger          *slog.Logger
 	ShutdownTimeout time.Duration
 }
 
 type Server struct {
 	cfg             Config
 	httpServer      *http.Server
-	logger          *log.Logger
+	logger          *slog.Logger
 	store           sessionStore
 	tools           *tools.Registry
 	sandbox         *sandbox.Sandbox
@@ -97,15 +96,12 @@ func (a postgresSearchAdapter) SearchMessages(ctx context.Context, query string,
 
 var messageSeq uint64
 
-func NewServer(cfg Config) (*Server, error) {
+func NewServer(logger *slog.Logger, cfg Config) (*Server, error) {
 	if strings.TrimSpace(cfg.Addr) == "" {
 		cfg.Addr = defaultAddr
 	}
 	if strings.TrimSpace(cfg.DefaultModel) == "" {
 		cfg.DefaultModel = defaultModelRef
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = log.New(os.Stderr, "gateway ", log.LstdFlags)
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = defaultShutdownTimeout
@@ -143,7 +139,7 @@ func NewServer(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("create memory store: %w", err)
 		}
 		cleanupFns = append(cleanupFns, memStore.Close)
-		memService = memory.NewService(memStore, nil)
+		memService = memory.NewService(slog.Default(), memStore, nil)
 		// Register memService.Close AFTER memStore.Close so that on reversed
 		// cleanup the queue drains first, then the underlying store closes.
 		cleanupFns = append(cleanupFns, func() {
@@ -152,13 +148,13 @@ func NewServer(cfg Config) (*Server, error) {
 			_ = memService.Close(ctx)
 		})
 		if err := memService.AutoMigrate(context.Background()); err != nil {
-			cfg.Logger.Printf("memory auto-migrate warning: %v", err)
+			logger.Warn("memory auto-migrate warning", "err", err)
 		}
 	}
 
 	s := &Server{
 		cfg:             cfg,
-		logger:          cfg.Logger,
+		logger:          logger,
 		store:           store,
 		tools:           registry,
 		sandbox:         sb,
@@ -203,7 +199,7 @@ func (s *Server) ListenAndServe() error {
 	if s == nil || s.httpServer == nil {
 		return errors.New("gateway server is not initialized")
 	}
-	s.logger.Printf("gateway listening on %s", s.httpServer.Addr)
+	s.logger.Info("gateway listening", "addr", s.httpServer.Addr)
 	err := s.httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -225,7 +221,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			defer cancel()
 		}
 		started := time.Now()
-		s.logger.Printf("gateway shutdown started inflight=%d", atomic.LoadInt64(&s.inFlightCount))
+		s.logger.Info("gateway shutdown started", "inflight", atomic.LoadInt64(&s.inFlightCount))
 
 		if s.httpServer != nil {
 			shutdownErr = s.httpServer.Shutdown(ctx)
@@ -247,12 +243,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		for i := len(s.cleanupFns) - 1; i >= 0; i-- {
 			s.cleanupFns[i]()
 		}
-		s.logger.Printf(
-			"gateway shutdown finished duration=%s inflight=%d uptime=%s err=%v",
-			time.Since(started).Round(time.Millisecond),
-			atomic.LoadInt64(&s.inFlightCount),
-			time.Since(s.startedAt).Round(time.Second),
-			shutdownErr,
+		s.logger.Info("gateway shutdown finished",
+			"duration", time.Since(started).Round(time.Millisecond),
+			"inflight", atomic.LoadInt64(&s.inFlightCount),
+			"uptime", time.Since(s.startedAt).Round(time.Second),
+			"err", shutdownErr,
 		)
 	})
 	return shutdownErr

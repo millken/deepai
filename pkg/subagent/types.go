@@ -2,7 +2,7 @@ package subagent
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -37,7 +37,7 @@ type SubagentConfig struct {
 type PoolConfig struct {
 	MaxConcurrent int
 	Timeout       time.Duration
-	Logger        *log.Logger
+	Logger        *slog.Logger
 	Defaults      map[SubagentType]SubagentConfig
 }
 

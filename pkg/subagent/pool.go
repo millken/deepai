@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +31,7 @@ func NewPool(executor Executor, cfg PoolConfig) *Pool {
 		cfg.Timeout = 2 * time.Minute
 	}
 	if cfg.Logger == nil {
-		cfg.Logger = log.Default()
+		cfg.Logger = slog.Default()
 	}
 	if cfg.Defaults == nil {
 		cfg.Defaults = map[SubagentType]SubagentConfig{
@@ -223,7 +223,7 @@ func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, re
 		event.Error = task.Error
 	}
 
-	p.cfg.Logger.Printf("subagent task id=%s request_id=%s type=%s status=%s", task.ID, task.RequestID, task.Type, task.Status)
+	p.cfg.Logger.Info("subagent task", "id", task.ID, "request_id", task.RequestID, "type", task.Type, "status", task.Status)
 	p.emit(ctx, event)
 }
 

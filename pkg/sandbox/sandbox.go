@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -169,7 +168,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd string, timeout time.Duration) (
 	case waitErr = <-waitDone:
 	case <-runCtx.Done():
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			log.Printf("sandbox warning: session=%s timeout=%s cmd=%q", filepath.Base(s.sessionDir), timeout, cmd)
+			slog.Warn("sandbox timeout", "session", filepath.Base(s.sessionDir), "timeout", timeout, "cmd", cmd)
 		}
 		s.forceKill(command.Process)
 		waitErr = s.waitAfterKill(waitDone)

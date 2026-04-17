@@ -3,7 +3,7 @@ package gateway
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -74,7 +74,7 @@ func newTestServer() *Server {
 		cfg: Config{
 			DefaultModel: "openai/test-model",
 		},
-		logger:          log.New(io.Discard, "", 0),
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:           newMemoryStore(),
 		tools:           tools.NewRegistry(),
 		providers:       map[string]llm.LLMProvider{},

@@ -113,7 +113,7 @@ func (q *UpdateQueue) submit(job updateJob) {
 	// just before Close() calls close(q.ch), causing a send-on-closed-channel panic.
 	defer func() {
 		if r := recover(); r != nil {
-			q.svc.logf("update queue submit recovered panic (channel closed): %v", r)
+			q.svc.logger.Warn("update queue submit recovered panic", "err", r)
 			if key != "" {
 				q.mu.Lock()
 				delete(q.pendingSeq, key)
@@ -125,7 +125,7 @@ func (q *UpdateQueue) submit(job updateJob) {
 	case q.ch <- job:
 		return
 	case <-time.After(submitTimeout):
-		q.svc.logf("update queue submit timeout after %v, dropping job type=%d session=%s", submitTimeout, job.typ, job.sessionID)
+		q.svc.logger.Warn("update queue submit timeout, dropping job", "timeout", submitTimeout, "type", job.typ, "session", job.sessionID)
 		if key != "" {
 			q.mu.Lock()
 			delete(q.pendingSeq, key)
@@ -223,42 +223,42 @@ func (q *UpdateQueue) execute(job updateJob) {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
-			q.svc.logf("async update with failed for session %s: %v", job.sessionID, err)
+			q.svc.logger.Warn("async update with failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdate:
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := q.svc.Update(ctx, job.sessionID, job.messages); err != nil {
-			q.svc.logf("async update failed for session %s: %v", job.sessionID, err)
+			q.svc.logger.Warn("async update failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdateWithFactSource:
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := q.svc.UpdateWithFactSource(ctx, job.sessionID, job.messages, job.ext, job.factSource); err != nil {
-			q.svc.logf("async update with fact source failed for session %s: %v", job.sessionID, err)
+			q.svc.logger.Warn("async update with fact source failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobRecordSkillUsage:
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := q.svc.RecordSkillUsage(ctx, job.sessionID, job.skillName); err != nil {
-			q.svc.logf("record skill usage failed for session %s skill %s: %v", job.sessionID, job.skillName, err)
+			q.svc.logger.Warn("record skill usage failed", "session", job.sessionID, "skill", job.skillName, "err", err)
 		}
 
 	case jobIncrementRetrieval:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := q.svc.storage.IncrementRetrievalCounts(ctx, job.sessionID, job.factIDs); err != nil {
-			q.svc.logf("increment retrieval counts failed for session %s: %v", job.sessionID, err)
+			q.svc.logger.Warn("increment retrieval counts failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdateScopeWithSkill:
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := q.svc.UpdateScopeWithSkillUsage(ctx, job.scope, job.messages, job.ext, job.skillName); err != nil {
-			q.svc.logf("async scope+skill update failed for scope %s: %v", job.scope.Key(), err)
+			q.svc.logger.Warn("async scope+skill update failed", "scope", job.scope.Key(), "err", err)
 		}
 	}
 }

@@ -19,7 +19,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -40,10 +40,11 @@ func main() {
 	flag.Parse()
 
 	if *openaiKey == "" && *anthropicKey == "" {
-		log.Fatal("至少需要设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY")
+		slog.Error("至少需要设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY")
+		os.Exit(1)
 	}
 
-	p, err := proxy.NewProxy(proxy.Config{
+	p, err := proxy.NewProxy(slog.Default(), proxy.Config{
 		Addr: *addr,
 		OpenAI: proxy.UpstreamConfig{
 			BaseURL: *openaiURL,
@@ -55,7 +56,8 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("create proxy: %v", err)
+		slog.Error("create proxy", "err", err)
+		os.Exit(1)
 	}
 
 	var storeDesc string
@@ -65,7 +67,8 @@ func main() {
 			MaxInlineBodySize: *maxInlineBody,
 		})
 		if err != nil {
-			log.Fatalf("create file event store: %v", err)
+			slog.Error("create file event store", "err", err)
+			os.Exit(1)
 		}
 		defer store.Close()
 		p.WithStore(store)
@@ -79,7 +82,7 @@ func main() {
 
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
-			log.Printf("proxy server error: %v", err)
+			slog.Error("proxy server error", "err", err)
 		}
 	}()
 
@@ -94,11 +97,12 @@ func main() {
 `, *addr, *openaiURL, *anthropicURL, storeDesc)
 
 	<-ctx.Done()
-	log.Print("shutting down...")
+	slog.Info("shutting down...")
 	if err := p.Shutdown(context.Background()); err != nil {
-		log.Fatalf("shutdown: %v", err)
+		slog.Error("shutdown", "err", err)
+		os.Exit(1)
 	}
-	log.Print("proxy stopped")
+	slog.Info("proxy stopped")
 }
 
 func envOr(key, fallback string) string {

@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
-	"os"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -78,28 +77,21 @@ type Extractor interface {
 type Service struct {
 	storage       Storage
 	extractor     Extractor
-	logger        *log.Logger
+	logger        *slog.Logger
 	updateTimeout time.Duration
 	queue         *UpdateQueue
 	sessionMu     sync.Map // sessionID → *sync.Mutex ; serializes Update-to-Save per session
 }
 
-func NewService(storage Storage, extractor Extractor) *Service {
+func NewService(logger *slog.Logger, storage Storage, extractor Extractor) *Service {
 	svc := &Service{
 		storage:       storage,
 		extractor:     extractor,
-		logger:        log.New(os.Stderr, "memory: ", log.LstdFlags),
+		logger:        logger,
 		updateTimeout: defaultUpdateTimeout,
 	}
 	svc.queue = newUpdateQueue(svc, defaultQueueSize)
 	return svc
-}
-
-func (s *Service) WithLogger(logger *log.Logger) *Service {
-	if s != nil && logger != nil {
-		s.logger = logger
-	}
-	return s
 }
 
 func (s *Service) WithUpdateTimeout(timeout time.Duration) *Service {
@@ -396,7 +388,7 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 		if !found {
 			factContent := "用户使用了 /" + skillName + " 技能"
 			if scanErr := ScanContent(factContent); scanErr != nil {
-				s.logf("skill usage fact blocked by security for %s: %v", skillName, scanErr)
+				s.logger.Warn("skill usage fact blocked by security", "key", skillName, "err", scanErr)
 			} else {
 				now := time.Now().UTC()
 				merged.Facts = append(merged.Facts, Fact{
@@ -485,7 +477,7 @@ func (s *Service) InjectWithContext(ctx context.Context, sessionID string, curre
 	doc, err := s.storage.Load(ctx, sessionID)
 	if err != nil {
 		if !errors.Is(err, ErrNotFound) {
-			s.logf("load memory for injection failed for session %s: %v", sessionID, err)
+			s.logger.Warn("load memory for injection failed", "session", sessionID, "err", err)
 		}
 		return ""
 	}
@@ -718,8 +710,3 @@ func cloneAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
-func (s *Service) logf(format string, args ...any) {
-	if s != nil && s.logger != nil {
-		s.logger.Printf(format, args...)
-	}
-}
