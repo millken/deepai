@@ -68,3 +68,80 @@ func TestMapChatReqToLitellmRequest(t *testing.T) {
 		t.Fatalf("function parameters mismatch: got %#v want %#v", tool.Function.Parameters, req.Tools[0].InputSchema)
 	}
 }
+
+func TestMapChatReqToLitellmRequest_DisableThinking(t *testing.T) {
+	req := ChatRequest{
+		Model:           "test-model",
+		Messages:        []models.Message{},
+		ReasoningEffort: "disabled",
+	}
+
+	msgs := []litellm.Message{{Role: "user", Content: "hello"}}
+	r := mapChatReqToLitellmRequest(req, msgs)
+
+	if r == nil {
+		t.Fatalf("expected non-nil litellm.Request")
+	}
+	if r.Thinking == nil {
+		t.Fatalf("thinking should be set when reasoning_effort is disabled")
+	}
+	if r.Thinking.Type != litellm.ThinkingDisabled {
+		t.Fatalf("thinking type mismatch: got %q want %q", r.Thinking.Type, litellm.ThinkingDisabled)
+	}
+}
+
+func TestExtractResponseContent(t *testing.T) {
+	tests := []struct {
+		name string
+		resp *litellm.Response
+		want string
+	}{
+		{
+			name: "prefer content field",
+			resp: &litellm.Response{
+				Content:  "title from content",
+				Contents: []litellm.MessageContent{{Type: "text", Text: "title from contents"}},
+			},
+			want: "title from content",
+		},
+		{
+			name: "fallback to contents text",
+			resp: &litellm.Response{
+				Content:  "",
+				Contents: []litellm.MessageContent{{Type: "text", Text: "title from contents"}},
+			},
+			want: "title from contents",
+		},
+		{
+			name: "empty when no text",
+			resp: &litellm.Response{
+				Content:  "",
+				Contents: []litellm.MessageContent{{Type: "text", Text: "   "}},
+			},
+			want: "",
+		},
+		{
+			name: "fallback to reasoning content",
+			resp: &litellm.Response{
+				Content:          "",
+				Contents:         []litellm.MessageContent{{Type: "text", Text: ""}},
+				ReasoningContent: "title from reasoning",
+			},
+			want: "title from reasoning",
+		},
+		{
+			name: "nil response",
+			resp: nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractResponseContent(tt.resp)
+			if got != tt.want {
+				t.Fatalf("extractResponseContent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

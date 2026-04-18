@@ -60,7 +60,7 @@ func (p *LitellmProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespon
 		return ChatResponse{}, err
 	}
 
-	msg := models.Message{Role: models.RoleAI, Content: resp.Content, ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
+	msg := models.Message{Role: models.RoleAI, Content: extractResponseContent(resp), ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
 	var usage Usage
 	if resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0 {
 		usage = Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
@@ -123,7 +123,7 @@ func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan S
 			ch <- StreamChunk{Err: err, Done: true}
 			return
 		}
-		msg := models.Message{Role: models.RoleAI, Content: resp.Content, ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
+		msg := models.Message{Role: models.RoleAI, Content: extractResponseContent(resp), ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
 		usage := lastUsage
 		if usage == nil && (resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0) {
 			usage = &Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
@@ -156,6 +156,28 @@ func convertLitellmToolCalls(calls []litellm.ToolCall) []models.ToolCall {
 		result = append(result, toolCall)
 	}
 	return result
+}
+
+func extractResponseContent(resp *litellm.Response) string {
+	if resp == nil {
+		return ""
+	}
+
+	if strings.TrimSpace(resp.Content) != "" {
+		return resp.Content
+	}
+
+	for _, c := range resp.Contents {
+		if strings.TrimSpace(c.Text) != "" {
+			return c.Text
+		}
+	}
+
+	if strings.TrimSpace(resp.ReasoningContent) != "" {
+		return resp.ReasoningContent
+	}
+
+	return ""
 }
 
 // mapMessageToLitellm converts a models.Message into a litellm.Message,
@@ -220,7 +242,12 @@ func mapChatReqToLitellmRequest(req ChatRequest, msgs []litellm.Message) *litell
 	// ReasoningEffort
 	// Thinking/Reasoning effort: enable thinking with provided level
 	if req.ReasoningEffort != "" {
-		r.Thinking = &litellm.ThinkingConfig{Type: litellm.ThinkingEnabled, Level: req.ReasoningEffort}
+		switch strings.ToLower(strings.TrimSpace(req.ReasoningEffort)) {
+		case "disabled", "disable", "none", "off", "false", "0":
+			r.Thinking = &litellm.ThinkingConfig{Type: litellm.ThinkingDisabled}
+		default:
+			r.Thinking = &litellm.ThinkingConfig{Type: litellm.ThinkingEnabled, Level: req.ReasoningEffort}
+		}
 	}
 
 	// Temperature: litellm.Request expects *float64

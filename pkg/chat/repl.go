@@ -386,9 +386,10 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 	)
 	maxTokens := 60
 	resp, err := r.cfg.LLMProvider.Chat(context.Background(), llm.ChatRequest{
-		Model:     r.cfg.Model,
-		Messages:  []models.Message{{Role: models.RoleHuman, Content: prompt}},
-		MaxTokens: &maxTokens,
+		Model:           r.cfg.Model,
+		Messages:        []models.Message{{Role: models.RoleHuman, Content: prompt}},
+		MaxTokens:       &maxTokens,
+		ReasoningEffort: "disabled",
 	})
 	if err != nil {
 		slog.Warn("auto-title LLM failed", "err", err)
