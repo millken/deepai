@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -69,7 +70,7 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 }
 
 // Run starts the REPL loop. It handles both interactive and single-query modes.
-func (r *ChatRepl) Run(ctx context.Context) error {
+func (r *ChatRepl) Run(parentCtx context.Context) error {
 	defer r.sb.Close()
 	defer func() {
 		if r.cfg.MemoryService != nil {
@@ -84,7 +85,7 @@ func (r *ChatRepl) Run(ctx context.Context) error {
 
 	// Single query mode.
 	if r.cfg.Query != "" {
-		return r.runSingleQuery(ctx)
+		return r.runSingleQuery(parentCtx)
 	}
 
 	// Show banner.
@@ -108,10 +109,15 @@ func (r *ChatRepl) Run(ctx context.Context) error {
 	})
 
 	// Interactive loop.
+	// SIGINT (Ctrl+C) during a turn cancels only that turn.
+	// SIGINT at the prompt exits the REPL.
+	sigCh := make(chan os.Signal, 1)
+	defer signal.Stop(sigCh)
 	for {
-		line, err := r.input.ReadPrompt(ctx)
+		// Wait for user input (no signal forwarding — Ctrl+C at prompt exits).
+		line, err := r.input.ReadPrompt(parentCtx)
 		if err != nil {
-			if ctx.Err() != nil {
+			if parentCtx.Err() != nil {
 				fmt.Fprintln(os.Stderr, "\n  Interrupted.")
 			}
 			break
@@ -129,10 +135,27 @@ func (r *ChatRepl) Run(ctx context.Context) error {
 		}
 
 		r.turn++
-		if err := r.runTurn(ctx, line); err != nil {
-			if ctx.Err() != nil {
+
+		// Create a cancellable context for this turn.
+		// Forward SIGINT to cancel the turn context, not the parent.
+		turnCtx, turnCancel := context.WithCancel(parentCtx)
+		signal.Notify(sigCh, os.Interrupt)
+		go func() {
+			select {
+			case <-sigCh:
+				turnCancel()
+			case <-turnCtx.Done():
+			}
+		}()
+
+		err = r.runTurn(turnCtx, line)
+		turnCancel()
+		signal.Stop(sigCh) // stop receiving on sigCh until next turn
+
+		if err != nil {
+			if turnCtx.Err() != nil {
 				r.renderer.RenderInterrupted()
-				continue
+				continue // back to prompt
 			}
 			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 		}
@@ -197,11 +220,7 @@ func (r *ChatRepl) runSingleQuery(ctx context.Context) error {
 	return r.runTurn(ctx, r.cfg.Query)
 }
 
-func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
-	// Create a cancellable sub-context for this turn.
-	ctx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
-
+func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 	// Evaluate fact feedback from previous turn (consume-once).
 	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
 
@@ -316,7 +335,6 @@ EventLoop:
 			}
 			break EventLoop
 		case <-ctx.Done():
-			cancel()
 			return ctx.Err()
 		}
 	}
