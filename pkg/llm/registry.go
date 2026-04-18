@@ -2,8 +2,11 @@ package llm
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -44,6 +47,24 @@ var providerDef = map[string]struct {
 	}},
 }
 
+// sharedHTTPClient is a process-wide HTTP client with HTTP/2 and connection pooling.
+var sharedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		ForceAttemptHTTP2: true,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		MaxConnsPerHost:       50,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
+
 // buildConfig resolves API key and base URL from env vars at call time,
 // then merges with optional explicit overrides and static resilience settings.
 func buildConfig(name string, overrides ProviderConfig) (litellm.ProviderConfig, error) {
@@ -65,6 +86,7 @@ func buildConfig(name string, overrides ProviderConfig) (litellm.ProviderConfig,
 		APIKey:     apiKey,
 		BaseURL:    baseURL,
 		Resilience: def.resilience,
+		HTTPClient: sharedHTTPClient,
 	}, nil
 }
 
