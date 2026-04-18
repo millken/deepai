@@ -21,30 +21,33 @@ type ProviderConfig struct {
 	BaseURL string
 }
 
+// defaultResilience is the baseline resilience config applied to all providers.
+var defaultResilience = litellm.ResilienceConfig{
+	MaxRetries:     3,
+	InitialDelay:   1 * time.Second,
+	MaxDelay:       30 * time.Second,
+	Multiplier:     2.0,
+	Jitter:         true,
+	RequestTimeout: 5 * time.Minute,
+	ConnectTimeout: 10 * time.Second,
+}
+
 // providerDef holds per-provider static config and env var mappings.
 var providerDef = map[string]struct {
 	apiKeyVar  string
 	baseURLVar string
 	resilience litellm.ResilienceConfig
 }{
-	"openai": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
-		RequestTimeout: 5 * time.Minute,
-		ConnectTimeout: 10 * time.Second,
-		MaxRetries:     1,
-	}},
-	"anthropic": {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", litellm.ResilienceConfig{}},
-	"qwen":      {"QWEN_API_KEY", "", litellm.ResilienceConfig{}},
-	"gemini":    {"GEMINI_API_KEY", "", litellm.ResilienceConfig{}},
-	"groq":      {"GROQ_API_KEY", "", litellm.ResilienceConfig{}},
-	"ollama":    {"OLLAMA_API_KEY", "", litellm.ResilienceConfig{}},
-	"glm":       {"GLM_API_KEY", "", litellm.ResilienceConfig{}},
-	"bedrock":   {"BEDROCK_API_KEY", "", litellm.ResilienceConfig{}},
-	"deepseek":  {"DEEPSEEK_API_KEY", "", litellm.ResilienceConfig{}},
-	"openai-compat": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
-		RequestTimeout: 5 * time.Minute,
-		ConnectTimeout: 10 * time.Second,
-		MaxRetries:     1,
-	}},
+	"openai":       {"OPENAI_API_KEY", "OPENAI_BASE_URL", defaultResilience},
+	"anthropic":    {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", defaultResilience},
+	"qwen":         {"QWEN_API_KEY", "", defaultResilience},
+	"gemini":       {"GEMINI_API_KEY", "", defaultResilience},
+	"groq":         {"GROQ_API_KEY", "", defaultResilience},
+	"ollama":       {"OLLAMA_API_KEY", "", defaultResilience},
+	"glm":          {"GLM_API_KEY", "", defaultResilience},
+	"bedrock":      {"BEDROCK_API_KEY", "", defaultResilience},
+	"deepseek":     {"DEEPSEEK_API_KEY", "", defaultResilience},
+	"openai-compat": {"OPENAI_API_KEY", "OPENAI_BASE_URL", defaultResilience},
 }
 
 // sharedHTTPClient is a process-wide HTTP client with HTTP/2 and connection pooling.
