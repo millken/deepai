@@ -1,10 +1,15 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -38,34 +43,150 @@ var providerDef = map[string]struct {
 	baseURLVar string
 	resilience litellm.ResilienceConfig
 }{
-	"openai":       {"OPENAI_API_KEY", "OPENAI_BASE_URL", defaultResilience},
-	"anthropic":    {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", defaultResilience},
-	"qwen":         {"QWEN_API_KEY", "", defaultResilience},
-	"gemini":       {"GEMINI_API_KEY", "", defaultResilience},
-	"groq":         {"GROQ_API_KEY", "", defaultResilience},
-	"ollama":       {"OLLAMA_API_KEY", "", defaultResilience},
-	"glm":          {"GLM_API_KEY", "", defaultResilience},
-	"bedrock":      {"BEDROCK_API_KEY", "", defaultResilience},
-	"deepseek":     {"DEEPSEEK_API_KEY", "", defaultResilience},
+	"openai":        {"OPENAI_API_KEY", "OPENAI_BASE_URL", defaultResilience},
+	"anthropic":     {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", defaultResilience},
+	"qwen":          {"QWEN_API_KEY", "", defaultResilience},
+	"gemini":        {"GEMINI_API_KEY", "", defaultResilience},
+	"groq":          {"GROQ_API_KEY", "", defaultResilience},
+	"ollama":        {"OLLAMA_API_KEY", "", defaultResilience},
+	"glm":           {"GLM_API_KEY", "", defaultResilience},
+	"bedrock":       {"BEDROCK_API_KEY", "", defaultResilience},
+	"deepseek":      {"DEEPSEEK_API_KEY", "", defaultResilience},
 	"openai-compat": {"OPENAI_API_KEY", "OPENAI_BASE_URL", defaultResilience},
 }
 
-// sharedHTTPClient is a process-wide HTTP client with HTTP/2 and connection pooling.
-var sharedHTTPClient = &http.Client{
-	Transport: &http.Transport{
+// newHTTP2Client creates an HTTP client with HTTP/2, connection pooling, and retry.
+func newHTTP2Client(cfg litellm.ResilienceConfig) *retryClient {
+	transport := &http.Transport{
 		ForceAttemptHTTP2: true,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   cfg.ConnectTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		MaxConnsPerHost:       50,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	},
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     50,
+		IdleConnTimeout:     120 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	return &retryClient{
+		client: &http.Client{
+			Timeout:   cfg.RequestTimeout,
+			Transport: transport,
+		},
+		config: cfg,
+	}
+}
+
+// retryClient wraps http.Client with retry, exponential backoff, and jitter.
+// Implements the HTTPDoer interface expected by litellm providers.
+type retryClient struct {
+	client *http.Client
+	config litellm.ResilienceConfig
+}
+
+func (c *retryClient) Do(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	var originalBody []byte
+
+	if req.Body != nil && req.GetBody == nil {
+		var err error
+		originalBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
+		req.Body.Close()
+	}
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get request body: %w", err)
+			}
+			req.Body = body
+		} else if originalBody != nil {
+			req.Body = io.NopCloser(bytes.NewReader(originalBody))
+		}
+
+		resp, err := c.client.Do(req)
+		if err == nil && !isRetryableStatus(resp.StatusCode) {
+			return resp, nil
+		}
+
+		if err != nil {
+			lastErr = err
+		} else {
+			bodyBytes, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil || len(bodyBytes) == 0 {
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			} else {
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			}
+		}
+
+		if attempt == c.config.MaxRetries {
+			break
+		}
+		if err == nil && !isRetryableStatus(resp.StatusCode) {
+			break
+		}
+		if err != nil && !isRetryableErr(err) {
+			break
+		}
+
+		delay := c.calculateDelay(attempt)
+		slog.Debug("retry request", "attempt", attempt+1, "delay", delay, "err", lastErr)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-req.Context().Done():
+			timer.Stop()
+			return nil, req.Context().Err()
+		}
+	}
+
+	return nil, lastErr
+}
+
+func (c *retryClient) calculateDelay(attempt int) time.Duration {
+	delay := float64(c.config.InitialDelay) * math.Pow(c.config.Multiplier, float64(attempt))
+	if delay > float64(c.config.MaxDelay) {
+		delay = float64(c.config.MaxDelay)
+	}
+	if c.config.Jitter {
+		delay += delay * 0.25 * (2*rand.Float64() - 1)
+		if delay < 0 {
+			delay = float64(c.config.InitialDelay)
+		}
+	}
+	return time.Duration(delay)
+}
+
+func isRetryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, 529,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func isRetryableErr(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if _, ok := errors.AsType[net.Error](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*net.OpError](err); ok {
+		return true
+	}
+	return false
 }
 
 // buildConfig resolves API key and base URL from env vars at call time,
@@ -89,7 +210,7 @@ func buildConfig(name string, overrides ProviderConfig) (litellm.ProviderConfig,
 		APIKey:     apiKey,
 		BaseURL:    baseURL,
 		Resilience: def.resilience,
-		HTTPClient: sharedHTTPClient,
+		HTTPClient: newHTTP2Client(def.resilience),
 	}, nil
 }
 
