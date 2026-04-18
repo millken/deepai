@@ -23,36 +23,36 @@ type BannerInfo struct {
 func RenderBanner(w io.Writer, info BannerInfo) {
 	styles := DefaultStyles()
 
-	width := 50
-	border := strings.Repeat("─", width)
+	innerWidth := 50
+	border := strings.Repeat("─", innerWidth)
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, styles.Separator.Render("  ┌"+border+"┐"))
+	fmt.Fprintln(w, "  ┌"+border+"┐")
 
-	title := styles.Banner.Render("  deepai")
+	title := styles.Banner.Render("deepai")
 	if info.Version != "" {
 		title += styles.BannerDim.Render(" v" + info.Version)
 	}
-	fmt.Fprintln(w, "  │"+padCenter(title, width)+"│")
+	fmt.Fprintln(w, "  │"+padCenter(title, innerWidth)+"│")
 
 	fmt.Fprintln(w, "  ├"+border+"┤")
 
-	fmt.Fprintln(w, fmtLine("Provider", info.Provider, width))
-	fmt.Fprintln(w, fmtLine("Model", info.Model, width))
-	fmt.Fprintln(w, fmtLine("Session", info.SessionID, width))
+	fmt.Fprintln(w, boxLine("Provider", info.Provider, innerWidth))
+	fmt.Fprintln(w, boxLine("Model", info.Model, innerWidth))
+	fmt.Fprintln(w, boxLine("Session", info.SessionID, innerWidth))
 
 	toolsLine := fmt.Sprintf("%d tools", info.ToolCount)
 	if info.SkillCount > 0 {
 		toolsLine += fmt.Sprintf(", %d skills", info.SkillCount)
 		if len(info.SkillNames) > 0 {
 			names := strings.Join(info.SkillNames, ", ")
-			if len(names) > 30 {
-				names = names[:30] + "..."
+			if lipgloss.Width(names) > 30 {
+				names = truncateWidth(names, 27) + "..."
 			}
 			toolsLine += " (" + names + ")"
 		}
 	}
-	fmt.Fprintln(w, fmtLine("Loaded", toolsLine, width))
+	fmt.Fprintln(w, boxLine("Loaded", toolsLine, innerWidth))
 
 	fmt.Fprintln(w, "  └"+border+"┘")
 	fmt.Fprintln(w)
@@ -62,16 +62,27 @@ func RenderBanner(w io.Writer, info BannerInfo) {
 	fmt.Fprintln(w)
 }
 
-func fmtLine(label, value string, width int) string {
-	l := "  " + label + ": "
+// boxLine renders a label: value line inside the box, e.g. "  │ Provider: openai    │".
+func boxLine(label, value string, innerWidth int) string {
 	if value == "" {
 		value = "-"
 	}
-	content := l + value
-	if len(content) > width {
-		content = content[:width-3] + "..."
+	s := DefaultStyles()
+	labelPart := " " + label + ": "
+	labelW := lipgloss.Width(labelPart)
+	remaining := innerWidth - labelW
+	if remaining < 3 {
+		remaining = 3
 	}
-	return styles(l, value) + " │"
+	if lipgloss.Width(value) > remaining {
+		value = truncateWidth(value, remaining-3) + "..."
+	}
+	content := s.Dim.Render(labelPart) + s.Assistant.Render(value)
+	// Pad to fill inner width.
+	if w := lipgloss.Width(content); w < innerWidth {
+		content += strings.Repeat(" ", innerWidth-w)
+	}
+	return "  │" + content + "│"
 }
 
 func padCenter(s string, width int) string {
@@ -83,9 +94,4 @@ func padCenter(s string, width int) string {
 	left := padding / 2
 	right := padding - left
 	return strings.Repeat(" ", left) + s + strings.Repeat(" ", right)
-}
-
-func styles(label, value string) string {
-	s := DefaultStyles()
-	return "  " + s.Dim.Render(label) + s.Assistant.Render(value)
 }

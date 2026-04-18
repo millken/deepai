@@ -61,7 +61,7 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 
 	return &ChatRepl{
 		cfg:      cfg,
-		renderer: NewRenderer(os.Stdout),
+		renderer: NewRenderer(os.Stderr),
 		input:    NewInputHandler(os.Stdin),
 		sessMgr:  sessMgr,
 		sb:       sb,

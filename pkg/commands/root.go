@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"errors"
 	"log/slog"
+	"os"
 
 	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/logs"
@@ -20,7 +22,11 @@ func New() *cobra.Command {
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			// Load ~/.deepai/.env early so all providers can read API keys.
 			if err := env.Load(EnvFile()); err != nil {
-				slog.Warn("failed to load .env", "path", EnvFile(), "err", err)
+				if !errors.Is(err, os.ErrNotExist) {
+					slog.Warn("failed to load .env", "path", EnvFile(), "err", err)
+				} else {
+					slog.Debug(".env not found, skipping", "path", EnvFile())
+				}
 			}
 
 			level := slog.LevelInfo

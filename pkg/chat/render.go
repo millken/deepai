@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/mattn/go-runewidth"
 )
 
 // Renderer handles terminal output for agent events.
@@ -26,30 +28,31 @@ func NewRenderer(w io.Writer) *Renderer {
 }
 
 // RenderEvent outputs a single agent event to the terminal.
+// Only consumes the primary event type from each agent co-emission pair:
+//   - text_chunk (not chunk)
+//   - tool_call_start (not tool_call)
+//   - tool_call_end (not tool_result)
 func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 	switch evt.Type {
-	case agent.AgentEventTextChunk, agent.AgentEventChunk:
+	case agent.AgentEventTextChunk:
 		if evt.Text != "" {
 			fmt.Fprint(r.out, evt.Text)
 		}
 
-	case agent.AgentEventToolCall, agent.AgentEventToolCallStart:
+	case agent.AgentEventToolCallStart:
 		r.renderToolStart(evt)
 
 	case agent.AgentEventToolCallEnd:
 		r.renderToolEnd(evt)
 
-	case agent.AgentEventToolResult:
-		r.renderToolResult(evt)
-
 	case agent.AgentEventError:
 		r.renderError(evt)
 
-	case agent.AgentEventEnd:
-		// End of stream — newline handled by caller.
-
 	case agent.AgentEventCompact:
 		r.renderCompact(evt)
+
+	// Ignored: AgentEventChunk, AgentEventToolCall, AgentEventToolResult,
+	// AgentEventEnd — redundant duplicates or handled by caller.
 	}
 }
 
@@ -57,6 +60,7 @@ func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 func (r *Renderer) TurnStart(turn int) {
 	r.turn = turn
 	r.start = time.Now()
+	fmt.Fprintln(r.out, r.styles.Dim.Render(fmt.Sprintf("  ── Assistant (turn %d) ──", turn)))
 }
 
 // TurnEnd prints usage statistics for the completed turn.
@@ -107,8 +111,8 @@ func (r *Renderer) renderToolEnd(evt agent.AgentEvent) {
 	}
 	if te.ResultPreview != "" {
 		preview := te.ResultPreview
-		if len(preview) > 120 {
-			preview = preview[:120] + "..."
+		if lipgloss.Width(preview) > 120 {
+			preview = truncateWidth(preview, 117) + "..."
 		}
 		detail += " -> " + preview
 	}
@@ -117,17 +121,6 @@ func (r *Renderer) renderToolEnd(evt agent.AgentEvent) {
 	}
 	line := fmt.Sprintf("  [%s] done%s", te.Name, detail)
 	fmt.Fprintln(r.out, r.styles.ToolResult.Render(line))
-}
-
-func (r *Renderer) renderToolResult(evt agent.AgentEvent) {
-	if evt.Result == nil {
-		return
-	}
-	content := evt.Result.Content
-	if len(content) > 200 {
-		content = content[:200] + "..."
-	}
-	fmt.Fprintln(r.out, r.styles.ToolResult.Render("  "+content))
 }
 
 func (r *Renderer) renderError(evt agent.AgentEvent) {
@@ -157,8 +150,8 @@ func toolArgsPreview(args map[string]any) string {
 	for _, key := range []string{"command", "description", "path", "query", "prompt"} {
 		if v, ok := args[key]; ok {
 			if s, ok := v.(string); ok {
-				if len(s) > 80 {
-					return s[:80] + "..."
+				if lipgloss.Width(s) > 80 {
+					return truncateWidth(s, 77) + "..."
 				}
 				return s
 			}
@@ -167,10 +160,25 @@ func toolArgsPreview(args map[string]any) string {
 	// Fallback: show first key.
 	for k, v := range args {
 		s := fmt.Sprintf("%v", v)
-		if len(s) > 60 {
-			s = s[:60] + "..."
+		if lipgloss.Width(s) > 60 {
+			s = truncateWidth(s, 57) + "..."
 		}
 		return k + "=" + s
 	}
 	return ""
+}
+
+// truncateWidth truncates a string to max display width (not bytes).
+func truncateWidth(s string, maxW int) string {
+	runes := []rune(s)
+	w, start := 0, 0
+	for _, r := range runes {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > maxW {
+			return string(runes[:start])
+		}
+		w += rw
+		start++
+	}
+	return s
 }
