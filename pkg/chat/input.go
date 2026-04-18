@@ -1,13 +1,16 @@
 package chat
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // SlashCommand represents a parsed /command.
@@ -16,91 +19,174 @@ type SlashCommand struct {
 	Args string
 }
 
-// InputHandler reads user input from stdin.
+// errInterrupted is returned when the user presses Ctrl+C at the prompt.
+var errInterrupted = errors.New("interrupted")
+
+// InputHandler reads user input from stdin using a bubbletea textarea.
 type InputHandler struct {
-	scanner *bufio.Scanner
-	styles  Styles
+	styles Styles
 }
 
-// NewInputHandler creates an input handler reading from r.
-func NewInputHandler(r io.Reader) *InputHandler {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+// NewInputHandler creates an input handler.
+// Input is always read from stdin via bubbletea.
+func NewInputHandler() *InputHandler {
 	return &InputHandler{
-		scanner: scanner,
-		styles:  DefaultStyles(),
+		styles: DefaultStyles(),
 	}
 }
 
-// ReadPrompt reads user input. Blocks until input is received or ctx is cancelled.
-// Returns empty string and nil error on EOF.
+// ReadPrompt reads user input using a bubbletea textarea.
+// Enter submits, Alt+Enter inserts a newline.
+// Returns errInterrupted on Ctrl+C, and io.EOF on Ctrl+D.
 func (h *InputHandler) ReadPrompt(ctx context.Context) (string, error) {
-	fmt.Fprint(os.Stderr, h.styles.UserPrompt.Render("> "))
+	ta := textarea.New()
+	ta.Prompt = h.styles.UserPrompt.Render("> ")
+	ta.Placeholder = "Type your message... (Alt+Enter for newline)"
+	ta.ShowLineNumbers = false
+	ta.SetHeight(3)
+	ta.SetWidth(80)
+	ta.Focus()
 
-	line, err := h.scanLine(ctx)
-	if err != nil {
-		return "", err
-	}
-	line = strings.TrimSpace(line)
+	resultCh := make(chan promptResult, 1)
 
-	// Support line continuation with backslash.
-	for strings.HasSuffix(line, "\\") {
-		line = strings.TrimSuffix(line, "\\")
-		fmt.Fprint(os.Stderr, h.styles.Dim.Render("... "))
-		cont, err := h.scanLine(ctx)
-		if err != nil {
-			return line, err
-		}
-		line += strings.TrimSpace(cont)
-	}
+	p := tea.NewProgram(&promptModel{
+		textarea: ta,
+	}, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 
-	return line, nil
-}
-
-// scanLine reads one line from stdin, respecting context cancellation.
-func (h *InputHandler) scanLine(ctx context.Context) (string, error) {
-	type result struct {
-		line string
-		err  error
-	}
-	ch := make(chan result, 1)
 	go func() {
-		if !h.scanner.Scan() {
-			err := h.scanner.Err()
-			if err == nil {
-				err = io.EOF
-			}
-			ch <- result{"", err}
+		model, err := p.Run()
+		if err != nil {
+			resultCh <- promptResult{err: err}
 			return
 		}
-		ch <- result{h.scanner.Text(), nil}
+		pm := model.(*promptModel)
+		resultCh <- promptResult{value: pm.value, err: pm.err}
 	}()
 
 	select {
-	case r := <-ch:
-		return r.line, r.err
+	case r := <-resultCh:
+		return strings.TrimSpace(r.value), r.err
 	case <-ctx.Done():
+		p.Quit()
+		<-resultCh // wait for p.Run to finish
 		return "", ctx.Err()
 	}
+}
+
+type promptResult struct {
+	value string
+	err   error
+}
+
+// promptModel is a minimal bubbletea model that wraps a textarea.
+// Enter submits, Alt+Enter inserts a newline.
+type promptModel struct {
+	textarea  textarea.Model
+	header    string // static text rendered above the textarea (question + options)
+	value     string
+	err       error
+	submitted bool
+}
+
+func (m *promptModel) Init() tea.Cmd {
+	return textarea.Blink
+}
+
+func (m *promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "enter":
+			// Alt+Enter or Ctrl+Enter inserts newline
+			if msg.Mod != 0 {
+				m.textarea, _ = m.textarea.Update(msg)
+				return m, nil
+			}
+			// Plain Enter — submit
+			val := m.textarea.Value()
+			if strings.TrimSpace(val) == "" {
+				return m, nil
+			}
+			m.value = val
+			m.submitted = true
+			return m, tea.Quit
+		case "ctrl+c":
+			m.err = errInterrupted
+			return m, tea.Quit
+		case "ctrl+d":
+			m.err = io.EOF
+			return m, tea.Quit
+		case "esc":
+			return m, nil
+		}
+	case tea.WindowSizeMsg:
+		m.textarea.SetWidth(msg.Width - 4)
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	return m, cmd
+}
+
+func (m *promptModel) View() tea.View {
+	if m.submitted {
+		return tea.NewView("")
+	}
+	return tea.NewView(m.header + m.textarea.View())
 }
 
 // AskQuestion implements tools.UserInteraction. It prints a question with optional
 // numbered choices, reads user input from stdin, and returns the answer.
 // If options are provided and the user enters a number, the corresponding option is returned.
-// Safe to call from agent goroutine: the REPL main loop is blocked on outcomes during tool execution,
-// so no concurrent reads on the shared bufio.Scanner.
 func (h *InputHandler) AskQuestion(ctx context.Context, question string, options []string) (string, error) {
-	fmt.Fprintf(os.Stderr, "\n  ? %s\n", question)
+	// Render question and options above the textarea so the user can see them.
+	var header strings.Builder
+	header.WriteString("\n  ? ")
+	header.WriteString(question)
 	for i, opt := range options {
-		fmt.Fprintf(os.Stderr, "    %d. %s\n", i+1, opt)
+		header.WriteString(fmt.Sprintf("\n    %d. %s", i+1, opt))
 	}
-	fmt.Fprint(os.Stderr, "  > ")
+	header.WriteString("\n")
 
-	line, err := h.scanLine(ctx)
-	if err != nil {
-		return "", err
+	ta := textarea.New()
+	ta.Prompt = "  > "
+	ta.Placeholder = "enter number or text"
+	ta.ShowLineNumbers = false
+	ta.SetHeight(1)
+	ta.SetWidth(60)
+	ta.Focus()
+
+	resultCh := make(chan promptResult, 1)
+
+	p := tea.NewProgram(&promptModel{
+		textarea: ta,
+		header:   header.String(),
+	}, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
+
+	go func() {
+		model, err := p.Run()
+		if err != nil {
+			resultCh <- promptResult{err: err}
+			return
+		}
+		pm := model.(*promptModel)
+		resultCh <- promptResult{value: pm.value, err: pm.err}
+	}()
+
+	var result promptResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		p.Quit()
+		<-resultCh
+		return "", ctx.Err()
 	}
-	answer := strings.TrimSpace(line)
+
+	if result.err != nil {
+		return "", result.err
+	}
+	answer := strings.TrimSpace(result.value)
 	if answer == "" {
 		return "", nil
 	}

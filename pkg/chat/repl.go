@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -62,7 +63,7 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 	return &ChatRepl{
 		cfg:       cfg,
 		renderer:  NewRenderer(os.Stderr),
-		input:     NewInputHandler(os.Stdin),
+		input:     NewInputHandler(),
 		sessMgr:   cfg.SessionRepo,
 		sb:        sb,
 		prefSched: memory.NewPreferenceScheduler(),
@@ -114,9 +115,14 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	defer signal.Stop(sigCh)
 	for {
-		// Wait for user input (no signal forwarding — Ctrl+C at prompt exits).
+		// Wait for user input.
 		line, err := r.input.ReadPrompt(parentCtx)
 		if err != nil {
+			if errors.Is(err, errInterrupted) {
+				// Ctrl+C at prompt — exit REPL.
+				fmt.Fprintln(os.Stderr, "\n  Interrupted.")
+				break
+			}
 			if parentCtx.Err() != nil {
 				fmt.Fprintln(os.Stderr, "\n  Interrupted.")
 			}
