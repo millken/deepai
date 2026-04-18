@@ -77,7 +77,7 @@ func TestCompactMessages_AssistantToolCallsPreserved(t *testing.T) {
 		}, Content: ""},
 		{ID: "4", SessionID: "s1", Role: models.RoleTool, Content: "result", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "read_file"}},
 		{ID: "5", SessionID: "s1", Role: models.RoleAI, ToolCalls: []models.ToolCall{
-			{ID: "c3", Name: "edit_file"},
+			{ID: "c3", Name: "edit_file", Arguments: map[string]any{"file": "test.go"}},
 		}, Content: ""},
 		{ID: "6", SessionID: "s1", Role: models.RoleTool, Content: "ok", ToolResult: &models.ToolResult{CallID: "c3", ToolName: "edit_file"}},
 		{ID: "7", SessionID: "s1", Role: models.RoleAI, Content: "final answer"},
@@ -102,12 +102,12 @@ func TestCompactMessages_AssistantToolCallsPreserved(t *testing.T) {
 		}
 	}
 
-	// Arguments should be stripped from compacted tool calls.
+	// Arguments should be preserved from compacted tool calls (API compatibility).
 	for _, m := range out {
 		if m.Role == models.RoleAI && strings.HasPrefix(m.Content, "[Called") {
 			for _, tc := range m.ToolCalls {
-				if len(tc.Arguments) > 0 {
-					t.Errorf("compacted tool call %s still has arguments", tc.ID)
+				if tc.Arguments == nil {
+					t.Errorf("compacted tool call %s lost arguments", tc.ID)
 				}
 			}
 		}

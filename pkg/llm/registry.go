@@ -25,6 +25,7 @@ var providerDef = map[string]struct {
 	resilience litellm.ResilienceConfig
 }{
 	"openai": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
+		RequestTimeout: 5 * time.Minute,
 		ConnectTimeout: 10 * time.Second,
 		MaxRetries:     1,
 	}},
@@ -37,6 +38,7 @@ var providerDef = map[string]struct {
 	"bedrock":   {"BEDROCK_API_KEY", "", litellm.ResilienceConfig{}},
 	"deepseek":  {"DEEPSEEK_API_KEY", "", litellm.ResilienceConfig{}},
 	"openai-compat": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
+		RequestTimeout: 5 * time.Minute,
 		ConnectTimeout: 10 * time.Second,
 		MaxRetries:     1,
 	}},

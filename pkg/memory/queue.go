@@ -51,6 +51,7 @@ type UpdateQueue struct {
 	svc          *Service
 	ch           chan updateJob
 	done         chan struct{}
+	cancel       context.CancelFunc // cancels in-flight jobs on Close
 	mu           sync.Mutex        // protects pendingSeq
 	pendingSeq   map[string]uint64 // dedup key → latest sequence number
 	flushVersion sync.Map          // "update:"+sessionID → uint64 ; bumped on sync flush
@@ -65,13 +66,15 @@ func newUpdateQueue(svc *Service, size int) *UpdateQueue {
 	if size <= 0 {
 		size = defaultQueueSize
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	q := &UpdateQueue{
 		svc:        svc,
 		ch:         make(chan updateJob, size),
 		done:       make(chan struct{}),
+		cancel:     cancel,
 		pendingSeq: make(map[string]uint64),
 	}
-	go q.run()
+	go q.run(ctx)
 	return q
 }
 
@@ -81,6 +84,7 @@ func newUpdateQueue(svc *Service, size int) *UpdateQueue {
 func (q *UpdateQueue) Close(ctx context.Context) error {
 	q.closeOnce.Do(func() {
 		q.closed.Store(true)
+		q.cancel() // cancel in-flight jobs
 		close(q.ch)
 		select {
 		case <-q.done:
@@ -200,7 +204,7 @@ func (q *UpdateQueue) dedupKey(job updateJob) string {
 }
 
 // run is the main worker loop.
-func (q *UpdateQueue) run() {
+func (q *UpdateQueue) run(ctx context.Context) {
 	defer close(q.done)
 
 	var dropped, processed uint64
@@ -220,7 +224,7 @@ func (q *UpdateQueue) run() {
 			q.mu.Unlock()
 		}
 
-		q.execute(job)
+		q.execute(ctx, job)
 		processed++
 	}
 
@@ -230,49 +234,49 @@ func (q *UpdateQueue) run() {
 	)
 }
 
-func (q *UpdateQueue) execute(job updateJob) {
+func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 	timeout := q.svc.updateTimeout
 	if timeout <= 0 {
 		timeout = defaultUpdateTimeout
 	}
 	switch job.typ {
 	case jobUpdateWith:
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
 			q.svc.logger.Warn("async update with failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdate:
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.Update(ctx, job.sessionID, job.messages); err != nil {
 			q.svc.logger.Warn("async update failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdateWithFactSource:
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.UpdateWithFactSource(ctx, job.sessionID, job.messages, job.ext, job.factSource); err != nil {
 			q.svc.logger.Warn("async update with fact source failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobRecordSkillUsage:
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		if err := q.svc.RecordSkillUsage(ctx, job.sessionID, job.skillName); err != nil {
 			q.svc.logger.Warn("record skill usage failed", "session", job.sessionID, "skill", job.skillName, "err", err)
 		}
 
 	case jobIncrementRetrieval:
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if err := q.svc.storage.IncrementRetrievalCounts(ctx, job.sessionID, job.factIDs); err != nil {
 			q.svc.logger.Warn("increment retrieval counts failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobIncrementHelpful:
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		n, err := q.svc.storage.IncrementHelpfulCounts(ctx, job.sessionID, job.factIDs)
 		if err != nil {
@@ -286,14 +290,14 @@ func (q *UpdateQueue) execute(job updateJob) {
 		}
 
 	case jobUpdateScopeWithSkill:
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.UpdateScopeWithSkillUsage(ctx, job.scope, job.messages, job.ext, job.skillName); err != nil {
 			q.svc.logger.Warn("async scope+skill update failed", "scope", job.scope.Key(), "err", err)
 		}
 
 	case jobPreferenceUpdate:
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
 			q.svc.logger.Warn("async preference update failed", "session", job.sessionID, "err", err)

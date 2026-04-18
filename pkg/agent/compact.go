@@ -124,9 +124,10 @@ func compactAssistantMessage(msg models.Message) models.Message {
 		out.ToolCalls = make([]models.ToolCall, len(msg.ToolCalls))
 		for i, tc := range msg.ToolCalls {
 			out.ToolCalls[i] = models.ToolCall{
-				ID:     tc.ID,
-				Name:   tc.Name,
-				Status: tc.Status,
+				ID:        tc.ID,
+				Name:      tc.Name,
+				Status:    tc.Status,
+				Arguments: tc.Arguments, // preserve for API compatibility
 			}
 		}
 		if strings.TrimSpace(msg.Content) == "" {
