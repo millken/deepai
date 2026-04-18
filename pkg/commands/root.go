@@ -36,6 +36,7 @@ func New() *cobra.Command {
 			cleanup, err := logs.Setup(logs.Config{
 				Level:     level,
 				DebugFile: "deepai-debug.log",
+				ErrorFile: "deepai-error.log",
 			})
 			if err != nil {
 				slog.Warn("failed to set up logging", "err", err)
