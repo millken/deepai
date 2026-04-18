@@ -13,7 +13,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
-const defaultUpdateTimeout = 60 * time.Second
+const defaultUpdateTimeout = 5 * time.Minute
 
 // Capacity limits for memory content.
 const (
