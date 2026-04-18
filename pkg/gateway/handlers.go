@@ -90,7 +90,7 @@ func decodeChatRequest(w http.ResponseWriter, r *http.Request) (chatRequest, err
 }
 
 func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, error) {
-	history, modelName, runAgent, ext, session, err := s.prepareRun(ctx, req)
+	history, modelName, runAgent, ext, prefExt, session, turn, prevMsgCount, err := s.prepareRun(ctx, req)
 	if err != nil {
 		return chatResponse{}, err
 	}
@@ -100,7 +100,7 @@ func (s *Server) runChat(ctx context.Context, req chatRequest) (chatResponse, er
 		return chatResponse{}, err
 	}
 
-	session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata, runAgent)
+	session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, prefExt, session.Metadata, runAgent, turn, prevMsgCount)
 
 	resp := chatResponse{
 		SessionID:    req.SessionID,
@@ -124,7 +124,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 		return
 	}
 
-	history, modelName, runAgent, ext, session, err := s.prepareRun(r.Context(), req)
+	history, modelName, runAgent, ext, prefExt, session, turn, prevMsgCount, err := s.prepareRun(r.Context(), req)
 	if err != nil {
 		writeError(w, errStatus(err), err)
 		return
@@ -166,7 +166,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 			Usage:        result.Usage,
 			MessageCount: len(result.Messages),
 		}
-		session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, session.Metadata, runAgent)
+		session.Metadata = s.updateMemoryAndNudge(req.SessionID, req.UserID, result.Messages, ext, prefExt, session.Metadata, runAgent, turn, prevMsgCount)
 		if saveErr := s.saveSession(r.Context(), req, result.Messages, session.Metadata); saveErr != nil {
 			outcomes <- outcome{err: saveErr}
 			return
@@ -210,17 +210,21 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatRequ
 	}
 }
 
-func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Message, string, *agent.Agent, memory.Extractor, models.Session, error) {
+func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Message, string, *agent.Agent, memory.Extractor, memory.Extractor, models.Session, int, int, error) {
 	session, err := s.store.LoadSession(ctx, req.SessionID)
 	if err != nil {
-		return nil, "", nil, nil, models.Session{}, err
+		return nil, "", nil, nil, nil, models.Session{}, 0, 0, err
 	}
 
-	runAgent, modelName, ext, err := s.newRuntime(firstNonEmpty(req.Model, s.cfg.DefaultModel), req.Tools, req.UserID)
+	runAgent, modelName, ext, prefExt, err := s.newRuntime(firstNonEmpty(req.Model, s.cfg.DefaultModel), req.Tools, req.UserID)
 	if err != nil {
-		return nil, "", nil, nil, models.Session{}, err
+		return nil, "", nil, nil, nil, models.Session{}, 0, 0, err
 	}
 
+	// Evaluate fact feedback from previous request (consume-once).
+	turn := s.evaluateFactFeedback(session.Messages, req.Message)
+
+	prevMsgCount := len(session.Messages)
 	history := session.Messages
 	if req.SystemPrompt != "" {
 		history = append(history, models.Message{
@@ -239,7 +243,7 @@ func (s *Server) prepareRun(ctx context.Context, req chatRequest) ([]models.Mess
 		CreatedAt: time.Now().UTC(),
 	})
 
-	return history, modelName, runAgent, ext, session, nil
+	return history, modelName, runAgent, ext, prefExt, session, turn, prevMsgCount, nil
 }
 
 func (s *Server) saveSession(ctx context.Context, req chatRequest, messages []models.Message, metadata map[string]string) error {
@@ -256,7 +260,7 @@ func (s *Server) saveSession(ctx context.Context, req chatRequest, messages []mo
 
 // updateMemoryAndNudge runs a scheduled memory update and manages the nudge counter
 // in session metadata. Also updates UserScope if userID is non-empty. Returns the updated metadata.
-func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []models.Message, ext memory.Extractor, metadata map[string]string, runAgent *agent.Agent) map[string]string {
+func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []models.Message, ext memory.Extractor, prefExt memory.Extractor, metadata map[string]string, runAgent *agent.Agent, turn int, prevMsgCount int) map[string]string {
 	if s.memService == nil || ext == nil {
 		return metadata
 	}
@@ -297,12 +301,90 @@ func (s *Server) updateMemoryAndNudge(sessionID, userID string, messages []model
 				s.memService.ScheduleUpdateWith(sessionID, messages, ext)
 			}
 		} else {
-				s.memService.ScheduleUpdateWith(sessionID, messages, ext)
+			s.memService.ScheduleUpdateWith(sessionID, messages, ext)
 		}
 	}
 
 	metadata["memory_nudge_count"] = strconv.Itoa(count)
+
+	// Record tool calls for preference extraction triggers.
+	if ps := s.getPrefSched(sessionID); ps != nil {
+		var toolCalls []memory.ToolCallInfo
+		for _, msg := range messages[prevMsgCount:] {
+			for _, call := range msg.ToolCalls {
+				toolCalls = append(toolCalls, memory.ToolCallInfo{Name: call.Name})
+			}
+		}
+		if len(toolCalls) > 0 {
+			ps.RecordToolCalls(toolCalls)
+		}
+
+		// Schedule preference extraction (throttle is handled internally).
+		if prefExt != nil {
+			s.memService.SchedulePreferenceUpdate(sessionID, messages, prefExt, ps)
+		}
+	}
+
 	return metadata
+}
+
+// evaluateFactFeedback classifies the user message for feedback purposes,
+// records events for preference extraction triggers, and schedules
+// HelpfulCount increment for previously retrieved facts if the signal is positive.
+// Returns the turn count (number of human-role messages in existing history).
+func (s *Server) evaluateFactFeedback(existingMessages []models.Message, userMessage string) int {
+	if s.memService == nil {
+		return 0
+	}
+
+	// Derive sessionID from existing messages.
+	sessionID := ""
+	if len(existingMessages) > 0 {
+		sessionID = existingMessages[0].SessionID
+	}
+	if sessionID == "" {
+		return 0
+	}
+	ps := s.getPrefSched(sessionID)
+
+	// Derive turn count from existing human messages.
+	turn := 0
+	for _, m := range existingMessages {
+		if m.Role == models.RoleHuman {
+			turn++
+		}
+	}
+	if turn > 0 {
+		turn++ // this request is the next turn
+	}
+
+	// Find previous user message.
+	var prevMsg string
+	for i := len(existingMessages) - 1; i >= 0; i-- {
+		if existingMessages[i].Role == models.RoleHuman {
+			prevMsg = existingMessages[i].Content
+			break
+		}
+	}
+	similarity := memory.TextCosineSimilarity(userMessage, prevMsg)
+	result := memory.ClassifyUserResponse(userMessage, prevMsg, similarity)
+
+	// Record events for preference extraction triggers.
+	if result.Classification == memory.FeedbackNegative {
+		ps.RecordNegativeFeedback()
+	} else {
+		ps.RecordNonNegativeFeedback()
+	}
+	ps.CheckLanguageSwitch(userMessage)
+
+	// HelpfulCount increment requires factIDs from previous injection.
+	factIDs := s.memService.LastRetrieved(sessionID)
+	if len(factIDs) == 0 || result.Classification != memory.FeedbackPositive {
+		return turn
+	}
+	s.memService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+
+	return turn
 }
 
 func enqueueEvent(ch chan<- sseEvent, evt sseEvent) {

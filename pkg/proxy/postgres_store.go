@@ -18,7 +18,7 @@ type PostgresEventStoreConfig struct {
 	BatchSize     int           // auto-flush threshold (default 100)
 	RequestsTable string        // default "proxy_requests"
 	EventsTable   string        // default "proxy_events"
-	Logger        *slog.Logger   // optional logger for flush errors
+	Logger        *slog.Logger  // optional logger for flush errors
 }
 
 // PostgresEventStore implements EventStore backed by PostgreSQL.

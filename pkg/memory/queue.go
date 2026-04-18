@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,25 +19,28 @@ const (
 type jobType int
 
 const (
-	jobUpdateWith             jobType = iota
-	jobUpdate                 // uses service's own extractor
-	jobUpdateWithFactSource   // update with explicit fact source
-	jobRecordSkillUsage       // direct skill usage fact
-	jobIncrementRetrieval     // atomic retrieval count bump
-	jobUpdateScopeWithSkill   // user-scope update + skill usage combined
+	jobUpdateWith           jobType = iota
+	jobUpdate                       // uses service's own extractor
+	jobUpdateWithFactSource         // update with explicit fact source
+	jobRecordSkillUsage             // direct skill usage fact
+	jobIncrementRetrieval           // atomic retrieval count bump
+	jobIncrementHelpful             // atomic helpful count bump
+	jobUpdateScopeWithSkill         // user-scope update + skill usage combined
+	jobPreferenceUpdate             // preference extraction with dedup key "pref:"
 )
 
 // updateJob represents a pending async memory operation.
 type updateJob struct {
-	typ         jobType
-	sessionID   string
-	messages    []models.Message // cloned
-	ext         Extractor
-	factSource  string
-	skillName   string
-	factIDs     []string
-	scope       Scope
-	seq         uint64 // monotonic sequence for dedup
+	typ        jobType
+	sessionID  string
+	messages   []models.Message // cloned
+	ext        Extractor
+	factSource string
+	skillName  string
+	factIDs    []string
+	scope      Scope
+	turnID     int    // turn number for dedup key
+	seq        uint64 // monotonic sequence for dedup
 }
 
 // UpdateQueue serializes and deduplicates memory update operations.
@@ -44,16 +48,16 @@ type updateJob struct {
 // ensuring that multiple updates for the same session are merged rather
 // than racing.
 type UpdateQueue struct {
-	svc           *Service
-	ch            chan updateJob
-	done          chan struct{}
-	mu            sync.Mutex    // protects pendingSeq
-	pendingSeq    map[string]uint64 // dedup key → latest sequence number
-	flushVersion  sync.Map      // "update:"+sessionID → uint64 ; bumped on sync flush
-	seq           uint64
-	closed        atomic.Bool
-	closeOnce     sync.Once
-	closeErr      error // first Close result; returned on subsequent calls
+	svc          *Service
+	ch           chan updateJob
+	done         chan struct{}
+	mu           sync.Mutex        // protects pendingSeq
+	pendingSeq   map[string]uint64 // dedup key → latest sequence number
+	flushVersion sync.Map          // "update:"+sessionID → uint64 ; bumped on sync flush
+	seq          uint64
+	closed       atomic.Bool
+	closeOnce    sync.Once
+	closeErr     error // first Close result; returned on subsequent calls
 }
 
 // newUpdateQueue creates and starts the queue.
@@ -62,10 +66,10 @@ func newUpdateQueue(svc *Service, size int) *UpdateQueue {
 		size = defaultQueueSize
 	}
 	q := &UpdateQueue{
-		svc:           svc,
-		ch:            make(chan updateJob, size),
-		done:          make(chan struct{}),
-		pendingSeq:    make(map[string]uint64),
+		svc:        svc,
+		ch:         make(chan updateJob, size),
+		done:       make(chan struct{}),
+		pendingSeq: make(map[string]uint64),
 	}
 	go q.run()
 	return q
@@ -183,6 +187,10 @@ func (q *UpdateQueue) dedupKey(job updateJob) string {
 	switch job.typ {
 	case jobRecordSkillUsage:
 		return "skill:" + job.sessionID + ":" + job.skillName
+	case jobIncrementHelpful:
+		return "helpful:" + job.sessionID + ":" + fmt.Sprintf("%d", job.turnID)
+	case jobPreferenceUpdate:
+		return "pref:" + job.sessionID
 	case jobIncrementRetrieval:
 		// Don't dedup retrieval increments — accumulate them.
 		return ""
@@ -195,6 +203,8 @@ func (q *UpdateQueue) dedupKey(job updateJob) string {
 func (q *UpdateQueue) run() {
 	defer close(q.done)
 
+	var dropped, processed uint64
+
 	for job := range q.ch {
 		key := q.dedupKey(job)
 		if key != "" {
@@ -203,6 +213,7 @@ func (q *UpdateQueue) run() {
 			if !exists || latest != job.seq {
 				// Job cancelled (!exists) or replaced by newer job; skip.
 				q.mu.Unlock()
+				dropped++
 				continue
 			}
 			delete(q.pendingSeq, key)
@@ -210,7 +221,13 @@ func (q *UpdateQueue) run() {
 		}
 
 		q.execute(job)
+		processed++
 	}
+
+	q.svc.logger.Debug("memory queue worker stopped",
+		"processed", processed,
+		"dropped", dropped,
+	)
 }
 
 func (q *UpdateQueue) execute(job updateJob) {
@@ -254,11 +271,32 @@ func (q *UpdateQueue) execute(job updateJob) {
 			q.svc.logger.Warn("increment retrieval counts failed", "session", job.sessionID, "err", err)
 		}
 
+	case jobIncrementHelpful:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		n, err := q.svc.storage.IncrementHelpfulCounts(ctx, job.sessionID, job.factIDs)
+		if err != nil {
+			q.svc.logger.Warn("increment helpful counts failed", "session", job.sessionID, "err", err)
+		} else if n > 0 {
+			q.svc.logger.Debug("helpful counts incremented",
+				"session", job.sessionID,
+				"turn", job.turnID,
+				"facts_updated", n,
+			)
+		}
+
 	case jobUpdateScopeWithSkill:
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := q.svc.UpdateScopeWithSkillUsage(ctx, job.scope, job.messages, job.ext, job.skillName); err != nil {
 			q.svc.logger.Warn("async scope+skill update failed", "scope", job.scope.Key(), "err", err)
+		}
+
+	case jobPreferenceUpdate:
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
+			q.svc.logger.Warn("async preference update failed", "session", job.sessionID, "err", err)
 		}
 	}
 }
@@ -332,6 +370,21 @@ func (s *Service) scheduleRetrievalIncrement(sessionID string, factIDs []string)
 			typ:       jobIncrementRetrieval,
 			sessionID: sessionID,
 			factIDs:   factIDs,
+		})
+	}
+}
+
+// ScheduleHelpfulIncrement enqueues a helpful count increment with turn-based dedup.
+func (s *Service) ScheduleHelpfulIncrement(sessionID string, turnID int, factIDs []string) {
+	if s == nil || s.storage == nil || len(factIDs) == 0 {
+		return
+	}
+	if s.queue != nil {
+		s.queue.submit(updateJob{
+			typ:       jobIncrementHelpful,
+			sessionID: sessionID,
+			factIDs:   factIDs,
+			turnID:    turnID,
 		})
 	}
 }

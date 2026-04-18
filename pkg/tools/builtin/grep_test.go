@@ -133,9 +133,9 @@ func TestGrepHandler_NoMatch(t *testing.T) {
 
 func TestGrepHandler_SkipsHiddenAndBinary(t *testing.T) {
 	root := createTestTree(t, map[string]string{
-		".hidden/a.txt":  "secret stuff",
-		"normal/a.txt":   "public hello",
-		"img/a.png":      "public hello",
+		".hidden/a.txt":      "secret stuff",
+		"normal/a.txt":       "public hello",
+		"img/a.png":          "public hello",
 		"node_modules/a.txt": "dependency code",
 	})
 

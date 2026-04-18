@@ -9,12 +9,12 @@ import (
 
 func TestFindHandler_ByName(t *testing.T) {
 	root := createTestTree(t, map[string]string{
-		"src/main.go":          "code",
-		"src/util.go":          "code",
-		"src/main_test.go":     "test",
-		"pkg/helper.go":        "code",
-		"pkg/helper_test.go":   "test",
-		"docs/README.md":       "doc",
+		"src/main.go":        "code",
+		"src/util.go":        "code",
+		"src/main_test.go":   "test",
+		"pkg/helper.go":      "code",
+		"pkg/helper_test.go": "test",
+		"docs/README.md":     "doc",
 	})
 
 	result, err := FindHandler(context.Background(), models.ToolCall{
@@ -46,10 +46,10 @@ func TestFindHandler_ByName(t *testing.T) {
 
 func TestFindHandler_ByExtension(t *testing.T) {
 	root := createTestTree(t, map[string]string{
-		"src/a.go":   "code",
-		"src/b.ts":   "code",
-		"src/c.go":   "code",
-		"readme.md":  "doc",
+		"src/a.go":  "code",
+		"src/b.ts":  "code",
+		"src/c.go":  "code",
+		"readme.md": "doc",
 	})
 
 	result, err := FindHandler(context.Background(), models.ToolCall{
@@ -128,8 +128,8 @@ func TestFindHandler_TypeFile(t *testing.T) {
 
 func TestFindHandler_SkipsHidden(t *testing.T) {
 	root := createTestTree(t, map[string]string{
-		".hidden/a.txt":    "secret",
-		"normal/a.txt":     "public",
+		".hidden/a.txt":     "secret",
+		"normal/a.txt":      "public",
 		"node_modules/b.js": "dep",
 		"vendor/c.go":       "dep",
 	})

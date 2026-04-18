@@ -3,9 +3,6 @@ package commands
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"os"
-	"strings"
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
@@ -16,6 +13,9 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/spf13/cobra"
+	"log/slog"
+	"os"
+	"strings"
 )
 
 // Chat flags shared between root and chat subcommand.
@@ -113,21 +113,27 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		slog.Info("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
-	// Memory service.
+	// Memory service. CLI defaults to SQLite at ~/.deepai/memory.db
+	// when no DATABASE_URL is configured.
 	var memService *memory.Service
 	var memExtractor memory.Extractor
-	if cfg.DatabaseURL != "" {
-		memStore, err := memory.OpenStore(ctx, cfg.DatabaseURL)
-		if err != nil {
-			slog.Warn("memory store init failed", "err", err)
-		} else {
-			memService = memory.NewService(slog.Default(), memStore, nil)
-			if err := memService.AutoMigrate(ctx); err != nil {
-				slog.Warn("memory auto-migrate failed", "err", err)
-			}
-			memExtractor = memory.NewLLMClient(provider, modelName)
-			slog.Info("memory service enabled")
+	var prefExtractor memory.Extractor
+	memDBURL := cfg.DatabaseURL
+	if memDBURL == "" {
+		home, _ := os.UserHomeDir()
+		memDBURL = home + "/.deepai/memory.db"
+	}
+	memStore, err := memory.OpenStore(ctx, memDBURL)
+	if err != nil {
+		slog.Warn("memory store init failed", "path", memDBURL, "err", err)
+	} else {
+		memService = memory.NewService(slog.Default(), memStore, nil)
+		if err := memService.AutoMigrate(ctx); err != nil {
+			slog.Warn("memory auto-migrate failed", "err", err)
 		}
+		memExtractor = memory.NewLLMClient(provider, modelName)
+		prefExtractor = memory.NewPreferenceExtractor(provider, modelName)
+		slog.Info("memory service enabled", "store", memDBURL)
 	}
 
 	// Load DEEPAI.md system prompts.
@@ -150,21 +156,22 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Build REPL config.
 	replCfg := chat.ReplConfig{
-		Provider:        cfg.Provider,
-		Model:           modelName,
-		LLMProvider:     provider,
-		DatabaseURL:     cfg.DatabaseURL,
-		ContextWindow:   cfg.ContextWindow,
-		MaxTurns:        maxTurns,
-		Query:           query,
-		ResumeSession:   resume,
-		ContinueLast:    continueLast,
-		SystemPrompt:    systemPrompt,
-		WorkDir:         workDir,
-		ToolRegistry:    registry,
-		SkillRegistry:   skillReg,
-		MemoryService:   memService,
-		MemoryExtractor: memExtractor,
+		Provider:            cfg.Provider,
+		Model:               modelName,
+		LLMProvider:         provider,
+		DatabaseURL:         cfg.DatabaseURL,
+		ContextWindow:       cfg.ContextWindow,
+		MaxTurns:            maxTurns,
+		Query:               query,
+		ResumeSession:       resume,
+		ContinueLast:        continueLast,
+		SystemPrompt:        systemPrompt,
+		WorkDir:             workDir,
+		ToolRegistry:        registry,
+		SkillRegistry:       skillReg,
+		MemoryService:       memService,
+		MemoryExtractor:     memExtractor,
+		PreferenceExtractor: prefExtractor,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

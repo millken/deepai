@@ -39,23 +39,26 @@ type Config struct {
 }
 
 type Server struct {
-	cfg             Config
-	httpServer      *http.Server
-	logger          *slog.Logger
-	store           sessionStore
-	tools           *tools.Registry
-	sandbox         *sandbox.Sandbox
-	memService      *memory.Service
-	providerMu      sync.Mutex
-	providers       map[string]llm.LLMProvider
-	providerFactory func(string) (llm.LLMProvider, error)
-	cleanupFns      []func()
-	shutdownOnce    sync.Once
-	startedAt       time.Time
-	shutdownTimeout time.Duration
-	inFlight        sync.WaitGroup
-	inFlightCount   int64
-	shuttingDown    atomic.Bool
+	cfg                Config
+	httpServer         *http.Server
+	logger             *slog.Logger
+	store              sessionStore
+	tools              *tools.Registry
+	sandbox            *sandbox.Sandbox
+	memService         *memory.Service
+	prefScheds         map[string]*memory.PreferenceScheduler // per-session to avoid cross-session pollution
+	prefSchedsLastSeen map[string]time.Time                   // last access time for eviction
+	prefSchedsMu       sync.Mutex
+	providerMu         sync.Mutex
+	providers          map[string]llm.LLMProvider
+	providerFactory    func(string) (llm.LLMProvider, error)
+	cleanupFns         []func()
+	shutdownOnce       sync.Once
+	startedAt          time.Time
+	shutdownTimeout    time.Duration
+	inFlight           sync.WaitGroup
+	inFlightCount      int64
+	shuttingDown       atomic.Bool
 }
 
 type sessionStore interface {
@@ -153,17 +156,25 @@ func NewServer(logger *slog.Logger, cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:             cfg,
-		logger:          logger,
-		store:           store,
-		tools:           registry,
-		sandbox:         sb,
-		memService:      memService,
-		providers:       make(map[string]llm.LLMProvider),
-		providerFactory: defaultProviderFactory,
-		cleanupFns:      cleanupFns,
-		startedAt:       time.Now().UTC(),
-		shutdownTimeout: cfg.ShutdownTimeout,
+		cfg:                cfg,
+		logger:             logger,
+		store:              store,
+		tools:              registry,
+		sandbox:            sb,
+		memService:         memService,
+		prefScheds:         make(map[string]*memory.PreferenceScheduler),
+		prefSchedsLastSeen: make(map[string]time.Time),
+		providers:          make(map[string]llm.LLMProvider),
+		providerFactory:    defaultProviderFactory,
+		cleanupFns:         cleanupFns,
+		startedAt:          time.Now().UTC(),
+		shutdownTimeout:    cfg.ShutdownTimeout,
+	}
+
+	// Periodic lastRetrieved cleanup for long-lived gateway processes.
+	if memService != nil {
+		stopCleanup := s.startStaleCleanup(memService, 5*time.Minute)
+		s.cleanupFns = append(s.cleanupFns, stopCleanup)
 	}
 
 	if memService != nil {
@@ -261,11 +272,11 @@ func (s *Server) routes() http.Handler {
 	return s.withMiddleware(mux)
 }
 
-func (s *Server) newRuntime(modelRef string, allowedTools []string, userID string) (*agent.Agent, string, memory.Extractor, error) {
+func (s *Server) newRuntime(modelRef string, allowedTools []string, userID string) (*agent.Agent, string, memory.Extractor, memory.Extractor, error) {
 	providerName, modelName := splitModelRef(modelRef)
 	provider, err := s.providerFor(providerName)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, nil, err
 	}
 
 	cfg := agent.AgentConfig{
@@ -277,14 +288,16 @@ func (s *Server) newRuntime(modelRef string, allowedTools []string, userID strin
 	}
 
 	var ext memory.Extractor
+	var prefExt memory.Extractor
 	if s.memService != nil {
 		cfg.MemoryService = s.memService
 		ext = memory.NewLLMClient(provider, modelName)
 		cfg.MemoryExtractor = ext
 		cfg.MemoryUserID = userID
+		prefExt = memory.NewPreferenceExtractor(provider, modelName)
 	}
 
-	return agent.New(cfg), modelName, ext, nil
+	return agent.New(cfg), modelName, ext, prefExt, nil
 }
 
 // userIDFromContext extracts the user ID from the chat request for memory scoping.
@@ -439,4 +452,47 @@ func firstCreatedAt(messages []models.Message) time.Time {
 		return time.Now().UTC()
 	}
 	return messages[0].CreatedAt
+}
+
+// startStaleCleanup runs periodic CleanupStale for the memory service and
+// evicts stale per-session preference schedulers.
+// Returns a stop function that signals the goroutine to exit.
+func (s *Server) startStaleCleanup(memService *memory.Service, interval time.Duration) func() {
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				memService.CleanupStale(time.Hour)
+				// Evict schedulers not accessed for 2x interval.
+				cutoff := time.Now().Add(-2 * interval)
+				s.prefSchedsMu.Lock()
+				for id, ts := range s.prefSchedsLastSeen {
+					if ts.Before(cutoff) {
+						delete(s.prefScheds, id)
+						delete(s.prefSchedsLastSeen, id)
+					}
+				}
+				s.prefSchedsMu.Unlock()
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() { close(stop) }
+}
+
+// getPrefSched returns the per-session PreferenceScheduler, creating one if needed.
+func (s *Server) getPrefSched(sessionID string) *memory.PreferenceScheduler {
+	s.prefSchedsMu.Lock()
+	defer s.prefSchedsMu.Unlock()
+	ps, ok := s.prefScheds[sessionID]
+	if !ok {
+		ps = memory.NewPreferenceScheduler()
+		s.prefScheds[sessionID] = ps
+	}
+	s.prefSchedsLastSeen[sessionID] = time.Now()
+	return ps
 }

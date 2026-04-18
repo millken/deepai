@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
-	"github.com/millken/deepai/pkg/agent"
 	"github.com/mattn/go-runewidth"
+	"github.com/millken/deepai/pkg/agent"
 )
 
 // Renderer handles terminal output for agent events.
@@ -51,8 +51,8 @@ func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 	case agent.AgentEventCompact:
 		r.renderCompact(evt)
 
-	// Ignored: AgentEventChunk, AgentEventToolCall, AgentEventToolResult,
-	// AgentEventEnd — redundant duplicates or handled by caller.
+		// Ignored: AgentEventChunk, AgentEventToolCall, AgentEventToolResult,
+		// AgentEventEnd — redundant duplicates or handled by caller.
 	}
 }
 

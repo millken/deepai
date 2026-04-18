@@ -59,9 +59,9 @@ func SessionSearchTool(searcher MessageSearcher) models.Tool {
 		}
 
 		data, _ := json.Marshal(map[string]any{
-			"query":       query,
-			"total":       len(hits),
-			"results":     hits,
+			"query":   query,
+			"total":   len(hits),
+			"results": hits,
 		})
 		return models.ToolResult{
 			CallID:   call.ID,

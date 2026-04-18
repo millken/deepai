@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/llm"
@@ -17,32 +18,35 @@ import (
 
 // ReplConfig holds configuration for the chat REPL.
 type ReplConfig struct {
-	Provider       string
-	Model          string
-	LLMProvider    llm.LLMProvider
-	DatabaseURL    string
-	ContextWindow  int
-	MaxTurns       int
-	Query          string // non-interactive single query
-	ResumeSession  string // session ID to resume
-	ContinueLast   bool   // resume most recent session
-	SystemPrompt   string
-	WorkDir        string
-	ToolRegistry   *tools.Registry
-	SkillRegistry  *skill.Registry
-	MemoryService  *memory.Service
-	MemoryExtractor memory.Extractor
+	Provider            string
+	Model               string
+	LLMProvider         llm.LLMProvider
+	DatabaseURL         string
+	ContextWindow       int
+	MaxTurns            int
+	Query               string // non-interactive single query
+	ResumeSession       string // session ID to resume
+	ContinueLast        bool   // resume most recent session
+	SystemPrompt        string
+	WorkDir             string
+	ToolRegistry        *tools.Registry
+	SkillRegistry       *skill.Registry
+	MemoryService       *memory.Service
+	MemoryExtractor     memory.Extractor
+	PreferenceExtractor memory.Extractor
 }
 
 // ChatRepl is the interactive chat REPL.
 type ChatRepl struct {
-	cfg      ReplConfig
-	renderer *Renderer
-	input    *InputHandler
-	sess     *Session
-	sessMgr  *SessionStore
-	sb       *sandbox.Sandbox
-	turn     int
+	cfg               ReplConfig
+	renderer          *Renderer
+	input             *InputHandler
+	sess              *Session
+	sessMgr           *SessionStore
+	sb                *sandbox.Sandbox
+	turn              int
+	prefSched         *memory.PreferenceScheduler
+	consecCorrections int
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -60,17 +64,23 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 	}
 
 	return &ChatRepl{
-		cfg:      cfg,
-		renderer: NewRenderer(os.Stderr),
-		input:    NewInputHandler(os.Stdin),
-		sessMgr:  sessMgr,
-		sb:       sb,
+		cfg:       cfg,
+		renderer:  NewRenderer(os.Stderr),
+		input:     NewInputHandler(os.Stdin),
+		sessMgr:   sessMgr,
+		sb:        sb,
+		prefSched: memory.NewPreferenceScheduler(),
 	}, nil
 }
 
 // Run starts the REPL loop. It handles both interactive and single-query modes.
 func (r *ChatRepl) Run(ctx context.Context) error {
 	defer r.sb.Close()
+	defer func() {
+		if r.cfg.MemoryService != nil {
+			r.cfg.MemoryService.CleanupStale(time.Hour)
+		}
+	}()
 
 	// Resolve session.
 	if err := r.resolveSession(); err != nil {
@@ -183,6 +193,9 @@ func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
 	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
+	// Evaluate fact feedback from previous turn (consume-once).
+	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
+
 	// Append user message to session history.
 	r.sess.Messages = append(r.sess.Messages, models.Message{
 		ID:        fmt.Sprintf("m-%d", r.turn),
@@ -238,6 +251,7 @@ func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
 
 	// Process events as they arrive.
 	var lastUsage *agent.Usage
+	var turnToolCalls []memory.ToolCallInfo
 EventLoop:
 	for {
 		select {
@@ -250,6 +264,18 @@ EventLoop:
 				lastUsage = evt.Usage
 			}
 			r.renderer.RenderEvent(evt)
+			// Collect tool call names for distribution tracking.
+			if evt.Type == agent.AgentEventToolCallStart {
+				name := ""
+				if evt.ToolEvent != nil {
+					name = evt.ToolEvent.Name
+				} else if evt.ToolCall != nil {
+					name = evt.ToolCall.Name
+				}
+				if name != "" {
+					turnToolCalls = append(turnToolCalls, memory.ToolCallInfo{Name: name})
+				}
+			}
 		case out := <-outcomes:
 			// Drain remaining events.
 			if events != nil {
@@ -281,9 +307,21 @@ EventLoop:
 
 	r.renderer.TurnEnd(lastUsage)
 
+	// Record tool call distribution for preference extraction triggers.
+	if r.prefSched != nil && len(turnToolCalls) > 0 {
+		r.prefSched.RecordToolCalls(turnToolCalls)
+	}
+
 	// Schedule memory update.
 	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
 		r.cfg.MemoryService.ScheduleUpdateWith(r.sess.ID, r.sess.Messages, r.cfg.MemoryExtractor)
+	}
+
+	// Schedule preference extraction (throttle is handled internally).
+	if r.cfg.MemoryService != nil && r.cfg.PreferenceExtractor != nil {
+		r.cfg.MemoryService.SchedulePreferenceUpdate(
+			r.sess.ID, r.sess.Messages, r.cfg.PreferenceExtractor, r.prefSched,
+		)
 	}
 
 	r.saveSession()
@@ -343,5 +381,70 @@ func printHistory(messages []models.Message) {
 			}
 			fmt.Fprintln(os.Stderr, styles.Assistant.Render("  AI: ")+content)
 		}
+	}
+}
+
+// evaluateFactFeedback classifies the user message for feedback purposes,
+// records events for preference extraction triggers, and increments HelpfulCount
+// for previously retrieved facts if the signal is positive. Called before the
+// agent runs for the current turn.
+func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage string) {
+	// Classify the user message (does not require factIDs).
+	var prevMsg string
+	for i := len(r.sess.Messages) - 1; i >= 0; i-- {
+		if r.sess.Messages[i].Role == models.RoleHuman {
+			prevMsg = r.sess.Messages[i].Content
+			break
+		}
+	}
+	similarity := memory.TextCosineSimilarity(userMessage, prevMsg)
+	result := memory.ClassifyUserResponse(userMessage, prevMsg, similarity)
+
+	slog.Debug("evaluateFactFeedback",
+		"session", sessionID,
+		"turn", turn,
+		"classification", result.Classification,
+		"similarity", similarity,
+	)
+	r.monitorFalseReward(result.Classification)
+
+	// Record events for preference extraction (independent of fact retrieval).
+	if result.Classification == memory.FeedbackNegative && r.prefSched != nil {
+		r.prefSched.RecordNegativeFeedback()
+	} else if r.prefSched != nil {
+		r.prefSched.RecordNonNegativeFeedback()
+	}
+	if r.prefSched != nil {
+		r.prefSched.CheckLanguageSwitch(userMessage)
+	}
+
+	// HelpfulCount increment requires factIDs from previous injection.
+	if r.cfg.MemoryService == nil {
+		return
+	}
+	factIDs := r.cfg.MemoryService.LastRetrieved(sessionID)
+	if len(factIDs) == 0 || result.Classification != memory.FeedbackPositive {
+		return
+	}
+	r.cfg.MemoryService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+}
+
+// monitorFalseReward checks if a positive classification was wrong by tracking
+// consecutive corrections. If 3+ consecutive corrections happen, it warns.
+func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassification) {
+	if classification == memory.FeedbackNegative {
+		r.consecCorrections++
+		if r.consecCorrections >= 3 {
+			slog.Warn("fact feedback: consecutive corrections detected, check for false rewards",
+				"consecutive", r.consecCorrections,
+			)
+		}
+	} else if classification == memory.FeedbackPositive {
+		if r.consecCorrections >= 3 {
+			slog.Warn("fact feedback: positive signal after consecutive corrections — possible false reward",
+				"consecutive_before", r.consecCorrections,
+			)
+		}
+		r.consecCorrections = 0
 	}
 }

@@ -93,9 +93,9 @@ func TestListDirHandler_NotDir(t *testing.T) {
 
 func TestListDirHandler_DefaultPath(t *testing.T) {
 	result, err := ListDirHandler(context.Background(), models.ToolCall{
-		ID:     "ls-4",
-		Name:   "list_dir",
-		Status: models.CallStatusPending,
+		ID:        "ls-4",
+		Name:      "list_dir",
+		Status:    models.CallStatusPending,
 		Arguments: map[string]any{},
 	})
 	if err != nil {

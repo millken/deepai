@@ -265,6 +265,21 @@ func (s *PostgresStore) IncrementRetrievalCounts(ctx context.Context, sessionID 
 	return nil
 }
 
+func (s *PostgresStore) IncrementHelpfulCounts(ctx context.Context, sessionID string, factIDs []string) (int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := s.db.Exec(ctx,
+		`update memory_facts set helpful_count = helpful_count + 1 where session_id = $1 and id = any($2)`,
+		sessionID, factIDs,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("increment helpful counts for session %q: %w", sessionID, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func upsertDocument(ctx context.Context, q interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }, doc Document) error {

@@ -20,9 +20,9 @@ type Sandbox = pkgsandbox.Sandbox
 type contextKey string
 
 const (
-	sandboxContextKey        contextKey = "tool_sandbox"
-	threadIDContextKey       contextKey = "tool_thread_id"
-	runtimeContextKey        contextKey = "tool_runtime_context"
+	sandboxContextKey         contextKey = "tool_sandbox"
+	threadIDContextKey        contextKey = "tool_thread_id"
+	runtimeContextKey         contextKey = "tool_runtime_context"
 	userInteractionContextKey contextKey = "tool_user_interaction"
 )
 

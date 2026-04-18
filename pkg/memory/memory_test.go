@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/millken/deepai/pkg/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/millken/deepai/pkg/models"
 )
 
 func TestMerge(t *testing.T) {
@@ -740,6 +740,28 @@ func (f *fakeStorage) IncrementRetrievalCounts(_ context.Context, sessionID stri
 	return nil
 }
 
+func (f *fakeStorage) IncrementHelpfulCounts(_ context.Context, sessionID string, factIDs []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	doc, ok := f.docs[sessionID]
+	if !ok {
+		return 0, nil
+	}
+	idSet := make(map[string]struct{}, len(factIDs))
+	for _, id := range factIDs {
+		idSet[id] = struct{}{}
+	}
+	updated := 0
+	for i := range doc.Facts {
+		if _, ok := idSet[doc.Facts[i].ID]; ok {
+			doc.Facts[i].HelpfulCount++
+			updated++
+		}
+	}
+	f.docs[sessionID] = doc
+	return updated, nil
+}
+
 func (f *fakeStorage) Load(_ context.Context, sessionID string) (Document, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1140,5 +1162,86 @@ func TestUpdateWithFactSource(t *testing.T) {
 	}
 	if doc.Facts[0].Source != "sess-1" {
 		t.Fatalf("fact source = %q, want %q", doc.Facts[0].Source, "sess-1")
+	}
+}
+
+func TestLastRetrievedConsumeOnce(t *testing.T) {
+	fs := &fakeStorage{}
+	svc := NewService(slog.Default(), fs, nil)
+
+	// First call returns nil (nothing stored).
+	if ids := svc.LastRetrieved("s1"); ids != nil {
+		t.Fatalf("first LastRetrieved = %v, want nil", ids)
+	}
+
+	// Simulate InjectWithContext storing IDs.
+	svc.lastRetrieved.mu.Lock()
+	svc.lastRetrieved.data["s1"] = &lastRetrieval{
+		ids: []string{"f1", "f2"},
+		ts:  time.Now().UnixNano(),
+	}
+	svc.lastRetrieved.mu.Unlock()
+
+	// Consume once — returns IDs.
+	ids := svc.LastRetrieved("s1")
+	if len(ids) != 2 || ids[0] != "f1" || ids[1] != "f2" {
+		t.Fatalf("LastRetrieved = %v, want [f1 f2]", ids)
+	}
+
+	// Second call — returns nil (consumed).
+	ids = svc.LastRetrieved("s1")
+	if ids != nil {
+		t.Fatalf("second LastRetrieved = %v, want nil", ids)
+	}
+}
+
+func TestLastRetrievedOverwriteExistingSession(t *testing.T) {
+	fs := &fakeStorage{}
+	svc := NewService(slog.Default(), fs, nil)
+
+	// Fill up to cap.
+	svc.lastRetrieved.mu.Lock()
+	for i := 0; i < 10000; i++ {
+		svc.lastRetrieved.data[fmt.Sprintf("session-%d", i)] = &lastRetrieval{
+			ids: []string{"old"},
+			ts:  time.Now().UnixNano(),
+		}
+	}
+	svc.lastRetrieved.mu.Unlock()
+
+	// Existing session should still be overwritten despite cap.
+	svc.lastRetrieved.mu.Lock()
+	_, exists := svc.lastRetrieved.data["session-0"]
+	if exists || len(svc.lastRetrieved.data) < 10000 {
+		svc.lastRetrieved.data["session-0"] = &lastRetrieval{
+			ids: []string{"new-fact"},
+			ts:  time.Now().UnixNano(),
+		}
+	}
+	svc.lastRetrieved.mu.Unlock()
+
+	ids := svc.LastRetrieved("session-0")
+	if len(ids) != 1 || ids[0] != "new-fact" {
+		t.Fatalf("overwritten LastRetrieved = %v, want [new-fact]", ids)
+	}
+}
+
+func TestCleanupStale(t *testing.T) {
+	fs := &fakeStorage{}
+	svc := NewService(slog.Default(), fs, nil)
+
+	now := time.Now()
+	svc.lastRetrieved.mu.Lock()
+	svc.lastRetrieved.data["fresh"] = &lastRetrieval{ids: []string{"a"}, ts: now.UnixNano()}
+	svc.lastRetrieved.data["stale"] = &lastRetrieval{ids: []string{"b"}, ts: now.Add(-2 * time.Hour).UnixNano()}
+	svc.lastRetrieved.mu.Unlock()
+
+	svc.CleanupStale(time.Hour)
+
+	if ids := svc.LastRetrieved("fresh"); len(ids) != 1 {
+		t.Fatalf("fresh entry should survive cleanup, got %v", ids)
+	}
+	if ids := svc.LastRetrieved("stale"); ids != nil {
+		t.Fatalf("stale entry should be cleaned up, got %v", ids)
 	}
 }

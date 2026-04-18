@@ -168,6 +168,28 @@ func (s *SQLiteStore) IncrementRetrievalCounts(ctx context.Context, sessionID st
 	return nil
 }
 
+func (s *SQLiteStore) IncrementHelpfulCounts(ctx context.Context, sessionID string, factIDs []string) (int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat(",?", len(factIDs)-1)
+	args := make([]any, 0, 1+len(factIDs))
+	args = append(args, sessionID)
+	for _, id := range factIDs {
+		args = append(args, id)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`update memory_facts set helpful_count = helpful_count + 1 where session_id = ? and id in (?`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("increment helpful counts for session %q: %w", sessionID, err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 func (s *SQLiteStore) upsertDocument(ctx context.Context, execer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, doc Document) error {

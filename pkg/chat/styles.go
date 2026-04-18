@@ -4,19 +4,19 @@ import "charm.land/lipgloss/v2"
 
 // Styles holds all terminal styling definitions.
 type Styles struct {
-	Banner       lipgloss.Style
-	BannerDim    lipgloss.Style
-	UserPrompt   lipgloss.Style
-	Assistant    lipgloss.Style
-	ToolCall     lipgloss.Style
-	ToolResult   lipgloss.Style
-	Error        lipgloss.Style
-	Stats        lipgloss.Style
-	Compaction   lipgloss.Style
-	Dim          lipgloss.Style
-	Bold         lipgloss.Style
-	Highlight    lipgloss.Style
-	Separator    lipgloss.Style
+	Banner     lipgloss.Style
+	BannerDim  lipgloss.Style
+	UserPrompt lipgloss.Style
+	Assistant  lipgloss.Style
+	ToolCall   lipgloss.Style
+	ToolResult lipgloss.Style
+	Error      lipgloss.Style
+	Stats      lipgloss.Style
+	Compaction lipgloss.Style
+	Dim        lipgloss.Style
+	Bold       lipgloss.Style
+	Highlight  lipgloss.Style
+	Separator  lipgloss.Style
 }
 
 // DefaultStyles returns the default style palette.

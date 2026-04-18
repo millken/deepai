@@ -598,7 +598,7 @@ func TestIsPrivateHost(t *testing.T) {
 		{"localhost:8080", true},
 		{"ip6-localhost", true},
 		{"ip6-loopback", true},
-		{"127.0.0.1", false},       // IP literals are handled by safeTransport, not isPrivateHost
+		{"127.0.0.1", false}, // IP literals are handled by safeTransport, not isPrivateHost
 		{"10.0.0.1", false},
 		{"192.168.1.1", false},
 		{"example.com", false},

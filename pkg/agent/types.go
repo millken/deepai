@@ -31,8 +31,8 @@ type AgentConfig struct {
 	Tools           *tools.Registry
 	PresentFiles    *tools.PresentFileRegistry
 	AgentType       AgentType
-	MaxTurns        int  // safety valve: hard cap on turns (0 = unlimited)
-	MaxTokensBudget int  // total token budget across all turns (0 = unlimited)
+	MaxTurns        int // safety valve: hard cap on turns (0 = unlimited)
+	MaxTokensBudget int // total token budget across all turns (0 = unlimited)
 	Model           string
 	ReasoningEffort string
 	SystemPrompt    string
@@ -42,14 +42,14 @@ type AgentConfig struct {
 	RequestTimeout  time.Duration
 
 	// Context compaction
-	ContextWindow        int     // model context window in tokens; 0 = no compaction
-	CompactionThreshold  float64 // fraction of ContextWindow to trigger compaction (default 0.75)
-	CompactionKeepTail   int     // number of recent messages to preserve (default 6)
+	ContextWindow       int     // model context window in tokens; 0 = no compaction
+	CompactionThreshold float64 // fraction of ContextWindow to trigger compaction (default 0.75)
+	CompactionKeepTail  int     // number of recent messages to preserve (default 6)
 
 	// Memory integration
-	MemoryService   *memory.Service   // used for Inject into system prompt
-	MemoryExtractor memory.Extractor  // per-request extractor (matches the LLM model of the current request)
-	MemoryUserID    string            // user ID for cross-session UserScope memory (empty = disabled)
+	MemoryService   *memory.Service  // used for Inject into system prompt
+	MemoryExtractor memory.Extractor // per-request extractor (matches the LLM model of the current request)
+	MemoryUserID    string           // user ID for cross-session UserScope memory (empty = disabled)
 }
 
 type TimeoutError struct {
@@ -105,18 +105,18 @@ type AgentError struct {
 
 // AgentEvent is emitted while the agent is running.
 type AgentEvent struct {
-	Type      AgentEventType     `json:"type"`
-	SessionID string             `json:"session_id,omitempty"`
-	RequestID string             `json:"request_id,omitempty"`
-	MessageID string             `json:"message_id,omitempty"`
-	Text      string             `json:"text,omitempty"`
-	ToolCall  *models.ToolCall   `json:"tool_call,omitempty"`
-	ToolEvent *ToolCallEvent     `json:"tool_event,omitempty"`
-	Result    *models.ToolResult `json:"result,omitempty"`
-	Usage     *Usage             `json:"usage,omitempty"`
-	Err       string             `json:"error,omitempty"`
-	Error     *AgentError        `json:"error_detail,omitempty"`
-	CompactStats *CompactStats   `json:"compact_stats,omitempty"`
+	Type         AgentEventType     `json:"type"`
+	SessionID    string             `json:"session_id,omitempty"`
+	RequestID    string             `json:"request_id,omitempty"`
+	MessageID    string             `json:"message_id,omitempty"`
+	Text         string             `json:"text,omitempty"`
+	ToolCall     *models.ToolCall   `json:"tool_call,omitempty"`
+	ToolEvent    *ToolCallEvent     `json:"tool_event,omitempty"`
+	Result       *models.ToolResult `json:"result,omitempty"`
+	Usage        *Usage             `json:"usage,omitempty"`
+	Err          string             `json:"error,omitempty"`
+	Error        *AgentError        `json:"error_detail,omitempty"`
+	CompactStats *CompactStats      `json:"compact_stats,omitempty"`
 }
 
 // CompactStats describes the outcome of a context compaction pass.

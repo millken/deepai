@@ -17,8 +17,8 @@ const defaultUpdateTimeout = 30 * time.Second
 
 // Capacity limits for memory content.
 const (
-	MaxFactsPerSession = 30   // Maximum facts per session
-	MaxFactContentLen  = 500  // Maximum characters per fact content
+	MaxFactsPerSession = 30  // Maximum facts per session
+	MaxFactContentLen  = 500 // Maximum characters per fact content
 )
 
 // Document is the durable memory snapshot for a single session.
@@ -44,15 +44,15 @@ type HistoryMemory struct {
 }
 
 type Fact struct {
-	ID            string    `json:"id"`
-	Content       string    `json:"content"`
-	Category      string    `json:"category,omitempty"`
-	Confidence    float64   `json:"confidence,omitempty"`
-	Source        string    `json:"source,omitempty"`
-	RetrievalCount int      `json:"retrieval_count,omitempty"`
-	HelpfulCount  int      `json:"helpful_count,omitempty"`
-	CreatedAt     time.Time `json:"created_at,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	ID             string    `json:"id"`
+	Content        string    `json:"content"`
+	Category       string    `json:"category,omitempty"`
+	Confidence     float64   `json:"confidence,omitempty"`
+	Source         string    `json:"source,omitempty"`
+	RetrievalCount int       `json:"retrieval_count,omitempty"`
+	HelpfulCount   int       `json:"helpful_count,omitempty"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 // Update is the incremental output returned by the memory LLM.
@@ -68,6 +68,7 @@ type Storage interface {
 	Load(ctx context.Context, sessionID string) (Document, error)
 	Save(ctx context.Context, doc Document) error
 	IncrementRetrievalCounts(ctx context.Context, sessionID string, factIDs []string) error
+	IncrementHelpfulCounts(ctx context.Context, sessionID string, factIDs []string) (int, error)
 }
 
 type Extractor interface {
@@ -81,6 +82,10 @@ type Service struct {
 	updateTimeout time.Duration
 	queue         *UpdateQueue
 	sessionMu     sync.Map // sessionID → *sync.Mutex ; serializes Update-to-Save per session
+	lastRetrieved struct {
+		mu   sync.RWMutex
+		data map[string]*lastRetrieval // sessionID → last retrieved facts
+	}
 }
 
 func NewService(logger *slog.Logger, storage Storage, extractor Extractor) *Service {
@@ -90,6 +95,7 @@ func NewService(logger *slog.Logger, storage Storage, extractor Extractor) *Serv
 		logger:        logger,
 		updateTimeout: defaultUpdateTimeout,
 	}
+	svc.lastRetrieved.data = make(map[string]*lastRetrieval)
 	svc.queue = newUpdateQueue(svc, defaultQueueSize)
 	return svc
 }
@@ -482,8 +488,25 @@ func (s *Service) InjectWithContext(ctx context.Context, sessionID string, curre
 		return ""
 	}
 	injection, retrievedIDs := buildInjectionWithIDs(doc, currentContext, 2000, activeSource)
+	slog.Debug("memory injected",
+		"session", sessionID,
+		"retrieved_facts", len(retrievedIDs),
+		"injection_len", len(injection),
+	)
 	if len(retrievedIDs) > 0 {
 		s.scheduleRetrievalIncrement(sessionID, retrievedIDs)
+		// Store for feedback loop consumption.
+		// Cap entries to prevent unbounded growth in long-lived processes
+		// (e.g. gateway) where LastRetrieved may not be called.
+		s.lastRetrieved.mu.Lock()
+		_, exists := s.lastRetrieved.data[sessionID]
+		if exists || len(s.lastRetrieved.data) < 10000 {
+			s.lastRetrieved.data[sessionID] = &lastRetrieval{
+				ids: retrievedIDs,
+				ts:  time.Now().UnixNano(),
+			}
+		}
+		s.lastRetrieved.mu.Unlock()
 	}
 	return injection
 }
@@ -492,7 +515,38 @@ func (s *Service) InjectScopeWithContext(ctx context.Context, scope Scope, curre
 	return s.InjectWithContext(ctx, scope.Key(), currentContext, activeSource)
 }
 
+// LastRetrieved returns and clears the fact IDs retrieved in the previous
+// InjectWithContext call for the given session. Returns nil if nothing was retrieved.
+// This is a consume-once operation: the second call returns nil.
+func (s *Service) LastRetrieved(sessionID string) []string {
+	if s == nil {
+		return nil
+	}
+	s.lastRetrieved.mu.Lock()
+	defer s.lastRetrieved.mu.Unlock()
+	r, ok := s.lastRetrieved.data[sessionID]
+	if !ok {
+		return nil
+	}
+	ids := r.ids
+	delete(s.lastRetrieved.data, sessionID)
+	return ids
+}
 
+// CleanupStale removes lastRetrieved entries older than the given duration.
+func (s *Service) CleanupStale(maxAge time.Duration) {
+	if s == nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+	s.lastRetrieved.mu.Lock()
+	defer s.lastRetrieved.mu.Unlock()
+	for k, v := range s.lastRetrieved.data {
+		if v.ts < cutoff {
+			delete(s.lastRetrieved.data, k)
+		}
+	}
+}
 
 func Merge(current Document, update Update, sessionID string, now time.Time) Document {
 	return MergeWithFactSource(current, update, sessionID, "", now)
@@ -709,4 +763,3 @@ func cloneAnyMap(in map[string]any) map[string]any {
 	}
 	return out
 }
-

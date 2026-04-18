@@ -146,6 +146,35 @@ func (s *FileStore) IncrementRetrievalCounts(ctx context.Context, sessionID stri
 	return s.Save(ctx, doc)
 }
 
+func (s *FileStore) IncrementHelpfulCounts(ctx context.Context, sessionID string, factIDs []string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return 0, nil
+	}
+	doc, err := s.Load(ctx, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	idSet := make(map[string]struct{}, len(factIDs))
+	for _, id := range factIDs {
+		idSet[id] = struct{}{}
+	}
+	updated := 0
+	for i := range doc.Facts {
+		if _, ok := idSet[doc.Facts[i].ID]; ok {
+			doc.Facts[i].HelpfulCount++
+			updated++
+		}
+	}
+	if updated > 0 {
+		return updated, s.Save(ctx, doc)
+	}
+	return 0, nil
+}
+
 func (s *FileStore) documentPath(sessionID string) (string, error) {
 	if s == nil || strings.TrimSpace(s.root) == "" {
 		return "", errors.New("file store is not initialized")
