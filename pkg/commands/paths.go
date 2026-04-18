@@ -1,0 +1,76 @@
+package commands
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+const appName = ".deepai"
+
+var (
+	homeDir     string
+	homeDirOnce sync.Once
+)
+
+// Home returns the deepai home directory (~/.deepai).
+func Home() string {
+	homeDirOnce.Do(func() {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		homeDir = filepath.Join(h, appName)
+	})
+	return homeDir
+}
+
+// ConfigFile returns the path to config.yaml.
+func ConfigFile() string {
+	return filepath.Join(Home(), "config.yaml")
+}
+
+// EnvFile returns the path to .env.
+func EnvFile() string {
+	return filepath.Join(Home(), ".env")
+}
+
+// SessionsDir returns the path to the sessions directory.
+func SessionsDir() string {
+	return filepath.Join(Home(), "sessions")
+}
+
+// LogsDir returns the path to the logs directory.
+func LogsDir() string {
+	return filepath.Join(Home(), "logs")
+}
+
+// MemoriesDir returns the path to the memories directory.
+func MemoriesDir() string {
+	return filepath.Join(Home(), "memories")
+}
+
+// GlobalInstructions returns the path to the global DEEPAI.md.
+func GlobalInstructions() string {
+	return filepath.Join(Home(), "DEEPAI.md")
+}
+
+// ProjectInstructions returns the path to the project-level DEEPAI.md.
+func ProjectInstructions(workDir string) string {
+	return filepath.Join(workDir, appName, "DEEPAI.md")
+}
+
+// EnsureHome creates ~/.deepai and all standard sub-directories.
+func EnsureHome() error {
+	dir := Home()
+	if dir == "" {
+		return fmt.Errorf("cannot determine home directory")
+	}
+	for _, sub := range []string{"sessions", "logs", "memories"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
+			return fmt.Errorf("create %s/%s: %w", dir, sub, err)
+		}
+	}
+	return os.MkdirAll(dir, 0700)
+}

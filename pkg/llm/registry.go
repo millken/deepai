@@ -3,133 +3,129 @@ package llm
 import (
 	"context"
 	"fmt"
-	"os"
-	"slices"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/dnsoa/go/env"
 	"github.com/voocel/litellm"
 )
 
-var supportedProviders = []struct {
-	name   string
-	config litellm.ProviderConfig
-}{
-	{
-		name: "openai",
-		config: litellm.ProviderConfig{
-			APIKey:  os.Getenv("OPENAI_API_KEY"),
-			BaseURL: strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")), // optional, for OpenAI-compatible providers
-			// other config fields can be added here as needed
-		},
-	},
-	//anthropic bedrock deepseek gemini glm grok ollama openai openrouter qwen
-	{
-		name: "anthropic",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		},
-	},
-	{
-		name: "qwen",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("QWEN_API_KEY"),
-		},
-	},
-	{
-		name: "gemini",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("GEMINI_API_KEY"),
-		},
-	},
-	{
-		name: "groq",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("GROQ_API_KEY"),
-		},
-	},
-	{
-		name: "ollama",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("OLLAMA_API_KEY"),
-		},
-	},
-	{
-		name: "glm",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("GLM_API_KEY"),
-		},
-	},
-	{
-		name: "bedrock",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("BEDROCK_API_KEY"),
-		},
-	},
-	{
-		name: "deepseek",
-		config: litellm.ProviderConfig{
-			APIKey: os.Getenv("DEEPSEEK_API_KEY"),
-		},
-	},
-	{
-		name: "openai-compat",
-		config: litellm.ProviderConfig{
-			APIKey:  os.Getenv("OPENAI_COMPAT_API_KEY"),
-			BaseURL: strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")),
-			Resilience: litellm.ResilienceConfig{
-				ConnectTimeout: 10 * time.Second,
-				MaxRetries:     1,
-			},
-		},
-	},
+// ProviderConfig holds provider initialization parameters.
+// It decouples callers from litellm-specific types.
+type ProviderConfig struct {
+	APIKey  string
+	BaseURL string
 }
 
-func NewProvider(name string) LLMProvider {
-	provider := strings.ToLower(strings.TrimSpace(name))
-	var cfg litellm.ProviderConfig
-	if slices.ContainsFunc(supportedProviders, func(p struct {
-		name   string
-		config litellm.ProviderConfig
-	}) bool {
-		if p.name == provider {
-			cfg = p.config
-			return true
-		}
-		return false
-	}) {
-		p, err := NewLitellmProvider(provider, cfg)
-		if err != nil {
-			return &UnavailableProvider{err: fmt.Errorf("init provider %q: %w", provider, err)}
-		}
-		return p
+// providerDef holds per-provider static config and env var mappings.
+var providerDef = map[string]struct {
+	apiKeyVar  string
+	baseURLVar string
+	resilience litellm.ResilienceConfig
+}{
+	"openai": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
+		ConnectTimeout: 10 * time.Second,
+		MaxRetries:     1,
+	}},
+	"anthropic": {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", litellm.ResilienceConfig{}},
+	"qwen":      {"QWEN_API_KEY", "", litellm.ResilienceConfig{}},
+	"gemini":    {"GEMINI_API_KEY", "", litellm.ResilienceConfig{}},
+	"groq":      {"GROQ_API_KEY", "", litellm.ResilienceConfig{}},
+	"ollama":    {"OLLAMA_API_KEY", "", litellm.ResilienceConfig{}},
+	"glm":       {"GLM_API_KEY", "", litellm.ResilienceConfig{}},
+	"bedrock":   {"BEDROCK_API_KEY", "", litellm.ResilienceConfig{}},
+	"deepseek":  {"DEEPSEEK_API_KEY", "", litellm.ResilienceConfig{}},
+	"openai-compat": {"OPENAI_API_KEY", "OPENAI_BASE_URL", litellm.ResilienceConfig{
+		ConnectTimeout: 10 * time.Second,
+		MaxRetries:     1,
+	}},
+}
+
+// buildConfig resolves API key and base URL from env vars at call time,
+// then merges with optional explicit overrides and static resilience settings.
+func buildConfig(name string, overrides ProviderConfig) (litellm.ProviderConfig, error) {
+	def, ok := providerDef[name]
+	if !ok {
+		return litellm.ProviderConfig{}, fmt.Errorf("unsupported provider %q", name)
 	}
-	return &UnavailableProvider{err: fmt.Errorf("unsupported provider %q", provider)}
+
+	apiKey := overrides.APIKey
+	if apiKey == "" && def.apiKeyVar != "" {
+		apiKey = env.Get(def.apiKeyVar, "")
+	}
+	baseURL := overrides.BaseURL
+	if baseURL == "" && def.baseURLVar != "" {
+		baseURL = strings.TrimSpace(env.Get(def.baseURLVar, ""))
+	}
+
+	return litellm.ProviderConfig{
+		APIKey:     apiKey,
+		BaseURL:    baseURL,
+		Resilience: def.resilience,
+	}, nil
+}
+
+// NewProvider creates a provider using env vars read at call time.
+func NewProvider(name string) LLMProvider {
+	name = strings.ToLower(strings.TrimSpace(name))
+	cfg, err := buildConfig(name, ProviderConfig{})
+	if err != nil {
+		return &UnavailableProvider{err: err}
+	}
+	p, err := NewLitellmProvider(name, cfg)
+	if err != nil {
+		return &UnavailableProvider{err: fmt.Errorf("init provider %q: %w", name, err)}
+	}
+	return p
 }
 
 // NewProviderWithOptions creates a provider like NewProvider but allows passing
 // extra litellm client options (e.g. WithOnPayload) that will be applied when
 // constructing the underlying litellm client.
 func NewProviderWithOptions(name string, opts ...litellm.ClientOption) LLMProvider {
-	provider := strings.ToLower(strings.TrimSpace(name))
-	var cfg litellm.ProviderConfig
-	if slices.ContainsFunc(supportedProviders, func(p struct {
-		name   string
-		config litellm.ProviderConfig
-	}) bool {
-		if p.name == provider {
-			cfg = p.config
-			return true
-		}
-		return false
-	}) {
-		p, err := NewLitellmProvider(provider, cfg, opts...)
-		if err != nil {
-			return &UnavailableProvider{err: fmt.Errorf("init provider %q: %w", provider, err)}
-		}
-		return p
+	name = strings.ToLower(strings.TrimSpace(name))
+	cfg, err := buildConfig(name, ProviderConfig{})
+	if err != nil {
+		return &UnavailableProvider{err: err}
 	}
-	return &UnavailableProvider{err: fmt.Errorf("unsupported provider %q", provider)}
+	p, err := NewLitellmProvider(name, cfg, opts...)
+	if err != nil {
+		return &UnavailableProvider{err: fmt.Errorf("init provider %q: %w", name, err)}
+	}
+	return p
+}
+
+// NewProviderFromConfig creates a provider using explicit config values.
+// Falls back to env vars for any field not provided.
+func NewProviderFromConfig(name string, cfg ProviderConfig) (LLMProvider, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+
+	litCfg, err := buildConfig(name, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Debug("provider config resolved",
+		"provider", name,
+		"api_key", maskKey(litCfg.APIKey),
+		"base_url", litCfg.BaseURL,
+	)
+
+	return NewLitellmProvider(name, litCfg)
+}
+
+func maskKey(key string) string {
+	if key == "" {
+		return "(empty)"
+	}
+	if len(key) <= 2 {
+		return key + "****"
+	}
+	if len(key) <= 8 {
+		return key[:2] + "****"
+	}
+	return key[:3] + "****" + key[len(key)-4:]
 }
 
 type UnavailableProvider struct {

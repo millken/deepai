@@ -3,6 +3,7 @@ package commands
 import (
 	"log/slog"
 
+	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/logs"
 	"github.com/spf13/cobra"
 )
@@ -17,6 +18,11 @@ func New() *cobra.Command {
 		SilenceUsage:      true, // Don't show usage on errors
 		DisableAutoGenTag: true,
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// Load ~/.deepai/.env early so all providers can read API keys.
+			if err := env.Load(EnvFile()); err != nil {
+				slog.Warn("failed to load .env", "path", EnvFile(), "err", err)
+			}
+
 			level := slog.LevelInfo
 			if verbose {
 				level = slog.LevelDebug
@@ -34,12 +40,13 @@ func New() *cobra.Command {
 			slog.Debug("logging initialized", "verbose", verbose)
 
 		},
-		Run: func(cmd *cobra.Command, args []string) {
-			cmd.Help()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxTurns)
 		},
 	}
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable debug logs")
 
+	RegisterChatFlags(root)
 	AddCommands(root)
 	return root
 }

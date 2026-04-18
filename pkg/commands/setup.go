@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -38,7 +38,7 @@ var providerInfo = map[string]struct {
 	"groq":          {"GROQ_API_KEY", []string{"llama-3.3-70b-versatile", "mixtral-8x7b-32768"}},
 	"ollama":        {"OLLAMA_API_KEY", []string{"qwen3:32b", "deepseek-r1:32b"}},
 	"bedrock":       {"BEDROCK_API_KEY", []string{"anthropic.claude-sonnet-4-20250514-v1:0"}},
-	"openai-compat": {"OPENAI_COMPAT_API_KEY", []string{}},
+	"openai-compat": {"OPENAI_API_KEY", []string{}},
 }
 
 const defaultDeepaiMD = `# DEEPAI.md
@@ -50,14 +50,13 @@ Project instructions for deepai agent.
 - Follow existing project conventions
 `
 
-// configPaths returns (deepaiDir, configPath, envPath).
-func configPaths() (string, string, string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", "", fmt.Errorf("cannot determine home directory: %w", err)
+// ConfigPaths returns (deepaiDir, configPath, envPath).
+func ConfigPaths() (string, string, string, error) {
+	dir := Home()
+	if dir == "" {
+		return "", "", "", fmt.Errorf("cannot determine home directory")
 	}
-	dir := filepath.Join(home, ".deepai")
-	return dir, filepath.Join(dir, "config.yaml"), filepath.Join(dir, ".env"), nil
+	return dir, ConfigFile(), EnvFile(), nil
 }
 
 func addSetup(topLevel *cobra.Command) {
@@ -91,7 +90,7 @@ func addSetup(topLevel *cobra.Command) {
 // --- Full wizard ---
 
 func runSetup(cmd *cobra.Command, args []string) error {
-	deepaiDir, configPath, envPath, err := configPaths()
+	deepaiDir, configPath, envPath, err := ConfigPaths()
 	if err != nil {
 		return err
 	}
@@ -100,7 +99,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cfg, cfgErr := loadConfig(configPath)
+	cfg, cfgErr := LoadConfig(configPath)
 	if cfgErr != nil {
 		fmt.Printf("  Warning: %v\n", cfgErr)
 		fmt.Println("  Starting with fresh config.")
@@ -136,7 +135,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 // --- Subcommand: provider ---
 
 func runSetupProvider(cmd *cobra.Command, args []string) error {
-	deepaiDir, configPath, envPath, err := configPaths()
+	deepaiDir, configPath, envPath, err := ConfigPaths()
 	if err != nil {
 		return err
 	}
@@ -145,7 +144,7 @@ func runSetupProvider(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cfg, cfgErr := loadConfig(configPath)
+	cfg, cfgErr := LoadConfig(configPath)
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -165,7 +164,7 @@ func runSetupProvider(cmd *cobra.Command, args []string) error {
 // --- Subcommand: model ---
 
 func runSetupModel(cmd *cobra.Command, args []string) error {
-	deepaiDir, configPath, _, err := configPaths()
+	deepaiDir, configPath, _, err := ConfigPaths()
 	if err != nil {
 		return err
 	}
@@ -174,7 +173,7 @@ func runSetupModel(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cfg, cfgErr := loadConfig(configPath)
+	cfg, cfgErr := LoadConfig(configPath)
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -194,7 +193,7 @@ func runSetupModel(cmd *cobra.Command, args []string) error {
 // --- Subcommand: database ---
 
 func runSetupDatabase(cmd *cobra.Command, args []string) error {
-	deepaiDir, configPath, _, err := configPaths()
+	deepaiDir, configPath, _, err := ConfigPaths()
 	if err != nil {
 		return err
 	}
@@ -203,7 +202,7 @@ func runSetupDatabase(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cfg, cfgErr := loadConfig(configPath)
+	cfg, cfgErr := LoadConfig(configPath)
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -267,10 +266,10 @@ func setupProvider(cfg *Config, envPath string) error {
 		fmt.Printf("  Saved API key to %s\n", envPath)
 	}
 
-	// BaseURL for openai-compat.
-	if provider == "openai-compat" {
+	// Base URL (optional for any provider).
+	if provider == "openai" || provider == "openai-compat" || provider == "anthropic" {
 		if err := huh.NewInput().
-			Title("Base URL").
+			Title("Base URL (empty for default)").
 			Value(&cfg.BaseURL).
 			Run(); err != nil {
 			return err
@@ -313,20 +312,14 @@ func setupDatabase(cfg *Config) error {
 // --- Helpers ---
 
 func ensureDeepaiHome(dir string) error {
-	subDirs := []string{"sessions", "logs", "memories"}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-	for _, sub := range subDirs {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
-			return fmt.Errorf("create %s/%s: %w", dir, sub, err)
-		}
+	if err := EnsureHome(); err != nil {
+		return err
 	}
 	fmt.Printf("  Directory %s ready\n", dir)
 	return nil
 }
 
-func loadConfig(path string) (Config, error) {
+func LoadConfig(path string) (Config, error) {
 	var cfg Config
 	data, err := os.ReadFile(path)
 	if err != nil {

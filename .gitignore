@@ -3,3 +3,5 @@ bin/
 bodies/
 logs/
 *.so
+deepai
+deepai-debug.log
