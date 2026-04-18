@@ -244,7 +244,7 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
-			q.svc.logger.Warn("async update with failed", "session", job.sessionID, "err", err)
+			q.svc.logger.Warn("async update with extractor failed", "session", job.sessionID, "err", err)
 		}
 
 	case jobUpdate:

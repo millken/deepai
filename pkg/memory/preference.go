@@ -57,8 +57,9 @@ func (e *PreferenceExtractor) ExtractUpdate(ctx context.Context, current Documen
 
 	existingPrefs := filterPreferenceFacts(current.Facts)
 	resp, err := e.provider.Chat(ctx, llm.ChatRequest{
-		Model:        e.model,
-		SystemPrompt: preferenceSystemPrompt,
+		Model:           e.model,
+		SystemPrompt:    preferenceSystemPrompt,
+		ReasoningEffort: "disabled",
 		Messages: []models.Message{
 			{
 				ID:      "pref-extract",
