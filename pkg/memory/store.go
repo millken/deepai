@@ -24,7 +24,15 @@ func OpenStore(ctx context.Context, databaseURL string) (Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		return NewSQLiteStore(ctx, path)
+		store, err := NewSQLiteStore(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if err := store.AutoMigrate(ctx); err != nil {
+			store.Close()
+			return nil, fmt.Errorf("memory auto-migrate: %w", err)
+		}
+		return store, nil
 	}
 	return NewPostgresStore(ctx, databaseURL)
 }

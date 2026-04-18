@@ -186,9 +186,9 @@ func mapMessageToLitellm(m models.Message) litellm.Message {
 		lm.ToolCalls = make([]litellm.ToolCall, len(m.ToolCalls))
 		for i, tc := range m.ToolCalls {
 			argsJSON, _ := json.Marshal(tc.Arguments)
-				if tc.Arguments == nil {
-					argsJSON = []byte("{}")
-				}
+			if tc.Arguments == nil {
+				argsJSON = []byte("{}")
+			}
 			lm.ToolCalls[i] = litellm.ToolCall{
 				ID:   tc.ID,
 				Type: "function",

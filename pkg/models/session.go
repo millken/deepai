@@ -30,6 +30,7 @@ func (s SessionState) Validate() error {
 type Session struct {
 	ID        string            `json:"id"`
 	UserID    string            `json:"user_id"`
+	Title     string            `json:"title,omitempty"`
 	State     SessionState      `json:"state"`
 	Messages  []Message         `json:"messages,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
@@ -53,9 +54,6 @@ func NewSession(id, userID string) Session {
 func (s Session) Validate() error {
 	if strings.TrimSpace(s.ID) == "" {
 		return errors.New("session id is required")
-	}
-	if strings.TrimSpace(s.UserID) == "" {
-		return errors.New("session user_id is required")
 	}
 	if err := s.State.Validate(); err != nil {
 		return err

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/chat"
@@ -14,6 +15,7 @@ import (
 	"github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/spf13/cobra"
 	"log/slog"
+	_ "modernc.org/sqlite"
 	"os"
 	"strings"
 )
@@ -27,6 +29,16 @@ var chatFlags struct {
 	MaxTurns int
 }
 
+// resumePickerSentinel is the value assigned to -r when used without an argument.
+const resumePickerSentinel = "__picker__"
+
+func registerResumeFlag(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&chatFlags.Resume, "resume", "r", "", "Resume a session by ID or title (no arg: interactive picker)")
+	if f := cmd.Flags().Lookup("resume"); f != nil {
+		f.NoOptDefVal = resumePickerSentinel
+	}
+}
+
 func addChat(topLevel *cobra.Command) {
 	cmd := &cobra.Command{
 		Use:   "chat",
@@ -37,7 +49,7 @@ func addChat(topLevel *cobra.Command) {
 	}
 
 	cmd.Flags().StringVarP(&chatFlags.Query, "query", "q", "", "Single query (non-interactive mode)")
-	cmd.Flags().StringVarP(&chatFlags.Resume, "resume", "r", "", "Resume a session by ID")
+	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
 	cmd.Flags().IntVar(&chatFlags.MaxTurns, "max-turns", 0, "Max agent turns per run (0=unlimited)")
@@ -48,7 +60,7 @@ func addChat(topLevel *cobra.Command) {
 // RegisterChatFlags adds chat flags to a command (used by root to support bare `deepai -q`).
 func RegisterChatFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&chatFlags.Query, "query", "q", "", "Single query (non-interactive mode)")
-	cmd.Flags().StringVarP(&chatFlags.Resume, "resume", "r", "", "Resume a session by ID")
+	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
 	cmd.Flags().IntVar(&chatFlags.MaxTurns, "max-turns", 0, "Max agent turns per run (0=unlimited)")
@@ -113,27 +125,40 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		slog.Info("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
-	// Memory service. CLI defaults to SQLite at ~/.deepai/memory.db
-	// when no DATABASE_URL is configured.
+	// Open unified SQLite database.
+	dbPath := DBFile()
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	sessStore := chat.NewSQLiteSessionStoreFromDB(db)
+	if err := sessStore.Migrate(); err != nil {
+		return fmt.Errorf("migrate session schema: %w", err)
+	}
+
+	// Memory service: reuse the same DB.
 	var memService *memory.Service
 	var memExtractor memory.Extractor
 	var prefExtractor memory.Extractor
-	memDBURL := cfg.DatabaseURL
-	if memDBURL == "" {
-		home, _ := os.UserHomeDir()
-		memDBURL = home + "/.deepai/memory.db"
+	memStore := memory.NewSQLiteStoreFromDB(db)
+	memService = memory.NewService(slog.Default(), memStore, nil)
+	if err := memService.AutoMigrate(ctx); err != nil {
+		slog.Warn("memory auto-migrate failed", "err", err)
 	}
-	memStore, err := memory.OpenStore(ctx, memDBURL)
-	if err != nil {
-		slog.Warn("memory store init failed", "path", memDBURL, "err", err)
-	} else {
-		memService = memory.NewService(slog.Default(), memStore, nil)
-		if err := memService.AutoMigrate(ctx); err != nil {
-			slog.Warn("memory auto-migrate failed", "err", err)
+	memExtractor = memory.NewLLMClient(provider, modelName)
+	prefExtractor = memory.NewPreferenceExtractor(provider, modelName)
+	slog.Info("memory service enabled", "store", dbPath)
+
+	// Handle -r with no argument: interactive picker.
+	if resume == resumePickerSentinel {
+		sess, err := chat.PickSession(sessStore)
+		if err != nil {
+			return err
 		}
-		memExtractor = memory.NewLLMClient(provider, modelName)
-		prefExtractor = memory.NewPreferenceExtractor(provider, modelName)
-		slog.Info("memory service enabled", "store", memDBURL)
+		resume = sess.ID
 	}
 
 	// Load DEEPAI.md system prompts.
@@ -172,6 +197,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		MemoryService:       memService,
 		MemoryExtractor:     memExtractor,
 		PreferenceExtractor: prefExtractor,
+		SessionRepo:         sessStore,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

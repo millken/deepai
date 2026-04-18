@@ -41,6 +41,11 @@ func SessionsDir() string {
 	return filepath.Join(Home(), "sessions")
 }
 
+// DBFile returns the path to the unified SQLite database.
+func DBFile() string {
+	return filepath.Join(Home(), "deepai.db")
+}
+
 // LogsDir returns the path to the logs directory.
 func LogsDir() string {
 	return filepath.Join(Home(), "logs")

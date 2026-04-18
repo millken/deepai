@@ -6,92 +6,89 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const sqliteSchemaSQL = `
-pragma foreign_keys = on;
-
-create table if not exists memories (
-	session_id text primary key,
-	user_memory text not null default '{}',
-	history_memory text not null default '{}',
-	source text not null default '',
-	updated_at text not null
-);
-
-create table if not exists memory_facts (
-	session_id text not null references memories(session_id) on delete cascade,
-	id text not null,
-	content text not null,
-	category text not null default '',
-	confidence real not null default 0,
-	source text not null default '',
-	retrieval_count integer not null default 0,
-	helpful_count integer not null default 0,
-	created_at text not null,
-	updated_at text not null,
-	primary key (session_id, id)
-);
-
-create index if not exists idx_memory_facts_session_updated
-	on memory_facts(session_id, updated_at desc, id asc);
-`
-
 type SQLiteStore struct {
-	db *sql.DB
+	db     *sql.DB
+	ownsDB bool
 }
 
+// NewSQLiteStore opens (or creates) a SQLite database at the given path.
 func NewSQLiteStore(ctx context.Context, path string) (*SQLiteStore, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, errors.New("sqlite path is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create sqlite directory: %w", err)
-	}
-	db, err := sql.Open("sqlite", path)
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, ownsDB: true}
 	if err := db.PingContext(ctx); err != nil {
 		store.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
-	if err := store.AutoMigrate(ctx); err != nil {
-		store.Close()
-		return nil, err
-	}
 	return store, nil
 }
 
+// NewSQLiteStoreFromDB wraps an existing *sql.DB (e.g. from SessionStore).
+// The returned store will not close the underlying DB on Close().
+func NewSQLiteStoreFromDB(db *sql.DB) *SQLiteStore {
+	return &SQLiteStore{db: db, ownsDB: false}
+}
+
 func (s *SQLiteStore) Close() {
-	if s != nil && s.db != nil {
+	if s != nil && s.db != nil && s.ownsDB {
 		_ = s.db.Close()
 	}
 }
 
+// AutoMigrate creates memory tables (if not already created by SessionStore)
+// and runs incremental column migrations.
 func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return errors.New("sqlite store is not initialized")
 	}
-	if _, err := s.db.ExecContext(ctx, sqliteSchemaSQL); err != nil {
-		return fmt.Errorf("migrate sqlite memory schema: %w", err)
+	// Ensure base tables exist (idempotent; SessionStore.Migrate may have created them).
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS memories (
+			session_id TEXT PRIMARY KEY,
+			user_memory TEXT NOT NULL DEFAULT '{}',
+			history_memory TEXT NOT NULL DEFAULT '{}',
+			source TEXT NOT NULL DEFAULT '',
+			updated_at REAL NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS memory_facts (
+			session_id TEXT NOT NULL REFERENCES memories(session_id) ON DELETE CASCADE,
+			id TEXT NOT NULL,
+			content TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			source TEXT NOT NULL DEFAULT '',
+			retrieval_count INTEGER NOT NULL DEFAULT 0,
+			helpful_count INTEGER NOT NULL DEFAULT 0,
+			created_at REAL NOT NULL,
+			updated_at REAL NOT NULL,
+			PRIMARY KEY (session_id, id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_facts_session_updated
+			ON memory_facts(session_id, updated_at DESC, id ASC)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("create memory table: %w", err)
+		}
 	}
-	// Incremental migrations for existing databases (ALTER TABLE is idempotent-safe via ignore).
-	// SQLite ignores ALTER TABLE ADD COLUMN if the column already exists in newer versions.
+	// Incremental column additions (ignore errors if column already exists).
 	for _, ddl := range []string{
 		"alter table memory_facts add column source text not null default ''",
 		"alter table memory_facts add column retrieval_count integer not null default 0",
 		"alter table memory_facts add column helpful_count integer not null default 0",
 	} {
-		// Ignore "duplicate column name" errors for existing databases.
 		_, _ = s.db.ExecContext(ctx, ddl)
 	}
 	return nil
@@ -248,20 +245,14 @@ func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, 
 	for rows.Next() {
 		var (
 			fact      Fact
-			createdAt string
-			updatedAt string
+			createdAt float64
+			updatedAt float64
 		)
 		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan facts for memory %q: %w", sessionID, err)
 		}
-		fact.CreatedAt, err = parseDBTime(createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse fact created_at for memory %q: %w", sessionID, err)
-		}
-		fact.UpdatedAt, err = parseDBTime(updatedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse fact updated_at for memory %q: %w", sessionID, err)
-		}
+		fact.CreatedAt = parseDBTime(createdAt)
+		fact.UpdatedAt = parseDBTime(updatedAt)
 		facts = append(facts, fact)
 	}
 	if err := rows.Err(); err != nil {
@@ -277,7 +268,7 @@ func scanSQLiteDocument(row sqliteScanner) (Document, error) {
 		doc         Document
 		userJSON    string
 		historyJSON string
-		updatedAt   string
+		updatedAt   float64
 	)
 	if err := row.Scan(&doc.SessionID, &userJSON, &historyJSON, &doc.Source, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -295,26 +286,19 @@ func scanSQLiteDocument(row sqliteScanner) (Document, error) {
 			return Document{}, fmt.Errorf("decode history memory: %w", err)
 		}
 	}
-	var err error
-	doc.UpdatedAt, err = parseDBTime(updatedAt)
-	if err != nil {
-		return Document{}, fmt.Errorf("parse memory updated_at: %w", err)
-	}
+	doc.UpdatedAt = parseDBTime(updatedAt)
 	return doc, nil
 }
 
-func formatDBTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+// formatDBTime converts time.Time to Unix timestamp for REAL columns.
+func formatDBTime(t time.Time) float64 {
+	return float64(t.UTC().Unix())
 }
 
-func parseDBTime(value string) (time.Time, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}, nil
+// parseDBTime converts Unix timestamp (REAL) back to time.Time.
+func parseDBTime(value float64) time.Time {
+	if value == 0 {
+		return time.Time{}
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return parsed.UTC(), nil
+	return time.Unix(int64(value), 0).UTC()
 }

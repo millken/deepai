@@ -52,9 +52,9 @@ type UpdateQueue struct {
 	ch           chan updateJob
 	done         chan struct{}
 	cancel       context.CancelFunc // cancels in-flight jobs on Close
-	mu           sync.Mutex        // protects pendingSeq
-	pendingSeq   map[string]uint64 // dedup key → latest sequence number
-	flushVersion sync.Map          // "update:"+sessionID → uint64 ; bumped on sync flush
+	mu           sync.Mutex         // protects pendingSeq
+	pendingSeq   map[string]uint64  // dedup key → latest sequence number
+	flushVersion sync.Map           // "update:"+sessionID → uint64 ; bumped on sync flush
 	seq          uint64
 	closed       atomic.Bool
 	closeOnce    sync.Once

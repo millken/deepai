@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
@@ -25,7 +26,7 @@ type ReplConfig struct {
 	ContextWindow       int
 	MaxTurns            int
 	Query               string // non-interactive single query
-	ResumeSession       string // session ID to resume
+	ResumeSession       string // session ID or title to resume
 	ContinueLast        bool   // resume most recent session
 	SystemPrompt        string
 	WorkDir             string
@@ -34,6 +35,7 @@ type ReplConfig struct {
 	MemoryService       *memory.Service
 	MemoryExtractor     memory.Extractor
 	PreferenceExtractor memory.Extractor
+	SessionRepo         models.SessionRepository // injected from outside
 }
 
 // ChatRepl is the interactive chat REPL.
@@ -41,8 +43,8 @@ type ChatRepl struct {
 	cfg               ReplConfig
 	renderer          *Renderer
 	input             *InputHandler
-	sess              *Session
-	sessMgr           *SessionStore
+	sess              *models.Session
+	sessMgr           models.SessionRepository
 	sb                *sandbox.Sandbox
 	turn              int
 	prefSched         *memory.PreferenceScheduler
@@ -56,18 +58,11 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 		return nil, fmt.Errorf("sandbox init: %w", err)
 	}
 
-	home, _ := os.UserHomeDir()
-	sessDir := home + "/.deepai/sessions"
-	sessMgr, err := NewSessionStore(sessDir)
-	if err != nil {
-		return nil, fmt.Errorf("session store init: %w", err)
-	}
-
 	return &ChatRepl{
 		cfg:       cfg,
 		renderer:  NewRenderer(os.Stderr),
 		input:     NewInputHandler(os.Stdin),
-		sessMgr:   sessMgr,
+		sessMgr:   cfg.SessionRepo,
 		sb:        sb,
 		prefSched: memory.NewPreferenceScheduler(),
 	}, nil
@@ -143,21 +138,27 @@ func (r *ChatRepl) Run(ctx context.Context) error {
 		}
 	}
 
-	// Save session on exit.
+	// Save session metadata on exit.
 	r.saveSession()
 	slog.Info("session ended", "session_id", r.sess.ID, "turns", r.turn)
 	return nil
 }
 
 func (r *ChatRepl) resolveSession() error {
-	// Resume by ID.
+	// Resume by ID or title.
 	if r.cfg.ResumeSession != "" {
-		sess, err := r.sessMgr.Load(r.cfg.ResumeSession)
+		sess, err := r.sessMgr.Resolve(r.cfg.ResumeSession)
 		if err != nil {
-			return fmt.Errorf("resume session %s: %w", r.cfg.ResumeSession, err)
+			return fmt.Errorf("resume session %q: %w", r.cfg.ResumeSession, err)
 		}
 		r.sess = sess
-		slog.Info("resumed session", "id", sess.ID, "messages", len(sess.Messages))
+		// Load messages from DB into memory for the agent.
+		msgs, err := r.sessMgr.LoadMessages(sess.ID)
+		if err != nil {
+			slog.Warn("load messages for resumed session", "err", err)
+		}
+		r.sess.Messages = msgs
+		slog.Info("resumed session", "id", sess.ID, "messages", len(msgs))
 		return nil
 	}
 
@@ -169,13 +170,21 @@ func (r *ChatRepl) resolveSession() error {
 		}
 		if sess != nil {
 			r.sess = sess
-			slog.Info("continued session", "id", sess.ID, "messages", len(sess.Messages))
+			msgs, err := r.sessMgr.LoadMessages(sess.ID)
+			if err != nil {
+				slog.Warn("load messages for continued session", "err", err)
+			}
+			r.sess.Messages = msgs
+			slog.Info("continued session", "id", sess.ID, "messages", len(msgs))
 			return nil
 		}
 	}
 
 	// New session.
-	sess, err := r.sessMgr.Create()
+	sess, err := r.sessMgr.Create(models.CreateOpts{
+		Model: r.cfg.Model,
+		CWD:   r.cfg.WorkDir,
+	})
 	if err != nil {
 		return err
 	}
@@ -196,23 +205,26 @@ func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
 	// Evaluate fact feedback from previous turn (consume-once).
 	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
 
-	// Append user message to session history.
-	r.sess.Messages = append(r.sess.Messages, models.Message{
-		ID:        fmt.Sprintf("m-%d", r.turn),
+	// Append user message to session history and persist.
+	userMsg := models.Message{
 		SessionID: r.sess.ID,
 		Role:      models.RoleHuman,
 		Content:   userInput,
-	})
+	}
+	if err := r.sessMgr.AppendMessage(r.sess.ID, userMsg); err != nil {
+		slog.Warn("append user message", "err", err)
+	}
+	r.sess.Messages = append(r.sess.Messages, userMsg)
 
 	// Create a fresh agent for this turn.
 	agentCfg := agent.AgentConfig{
-		LLMProvider:   r.cfg.LLMProvider,
-		Tools:         r.cfg.ToolRegistry,
-		Sandbox:       r.sb,
-		AgentType:     agent.AgentTypeCoder,
-		Model:         r.cfg.Model,
-		ContextWindow: r.cfg.ContextWindow,
-		MaxTurns:      r.cfg.MaxTurns,
+		LLMProvider:     r.cfg.LLMProvider,
+		Tools:           r.cfg.ToolRegistry,
+		Sandbox:         r.sb,
+		AgentType:       agent.AgentTypeCoder,
+		Model:           r.cfg.Model,
+		ContextWindow:   r.cfg.ContextWindow,
+		MaxTurns:        r.cfg.MaxTurns,
 		UserInteraction: r.input,
 	}
 
@@ -229,6 +241,9 @@ func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
 	}
 
 	r.renderer.TurnStart(r.turn)
+
+	// Remember message count before agent run to only persist new messages.
+	prevMsgCount := len(r.sess.Messages)
 
 	// Start event draining goroutine BEFORE Run().
 	events := make(chan agent.AgentEvent, 128)
@@ -308,6 +323,24 @@ EventLoop:
 
 	r.renderer.TurnEnd(lastUsage)
 
+	// Persist only new messages produced by the agent.
+	for _, msg := range r.sess.Messages[prevMsgCount:] {
+		_ = r.sessMgr.AppendMessage(r.sess.ID, msg)
+	}
+
+	// Auto-title generation after first turn (synchronous to guarantee completion).
+	if r.turn == 1 && r.sess.Title == "" {
+		sessionID := r.sess.ID
+		var firstUserMsg string
+		for _, m := range r.sess.Messages {
+			if m.Role == models.RoleHuman {
+				firstUserMsg = m.Content
+				break
+			}
+		}
+		r.generateTitle(sessionID, firstUserMsg)
+	}
+
 	// Record tool call distribution for preference extraction triggers.
 	if r.prefSched != nil && len(turnToolCalls) > 0 {
 		r.prefSched.RecordToolCalls(turnToolCalls)
@@ -338,6 +371,60 @@ func (r *ChatRepl) saveSession() {
 	}
 }
 
+func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
+	if r.cfg.LLMProvider == nil || firstUserMsg == "" {
+		slog.Warn("auto-title skipped", "provider_nil", r.cfg.LLMProvider == nil, "msg_empty", firstUserMsg == "")
+		return
+	}
+	if len(firstUserMsg) > 500 {
+		firstUserMsg = firstUserMsg[:500]
+	}
+
+	prompt := fmt.Sprintf(
+		"Generate a concise title (no more than 30 chars) in the same language as the user's message. Return only the title text, no quotes or formatting.\nUser: %s",
+		firstUserMsg,
+	)
+	maxTokens := 60
+	resp, err := r.cfg.LLMProvider.Chat(context.Background(), llm.ChatRequest{
+		Model:     r.cfg.Model,
+		Messages:  []models.Message{{Role: models.RoleHuman, Content: prompt}},
+		MaxTokens: &maxTokens,
+	})
+	if err != nil {
+		slog.Warn("auto-title LLM failed", "err", err)
+		fallback := firstUserMsg
+		if len([]rune(fallback)) > 20 {
+			fallback = string([]rune(fallback)[:20]) + "..."
+		}
+		if err := r.sessMgr.SetTitle(sessionID, fallback); err != nil {
+			slog.Warn("auto-title fallback SetTitle failed", "err", err)
+		} else {
+			slog.Info("auto-title set via fallback", "id", sessionID, "title", fallback)
+		}
+		return
+	}
+
+	title := strings.TrimSpace(resp.Message.Content)
+	slog.Info("auto-title LLM response", "id", sessionID, "raw_title", resp.Message.Content, "title", title)
+	if len([]rune(title)) > 30 {
+		title = string([]rune(title)[:30])
+	}
+	if title == "" {
+		slog.Warn("auto-title: LLM returned empty content, using fallback")
+		fallback := firstUserMsg
+		if len([]rune(fallback)) > 20 {
+			fallback = string([]rune(fallback)[:20]) + "..."
+		}
+		_ = r.sessMgr.SetTitle(sessionID, fallback)
+		return
+	}
+
+	if err := r.sessMgr.SetTitle(sessionID, title); err != nil {
+		slog.Warn("auto-title SetTitle failed", "err", err)
+	}
+	slog.Info("session title set", "id", sessionID, "title", title)
+}
+
 // handleSlashCommand processes a slash command. Returns true if the REPL should exit.
 func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	switch cmd.Name {
@@ -352,11 +439,71 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 		printHistory(r.sess.Messages)
 	case "compact":
 		fmt.Fprintln(os.Stderr, "  Compaction is automatic when context fills up.")
+	case "new":
+		r.startNewSession()
+	case "title":
+		if cmd.Args == "" {
+			fmt.Fprintln(os.Stderr, "  Usage: /title <name>")
+			return false
+		}
+		_ = r.sessMgr.SetTitle(r.sess.ID, cmd.Args)
+		r.sess.Title = cmd.Args
+		fmt.Fprintf(os.Stderr, "  Title set to: %s\n", cmd.Args)
+	case "save":
+		r.saveSession()
+		fmt.Fprintln(os.Stderr, "  Session saved.")
+	case "undo":
+		r.undoLastTurn()
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
 	}
 	return false
+}
+
+func (r *ChatRepl) startNewSession() {
+	// Mark current session as completed.
+	r.sess.State = models.SessionStateCompleted
+	r.saveSession()
+
+	// Create new session.
+	sess, err := r.sessMgr.Create(models.CreateOpts{
+		Model: r.cfg.Model,
+		CWD:   r.cfg.WorkDir,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Error creating new session: %v\n", err)
+		return
+	}
+	r.sess = sess
+	r.turn = 0
+	fmt.Fprintf(os.Stderr, "  New session started: %s\n", sess.ID)
+}
+
+func (r *ChatRepl) undoLastTurn() {
+	// Find the last human message and remove it and everything after it.
+	lastHuman := -1
+	for i := len(r.sess.Messages) - 1; i >= 0; i-- {
+		if r.sess.Messages[i].Role == models.RoleHuman {
+			lastHuman = i
+			break
+		}
+	}
+	if lastHuman < 0 {
+		fmt.Fprintln(os.Stderr, "  Nothing to undo.")
+		return
+	}
+	removed := len(r.sess.Messages) - lastHuman
+	r.sess.Messages = r.sess.Messages[:lastHuman]
+
+	// Delete persisted messages after the kept boundary.
+	// LoadMessages returns messages ordered by seq ASC, so index maps to seq = index+1.
+	// We keep messages 0..lastHuman-1 (seq 1..lastHuman), delete seq > lastHuman.
+	if err := r.sessMgr.DeleteMessagesAfterSeq(r.sess.ID, lastHuman); err != nil {
+		slog.Warn("undo: delete messages from DB failed", "err", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  Undone %d messages.\n", removed)
 }
 
 func printSlashHelp() {
@@ -365,6 +512,10 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /help      Show this help")
 	fmt.Fprintln(os.Stderr, "    /clear     Clear session history")
 	fmt.Fprintln(os.Stderr, "    /history   Show conversation history")
+	fmt.Fprintln(os.Stderr, "    /new       Start a new session")
+	fmt.Fprintln(os.Stderr, "    /title     Set session title")
+	fmt.Fprintln(os.Stderr, "    /save      Save session metadata")
+	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }
@@ -390,7 +541,6 @@ func printHistory(messages []models.Message) {
 // for previously retrieved facts if the signal is positive. Called before the
 // agent runs for the current turn.
 func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage string) {
-	// Classify the user message (does not require factIDs).
 	var prevMsg string
 	for i := len(r.sess.Messages) - 1; i >= 0; i-- {
 		if r.sess.Messages[i].Role == models.RoleHuman {
@@ -409,7 +559,6 @@ func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage 
 	)
 	r.monitorFalseReward(result.Classification)
 
-	// Record events for preference extraction (independent of fact retrieval).
 	if result.Classification == memory.FeedbackNegative && r.prefSched != nil {
 		r.prefSched.RecordNegativeFeedback()
 	} else if r.prefSched != nil {
@@ -419,7 +568,6 @@ func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage 
 		r.prefSched.CheckLanguageSwitch(userMessage)
 	}
 
-	// HelpfulCount increment requires factIDs from previous injection.
 	if r.cfg.MemoryService == nil {
 		return
 	}
@@ -431,7 +579,7 @@ func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage 
 }
 
 // monitorFalseReward checks if a positive classification was wrong by tracking
-// consecutive corrections. If 3+ consecutive corrections happen, it warns.
+// consecutive corrections.
 func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassification) {
 	if classification == memory.FeedbackNegative {
 		r.consecCorrections++
