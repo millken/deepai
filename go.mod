@@ -12,6 +12,7 @@ require (
 	github.com/ebitengine/purego v0.10.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/mark3labs/mcp-go v0.48.0
+	github.com/mattn/go-runewidth v0.0.23
 	github.com/spf13/cobra v1.10.2
 	github.com/voocel/litellm v1.6.6
 	golang.org/x/sync v0.20.0
@@ -55,7 +56,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
-	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/mitchellh/hashstructure/v2 v2.0.2 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
