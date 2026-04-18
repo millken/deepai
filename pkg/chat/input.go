@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -81,6 +82,34 @@ func (h *InputHandler) scanLine(ctx context.Context) (string, error) {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// AskQuestion implements tools.UserInteraction. It prints a question with optional
+// numbered choices, reads user input from stdin, and returns the answer.
+// If options are provided and the user enters a number, the corresponding option is returned.
+// Safe to call from agent goroutine: the REPL main loop is blocked on outcomes during tool execution,
+// so no concurrent reads on the shared bufio.Scanner.
+func (h *InputHandler) AskQuestion(ctx context.Context, question string, options []string) (string, error) {
+	fmt.Fprintf(os.Stderr, "\n  ? %s\n", question)
+	for i, opt := range options {
+		fmt.Fprintf(os.Stderr, "    %d. %s\n", i+1, opt)
+	}
+	fmt.Fprint(os.Stderr, "  > ")
+
+	line, err := h.scanLine(ctx)
+	if err != nil {
+		return "", err
+	}
+	answer := strings.TrimSpace(line)
+	if answer == "" {
+		return "", nil
+	}
+	if len(options) > 0 {
+		if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(options) {
+			return options[idx-1], nil
+		}
+	}
+	return answer, nil
 }
 
 // ParseSlashCommand checks if input is a slash command.

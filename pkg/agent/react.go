@@ -61,6 +61,9 @@ type Agent struct {
 
 	// Skill tracking for memory source tagging
 	activeSkill atomic.Value // stores string
+
+	// User interaction
+	userInteraction tools.UserInteraction
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -104,6 +107,7 @@ func New(cfg AgentConfig) *Agent {
 		memoryService:       cfg.MemoryService,
 		memoryExtractor:     cfg.MemoryExtractor,
 		memoryUserID:        cfg.MemoryUserID,
+		userInteraction:     cfg.UserInteraction,
 	}
 }
 
@@ -387,6 +391,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			toolStarted := time.Now().UTC()
 			toolCtx := tools.WithSandbox(ctx, a.sandbox)
 			toolCtx = tools.WithThreadID(toolCtx, sessionID)
+			if a.userInteraction != nil {
+				toolCtx = tools.WithUserInteraction(toolCtx, a.userInteraction)
+			}
 			result, err := a.tools.Execute(toolCtx, call)
 			if err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)

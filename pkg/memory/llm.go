@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -67,8 +68,13 @@ func (c *LLMClient) ExtractUpdate(ctx context.Context, current Document, message
 		return Update{}, fmt.Errorf("memory llm call failed: %w", err)
 	}
 
+	content := extractJSON(resp.Message.Content)
+	if content == "" {
+		slog.Debug("memory extraction returned empty content, skipping update", "session", current.SessionID)
+		return Update{}, nil
+	}
 	var update Update
-	if err := json.Unmarshal([]byte(extractJSON(resp.Message.Content)), &update); err != nil {
+	if err := json.Unmarshal([]byte(content), &update); err != nil {
 		return Update{}, fmt.Errorf("decode memory llm response: %w", err)
 	}
 	return update, nil

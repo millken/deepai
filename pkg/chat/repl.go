@@ -213,6 +213,7 @@ func (r *ChatRepl) runTurn(parentCtx context.Context, userInput string) error {
 		Model:         r.cfg.Model,
 		ContextWindow: r.cfg.ContextWindow,
 		MaxTurns:      r.cfg.MaxTurns,
+		UserInteraction: r.input,
 	}
 
 	runAgent := agent.New(agentCfg)

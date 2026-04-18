@@ -50,6 +50,9 @@ type AgentConfig struct {
 	MemoryService   *memory.Service  // used for Inject into system prompt
 	MemoryExtractor memory.Extractor // per-request extractor (matches the LLM model of the current request)
 	MemoryUserID    string           // user ID for cross-session UserScope memory (empty = disabled)
+
+	// User interaction (e.g. ask_clarification tool)
+	UserInteraction tools.UserInteraction // nil = non-interactive, tools proceed without user input
 }
 
 type TimeoutError struct {
