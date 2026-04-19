@@ -56,5 +56,15 @@ func DefaultStyles() Styles {
 			Foreground(lipgloss.Color("#7AA2F7")),
 		Separator: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#3B4261")),
+		SeverityCrit: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF5555")).Bold(true),
+		SeverityWarn: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFBF00")),
+		SeveritySugg: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#7AA2F7")),
+		ReviewPass: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9ECE6A")),
+		ReviewFail: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF5555")).Bold(true),
 	}
 }
