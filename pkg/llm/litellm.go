@@ -4,9 +4,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	"github.com/millken/deepai/pkg/models"
 	"github.com/voocel/litellm"
@@ -87,51 +91,129 @@ func (p *LitellmProvider) Stream(ctx context.Context, req ChatRequest) (<-chan S
 		return nil, err
 	}
 
-	ch := make(chan StreamChunk)
+	ch := make(chan StreamChunk, 128)
 	go func() {
 		defer close(ch)
-		defer stream.Close()
 
-		toolAcc := litellm.NewToolCallAccumulator()
-		var lastUsage *Usage
-
-		resp, err := litellm.CollectStreamWithHandler(stream, func(chunk *litellm.StreamChunk) {
-			if chunk == nil {
+		const maxStreamRetries = 3
+		var lastRetryErr error
+		for attempt := 0; attempt <= maxStreamRetries; attempt++ {
+			// consumeStream returns true if we should retry.
+			retry := p.consumeStream(ctx, ch, stream, req.Model, attempt < maxStreamRetries)
+			stream.Close()
+			if !retry {
 				return
 			}
-
-			if chunk.Content != "" {
-				ch <- StreamChunk{Model: req.Model, Delta: chunk.Content}
+			// Exponential backoff with jitter before retry.
+			delay := streamRetryDelay(attempt)
+			slog.Debug("retrying stream", "provider", p.provider, "attempt", attempt+1, "delay", delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				ch <- StreamChunk{Err: ctx.Err(), Done: true}
+				return
 			}
-
-			if chunk.ToolCallDelta != nil {
-				toolAcc.Apply(chunk.ToolCallDelta)
-				if call := toolAcc.Get(chunk.ToolCallDelta.Index); call != nil {
-					ch <- StreamChunk{Model: req.Model, ToolCalls: convertLitellmToolCalls([]litellm.ToolCall{*call})}
+			var err error
+			stream, err = p.client.Stream(ctx, litReq)
+			if err != nil {
+				lastRetryErr = err
+				if !isRetryableStreamErr(err) || attempt == maxStreamRetries {
+					ch <- StreamChunk{Err: lastRetryErr, Done: true}
+					return
 				}
+				// Reconnect failed but still retryable — continue loop to backoff and retry again.
+				continue
 			}
-
-			if chunk.Usage != nil {
-				lastUsage = &Usage{
-					InputTokens:  chunk.Usage.PromptTokens,
-					OutputTokens: chunk.Usage.CompletionTokens,
-					TotalTokens:  chunk.Usage.TotalTokens,
-				}
-			}
-		})
-		if err != nil {
-			ch <- StreamChunk{Err: err, Done: true}
-			return
 		}
-		msg := models.Message{Role: models.RoleAI, Content: extractResponseContent(resp), ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
-		usage := lastUsage
-		if usage == nil && (resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0) {
-			usage = &Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
+		// All retries exhausted during reconnect.
+		if lastRetryErr != nil {
+			ch <- StreamChunk{Err: lastRetryErr, Done: true}
 		}
-		ch <- StreamChunk{Model: req.Model, Message: &msg, ToolCalls: msg.ToolCalls, Usage: usage, Stop: resp.FinishReason, Done: true}
 	}()
 
 	return ch, nil
+}
+
+// streamRetryDelay returns exponential backoff with jitter for stream retries.
+func streamRetryDelay(attempt int) time.Duration {
+	delay := float64(time.Second) * math.Pow(2, float64(attempt))
+	if delay > float64(30*time.Second) {
+		delay = float64(30 * time.Second)
+	}
+	delay += delay * 0.25 * (2*rand.Float64() - 1)
+	if delay < 0 {
+		delay = float64(time.Second)
+	}
+	return time.Duration(delay)
+}
+
+// isRetryableStreamErr checks if a stream error is worth retrying.
+// Only retries on timeout, network, rate limit, overloaded, and 5xx provider errors.
+func isRetryableStreamErr(err error) bool {
+	var litErr *providers.LiteLLMError
+	if errors.As(err, &litErr) {
+		switch litErr.Type {
+		case providers.ErrorTypeNetwork, providers.ErrorTypeTimeout,
+			providers.ErrorTypeRateLimit, providers.ErrorTypeOverloaded:
+			return true
+		case providers.ErrorTypeProvider:
+			// Only retry 5xx provider errors, not 4xx (validation, auth, etc.)
+			return litErr.StatusCode >= 500 || litErr.StatusCode == 0
+		}
+		return false
+	}
+	// Non-LiteLLM errors are not retried by default.
+	return false
+}
+
+// consumeStream reads from a stream and sends chunks to ch.
+// Returns true if the stream failed early (no content emitted) with a retryable error.
+func (p *LitellmProvider) consumeStream(ctx context.Context, ch chan<- StreamChunk, stream litellm.StreamReader, model string, retryable bool) (retry bool) {
+	toolAcc := litellm.NewToolCallAccumulator()
+	var lastUsage *Usage
+	var emitted bool
+
+	resp, err := litellm.CollectStreamWithHandler(stream, func(chunk *litellm.StreamChunk) {
+		if chunk == nil {
+			return
+		}
+
+		if chunk.Content != "" {
+			emitted = true
+			ch <- StreamChunk{Model: model, Delta: chunk.Content}
+		}
+
+		if chunk.ToolCallDelta != nil {
+			emitted = true
+			toolAcc.Apply(chunk.ToolCallDelta)
+			if call := toolAcc.Get(chunk.ToolCallDelta.Index); call != nil {
+				ch <- StreamChunk{Model: model, ToolCalls: convertLitellmToolCalls([]litellm.ToolCall{*call})}
+			}
+		}
+
+		if chunk.Usage != nil {
+			lastUsage = &Usage{
+				InputTokens:  chunk.Usage.PromptTokens,
+				OutputTokens: chunk.Usage.CompletionTokens,
+				TotalTokens:  chunk.Usage.TotalTokens,
+			}
+		}
+	})
+	if err != nil {
+		if !emitted && retryable && isRetryableStreamErr(err) {
+			slog.Debug("stream failed before emitting content, will retry", "provider", p.provider, "err", err)
+			return true
+		}
+		ch <- StreamChunk{Err: err, Done: true}
+		return false
+	}
+	msg := models.Message{Role: models.RoleAI, Content: extractResponseContent(resp), ToolCalls: convertLitellmToolCalls(resp.ToolCalls)}
+	usage := lastUsage
+	if usage == nil && (resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0 || resp.Usage.TotalTokens != 0) {
+		usage = &Usage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens, TotalTokens: resp.Usage.TotalTokens}
+	}
+	ch <- StreamChunk{Model: model, Message: &msg, ToolCalls: msg.ToolCalls, Usage: usage, Stop: resp.FinishReason, Done: true}
+	return false
 }
 
 func convertLitellmToolCalls(calls []litellm.ToolCall) []models.ToolCall {

@@ -1,11 +1,15 @@
 package llm
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/millken/deepai/pkg/models"
 	"github.com/voocel/litellm"
+	"github.com/voocel/litellm/providers"
 )
 
 func TestAvalibleProvider(t *testing.T) {
@@ -143,5 +147,113 @@ func TestExtractResponseContent(t *testing.T) {
 				t.Fatalf("extractResponseContent() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsRetryableStreamErr(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "network error",
+			err:  providers.NewNetworkError("test", "conn reset", nil),
+			want: true,
+		},
+		{
+			name: "timeout error",
+			err:  providers.NewError(providers.ErrorTypeTimeout, "deadline exceeded"),
+			want: true,
+		},
+		{
+			name: "rate limit error",
+			err:  providers.NewHTTPError("test", 429, "slow down"),
+			want: true,
+		},
+		{
+			name: "overloaded error (529)",
+			err:  providers.NewHTTPError("test", 529, "overloaded"),
+			want: true,
+		},
+		{
+			name: "provider 5xx error",
+			err:  providers.NewHTTPError("test", 502, "bad gateway"),
+			want: true,
+		},
+		{
+			name: "provider 500 error",
+			err:  providers.NewHTTPError("test", 500, "internal error"),
+			want: true,
+		},
+		{
+			name: "provider 4xx error (not retryable)",
+			err:  providers.NewHTTPError("test", 400, "bad request"),
+			want: false,
+		},
+		{
+			name: "auth error",
+			err:  providers.NewAuthError("test", "invalid key"),
+			want: false,
+		},
+		{
+			name: "validation error",
+			err:  providers.NewValidationError("test", "invalid param"),
+			want: false,
+		},
+		{
+			name: "model not found error",
+			err:  providers.NewModelError("test", "test-model", "model not found"),
+			want: false,
+		},
+		{
+			name: "generic error (not retryable)",
+			err:  errors.New("something went wrong"),
+			want: false,
+		},
+		{
+			name: "anthropic stream error (not retryable)",
+			err:  errors.New("anthropic: stream error: [] "),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isRetryableStreamErr(tt.err)
+			if got != tt.want {
+				t.Errorf("isRetryableStreamErr() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamRetryDelay(t *testing.T) {
+	tests := []struct {
+		attempt   int
+		wantMin   time.Duration
+		wantMax   time.Duration
+	}{
+		{attempt: 0, wantMin: 500 * time.Millisecond, wantMax: 5 * time.Second},
+		{attempt: 1, wantMin: 1 * time.Second, wantMax: 5 * time.Second},
+		{attempt: 2, wantMin: 2 * time.Second, wantMax: 10 * time.Second},
+		{attempt: 5, wantMin: 10 * time.Second, wantMax: 40 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("attempt_%d", tt.attempt), func(t *testing.T) {
+			got := streamRetryDelay(tt.attempt)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("streamRetryDelay(%d) = %v, want between %v and %v", tt.attempt, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestStreamRetryDelay_Capped(t *testing.T) {
+	// Very high attempt should still be capped near 30s.
+	got := streamRetryDelay(20)
+	if got > 40*time.Second {
+		t.Errorf("streamRetryDelay(20) = %v, should be capped near 30s", got)
 	}
 }
