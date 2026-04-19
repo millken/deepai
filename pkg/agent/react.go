@@ -64,6 +64,12 @@ type Agent struct {
 
 	// User interaction
 	userInteraction tools.UserInteraction
+
+	// Plan mode: restrict to read-only tools until user approves
+	planMode  atomic.Bool
+	fullTools *tools.Registry // saved full tool set, restored on exit
+	workDir   string          // working directory for plan files
+	planFile  string          // path to the current plan file
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -86,7 +92,7 @@ func New(cfg AgentConfig) *Agent {
 	if requestTimeout <= 0 {
 		requestTimeout = defaultRequestTimeout
 	}
-	return &Agent{
+	a := &Agent{
 		llm:                 cfg.LLMProvider,
 		tools:               registry,
 		sandbox:             cfg.Sandbox,
@@ -108,7 +114,18 @@ func New(cfg AgentConfig) *Agent {
 		memoryExtractor:     cfg.MemoryExtractor,
 		memoryUserID:        cfg.MemoryUserID,
 		userInteraction:     cfg.UserInteraction,
+		workDir:             cfg.WorkDir,
 	}
+
+	// Register plan mode tools (agent self-references via closures).
+	a.registerPlanTools()
+
+	// Start in plan mode if requested (e.g. user typed /plan).
+	if cfg.PlanMode {
+		a.enterPlanMode()
+	}
+
+	return a
 }
 
 // AppendSystemPrompt appends extra text to the agent's system prompt.
@@ -486,6 +503,7 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string) string 
 	}
 
 	sections = append(sections, "Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.")
+	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
 }
 

@@ -6,3 +6,4 @@ logs/
 *.log
 deepai
 deepai-debug.log
+.deepai/plans/

@@ -51,6 +51,7 @@ type ChatRepl struct {
 	turn              int
 	prefSched         *memory.PreferenceScheduler
 	consecCorrections int
+	planMode          bool // restrict to read-only tools until user approves plan
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -251,6 +252,8 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		ContextWindow:   r.cfg.ContextWindow,
 		MaxTurns:        r.cfg.MaxTurns,
 		UserInteraction: r.input,
+		PlanMode:        r.planMode,
+		WorkDir:         r.cfg.WorkDir,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -346,6 +349,13 @@ EventLoop:
 	}
 
 	r.renderer.TurnEnd(lastUsage)
+
+	// Sync plan mode: if the agent exited plan mode during this turn
+	// (e.g. user confirmed the plan via exit_plan_mode tool), clear the
+	// REPL flag so the next turn won't re-enter plan mode.
+	if r.planMode && !runAgent.IsPlanMode() {
+		r.planMode = false
+	}
 
 	// Persist only new messages produced by the agent.
 	for _, msg := range r.sess.Messages[prevMsgCount:] {
@@ -479,6 +489,13 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 		fmt.Fprintln(os.Stderr, "  Session saved.")
 	case "undo":
 		r.undoLastTurn()
+	case "plan":
+		r.planMode = true
+		fmt.Fprintln(os.Stderr, "  Plan mode enabled. Agent will explore and plan before writing code.")
+		fmt.Fprintln(os.Stderr, "  Use /run to disable, or the agent will ask you to approve the plan.")
+	case "run", "code":
+		r.planMode = false
+		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
@@ -541,6 +558,8 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /title     Set session title")
 	fmt.Fprintln(os.Stderr, "    /save      Save session metadata")
 	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
+	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
+	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }

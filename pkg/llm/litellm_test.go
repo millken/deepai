@@ -230,9 +230,9 @@ func TestIsRetryableStreamErr(t *testing.T) {
 
 func TestStreamRetryDelay(t *testing.T) {
 	tests := []struct {
-		attempt   int
-		wantMin   time.Duration
-		wantMax   time.Duration
+		attempt int
+		wantMin time.Duration
+		wantMax time.Duration
 	}{
 		{attempt: 0, wantMin: 500 * time.Millisecond, wantMax: 5 * time.Second},
 		{attempt: 1, wantMin: 1 * time.Second, wantMax: 5 * time.Second},

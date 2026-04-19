@@ -53,6 +53,10 @@ type AgentConfig struct {
 
 	// User interaction (e.g. ask_clarification tool)
 	UserInteraction tools.UserInteraction // nil = non-interactive, tools proceed without user input
+
+	// Plan mode: restrict agent to read-only tools until user approves the plan
+	PlanMode bool
+	WorkDir  string // working directory for writing plan files
 }
 
 type TimeoutError struct {
