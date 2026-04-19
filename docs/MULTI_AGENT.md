@@ -294,14 +294,20 @@ Engine 按 DAG 拓扑排序执行 stage，同 wave 内并行：
 
 ```go
 // pkg/workflow/environment.go
-type Environment struct {
-    roles    map[AgentType]AgentRole
-    inbox    map[AgentType]chan AgentMessage
-    history  []AgentMessage
+type Subscription struct {
+    Role     string   // agent type or stage name
+    MsgTypes []string // subscribed message types; empty = all
 }
 
-func (e *Environment) Publish(msg AgentMessage)
-func (e *Environment) Subscribe(role AgentType, msgTypes ...string)
+type Environment struct { ... }
+
+func NewEnvironment(opts ...EnvOption) *Environment
+func (e *Environment) Register(sub Subscription) error
+func (e *Environment) Unregister(role string)
+func (e *Environment) Publish(ctx context.Context, msg AgentMessage) error
+func (e *Environment) Receive(ctx context.Context, role string) (AgentMessage, error)
+func (e *Environment) History(filters ...MsgFilter) []AgentMessage
+func (e *Environment) Close()
 ```
 
 **3.2 并行审查**

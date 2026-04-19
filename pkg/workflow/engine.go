@@ -66,11 +66,19 @@ func evaluateCondition(name string, results map[string]*StageResult) (bool, erro
 	return fn(results), nil
 }
 
+// EnvEvent represents a stage lifecycle event for real-time rendering.
+type EnvEvent struct {
+	Type  string // "stage_started", "stage_completed", "stage_skipped", "stage_failed"
+	Stage string
+	Role  string
+}
+
 // Engine executes Workflows using the subagent infrastructure.
 type Engine struct {
 	executor subagent.Executor
 	pool     *subagent.Pool
 	workDir  string
+	env      *Environment // optional message bus
 }
 
 // NewEngine creates a workflow engine.
@@ -82,6 +90,14 @@ func NewEngine(executor subagent.Executor, pool *subagent.Pool, workDir string) 
 		})
 	}
 	return &Engine{executor: executor, pool: pool, workDir: workDir}
+}
+
+// WithEnvironment attaches a message bus for inter-agent communication.
+func (e *Engine) WithEnvironment(env *Environment) *Engine {
+	if e != nil {
+		e.env = env
+	}
+	return e
 }
 
 // Run executes a workflow with the given user input.
@@ -149,9 +165,11 @@ func (e *Engine) executeStage(ctx context.Context, s WorkflowStage, userInput st
 		return nil, err
 	}
 	if !ok {
+		e.emitStageEvent(ctx, EnvEvent{Type: "stage_skipped", Stage: s.Name, Role: string(s.Role)})
 		return &StageResult{Name: s.Name, Status: "skipped"}, nil
 	}
 
+	e.emitStageEvent(ctx, EnvEvent{Type: "stage_started", Stage: s.Name, Role: string(s.Role)})
 	prompt := e.buildPrompt(s, userInput, results, baseline)
 	task := &subagent.Task{
 		ID:     fmt.Sprintf("wf-%s", s.Name),
@@ -167,12 +185,16 @@ func (e *Engine) executeStage(ctx context.Context, s WorkflowStage, userInput st
 		execResult, execErr = e.executor.Execute(ctx, task, func(subagent.TaskEvent) {})
 		if execErr == nil {
 			output := truncateOutput(execResult.Result)
+			e.publishMessage(ctx, s, output)
+			e.emitStageEvent(ctx, EnvEvent{Type: "stage_completed", Stage: s.Name, Role: string(s.Role)})
 			return &StageResult{Name: s.Name, Output: output, Status: "completed"}, nil
 		}
 		if ctx.Err() != nil {
+			e.emitStageEvent(ctx, EnvEvent{Type: "stage_failed", Stage: s.Name, Role: string(s.Role)})
 			return &StageResult{Name: s.Name, Status: "failed"}, ctx.Err()
 		}
 	}
+	e.emitStageEvent(ctx, EnvEvent{Type: "stage_failed", Stage: s.Name, Role: string(s.Role)})
 	return &StageResult{Name: s.Name, Status: "failed"}, fmt.Errorf("stage %q failed after %d attempts: %w", s.Name, s.MaxRetries+1, execErr)
 }
 
@@ -188,14 +210,17 @@ func (e *Engine) executeParallel(ctx context.Context, wave []WorkflowStage, user
 				return err
 			}
 			if !ok {
+				e.emitStageEvent(gctx, EnvEvent{Type: "stage_skipped", Stage: s.Name, Role: string(s.Role)})
 				stageResults[i] = &StageResult{Name: s.Name, Status: "skipped"}
 				return nil
 			}
 
+			e.emitStageEvent(gctx, EnvEvent{Type: "stage_started", Stage: s.Name, Role: string(s.Role)})
 			prompt := e.buildPrompt(s, userInput, results, baseline)
 			var lastErr error
 			for attempt := 0; attempt <= s.MaxRetries; attempt++ {
 				if gctx.Err() != nil {
+					e.emitStageEvent(gctx, EnvEvent{Type: "stage_failed", Stage: s.Name, Role: string(s.Role)})
 					return gctx.Err()
 				}
 				task, err := e.pool.StartTask(gctx, s.Name, prompt, subagent.SubagentConfig{
@@ -215,9 +240,12 @@ func (e *Engine) executeParallel(ctx context.Context, wave []WorkflowStage, user
 					continue
 				}
 				output := truncateOutput(completed.Result)
+				e.publishMessage(gctx, s, output)
+				e.emitStageEvent(gctx, EnvEvent{Type: "stage_completed", Stage: s.Name, Role: string(s.Role)})
 				stageResults[i] = &StageResult{Name: s.Name, Output: output, Status: "completed"}
 				return nil
 			}
+			e.emitStageEvent(gctx, EnvEvent{Type: "stage_failed", Stage: s.Name, Role: string(s.Role)})
 			return lastErr
 		})
 	}
@@ -295,4 +323,39 @@ func truncateOutput(s string) string {
 		return s[:maxOutputLen] + "\n... [truncated]"
 	}
 	return s
+}
+
+// emitStageEvent sends a stage lifecycle event via the subagent event sink in context.
+func (e *Engine) emitStageEvent(ctx context.Context, evt EnvEvent) {
+	subagent.EmitEvent(ctx, subagent.TaskEvent{
+		Type:        evt.Type,
+		TaskID:      fmt.Sprintf("wf-%s", evt.Stage),
+		Description: evt.Stage,
+		Message:     fmt.Sprintf("%s %s (%s)", evt.Type, evt.Stage, evt.Role),
+	})
+}
+
+// publishMessage sends a stage result as an AgentMessage to the Environment.
+func (e *Engine) publishMessage(ctx context.Context, s WorkflowStage, output string) {
+	if e.env == nil {
+		return
+	}
+	msg := newAgentMessage(s.Name, "", stageMsgType(s.Role), output)
+	e.env.Publish(ctx, msg)
+}
+
+// stageMsgType maps agent roles to message types.
+func stageMsgType(role agent.AgentType) string {
+	switch role {
+	case agent.AgentTypeCoder:
+		return MsgTypeCodeChange
+	case agent.AgentTypeSecurityReviewer, agent.AgentTypeArchReviewer, agent.AgentTypePerfReviewer:
+		return MsgTypeReviewResult
+	case agent.AgentTypeProductManager:
+		return MsgTypePRD
+	case agent.AgentTypeArchitect:
+		return MsgTypeDesign
+	default:
+		return "result"
+	}
 }

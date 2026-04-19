@@ -662,3 +662,196 @@ func TestConditionEvaluationError(t *testing.T) {
 		t.Errorf("error should mention condition name: %v", err)
 	}
 }
+
+func TestEngineRun_WithEnvironment(t *testing.T) {
+	env := NewEnvironment()
+	defer env.Close()
+	env.Register(Subscription{Role: "listener", MsgTypes: []string{MsgTypeCodeChange}})
+
+	exec := &mockExecutor{results: map[string]string{
+		"impl": "code output",
+	}}
+	pool := newTestPool(exec)
+	engine := NewEngine(exec, pool, "").WithEnvironment(env)
+
+	wf := &Workflow{
+		Name: "env-test",
+		Stages: []WorkflowStage{
+			{Name: "impl", Role: agent.AgentTypeCoder, Prompt: "impl"},
+		},
+	}
+
+	result, err := engine.Run(context.Background(), wf, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "completed" {
+		t.Errorf("Status = %q", result.Status)
+	}
+
+	// Verify message was published to environment
+	received, err := env.Receive(context.Background(), "listener")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if received.From != "impl" {
+		t.Errorf("From = %q, want impl", received.From)
+	}
+	if received.Type != MsgTypeCodeChange {
+		t.Errorf("Type = %q, want %s", received.Type, MsgTypeCodeChange)
+	}
+
+	// Verify history
+	history := env.History()
+	if len(history) != 1 {
+		t.Fatalf("History len = %d, want 1", len(history))
+	}
+}
+
+func TestEngineRun_StageEvents(t *testing.T) {
+	exec := &mockExecutor{results: map[string]string{
+		"step": "output",
+	}}
+	pool := newTestPool(exec)
+	engine := NewEngine(exec, pool, "")
+
+	var events []EnvEvent
+	ctx := context.Background()
+	sink := func(evt subagent.TaskEvent) {
+		events = append(events, EnvEvent{
+			Type:  evt.Type,
+			Stage: strings.TrimPrefix(evt.TaskID, "wf-"),
+			Role:  "",
+		})
+	}
+	ctx = subagent.WithEventSink(ctx, subagent.EventSink(sink))
+
+	wf := &Workflow{
+		Name: "event-test",
+		Stages: []WorkflowStage{
+			{Name: "step", Role: agent.AgentTypeCoder, Prompt: "test"},
+		},
+	}
+
+	_, err := engine.Run(ctx, wf, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) < 2 {
+		t.Fatalf("expected at least 2 events, got %d", len(events))
+	}
+	hasStarted := false
+	hasCompleted := false
+	for _, evt := range events {
+		if evt.Type == "stage_started" && evt.Stage == "step" {
+			hasStarted = true
+		}
+		if evt.Type == "stage_completed" && evt.Stage == "step" {
+			hasCompleted = true
+		}
+	}
+	if !hasStarted {
+		t.Error("missing stage_started event")
+	}
+	if !hasCompleted {
+		t.Error("missing stage_completed event")
+	}
+}
+
+func TestEngineRun_ParallelStageEvents(t *testing.T) {
+	passReview, _ := json.Marshal(agent.ReviewResult{
+		Verdict: "pass", Summary: "clean",
+	})
+
+	exec := &mockExecutor{results: map[string]string{
+		"implement": "code",
+		"Review":    string(passReview),
+	}}
+	pool := newTestPool(exec)
+	engine := NewEngine(exec, pool, "")
+
+	var mu sync.Mutex
+	var events []EnvEvent
+	ctx := context.Background()
+	ctx = subagent.WithEventSink(ctx, subagent.EventSink(func(evt subagent.TaskEvent) {
+		mu.Lock()
+		events = append(events, EnvEvent{Type: evt.Type, Stage: strings.TrimPrefix(evt.TaskID, "wf-")})
+		mu.Unlock()
+	}))
+
+	wf := &Workflow{
+		Name: "parallel-events",
+		Stages: []WorkflowStage{
+			{Name: "implement", Role: agent.AgentTypeCoder, Prompt: "impl"},
+			{Name: "security", Role: agent.AgentTypeSecurityReviewer, InputFrom: []string{"implement"}, Prompt: "Review"},
+			{Name: "arch", Role: agent.AgentTypeArchReviewer, InputFrom: []string{"implement"}, Prompt: "Review"},
+		},
+	}
+
+	_, err := engine.Run(ctx, wf, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	started := 0
+	completed := 0
+	for _, evt := range events {
+		if evt.Type == "stage_started" {
+			started++
+		}
+		if evt.Type == "stage_completed" {
+			completed++
+		}
+	}
+	if started != 3 {
+		t.Errorf("started events = %d, want 3", started)
+	}
+	if completed != 3 {
+		t.Errorf("completed events = %d, want 3", completed)
+	}
+}
+
+func TestEngineRun_ParallelWithEnvironment(t *testing.T) {
+	env := NewEnvironment()
+	defer env.Close()
+	env.Register(Subscription{Role: "listener", MsgTypes: []string{MsgTypeReviewResult}})
+
+	passReview, _ := json.Marshal(agent.ReviewResult{Verdict: "pass"})
+	exec := &mockExecutor{results: map[string]string{
+		"implement": "code",
+		"Review":    string(passReview),
+	}}
+	pool := newTestPool(exec)
+	engine := NewEngine(exec, pool, "").WithEnvironment(env)
+
+	wf := &Workflow{
+		Name: "parallel-env",
+		Stages: []WorkflowStage{
+			{Name: "implement", Role: agent.AgentTypeCoder, Prompt: "impl"},
+			{Name: "security", Role: agent.AgentTypeSecurityReviewer, InputFrom: []string{"implement"}, Prompt: "Review"},
+			{Name: "arch", Role: agent.AgentTypeArchReviewer, InputFrom: []string{"implement"}, Prompt: "Review"},
+		},
+	}
+
+	_, err := engine.Run(context.Background(), wf, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	history := env.History()
+	if len(history) != 3 {
+		t.Errorf("env history = %d messages, want 3 (1 code_change + 2 review_result)", len(history))
+	}
+
+	codeChanges := env.History(Type(MsgTypeCodeChange))
+	if len(codeChanges) != 1 {
+		t.Errorf("code_change messages = %d, want 1", len(codeChanges))
+	}
+	reviews := env.History(Type(MsgTypeReviewResult))
+	if len(reviews) != 2 {
+		t.Errorf("review_result messages = %d, want 2", len(reviews))
+	}
+}

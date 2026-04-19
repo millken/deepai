@@ -16,6 +16,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/workflow"
 )
@@ -774,9 +775,27 @@ func (r *ChatRepl) handleWorkflow(args string) {
 		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
 			WithWorkDir(r.cfg.WorkDir)
 		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
-		engine := workflow.NewEngine(executor, pool, r.cfg.WorkDir)
 
-		result, err := engine.Run(ctx, wf, prompt)
+		env := workflow.NewEnvironment()
+		defer env.Close()
+
+		engine := workflow.NewEngine(executor, pool, r.cfg.WorkDir).WithEnvironment(env)
+
+		// Inject event sink for real-time stage progress
+		wfCtx := subagent.WithEventSink(ctx, subagent.EventSink(func(evt subagent.TaskEvent) {
+			switch evt.Type {
+			case "stage_started":
+				fmt.Fprintf(os.Stderr, "  [%s] running...\n", evt.Description)
+			case "stage_completed":
+				fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Description)
+			case "stage_skipped":
+				fmt.Fprintf(os.Stderr, "  [%s] skipped\n", evt.Description)
+			case "stage_failed":
+				fmt.Fprintf(os.Stderr, "  [%s] failed\n", evt.Description)
+			}
+		}))
+
+		result, err := engine.Run(wfCtx, wf, prompt)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  Workflow error: %v\n", err)
 			return
