@@ -25,7 +25,7 @@ type Pool struct {
 
 func NewPool(executor Executor, cfg PoolConfig) *Pool {
 	if cfg.MaxConcurrent <= 0 {
-		cfg.MaxConcurrent = 1
+		cfg.MaxConcurrent = 3
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 2 * time.Minute
@@ -34,18 +34,18 @@ func NewPool(executor Executor, cfg PoolConfig) *Pool {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.Defaults == nil {
-		cfg.Defaults = map[SubagentType]SubagentConfig{
-			SubagentGeneralPurpose: {
-				Type:     SubagentGeneralPurpose,
-				MaxTurns: 6,
-				Timeout:  cfg.Timeout,
-				Tools:    []string{"file_ops"},
+		cfg.Defaults = map[string]SubagentConfig{
+			"general-purpose": {
+				AgentType: "general-purpose",
+				MaxTurns:  6,
+				Timeout:   cfg.Timeout,
+				Tools:     []string{"file_ops"},
 			},
-			SubagentBash: {
-				Type:     SubagentBash,
-				MaxTurns: 4,
-				Timeout:  cfg.Timeout,
-				Tools:    []string{"bash"},
+			"bash": {
+				AgentType: "bash",
+				MaxTurns:  4,
+				Timeout:   cfg.Timeout,
+				Tools:     []string{"bash"},
 			},
 		}
 	}
@@ -73,7 +73,7 @@ func (p *Pool) StartTask(ctx context.Context, description, prompt string, cfg Su
 	task := &Task{
 		ID:          newTaskID(),
 		RequestID:   newTaskRequestID(),
-		Type:        resolved.Type,
+		Type:        SubagentType(resolved.EffectiveAgentType()),
 		Config:      resolved,
 		Status:      TaskStatusPending,
 		Description: strings.TrimSpace(description),
@@ -232,15 +232,24 @@ func (p *Pool) emit(ctx context.Context, evt TaskEvent) {
 }
 
 func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
-	base, ok := p.cfg.Defaults[cfg.Type]
+	agentType := cfg.EffectiveAgentType()
+	if agentType == "" {
+		agentType = "general-purpose"
+	}
+
+	base, ok := p.cfg.Defaults[agentType]
 	if !ok {
-		base = p.cfg.Defaults[SubagentGeneralPurpose]
+		base, ok = p.cfg.Defaults["general-purpose"]
 	}
-	if base.Type == "" {
-		base.Type = SubagentGeneralPurpose
+	if !ok {
+		base = SubagentConfig{AgentType: "general-purpose"}
 	}
-	if cfg.Type != "" {
-		base.Type = cfg.Type
+
+	if cfg.AgentType != "" {
+		base.AgentType = cfg.AgentType
+	}
+	if base.AgentType == "" {
+		base.AgentType = agentType
 	}
 	if cfg.MaxTurns > 0 {
 		base.MaxTurns = cfg.MaxTurns

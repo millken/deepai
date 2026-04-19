@@ -24,7 +24,8 @@ func TaskTool(pool taskPool) models.Tool {
 			"properties": map[string]any{
 				"description":   map[string]any{"type": "string", "description": "Short description of the delegated task"},
 				"prompt":        map[string]any{"type": "string", "description": "Detailed instructions for the subagent"},
-				"subagent_type": map[string]any{"type": "string", "enum": []any{string(subagent.SubagentGeneralPurpose), string(subagent.SubagentBash)}},
+				"subagent_type": map[string]any{"type": "string", "description": "Deprecated: use agent_type instead"},
+				"agent_type":    map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
 				"max_turns":     map[string]any{"type": "integer", "description": "Optional max turns override"},
 			},
 			"required": []any{"description", "prompt"},
@@ -36,12 +37,17 @@ func TaskTool(pool taskPool) models.Tool {
 
 			description, _ := call.Arguments["description"].(string)
 			prompt, _ := call.Arguments["prompt"].(string)
-			subagentType := parseSubagentType(call.Arguments["subagent_type"])
 			maxTurns := intFromArg(call.Arguments["max_turns"])
 
+			// Resolve agent type: agent_type > subagent_type > general-purpose
+			agentType, _ := call.Arguments["agent_type"].(string)
+			if agentType == "" {
+				agentType = string(parseSubagentType(call.Arguments["subagent_type"]))
+			}
+
 			task, err := pool.StartTask(ctx, strings.TrimSpace(description), strings.TrimSpace(prompt), subagent.SubagentConfig{
-				Type:     subagentType,
-				MaxTurns: maxTurns,
+				AgentType: agentType,
+				MaxTurns:  maxTurns,
 			})
 			if err != nil {
 				return models.ToolResult{

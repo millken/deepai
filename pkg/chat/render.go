@@ -182,3 +182,57 @@ func truncateWidth(s string, maxW int) string {
 	}
 	return s
 }
+
+// RenderPipelineResult renders a pipeline result with color-coded severity.
+func (r *Renderer) RenderPipelineResult(result *agent.OrchestratorResult) {
+	if result == nil {
+		return
+	}
+
+	verdictStyle := r.styles.ReviewPass
+	verdictText := "PASS"
+	if result.Verdict != "pass" {
+		verdictStyle = r.styles.ReviewFail
+		verdictText = "ISSUES FOUND"
+	}
+	fmt.Fprintf(r.out, "  Verdict: %s  (rounds=%d)\n", verdictStyle.Render(verdictText), result.Rounds)
+
+	if len(result.Reviews) == 0 {
+		return
+	}
+	fmt.Fprintln(r.out, "  Reviews:")
+	for key, review := range result.Reviews {
+		reviewVerdict := r.styles.ReviewPass.Render("pass")
+		if review.Verdict != "pass" {
+			reviewVerdict = r.styles.ReviewFail.Render(review.Verdict)
+		}
+		fmt.Fprintf(r.out, "    [%s] %s %s\n", key, reviewVerdict, r.styles.Dim.Render("- "+review.Summary))
+
+		for _, issue := range review.Issues {
+			var severityStr string
+			switch issue.Severity {
+			case "critical":
+				severityStr = r.styles.SeverityCrit.Render("CRITICAL")
+			case "warning":
+				severityStr = r.styles.SeverityWarn.Render("WARNING")
+			default:
+				severityStr = r.styles.SeveritySugg.Render(strings.ToUpper(issue.Severity))
+			}
+			loc := ""
+			if issue.File != "" {
+				loc = issue.File
+				if issue.Line > 0 {
+					loc += fmt.Sprintf(":%d", issue.Line)
+				}
+			}
+			msg := issue.Message
+			if loc != "" {
+				msg = loc + ": " + msg
+			}
+			fmt.Fprintf(r.out, "      %s %s\n", severityStr, msg)
+			if issue.Suggestion != "" {
+				fmt.Fprintf(r.out, "        %s %s\n", r.styles.Dim.Render("->"), issue.Suggestion)
+			}
+		}
+	}
+}

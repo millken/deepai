@@ -34,7 +34,7 @@ func TestPoolStartTaskCompletes(t *testing.T) {
 		events = append(events, evt)
 	})
 
-	task, err := pool.StartTask(ctx, "test task", "do work", SubagentConfig{Type: SubagentGeneralPurpose})
+	task, err := pool.StartTask(ctx, "test task", "do work", SubagentConfig{AgentType: "general-purpose"})
 	if err != nil {
 		t.Fatalf("StartTask() error = %v", err)
 	}
@@ -77,7 +77,7 @@ func TestPoolStartTaskTimesOut(t *testing.T) {
 		},
 	}, PoolConfig{Timeout: 20 * time.Millisecond})
 
-	task, err := pool.StartTask(context.Background(), "timeout task", "sleep", SubagentConfig{Type: SubagentBash})
+	task, err := pool.StartTask(context.Background(), "timeout task", "sleep", SubagentConfig{AgentType: "bash"})
 	if err != nil {
 		t.Fatalf("StartTask() error = %v", err)
 	}

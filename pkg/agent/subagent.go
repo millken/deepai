@@ -22,6 +22,7 @@ type SubagentExecutor struct {
 	sandbox       *sandbox.Sandbox
 	model         string
 	contextWindow int
+	workDir       string
 }
 
 func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, model ...string) *SubagentExecutor {
@@ -40,6 +41,14 @@ func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb 
 	}
 }
 
+// WithWorkDir sets the working directory for YAML agent config loading.
+func (e *SubagentExecutor) WithWorkDir(dir string) *SubagentExecutor {
+	if e != nil {
+		e.workDir = dir
+	}
+	return e
+}
+
 // WithContextWindow sets the context window for subagents.
 func (e *SubagentExecutor) WithContextWindow(n int) *SubagentExecutor {
 	if e != nil {
@@ -53,19 +62,51 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		return subagent.ExecutionResult{}, fmt.Errorf("subagent llm provider is required")
 	}
 
+	// Resolve agent type config: YAML > builtin > fallback general
+	agentType := AgentType(task.Config.EffectiveAgentType())
+	if agentType == "" {
+		agentType = AgentTypeGeneral
+	}
+	profileCfg := resolveAgentTypeConfig(agentType, e.workDir)
+
+	// Determine tools: explicit Tools > AgentType DefaultTools > all
+	var toolSelectors []string
+	if len(task.Config.Tools) > 0 {
+		toolSelectors = task.Config.Tools
+	} else if len(profileCfg.DefaultTools) > 0 {
+		toolSelectors = profileCfg.DefaultTools
+	}
+
 	registry := tools.NewRegistry()
-	for _, tool := range selectSubagentTools(e.tools.List(), task.Config.Tools) {
+	for _, tool := range selectSubagentTools(e.tools.List(), toolSelectors) {
 		_ = registry.Register(tool)
+	}
+
+	// Determine system prompt: explicit > AgentType default
+	systemPrompt := task.Config.SystemPrompt
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = profileCfg.SystemPrompt
+	}
+
+	maxTurns := task.Config.MaxTurns
+	if maxTurns <= 0 && profileCfg.MaxTurns > 0 {
+		maxTurns = profileCfg.MaxTurns
+	}
+
+	// Inject OutputSchema prompt into system prompt when available
+	if profileCfg.OutputSchema != nil && profileCfg.OutputSchema.Prompt != "" {
+		systemPrompt += "\n\nOutput your response as JSON matching this schema:\n" + profileCfg.OutputSchema.Prompt
 	}
 
 	runAgent := New(AgentConfig{
 		LLMProvider:    e.llm,
 		Tools:          registry,
-		MaxTurns:       task.Config.MaxTurns,
+		MaxTurns:       maxTurns,
 		Model:          e.model,
 		Sandbox:        e.sandbox,
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,
+		SystemPrompt:   systemPrompt,
 	})
 
 	eventsDone := make(chan struct{})
@@ -86,13 +127,6 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}()
 
 	result, err := runAgent.Run(ctx, task.ID, []models.Message{
-		{
-			ID:        newSubagentMessageID("system"),
-			SessionID: task.ID,
-			Role:      models.RoleSystem,
-			Content:   subagentSystemPrompt(task),
-			CreatedAt: time.Now().UTC(),
-		},
 		{
 			ID:        newSubagentMessageID("human"),
 			SessionID: task.ID,
@@ -174,13 +208,6 @@ func subagentMessageFromAgentEvent(evt AgentEvent) string {
 		return strings.TrimSpace(evt.Err)
 	}
 	return ""
-}
-
-func subagentSystemPrompt(task *subagent.Task) string {
-	if task != nil && strings.TrimSpace(task.Config.SystemPrompt) != "" {
-		return strings.TrimSpace(task.Config.SystemPrompt)
-	}
-	return "You are a focused subagent. Complete the assigned task and return the result."
 }
 
 func newSubagentMessageID(prefix string) string {

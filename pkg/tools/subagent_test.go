@@ -24,8 +24,8 @@ func (f fakeTaskPool) Wait(ctx context.Context, taskID string) (*subagent.Task, 
 func TestTaskToolCompleted(t *testing.T) {
 	tool := TaskTool(fakeTaskPool{
 		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
-			if cfg.Type != subagent.SubagentBash {
-				t.Fatalf("cfg.Type = %s, want %s", cfg.Type, subagent.SubagentBash)
+			if cfg.AgentType != "bash" {
+				t.Fatalf("cfg.AgentType = %s, want bash", cfg.AgentType)
 			}
 			if cfg.MaxTurns != 3 {
 				t.Fatalf("cfg.MaxTurns = %d, want 3", cfg.MaxTurns)

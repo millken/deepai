@@ -496,6 +496,8 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	case "run", "code":
 		r.planMode = false
 		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
+	case "pipeline":
+		r.handlePipeline(cmd.Args)
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
@@ -560,6 +562,7 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
 	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
 	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
+	fmt.Fprintln(os.Stderr, "    /pipeline  Manage pipelines (list, run)")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }
@@ -639,5 +642,82 @@ func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassificati
 			)
 		}
 		r.consecCorrections = 0
+	}
+}
+
+func (r *ChatRepl) handlePipeline(args string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		fmt.Fprintln(os.Stderr, "  Usage: /pipeline <list|run> [name] [prompt]")
+		fmt.Fprintln(os.Stderr, "    /pipeline list              List available pipelines")
+		fmt.Fprintln(os.Stderr, "    /pipeline run <name> <prompt>  Run a pipeline")
+		return
+	}
+
+	switch parts[0] {
+	case "list":
+		names := agent.ListPipelines(r.cfg.WorkDir)
+		if len(names) == 0 {
+			fmt.Fprintln(os.Stderr, "  No pipelines available.")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "  Available pipelines:")
+		for _, name := range names {
+			p, err := agent.ResolvePipeline(name, r.cfg.WorkDir)
+			if err != nil {
+				continue
+			}
+			reviewerCount := len(p.Reviewers)
+			desc := fmt.Sprintf("actor=%s, reviewers=%d, on_issues=%s", p.Actor.AgentType, reviewerCount, p.OnIssues)
+			fmt.Fprintf(os.Stderr, "    %-20s %s\n", name, desc)
+		}
+	case "run":
+		if len(parts) < 3 {
+			fmt.Fprintln(os.Stderr, "  Usage: /pipeline run <name> <prompt>")
+			return
+		}
+		name := parts[1]
+		prompt := strings.Join(parts[2:], " ")
+
+		p, err := agent.ResolvePipeline(name, r.cfg.WorkDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "  Running pipeline %q...\n", name)
+
+		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
+			WithWorkDir(r.cfg.WorkDir)
+		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
+		orch := agent.NewOrchestrator(executor, pool, r.cfg.WorkDir)
+
+		result, err := orch.Run(ctx, p, agent.OrchestratorInput{
+			UserInput: prompt,
+			WorkDir:   r.cfg.WorkDir,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Pipeline error: %v\n", err)
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "\n  Pipeline result: %s (rounds=%d)\n", result.Verdict, result.Rounds)
+		if len(result.Reviews) > 0 {
+			fmt.Fprintln(os.Stderr, "  Reviews:")
+			for key, review := range result.Reviews {
+				fmt.Fprintf(os.Stderr, "    [%s] %s: %s\n", key, review.Verdict, review.Summary)
+			}
+		}
+		if result.ActorOutput != "" {
+			preview := result.ActorOutput
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			fmt.Fprintf(os.Stderr, "\n  Output:\n%s\n", preview)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "  Unknown pipeline subcommand: %s\n", parts[0])
+		fmt.Fprintln(os.Stderr, "  Use: list or run")
 	}
 }
