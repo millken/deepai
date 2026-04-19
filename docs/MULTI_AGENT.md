@@ -257,20 +257,21 @@ type Issue struct {
 **2.1 Workflow 定义与执行**
 
 ```go
-// pkg/workflow/workflow.go
+// pkg/workflow/engine.go
 type Engine struct {
-    provider  llm.LLMProvider
-    tools     *tools.Registry
-    sandbox   *sandbox.Sandbox
+    executor subagent.Executor  // 接口，通过 SubagentExecutor 创建独立 Agent
+    pool     *subagent.Pool     // 并行 stage 执行
+    workDir  string
 }
 
-func (e *Engine) Run(ctx context.Context, wf Workflow, userInput string) error
+func NewEngine(executor subagent.Executor, pool *subagent.Pool, workDir string) *Engine
+func (e *Engine) Run(ctx context.Context, wf *Workflow, userInput string) (*WorkflowResult, error)
 ```
 
-Engine 按顺序执行 stage，每个 stage 创建一个独立 Agent 实例：
+Engine 按 DAG 拓扑排序执行 stage，同 wave 内并行：
 - 将前序 stage 的输出作为上下文注入
-- 解析当前 stage 的结构化输出
-- 根据 condition 决定是否跳过或重试
+- 根据 condition 决定是否跳过
+- 失败时按 MaxRetries 重试
 
 **2.2 与 REPL 集成**
 

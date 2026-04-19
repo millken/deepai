@@ -17,6 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/tools"
+	"github.com/millken/deepai/pkg/workflow"
 )
 
 // ReplConfig holds configuration for the chat REPL.
@@ -498,6 +499,8 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
 	case "pipeline":
 		r.handlePipeline(cmd.Args)
+	case "workflow":
+		r.handleWorkflow(cmd.Args)
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
@@ -563,6 +566,7 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
 	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
 	fmt.Fprintln(os.Stderr, "    /pipeline  Manage pipelines (list, run)")
+	fmt.Fprintln(os.Stderr, "    /workflow  Manage workflows (list, run)")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }
@@ -718,6 +722,69 @@ func (r *ChatRepl) handlePipeline(args string) {
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown pipeline subcommand: %s\n", parts[0])
+		fmt.Fprintln(os.Stderr, "  Use: list or run")
+	}
+}
+
+func (r *ChatRepl) handleWorkflow(args string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		fmt.Fprintln(os.Stderr, "  Usage: /workflow <list|run> [name] [prompt]")
+		fmt.Fprintln(os.Stderr, "    /workflow list              List available workflows")
+		fmt.Fprintln(os.Stderr, "    /workflow run <name> <prompt>  Run a workflow")
+		return
+	}
+
+	switch parts[0] {
+	case "list":
+		names := workflow.ListWorkflows(r.cfg.WorkDir)
+		if len(names) == 0 {
+			fmt.Fprintln(os.Stderr, "  No workflows available.")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "  Available workflows:")
+		for _, name := range names {
+			wf, err := workflow.ResolveWorkflow(name, r.cfg.WorkDir)
+			if err != nil {
+				continue
+			}
+			desc := fmt.Sprintf("stages=%d", len(wf.Stages))
+			if wf.Description != "" {
+				desc = wf.Description
+			}
+			fmt.Fprintf(os.Stderr, "    %-20s %s\n", name, DefaultStyles().Dim.Render(desc))
+		}
+	case "run":
+		if len(parts) < 3 {
+			fmt.Fprintln(os.Stderr, "  Usage: /workflow run <name> <prompt>")
+			return
+		}
+		name := parts[1]
+		prompt := strings.Join(parts[2:], " ")
+
+		wf, err := workflow.ResolveWorkflow(name, r.cfg.WorkDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "  Running workflow %q (%d stages)...\n", name, len(wf.Stages))
+
+		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
+			WithWorkDir(r.cfg.WorkDir)
+		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
+		engine := workflow.NewEngine(executor, pool, r.cfg.WorkDir)
+
+		result, err := engine.Run(ctx, wf, prompt)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Workflow error: %v\n", err)
+			return
+		}
+
+		r.renderer.RenderWorkflowResult(result)
+	default:
+		fmt.Fprintf(os.Stderr, "  Unknown workflow subcommand: %s\n", parts[0])
 		fmt.Fprintln(os.Stderr, "  Use: list or run")
 	}
 }

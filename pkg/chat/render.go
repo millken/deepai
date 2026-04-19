@@ -3,12 +3,14 @@ package chat
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/workflow"
 )
 
 // Renderer handles terminal output for agent events.
@@ -234,5 +236,54 @@ func (r *Renderer) RenderPipelineResult(result *agent.OrchestratorResult) {
 				fmt.Fprintf(r.out, "        %s %s\n", r.styles.Dim.Render("->"), issue.Suggestion)
 			}
 		}
+	}
+}
+
+// RenderWorkflowResult renders a workflow execution result.
+func (r *Renderer) RenderWorkflowResult(result *workflow.WorkflowResult) {
+	if result == nil {
+		return
+	}
+
+	statusStyle := r.styles.ReviewPass
+	statusText := strings.ToUpper(result.Status)
+	if result.Status != "completed" {
+		statusStyle = r.styles.ReviewFail
+	}
+
+	fmt.Fprintf(r.out, "  Workflow: %s  Status: %s\n", result.Name, statusStyle.Render(statusText))
+
+	if len(result.Stages) == 0 {
+		return
+	}
+
+	names := result.StageOrder
+	if len(names) == 0 {
+		names = make([]string, 0, len(result.Stages))
+		for name := range result.Stages {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+	}
+
+	fmt.Fprintln(r.out, "  Stages:")
+	for _, name := range names {
+		sr := result.Stages[name]
+		switch sr.Status {
+		case "completed":
+			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.ReviewPass.Render("done"))
+		case "skipped":
+			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.Dim.Render("skipped"))
+		default:
+			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.ReviewFail.Render(sr.Status))
+		}
+	}
+
+	if result.FinalOutput != "" {
+		preview := result.FinalOutput
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		fmt.Fprintf(r.out, "\n  Output:\n%s\n", preview)
 	}
 }

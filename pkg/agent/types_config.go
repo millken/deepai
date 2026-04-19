@@ -16,6 +16,7 @@ const (
 	AgentTypeArchReviewer     AgentType = "arch-reviewer"
 	AgentTypePerfReviewer     AgentType = "perf-reviewer"
 	AgentTypeProductManager   AgentType = "product-manager"
+	AgentTypeArchitect        AgentType = "architect"
 	AgentTypeBash             AgentType = "bash"
 )
 
@@ -47,6 +48,8 @@ const (
 	perfReviewerSystemPrompt = "You are an independent performance reviewer. You must make objective judgments based on the code you see.\n\nFocus on: algorithm complexity, memory allocations, I/O patterns, concurrency bottlenecks, and resource leaks.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. If the code looks fine, output verdict \"pass\" — do not invent issues.\n3. Output your findings as structured JSON matching the ReviewResult schema."
 	// productManagerSystemPrompt focuses on user needs and feature planning.
 	productManagerSystemPrompt = "You are a product manager. Focus on user needs, feature decomposition, priority assessment, and acceptance criteria. Ask for clarification with ask_clarification when requirements are ambiguous."
+	// architectSystemPrompt focuses on system design, module decomposition, and interface definition.
+	architectSystemPrompt = "You are a software architect. Focus on system design, module decomposition, interface definition, data flow, and technology selection. Produce clear technical design documents with concrete decisions and rationale. Ask for clarification with ask_clarification when requirements are ambiguous."
 	// bashSystemPrompt is a minimal prompt for command execution.
 	bashSystemPrompt = "You are a bash command executor. Run the requested commands and report results."
 )
@@ -123,6 +126,15 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "ask_clarification"},
 		MaxTurns:     0,
 		Temperature:  0.15,
+	},
+	AgentTypeArchitect: {
+		Type:         AgentTypeArchitect,
+		Name:         "Architect",
+		Description:  "Produces technical design documents, system decomposition, and interface definitions.",
+		SystemPrompt: architectSystemPrompt,
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find"},
+		MaxTurns:     0,
+		Temperature:  0.2,
 	},
 	AgentTypeBash: {
 		Type:         AgentTypeBash,
