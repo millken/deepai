@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/millken/deepai/pkg/models"
 	pkgsandbox "github.com/millken/deepai/pkg/sandbox"
 )
@@ -363,91 +364,29 @@ func validateArgs(schema map[string]any, args map[string]any) error {
 		args = map[string]any{}
 	}
 
-	required, _ := schema["required"].([]any)
-	if len(required) == 0 {
-		if typed, ok := schema["required"].([]string); ok {
-			required = make([]any, 0, len(typed))
-			for _, item := range typed {
-				required = append(required, item)
-			}
-		}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return fmt.Errorf("invalid schema: %w", err)
 	}
-	for _, raw := range required {
-		name, _ := raw.(string)
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		value, ok := args[name]
-		if !ok || value == nil {
-			return fmt.Errorf("missing required argument %q", name)
-		}
+	var s jsonschema.Schema
+	if err := s.UnmarshalJSON(data); err != nil {
+		return fmt.Errorf("invalid schema: %w", err)
+	}
+	resolved, err := s.Resolve(nil)
+	if err != nil {
+		return fmt.Errorf("invalid schema: %w", err)
 	}
 
-	properties, _ := schema["properties"].(map[string]any)
-	for name, rawSpec := range properties {
-		value, ok := args[name]
-		if !ok || value == nil {
-			continue
-		}
-		spec, _ := rawSpec.(map[string]any)
-		if err := validateType(name, spec["type"], value); err != nil {
-			return err
-		}
+	// Normalize args to JSON types (e.g. Go int → float64) so that
+	// the jsonschema validator sees the same types as json.Unmarshal produces.
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("invalid args: %w", err)
 	}
-	return nil
-}
+	var normalized any
+	if err := json.Unmarshal(argsJSON, &normalized); err != nil {
+		return fmt.Errorf("invalid args: %w", err)
+	}
 
-func validateType(name string, expected any, value any) error {
-	kind, _ := expected.(string)
-	switch kind {
-	case "", "any":
-		return nil
-	case "string":
-		if _, ok := value.(string); !ok {
-			return fmt.Errorf("argument %q must be a string", name)
-		}
-	case "boolean":
-		if _, ok := value.(bool); !ok {
-			return fmt.Errorf("argument %q must be a boolean", name)
-		}
-	case "integer":
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-			return nil
-		case float32:
-			if float32(int64(value.(float32))) == value.(float32) {
-				return nil
-			}
-		case float64:
-			if float64(int64(value.(float64))) == value.(float64) {
-				return nil
-			}
-		}
-		return fmt.Errorf("argument %q must be an integer", name)
-	case "number":
-		switch value.(type) {
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-			return nil
-		default:
-			return fmt.Errorf("argument %q must be a number", name)
-		}
-	case "array":
-		switch value.(type) {
-		case []any, []string:
-			return nil
-		default:
-			return fmt.Errorf("argument %q must be an array", name)
-		}
-	case "object":
-		switch value.(type) {
-		case map[string]any:
-			return nil
-		default:
-			return fmt.Errorf("argument %q must be an object", name)
-		}
-	default:
-		return nil
-	}
-	return nil
+	return resolved.Validate(normalized)
 }
