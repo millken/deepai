@@ -306,7 +306,7 @@ func (s *Service) SchedulePreferenceUpdate(sessionID string, messages []models.M
 		s.queue.submit(updateJob{
 			typ:       jobPreferenceUpdate,
 			sessionID: sessionID,
-			messages:  cloneMessages(messages),
+			messages:  prepareAsyncMessages(messages),
 			ext:       ext,
 		})
 		slog.Debug("preference extraction scheduled",

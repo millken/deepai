@@ -13,6 +13,8 @@ import (
 
 const (
 	defaultQueueSize = 128
+	// Keep async extraction payload bounded to avoid long first-byte latency.
+	maxAsyncUpdateMessages = 24
 )
 
 // jobType classifies the kind of async memory update.
@@ -314,7 +316,7 @@ func (s *Service) ScheduleUpdateWith(sessionID string, messages []models.Message
 		s.queue.submit(updateJob{
 			typ:       jobUpdateWith,
 			sessionID: sessionID,
-			messages:  cloneMessages(messages),
+			messages:  prepareAsyncMessages(messages),
 			ext:       ext,
 		})
 	}
@@ -329,7 +331,7 @@ func (s *Service) ScheduleUpdate(sessionID string, messages []models.Message) {
 		s.queue.submit(updateJob{
 			typ:       jobUpdate,
 			sessionID: sessionID,
-			messages:  cloneMessages(messages),
+			messages:  prepareAsyncMessages(messages),
 		})
 	}
 }
@@ -343,7 +345,7 @@ func (s *Service) ScheduleUpdateWithFactSource(sessionID string, messages []mode
 		s.queue.submit(updateJob{
 			typ:        jobUpdateWithFactSource,
 			sessionID:  sessionID,
-			messages:   cloneMessages(messages),
+			messages:   prepareAsyncMessages(messages),
 			ext:        ext,
 			factSource: factSource,
 		})
@@ -402,10 +404,20 @@ func (s *Service) ScheduleScopeUpdateWithSkill(scope Scope, messages []models.Me
 		s.queue.submit(updateJob{
 			typ:       jobUpdateScopeWithSkill,
 			sessionID: scope.Key(),
-			messages:  cloneMessages(messages),
+			messages:  prepareAsyncMessages(messages),
 			ext:       ext,
 			skillName: skillName,
 			scope:     scope,
 		})
 	}
+}
+
+func prepareAsyncMessages(messages []models.Message) []models.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	if len(messages) > maxAsyncUpdateMessages {
+		messages = messages[len(messages)-maxAsyncUpdateMessages:]
+	}
+	return cloneMessages(messages)
 }
