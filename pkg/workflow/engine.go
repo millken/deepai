@@ -355,6 +355,12 @@ func stageMsgType(role agent.AgentType) string {
 		return MsgTypePRD
 	case agent.AgentTypeArchitect:
 		return MsgTypeDesign
+	case agent.AgentTypeFrontend:
+		return MsgTypeCodeChange
+	case agent.AgentTypeUIDesigner:
+		return MsgTypeDesign
+	case agent.AgentTypeNews:
+		return "news"
 	default:
 		return "result"
 	}

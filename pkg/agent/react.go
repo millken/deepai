@@ -19,7 +19,7 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
+const defaultMaxTurns = 30 // safety cap to prevent infinite tool-call loops
 const defaultRequestTimeout = 10 * time.Minute
 const maxToolResultInHistory = 8192 // truncate tool results in history to 8KB
 

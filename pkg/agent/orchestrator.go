@@ -12,11 +12,20 @@ import (
 	"github.com/millken/deepai/pkg/subagent"
 )
 
+// OrchestratorEvent represents a progress event during pipeline execution.
+type OrchestratorEvent struct {
+	Type    string // "actor_started", "actor_completed", "reviewer_started", "reviewer_completed", "reviewer_failed"
+	Round   int
+	Name    string // agent type or reviewer key
+	Message string
+}
+
 // Orchestrator executes a Pipeline: actor → reviewers → [actor(retry) → reviewers]*
 type Orchestrator struct {
 	executor subagent.Executor
 	pool     *subagent.Pool
 	workDir  string
+	onEvent  func(OrchestratorEvent)
 }
 
 // NewOrchestrator creates a new orchestrator.
@@ -25,6 +34,20 @@ func NewOrchestrator(executor subagent.Executor, pool *subagent.Pool, workDir st
 		executor: executor,
 		pool:     pool,
 		workDir:  workDir,
+	}
+}
+
+// WithEventSink sets a callback for progress events.
+func (o *Orchestrator) WithEventSink(fn func(OrchestratorEvent)) *Orchestrator {
+	if o != nil {
+		o.onEvent = fn
+	}
+	return o
+}
+
+func (o *Orchestrator) emit(evt OrchestratorEvent) {
+	if o.onEvent != nil {
+		o.onEvent(evt)
 	}
 }
 
@@ -70,6 +93,7 @@ func (o *Orchestrator) Run(ctx context.Context, pipeline *Pipeline, input Orches
 		actorPrompt := o.buildActorPrompt(pipeline.Actor, input.UserInput, previousDiff, lastReviews)
 
 		// 2. Execute actor via executor (creates new Agent per Execute, satisfies single-use)
+		o.emit(OrchestratorEvent{Type: "actor_started", Round: round, Name: string(pipeline.Actor.AgentType)})
 		actorTask := &subagent.Task{
 			ID:     fmt.Sprintf("pipeline-actor-round-%d", round),
 			Prompt: actorPrompt,
@@ -82,6 +106,7 @@ func (o *Orchestrator) Run(ctx context.Context, pipeline *Pipeline, input Orches
 			return nil, fmt.Errorf("actor run round %d: %w", round, err)
 		}
 		actorOutput = actorResult.Result
+		o.emit(OrchestratorEvent{Type: "actor_completed", Round: round, Name: string(pipeline.Actor.AgentType)})
 
 		// 3. No reviewers → return
 		if len(pipeline.Reviewers) == 0 {
@@ -179,6 +204,7 @@ func (o *Orchestrator) runReviewers(ctx context.Context, reviewers []ReviewerRef
 	for i, r := range reviewers {
 		i, r := i, r
 		g.Go(func() error {
+			o.emit(OrchestratorEvent{Type: "reviewer_started", Name: r.ReviewerKey()})
 			prompt := expandTemplate(r.Prompt, map[string]string{
 				"diff":   input.Diff,
 				"output": input.Output,
@@ -195,12 +221,23 @@ func (o *Orchestrator) runReviewers(ctx context.Context, reviewers []ReviewerRef
 			if err != nil {
 				return fmt.Errorf("reviewer %s wait: %w", r.ReviewerKey(), err)
 			}
+			if completed.Status == subagent.TaskStatusFailed || completed.Status == subagent.TaskStatusTimedOut {
+				o.emit(OrchestratorEvent{Type: "reviewer_failed", Name: r.ReviewerKey(), Message: completed.Error})
+				return fmt.Errorf("reviewer %s: %s", r.ReviewerKey(), completed.Error)
+			}
+			o.emit(OrchestratorEvent{Type: "reviewer_completed", Name: r.ReviewerKey()})
+
+			// Extract JSON from agent output (handles markdown fences, preamble)
+			jsonStr := extractJSON(completed.Result)
+			if jsonStr == "" {
+				return fmt.Errorf("reviewer %s: no JSON object found in output", r.ReviewerKey())
+			}
 
 			// Validate output schema if available
 			reviewSchema := resolveOutputSchema(r.AgentType, o.workDir)
 			if reviewSchema != nil && reviewSchema.Resolved != nil {
 				var raw any
-				if err := json.Unmarshal([]byte(completed.Result), &raw); err != nil {
+				if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
 					return fmt.Errorf("reviewer %s: invalid JSON: %w", r.ReviewerKey(), err)
 				}
 				if err := reviewSchema.Resolved.Validate(raw); err != nil {
@@ -208,7 +245,7 @@ func (o *Orchestrator) runReviewers(ctx context.Context, reviewers []ReviewerRef
 				}
 			}
 
-			if err := json.Unmarshal([]byte(completed.Result), &results[i]); err != nil {
+			if err := json.Unmarshal([]byte(jsonStr), &results[i]); err != nil {
 				return fmt.Errorf("reviewer %s: unmarshal: %w", r.ReviewerKey(), err)
 			}
 			return nil

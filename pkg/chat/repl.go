@@ -653,6 +653,18 @@ func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassificati
 func (r *ChatRepl) handlePipeline(args string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	// Listen for Ctrl+C to cancel the pipeline
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
 		fmt.Fprintln(os.Stderr, "  Usage: /pipeline <list|run> [name] [prompt]")
@@ -696,7 +708,29 @@ func (r *ChatRepl) handlePipeline(args string) {
 		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
 			WithWorkDir(r.cfg.WorkDir)
 		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
-		orch := agent.NewOrchestrator(executor, pool, r.cfg.WorkDir)
+		orch := agent.NewOrchestrator(executor, pool, r.cfg.WorkDir).
+			WithEventSink(func(evt agent.OrchestratorEvent) {
+				switch evt.Type {
+				case "actor_started":
+					round := ""
+					if evt.Round > 0 {
+						round = fmt.Sprintf(" (retry round %d)", evt.Round+1)
+					}
+					fmt.Fprintf(os.Stderr, "  [%s] running%s...\n", evt.Name, round)
+				case "actor_completed":
+					fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Name)
+				case "reviewer_started":
+					fmt.Fprintf(os.Stderr, "  [%s] running...\n", evt.Name)
+				case "reviewer_completed":
+					fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Name)
+				case "reviewer_failed":
+					msg := evt.Message
+					if len(msg) > 80 {
+						msg = msg[:80] + "..."
+					}
+					fmt.Fprintf(os.Stderr, "  [%s] failed: %s\n", evt.Name, msg)
+				}
+			})
 
 		result, err := orch.Run(ctx, p, agent.OrchestratorInput{
 			UserInput: prompt,
@@ -730,6 +764,17 @@ func (r *ChatRepl) handlePipeline(args string) {
 func (r *ChatRepl) handleWorkflow(args string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	// Listen for Ctrl+C to cancel the workflow
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
 		fmt.Fprintln(os.Stderr, "  Usage: /workflow <list|run> [name] [prompt]")
