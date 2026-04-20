@@ -18,12 +18,12 @@ import (
 // --- Mock Infrastructure ---
 
 type mockExecutor struct {
-	mu      sync.Mutex
-	calls   []string
-	results map[string]string // prompt substring -> result
-	err     error
-	errN    int32 // fail first N calls, then succeed
-	delay   time.Duration
+	mu        sync.Mutex
+	calls     []string
+	results   map[string]string // prompt substring -> result
+	err       error
+	errN      int32 // fail first N calls, then succeed
+	delay     time.Duration
 	callCount int32
 }
 
@@ -384,9 +384,9 @@ func TestConditionEvaluation(t *testing.T) {
 
 func TestExpandWorkflowTemplate(t *testing.T) {
 	vars := map[string]string{
-		"UserInput":       "hello",
-		"outputs.step1":   "result1",
-		"outputs.step2":   "result2",
+		"UserInput":     "hello",
+		"outputs.step1": "result1",
+		"outputs.step2": "result2",
 	}
 	got := expandTemplate("{{.UserInput}} {{.outputs.step1}} {{.outputs.step2}}", vars)
 	want := "hello result1 result2"

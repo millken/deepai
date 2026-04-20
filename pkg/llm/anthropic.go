@@ -131,30 +131,30 @@ func (p *AnthropicProvider) consumeStream(
 
 	for stream.Next() {
 		event := stream.Current()
-		switch variant := event.AsAny().(type) {
-		case anthropic.ContentBlockStartEvent:
-			if cb, ok := variant.ContentBlock.AsAny().(*anthropic.ToolUseBlock); ok {
-				toolCallBuilders[variant.Index] = &toolCallBuilder{
-					id:   cb.ID,
-					name: cb.Name,
+		switch event.Type {
+		case "content_block_start":
+			if event.ContentBlock.Type == "tool_use" {
+				toolCallBuilders[event.Index] = &toolCallBuilder{
+					id:   event.ContentBlock.ID,
+					name: event.ContentBlock.Name,
 				}
 			}
-		case anthropic.ContentBlockDeltaEvent:
-			switch delta := variant.Delta.AsAny().(type) {
-			case *anthropic.TextDelta:
-				if delta.Text != "" {
+		case "content_block_delta":
+			switch event.Delta.Type {
+			case "text_delta":
+				if event.Delta.Text != "" {
 					emitted = true
-					ch <- StreamChunk{Model: model, Delta: delta.Text}
-					contentBuf.WriteString(delta.Text)
+					ch <- StreamChunk{Model: model, Delta: event.Delta.Text}
+					contentBuf.WriteString(event.Delta.Text)
 				}
-			case *anthropic.InputJSONDelta:
-				if b, ok := toolCallBuilders[variant.Index]; ok {
-					b.args += delta.PartialJSON
+			case "input_json_delta":
+				if b, ok := toolCallBuilders[event.Index]; ok {
+					b.args += event.Delta.PartialJSON
 					emitted = true
 				}
 			}
-		case anthropic.ContentBlockStopEvent:
-			if b, ok := toolCallBuilders[variant.Index]; ok {
+		case "content_block_stop":
+			if b, ok := toolCallBuilders[event.Index]; ok {
 				tc := models.ToolCall{ID: b.id, Name: b.name}
 				if strings.TrimSpace(b.args) != "" {
 					var args map[string]any
@@ -164,21 +164,21 @@ func (p *AnthropicProvider) consumeStream(
 				}
 				toolCalls = append(toolCalls, tc)
 				ch <- StreamChunk{Model: model, ToolCalls: []models.ToolCall{tc}}
-				delete(toolCallBuilders, variant.Index)
+				delete(toolCallBuilders, event.Index)
 			}
-		case anthropic.MessageStartEvent:
-			if variant.Message.Usage.InputTokens > 0 {
+		case "message_start":
+			if event.Message.Usage.InputTokens > 0 {
 				lastUsage = &Usage{
-					InputTokens: int(variant.Message.Usage.InputTokens),
+					InputTokens: int(event.Message.Usage.InputTokens),
 				}
 			}
-		case anthropic.MessageDeltaEvent:
-			stopReason = string(variant.Delta.StopReason)
-			if variant.Usage.OutputTokens > 0 {
+		case "message_delta":
+			stopReason = string(event.Delta.StopReason)
+			if event.Usage.OutputTokens > 0 {
 				if lastUsage == nil {
 					lastUsage = &Usage{}
 				}
-				lastUsage.OutputTokens = int(variant.Usage.OutputTokens)
+				lastUsage.OutputTokens = int(event.Usage.OutputTokens)
 			}
 		}
 	}
@@ -197,18 +197,16 @@ func (p *AnthropicProvider) consumeStream(
 
 func (p *AnthropicProvider) mapResponse(msg *anthropic.Message, model string) ChatResponse {
 	var content string
-	for _, block := range msg.Content {
-		if tb, ok := block.AsAny().(*anthropic.TextBlock); ok {
-			content += tb.Text
-		}
-	}
 	var toolCalls []models.ToolCall
 	for _, block := range msg.Content {
-		if tu, ok := block.AsAny().(*anthropic.ToolUseBlock); ok {
-			tc := models.ToolCall{ID: tu.ID, Name: tu.Name}
-			if len(tu.Input) > 0 {
+		switch block.Type {
+		case "text":
+			content += block.Text
+		case "tool_use":
+			tc := models.ToolCall{ID: block.ID, Name: block.Name}
+			if len(block.Input) > 0 {
 				var args map[string]any
-				if err := json.Unmarshal(tu.Input, &args); err == nil {
+				if err := json.Unmarshal(block.Input, &args); err == nil {
 					tc.Arguments = args
 				}
 			}

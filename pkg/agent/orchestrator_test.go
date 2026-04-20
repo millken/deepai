@@ -295,7 +295,7 @@ func TestOrchestratorParallelReviewers(t *testing.T) {
 	}, subagent.PoolConfig{MaxConcurrent: 3, Timeout: 5 * time.Second})
 
 	pipeline := &Pipeline{
-		Name: "test-parallel",
+		Name:  "test-parallel",
 		Actor: ActorRef{AgentType: AgentTypeCoder, Prompt: "{{.UserInput}}"},
 		Reviewers: []ReviewerRef{
 			{AgentType: AgentTypeSecurityReviewer, Prompt: "review:\n{{.diff}}"},
@@ -664,9 +664,9 @@ func TestRunWarningsOnlyNoRetry(t *testing.T) {
 
 // countingExecutor calls fn for each execute and returns the result.
 type countingExecutor struct {
-	mu      sync.Mutex
-	calls   int
-	fn      func(prompt string) string
+	mu    sync.Mutex
+	calls int
+	fn    func(prompt string) string
 }
 
 func (e *countingExecutor) Execute(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
