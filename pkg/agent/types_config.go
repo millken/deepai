@@ -36,7 +36,7 @@ type AgentTypeConfig struct {
 
 const (
 	// generalPurposeSystemPrompt is the default profile prompt for balanced assistant behavior.
-	generalPurposeSystemPrompt = "You are a helpful assistant. Work step by step, use tools when needed, ask for clarification with ask_clarification instead of guessing when requirements are ambiguous, and stop when you have a complete answer."
+	generalPurposeSystemPrompt = "You are a helpful assistant. Work step by step, use tools when needed, ask for clarification with ask_clarification instead of guessing when requirements are ambiguous, and stop when you have a complete answer.\n\nTool preference: use dedicated tools over bash for file operations — read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools."
 	// researcherSystemPrompt keeps the agent focused on gathering evidence and synthesizing findings.
 	researcherSystemPrompt = "You are a research assistant. Prioritize gathering evidence, reading available material carefully, summarizing findings precisely, and asking for clarification with ask_clarification when the research scope is unclear."
 	// coderSystemPrompt keeps the agent focused on code changes, debugging, and verification.

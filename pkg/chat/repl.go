@@ -249,7 +249,6 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		LLMProvider:     r.cfg.LLMProvider,
 		Tools:           r.cfg.ToolRegistry,
 		Sandbox:         r.sb,
-		AgentType:       agent.AgentTypeCoder,
 		Model:           r.cfg.Model,
 		ContextWindow:   r.cfg.ContextWindow,
 		MaxTurns:        r.cfg.MaxTurns,
