@@ -1,336 +1,374 @@
 # Multi-Agent 协同设计
 
-## 现状
+## 概述
 
-当前 deepai 采用**主从模式**：
+deepai 多 agent 系统通过三个层次实现 agent 协同：
 
-```
-用户 → REPL → Agent(ReAct loop) → LLM + Tools
-                              ↓
-                         Subagent(task) → 独立 Agent 实例 → 返回结果文本
-```
+1. **Pipeline**（`/pipeline`）— 简单的 actor + 并行 reviewers + 重试循环
+2. **Workflow**（`/workflow`）— 通用 DAG 工作流引擎，支持条件分支、重试、并行执行
+3. **Environment** — 发布/订阅消息总线，agent 间异步通信，消息历史追溯
 
-- Agent 是单次使用的（`started` 标志），一个 turn 创建一个
-- Subagent 通过 `task` 工具启动，主 agent 拿到的是**结果文本**，不是结构化上下文
-- Subagent 之间没有通信通道，只能通过主 agent 中转
-- 已有 agent type：`general-purpose`、`researcher`、`coder`、`analyst`
+## 快速开始
 
-## 目标场景
+### Pipeline 模式
 
-1. **多角色审查**：代码完成后，安全/架构/性能 agent 从不同视角审查，反馈给 coder 修改，多轮迭代直到通过
-2. **功能规划**：产品 agent 制定功能计划 → coder 实现 → 审查 → 迭代
-3. **持续改进**：agent 之间形成反馈闭环，不断优化产出质量
-
-## MetaGPT 架构研究
-
-### 核心概念
-
-MetaGPT 的多 agent 协同基于三个核心抽象：
-
-**1. Role（角色）**
-- 每个 Role 有独立的 `profile`（角色描述）、`goal`（目标）、`constraints`（约束）
-- Role 通过 `_watch` 订阅特定类型的消息（如 ProductManager watch `UserRequirement`，Architect watch `WritePRD`）
-- Role 内部维护 `memory`（记忆）和 `working_memory`（工作记忆），区分长期和短期上下文
-- 支持三种运行模式：`REACT`（自由推理）、`BY_ORDER`（按顺序执行 action）、`PLAN_AND_ACT`（先规划再执行）
-
-**2. Environment（环境）**
-- 所有 Role 注册到同一个 Environment
-- Role 通过 `publish_message` 发布消息到 Environment
-- Environment 根据消息的 `send_to` / `cause_by` 路由到目标 Role
-- 本质是一个**消息总线 + 路由器**
-
-**3. Action（动作）**
-- 每个 Action 是一个原子操作（如 `WritePRD`、`WriteDesign`、`WriteCode`、`WriteCodeReview`）
-- Action 的输出通过 `ActionOutput` 结构化，下游 Role 可以精确消费
-- Action 之间通过 `cause_by` 建立依赖关系（如 `WriteCodeReview` 的输入是 `WriteCode` 的输出）
-
-### 协同流程
+Pipeline 适用于「一个执行者 + 多个审查者」的简单场景：
 
 ```
-用户需求 → Environment.publish_message(Message)
-  → ProductManager._observe() → _think() → _act(WritePRD)
-    → Environment.publish_message(Message, cause_by=WritePRD)
-      → Architect._observe() → _think() → _act(WriteDesign)
-        → Environment.publish_message(Message, cause_by=WriteDesign)
-          → Engineer._observe() → _think() → _act(WriteCode)
-            → WriteCodeReview (内部迭代，最多 k 轮)
-              → LGTM → 完成
-              → LBTM → 重写代码 → 再次审查
+/pipeline list                        # 查看可用 pipeline
+/pipeline run code-with-review "实现一个 HTTP 限流中间件"   # 执行
 ```
 
-### 关键设计决策
+内置 Pipeline：
 
-| 决策 | MetaGPT 方案 | 启示 |
-|------|-------------|------|
-| Agent 间通信 | 通过 Environment 消息总线，非直接调用 | 解耦发送者和接收者 |
-| 流程编排 | 每个 Role 声明式订阅（`_watch`），非命令式编排 | 新增 Role 不需要修改其他 Role |
-| 上下文传递 | `Message` 携带结构化 `ActionOutput`，非纯文本 | 下游可精确消费 |
-| 审查迭代 | `WriteCodeReview` 内部循环（最多 k 次），非跨 Role 循环 | 审查逻辑封装在 Action 内 |
-| 成本控制 | `Team.invest()` 设置预算，超支抛异常 | 全局 token 预算管理 |
-| 记忆管理 | `memory`（长期）+ `working_memory`（短期） | 避免上下文膨胀 |
+| 名称 | 描述 | Actor | Reviewers | 策略 |
+|------|------|-------|-----------|------|
+| `code-with-review` | 实现 + 并行安全/架构审查 + 自动修复 | coder | security, arch, perf | retry (最多 3 轮) |
+| `code-quick` | 快速实现，无审查 | coder | 无 | report |
 
-### 与 deepai 的差异
+### Workflow 模式
 
-| 维度 | MetaGPT | deepai |
-|------|---------|--------|
-| 语言 | Python | Go |
-| Agent 生命周期 | 持久（多轮对话） | 单次使用（一个 turn 一个） |
-| 通信模型 | 异步消息总线 | 同步函数调用（task 工具） |
-| 流程定义 | 声明式（watch + cause_by） | 隐式（system prompt 指导） |
-| 输出格式 | 结构化（ActionOutput） | 纯文本 |
-| 并发 | asyncio 并行运行多个 Role | 串行 subagent |
+Workflow 适用于复杂的多阶段流程：
 
-## 方案设计
-
-借鉴 MetaGPT 的优点，同时适配 deepai 的 Go 同步架构和 ReAct 模式。
-
-### 核心抽象
-
-#### 1. Message（结构化消息）
-
-```go
-// AgentMessage 是 agent 间传递的结构化消息。
-// 替代当前的纯文本结果，支持精确消费。
-type AgentMessage struct {
-    From      string         `json:"from"`       // 发送者 agent type
-    To        string         `json:"to"`         // 接收者 agent type（空=广播）
-    Type      string         `json:"type"`       // 消息类型（如 "review_result", "code_change"）
-    Content   string         `json:"content"`    // 自然语言内容
-    Artifacts map[string]any `json:"artifacts"`  // 结构化产物（如 ReviewResult, PRD）
-}
+```
+/workflow list                         # 查看可用 workflow
+/workflow run code-with-review "实现一个 HTTP 限流中间件"
+/workflow run feature-planning "用户注册功能"
 ```
 
-#### 2. AgentRole（角色定义）
+内置 Workflow：
 
-```go
-// AgentRole 定义一个 agent 角色的行为规范。
-// 借鉴 MetaGPT 的 Role 概念，但适配 deepai 的 ReAct 模式。
-type AgentRole struct {
-    Type         AgentType      // 角色类型
-    Name         string         // 显示名称
-    Profile      string         // 角色描述（用于 system prompt）
-    Goal         string         // 目标
-    Constraints  string         // 约束
-    Watch        []string       // 订阅的消息类型（触发此角色）
-    Tools        []string       // 可用工具
-    MaxTurns     int            // 最大轮次
-    Temperature  float64        // 温度
-}
+| 名称 | 描述 | 阶段 |
+|------|------|------|
+| `code-with-review` | 实现 → 并行安全+架构审查 → 条件修复 | implement → security ∥ arch → fix |
+| `feature-planning` | PRD → 设计 → 实现 → 审查 → 条件修复 | prd → design → implement → review → fix |
+
+执行时实时显示每个阶段的状态：
+
+```
+  Running workflow "code-with-review" (4 stages)...
+  [implement] running...
+  [implement] done
+  [security] running...
+  [arch] running...
+  [security] done
+  [arch] done
+  [fix] skipped
+  Workflow: code-with-review  Status: COMPLETED
+  Stages:
+    [implement] done
+    [security] done
+    [arch] done
+    [fix] skipped
 ```
 
-#### 3. Workflow（工作流）
+## Agent 类型
 
-```go
-// Workflow 定义多 agent 协同的流程。
-// 借鉴 MetaGPT 的 Team + Environment 概念。
-type Workflow struct {
-    Name        string
-    Description string
-    Roles       []AgentRole     // 参与的角色
-    Stages      []WorkflowStage // 执行阶段
-}
-
-type WorkflowStage struct {
-    Name       string            // 阶段名称
-    Role       AgentType         // 执行角色
-    InputFrom  []string          // 输入来源（前序 stage 名称）
-    Prompt     string            // prompt 模板（可引用前序 stage 输出）
-    Condition  string            // 执行条件（可选）
-    MaxRetries int               // 最大重试次数
-}
-```
-
-### 预定义角色
-
-借鉴 MetaGPT 的角色体系，定义 deepai 的多角色：
-
-| Agent Type | 角色 | Profile | Watch | Tools |
+| Agent Type | 角色 | 工具 | 温度 | 用途 |
 |---|---|---|---|---|
-| `coder` | 编码 | 代码实现、调试、重构 | `user_request`, `review_feedback` | bash, file_ops, git |
-| `security-reviewer` | 安全审查 | 关注漏洞、注入、权限、敏感数据 | `code_change` | read_file, grep, glob |
-| `arch-reviewer` | 架构审查 | 关注设计模式、耦合度、可扩展性 | `code_change` | read_file, grep, glob |
-| `perf-reviewer` | 性能审查 | 关注算法复杂度、内存、并发 | `code_change` | read_file, grep, glob, bash |
-| `product-manager` | 产品 | 需求分析、功能拆解、优先级 | `user_request` | read_file, grep, ask_clarification |
-| `architect` | 架构设计 | 系统设计、模块划分、接口定义 | `prd`, `user_request` | read_file, grep, glob, list_dir |
+| `general-purpose` | 通用助手 | 全部 | 0.7 | 日常对话 |
+| `researcher` | 研究员 | 全部 | 0.3 | 信息收集与综合 |
+| `coder` | 编码 | bash, file_ops, git | 0.7 | 代码实现、调试 |
+| `analyst` | 分析师 | 全部 | 0.3 | 数据分析 |
+| `security-reviewer` | 安全审查 | read_file, grep, glob, list_dir, find | 0.2 | 漏洞、注入、权限 |
+| `arch-reviewer` | 架构审查 | read_file, grep, glob, list_dir, find | 0.2 | 设计模式、耦合度 |
+| `perf-reviewer` | 性能审查 | read_file, grep, glob, list_dir, find, bash | 0.2 | 算法复杂度、内存 |
+| `product-manager` | 产品经理 | read_file, grep, glob, list_dir, find, ask_clarification | 0.15 | 需求分析、功能拆解 |
+| `architect` | 架构师 | read_file, grep, glob, list_dir, find | 0.2 | 系统设计、接口定义 |
+| `bash` | 命令执行 | bash | 0.0 | 仅执行 shell 命令 |
+| `frontend` | 前端开发 | bash, file_ops, web_search, web_fetch, image_search | 0.15 | HTML/CSS/JS、React/Vue/Angular、响应式设计、无障碍 |
+| `ui-designer` | UI 设计 | file_ops, web_search, web_fetch, image_search | 0.2 | 设计系统、线框图、组件规范、色彩、排版 |
+| `news` | 新闻获取 | web_search, web_fetch, web_fetch_batch | 0.1 | 新闻搜索、来源验证、结构化报道 |
 
-### 预定义 Workflow
+审查类 agent（security/arch/perf-reviewer）自动配置 `OutputSchema`，要求输出结构化 JSON：
 
-#### code-with-review
-
+```json
+{
+  "verdict": "pass",
+  "summary": "代码安全性良好",
+  "issues": [
+    {
+      "severity": "critical",
+      "file": "handler.go",
+      "line": 42,
+      "message": "SQL 拼接注入风险",
+      "suggestion": "使用参数化查询"
+    }
+  ]
+}
 ```
-用户需求 → coder(实现) → security-reviewer(审查) → arch-reviewer(审查)
-         ↑                                              ↓
-         └──────────── 有问题则修改并重新审查 ←───────────┘
+
+## 自定义 Agent
+
+在项目根目录创建 `.deepai/agents/{type}.yaml`：
+
+```yaml
+# .deepai/agents/db-reviewer.yaml
+type: db-reviewer
+name: Database Reviewer
+description: 审查数据库查询性能和安全
+system_prompt: |
+  你是数据库审查专家。关注：SQL 注入、索引使用、N+1 查询、事务隔离级别。
+  输出 JSON 格式的 ReviewResult。
+tools:
+  - read_file
+  - grep
+  - glob
+temperature: 0.2
+max_turns: 10
 ```
+
+或者使用外部 prompt 文件：
+
+```yaml
+# .deepai/agents/api-reviewer.yaml
+type: api-reviewer
+name: API Reviewer
+system_prompt_file: prompts/api-reviewer.md
+tools:
+  - read_file
+  - grep
+```
+
+加载优先级：`.deepai/agents/{type}.yaml` > 内置配置 > `general-purpose` 兜底。
+
+## 自定义 Pipeline
+
+在 `.deepai/pipelines/{name}.yaml` 中定义：
+
+```yaml
+# .deepai/pipelines/db-review.yaml
+name: db-review
+actor:
+  agent_type: coder
+  prompt: "{{.UserInput}}"
+reviewers:
+  - agent_type: db-reviewer
+    name: db-security
+    prompt: "Review database security:\n{{.diff}}"
+  - agent_type: perf-reviewer
+    name: db-perf
+    prompt: "Review query performance:\n{{.diff}}"
+on_issues: retry
+max_rounds: 2
+```
+
+模板变量：
+- `{{.UserInput}}` — 用户输入
+- `{{.diff}}` — git diff（相对于 baseline）
+- `{{.output}}` — actor 的输出文本
+
+## 自定义 Workflow
+
+在 `.deepai/workflows/{name}.yaml`（支持 `.yml`）中定义：
+
+```yaml
+# .deepai/workflows/full-review.yaml
+name: full-review
+description: 实现 + 安全/架构/性能并行审查 + 条件修复
+stages:
+  - name: implement
+    role: coder
+    prompt: "{{.UserInput}}"
+
+  - name: security
+    role: security-reviewer
+    input_from: [implement]
+    prompt: "Review for security issues:\n{{.outputs.implement}}"
+
+  - name: arch
+    role: arch-reviewer
+    input_from: [implement]
+    prompt: "Review for architecture issues:\n{{.outputs.implement}}"
+
+  - name: perf
+    role: perf-reviewer
+    input_from: [implement]
+    prompt: "Review for performance issues:\n{{.outputs.implement}}"
+
+  - name: fix
+    role: coder
+    input_from: [implement, security, arch, perf]
+    condition: has_critical_issues
+    max_retries: 3
+    prompt: |
+      Fix the issues found by reviewers.
+      Implementation: {{.outputs.implement}}
+      Security: {{.outputs.security}}
+      Architecture: {{.outputs.arch}}
+      Performance: {{.outputs.perf}}
+```
+
+### Workflow 字段说明
+
+**WorkflowStage 字段：**
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | 是 | 阶段名称，必须唯一 |
+| `role` | 是 | 执行的 agent type |
+| `prompt` | 是 | Prompt 模板 |
+| `input_from` | 否 | 依赖的前序阶段名称列表 |
+| `condition` | 否 | 执行条件（`has_critical_issues` / `always` / `never` / 自定义） |
+| `max_retries` | 否 | 失败重试次数（默认 0） |
+
+**模板变量：**
+- `{{.UserInput}}` — 用户原始输入
+- `{{.outputs.<stagename>}}` — 前序阶段的输出文本
+- `{{.diff}}` — git diff（相对于 workflow 开始时）
+
+**执行逻辑：**
+1. 根据 `input_from` 构建依赖 DAG
+2. 拓扑排序为执行波次（同波次内并行执行）
+3. 每个阶段：检查 condition → 构建 prompt → 执行 agent → 失败则重试
+4. 条件为 false 的阶段标记为 skipped，不影响 workflow 最终状态
+5. 阶段输出超过 10000 字符自动截断
+
+**内置条件：**
+
+| 条件 | 说明 |
+|------|------|
+| `has_critical_issues` | 前序阶段存在 severity=critical 的审查结果 |
+| `always` | 始终执行 |
+| `never` | 始终跳过 |
+
+通过 `workflow.RegisterCondition()` 可注册自定义条件。
+
+## Environment 消息总线
+
+Workflow 执行时自动创建 Environment，每个阶段完成后发布结构化消息：
 
 ```go
-Workflow{
-    Name: "code-with-review",
-    Stages: []WorkflowStage{
-        {Name: "implement", Role: AgentTypeCoder, Prompt: "{{.UserInput}}"},
-        {Name: "security",  Role: AgentTypeSecurityReviewer, InputFrom: []string{"implement"}},
-        {Name: "arch",      Role: AgentTypeArchReviewer, InputFrom: []string{"implement"}},
-        {Name: "fix",       Role: AgentTypeCoder, InputFrom: []string{"security", "arch"},
-            Condition: "has_critical_issues", MaxRetries: 3},
-    },
-}
+// 消息类型映射
+coder              → "code_change"
+security-reviewer   → "review_result"
+arch-reviewer       → "review_result"
+perf-reviewer       → "review_result"
+product-manager     → "prd"
+architect           → "design"
 ```
 
-#### feature-planning
-
-```
-用户需求 → product-manager(PRD) → architect(设计) → coder(实现) → review → 迭代
-```
+所有消息记录在 History 中，可通过过滤器查询：
 
 ```go
-Workflow{
-    Name: "feature-planning",
-    Stages: []WorkflowStage{
-        {Name: "prd",    Role: AgentTypeProductManager, Prompt: "{{.UserInput}}"},
-        {Name: "design", Role: AgentTypeArchitect, InputFrom: []string{"prd"}},
-        {Name: "implement", Role: AgentTypeCoder, InputFrom: []string{"prd", "design"}},
-        {Name: "review", Role: AgentTypeSecurityReviewer, InputFrom: []string{"implement"}},
-        {Name: "fix",    Role: AgentTypeCoder, InputFrom: []string{"review"},
-            Condition: "has_critical_issues", MaxRetries: 2},
-    },
-}
+// 获取所有审查结果
+reviews := env.History(Type(MsgTypeReviewResult))
+
+// 获取 coder 的输出
+code := env.History(From("implement"))
+
+// 获取某个时间之后的消息
+recent := env.History(Since(startTime))
 ```
 
-## 实施计划
+## 代码 API
 
-### Phase 1：多角色 Agent + 结构化输出（最小可用）
-
-改动范围：`pkg/agent/`、`pkg/subagent/`
-
-**1.1 新增 Agent Type**
-
-在 `pkg/agent/types_config.go` 中新增 `security-reviewer`、`arch-reviewer`、`perf-reviewer`、`product-manager`、`architect`。
-
-每个角色有独立的：
-- `SystemPrompt`：角色行为规范（借鉴 MetaGPT 的 profile + goal + constraints）
-- `DefaultTools`：最小工具集（审查角色不需要写文件）
-- `Temperature`：审查角色用低温度（0.05），产品角色用中等温度（0.3）
-
-**1.2 结构化审查结果**
+### 直接使用 Pipeline
 
 ```go
-type ReviewResult struct {
-    Verdict    string  `json:"verdict"`     // "pass" | "issues_found"
-    Summary    string  `json:"summary"`
-    Issues     []Issue `json:"issues"`
-}
+executor := agent.NewSubagentExecutor(provider, registry, sandbox, model).
+    WithWorkDir(workDir)
+pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
 
-type Issue struct {
-    Severity   string `json:"severity"`    // "critical" | "warning" | "suggestion"
-    File       string `json:"file"`
-    Line       int    `json:"line"`
-    Message    string `json:"message"`
-    Suggestion string `json:"suggestion"`
-}
+pipeline, _ := agent.ResolvePipeline("code-with-review", workDir)
+orch := agent.NewOrchestrator(executor, pool, workDir)
+
+result, err := orch.Run(ctx, pipeline, agent.OrchestratorInput{
+    UserInput: "实现一个限流中间件",
+    WorkDir:   workDir,
+})
+// result.Verdict: "pass" | "issues_found"
+// result.Reviews: map[string]ReviewResult
+// result.Rounds: 实际执行轮数
 ```
 
-审查 agent 的 system prompt 要求输出 JSON 格式的 `ReviewResult`。主 agent 解析后决定是否修改。
-
-**1.3 主 Agent System Prompt 增强**
-
-在 coder agent 的 system prompt 中增加协同规则（借鉴 MetaGPT Engineer 的 `use_code_review` 模式）：
-
-```
-完成代码修改后，执行审查流程：
-1. 调用 task 工具，type=security-reviewer，传入变更文件和 diff
-2. 调用 task 工具，type=arch-reviewer，同上
-3. 如果存在 critical 级别问题：根据审查意见修改，重新提交审查
-4. 所有审查通过后，执行 git commit
-```
-
-**1.4 验收标准**
-
-- [ ] 新增 5 个 agent type，各有独立 system prompt 和工具集
-- [ ] 主 agent 能调用审查 agent 并解析结构化结果
-- [ ] 主 agent 能根据审查反馈修改代码并重新提交审查
-- [ ] 审查结果在 REPL 中有清晰的渲染（区分 severity 颜色）
-
-### Phase 2：Workflow 引擎
-
-改动范围：新增 `pkg/workflow/`
-
-**2.1 Workflow 定义与执行**
+### 直接使用 Workflow
 
 ```go
-// pkg/workflow/engine.go
-type Engine struct {
-    executor subagent.Executor  // 接口，通过 SubagentExecutor 创建独立 Agent
-    pool     *subagent.Pool     // 并行 stage 执行
-    workDir  string
-}
+engine := workflow.NewEngine(executor, pool, workDir)
 
-func NewEngine(executor subagent.Executor, pool *subagent.Pool, workDir string) *Engine
-func (e *Engine) Run(ctx context.Context, wf *Workflow, userInput string) (*WorkflowResult, error)
+// 可选：附加 Environment
+env := workflow.NewEnvironment(workflow.WithMaxHistory(100))
+defer env.Close()
+engine.WithEnvironment(env)
+
+wf, _ := workflow.ResolveWorkflow("feature-planning", workDir)
+result, err := engine.Run(ctx, wf, "用户注册功能")
+// result.Status: "completed" | "failed"
+// result.Stages: map[string]*StageResult
+// result.StageOrder: []string 执行顺序
+// result.FinalOutput: 最后一个完成阶段的输出
 ```
 
-Engine 按 DAG 拓扑排序执行 stage，同 wave 内并行：
-- 将前序 stage 的输出作为上下文注入
-- 根据 condition 决定是否跳过
-- 失败时按 MaxRetries 重试
-
-**2.2 与 REPL 集成**
-
-- 新增 `/workflow` 命令，列出可用 workflow
-- 新增 `/workflow code-with-review` 启动指定 workflow
-- Workflow 事件通过现有 AgentEvent 机制渲染
-
-**2.3 验收标准**
-
-- [ ] Workflow 可通过代码定义
-- [ ] Engine 支持条件分支和重试
-- [ ] Stage 之间传递结构化上下文
-- [ ] REPL 可视化 workflow 进度
-
-### Phase 3：Environment 消息总线（远期）
-
-借鉴 MetaGPT 的 Environment 概念，实现 agent 间异步通信。
-
-**3.1 消息路由**
+### 直接使用 Environment
 
 ```go
-// pkg/workflow/environment.go
-type Subscription struct {
-    Role     string   // agent type or stage name
-    MsgTypes []string // subscribed message types; empty = all
-}
+env := workflow.NewEnvironment(
+    workflow.WithMaxHistory(500),
+    workflow.WithInboxSize(128),
+)
+defer env.Close()
 
-type Environment struct { ... }
+env.Register(workflow.Subscription{
+    Role:     "monitor",
+    MsgTypes: []string{workflow.MsgTypeCodeChange, workflow.MsgTypeReviewResult},
+})
 
-func NewEnvironment(opts ...EnvOption) *Environment
-func (e *Environment) Register(sub Subscription) error
-func (e *Environment) Unregister(role string)
-func (e *Environment) Publish(ctx context.Context, msg AgentMessage) error
-func (e *Environment) Receive(ctx context.Context, role string) (AgentMessage, error)
-func (e *Environment) History(filters ...MsgFilter) []AgentMessage
-func (e *Environment) Close()
+env.Publish(ctx, workflow.AgentMessage{
+    From:    "coder",
+    Type:    workflow.MsgTypeCodeChange,
+    Content: "重构了中间件层",
+})
+
+// 接收（阻塞等待）
+msg, err := env.Receive(ctx, "monitor")
+
+// 查询历史
+all := env.History()
+fromCoder := env.History(workflow.From("coder"))
+reviews := env.History(workflow.Type(workflow.MsgTypeReviewResult))
 ```
 
-**3.2 并行审查**
-
-多个审查 agent 同时运行，结果汇总后传给 coder：
+## 文件结构
 
 ```
-coder(实现) → Environment.publish(code_change)
-            → security-reviewer ──┐
-            → arch-reviewer ──────┤→ 汇总 → coder(修改)
-            → perf-reviewer ──────┘
+.deepai/
+├── agents/           # 自定义 agent 配置
+│   ├── db-reviewer.yaml
+│   └── api-reviewer.yaml
+├── pipelines/        # 自定义 pipeline 定义
+│   └── db-review.yaml
+└── workflows/        # 自定义 workflow 定义
+    ├── full-review.yaml
+    └── custom.yml    # 同时支持 .yml 后缀
 ```
 
-**3.3 验收标准**
+## 架构参考
 
-- [ ] Agent 可异步收发消息
-- [ ] 多个审查 agent 可并行运行
-- [ ] 消息历史可追溯
+```
+用户 → REPL
+        ├── /pipeline list | run    → Orchestrator → actor → reviewers(retry)
+        └── /workflow list | run    → Engine
+                                       ├── DAG 拓扑排序 → 波次
+                                       ├── 单阶段: executor.Execute()
+                                       ├── 并行: errgroup + pool
+                                       ├── 条件评估: ConditionFunc
+                                       ├── 消息发布: Environment.Publish()
+                                       └── 事件流: EventSink → REPL 实时渲染
 
-## 技术约束
+Environment (消息总线)
+  ├── Register(Subscription)   → 订阅角色
+  ├── Publish(AgentMessage)    → 定向/广播
+  ├── Receive(role)            → 阻塞接收
+  └── History(filters...)      → 历史查询
+```
 
-- **Token 预算**：多 agent 协同显著增加 token 消耗，需要预算控制（借鉴 MetaGPT 的 `invest` 机制）
-- **上下文管理**：审查结果传入主 agent 时需要压缩，避免上下文溢出（借鉴 MetaGPT 的 `working_memory` 分离）
-- **延迟**：串行审查增加总延迟，Phase 3 的并行审查可缓解
-- **成本**：每次审查都是完整 LLM 调用，需要权衡审查深度和成本
-- **Go 同步模型**：MetaGPT 基于 Python asyncio，deepai 基于 Go 同步模型，需要适配（goroutine + channel 替代 asyncio）
+## 实施状态
+
+| Phase | 内容 | 状态 |
+|-------|------|------|
+| Phase 1 | 多角色 Agent + 结构化输出 | 已完成 |
+| Phase 2 | Workflow 引擎 + REPL 集成 | 已完成 |
+| Phase 3 | Environment 消息总线 + 事件流 | 已完成 |
+
+所有验收标准（14/14）已满足，`go build ./...` 和 `go test ./...` 全部通过。

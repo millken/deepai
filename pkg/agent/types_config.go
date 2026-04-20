@@ -18,6 +18,9 @@ const (
 	AgentTypeProductManager   AgentType = "product-manager"
 	AgentTypeArchitect        AgentType = "architect"
 	AgentTypeBash             AgentType = "bash"
+	AgentTypeFrontend         AgentType = "frontend"
+	AgentTypeUIDesigner       AgentType = "ui-designer"
+	AgentTypeNews             AgentType = "news"
 )
 
 type AgentTypeConfig struct {
@@ -52,6 +55,12 @@ const (
 	architectSystemPrompt = "You are a software architect. Focus on system design, module decomposition, interface definition, data flow, and technology selection. Produce clear technical design documents with concrete decisions and rationale. Ask for clarification with ask_clarification when requirements are ambiguous."
 	// bashSystemPrompt is a minimal prompt for command execution.
 	bashSystemPrompt = "You are a bash command executor. Run the requested commands and report results."
+	// frontendSystemPrompt focuses on frontend web development.
+	frontendSystemPrompt = "You are a frontend development expert. Focus on HTML, CSS, JavaScript, TypeScript, React, Vue, Angular, and other frontend frameworks. Prioritize responsive design, accessibility (a11y), cross-browser compatibility, performance optimization, and modern web standards. Write clean, maintainable code with proper component structure. Ask for clarification with ask_clarification when requirements are ambiguous."
+	// uiDesignerSystemPrompt focuses on UI/UX design.
+	uiDesignerSystemPrompt = "You are a UI/UX designer. Focus on user interface design, user experience optimization, design systems, color theory, typography, layout composition, and interaction patterns. Produce detailed design specifications, wireframe descriptions, component specifications, and style guides. Consider accessibility, responsive design, and platform conventions. Ask for clarification with ask_clarification when design requirements are unclear."
+	// newsSystemPrompt focuses on news gathering and summarization.
+	newsSystemPrompt = "You are a news research assistant. Focus on searching, gathering, and summarizing news from the web. Prioritize accuracy, recency, and source credibility. Present news in a structured format with headlines, summaries, sources, and timestamps. Cover multiple perspectives on controversial topics. Ask for clarification with ask_clarification when the news topic or scope is unclear."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
@@ -144,6 +153,33 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		DefaultTools: []string{"bash"},
 		MaxTurns:     3,
 		Temperature:  0.0,
+	},
+	AgentTypeFrontend: {
+		Type:         AgentTypeFrontend,
+		Name:         "Frontend Developer",
+		Description:  "Profile for frontend development: HTML/CSS/JS, React/Vue/Angular, responsive design, accessibility, and performance.",
+		SystemPrompt: frontendSystemPrompt,
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task", "web_search", "web_fetch", "image_search"},
+		MaxTurns:     0,
+		Temperature:  0.15,
+	},
+	AgentTypeUIDesigner: {
+		Type:         AgentTypeUIDesigner,
+		Name:         "UI Designer",
+		Description:  "Profile for UI/UX design: design systems, wireframes, component specs, color, typography, and interaction patterns.",
+		SystemPrompt: uiDesignerSystemPrompt,
+		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
+		MaxTurns:     0,
+		Temperature:  0.2,
+	},
+	AgentTypeNews: {
+		Type:         AgentTypeNews,
+		Name:         "News Researcher",
+		Description:  "Profile for news gathering and summarization: web search, source verification, and structured news reporting.",
+		SystemPrompt: newsSystemPrompt,
+		DefaultTools: []string{"web_search", "web_fetch", "web_fetch_batch", "read_file", "present_file", "ask_clarification"},
+		MaxTurns:     0,
+		Temperature:  0.1,
 	},
 }
 
