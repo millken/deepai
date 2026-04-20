@@ -374,6 +374,16 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		}
 
 		if len(toolCalls) == 0 {
+			// If the model hit context length limits, compact and retry
+			// instead of silently ending with empty output.
+			if isContextOverflow(stopReason) && a.contextWindow > 0 && turn > 0 {
+				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
+				if didCompact {
+					a.logger.Debug("compacting after context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
+					runMessages = compacted
+					continue
+				}
+			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
 				MessageID: aiMessageID,
@@ -701,6 +711,14 @@ func formatEventTime(ts time.Time) string {
 		return ""
 	}
 	return ts.UTC().Format(time.RFC3339Nano)
+}
+
+func isContextOverflow(stopReason string) bool {
+	switch stopReason {
+	case "max_tokens", "length", "model_context_window_exceeded":
+		return true
+	}
+	return false
 }
 
 func newAgentError(err error) *AgentError {
