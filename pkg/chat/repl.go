@@ -706,7 +706,8 @@ func (r *ChatRepl) handlePipeline(args string) {
 		fmt.Fprintf(os.Stderr, "  Running pipeline %q...\n", name)
 
 		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
-			WithWorkDir(r.cfg.WorkDir)
+			WithWorkDir(r.cfg.WorkDir).
+			WithContextWindow(r.cfg.ContextWindow)
 		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
 		orch := agent.NewOrchestrator(executor, pool, r.cfg.WorkDir).
 			WithEventSink(func(evt agent.OrchestratorEvent) {
@@ -818,7 +819,8 @@ func (r *ChatRepl) handleWorkflow(args string) {
 		fmt.Fprintf(os.Stderr, "  Running workflow %q (%d stages)...\n", name, len(wf.Stages))
 
 		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
-			WithWorkDir(r.cfg.WorkDir)
+			WithWorkDir(r.cfg.WorkDir).
+			WithContextWindow(r.cfg.ContextWindow)
 		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
 
 		env := workflow.NewEnvironment()

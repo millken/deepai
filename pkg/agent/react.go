@@ -19,9 +19,8 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-const defaultMaxTurns = 30 // safety cap to prevent infinite tool-call loops
+const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
 const defaultRequestTimeout = 10 * time.Minute
-const maxToolResultInHistory = 8192 // truncate tool results in history to 8KB
 
 var messageSeq uint64
 var agentRequestSeq uint64
@@ -610,14 +609,7 @@ func toolMessageContent(result models.ToolResult) string {
 	if result.Error != "" {
 		return result.Error
 	}
-	return truncateForHistory(result.Content)
-}
-
-func truncateForHistory(s string) string {
-	if len(s) <= maxToolResultInHistory {
-		return s
-	}
-	return s[:maxToolResultInHistory] + fmt.Sprintf("\n... [truncated: showing %d of %d bytes]", maxToolResultInHistory, len(s))
+	return result.Content
 }
 
 func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {

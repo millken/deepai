@@ -102,12 +102,12 @@ func TestCompactMessages_AssistantToolCallsPreserved(t *testing.T) {
 		}
 	}
 
-	// Arguments should be preserved from compacted tool calls (API compatibility).
+	// Arguments should be stripped from compacted tool calls to save space.
 	for _, m := range out {
 		if m.Role == models.RoleAI && strings.HasPrefix(m.Content, "[Called") {
 			for _, tc := range m.ToolCalls {
-				if tc.Arguments == nil {
-					t.Errorf("compacted tool call %s lost arguments", tc.ID)
+				if tc.Arguments != nil {
+					t.Errorf("compacted tool call %s retained arguments (should be stripped)", tc.ID)
 				}
 			}
 		}

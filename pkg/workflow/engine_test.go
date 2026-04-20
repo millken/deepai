@@ -618,25 +618,25 @@ func TestEngineRun_StageOrder(t *testing.T) {
 	}
 }
 
-func TestTruncateOutput(t *testing.T) {
+func TestTruncateForPrompt(t *testing.T) {
 	t.Run("short output unchanged", func(t *testing.T) {
-		got := truncateOutput("hello")
+		got := truncateForPrompt("hello")
 		if got != "hello" {
 			t.Errorf("got %q, want %q", got, "hello")
 		}
 	})
 
 	t.Run("empty output", func(t *testing.T) {
-		got := truncateOutput("")
+		got := truncateForPrompt("")
 		if got != "" {
 			t.Errorf("got %q, want empty", got)
 		}
 	})
 
 	t.Run("long output truncated", func(t *testing.T) {
-		long := strings.Repeat("x", maxOutputLen+1000)
-		got := truncateOutput(long)
-		if len(got) > maxOutputLen+50 {
+		long := strings.Repeat("x", maxPromptOutputLen+1000)
+		got := truncateForPrompt(long)
+		if len(got) > maxPromptOutputLen+50 {
 			t.Errorf("output too long: %d", len(got))
 		}
 		if !strings.HasSuffix(got, "\n... [truncated]") {
@@ -645,8 +645,8 @@ func TestTruncateOutput(t *testing.T) {
 	})
 
 	t.Run("exactly at limit", func(t *testing.T) {
-		exact := strings.Repeat("x", maxOutputLen)
-		got := truncateOutput(exact)
+		exact := strings.Repeat("x", maxPromptOutputLen)
+		got := truncateForPrompt(exact)
 		if got != exact {
 			t.Error("output at limit should not be truncated")
 		}

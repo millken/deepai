@@ -186,7 +186,10 @@ func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
 			}
 		}
 	}
-	return selected
+	if len(selected) > 0 {
+		return selected
+	}
+	return append([]models.Tool(nil), all...)
 }
 
 func subagentMessageFromAgentEvent(evt AgentEvent) string {

@@ -80,41 +80,61 @@ func ParseOutput[T any](schema *OutputSchema, text string) (*T, error) {
 	return &result, nil
 }
 
-// extractJSON finds the first balanced JSON object in text.
+// extractJSON finds the last balanced JSON object in text.
+// Returns the last match to handle cases where the model includes
+// JSON examples in preamble text before the actual structured output.
 func extractJSON(text string) string {
-	start := strings.IndexByte(text, '{')
-	if start < 0 {
-		return ""
-	}
-	depth := 0
-	inStr := false
-	escape := false
-	for i := start; i < len(text); i++ {
-		ch := text[i]
-		if escape {
-			escape = false
-			continue
+	lastEnd := -1
+	lastStart := -1
+	offset := 0
+	for offset < len(text) {
+		start := strings.IndexByte(text[offset:], '{')
+		if start < 0 {
+			break
 		}
-		if ch == '\\' && inStr {
-			escape = true
-			continue
-		}
-		if ch == '"' {
-			inStr = !inStr
-			continue
-		}
-		if inStr {
-			continue
-		}
-		switch ch {
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
-			if depth == 0 {
-				return text[start : i+1]
+		start += offset
+		depth := 0
+		inStr := false
+		escape := false
+		end := -1
+	loop:
+		for i := start; i < len(text); i++ {
+			ch := text[i]
+			if escape {
+				escape = false
+				continue
+			}
+			if ch == '\\' && inStr {
+				escape = true
+				continue
+			}
+			if ch == '"' {
+				inStr = !inStr
+				continue
+			}
+			if inStr {
+				continue
+			}
+			switch ch {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break loop
+				}
 			}
 		}
+		if end < 0 {
+			break
+		}
+		lastStart = start
+		lastEnd = end
+		offset = end
+	}
+	if lastStart >= 0 && lastEnd > lastStart {
+		return text[lastStart:lastEnd]
 	}
 	return ""
 }

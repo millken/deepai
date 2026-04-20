@@ -14,7 +14,7 @@ import (
 	"github.com/millken/deepai/pkg/subagent"
 )
 
-const maxOutputLen = 10000
+const maxPromptOutputLen = 50000
 
 // ConditionFunc evaluates whether a stage should execute.
 type ConditionFunc func(results map[string]*StageResult) bool
@@ -184,7 +184,7 @@ func (e *Engine) executeStage(ctx context.Context, s WorkflowStage, userInput st
 	for attempt := 0; attempt <= s.MaxRetries; attempt++ {
 		execResult, execErr = e.executor.Execute(ctx, task, func(subagent.TaskEvent) {})
 		if execErr == nil {
-			output := truncateOutput(execResult.Result)
+			output := execResult.Result
 			e.publishMessage(ctx, s, output)
 			e.emitStageEvent(ctx, EnvEvent{Type: "stage_completed", Stage: s.Name, Role: string(s.Role)})
 			return &StageResult{Name: s.Name, Output: output, Status: "completed"}, nil
@@ -239,7 +239,7 @@ func (e *Engine) executeParallel(ctx context.Context, wave []WorkflowStage, user
 					lastErr = fmt.Errorf("stage %q: %s", s.Name, completed.Error)
 					continue
 				}
-				output := truncateOutput(completed.Result)
+				output := completed.Result
 				e.publishMessage(gctx, s, output)
 				e.emitStageEvent(gctx, EnvEvent{Type: "stage_completed", Stage: s.Name, Role: string(s.Role)})
 				stageResults[i] = &StageResult{Name: s.Name, Output: output, Status: "completed"}
@@ -262,7 +262,7 @@ func (e *Engine) buildPrompt(s WorkflowStage, userInput string, results map[stri
 	}
 	for _, dep := range s.InputFrom {
 		if sr, ok := results[dep]; ok {
-			vars["outputs."+dep] = sr.Output
+			vars["outputs."+dep] = truncateForPrompt(sr.Output)
 		}
 	}
 	if baseline != "" {
@@ -318,13 +318,6 @@ func expandTemplate(tmpl string, vars map[string]string) string {
 	return result
 }
 
-func truncateOutput(s string) string {
-	if len(s) > maxOutputLen {
-		return s[:maxOutputLen] + "\n... [truncated]"
-	}
-	return s
-}
-
 // emitStageEvent sends a stage lifecycle event via the subagent event sink in context.
 func (e *Engine) emitStageEvent(ctx context.Context, evt EnvEvent) {
 	subagent.EmitEvent(ctx, subagent.TaskEvent{
@@ -342,6 +335,13 @@ func (e *Engine) publishMessage(ctx context.Context, s WorkflowStage, output str
 	}
 	msg := newAgentMessage(s.Name, "", stageMsgType(s.Role), output)
 	e.env.Publish(ctx, msg)
+}
+
+func truncateForPrompt(s string) string {
+	if len(s) <= maxPromptOutputLen {
+		return s
+	}
+	return s[:maxPromptOutputLen] + "\n... [truncated]"
 }
 
 // stageMsgType maps agent roles to message types.

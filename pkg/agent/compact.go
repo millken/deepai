@@ -124,10 +124,9 @@ func compactAssistantMessage(msg models.Message) models.Message {
 		out.ToolCalls = make([]models.ToolCall, len(msg.ToolCalls))
 		for i, tc := range msg.ToolCalls {
 			out.ToolCalls[i] = models.ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Name,
-				Status:    tc.Status,
-				Arguments: tc.Arguments, // preserve for API compatibility
+				ID:     tc.ID,
+				Name:   tc.Name,
+				Status: tc.Status,
 			}
 		}
 		if strings.TrimSpace(msg.Content) == "" {
@@ -190,7 +189,9 @@ func estimateTokens(messages []models.Message, systemPrompt string, _ int) int {
 			size += len(tc.ID) + len(tc.Name) + len(argsJSON) + 20 // overhead
 		}
 		if msg.ToolResult != nil {
-			size += len(msg.ToolResult.CallID) + len(msg.ToolResult.ToolName) + 20
+			size += len(msg.ToolResult.CallID) + len(msg.ToolResult.ToolName)
+			size += len(msg.ToolResult.Content) + len(msg.ToolResult.Error)
+			size += 20
 		}
 		totalBytes += size + 30 // role/ID/metadata overhead per message
 	}

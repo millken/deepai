@@ -22,7 +22,7 @@ func TestExtractJSON(t *testing.T) {
 		{"empty object", `text {} after`, `{}`},
 		{"braces in string", `{"msg":"hello {world}"}`, `{"msg":"hello {world}"}`},
 		{"escaped quote in string", `{"msg":"he said \"hi\""}`, `{"msg":"he said \"hi\""}`},
-		{"multiple objects", `first {"a":1} then {"b":2}`, `{"a":1}`},
+		{"multiple objects", `first {"a":1} then {"b":2}`, `{"b":2}`},
 		{"incomplete object", `{"key":`, ""},
 		{"deeply nested", `{"a":{"b":{"c":1}}}`, `{"a":{"b":{"c":1}}}`},
 	}
