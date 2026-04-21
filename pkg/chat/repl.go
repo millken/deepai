@@ -118,7 +118,26 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	// SIGINT at the prompt exits the REPL.
 	sigCh := make(chan os.Signal, 1)
 	defer signal.Stop(sigCh)
+
+	// Auto-continue: if the resumed session was interrupted mid-task,
+	// start the agent immediately without waiting for user input.
+	autoContinue := (r.cfg.ResumeSession != "" || r.cfg.ContinueLast) && isSessionInterrupted(r.sess.Messages)
+
 	for {
+		// Auto-continue: on first iteration of an interrupted session,
+		// run the agent immediately without waiting for user input.
+		if autoContinue {
+			autoContinue = false
+			fmt.Fprintln(os.Stderr, "  Resuming interrupted session...")
+			r.turn++
+			if err := r.runTurnWithSignal(parentCtx, sigCh, r.continueTurn); err != nil {
+				if parentCtx.Err() != nil {
+					break
+				}
+				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+			}
+		}
+
 		// Wait for user input.
 		line, err := r.input.ReadPrompt(parentCtx)
 		if err != nil {
@@ -139,35 +158,35 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// Handle slash commands.
 		if cmd, ok := ParseSlashCommand(line); ok {
 			if r.handleSlashCommand(cmd) {
-				break // exit requested
+				break
+			}
+			continue
+		}
+
+		// Continuation input ("继续", "continue", etc.): resume agent
+		// without adding a new human message.
+		if isContinuationInput(line) && len(r.sess.Messages) > 0 {
+			r.turn++
+			if err := r.runTurnWithSignal(parentCtx, sigCh, r.continueTurn); err != nil {
+				if parentCtx.Err() != nil {
+					break
+				}
+				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 			}
 			continue
 		}
 
 		r.turn++
 
-		// Create a cancellable context for this turn.
-		// Forward SIGINT to cancel the turn context, not the parent.
-		turnCtx, turnCancel := context.WithCancel(parentCtx)
-		signal.Notify(sigCh, os.Interrupt)
-		go func() {
-			select {
-			case <-sigCh:
-				turnCancel()
-			case <-turnCtx.Done():
-			}
-		}()
-
-		err = r.runTurn(turnCtx, line)
-		turnCancel()
-		signal.Stop(sigCh) // stop receiving on sigCh until next turn
-
-		if err != nil {
-			if turnCtx.Err() != nil {
+		turnErr := r.runTurnWithSignal(parentCtx, sigCh, func(ctx context.Context) error {
+			return r.runTurn(ctx, line)
+		})
+		if turnErr != nil {
+			if turnErr.cancelled {
 				r.renderer.RenderInterrupted()
-				continue // back to prompt
+				continue
 			}
-			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  Error: %v\n", turnErr)
 		}
 	}
 
@@ -192,6 +211,8 @@ func (r *ChatRepl) resolveSession() error {
 		}
 		r.sess.Messages = msgs
 		slog.Info("resumed session", "id", sess.ID, "messages", len(msgs))
+		// Clean up incomplete tool calls from interrupted turn.
+		r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
 		return nil
 	}
 
@@ -209,6 +230,7 @@ func (r *ChatRepl) resolveSession() error {
 			}
 			r.sess.Messages = msgs
 			slog.Info("continued session", "id", sess.ID, "messages", len(msgs))
+			r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
 			return nil
 		}
 	}
@@ -228,6 +250,107 @@ func (r *ChatRepl) resolveSession() error {
 func (r *ChatRepl) runSingleQuery(ctx context.Context) error {
 	r.turn = 1
 	return r.runTurn(ctx, r.cfg.Query)
+}
+
+// filterUnresolvedToolUses removes assistant messages where ALL tool calls
+// have no corresponding tool results. Keeps messages with at least one
+// resolved tool call so the model has context of completed work.
+func filterUnresolvedToolUses(messages []models.Message) []models.Message {
+	// Collect all tool result call IDs.
+	resolvedResults := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.Role == models.RoleTool && msg.ToolResult != nil {
+			resolvedResults[msg.ToolResult.CallID] = true
+		}
+	}
+
+	filtered := make([]models.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role != models.RoleAI || len(msg.ToolCalls) == 0 {
+			filtered = append(filtered, msg)
+			continue
+		}
+		// Keep assistant message if at least one tool call has a result.
+		hasResolved := false
+		for _, tc := range msg.ToolCalls {
+			if resolvedResults[tc.ID] {
+				hasResolved = true
+				break
+			}
+		}
+		if hasResolved {
+			// Strip unresolved tool calls, keep the rest.
+			kept := make([]models.ToolCall, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				if resolvedResults[tc.ID] {
+					kept = append(kept, tc)
+				}
+			}
+			msg.ToolCalls = kept
+			filtered = append(filtered, msg)
+		}
+		// Drop assistant messages where ALL tool calls are unresolved.
+	}
+	return filtered
+}
+
+// isContinuationInput checks if the user input is a continuation request.
+func isContinuationInput(s string) bool {
+	s = strings.TrimSpace(strings.ToLower(s))
+	return s == "继续" || s == "continue" || s == "go on" || s == "keep going"
+}
+
+// isSessionInterrupted checks if the session ended mid-task (last message
+// indicates an incomplete turn: tool result without follow-up, or error state).
+func isSessionInterrupted(messages []models.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	// Last message is a tool result → agent didn't get to respond
+	if last.Role == models.RoleTool {
+		return true
+	}
+	// Last assistant message is empty or has tool calls with no following results
+	if last.Role == models.RoleAI {
+		if strings.TrimSpace(last.Content) == "" && len(last.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// continueTurn resumes the agent from an interrupted session by injecting
+// a continuation prompt instead of a real user message.
+func (r *ChatRepl) continueTurn(ctx context.Context) error {
+	return r.runTurn(ctx, "Continue from where you left off.")
+}
+
+// turnError wraps errors from runTurn to distinguish cancellation from real errors.
+type turnError struct {
+	err       error
+	cancelled bool
+}
+
+func (e *turnError) Error() string { return e.err.Error() }
+
+// runTurnWithSignal creates a cancellable turn context, forwards SIGINT to it,
+// runs the given turn function, and returns a turnError that distinguishes
+// cancellation (Ctrl+C) from real errors.
+func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Signal, fn func(context.Context) error) *turnError {
+	turnCtx, turnCancel := context.WithCancel(parentCtx)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		select {
+		case <-sigCh:
+			turnCancel()
+		case <-turnCtx.Done():
+		}
+	}()
+	err := fn(turnCtx)
+	turnCancel()
+	signal.Stop(sigCh)
+	return &turnError{err: err, cancelled: turnCtx.Err() != nil}
 }
 
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
