@@ -394,8 +394,24 @@ func payloadMiddleware(provider string) option.Middleware {
 	return func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
 		if req.Body != nil {
 			if body, err := io.ReadAll(req.Body); err == nil {
-				slog.Debug("provider payload", "provider", provider, "payload", string(body))
 				req.Body = io.NopCloser(bytes.NewBuffer(body))
+				// Log a compact summary instead of the full payload to avoid
+				// bloating debug logs with large tool results.
+				var summary struct {
+					Model    string `json:"model"`
+					Messages []any  `json:"messages"`
+					Tools    []any  `json:"tools"`
+				}
+				if json.Unmarshal(body, &summary) == nil {
+					slog.Debug("provider payload",
+						"provider", provider,
+						"model", summary.Model,
+						"messages", len(summary.Messages),
+						"tools", len(summary.Tools),
+						"body_bytes", len(body))
+				} else {
+					slog.Debug("provider payload", "provider", provider, "body_bytes", len(body))
+				}
 			}
 		}
 		return next(req)
