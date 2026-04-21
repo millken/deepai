@@ -376,7 +376,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if len(toolCalls) == 0 {
 			// If the model hit context length limits, compact and retry
 			// instead of silently ending with empty output.
-			if isContextOverflow(stopReason) && turn > 0 {
+			if isContextOverflow(stopReason) {
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 				if !didCompact {
 					compacted, didCompact = compactMessages(runMessages, 4)
