@@ -29,6 +29,7 @@ type ReplConfig struct {
 	DatabaseURL         string
 	ContextWindow       int
 	MaxTurns            int
+	RequestTimeout      time.Duration
 	Query               string // non-interactive single query
 	ResumeSession       string // session ID or title to resume
 	ContinueLast        bool   // resume most recent session
@@ -246,15 +247,16 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 
 	// Create a fresh agent for this turn.
 	agentCfg := agent.AgentConfig{
-		LLMProvider:     r.cfg.LLMProvider,
-		Tools:           r.cfg.ToolRegistry,
-		Sandbox:         r.sb,
-		Model:           r.cfg.Model,
-		ContextWindow:   r.cfg.ContextWindow,
-		MaxTurns:        r.cfg.MaxTurns,
+		LLMProvider:    r.cfg.LLMProvider,
+		Tools:          r.cfg.ToolRegistry,
+		Sandbox:        r.sb,
+		Model:          r.cfg.Model,
+		ContextWindow:  r.cfg.ContextWindow,
+		MaxTurns:       r.cfg.MaxTurns,
+		RequestTimeout: r.cfg.RequestTimeout,
 		UserInteraction: r.input,
-		PlanMode:        r.planMode,
-		WorkDir:         r.cfg.WorkDir,
+		PlanMode:       r.planMode,
+		WorkDir:        r.cfg.WorkDir,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -269,7 +271,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		runAgent.AppendSystemPrompt(r.cfg.SystemPrompt)
 	}
 
-	r.renderer.TurnStart(r.turn)
+	r.renderer.TurnStart(r.turn, userInput)
 
 	// Remember message count before agent run to only persist new messages.
 	prevMsgCount := len(r.sess.Messages)
@@ -296,6 +298,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 
 	// Process events as they arrive.
 	var lastUsage *agent.Usage
+	var turnErr error
 	var turnToolCalls []memory.ToolCallInfo
 EventLoop:
 	for {
@@ -331,36 +334,37 @@ EventLoop:
 					r.renderer.RenderEvent(evt)
 				}
 			}
-			if out.err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return out.err
-			}
 			if out.result != nil {
 				r.sess.Messages = out.result.Messages
 				if out.result.Usage != nil {
 					lastUsage = out.result.Usage
 				}
 			}
+			turnErr = out.err
 			break EventLoop
 		case <-ctx.Done():
-			return ctx.Err()
+			turnErr = ctx.Err()
+			break EventLoop
 		}
 	}
 
 	r.renderer.TurnEnd(lastUsage)
+
+	// Always persist new messages, even on timeout/cancellation.
+	for _, msg := range r.sess.Messages[prevMsgCount:] {
+		_ = r.sessMgr.AppendMessage(r.sess.ID, msg)
+	}
+
+	if turnErr != nil {
+		r.saveSession()
+		return turnErr
+	}
 
 	// Sync plan mode: if the agent exited plan mode during this turn
 	// (e.g. user confirmed the plan via exit_plan_mode tool), clear the
 	// REPL flag so the next turn won't re-enter plan mode.
 	if r.planMode && !runAgent.IsPlanMode() {
 		r.planMode = false
-	}
-
-	// Persist only new messages produced by the agent.
-	for _, msg := range r.sess.Messages[prevMsgCount:] {
-		_ = r.sessMgr.AppendMessage(r.sess.ID, msg)
 	}
 
 	// Auto-title generation after first turn (synchronous to guarantee completion).

@@ -18,6 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 	"os"
 	"strings"
+	"time"
 )
 
 // Chat flags shared between root and chat subcommand.
@@ -187,6 +188,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		DatabaseURL:         cfg.DatabaseURL,
 		ContextWindow:       cfg.ContextWindow,
 		MaxTurns:            maxTurns,
+		RequestTimeout:      resolveRequestTimeout(cfg.RequestTimeout),
 		Query:               query,
 		ResumeSession:       resume,
 		ContinueLast:        continueLast,
@@ -227,6 +229,13 @@ func registerChatTools(registry *tools.Registry, provider llm.LLMProvider) {
 	for _, tool := range builtin.WebTools() {
 		mustRegisterTool(registry, tool)
 	}
+}
+
+func resolveRequestTimeout(minutes int) time.Duration {
+	if minutes > 0 {
+		return time.Duration(minutes) * time.Minute
+	}
+	return 30 * time.Minute
 }
 
 func mustRegisterTool(registry *tools.Registry, tool models.Tool) {

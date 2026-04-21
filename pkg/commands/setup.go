@@ -21,6 +21,7 @@ type Config struct {
 	DatabaseURL   string `yaml:"database_url,omitempty"`
 	ContextWindow int    `yaml:"context_window,omitempty"`
 	BaseURL       string `yaml:"base_url,omitempty"`
+	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes (default 30)
 }
 
 // providerInfo maps provider names to their API key env var and common models.

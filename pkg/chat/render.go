@@ -15,10 +15,11 @@ import (
 
 // Renderer handles terminal output for agent events.
 type Renderer struct {
-	out    io.Writer
-	styles Styles
-	turn   int
-	start  time.Time
+	out        io.Writer
+	styles     Styles
+	turn       int
+	start      time.Time
+	thinking   bool
 }
 
 // NewRenderer creates a renderer writing to w.
@@ -38,10 +39,12 @@ func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 	switch evt.Type {
 	case agent.AgentEventTextChunk:
 		if evt.Text != "" {
+			r.clearThinking()
 			fmt.Fprint(r.out, evt.Text)
 		}
 
 	case agent.AgentEventToolCallStart:
+		r.clearThinking()
 		r.renderToolStart(evt)
 
 	case agent.AgentEventToolCallEnd:
@@ -58,11 +61,18 @@ func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 	}
 }
 
-// TurnStart resets the turn timer and prints the assistant header.
-func (r *Renderer) TurnStart(turn int) {
+// TurnStart prints the user message and assistant header, then shows a
+// "Thinking..." indicator so the user knows the model is working.
+func (r *Renderer) TurnStart(turn int, userInput string) {
 	r.turn = turn
 	r.start = time.Now()
-	fmt.Fprintln(r.out, r.styles.Dim.Render(fmt.Sprintf("  ── Assistant (turn %d) ──", turn)))
+	r.thinking = true
+
+	// Show user message
+	fmt.Fprintf(r.out, "%s %s\n", r.styles.UserPrompt.Render("  You:"), userInput)
+
+	// Show thinking indicator
+	fmt.Fprint(r.out, r.styles.Dim.Render("  Thinking..."))
 }
 
 // TurnEnd prints usage statistics for the completed turn.
@@ -84,6 +94,16 @@ func (r *Renderer) TurnEnd(usage *agent.Usage) {
 func (r *Renderer) RenderInterrupted() {
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, r.styles.Dim.Render("  Interrupted."))
+}
+
+// clearThinking replaces the "Thinking..." indicator with a newline on first output.
+func (r *Renderer) clearThinking() {
+	if !r.thinking {
+		return
+	}
+	r.thinking = false
+	// Move cursor to beginning of "Thinking..." line, clear to end of line, reset cursor
+	fmt.Fprint(r.out, "\r\033[K")
 }
 
 func (r *Renderer) renderToolStart(evt agent.AgentEvent) {

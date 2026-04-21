@@ -231,7 +231,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if a.maxTurns > 0 && turn >= a.maxTurns {
 			err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return nil, err
+			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
 		// Token budget check
@@ -243,7 +243,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				Suggestion: "Increase token budget or simplify the request.",
 			}
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
-			return nil, err
+			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
 		// Context compaction: compress old messages when approaching context window.
@@ -300,7 +300,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if err != nil {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return nil, err
+			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
 		var (
@@ -315,7 +315,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			if chunk.Err != nil {
 				err := normalizeRunError(ctx, chunk.Err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return nil, err
+				return &RunResult{Messages: runMessages, Usage: usage}, err
 			}
 			if chunk.Delta != "" {
 				textBuilder.WriteString(chunk.Delta)
@@ -343,7 +343,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if err := ctx.Err(); err != nil {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return nil, err
+			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
 		if streamUsage != nil {
@@ -381,12 +381,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				if !didCompact {
 					compacted, didCompact = compactMessages(runMessages, 4)
 				}
-				if didCompact {
+				if didCompact && len(compacted) < len(runMessages) {
 					a.logger.Debug("compacting after context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
 					runMessages = compacted
 					continue
 				}
-				a.logger.Warn("context overflow but compaction failed", "turn", turn, "messages", len(runMessages))
+				a.logger.Warn("context overflow and compaction cannot reduce further", "turn", turn, "messages", len(runMessages))
 			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
@@ -486,7 +486,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return nil, err
+				return &RunResult{Messages: runMessages, Usage: usage}, err
 			}
 		}
 	}

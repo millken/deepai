@@ -75,7 +75,9 @@ func compactMessages(messages []models.Message, keepTail int) ([]models.Message,
 		case models.RoleTool:
 			compactedMsg := compactToolMessage(msg)
 			result = append(result, compactedMsg)
-			compacted = true
+			if compactedMsg.Content != msg.Content {
+				compacted = true
+			}
 
 		case models.RoleAI:
 			compactedMsg := compactAssistantMessage(msg)
