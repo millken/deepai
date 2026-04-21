@@ -99,7 +99,7 @@ func New(cfg AgentConfig) *Agent {
 		agentType:           cfg.AgentType,
 		model:               resolveModel(cfg.Model),
 		reasoningEffort:     strings.TrimSpace(cfg.ReasoningEffort),
-		systemPrompt:        strings.TrimSpace(cfg.SystemPrompt),
+		systemPrompt:        buildSystemPrompt(strings.TrimSpace(cfg.SystemPrompt), time.Now().Format("2006-01-02")),
 		temperature:         cfg.Temperature,
 		maxTokens:           cfg.MaxTokens,
 		maxTurns:            maxTurns,
@@ -376,13 +376,17 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if len(toolCalls) == 0 {
 			// If the model hit context length limits, compact and retry
 			// instead of silently ending with empty output.
-			if isContextOverflow(stopReason) && a.contextWindow > 0 && turn > 0 {
+			if isContextOverflow(stopReason) && turn > 0 {
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
+				if !didCompact {
+					compacted, didCompact = compactMessages(runMessages, 4)
+				}
 				if didCompact {
 					a.logger.Debug("compacting after context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
 					runMessages = compacted
 					continue
 				}
+				a.logger.Warn("context overflow but compaction failed", "turn", turn, "messages", len(runMessages))
 			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
@@ -536,6 +540,18 @@ func (a *Agent) closeEvents() {
 	}
 	close(a.events)
 	a.eventsClosed = true
+}
+
+func buildSystemPrompt(base string, date string) string {
+	var b strings.Builder
+	if base != "" {
+		b.WriteString(base)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("# Current date\nToday's date is ")
+	b.WriteString(date)
+	b.WriteByte('.')
+	return b.String()
 }
 
 func resolveModel(model string) string {
