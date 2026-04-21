@@ -55,6 +55,13 @@ func compactMessages(messages []models.Message, keepTail int) ([]models.Message,
 		return messages, false
 	}
 
+	// Don't cut in the middle of a tool_call/tool_result chain.
+	// If the tail would start with a tool result, move back to include
+	// the preceding assistant message that issued the tool calls.
+	for tailStart > headEnd && messages[tailStart].Role == models.RoleTool {
+		tailStart--
+	}
+
 	var result []models.Message
 	compacted := false
 
