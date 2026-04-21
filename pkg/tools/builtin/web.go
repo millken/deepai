@@ -38,7 +38,7 @@ var (
 	}
 	safeTransport = &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
+			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 			}
@@ -54,7 +54,8 @@ var (
 					return nil, fmt.Errorf("host %q resolved to metadata address", host)
 				}
 			}
-			return safeDialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+			// Dial with the original addr (hostname) to preserve TLS SNI.
+			return safeDialer.DialContext(ctx, network, addr)
 		},
 	}
 	// webFetchClient rejects private hosts at the transport level (DialContext)
