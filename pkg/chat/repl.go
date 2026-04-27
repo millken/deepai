@@ -16,6 +16,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -358,6 +359,10 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Si
 }
 
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
+	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+		r.renderer.RenderSubagentEvent(evt)
+	})
+
 	// Evaluate fact feedback from previous turn (consume-once).
 	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
 
@@ -614,7 +619,7 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 		r.sess.Messages = nil
 		fmt.Fprintln(os.Stderr, "  Session history cleared.")
 	case "history":
-		printHistory(r.sess.Messages)
+		PrintHistory(os.Stderr, r.sess.Messages)
 	case "compact":
 		fmt.Fprintln(os.Stderr, "  Compaction is automatic when context fills up.")
 	case "new":
@@ -630,6 +635,8 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	case "save":
 		r.saveSession()
 		fmt.Fprintln(os.Stderr, "  Session saved.")
+	case "sessions":
+		r.printSessionList()
 	case "undo":
 		r.undoLastTurn()
 	case "plan":
@@ -697,6 +704,7 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /help      Show this help")
 	fmt.Fprintln(os.Stderr, "    /clear     Clear session history")
 	fmt.Fprintln(os.Stderr, "    /history   Show conversation history")
+	fmt.Fprintln(os.Stderr, "    /sessions  List recent sessions")
 	fmt.Fprintln(os.Stderr, "    /new       Start a new session")
 	fmt.Fprintln(os.Stderr, "    /title     Set session title")
 	fmt.Fprintln(os.Stderr, "    /save      Save session metadata")
@@ -721,6 +729,42 @@ func printHistory(messages []models.Message) {
 			fmt.Fprintln(os.Stderr, styles.Assistant.Render("  AI: ")+content)
 		}
 	}
+}
+
+// printSessionList lists recent sessions in the current REPL.
+func (r *ChatRepl) printSessionList() {
+	if r.sessMgr == nil {
+		fmt.Fprintln(os.Stderr, "  No session repository configured.")
+		return
+	}
+	metas, err := r.sessMgr.ListRecent(20)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Error listing sessions: %v\n", err)
+		return
+	}
+	if len(metas) == 0 {
+		fmt.Fprintln(os.Stderr, "  No sessions found.")
+		return
+	}
+	styles := DefaultStyles()
+	header := fmt.Sprintf("  %-24s %-40s %5s %s", "ID", "TITLE", "MSGS", "CREATED")
+	fmt.Fprintln(os.Stderr, styles.Dim.Render(header))
+	for _, m := range metas {
+		title := m.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		if len([]rune(title)) > 40 {
+			title = string([]rune(title)[:37]) + "..."
+		}
+		created := m.CreatedAt.Format("2006-01-02 15:04")
+		marker := "  "
+		if m.ID == r.sess.ID {
+			marker = styles.Highlight.Render(" *")
+		}
+		fmt.Fprintf(os.Stderr, "%s %-24s %-40s %5d %s\n", marker, m.ID, title, m.MsgCount, created)
+	}
+	fmt.Fprintf(os.Stderr, "  Use 'deepai -r <ID>' to resume a session.\n")
 }
 
 // evaluateFactFeedback classifies the user message for feedback purposes,

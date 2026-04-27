@@ -4,20 +4,25 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/subagent"
 )
 
 // Renderer handles terminal output for agent events.
+// All public methods are safe to call from multiple goroutines.
 type Renderer struct {
-	out        io.Writer
-	styles     Styles
-	turn       int
-	start      time.Time
-	thinking   bool
+	out      io.Writer
+	styles   Styles
+	turn     int
+	start    time.Time
+	thinking bool
+	mu       sync.Mutex
 }
 
 // NewRenderer creates a renderer writing to w.
@@ -34,6 +39,8 @@ func NewRenderer(w io.Writer) *Renderer {
 //   - tool_call_start (not tool_call)
 //   - tool_call_end (not tool_result)
 func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	switch evt.Type {
 	case agent.AgentEventTextChunk:
 		if evt.Text != "" {
@@ -62,6 +69,8 @@ func (r *Renderer) RenderEvent(evt agent.AgentEvent) {
 // TurnStart prints the user message and assistant header, then shows a
 // "Thinking..." indicator so the user knows the model is working.
 func (r *Renderer) TurnStart(turn int, userInput string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.turn = turn
 	r.start = time.Now()
 	r.thinking = true
@@ -75,6 +84,8 @@ func (r *Renderer) TurnStart(turn int, userInput string) {
 
 // TurnEnd prints usage statistics for the completed turn.
 func (r *Renderer) TurnEnd(usage *agent.Usage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	fmt.Fprintln(r.out)
 	elapsed := time.Since(r.start)
 
@@ -90,11 +101,14 @@ func (r *Renderer) TurnEnd(usage *agent.Usage) {
 
 // RenderInterrupted shows an interruption message.
 func (r *Renderer) RenderInterrupted() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, r.styles.Dim.Render("  Interrupted."))
 }
 
 // clearThinking replaces the "Thinking..." indicator with a newline on first output.
+// Caller must hold r.mu.
 func (r *Renderer) clearThinking() {
 	if !r.thinking {
 		return
@@ -102,6 +116,68 @@ func (r *Renderer) clearThinking() {
 	r.thinking = false
 	// Move cursor to beginning of "Thinking..." line, clear to end of line, reset cursor
 	fmt.Fprint(r.out, "\r\033[K")
+}
+
+// RenderSubagentEvent displays subagent lifecycle events in the REPL.
+// Called from the subagent pool goroutine; protected by r.mu.
+func (r *Renderer) RenderSubagentEvent(evt subagent.TaskEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch evt.Type {
+	case "task_started":
+		desc := evt.Description
+		if len([]rune(desc)) > 80 {
+			desc = string([]rune(desc)[:77]) + "..."
+		}
+		fmt.Fprintln(r.out, r.styles.Dim.Render(fmt.Sprintf("  ↳ [subagent] %s", desc)))
+	case "task_failed":
+		errMsg := evt.Error
+		if errMsg == "" {
+			errMsg = evt.Message
+		}
+		fmt.Fprintln(r.out, r.styles.Error.Render(fmt.Sprintf("  ↳ [subagent] failed: %s", errMsg)))
+	case "task_completed":
+		// completion is shown by the tool_call_end event from the parent agent
+	}
+}
+
+// PrintHistory renders the full conversation history to w.
+func PrintHistory(w io.Writer, messages []models.Message) {
+	styles := DefaultStyles()
+	sep := styles.Dim.Render("  " + strings.Repeat("─", 60))
+
+	turnNum := 0
+	for i, msg := range messages {
+		switch msg.Role {
+		case models.RoleHuman:
+			turnNum++
+			if i > 0 {
+				fmt.Fprintln(w, sep)
+			}
+			fmt.Fprintf(w, "%s %s\n", styles.UserPrompt.Render(fmt.Sprintf("  [%d] You:", turnNum)), msg.Content)
+		case models.RoleAI:
+			if msg.Content != "" {
+				content := msg.Content
+				if len(content) > 2000 {
+					content = content[:2000] + "... [truncated]"
+				}
+				fmt.Fprintf(w, "%s %s\n", styles.Assistant.Render("  AI:"), content)
+			}
+			for _, tc := range msg.ToolCalls {
+				preview := toolArgsPreview(tc.Arguments)
+				if preview != "" {
+					fmt.Fprintln(w, styles.ToolCall.Render(fmt.Sprintf("    ⚙ %s(%s)", tc.Name, preview)))
+				} else {
+					fmt.Fprintln(w, styles.ToolCall.Render(fmt.Sprintf("    ⚙ %s", tc.Name)))
+				}
+			}
+		case models.RoleTool:
+			// skip raw tool results in history view
+		}
+	}
+	if len(messages) > 0 {
+		fmt.Fprintln(w, sep)
+	}
 }
 
 func (r *Renderer) renderToolStart(evt agent.AgentEvent) {

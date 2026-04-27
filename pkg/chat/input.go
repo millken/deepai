@@ -24,8 +24,11 @@ var errInterrupted = errors.New("interrupted")
 
 // InputHandler reads user input from stdin using a bubbletea textarea.
 type InputHandler struct {
-	styles Styles
+	styles  Styles
+	history []string // newest-first, capped at maxHistory
 }
+
+const maxHistory = 200
 
 // NewInputHandler creates an input handler.
 // Input is always read from stdin via bubbletea.
@@ -37,13 +40,14 @@ func NewInputHandler() *InputHandler {
 
 // ReadPrompt reads user input using a bubbletea textarea.
 // Enter submits, Alt+Enter inserts a newline.
+// Up/Down navigate input history when content is single-line.
 // Returns errInterrupted on Ctrl+C, and io.EOF on Ctrl+D.
 func (h *InputHandler) ReadPrompt(ctx context.Context) (string, error) {
 	ta := textarea.New()
 	ta.Prompt = h.styles.UserPrompt.Render("> ")
-	ta.Placeholder = "Type your message... (Alt+Enter for newline)"
+	ta.Placeholder = "Type your message... (↑↓ history, Alt+Enter newline)"
 	ta.ShowLineNumbers = false
-	ta.SetHeight(3)
+	ta.SetHeight(5)
 	ta.SetWidth(80)
 	ta.Focus()
 
@@ -51,6 +55,8 @@ func (h *InputHandler) ReadPrompt(ctx context.Context) (string, error) {
 
 	p := tea.NewProgram(&promptModel{
 		textarea: ta,
+		history:  h.history,
+		histIdx:  -1,
 	}, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 
 	go func() {
@@ -63,14 +69,23 @@ func (h *InputHandler) ReadPrompt(ctx context.Context) (string, error) {
 		resultCh <- promptResult{value: pm.value, err: pm.err}
 	}()
 
+	var r promptResult
 	select {
-	case r := <-resultCh:
-		return strings.TrimSpace(r.value), r.err
+	case r = <-resultCh:
 	case <-ctx.Done():
 		p.Quit()
-		<-resultCh // wait for p.Run to finish
+		<-resultCh
 		return "", ctx.Err()
 	}
+
+	if r.err == nil && strings.TrimSpace(r.value) != "" {
+		// prepend to history, drop oldest if over cap
+		h.history = append([]string{r.value}, h.history...)
+		if len(h.history) > maxHistory {
+			h.history = h.history[:maxHistory]
+		}
+	}
+	return strings.TrimSpace(r.value), r.err
 }
 
 type promptResult struct {
@@ -80,12 +95,16 @@ type promptResult struct {
 
 // promptModel is a minimal bubbletea model that wraps a textarea.
 // Enter submits, Alt+Enter inserts a newline.
+// Up/Down navigate history when content is single-line.
 type promptModel struct {
-	textarea  textarea.Model
-	header    string // static text rendered above the textarea (question + options)
-	value     string
-	err       error
-	submitted bool
+	textarea   textarea.Model
+	header     string // static text rendered above the textarea
+	value      string
+	err        error
+	submitted  bool
+	history    []string // newest-first
+	histIdx    int      // -1 = current input, 0..N-1 = history items newest-first
+	savedInput string   // content saved before entering history navigation
 }
 
 func (m *promptModel) Init() tea.Cmd {
@@ -118,6 +137,30 @@ func (m *promptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "esc":
 			return m, nil
+		case "up":
+			// Navigate history only when content has no newlines (single-line mode).
+			if !strings.Contains(m.textarea.Value(), "\n") && len(m.history) > 0 {
+				if m.histIdx == -1 {
+					m.savedInput = m.textarea.Value()
+				}
+				if m.histIdx < len(m.history)-1 {
+					m.histIdx++
+					m.textarea.SetValue(m.history[m.histIdx])
+					m.textarea.CursorEnd()
+				}
+				return m, nil
+			}
+		case "down":
+			if m.histIdx >= 0 {
+				m.histIdx--
+				if m.histIdx == -1 {
+					m.textarea.SetValue(m.savedInput)
+				} else {
+					m.textarea.SetValue(m.history[m.histIdx])
+				}
+				m.textarea.CursorEnd()
+				return m, nil
+			}
 		}
 	case tea.WindowSizeMsg:
 		m.textarea.SetWidth(msg.Width - 4)
