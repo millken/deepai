@@ -229,6 +229,10 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 	runMessages := append([]models.Message(nil), messages...)
 	usage := &Usage{}
+	// validationFailures tracks consecutive tool-validation errors per tool name.
+	// When the same tool fails argument validation 3 times in a row the agent
+	// injects a synthetic human message to break the loop.
+	validationFailures := make(map[string]int)
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -489,6 +493,27 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					Result:    &result,
 					ToolEvent: newToolEventFromResult(completed, result),
 				})
+				// Circuit-breaker for parallel path (same logic as serial path).
+				if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+					validationFailures[call.Name]++
+					if validationFailures[call.Name] >= maxValidationRetries {
+						hint := fmt.Sprintf(
+							"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
+								"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
+							call.Name, validationFailures[call.Name], result.Error,
+						)
+						runMessages = append(runMessages, models.Message{
+							ID:        newMessageID("human"),
+							SessionID: sessionID,
+							Role:      models.RoleHuman,
+							Content:   hint,
+							CreatedAt: time.Now().UTC(),
+						})
+						validationFailures[call.Name] = 0
+					}
+				} else {
+					validationFailures[call.Name] = 0
+				}
 			}
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -559,6 +584,31 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				Result:    &result,
 				ToolEvent: newToolEventFromResult(completedCall, result),
 			})
+
+			// Circuit-breaker: if the same tool fails argument validation 3 times
+			// in a row, inject a human hint and reset the counter. This prevents
+			// infinite loops where the model keeps omitting required arguments.
+			const maxValidationRetries = 3
+			if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+				validationFailures[call.Name]++
+				if validationFailures[call.Name] >= maxValidationRetries {
+					hint := fmt.Sprintf(
+						"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
+							"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
+						call.Name, validationFailures[call.Name], result.Error,
+					)
+					runMessages = append(runMessages, models.Message{
+						ID:        newMessageID("human"),
+						SessionID: sessionID,
+						Role:      models.RoleHuman,
+						Content:   hint,
+						CreatedAt: time.Now().UTC(),
+					})
+					validationFailures[call.Name] = 0
+				}
+			} else {
+				validationFailures[call.Name] = 0
+			}
 
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -896,8 +946,7 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 // allParallelSafe reports whether every call in the batch resolves to a
 // registered tool that has declared ParallelSafe=true. Unknown tools and any
 // false flag short-circuit to false so the safe (sequential) path is taken.
-func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {
-	if a.tools == nil {
+func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {	if a.tools == nil {
 		return false
 	}
 	for _, c := range calls {
@@ -941,3 +990,15 @@ func newAgentError(err error) *AgentError {
 	}
 	return agentErr
 }
+
+// isValidationError reports whether a tool error string originates from
+// argument validation (missing required args, invalid schema). Used by the
+// circuit-breaker to distinguish fixable model mistakes from real failures.
+func isValidationError(errMsg string) bool {
+	return strings.HasPrefix(errMsg, "missing required argument") ||
+		strings.HasPrefix(errMsg, "invalid tool arguments")
+}
+
+// maxValidationRetries is the number of consecutive validation failures for the
+// same tool before the circuit-breaker injects a corrective human hint.
+const maxValidationRetries = 3

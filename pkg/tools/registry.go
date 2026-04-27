@@ -365,28 +365,45 @@ func validateArgs(schema map[string]any, args map[string]any) error {
 	}
 
 	// Fast-path: check for missing required fields before full schema validation
-	// so the error message is LLM-actionable ("missing required argument: files")
-	// rather than raw JSON Schema vocabulary.
+	// so the error message is LLM-actionable rather than raw JSON Schema vocabulary.
+	// Include field description/type from the schema so the model knows what to provide.
 	if required, ok := schema["required"]; ok {
 		var missing []string
-		switch rv := required.(type) {
-		case []any:
-			for _, r := range rv {
-				if key, _ := r.(string); key != "" {
-					if _, exists := args[key]; !exists {
-						missing = append(missing, key)
+		props, _ := schema["properties"].(map[string]any)
+		addMissing := func(key string) {
+			if _, exists := args[key]; !exists {
+				desc := ""
+				if props != nil {
+					if prop, ok := props[key].(map[string]any); ok {
+						desc, _ = prop["description"].(string)
+						if desc == "" {
+							if typ, _ := prop["type"].(string); typ != "" {
+								desc = typ
+							}
+						}
 					}
 				}
-			}
-		case []string:
-			for _, key := range rv {
-				if _, exists := args[key]; !exists {
+				if desc != "" {
+					missing = append(missing, key+" ("+desc+")")
+				} else {
 					missing = append(missing, key)
 				}
 			}
 		}
+		switch rv := required.(type) {
+		case []any:
+			for _, r := range rv {
+				if key, _ := r.(string); key != "" {
+					addMissing(key)
+				}
+			}
+		case []string:
+			for _, key := range rv {
+				addMissing(key)
+			}
+		}
 		if len(missing) > 0 {
-			return fmt.Errorf("missing required argument(s): %s", strings.Join(missing, ", "))
+			return fmt.Errorf("missing required argument(s): %s", strings.Join(missing, "; "))
 		}
 	}
 
