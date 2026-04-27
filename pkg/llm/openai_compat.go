@@ -174,9 +174,17 @@ func (p *OpenAICompatProvider) consumeStream(
 			tc := models.ToolCall{ID: b.id, Name: b.name}
 			if strings.TrimSpace(b.args) != "" {
 				var args map[string]any
-				if err := json.Unmarshal([]byte(b.args), &args); err == nil {
-					tc.Arguments = args
+				if err := json.Unmarshal([]byte(b.args), &args); err != nil {
+					// Arguments JSON is malformed (e.g. stream was truncated).
+					// Surface as a retryable error instead of silently dropping.
+					if retryable {
+						slog.Debug("tool call arguments JSON invalid, will retry", "tool", b.name, "err", err)
+						return true
+					}
+					ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", b.name, err), Done: true}
+					return false
 				}
+				tc.Arguments = args
 			}
 			toolCalls = append(toolCalls, tc)
 		}
