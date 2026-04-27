@@ -3,14 +3,12 @@ package chat
 import (
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"time"
 
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
 	"github.com/millken/deepai/pkg/agent"
-	"github.com/millken/deepai/pkg/workflow"
 )
 
 // Renderer handles terminal output for agent events.
@@ -205,105 +203,3 @@ func truncateWidth(s string, maxW int) string {
 	return s
 }
 
-// RenderPipelineResult renders a pipeline result with color-coded severity.
-func (r *Renderer) RenderPipelineResult(result *agent.OrchestratorResult) {
-	if result == nil {
-		return
-	}
-
-	verdictStyle := r.styles.ReviewPass
-	verdictText := "PASS"
-	if result.Verdict != "pass" {
-		verdictStyle = r.styles.ReviewFail
-		verdictText = "ISSUES FOUND"
-	}
-	fmt.Fprintf(r.out, "  Verdict: %s  (rounds=%d)\n", verdictStyle.Render(verdictText), result.Rounds)
-
-	if len(result.Reviews) == 0 {
-		return
-	}
-	fmt.Fprintln(r.out, "  Reviews:")
-	for key, review := range result.Reviews {
-		reviewVerdict := r.styles.ReviewPass.Render("pass")
-		if review.Verdict != "pass" {
-			reviewVerdict = r.styles.ReviewFail.Render(review.Verdict)
-		}
-		fmt.Fprintf(r.out, "    [%s] %s %s\n", key, reviewVerdict, r.styles.Dim.Render("- "+review.Summary))
-
-		for _, issue := range review.Issues {
-			var severityStr string
-			switch issue.Severity {
-			case "critical":
-				severityStr = r.styles.SeverityCrit.Render("CRITICAL")
-			case "warning":
-				severityStr = r.styles.SeverityWarn.Render("WARNING")
-			default:
-				severityStr = r.styles.SeveritySugg.Render(strings.ToUpper(issue.Severity))
-			}
-			loc := ""
-			if issue.File != "" {
-				loc = issue.File
-				if issue.Line > 0 {
-					loc += fmt.Sprintf(":%d", issue.Line)
-				}
-			}
-			msg := issue.Message
-			if loc != "" {
-				msg = loc + ": " + msg
-			}
-			fmt.Fprintf(r.out, "      %s %s\n", severityStr, msg)
-			if issue.Suggestion != "" {
-				fmt.Fprintf(r.out, "        %s %s\n", r.styles.Dim.Render("->"), issue.Suggestion)
-			}
-		}
-	}
-}
-
-// RenderWorkflowResult renders a workflow execution result.
-func (r *Renderer) RenderWorkflowResult(result *workflow.WorkflowResult) {
-	if result == nil {
-		return
-	}
-
-	statusStyle := r.styles.ReviewPass
-	statusText := strings.ToUpper(result.Status)
-	if result.Status != "completed" {
-		statusStyle = r.styles.ReviewFail
-	}
-
-	fmt.Fprintf(r.out, "  Workflow: %s  Status: %s\n", result.Name, statusStyle.Render(statusText))
-
-	if len(result.Stages) == 0 {
-		return
-	}
-
-	names := result.StageOrder
-	if len(names) == 0 {
-		names = make([]string, 0, len(result.Stages))
-		for name := range result.Stages {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-	}
-
-	fmt.Fprintln(r.out, "  Stages:")
-	for _, name := range names {
-		sr := result.Stages[name]
-		switch sr.Status {
-		case "completed":
-			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.ReviewPass.Render("done"))
-		case "skipped":
-			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.Dim.Render("skipped"))
-		default:
-			fmt.Fprintf(r.out, "    [%s] %s\n", name, r.styles.ReviewFail.Render(sr.Status))
-		}
-	}
-
-	if result.FinalOutput != "" {
-		preview := result.FinalOutput
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		fmt.Fprintf(r.out, "\n  Output:\n%s\n", preview)
-	}
-}

@@ -16,9 +16,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/skill"
-	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
-	"github.com/millken/deepai/pkg/workflow"
 )
 
 // ReplConfig holds configuration for the chat REPL.
@@ -370,16 +368,16 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 
 	// Create a fresh agent for this turn.
 	agentCfg := agent.AgentConfig{
-		LLMProvider:    r.cfg.LLMProvider,
-		Tools:          r.cfg.ToolRegistry,
-		Sandbox:        r.sb,
-		Model:          r.cfg.Model,
-		ContextWindow:  r.cfg.ContextWindow,
-		MaxTurns:       r.cfg.MaxTurns,
-		RequestTimeout: r.cfg.RequestTimeout,
+		LLMProvider:     r.cfg.LLMProvider,
+		Tools:           r.cfg.ToolRegistry,
+		Sandbox:         r.sb,
+		Model:           r.cfg.Model,
+		ContextWindow:   r.cfg.ContextWindow,
+		MaxTurns:        r.cfg.MaxTurns,
+		RequestTimeout:  r.cfg.RequestTimeout,
 		UserInteraction: r.input,
-		PlanMode:       r.planMode,
-		WorkDir:        r.cfg.WorkDir,
+		PlanMode:        r.planMode,
+		WorkDir:         r.cfg.WorkDir,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -624,10 +622,6 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	case "run", "code":
 		r.planMode = false
 		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
-	case "pipeline":
-		r.handlePipeline(cmd.Args)
-	case "workflow":
-		r.handleWorkflow(cmd.Args)
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
@@ -692,8 +686,6 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
 	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
 	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
-	fmt.Fprintln(os.Stderr, "    /pipeline  Manage pipelines (list, run)")
-	fmt.Fprintln(os.Stderr, "    /workflow  Manage workflows (list, run)")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }
@@ -773,210 +765,5 @@ func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassificati
 			)
 		}
 		r.consecCorrections = 0
-	}
-}
-
-func (r *ChatRepl) handlePipeline(args string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	// Listen for Ctrl+C to cancel the pipeline
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
-	go func() {
-		select {
-		case <-sigCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
-	parts := strings.Fields(args)
-	if len(parts) == 0 {
-		fmt.Fprintln(os.Stderr, "  Usage: /pipeline <list|run> [name] [prompt]")
-		fmt.Fprintln(os.Stderr, "    /pipeline list              List available pipelines")
-		fmt.Fprintln(os.Stderr, "    /pipeline run <name> <prompt>  Run a pipeline")
-		return
-	}
-
-	switch parts[0] {
-	case "list":
-		names := agent.ListPipelines(r.cfg.WorkDir)
-		if len(names) == 0 {
-			fmt.Fprintln(os.Stderr, "  No pipelines available.")
-			return
-		}
-		fmt.Fprintln(os.Stderr, "  Available pipelines:")
-		for _, name := range names {
-			p, err := agent.ResolvePipeline(name, r.cfg.WorkDir)
-			if err != nil {
-				continue
-			}
-			reviewerCount := len(p.Reviewers)
-			desc := fmt.Sprintf("actor=%s, reviewers=%d, on_issues=%s", p.Actor.AgentType, reviewerCount, p.OnIssues)
-			fmt.Fprintf(os.Stderr, "    %-20s %s\n", name, desc)
-		}
-	case "run":
-		if len(parts) < 3 {
-			fmt.Fprintln(os.Stderr, "  Usage: /pipeline run <name> <prompt>")
-			return
-		}
-		name := parts[1]
-		prompt := strings.Join(parts[2:], " ")
-
-		p, err := agent.ResolvePipeline(name, r.cfg.WorkDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "  Running pipeline %q...\n", name)
-
-		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
-			WithWorkDir(r.cfg.WorkDir).
-			WithContextWindow(r.cfg.ContextWindow)
-		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
-		orch := agent.NewOrchestrator(executor, pool, r.cfg.WorkDir).
-			WithEventSink(func(evt agent.OrchestratorEvent) {
-				switch evt.Type {
-				case "actor_started":
-					round := ""
-					if evt.Round > 0 {
-						round = fmt.Sprintf(" (retry round %d)", evt.Round+1)
-					}
-					fmt.Fprintf(os.Stderr, "  [%s] running%s...\n", evt.Name, round)
-				case "actor_completed":
-					fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Name)
-				case "reviewer_started":
-					fmt.Fprintf(os.Stderr, "  [%s] running...\n", evt.Name)
-				case "reviewer_completed":
-					fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Name)
-				case "reviewer_failed":
-					msg := evt.Message
-					if len(msg) > 80 {
-						msg = msg[:80] + "..."
-					}
-					fmt.Fprintf(os.Stderr, "  [%s] failed: %s\n", evt.Name, msg)
-				}
-			})
-
-		result, err := orch.Run(ctx, p, agent.OrchestratorInput{
-			UserInput: prompt,
-			WorkDir:   r.cfg.WorkDir,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Pipeline error: %v\n", err)
-			return
-		}
-
-		fmt.Fprintf(os.Stderr, "\n  Pipeline result: %s (rounds=%d)\n", result.Verdict, result.Rounds)
-		if len(result.Reviews) > 0 {
-			fmt.Fprintln(os.Stderr, "  Reviews:")
-			for key, review := range result.Reviews {
-				fmt.Fprintf(os.Stderr, "    [%s] %s: %s\n", key, review.Verdict, review.Summary)
-			}
-		}
-		if result.ActorOutput != "" {
-			preview := result.ActorOutput
-			if len(preview) > 500 {
-				preview = preview[:500] + "..."
-			}
-			fmt.Fprintf(os.Stderr, "\n  Output:\n%s\n", preview)
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "  Unknown pipeline subcommand: %s\n", parts[0])
-		fmt.Fprintln(os.Stderr, "  Use: list or run")
-	}
-}
-
-func (r *ChatRepl) handleWorkflow(args string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	// Listen for Ctrl+C to cancel the workflow
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
-	go func() {
-		select {
-		case <-sigCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	parts := strings.Fields(args)
-	if len(parts) == 0 {
-		fmt.Fprintln(os.Stderr, "  Usage: /workflow <list|run> [name] [prompt]")
-		fmt.Fprintln(os.Stderr, "    /workflow list              List available workflows")
-		fmt.Fprintln(os.Stderr, "    /workflow run <name> <prompt>  Run a workflow")
-		return
-	}
-
-	switch parts[0] {
-	case "list":
-		names := workflow.ListWorkflows(r.cfg.WorkDir)
-		if len(names) == 0 {
-			fmt.Fprintln(os.Stderr, "  No workflows available.")
-			return
-		}
-		fmt.Fprintln(os.Stderr, "  Available workflows:")
-		for _, name := range names {
-			wf, err := workflow.ResolveWorkflow(name, r.cfg.WorkDir)
-			if err != nil {
-				continue
-			}
-			desc := fmt.Sprintf("stages=%d", len(wf.Stages))
-			if wf.Description != "" {
-				desc = wf.Description
-			}
-			fmt.Fprintf(os.Stderr, "    %-20s %s\n", name, DefaultStyles().Dim.Render(desc))
-		}
-	case "run":
-		if len(parts) < 3 {
-			fmt.Fprintln(os.Stderr, "  Usage: /workflow run <name> <prompt>")
-			return
-		}
-		name := parts[1]
-		prompt := strings.Join(parts[2:], " ")
-
-		wf, err := workflow.ResolveWorkflow(name, r.cfg.WorkDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "  Running workflow %q (%d stages)...\n", name, len(wf.Stages))
-
-		executor := agent.NewSubagentExecutor(r.cfg.LLMProvider, r.cfg.ToolRegistry, r.sb, r.cfg.Model).
-			WithWorkDir(r.cfg.WorkDir).
-			WithContextWindow(r.cfg.ContextWindow)
-		pool := agent.NewSubagentPool(executor, 3, 2*time.Minute)
-
-		env := workflow.NewEnvironment()
-		defer env.Close()
-
-		engine := workflow.NewEngine(executor, pool, r.cfg.WorkDir).WithEnvironment(env)
-
-		// Inject event sink for real-time stage progress
-		wfCtx := subagent.WithEventSink(ctx, subagent.EventSink(func(evt subagent.TaskEvent) {
-			switch evt.Type {
-			case "stage_started":
-				fmt.Fprintf(os.Stderr, "  [%s] running...\n", evt.Description)
-			case "stage_completed":
-				fmt.Fprintf(os.Stderr, "  [%s] done\n", evt.Description)
-			case "stage_skipped":
-				fmt.Fprintf(os.Stderr, "  [%s] skipped\n", evt.Description)
-			case "stage_failed":
-				fmt.Fprintf(os.Stderr, "  [%s] failed\n", evt.Description)
-			}
-		}))
-
-		result, err := engine.Run(wfCtx, wf, prompt)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Workflow error: %v\n", err)
-			return
-		}
-
-		r.renderer.RenderWorkflowResult(result)
-	default:
-		fmt.Fprintf(os.Stderr, "  Unknown workflow subcommand: %s\n", parts[0])
-		fmt.Fprintln(os.Stderr, "  Use: list or run")
 	}
 }
