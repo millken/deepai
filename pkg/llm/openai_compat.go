@@ -48,6 +48,11 @@ func (p *OpenAICompatProvider) Chat(ctx context.Context, req ChatRequest) (ChatR
 	}
 	params := p.buildParams(req)
 	resp, err := p.client.Chat.Completions.New(ctx, params)
+	if err != nil && isReasoningEffortError(err) && params.ReasoningEffort != "" {
+		slog.Debug("model does not support reasoning_effort, retrying without it", "provider", p.provider, "model", req.Model)
+		params.ReasoningEffort = ""
+		resp, err = p.client.Chat.Completions.New(ctx, params)
+	}
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -65,11 +70,17 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req ChatRequest) (<-c
 	go func() {
 		defer close(ch)
 		const maxRetries = 3
+		reasoningStripped := false
 		for attempt := 0; attempt <= maxRetries; attempt++ {
-			retry := p.consumeStream(ctx, ch, stream, req.Model, attempt < maxRetries)
+			retry, stripRE := p.consumeStream(ctx, ch, stream, req.Model, attempt < maxRetries)
 			stream.Close()
 			if !retry {
 				return
+			}
+			if stripRE && !reasoningStripped && params.ReasoningEffort != "" {
+				params.ReasoningEffort = ""
+				reasoningStripped = true
+				slog.Debug("stripped reasoning_effort for retry", "provider", p.provider, "model", req.Model)
 			}
 			delay := streamRetryDelay(attempt)
 			slog.Debug("retrying stream", "provider", p.provider, "attempt", attempt+1, "delay", delay)
@@ -96,7 +107,13 @@ func (p *OpenAICompatProvider) buildParams(req ChatRequest) openai.ChatCompletio
 		params.Temperature = param.NewOpt(*req.Temperature)
 	}
 	if req.ReasoningEffort != "" {
-		params.ReasoningEffort = openai.ReasoningEffort(req.ReasoningEffort)
+		switch strings.ToLower(strings.TrimSpace(req.ReasoningEffort)) {
+		case "low", "medium", "high":
+			params.ReasoningEffort = openai.ReasoningEffort(strings.ToLower(strings.TrimSpace(req.ReasoningEffort)))
+		// "disabled", "none", "off", "auto" etc. → do not set the field;
+		// the server default applies. Prevents 400 errors from providers that
+		// only accept low/medium/high.
+		}
 	}
 	if len(req.Tools) > 0 {
 		params.Tools = mapToolsToOpenAI(req.Tools)
@@ -111,7 +128,7 @@ func (p *OpenAICompatProvider) consumeStream(
 	stream *ssestream.Stream[openai.ChatCompletionChunk],
 	model string,
 	retryable bool,
-) (retry bool) {
+) (retry bool, stripReasoningEffort bool) {
 	var contentBuf strings.Builder
 	var toolCalls []models.ToolCall
 	toolCallBuilders := make(map[int64]*toolCallBuilder)
@@ -161,12 +178,17 @@ func (p *OpenAICompatProvider) consumeStream(
 		}
 	}
 	if err := stream.Err(); err != nil {
+		// reasoning_effort rejection: signal caller to strip the field and retry.
+		if !emitted && retryable && isReasoningEffortError(err) {
+			slog.Debug("model rejected reasoning_effort, will retry without it", "provider", p.provider, "model", model, "err", err)
+			return true, true
+		}
 		if !emitted && retryable && isRetryableOpenAIStreamErr(err) {
 			slog.Debug("stream failed before emitting content, will retry", "provider", p.provider, "err", err)
-			return true
+			return true, false
 		}
 		ch <- StreamChunk{Err: err, Done: true}
-		return false
+		return false, false
 	}
 	// Finalize tool call builders.
 	for i := int64(0); int(i) < len(toolCallBuilders); i++ {
@@ -179,10 +201,10 @@ func (p *OpenAICompatProvider) consumeStream(
 					// Surface as a retryable error instead of silently dropping.
 					if retryable {
 						slog.Debug("tool call arguments JSON invalid, will retry", "tool", b.name, "err", err)
-						return true
+						return true, false
 					}
 					ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", b.name, err), Done: true}
-					return false
+					return false, false
 				}
 				tc.Arguments = args
 			}
@@ -195,7 +217,7 @@ func (p *OpenAICompatProvider) consumeStream(
 	}
 	msg := models.Message{Role: models.RoleAI, Content: contentBuf.String(), ToolCalls: toolCalls}
 	ch <- StreamChunk{Model: model, Message: &msg, ToolCalls: toolCalls, Usage: lastUsage, Stop: stopReason, Done: true}
-	return false
+	return false, false
 }
 
 func (p *OpenAICompatProvider) mapResponse(resp *openai.ChatCompletion, model string) ChatResponse {
@@ -326,4 +348,16 @@ func isRetryableOpenAIStreamErr(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "unexpected end of JSON input") ||
 		strings.Contains(s, "unexpected EOF")
+}
+
+// isReasoningEffortError reports whether a 400 error was caused by the
+// reasoning_effort field being rejected by the provider (e.g. models that only
+// accept low/medium/high, or models that don't support the field at all).
+func isReasoningEffortError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "reasoning_effort") ||
+		strings.Contains(s, "reasoning effort")
 }
