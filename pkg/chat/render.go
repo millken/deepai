@@ -129,15 +129,17 @@ func (r *Renderer) renderToolEnd(evt agent.AgentEvent) {
 	if te.DurationMS > 0 {
 		detail = fmt.Sprintf(" (%.1fs)", float64(te.DurationMS)/1000)
 	}
-	if te.ResultPreview != "" {
+	// Show result preview only when there is no error — the error field
+	// already contains the full failure detail and showing both would
+	// duplicate the message.
+	if te.Error != "" {
+		detail += " " + r.styles.Error.Render("ERROR: "+te.Error)
+	} else if te.ResultPreview != "" {
 		preview := te.ResultPreview
 		if lipgloss.Width(preview) > 120 {
 			preview = truncateWidth(preview, 117) + "..."
 		}
 		detail += " -> " + preview
-	}
-	if te.Error != "" {
-		detail += " " + r.styles.Error.Render("ERROR: "+te.Error)
 	}
 	line := fmt.Sprintf("  [%s] done%s", te.Name, detail)
 	fmt.Fprintln(r.out, r.styles.ToolResult.Render(line))

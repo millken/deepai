@@ -364,6 +364,32 @@ func validateArgs(schema map[string]any, args map[string]any) error {
 		args = map[string]any{}
 	}
 
+	// Fast-path: check for missing required fields before full schema validation
+	// so the error message is LLM-actionable ("missing required argument: files")
+	// rather than raw JSON Schema vocabulary.
+	if required, ok := schema["required"]; ok {
+		var missing []string
+		switch rv := required.(type) {
+		case []any:
+			for _, r := range rv {
+				if key, _ := r.(string); key != "" {
+					if _, exists := args[key]; !exists {
+						missing = append(missing, key)
+					}
+				}
+			}
+		case []string:
+			for _, key := range rv {
+				if _, exists := args[key]; !exists {
+					missing = append(missing, key)
+				}
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("missing required argument(s): %s", strings.Join(missing, ", "))
+		}
+	}
+
 	data, err := json.Marshal(schema)
 	if err != nil {
 		return fmt.Errorf("invalid schema: %w", err)
@@ -388,5 +414,8 @@ func validateArgs(schema map[string]any, args map[string]any) error {
 		return fmt.Errorf("invalid args: %w", err)
 	}
 
-	return resolved.Validate(normalized)
+	if err := resolved.Validate(normalized); err != nil {
+		return fmt.Errorf("invalid tool arguments: %w", err)
+	}
+	return nil
 }

@@ -367,7 +367,14 @@ func isRetryableAnthropicStreamErr(err error) bool {
 	if errors.As(err, &apierr) {
 		return apierr.StatusCode == 429 || apierr.StatusCode == 529 || apierr.StatusCode >= 500
 	}
-	return false
+	// Transient network / SSE-parse errors
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "unexpected end of JSON input") ||
+		strings.Contains(s, "unexpected EOF")
 }
 
 // --- shared helpers ---

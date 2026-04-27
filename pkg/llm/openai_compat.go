@@ -309,5 +309,13 @@ func isRetryableOpenAIStreamErr(err error) bool {
 	if errors.As(err, &apierr) {
 		return apierr.StatusCode == 429 || apierr.StatusCode >= 500
 	}
-	return false
+	// Transient network / SSE-parse errors (truncated stream, connection reset)
+	// are worth retrying once before surfacing to the caller.
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "unexpected end of JSON input") ||
+		strings.Contains(s, "unexpected EOF")
 }
