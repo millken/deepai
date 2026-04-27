@@ -112,6 +112,12 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		CallID:   call.ID,
 		ToolName: call.Name,
 		Content:  b.String() + truncated,
+		Data: map[string]any{
+			"matches":     matches,
+			"truncated":   len(matches) == maxResults,
+			"max_results": maxResults,
+			"context":     contextLines,
+		},
 	}, nil
 }
 
@@ -195,7 +201,7 @@ func searchFile(path string, re *regexp.Regexp, limit int) ([]grepMatch, error) 
 			matches = append(matches, grepMatch{
 				File:    path,
 				Line:    i + 1,
-				Content: strings.TrimSpace(line),
+				Content: line,
 			})
 			if len(matches) >= limit {
 				break
@@ -255,7 +261,7 @@ func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLi
 			if prev > 0 && ln > prev+1 {
 				b.WriteString("...\n")
 			}
-			fmt.Fprintf(b, "%s:%d: %s\n", fr.path, ln, strings.TrimSpace(lines[ln-1]))
+			fmt.Fprintf(b, "%s:%d: %s\n", fr.path, ln, lines[ln-1])
 			prev = ln
 		}
 	}

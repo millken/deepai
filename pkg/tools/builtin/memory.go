@@ -38,7 +38,11 @@ func MemoryTool(memService *memory.Service) models.Tool {
 			}, nil
 		}
 
-		sessionID := tools.ThreadIDFromContext(ctx)
+		sessionID, _ := call.Arguments["session_id"].(string)
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			sessionID = tools.ThreadIDFromContext(ctx)
+		}
 		if sessionID == "" {
 			return models.ToolResult{
 				CallID:   call.ID,
@@ -70,7 +74,7 @@ func MemoryTool(memService *memory.Service) models.Tool {
 
 	return models.Tool{
 		Name:        "memory",
-		Description: "Manage persistent memory facts about the user, environment, and stable conventions. Use add_fact to remember new information, replace_fact to update existing facts, remove_fact to delete outdated ones, and read to view current facts.",
+		Description: "Manage persistent memory facts about the user, environment, and stable conventions. session_id is optional; when omitted the current thread id is used. Use add_fact to remember new information, replace_fact to update existing facts, remove_fact to delete outdated ones, and read to view current facts.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -82,6 +86,10 @@ func MemoryTool(memService *memory.Service) models.Tool {
 				"fact_id": map[string]any{
 					"type":        "string",
 					"description": "Fact ID (required for replace/remove; auto-generated for add)",
+				},
+				"session_id": map[string]any{
+					"type":        "string",
+					"description": "Optional explicit memory session identifier. Defaults to the current thread id when omitted.",
 				},
 				"content": map[string]any{
 					"type":        "string",

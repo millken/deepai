@@ -186,3 +186,33 @@ func TestPresentFileToolMissingPath(t *testing.T) {
 		t.Errorf("Status = %q, want %q", result.Status, models.CallStatusFailed)
 	}
 }
+
+func TestPresentFileToolResolvesACPWorkspaceVirtualPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+	threadID := "thread-present-1"
+	resolved := filepath.Join(root, "threads", threadID, "acp-workspace", "out", "artifact.txt")
+	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(resolved, []byte("artifact output"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	registry := NewPresentFileRegistry()
+	tool := PresentFileTool(registry)
+	ctx := WithThreadID(context.Background(), threadID)
+	result, err := tool.Handler(ctx, models.ToolCall{
+		ID:   "call_virtual",
+		Name: "present_file",
+		Arguments: map[string]any{
+			"path": "/mnt/acp-workspace/out/artifact.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handler failed: %v", err)
+	}
+	if result.Data["path"] != resolved {
+		t.Fatalf("resolved path = %v, want %q", result.Data["path"], resolved)
+	}
+}

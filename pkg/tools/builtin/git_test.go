@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,17 @@ func callID(t *testing.T) string {
 	return "call-1"
 }
 
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %s: %v", strings.Join(args, " "), out, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func TestGitStatusHandler_Clean(t *testing.T) {
 	dir := initGitRepo(t)
 	result, err := GitStatusHandler(context.Background(), models.ToolCall{
@@ -71,6 +83,32 @@ func TestGitStatusHandler_Dirty(t *testing.T) {
 	}
 }
 
+func TestGitStatusHandler_StructuredData(t *testing.T) {
+	dir := initGitRepo(t)
+	os.WriteFile(filepath.Join(dir, "new.txt"), []byte("hello"), 0644)
+	result, err := GitStatusHandler(context.Background(), models.ToolCall{
+		ID:        callID(t),
+		Name:      "git_status",
+		Arguments: map[string]any{"working_dir": dir},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Clean     bool `json:"clean"`
+		Untracked []string `json:"untracked"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if payload.Clean || len(payload.Untracked) != 1 || payload.Untracked[0] != "new.txt" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	if result.Data["entries"] == nil {
+		t.Fatal("expected structured entries in result.Data")
+	}
+}
+
 func TestGitLogHandler(t *testing.T) {
 	dir := initGitRepo(t)
 	result, err := GitLogHandler(context.Background(), models.ToolCall{
@@ -83,6 +121,60 @@ func TestGitLogHandler(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "init") {
 		t.Fatalf("expected log with 'init', got: %s", result.Content)
+	}
+}
+
+func TestGitLogHandler_StructuredEntries(t *testing.T) {
+	dir := initGitRepo(t)
+	result, err := GitLogHandler(context.Background(), models.ToolCall{
+		ID:        callID(t),
+		Name:      "git_log",
+		Arguments: map[string]any{"working_dir": dir, "count": float64(1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(payload.Entries) != 1 {
+		t.Fatalf("unexpected entries: %+v", payload.Entries)
+	}
+	if payload.Entries[0]["subject"] != "init" {
+		t.Fatalf("unexpected subject: %+v", payload.Entries[0])
+	}
+}
+
+func TestGitDiffHandler_StructuredData(t *testing.T) {
+	dir := initGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "diff.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, dir, "add", "--", "diff.txt")
+	result, err := GitDiffHandler(context.Background(), models.ToolCall{
+		ID:        callID(t),
+		Name:      "git_diff",
+		Arguments: map[string]any{"working_dir": dir, "staged": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Staged bool     `json:"staged"`
+		Files  []string `json:"files"`
+		Diff   string   `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if !payload.Staged || len(payload.Files) != 1 || payload.Files[0] != "diff.txt" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	if !strings.Contains(payload.Diff, "+hello") {
+		t.Fatalf("unexpected diff: %q", payload.Diff)
 	}
 }
 
@@ -133,6 +225,64 @@ func TestGitCommitHandler_NoStagedChanges(t *testing.T) {
 	}
 }
 
+func TestGitCommitHandler_WithAuthorOverride(t *testing.T) {
+	dir := initGitRepo(t)
+	gitOutput(t, dir, "config", "--unset", "user.name")
+	gitOutput(t, dir, "config", "--unset", "user.email")
+	if err := os.WriteFile(filepath.Join(dir, "override.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, dir, "add", "--", "override.txt")
+
+	_, err := GitCommitHandler(context.Background(), models.ToolCall{
+		ID:   callID(t),
+		Name: "git_commit",
+		Arguments: map[string]any{
+			"working_dir":  dir,
+			"message":      "override author",
+			"author_name":  "Tool Bot",
+			"author_email": "toolbot@example.com",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected commit with explicit author override: %v", err)
+	}
+	if got := gitOutput(t, dir, "log", "-1", "--pretty=format:%an <%ae>"); got != "Tool Bot <toolbot@example.com>" {
+		t.Fatalf("unexpected author: %q", got)
+	}
+}
+
+func TestGitCommitHandler_MissingIdentityMessage(t *testing.T) {
+	dir := initGitRepo(t)
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(t.TempDir(), "global.gitconfig"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_AUTHOR_NAME", "")
+	t.Setenv("GIT_AUTHOR_EMAIL", "")
+	t.Setenv("GIT_COMMITTER_NAME", "")
+	t.Setenv("GIT_COMMITTER_EMAIL", "")
+	gitOutput(t, dir, "config", "--unset", "user.name")
+	gitOutput(t, dir, "config", "--unset", "user.email")
+	if err := os.WriteFile(filepath.Join(dir, "missing.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, dir, "add", "--", "missing.txt")
+
+	_, err := GitCommitHandler(context.Background(), models.ToolCall{
+		ID:   callID(t),
+		Name: "git_commit",
+		Arguments: map[string]any{
+			"working_dir": dir,
+			"message":     "missing identity",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected identity error")
+	}
+	if !strings.Contains(err.Error(), "git user identity is not configured") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestGitPushHandler_NoWorkingTreeCheck(t *testing.T) {
 	dir := initGitRepo(t)
 	// Create an uncommitted file — this should NOT block push
@@ -147,6 +297,46 @@ func TestGitPushHandler_NoWorkingTreeCheck(t *testing.T) {
 	// "there are uncommitted changes" — that check has been removed.
 	if err != nil && strings.Contains(err.Error(), "uncommitted changes") {
 		t.Fatal("git_push should not check for uncommitted changes")
+	}
+}
+
+func TestGitPushHandler_SetUpstream(t *testing.T) {
+	dir := initGitRepo(t)
+	remoteDir := filepath.Join(t.TempDir(), "remote.git")
+	cmd := exec.Command("git", "init", "--bare", remoteDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %s: %v", out, err)
+	}
+	gitOutput(t, dir, "remote", "add", "origin", remoteDir)
+	gitOutput(t, dir, "checkout", "-b", "feature/tool-push")
+	if err := os.WriteFile(filepath.Join(dir, "push.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, dir, "add", "--", "push.txt")
+	gitOutput(t, dir, "commit", "-m", "push me")
+
+	result, err := GitPushHandler(context.Background(), models.ToolCall{
+		ID:   callID(t),
+		Name: "git_push",
+		Arguments: map[string]any{
+			"working_dir":  dir,
+			"set_upstream": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("push with upstream should succeed: %v", err)
+	}
+	if got := gitOutput(t, dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); got != "origin/feature/tool-push" {
+		t.Fatalf("unexpected upstream: %q", got)
+	}
+	var payload struct {
+		SetUpstream bool `json:"set_upstream"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if !payload.SetUpstream {
+		t.Fatal("expected set_upstream=true in result")
 	}
 }
 

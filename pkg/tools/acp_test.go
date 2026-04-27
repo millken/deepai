@@ -66,3 +66,30 @@ func TestResolveVirtualPathMapsACPWorkspace(t *testing.T) {
 		t.Fatalf("path=%q want %q", got, want)
 	}
 }
+
+func TestInvokeACPAgentToolRequiresThreadID(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+
+	tool := InvokeACPAgentTool(map[string]ACPAgentConfig{
+		"demo": {Command: "sh", Args: []string{"-c", "printf 'ok'"}},
+	})
+
+	result, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "call-acp-missing-thread",
+		Name: tool.Name,
+		Arguments: map[string]any{
+			"agent":  "demo",
+			"prompt": "build a demo",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when thread id is missing")
+	}
+	if !strings.Contains(err.Error(), "thread id is required") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != models.CallStatusFailed {
+		t.Fatalf("status=%q want %q", result.Status, models.CallStatusFailed)
+	}
+}

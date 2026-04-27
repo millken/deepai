@@ -169,7 +169,6 @@ func PresentFileTool(registry *PresentFileRegistry) models.Tool {
 			"required": []any{"path"},
 		},
 		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
-			_ = ctx
 			if registry == nil {
 				err := fmt.Errorf("present file registry is required")
 				return models.ToolResult{
@@ -183,9 +182,10 @@ func PresentFileTool(registry *PresentFileRegistry) models.Tool {
 			path, _ := call.Arguments["path"].(string)
 			description, _ := call.Arguments["description"].(string)
 			mimeType, _ := call.Arguments["mime_type"].(string)
+			resolvedPath := ResolveVirtualPath(ctx, path)
 
 			file := PresentFile{
-				Path:        path,
+				Path:        resolvedPath,
 				Description: description,
 				MimeType:    mimeType,
 			}
@@ -198,7 +198,7 @@ func PresentFileTool(registry *PresentFileRegistry) models.Tool {
 				}, err
 			}
 
-			registered, ok := latestRegisteredFile(registry, path)
+			registered, ok := latestRegisteredFile(registry, resolvedPath)
 			if !ok {
 				err := fmt.Errorf("registered file not found")
 				return models.ToolResult{

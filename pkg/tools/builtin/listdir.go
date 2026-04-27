@@ -13,6 +13,7 @@ import (
 type dirEntry struct {
 	Name    string `json:"name"`
 	IsDir   bool   `json:"is_dir"`
+	Mode    string `json:"mode,omitempty"`
 	Size    int64  `json:"size,omitempty"`
 	ModTime string `json:"mod_time,omitempty"`
 }
@@ -45,6 +46,7 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 		entries = append(entries, dirEntry{
 			Name:    name,
 			IsDir:   d.IsDir(),
+			Mode:    info.Mode().String(),
 			Size:    info.Size(),
 			ModTime: info.ModTime().Format("2006-01-02 15:04"),
 		})
@@ -60,17 +62,16 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 
 	var b strings.Builder
 	for _, e := range entries {
-		prefix := "-rw-"
-		if e.IsDir {
-			prefix = "drw-"
-		}
-		fmt.Fprintf(&b, "%s %8d %s  %s\n", prefix, e.Size, e.ModTime, e.Name)
+		fmt.Fprintf(&b, "%s %8d %s  %s\n", e.Mode, e.Size, e.ModTime, e.Name)
 	}
 
 	return models.ToolResult{
 		CallID:   call.ID,
 		ToolName: call.Name,
 		Content:  b.String(),
+		Data: map[string]any{
+			"entries": entries,
+		},
 	}, nil
 }
 

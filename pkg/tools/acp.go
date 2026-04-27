@@ -150,7 +150,7 @@ func ACPWorkspaceDir(threadID string) (string, error) {
 	}
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {
-		return filepath.Join(root, "acp-workspace"), nil
+		return "", fmt.Errorf("thread id is required for ACP workspace isolation")
 	}
 	return filepath.Join(root, "threads", threadID, "acp-workspace"), nil
 }

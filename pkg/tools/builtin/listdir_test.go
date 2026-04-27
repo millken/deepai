@@ -47,6 +47,8 @@ func TestListDirHandler_DirsFirst(t *testing.T) {
 	root := t.TempDir()
 	os.WriteFile(filepath.Join(root, "zzz.txt"), []byte("file"), 0644)
 	os.MkdirAll(filepath.Join(root, "aaa"), 0755)
+	dirMode := mustStatMode(t, filepath.Join(root, "aaa"))
+	fileMode := mustStatMode(t, filepath.Join(root, "zzz.txt"))
 
 	result, err := ListDirHandler(context.Background(), models.ToolCall{
 		ID:     "ls-2",
@@ -65,11 +67,15 @@ func TestListDirHandler_DirsFirst(t *testing.T) {
 		t.Fatalf("expected 2 lines, got %d: %s", len(lines), result.Content)
 	}
 	// Directory should come first
-	if !strings.Contains(lines[0], "drw-") || !strings.Contains(lines[0], "aaa") {
+	if !strings.Contains(lines[0], dirMode) || !strings.Contains(lines[0], "aaa") {
 		t.Errorf("expected dir 'aaa' first, got: %s", lines[0])
 	}
-	if !strings.Contains(lines[1], "-rw-") || !strings.Contains(lines[1], "zzz.txt") {
+	if !strings.Contains(lines[1], fileMode) || !strings.Contains(lines[1], "zzz.txt") {
 		t.Errorf("expected file 'zzz.txt' second, got: %s", lines[1])
+	}
+	entries, ok := result.Data["entries"].([]dirEntry)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("entries=%v", result.Data["entries"])
 	}
 }
 
@@ -124,4 +130,13 @@ func TestListDirHandler_EmptyDir(t *testing.T) {
 	if result.Content != "" {
 		t.Errorf("expected empty output for empty dir, got: %s", result.Content)
 	}
+}
+
+func mustStatMode(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().String()
 }

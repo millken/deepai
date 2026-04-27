@@ -297,6 +297,35 @@ func TestGrepHandler_ContextLines(t *testing.T) {
 	}
 }
 
+func TestGrepHandler_PreservesOriginalWhitespace(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"a.txt": "\tkeep trailing  ",
+	})
+
+	result, err := GrepHandler(context.Background(), models.ToolCall{
+		ID:     "grep-10",
+		Name:   "grep",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"pattern": "keep",
+			"path":    root,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, ":1: \tkeep trailing  ") {
+		t.Fatalf("expected original whitespace preserved, got: %q", result.Content)
+	}
+	matches, ok := result.Data["matches"].([]grepMatch)
+	if !ok || len(matches) != 1 {
+		t.Fatalf("matches=%v", result.Data["matches"])
+	}
+	if matches[0].Content != "\tkeep trailing  " {
+		t.Fatalf("match content=%q", matches[0].Content)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && searchString(s, sub)
 }

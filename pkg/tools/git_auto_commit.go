@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/millken/deepai/pkg/llm"
@@ -39,7 +40,7 @@ Rules:
 func GitAutoCommitTool(provider llm.LLMProvider) models.Tool {
 	return models.Tool{
 		Name:        "git_auto_commit",
-		Description: "Generate a conventional commit message via AI, commit staged or specified files, and optionally push. Does NOT auto-stage all changes — pass explicit files or pre-stage with git_add.",
+		Description: "Generate a conventional commit message via AI, commit staged or specified files, and optionally push. Does NOT auto-stage all changes — pass explicit files or pre-stage with git_add. Supports author_name/author_email and set_upstream for environment-safe git automation.",
 		Groups:      []string{"workflow", "git"},
 		InputSchema: map[string]any{
 			"type": "object",
@@ -50,7 +51,10 @@ func GitAutoCommitTool(provider llm.LLMProvider) models.Tool {
 					"description": "Specific files to stage before committing. If empty, only commits what is already staged.",
 				},
 				"description": map[string]any{"type": "string", "description": "Brief context of what was done (e.g., 'Fix login bug')"},
-				"auto_push":   map[string]any{"type": "boolean", "description": "Push to remote after commit (default: false)"},
+				"author_name":  map[string]any{"type": "string", "description": "Optional git author/committer name override for environments without configured identity"},
+				"author_email": map[string]any{"type": "string", "description": "Optional git author/committer email override for environments without configured identity"},
+				"auto_push":    map[string]any{"type": "boolean", "description": "Push to remote after commit (default: false)"},
+				"set_upstream": map[string]any{"type": "boolean", "description": "Use --set-upstream/-u when pushing so the branch tracks the remote on first push"},
 				"working_dir": map[string]any{
 					"type":        "string",
 					"description": "Absolute path to the git repository. Defaults to the current working directory.",
@@ -67,14 +71,27 @@ func gitAutoCommitHandler(provider llm.LLMProvider) models.ToolHandler {
 		dir, _ := args["working_dir"].(string)
 		description, _ := args["description"].(string)
 		autoPush, _ := args["auto_push"].(bool)
+		setUpstream, _ := args["set_upstream"].(bool)
 		rawFiles, _ := args["files"].([]interface{})
+		baseDir, err := gitWorkingDir(dir)
+		if err != nil {
+			return toolResult(call, ""), err
+		}
 
 		// 1. Stage specific files if provided
 		if len(rawFiles) > 0 {
+			repoRoot, err := gitRepoRoot(ctx, dir)
+			if err != nil {
+				return toolResult(call, ""), fmt.Errorf("resolve git repo root: %w", err)
+			}
 			var files []string
 			for _, f := range rawFiles {
 				if s, ok := f.(string); ok && strings.TrimSpace(s) != "" {
-					files = append(files, s)
+					normalized, err := normalizeGitPath(repoRoot, baseDir, s)
+					if err != nil {
+						return toolResult(call, ""), err
+					}
+					files = append(files, normalized)
 				}
 			}
 			if len(files) == 0 {
@@ -127,8 +144,18 @@ func gitAutoCommitHandler(provider llm.LLMProvider) models.ToolHandler {
 			commitMessage = generateFallbackMessage(description, stagedFiles)
 		}
 
+		commitEnv, err := gitCommitEnv(args)
+		if err != nil {
+			return toolResult(call, ""), err
+		}
+		if len(commitEnv) == 0 {
+			if _, err := runGit(ctx, dir, "var", "GIT_AUTHOR_IDENT"); err != nil {
+				return toolResult(call, ""), fmt.Errorf("git commit failed: git user identity is not configured; provide author_name and author_email or configure git user.name/user.email")
+			}
+		}
+
 		// 5. Commit
-		commitOutput, err := runGit(ctx, dir, "commit", "-m", commitMessage)
+		commitOutput, err := runGitWithEnv(ctx, dir, commitEnv, "commit", "-m", commitMessage)
 		if err != nil {
 			return toolResult(call, ""), fmt.Errorf("git commit failed: %s: %w", commitOutput, err)
 		}
@@ -148,12 +175,18 @@ func gitAutoCommitHandler(provider llm.LLMProvider) models.ToolHandler {
 				return toolResult(call, string(data)), fmt.Errorf("commit succeeded but push failed: could not determine branch: %w", err)
 			}
 			branch := strings.TrimSpace(branchOutput)
-			pushOutput, err := runGit(ctx, dir, "push", "origin", branch)
+			pushArgs := []string{"push"}
+			if setUpstream {
+				pushArgs = append(pushArgs, "--set-upstream")
+			}
+			pushArgs = append(pushArgs, "origin", branch)
+			pushOutput, err := runGit(ctx, dir, pushArgs...)
 			if err != nil {
 				data, _ := json.Marshal(result)
 				return toolResult(call, string(data)), fmt.Errorf("commit succeeded but push failed: %s: %w", pushOutput, err)
 			}
 			result["pushed"] = true
+			result["set_upstream"] = setUpstream
 		}
 
 		data, _ := json.Marshal(result)
@@ -231,6 +264,65 @@ func generateFallbackMessage(description string, stagedFiles []string) string {
 	return fmt.Sprintf("%s: %d file(s)", description, len(stagedFiles))
 }
 
+func gitCommitEnv(args map[string]any) ([]string, error) {
+	authorName, _ := args["author_name"].(string)
+	authorEmail, _ := args["author_email"].(string)
+	authorName = strings.TrimSpace(authorName)
+	authorEmail = strings.TrimSpace(authorEmail)
+	if authorName == "" && authorEmail == "" {
+		return nil, nil
+	}
+	if authorName == "" || authorEmail == "" {
+		return nil, fmt.Errorf("author_name and author_email must be provided together")
+	}
+	return []string{
+		"GIT_AUTHOR_NAME=" + authorName,
+		"GIT_AUTHOR_EMAIL=" + authorEmail,
+		"GIT_COMMITTER_NAME=" + authorName,
+		"GIT_COMMITTER_EMAIL=" + authorEmail,
+	}, nil
+}
+
+func gitWorkingDir(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return os.Getwd()
+	}
+	return filepath.Abs(dir)
+}
+
+func gitRepoRoot(ctx context.Context, dir string) (string, error) {
+	output, err := runGit(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(strings.TrimSpace(output))
+}
+
+func normalizeGitPath(repoRoot, baseDir, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("file path is required")
+	}
+	path := raw
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, path)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve file path %q: %w", raw, err)
+	}
+	relPath, err := filepath.Rel(repoRoot, absPath)
+	if err != nil {
+		return "", fmt.Errorf("normalize file path %q: %w", raw, err)
+	}
+	relPath = filepath.Clean(relPath)
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("file %q is outside repository root %q", raw, repoRoot)
+	}
+	return filepath.ToSlash(relPath), nil
+}
+
 // cleanCommitMessage sanitizes LLM output into a valid one-line commit message.
 func cleanCommitMessage(s string) string {
 	msg := strings.TrimSpace(s)
@@ -260,9 +352,16 @@ func resolveGitModel() string {
 
 // runGit executes a git command with optional working directory.
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitWithEnv(ctx, dir, nil, args...)
+}
+
+func runGitWithEnv(ctx context.Context, dir string, env []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
+	}
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
 	output, err := cmd.CombinedOutput()
 	return string(output), err
