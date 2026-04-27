@@ -323,6 +323,7 @@ func ImageSearchTool() models.Tool {
 		Name:        "image_search",
 		Description: "Search for reference images online and return image URLs plus thumbnails.",
 		Groups:      []string{"builtin", "web"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -426,6 +427,7 @@ func WebFetchBatchTool() models.Tool {
 		Name:        "web_fetch_batch",
 		Description: "Fetches multiple web pages in parallel and returns results for all URLs.",
 		Groups:      []string{"builtin", "web"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

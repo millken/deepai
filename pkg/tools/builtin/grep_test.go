@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 func createTestTree(t *testing.T, files map[string]string) string {
@@ -220,6 +221,39 @@ func TestGrepHandler_MaxResults(t *testing.T) {
 	}
 	if !contains(result.Content, "results capped at 2") {
 		t.Errorf("expected cap notice, got: %s", result.Content)
+	}
+}
+
+func TestGrepHandler_ReturnsVirtualPaths(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+
+	threadID := "thread-grep-virtual"
+	base := filepath.Join(root, "threads", threadID, "user-data", "uploads")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "note.txt"), []byte("hello virtual"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	ctx := tools.WithThreadID(context.Background(), threadID)
+	result, err := GrepHandler(ctx, models.ToolCall{
+		ID:   "grep-virtual",
+		Name: "grep",
+		Arguments: map[string]any{
+			"pattern": "hello",
+			"path":    "/mnt/user-data/uploads",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "/mnt/user-data/uploads/note.txt:1:") {
+		t.Fatalf("content=%q want virtual path", result.Content)
+	}
+	if contains(result.Content, "/threads/"+threadID+"/user-data/") {
+		t.Fatalf("content=%q leaked internal path", result.Content)
 	}
 }
 

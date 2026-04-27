@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +58,19 @@ func TestWriteFileHandlerWritesToResolvedVirtualPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteFileHandler() error = %v", err)
 	}
+	if resultContent := strings.TrimSpace((func() string {
+		res, _ := WriteFileHandler(ctx, models.ToolCall{
+			ID:   "call-2b",
+			Name: "write_file",
+			Arguments: map[string]any{
+				"path":    "/mnt/user-data/uploads/out2.txt",
+				"content": "created",
+			},
+		})
+		return res.Content
+	})()); !strings.Contains(resultContent, "/mnt/user-data/uploads/out2.txt") {
+		t.Fatalf("content=%q want virtual path", resultContent)
+	}
 
 	data, err := os.ReadFile(filepath.Join(root, "threads", threadID, "user-data", "uploads", "out.txt"))
 	if err != nil {
@@ -64,6 +78,68 @@ func TestWriteFileHandlerWritesToResolvedVirtualPath(t *testing.T) {
 	}
 	if string(data) != "created" {
 		t.Fatalf("content=%q want created", string(data))
+	}
+}
+
+func TestReadFileHandlerResolvesACPWorkspaceVirtualPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+
+	threadID := "thread-read-acp"
+	target := filepath.Join(root, "threads", threadID, "acp-workspace", "out", "report.txt")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("from acp"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	ctx := tools.WithThreadID(context.Background(), threadID)
+	result, err := ReadFileHandler(ctx, models.ToolCall{
+		ID:   "call-acp-read",
+		Name: "read_file",
+		Arguments: map[string]any{
+			"path": "/mnt/acp-workspace/out/report.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReadFileHandler() error = %v", err)
+	}
+	if result.Content != "from acp" {
+		t.Fatalf("content=%q want %q", result.Content, "from acp")
+	}
+}
+
+func TestGlobHandlerReturnsVirtualPaths(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+
+	threadID := "thread-glob-virtual"
+	dir := filepath.Join(root, "threads", threadID, "user-data", "uploads")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	ctx := tools.WithThreadID(context.Background(), threadID)
+	result, err := GlobHandler(ctx, models.ToolCall{
+		ID:   "call-glob-virtual",
+		Name: "glob",
+		Arguments: map[string]any{
+			"pattern": "/mnt/user-data/uploads/*.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("GlobHandler() error = %v", err)
+	}
+	var matches []string
+	if err := json.Unmarshal([]byte(result.Content), &matches); err != nil {
+		t.Fatalf("unmarshal glob: %v", err)
+	}
+	if len(matches) != 1 || matches[0] != "/mnt/user-data/uploads/a.txt" {
+		t.Fatalf("matches=%v", matches)
 	}
 }
 

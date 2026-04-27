@@ -29,7 +29,8 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string and new_string are identical")
 	}
 
-	path = resolveVirtualPath(ctx, path)
+	displayPath := strings.TrimSpace(path)
+	path = resolveWritablePath(ctx, path)
 	replaceAll, _ := args["replace_all"].(bool)
 
 	data, err := os.ReadFile(path)
@@ -43,7 +44,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if !replaceAll && count > 1 {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
 				"old_string matches %d times in %s; provide more context to make it unique, or set replace_all=true",
-				count, path,
+				count, displayPath,
 			)
 		}
 		var updated string
@@ -58,7 +59,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{
 			CallID:   call.ID,
 			ToolName: call.Name,
-			Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s", count, path),
+			Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s", count, displayPath),
 		}, nil
 	}
 
@@ -71,7 +72,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			if !replaceAll && len(spans) > 1 {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
 					"old_string matches %d locations in %s after whitespace normalization; provide more context or set replace_all=true",
-					len(spans), path,
+					len(spans), displayPath,
 				)
 			}
 			updated := replaceSpans(content, spans, newStr, replaceAll)
@@ -85,12 +86,12 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			return models.ToolResult{
 				CallID:   call.ID,
 				ToolName: call.Name,
-				Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s (whitespace-tolerant match)", n, path),
+				Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s (whitespace-tolerant match)", n, displayPath),
 			}, nil
 		}
 	}
 
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string not found in %s", path)
+	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string not found in %s", displayPath)
 }
 
 // normalizeWhitespace collapses CRLF/CR to LF and runs of horizontal

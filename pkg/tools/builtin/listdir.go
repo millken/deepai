@@ -24,7 +24,7 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 	if strings.TrimSpace(path) == "" {
 		path = "."
 	}
-	path = resolveVirtualPath(ctx, path)
+	path = resolveReadablePath(ctx, path)
 
 	dirs, err := os.ReadDir(path)
 	if err != nil {

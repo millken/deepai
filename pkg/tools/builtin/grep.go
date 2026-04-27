@@ -28,7 +28,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	if strings.TrimSpace(path) == "" {
 		path = "."
 	}
-	path = resolveVirtualPath(ctx, path)
+	path = resolveReadablePath(ctx, path)
 
 	caseInsensitive := false
 	if v, ok := args["case_insensitive"].(bool); ok {
@@ -94,11 +94,14 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	}
 
 	var b strings.Builder
+	displayMatches := displayGrepMatches(ctx, matches)
 	if contextLines > 0 {
 		// Group matches by file and render with context lines
-		renderMatchesWithContext(&b, matches, contextLines)
+		renderMatchesWithContext(&b, matches, contextLines, func(path string) string {
+			return displayVirtualPath(ctx, path)
+		})
 	} else {
-		for _, m := range matches {
+		for _, m := range displayMatches {
 			fmt.Fprintf(&b, "%s:%d: %s\n", m.File, m.Line, m.Content)
 		}
 	}
@@ -113,7 +116,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		ToolName: call.Name,
 		Content:  b.String() + truncated,
 		Data: map[string]any{
-			"matches":     matches,
+			"matches":     displayMatches,
 			"truncated":   len(matches) == maxResults,
 			"max_results": maxResults,
 			"context":     contextLines,
@@ -212,7 +215,7 @@ func searchFile(path string, re *regexp.Regexp, limit int) ([]grepMatch, error) 
 }
 
 // renderMatchesWithContext groups matches by file and renders surrounding lines.
-func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLines int) {
+func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLines int, displayPath func(string) string) {
 	type fileRequest struct {
 		path    string
 		matches []grepMatch
@@ -261,10 +264,29 @@ func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLi
 			if prev > 0 && ln > prev+1 {
 				b.WriteString("...\n")
 			}
-			fmt.Fprintf(b, "%s:%d: %s\n", fr.path, ln, lines[ln-1])
+			shownPath := fr.path
+			if displayPath != nil {
+				shownPath = displayPath(fr.path)
+			}
+			fmt.Fprintf(b, "%s:%d: %s\n", shownPath, ln, lines[ln-1])
 			prev = ln
 		}
 	}
+}
+
+func displayGrepMatches(ctx context.Context, matches []grepMatch) []grepMatch {
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]grepMatch, len(matches))
+	for i, match := range matches {
+		out[i] = grepMatch{
+			File:    displayVirtualPath(ctx, match.File),
+			Line:    match.Line,
+			Content: match.Content,
+		}
+	}
+	return out
 }
 
 func readFileLines(path string) ([]string, error) {

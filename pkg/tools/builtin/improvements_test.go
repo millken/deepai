@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -121,8 +122,55 @@ func TestReadFileHandler_LineNumbersOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Content != "1\tx\n2\ty\n3\t\n" {
+	if res.Content != "1\tx\n2\ty\n" {
 		t.Fatalf("got %q", res.Content)
+	}
+}
+
+func TestReadFileHandler_ReversedOutOfRangeLineRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rev.txt")
+	if err := os.WriteFile(path, []byte("a\nb\nc\nd\ne\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReadFileHandler(context.Background(), models.ToolCall{
+		ID: "r", Name: "read_file",
+		Arguments: map[string]any{
+			"path":       path,
+			"start_line": float64(999),
+			"end_line":   float64(2),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "2\tb\n3\tc\n4\td\n5\te\n" {
+		t.Fatalf("got %q", res.Content)
+	}
+}
+
+func TestBashHandler_SeparatesStdoutAndStderr(t *testing.T) {
+	res, err := BashHandler(context.Background(), models.ToolCall{
+		ID: "b", Name: "bash",
+		Arguments: map[string]any{
+			"command": "printf out; printf err 1>&2",
+			"timeout": float64(5),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output BashOutput
+	if err := json.Unmarshal([]byte(res.Content), &output); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	if output.Stdout != "out" {
+		t.Fatalf("stdout=%q want %q", output.Stdout, "out")
+	}
+	if output.Stderr != "err" {
+		t.Fatalf("stderr=%q want %q", output.Stderr, "err")
+	}
+	if output.ExitCode != 0 {
+		t.Fatalf("exit_code=%d want 0", output.ExitCode)
 	}
 }
 

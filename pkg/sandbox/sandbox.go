@@ -446,9 +446,10 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 	}
 	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
 	execCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var buf bytes.Buffer
-	execCmd.Stdout = &buf
-	execCmd.Stderr = &buf
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	execCmd.Stdout = &stdoutBuf
+	execCmd.Stderr = &stderrBuf
 
 	if err := execCmd.Start(); err != nil {
 		return NewResult("", err.Error(), -1, time.Since(start), err), nil
@@ -466,5 +467,5 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		}
 	}
 
-	return NewResult(buf.String(), "", exitCode, duration, nil), nil
+	return NewResult(stdoutBuf.String(), stderrBuf.String(), exitCode, duration, nil), nil
 }

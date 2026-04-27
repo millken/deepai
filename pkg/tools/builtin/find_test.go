@@ -2,9 +2,13 @@ package builtin
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 func TestFindHandler_ByName(t *testing.T) {
@@ -208,5 +212,37 @@ func TestFindHandler_MaxResults(t *testing.T) {
 	}
 	if !contains(result.Content, "results capped at 2") {
 		t.Errorf("expected cap notice, got: %s", result.Content)
+	}
+}
+
+func TestFindHandler_ReturnsVirtualPaths(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+
+	threadID := "thread-find-virtual"
+	base := filepath.Join(root, "threads", threadID, "user-data", "uploads")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "one.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	ctx := tools.WithThreadID(context.Background(), threadID)
+	result, err := FindHandler(ctx, models.ToolCall{
+		ID:   "find-virtual",
+		Name: "find",
+		Arguments: map[string]any{
+			"path": "/mnt/user-data/uploads",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result.Content, "/mnt/user-data/uploads/one.txt") {
+		t.Fatalf("content=%q want virtual path", result.Content)
+	}
+	if strings.Contains(result.Content, "/threads/"+threadID+"/user-data/") {
+		t.Fatalf("content=%q leaked internal path", result.Content)
 	}
 }

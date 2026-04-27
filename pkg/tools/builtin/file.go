@@ -19,7 +19,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if !ok || strings.TrimSpace(path) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("path is required")
 	}
-	path = resolveVirtualPath(ctx, path)
+	path = resolveReadablePath(ctx, path)
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -29,13 +29,17 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	startLine, _ := args["start_line"].(float64)
 	endLine, _ := args["end_line"].(float64)
 	withLineNumbers, _ := args["line_numbers"].(bool)
+	text := string(data)
+	lines := splitFileLines(text)
 
 	// Line-range slicing takes precedence over byte limit; line numbers are
 	// implicitly enabled when a range is requested so the AI can refer back to
 	// specific lines for follow-up edits.
 	if startLine > 0 || endLine > 0 {
-		lines := strings.Split(string(data), "\n")
 		total := len(lines)
+		if total == 0 {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
+		}
 		s := int(startLine)
 		e := int(endLine)
 		if s <= 0 {
@@ -44,11 +48,20 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if e <= 0 || e > total {
 			e = total
 		}
+		if startLine > 0 && endLine > 0 && s > e {
+			s, e = e, s
+		}
+		if s < 1 {
+			s = 1
+		}
+		if e > total {
+			e = total
+		}
 		if s > total {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		if s > e {
-			s, e = e, s
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		selected := lines[s-1 : e]
 		var b strings.Builder
@@ -64,10 +77,14 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	if limit, ok := args["limit"].(float64); ok && limit > 0 && int(limit) < len(data) {
 		data = data[:int(limit)]
+		text = string(data)
+		lines = splitFileLines(text)
 	}
 
 	if withLineNumbers {
-		lines := strings.Split(string(data), "\n")
+		if len(lines) == 0 {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
+		}
 		width := numWidth(len(lines))
 		var b strings.Builder
 		for i, ln := range lines {
@@ -77,6 +94,17 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	}
 
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
+}
+
+func splitFileLines(text string) []string {
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if strings.HasSuffix(text, "\n") {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 // numWidth returns the number of decimal digits required to display n.
@@ -98,7 +126,8 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	if !ok || strings.TrimSpace(path) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("path is required")
 	}
-	path = resolveVirtualPath(ctx, path)
+	displayPath := strings.TrimSpace(path)
+	path = resolveWritablePath(ctx, path)
 	content, ok := args["content"].(string)
 	if !ok {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("content is required")
@@ -122,7 +151,7 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
 
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: fmt.Sprintf("Written %d bytes to %s", len(content), path)}, nil
+	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: fmt.Sprintf("Written %d bytes to %s", len(content), displayPath)}, nil
 }
 
 func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
@@ -131,9 +160,9 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	if !ok || strings.TrimSpace(pattern) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("pattern is required")
 	}
-	pattern = resolveVirtualPath(ctx, pattern)
+	pattern = resolveReadablePath(ctx, pattern)
 	if root, ok := args["root"].(string); ok && strings.TrimSpace(root) != "" {
-		root = resolveVirtualPath(ctx, root)
+		root = resolveReadablePath(ctx, root)
 		if !filepath.IsAbs(pattern) {
 			pattern = filepath.Join(root, pattern)
 		}
@@ -144,6 +173,9 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("glob failed: %w", err)
 	}
 
+	for i, match := range matches {
+		matches[i] = displayVirtualPath(ctx, match)
+	}
 	data, _ := json.Marshal(matches)
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
 }
@@ -218,7 +250,11 @@ func FileTools() []models.Tool {
 	}
 }
 
-func resolveVirtualPath(ctx context.Context, path string) string {
+func resolveReadablePath(ctx context.Context, path string) string {
+	return tools.ResolveVirtualPath(ctx, path)
+}
+
+func resolveWritablePath(ctx context.Context, path string) string {
 	path = strings.TrimSpace(path)
 	if !strings.HasPrefix(path, "/mnt/user-data/") {
 		return path
@@ -233,4 +269,49 @@ func resolveVirtualPath(ctx context.Context, path string) string {
 	}
 	suffix := strings.TrimPrefix(path, "/mnt/user-data/")
 	return filepath.Join(root, "threads", threadID, "user-data", filepath.FromSlash(suffix))
+}
+
+func displayVirtualPath(ctx context.Context, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	if virtual := displayVirtualUserDataPath(ctx, path); virtual != "" {
+		return virtual
+	}
+	threadID := tools.ThreadIDFromContext(ctx)
+	if threadID != "" {
+		if root, err := tools.ACPWorkspaceDir(threadID); err == nil {
+			if virtual := displayVirtualPathFromRoot(path, root, "/mnt/acp-workspace"); virtual != "" {
+				return virtual
+			}
+		}
+	}
+	return path
+}
+
+func displayVirtualUserDataPath(ctx context.Context, path string) string {
+	threadID := tools.ThreadIDFromContext(ctx)
+	if threadID == "" {
+		return ""
+	}
+	root := strings.TrimSpace(os.Getenv("DEEPAI_DATA_ROOT"))
+	if root == "" {
+		root = filepath.Join(os.TempDir(), "deepai-go-data")
+	}
+	userDataRoot := filepath.Join(root, "threads", threadID, "user-data")
+	return displayVirtualPathFromRoot(path, userDataRoot, "/mnt/user-data")
+}
+
+func displayVirtualPathFromRoot(path, root, virtualRoot string) string {
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	rel, err := filepath.Rel(cleanRoot, cleanPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return ""
+	}
+	if rel == "." {
+		return virtualRoot
+	}
+	return virtualRoot + "/" + filepath.ToSlash(rel)
 }

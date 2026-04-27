@@ -17,7 +17,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	if strings.TrimSpace(path) == "" {
 		path = "."
 	}
-	path = resolveVirtualPath(ctx, path)
+	path = resolveReadablePath(ctx, path)
 
 	name, _ := args["name"].(string)
 	fileType, _ := args["type"].(string)
@@ -66,7 +66,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 			}
 		}
 
-		results = append(results, fp)
+		results = append(results, displayVirtualPath(ctx, fp))
 		return nil
 	})
 	if err != nil {

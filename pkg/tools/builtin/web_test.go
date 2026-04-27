@@ -622,3 +622,17 @@ func TestNormalizedDuckDuckGoRegionDefaults(t *testing.T) {
 		t.Fatalf("normalizedDuckDuckGoRegion(\" US-EN \")=%q want %q", got, "us-en")
 	}
 }
+
+func TestWebToolsParallelSafe(t *testing.T) {
+	tools := []models.Tool{
+		WebSearchTool(),
+		WebFetchTool(),
+		ImageSearchTool(),
+		WebFetchBatchTool(),
+	}
+	for _, tool := range tools {
+		if !tool.ParallelSafe {
+			t.Fatalf("tool %q should be ParallelSafe", tool.Name)
+		}
+	}
+}
