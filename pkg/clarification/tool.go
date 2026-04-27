@@ -11,6 +11,13 @@ import (
 )
 
 func AskClarificationTool(manager *Manager) models.Tool {
+	return AskClarificationToolWithMode(manager, false)
+}
+
+// AskClarificationToolWithMode returns the clarification tool. When autonomous
+// is true, the tool short-circuits to best-judgment content even if a CLI
+// UserInteraction is attached, so unattended runs never block on stdin.
+func AskClarificationToolWithMode(manager *Manager, autonomous bool) models.Tool {
 	return models.Tool{
 		Name:        "ask_clarification",
 		Description: "Request clarification from the user when requirements are ambiguous or confirmation is required. In CLI mode, blocks until the user answers. In non-interactive mode, proceeds with best judgment.",
@@ -57,6 +64,17 @@ func AskClarificationTool(manager *Manager) models.Tool {
 					Status:   models.CallStatusFailed,
 					Error:    "question is required",
 				}, fmt.Errorf("question is required")
+			}
+
+			// Autonomous mode: never block on user input; the agent must proceed
+			// with its best judgment so the run can complete unattended.
+			if autonomous {
+				return models.ToolResult{
+					CallID:   call.ID,
+					ToolName: call.Name,
+					Status:   models.CallStatusCompleted,
+					Content:  "Autonomous mode: no user interaction. Proceed with your best judgment and document the assumption in your final answer.",
+				}, nil
 			}
 
 			// CLI mode: synchronous — ask user directly via stdin

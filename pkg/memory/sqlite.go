@@ -72,6 +72,7 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 			source TEXT NOT NULL DEFAULT '',
 			retrieval_count INTEGER NOT NULL DEFAULT 0,
 			helpful_count INTEGER NOT NULL DEFAULT 0,
+			suspect_count INTEGER NOT NULL DEFAULT 0,
 			created_at REAL NOT NULL,
 			updated_at REAL NOT NULL,
 			PRIMARY KEY (session_id, id)
@@ -88,6 +89,7 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 		"alter table memory_facts add column source text not null default ''",
 		"alter table memory_facts add column retrieval_count integer not null default 0",
 		"alter table memory_facts add column helpful_count integer not null default 0",
+		"alter table memory_facts add column suspect_count integer not null default 0",
 	} {
 		_, _ = s.db.ExecContext(ctx, ddl)
 	}
@@ -187,6 +189,28 @@ func (s *SQLiteStore) IncrementHelpfulCounts(ctx context.Context, sessionID stri
 	return int(n), nil
 }
 
+func (s *SQLiteStore) IncrementSuspectCounts(ctx context.Context, sessionID string, factIDs []string) (int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat(",?", len(factIDs)-1)
+	args := make([]any, 0, 1+len(factIDs))
+	args = append(args, sessionID)
+	for _, id := range factIDs {
+		args = append(args, id)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`update memory_facts set suspect_count = suspect_count + 1 where session_id = ? and id in (?`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("increment suspect counts for session %q: %w", sessionID, err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 func (s *SQLiteStore) upsertDocument(ctx context.Context, execer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }, doc Document) error {
@@ -220,9 +244,9 @@ func (s *SQLiteStore) insertFact(ctx context.Context, execer interface {
 		return err
 	}
 	_, err := execer.ExecContext(ctx, `
-		insert into memory_facts (session_id, id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, formatDBTime(fact.CreatedAt), formatDBTime(fact.UpdatedAt))
+		insert into memory_facts (session_id, id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.SuspectCount, formatDBTime(fact.CreatedAt), formatDBTime(fact.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("insert fact %q for session %q: %w", fact.ID, sessionID, err)
 	}
@@ -231,7 +255,7 @@ func (s *SQLiteStore) insertFact(ctx context.Context, execer interface {
 
 func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		select id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at
+		select id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at
 		from memory_facts
 		where session_id = ?
 		order by updated_at desc, id asc
@@ -248,7 +272,7 @@ func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, 
 			createdAt float64
 			updatedAt float64
 		)
-		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &fact.SuspectCount, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan facts for memory %q: %w", sessionID, err)
 		}
 		fact.CreatedAt = parseDBTime(createdAt)

@@ -27,6 +27,7 @@ const (
 	jobRecordSkillUsage             // direct skill usage fact
 	jobIncrementRetrieval           // atomic retrieval count bump
 	jobIncrementHelpful             // atomic helpful count bump
+	jobIncrementSuspect             // atomic suspect count bump (negative feedback)
 	jobUpdateScopeWithSkill         // user-scope update + skill usage combined
 	jobPreferenceUpdate             // preference extraction with dedup key "pref:"
 )
@@ -195,6 +196,8 @@ func (q *UpdateQueue) dedupKey(job updateJob) string {
 		return "skill:" + job.sessionID + ":" + job.skillName
 	case jobIncrementHelpful:
 		return "helpful:" + job.sessionID + ":" + fmt.Sprintf("%d", job.turnID)
+	case jobIncrementSuspect:
+		return "suspect:" + job.sessionID + ":" + fmt.Sprintf("%d", job.turnID)
 	case jobPreferenceUpdate:
 		return "pref:" + job.sessionID
 	case jobIncrementRetrieval:
@@ -285,6 +288,20 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 			q.svc.logger.Warn("increment helpful counts failed", "session", job.sessionID, "err", err)
 		} else if n > 0 {
 			q.svc.logger.Debug("helpful counts incremented",
+				"session", job.sessionID,
+				"turn", job.turnID,
+				"facts_updated", n,
+			)
+		}
+
+	case jobIncrementSuspect:
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		n, err := q.svc.storage.IncrementSuspectCounts(ctx, job.sessionID, job.factIDs)
+		if err != nil {
+			q.svc.logger.Warn("increment suspect counts failed", "session", job.sessionID, "err", err)
+		} else if n > 0 {
+			q.svc.logger.Debug("suspect counts incremented",
 				"session", job.sessionID,
 				"turn", job.turnID,
 				"facts_updated", n,
@@ -388,6 +405,23 @@ func (s *Service) ScheduleHelpfulIncrement(sessionID string, turnID int, factIDs
 	if s.queue != nil {
 		s.queue.submit(updateJob{
 			typ:       jobIncrementHelpful,
+			sessionID: sessionID,
+			factIDs:   factIDs,
+			turnID:    turnID,
+		})
+	}
+}
+
+// ScheduleSuspectIncrement enqueues a suspect count bump for facts that were
+// active during a turn that received negative user feedback. Turn-based dedup
+// avoids double-counting when feedback is processed multiple times in a turn.
+func (s *Service) ScheduleSuspectIncrement(sessionID string, turnID int, factIDs []string) {
+	if s == nil || s.storage == nil || len(factIDs) == 0 {
+		return
+	}
+	if s.queue != nil {
+		s.queue.submit(updateJob{
+			typ:       jobIncrementSuspect,
 			sessionID: sessionID,
 			factIDs:   factIDs,
 			turnID:    turnID,

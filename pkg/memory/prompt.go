@@ -165,6 +165,10 @@ func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens in
 		if fact.Content == "" {
 			continue
 		}
+		// Hard filter: facts with sustained negative feedback are removed entirely.
+		if fact.SuspectCount >= 3 {
+			continue
+		}
 		confidence := clamp01(fact.Confidence)
 		score := confidence
 		similarity := 0.0
@@ -181,6 +185,10 @@ func selectRelevantFacts(facts []Fact, currentContext string, remainingTokens in
 			if strings.HasPrefix(src, "skill:") && src != activeSource {
 				score *= 0.3
 			}
+		}
+		// Soft penalty for occasional negative feedback (1 or 2 suspect hits).
+		if fact.SuspectCount > 0 {
+			score *= 1.0 - 0.3*float64(fact.SuspectCount)
 		}
 		scored = append(scored, scoredFact{
 			fact:       fact,

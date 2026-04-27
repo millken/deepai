@@ -37,6 +37,7 @@ create table if not exists memory_facts (
 alter table memory_facts add column if not exists source text not null default '';
 alter table memory_facts add column if not exists retrieval_count integer not null default 0;
 alter table memory_facts add column if not exists helpful_count integer not null default 0;
+alter table memory_facts add column if not exists suspect_count integer not null default 0;
 
 create index if not exists idx_memory_facts_session_updated
 	on memory_facts(session_id, updated_at desc, id asc);
@@ -280,6 +281,21 @@ func (s *PostgresStore) IncrementHelpfulCounts(ctx context.Context, sessionID st
 	return int(tag.RowsAffected()), nil
 }
 
+func (s *PostgresStore) IncrementSuspectCounts(ctx context.Context, sessionID string, factIDs []string) (int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(factIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := s.db.Exec(ctx,
+		`update memory_facts set suspect_count = suspect_count + 1 where session_id = $1 and id = any($2)`,
+		sessionID, factIDs,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("increment suspect counts for session %q: %w", sessionID, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func upsertDocument(ctx context.Context, q interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }, doc Document) error {
@@ -314,9 +330,9 @@ func insertFact(ctx context.Context, q interface {
 		return err
 	}
 	_, err := q.Exec(ctx, `
-		insert into memory_facts (session_id, id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.CreatedAt, fact.UpdatedAt)
+		insert into memory_facts (session_id, id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, sessionID, fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.SuspectCount, fact.CreatedAt, fact.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("insert fact %q for session %q: %w", fact.ID, sessionID, err)
 	}
@@ -325,7 +341,7 @@ func insertFact(ctx context.Context, q interface {
 
 func (s *PostgresStore) listFacts(ctx context.Context, sessionID string) ([]Fact, error) {
 	rows, err := s.db.Query(ctx, `
-		select id, content, category, confidence, source, retrieval_count, helpful_count, created_at, updated_at
+		select id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at
 		from memory_facts
 		where session_id = $1
 		order by updated_at desc, id asc
@@ -338,7 +354,7 @@ func (s *PostgresStore) listFacts(ctx context.Context, sessionID string) ([]Fact
 	var facts []Fact
 	for rows.Next() {
 		var fact Fact
-		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
+		if err := rows.Scan(&fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &fact.SuspectCount, &fact.CreatedAt, &fact.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan facts for memory %q: %w", sessionID, err)
 		}
 		facts = append(facts, fact)

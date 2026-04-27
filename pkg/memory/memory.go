@@ -51,6 +51,7 @@ type Fact struct {
 	Source         string    `json:"source,omitempty"`
 	RetrievalCount int       `json:"retrieval_count,omitempty"`
 	HelpfulCount   int       `json:"helpful_count,omitempty"`
+	SuspectCount   int       `json:"suspect_count,omitempty"`
 	CreatedAt      time.Time `json:"created_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
@@ -69,6 +70,7 @@ type Storage interface {
 	Save(ctx context.Context, doc Document) error
 	IncrementRetrievalCounts(ctx context.Context, sessionID string, factIDs []string) error
 	IncrementHelpfulCounts(ctx context.Context, sessionID string, factIDs []string) (int, error)
+	IncrementSuspectCounts(ctx context.Context, sessionID string, factIDs []string) (int, error)
 }
 
 type Extractor interface {
@@ -654,6 +656,21 @@ func mergeFacts(existing, incoming []Fact, defaultSource string, now time.Time) 
 
 		if idx, ok := index[fact.ID]; ok {
 			current := merged[idx]
+			// Conflict detection: if the LLM rewrote the same fact ID with a
+			// substantially different content, archive the old version under a
+			// timestamped ID and demote it (low confidence + suspect bumps), so
+			// `selectRelevantFacts` either soft-penalizes or hard-filters it.
+			// This keeps the audit trail short-lived (eviction will eventually
+			// drop it) without growing schema or burying history.
+			if factContentDiffers(current.Content, fact.Content) {
+				archived := current
+				archived.ID = fmt.Sprintf("%s#prev%d", current.ID, now.UnixNano())
+				archived.Confidence = current.Confidence * 0.3
+				archived.SuspectCount = current.SuspectCount + 2
+				archived.UpdatedAt = now
+				index[archived.ID] = len(merged)
+				merged = append(merged, archived)
+			}
 			current.Content = fact.Content
 			if fact.Category != "" {
 				current.Category = fact.Category
@@ -698,6 +715,14 @@ func factScore(f Fact, now time.Time) float64 {
 	ageDays := now.Sub(f.UpdatedAt).Hours() / 24
 	recency := 1.0 / (1.0 + ageDays/30.0)
 	return confidence * (1.0 + helpfulRatio) * recency
+}
+
+// factContentDiffers reports whether two fact contents are substantially
+// different, ignoring whitespace and case. Used to detect LLM-induced
+// rewrites of the same fact ID so the prior version can be archived.
+func factContentDiffers(a, b string) bool {
+	return strings.ToLower(strings.Join(strings.Fields(a), " ")) !=
+		strings.ToLower(strings.Join(strings.Fields(b), " "))
 }
 
 // evictLowScoreFacts trims facts to MaxFactsPerSession by removing the lowest-scored.

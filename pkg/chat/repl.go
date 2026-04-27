@@ -41,6 +41,12 @@ type ReplConfig struct {
 	SessionRepo         models.SessionRepository // injected from outside
 }
 
+// memoryExtractInterval is the turn cadence for async memory extraction in CLI.
+// Set to 5: covers a typical short exchange in one batch while keeping LLM
+// extraction cost bounded. Compaction always flushes synchronously, so facts
+// are never lost across the context boundary.
+const memoryExtractInterval = 5
+
 // ChatRepl is the interactive chat REPL.
 type ChatRepl struct {
 	cfg               ReplConfig
@@ -507,7 +513,11 @@ EventLoop:
 	}
 
 	// Schedule memory update.
-	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
+	// Throttle: extract every memoryExtractInterval turns. Compaction performs a
+	// synchronous flush ([pkg/agent/react.go] CancelPendingUpdates+UpdateWith) so
+	// nothing is lost; this guard avoids paying for an LLM extraction call on every
+	// single turn while still capturing facts before context is compacted.
+	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil && r.turn%memoryExtractInterval == 0 {
 		r.cfg.MemoryService.ScheduleUpdateWith(r.sess.ID, r.sess.Messages, r.cfg.MemoryExtractor)
 	}
 
@@ -742,10 +752,15 @@ func (r *ChatRepl) evaluateFactFeedback(sessionID string, turn int, userMessage 
 		return
 	}
 	factIDs := r.cfg.MemoryService.LastRetrieved(sessionID)
-	if len(factIDs) == 0 || result.Classification != memory.FeedbackPositive {
+	if len(factIDs) == 0 {
 		return
 	}
-	r.cfg.MemoryService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+	switch result.Classification {
+	case memory.FeedbackPositive:
+		r.cfg.MemoryService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+	case memory.FeedbackNegative:
+		r.cfg.MemoryService.ScheduleSuspectIncrement(sessionID, turn, factIDs)
+	}
 }
 
 // monitorFalseReward checks if a positive classification was wrong by tracking

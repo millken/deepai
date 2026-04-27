@@ -4,6 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
@@ -14,11 +19,7 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/spf13/cobra"
-	"log/slog"
 	_ "modernc.org/sqlite"
-	"os"
-	"strings"
-	"time"
 )
 
 // Chat flags shared between root and chat subcommand.
@@ -112,7 +113,10 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Create tool registry.
 	registry := tools.NewRegistry()
-	registerChatTools(registry, provider)
+	registerChatTools(registry, provider, cfg.IsAutonomous())
+	if cfg.IsAutonomous() {
+		slog.Info("autonomous mode enabled: ask_clarification will not block")
+	}
 
 	// Load skills.
 	skillReg := skill.NewRegistry()
@@ -210,9 +214,9 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, provider llm.LLMProvider) {
+func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool) {
 	mustRegisterTool(registry, builtin.BashTool())
-	mustRegisterTool(registry, clarification.AskClarificationTool(nil))
+	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
 
 	// Subagent tools.
 	subExecutor := agent.NewSubagentExecutor(provider, registry, nil)

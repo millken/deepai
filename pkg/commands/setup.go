@@ -22,6 +22,16 @@ type Config struct {
 	ContextWindow int    `yaml:"context_window,omitempty"`
 	BaseURL       string `yaml:"base_url,omitempty"`
 	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes (default 30)
+	// Mode controls whether the agent stops to ask clarifying questions.
+	// Empty or "interactive" (default): the agent may use ask_clarification to
+	// block on user input. "autonomous": ask_clarification short-circuits to a
+	// best-judgment response so unattended runs never block.
+	Mode          string `yaml:"mode,omitempty"`
+}
+
+// IsAutonomous reports whether the configured mode skips user prompts.
+func (c Config) IsAutonomous() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Mode), "autonomous")
 }
 
 // providerInfo maps provider names to their API key env var and common models.

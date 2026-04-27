@@ -55,17 +55,32 @@ func TestMerge(t *testing.T) {
 	if got.History.LongTermBackground != "Maintains long-lived agent infrastructure." {
 		t.Fatalf("long term background = %q", got.History.LongTermBackground)
 	}
-	if len(got.Facts) != 2 {
+	if len(got.Facts) != 3 {
 		t.Fatalf("facts len = %d", len(got.Facts))
 	}
-	if got.Facts[0].ID != "pref-editor" || got.Facts[0].Content != "Prefers neovim" {
-		t.Fatalf("merged fact = %#v", got.Facts[0])
+	// Locate facts by ID since archive insertion changes ordering.
+	var live, project, archived *Fact
+	for i := range got.Facts {
+		switch {
+		case got.Facts[i].ID == "pref-editor":
+			live = &got.Facts[i]
+		case got.Facts[i].ID == "project-main":
+			project = &got.Facts[i]
+		case strings.HasPrefix(got.Facts[i].ID, "pref-editor#prev"):
+			archived = &got.Facts[i]
+		}
 	}
-	if got.Facts[0].Source != "session-1" {
-		t.Fatalf("merged fact source = %q", got.Facts[0].Source)
+	if live == nil || live.Content != "Prefers neovim" {
+		t.Fatalf("merged fact = %#v", live)
 	}
-	if got.Facts[1].Source != "session-1" {
-		t.Fatalf("new fact source = %q", got.Facts[1].Source)
+	if live.Source != "session-1" {
+		t.Fatalf("merged fact source = %q", live.Source)
+	}
+	if project == nil || project.Source != "session-1" {
+		t.Fatalf("new fact source = %#v", project)
+	}
+	if archived == nil || archived.Content != "Prefers vim" {
+		t.Fatalf("archived prev fact missing or wrong content: %#v", archived)
 	}
 }
 
@@ -762,6 +777,28 @@ func (f *fakeStorage) IncrementHelpfulCounts(_ context.Context, sessionID string
 	return updated, nil
 }
 
+func (f *fakeStorage) IncrementSuspectCounts(_ context.Context, sessionID string, factIDs []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	doc, ok := f.docs[sessionID]
+	if !ok {
+		return 0, nil
+	}
+	idSet := make(map[string]struct{}, len(factIDs))
+	for _, id := range factIDs {
+		idSet[id] = struct{}{}
+	}
+	updated := 0
+	for i := range doc.Facts {
+		if _, ok := idSet[doc.Facts[i].ID]; ok {
+			doc.Facts[i].SuspectCount++
+			updated++
+		}
+	}
+	f.docs[sessionID] = doc
+	return updated, nil
+}
+
 func (f *fakeStorage) Load(_ context.Context, sessionID string) (Document, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -818,7 +855,7 @@ func (f *fakeMemoryDB) Query(_ context.Context, sql string, args ...any) (rows, 
 		}
 		data := make([][]any, 0, len(doc.Facts))
 		for _, fact := range doc.Facts {
-			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.CreatedAt, fact.UpdatedAt})
+			data = append(data, []any{fact.ID, fact.Content, fact.Category, fact.Confidence, fact.Source, fact.RetrievalCount, fact.HelpfulCount, fact.SuspectCount, fact.CreatedAt, fact.UpdatedAt})
 		}
 		return &fakeRows{data: data}, nil
 	}
@@ -880,8 +917,9 @@ func (f *fakeMemoryTx) Exec(_ context.Context, sql string, arguments ...any) (pg
 			Source:         arguments[5].(string),
 			RetrievalCount: arguments[6].(int),
 			HelpfulCount:   arguments[7].(int),
-			CreatedAt:      arguments[8].(time.Time),
-			UpdatedAt:      arguments[9].(time.Time),
+			SuspectCount:   arguments[8].(int),
+			CreatedAt:      arguments[9].(time.Time),
+			UpdatedAt:      arguments[10].(time.Time),
 		})
 		f.db.memories[sessionID] = doc
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
