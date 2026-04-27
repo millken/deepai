@@ -79,6 +79,7 @@ func ListDirTool() models.Tool {
 		Name:        "list_dir",
 		Description: "List directory contents with file metadata. Shows files and subdirectories sorted (dirs first). Use this to understand project structure.",
 		Groups:      []string{"builtin", "file_ops"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

@@ -69,6 +69,11 @@ type Agent struct {
 	fullTools *tools.Registry // saved full tool set, restored on exit
 	workDir   string          // working directory for plan files
 	planFile  string          // path to the current plan file
+
+	// Diagnostic: warn at most once when the events channel overflows so the
+	// silent drop is visible in logs without flooding when the slow consumer
+	// stays slow for many events in a row.
+	eventDropWarned atomic.Bool
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -421,6 +426,78 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}, nil
 		}
 
+		// Tool calls execution.
+		// When ALL tool calls in this batch are declared ParallelSafe, run
+		// them concurrently and only serialize the surrounding event/message
+		// bookkeeping. A single non-parallel-safe call (bash, edit_file,
+		// skill, ...) forces the whole batch to run sequentially so mutating
+		// tools observe each other's effects deterministically.
+		if a.allParallelSafe(toolCalls) && len(toolCalls) > 1 {
+			runningCalls := make([]models.ToolCall, len(toolCalls))
+			for i, call := range toolCalls {
+				emit(AgentEvent{
+					Type:      AgentEventToolCall,
+					MessageID: aiMessageID,
+					ToolCall:  &call,
+					ToolEvent: newToolCallEvent(call, nil),
+				})
+				running := call
+				running.Status = models.CallStatusRunning
+				running.StartedAt = time.Now().UTC()
+				runningCalls[i] = running
+				emit(AgentEvent{
+					Type:      AgentEventToolCallStart,
+					ToolCall:  &running,
+					ToolEvent: newToolCallEvent(running, nil),
+				})
+			}
+			results := make([]models.ToolResult, len(toolCalls))
+			var wg sync.WaitGroup
+			for i, call := range toolCalls {
+				i, call := i, call
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					results[i] = a.runOneTool(ctx, sessionID, call)
+				}()
+			}
+			wg.Wait()
+			for i, call := range toolCalls {
+				result := results[i]
+				runMessages = append(runMessages, models.Message{
+					ID:         newMessageID("tool"),
+					SessionID:  sessionID,
+					Role:       models.RoleTool,
+					Content:    toolMessageContent(result),
+					ToolResult: &result,
+					CreatedAt:  time.Now().UTC(),
+				})
+				toolMessage := runMessages[len(runMessages)-1]
+				emit(AgentEvent{
+					Type:      AgentEventToolResult,
+					MessageID: toolMessage.ID,
+					Result:    &result,
+					ToolEvent: newToolEventFromResult(call, result),
+				})
+				completed := runningCalls[i]
+				completed.Status = result.Status
+				completed.CompletedAt = result.CompletedAt
+				emit(AgentEvent{
+					Type:      AgentEventToolCallEnd,
+					MessageID: toolMessage.ID,
+					ToolCall:  &completed,
+					Result:    &result,
+					ToolEvent: newToolEventFromResult(completed, result),
+				})
+			}
+			if err := ctx.Err(); err != nil {
+				err = normalizeRunError(ctx, err, a.requestTimeout)
+				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
+				return &RunResult{Messages: runMessages, Usage: usage}, err
+			}
+			continue
+		}
+
 		for _, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
@@ -438,27 +515,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				ToolEvent: newToolCallEvent(runningCall, nil),
 			})
 
-			toolStarted := time.Now().UTC()
-			toolCtx := tools.WithSandbox(ctx, a.sandbox)
-			toolCtx = tools.WithThreadID(toolCtx, sessionID)
-			if a.userInteraction != nil {
-				toolCtx = tools.WithUserInteraction(toolCtx, a.userInteraction)
-			}
-			result, err := a.tools.Execute(toolCtx, call)
-			if err != nil {
-				err = normalizeRunError(ctx, err, a.requestTimeout)
-				result = models.ToolResult{
-					CallID:      call.ID,
-					ToolName:    call.Name,
-					Status:      models.CallStatusFailed,
-					Error:       err.Error(),
-					CompletedAt: time.Now().UTC(),
-				}
-			}
-			result.Duration = time.Since(toolStarted)
-			if result.CompletedAt.IsZero() {
-				result.CompletedAt = time.Now().UTC()
-			}
+			result := a.runOneTool(ctx, sessionID, call)
 
 			// If a skill was loaded, inject its body into the system prompt
 			// so it doesn't need to be repeated in every turn's history.
@@ -549,6 +606,13 @@ func (a *Agent) emit(evt AgentEvent) {
 	select {
 	case a.events <- evt:
 	default:
+		// Buffer full — a slow consumer (renderer / HTTP client) is falling
+		// behind. We still drop to keep the agent live, but surface it once so
+		// the missing chunks aren't completely silent. Final assistant text is
+		// always re-emitted in AgentEventEnd.Text, so correctness is preserved.
+		if a.eventDropWarned.CompareAndSwap(false, true) {
+			a.logger.Warn("agent event channel full, dropping events", "event_type", evt.Type, "buffer_size", cap(a.events))
+		}
 	}
 }
 
@@ -799,6 +863,50 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, turn int, where 
 	}
 	a.logger.Warn("context overflow and compaction cannot reduce further", "where", where, "turn", turn, "messages", len(runMessages))
 	return runMessages, false
+}
+
+// runOneTool executes a single tool call with the standard sandbox/thread/UI
+// context plumbing and normalizes errors into a Failed ToolResult so callers
+// can treat success and failure uniformly.
+func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.ToolCall) models.ToolResult {
+	toolStarted := time.Now().UTC()
+	toolCtx := tools.WithSandbox(ctx, a.sandbox)
+	toolCtx = tools.WithThreadID(toolCtx, sessionID)
+	if a.userInteraction != nil {
+		toolCtx = tools.WithUserInteraction(toolCtx, a.userInteraction)
+	}
+	result, err := a.tools.Execute(toolCtx, call)
+	if err != nil {
+		err = normalizeRunError(ctx, err, a.requestTimeout)
+		result = models.ToolResult{
+			CallID:      call.ID,
+			ToolName:    call.Name,
+			Status:      models.CallStatusFailed,
+			Error:       err.Error(),
+			CompletedAt: time.Now().UTC(),
+		}
+	}
+	result.Duration = time.Since(toolStarted)
+	if result.CompletedAt.IsZero() {
+		result.CompletedAt = time.Now().UTC()
+	}
+	return result
+}
+
+// allParallelSafe reports whether every call in the batch resolves to a
+// registered tool that has declared ParallelSafe=true. Unknown tools and any
+// false flag short-circuit to false so the safe (sequential) path is taken.
+func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {
+	if a.tools == nil {
+		return false
+	}
+	for _, c := range calls {
+		t := a.tools.Get(c.Name)
+		if t == nil || !t.ParallelSafe {
+			return false
+		}
+	}
+	return true
 }
 
 func newAgentError(err error) *AgentError {

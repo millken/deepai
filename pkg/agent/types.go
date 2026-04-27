@@ -39,7 +39,11 @@ type AgentConfig struct {
 	Temperature     *float64
 	MaxTokens       *int
 	Sandbox         *sandbox.Sandbox
-	RequestTimeout  time.Duration
+	// RequestTimeout bounds the *entire* Run (all turns + tool calls).
+	// Despite the name it is run-level, not per-request. A long multi-turn
+	// task that legitimately needs hours should set this to 0 only via a
+	// caller that imposes its own ctx deadline. Default: 10 minutes.
+	RequestTimeout time.Duration
 
 	// Context compaction
 	ContextWindow       int     // model context window in tokens; 0 = no compaction

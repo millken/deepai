@@ -203,6 +203,10 @@ func (q *UpdateQueue) dedupKey(job updateJob) string {
 	case jobIncrementRetrieval:
 		// Don't dedup retrieval increments — accumulate them.
 		return ""
+	case jobUpdateScopeWithSkill:
+		// Skill usage is a deterministic side effect that must not be
+		// dropped by a later plain Update for the same session.
+		return "update-skill:" + job.sessionID + ":" + job.skillName
 	default:
 		return "update:" + job.sessionID
 	}

@@ -87,6 +87,7 @@ func ViewImageTool() models.Tool {
 		Name:        "view_image",
 		Description: "Load an image file so the agent can inspect it in a later model turn.",
 		Groups:      []string{"builtin", "image"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

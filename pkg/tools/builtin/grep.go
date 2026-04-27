@@ -56,6 +56,8 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		contextLines = int(v)
 	}
 
+	includeHidden, _ := args["include_hidden"].(bool)
+
 	re, err := compileGrepPattern(pattern, caseInsensitive)
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("invalid pattern: %w", err)
@@ -74,7 +76,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		}
 		matches = fileMatches
 	} else {
-		matches, err = searchDir(path, re, extFilter, globPatterns, maxResults)
+		matches, err = searchDir(path, re, extFilter, globPatterns, maxResults, includeHidden)
 		if err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 		}
@@ -121,7 +123,7 @@ func compileGrepPattern(pattern string, caseInsensitive bool) (*regexp.Regexp, e
 	return regexp.Compile(flags + pattern)
 }
 
-func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPatterns []string, maxResults int) ([]grepMatch, error) {
+func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPatterns []string, maxResults int, includeHidden bool) ([]grepMatch, error) {
 	var matches []grepMatch
 
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -132,17 +134,17 @@ func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPa
 			return filepath.SkipDir
 		}
 
-		// Skip hidden dirs and common non-code dirs (but not the root itself)
+		// Skip hidden / vendor dirs unless explicitly opted in.
 		if d.IsDir() && path != root {
 			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == "__pycache__" || strings.HasPrefix(name, ".") {
+			if !includeHidden && (name == ".git" || name == "node_modules" || name == "vendor" || name == "__pycache__" || strings.HasPrefix(name, ".")) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// Skip binary-ish files and hidden files
-		if strings.HasPrefix(d.Name(), ".") {
+		// Skip binary-ish files; skip dotfiles unless include_hidden is set.
+		if !includeHidden && strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		if isBinaryExt(filepath.Ext(d.Name())) {
@@ -286,6 +288,7 @@ func GrepTool() models.Tool {
 		Name:        "grep",
 		Description: "Search file contents by regex pattern. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
 		Groups:      []string{"builtin", "file_ops"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -294,6 +297,7 @@ func GrepTool() models.Tool {
 				"type":             map[string]any{"type": "string", "description": "Filter by file type: go, py, js, ts, java, rust, c, cpp, rb, php, rs, sql, sh, html, css, json, yaml, xml, md, proto"},
 				"glob":             map[string]any{"type": "string", "description": "Filter files by glob pattern (e.g. *.txt). Use 'type' instead for common languages."},
 				"case_insensitive": map[string]any{"type": "boolean", "description": "Case-insensitive search (default: false)"},
+				"include_hidden":   map[string]any{"type": "boolean", "description": "Search inside .git/.github/vendor/node_modules/__pycache__ and dotfiles"},
 				"context":          map[string]any{"type": "number", "description": "Number of context lines before and after each match (default: 0)"},
 				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 100)"},
 			},

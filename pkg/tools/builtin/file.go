@@ -26,11 +26,70 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("read failed: %w", err)
 	}
 
+	startLine, _ := args["start_line"].(float64)
+	endLine, _ := args["end_line"].(float64)
+	withLineNumbers, _ := args["line_numbers"].(bool)
+
+	// Line-range slicing takes precedence over byte limit; line numbers are
+	// implicitly enabled when a range is requested so the AI can refer back to
+	// specific lines for follow-up edits.
+	if startLine > 0 || endLine > 0 {
+		lines := strings.Split(string(data), "\n")
+		total := len(lines)
+		s := int(startLine)
+		e := int(endLine)
+		if s <= 0 {
+			s = 1
+		}
+		if e <= 0 || e > total {
+			e = total
+		}
+		if s > total {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
+		}
+		if s > e {
+			s, e = e, s
+		}
+		selected := lines[s-1 : e]
+		var b strings.Builder
+		// Range mode always renders line numbers so follow-up edits can
+		// reference exact positions.
+		_ = withLineNumbers
+		width := numWidth(e)
+		for i, ln := range selected {
+			fmt.Fprintf(&b, "%*d\t%s\n", width, s+i, ln)
+		}
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
+	}
+
 	if limit, ok := args["limit"].(float64); ok && limit > 0 && int(limit) < len(data) {
 		data = data[:int(limit)]
 	}
 
+	if withLineNumbers {
+		lines := strings.Split(string(data), "\n")
+		width := numWidth(len(lines))
+		var b strings.Builder
+		for i, ln := range lines {
+			fmt.Fprintf(&b, "%*d\t%s\n", width, i+1, ln)
+		}
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
+	}
+
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
+}
+
+// numWidth returns the number of decimal digits required to display n.
+func numWidth(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	w := 0
+	for n > 0 {
+		w++
+		n /= 10
+	}
+	return w
 }
 
 func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
@@ -49,8 +108,9 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("mkdir failed: %w", err)
 	}
+	perm := filePerm(path, 0644)
 	if appendMode {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, perm)
 		if err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("open failed: %w", err)
 		}
@@ -58,7 +118,7 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		if _, err := file.WriteString(content); err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("append failed: %w", err)
 		}
-	} else if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	} else if err := os.WriteFile(path, []byte(content), perm); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
 
@@ -90,9 +150,10 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 
 func GlobTool() models.Tool {
 	return models.Tool{
-		Name:        "glob",
-		Description: "List files matching a glob pattern.",
-		Groups:      []string{"builtin", "file_ops"},
+		Name:         "glob",
+		Description:  "List files matching a glob pattern.",
+		Groups:       []string{"builtin", "file_ops"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -107,14 +168,18 @@ func GlobTool() models.Tool {
 
 func ReadFileTool() models.Tool {
 	return models.Tool{
-		Name:        "read_file",
-		Description: "Read the contents of a file.",
-		Groups:      []string{"builtin", "file_ops"},
+		Name:         "read_file",
+		Description:  "Read a file. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number.",
+		Groups:       []string{"builtin", "file_ops"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":  map[string]any{"type": "string", "description": "File path to read"},
-				"limit": map[string]any{"type": "number", "description": "Maximum bytes to read"},
+				"path":         map[string]any{"type": "string", "description": "File path to read"},
+				"start_line":   map[string]any{"type": "number", "description": "1-based inclusive start line; enables line-range mode"},
+				"end_line":     map[string]any{"type": "number", "description": "1-based inclusive end line; pairs with start_line"},
+				"line_numbers": map[string]any{"type": "boolean", "description": "Prefix each line with its 1-based line number (auto when range is set)"},
+				"limit":        map[string]any{"type": "number", "description": "Maximum bytes to read (ignored when range is set)"},
 			},
 			"required": []any{"path"},
 		},

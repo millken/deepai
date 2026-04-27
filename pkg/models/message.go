@@ -166,6 +166,12 @@ type Tool struct {
 	InputSchema map[string]any `json:"input_schema,omitempty"`
 	Groups      []string       `json:"groups,omitempty"`
 	Handler     ToolHandler    `json:"-"`
+	// ParallelSafe declares the tool can be executed concurrently with
+	// other parallel-safe tools when the model emits multiple tool_calls in
+	// a single turn. Read-only operations (file reads, search, fetch) set
+	// this to true. Mutating tools (bash, edit_file, write_file) leave it
+	// false so they execute sequentially and observe each other's effects.
+	ParallelSafe bool `json:"-"`
 }
 
 // Validate checks whether the tool definition is ready for registration.

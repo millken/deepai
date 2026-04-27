@@ -377,12 +377,18 @@ func (s *Server) evaluateFactFeedback(existingMessages []models.Message, userMes
 	}
 	ps.CheckLanguageSwitch(userMessage)
 
-	// HelpfulCount increment requires factIDs from previous injection.
+	// Feedback requires factIDs from previous injection. Positive bumps
+	// HelpfulCount, negative bumps SuspectCount; neutral skips both.
 	factIDs := s.memService.LastRetrieved(sessionID)
-	if len(factIDs) == 0 || result.Classification != memory.FeedbackPositive {
+	if len(factIDs) == 0 {
 		return turn
 	}
-	s.memService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+	switch result.Classification {
+	case memory.FeedbackPositive:
+		s.memService.ScheduleHelpfulIncrement(sessionID, turn, factIDs)
+	case memory.FeedbackNegative:
+		s.memService.ScheduleSuspectIncrement(sessionID, turn, factIDs)
+	}
 
 	return turn
 }

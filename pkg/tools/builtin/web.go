@@ -286,6 +286,7 @@ func WebSearchTool() models.Tool {
 		Name:        "web_search",
 		Description: "Search the web for current information and return relevant results.",
 		Groups:      []string{"builtin", "web"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -303,6 +304,7 @@ func WebFetchTool() models.Tool {
 		Name:        "web_fetch",
 		Description: "Fetch the contents of a web page URL and return a readable text summary. Uses readability extraction to get clean article content.",
 		Groups:      []string{"builtin", "web"},
+		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

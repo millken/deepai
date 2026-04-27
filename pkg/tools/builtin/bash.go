@@ -19,7 +19,9 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("command is required")
 	}
 
-	timeout := 60 * time.Second
+	// Default timeout is generous to cover common build/test commands without
+	// forcing the AI to set timeout explicitly every call.
+	timeout := 300 * time.Second
 	if t, ok := args["timeout"].(float64); ok && t > 0 {
 		timeout = time.Duration(t) * time.Second
 	}
@@ -53,7 +55,7 @@ func BashTool() models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{"type": "string", "description": "Shell command to execute"},
-				"timeout": map[string]any{"type": "number", "description": "Timeout in seconds (default 60)"},
+				"timeout": map[string]any{"type": "number", "description": "Timeout in seconds (default 300)"},
 			},
 			"required": []any{"command"},
 		},
