@@ -43,8 +43,9 @@ func registerResumeFlag(cmd *cobra.Command) {
 
 func addChat(topLevel *cobra.Command) {
 	cmd := &cobra.Command{
-		Use:   "chat",
-		Short: "Start an interactive chat session",
+		Use:    "chat",
+		Short:  "Start an interactive chat session",
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxTurns)
 		},
@@ -100,7 +101,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		cfg.ContextWindow = 128000
 	}
 
-	slog.Info("chat config",
+	slog.Debug("chat config",
 		"provider", cfg.Provider,
 		"model", modelName,
 		"base_url", cfg.BaseURL,
@@ -138,7 +139,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		if err := registry.Register(skill.SkillToolWithRegistry(skillReg)); err != nil {
 			slog.Warn("register skill tool failed", "err", err)
 		}
-		slog.Info("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
+		slog.Debug("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
 	// Open unified SQLite database.
@@ -166,7 +167,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	}
 	memExtractor = memory.NewLLMClient(provider, modelName)
 	prefExtractor = memory.NewPreferenceExtractor(provider, modelName)
-	slog.Info("memory service enabled", "store", dbPath)
+	slog.Debug("memory service enabled", "store", dbPath)
 
 	// Handle -r with no argument: interactive picker.
 	if resume == resumePickerSentinel {
@@ -215,6 +216,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		MemoryExtractor:     memExtractor,
 		PreferenceExtractor: prefExtractor,
 		SessionRepo:         sessStore,
+		InputHistoryFile:    InputHistoryFile(),
 	}
 
 	repl, err := chat.NewRepl(replCfg)

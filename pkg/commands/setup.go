@@ -81,17 +81,29 @@ func addSetup(topLevel *cobra.Command) {
 		&cobra.Command{
 			Use:   "provider",
 			Short: "Configure LLM provider and API key",
-			RunE:  runSetupProvider,
+			Long: `Interactive wizard to select an LLM provider (e.g. anthropic, openai, deepseek)
+and configure its API key. The key is saved to ~/.deepai/.env, the provider
+name is written to ~/.deepai/config.yaml.`,
+			Example: "  deepai setup provider",
+			RunE: runSetupProvider,
 		},
 		&cobra.Command{
 			Use:   "model",
 			Short: "Configure model name",
-			RunE:  runSetupModel,
+			Long: `Interactive wizard to pick or enter a model name for the configured provider.
+The model name is written to ~/.deepai/config.yaml and used as the default
+for every chat session unless overridden with -m.`,
+			Example: "  deepai setup model",
+			RunE: runSetupModel,
 		},
 		&cobra.Command{
 			Use:   "database",
-			Short: "Configure database for memory",
-			RunE:  runSetupDatabase,
+			Short: "Configure external database URL",
+			Long: `Optionally set an external PostgreSQL database URL for session and memory
+storage. Leave blank to keep using the default local SQLite database at
+~/.deepai/deepai.db.`,
+			Example: "  deepai setup database",
+			RunE: runSetupDatabase,
 		},
 	)
 

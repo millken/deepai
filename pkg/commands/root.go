@@ -16,7 +16,7 @@ func New() *cobra.Command {
 	var verbose bool
 	root := &cobra.Command{
 		Use:               "deepai",
-		Short:             "deepai tools",
+		Short:             "AI coding assistant powered by LLMs",
 		SilenceUsage:      true, // Don't show usage on errors
 		DisableAutoGenTag: true,
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
@@ -52,6 +52,7 @@ func New() *cobra.Command {
 		},
 	}
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable debug logs")
+	root.CompletionOptions.HiddenDefaultCmd = true
 
 	RegisterChatFlags(root)
 	AddCommands(root)

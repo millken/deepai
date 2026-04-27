@@ -46,6 +46,11 @@ func DBFile() string {
 	return filepath.Join(Home(), "deepai.db")
 }
 
+// InputHistoryFile returns the path to the CLI input history file.
+func InputHistoryFile() string {
+	return filepath.Join(Home(), "input_history")
+}
+
 // LogsDir returns the path to the logs directory.
 func LogsDir() string {
 	return filepath.Join(Home(), "logs")

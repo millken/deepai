@@ -40,6 +40,7 @@ type ReplConfig struct {
 	MemoryExtractor     memory.Extractor
 	PreferenceExtractor memory.Extractor
 	SessionRepo         models.SessionRepository // injected from outside
+	InputHistoryFile    string                   // path for persisting input history (optional)
 }
 
 // memoryExtractInterval is the turn cadence for async memory extraction in CLI.
@@ -69,19 +70,24 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 		return nil, fmt.Errorf("sandbox init: %w", err)
 	}
 
-	return &ChatRepl{
+	repl := &ChatRepl{
 		cfg:       cfg,
 		renderer:  NewRenderer(os.Stderr),
 		input:     NewInputHandler(),
 		sessMgr:   cfg.SessionRepo,
 		sb:        sb,
 		prefSched: memory.NewPreferenceScheduler(),
-	}, nil
+	}
+	if cfg.InputHistoryFile != "" {
+		repl.input.LoadHistoryFile(cfg.InputHistoryFile)
+	}
+	return repl, nil
 }
 
 // Run starts the REPL loop. It handles both interactive and single-query modes.
 func (r *ChatRepl) Run(parentCtx context.Context) error {
 	defer r.sb.Close()
+	defer r.input.SaveHistoryFile()
 	defer func() {
 		if r.cfg.MemoryService != nil {
 			r.cfg.MemoryService.CleanupStale(time.Hour)
@@ -646,6 +652,13 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	case "run", "code":
 		r.planMode = false
 		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
+	case "model":
+		if cmd.Args == "" {
+			fmt.Fprintf(os.Stderr, "  Current model: %s\n", r.cfg.Model)
+			return false
+		}
+		r.cfg.Model = cmd.Args
+		fmt.Fprintf(os.Stderr, "  Model changed to: %s\n  (takes effect on next turn)\n", r.cfg.Model)
 	default:
 		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
 		printSlashHelp()
@@ -711,6 +724,7 @@ func printSlashHelp() {
 	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
 	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
 	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
+	fmt.Fprintln(os.Stderr, "    /model     Show current model (/model <name> to switch)")
 	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
 	fmt.Fprintln(os.Stderr)
 }

@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -24,8 +25,9 @@ var errInterrupted = errors.New("interrupted")
 
 // InputHandler reads user input from stdin using a bubbletea textarea.
 type InputHandler struct {
-	styles  Styles
-	history []string // newest-first, capped at maxHistory
+	styles      Styles
+	history     []string // newest-first, capped at maxHistory
+	historyPath string   // file to persist history across sessions
 }
 
 const maxHistory = 200
@@ -36,6 +38,52 @@ func NewInputHandler() *InputHandler {
 	return &InputHandler{
 		styles: DefaultStyles(),
 	}
+}
+
+// LoadHistoryFile loads history from a file into the handler.
+// Lines are stored newest-first after loading.
+// Errors are silently ignored (missing file is normal on first run).
+func (h *InputHandler) LoadHistoryFile(path string) {
+	h.historyPath = path
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if line := sc.Text(); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	// File is oldest-first; reverse to newest-first and cap.
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	if len(lines) > maxHistory {
+		lines = lines[:maxHistory]
+	}
+	h.history = lines
+}
+
+// SaveHistoryFile writes the current history to the file set by LoadHistoryFile.
+// Errors are silently ignored.
+func (h *InputHandler) SaveHistoryFile() {
+	if h.historyPath == "" || len(h.history) == 0 {
+		return
+	}
+	f, err := os.OpenFile(h.historyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	// Write oldest-first so LoadHistoryFile can reverse back.
+	for i := len(h.history) - 1; i >= 0; i-- {
+		_, _ = fmt.Fprintln(w, h.history[i])
+	}
+	_ = w.Flush()
 }
 
 // ReadPrompt reads user input using a bubbletea textarea.

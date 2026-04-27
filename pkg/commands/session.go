@@ -57,8 +57,8 @@ func cmdSessionList() *cobra.Command {
 			}
 
 			// Print table header.
-			fmt.Fprintf(os.Stderr, "  %-25s %-40s %5s %s\n", "ID", "TITLE", "MSGS", "CREATED")
-			fmt.Fprintln(os.Stderr, "  "+dashes(25)+" "+dashes(40)+" "+dashes(5)+" "+dashes(19))
+			fmt.Fprintf(os.Stdout, "  %-25s %-40s %5s %s\n", "ID", "TITLE", "MSGS", "CREATED")
+			fmt.Fprintln(os.Stdout, "  "+dashes(25)+" "+dashes(40)+" "+dashes(5)+" "+dashes(19))
 			for _, m := range metas {
 				title := m.Title
 				if title == "" {
@@ -66,7 +66,7 @@ func cmdSessionList() *cobra.Command {
 				}
 				title = chat.Truncate(title, 40)
 				created := m.CreatedAt.Format("2006-01-02 15:04")
-				fmt.Fprintf(os.Stderr, "  %-25s %-40s %5d %s\n", m.ID, title, m.MsgCount, created)
+				fmt.Fprintf(os.Stdout, "  %-25s %-40s %5d %s\n", m.ID, title, m.MsgCount, created)
 			}
 			return nil
 		},
@@ -102,23 +102,33 @@ func cmdSessionShow() *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(os.Stderr, "ID:         %s\n", sess.ID)
-			fmt.Fprintf(os.Stderr, "Title:      %s\n", sess.Title)
-			fmt.Fprintf(os.Stderr, "Created:    %s\n", sess.CreatedAt.Format("2006-01-02 15:04:05"))
-			fmt.Fprintf(os.Stderr, "Messages:   %d\n", len(msgs))
+			fmt.Fprintf(os.Stdout, "ID:         %s\n", sess.ID)
+			fmt.Fprintf(os.Stdout, "Title:      %s\n", sess.Title)
+			model := sess.Metadata["model"]
+			if model == "" {
+				model = "-"
+			}
+			fmt.Fprintf(os.Stdout, "Model:      %s\n", model)
+			fmt.Fprintf(os.Stdout, "State:      %s\n", sess.State)
+			fmt.Fprintf(os.Stdout, "Created:    %s\n", sess.CreatedAt.Format("2006-01-02 15:04:05"))
+			fmt.Fprintf(os.Stdout, "Messages:   %d\n", len(msgs))
 
 			displayMsgs := msgs
 			if !full && len(displayMsgs) > 5 {
 				displayMsgs = displayMsgs[len(displayMsgs)-5:]
 			}
-			fmt.Fprintln(os.Stderr, "\n--- Messages ---")
+			fmt.Fprintln(os.Stdout, "\n--- Messages ---")
+			maxLen := 200
+			if full {
+				maxLen = 2000
+			}
 			for _, m := range displayMsgs {
 				tag := string(m.Role)
 				content := m.Content
-				if len(content) > 200 {
-					content = content[:200] + "..."
+				if len(content) > maxLen {
+					content = content[:maxLen] + "..."
 				}
-				fmt.Fprintf(os.Stderr, "  [%s] %s\n", tag, content)
+				fmt.Fprintf(os.Stdout, "  [%s] %s\n", tag, content)
 			}
 			return nil
 		},
@@ -165,9 +175,16 @@ func cmdSessionRename() *cobra.Command {
 func cmdSessionExport() *cobra.Command {
 	var sessionID string
 	cmd := &cobra.Command{
-		Use:   "export <OUTPUT>",
+		Use:   "export <OUTPUT|->",
 		Short: "Export sessions to JSONL",
-		Args:  cobra.ExactArgs(1),
+		Long: `Export all sessions (or a single session) to JSONL format.
+Use '-' as OUTPUT to write to stdout.
+
+Each line is a JSON-encoded message object.`,
+		Example: `  deepai session export sessions.jsonl
+  deepai session export -
+  deepai session export - --session-id 20260420_160729_d9d1`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, cleanup, err := openSessionRepo()
 			if err != nil {
@@ -322,7 +339,10 @@ func cmdSessionPrune() *cobra.Command {
 	var dryRun bool
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Delete old completed sessions",
+		Short: "Delete sessions older than N days",
+		Long: `Delete sessions that are older than --older-than days (default 90).
+Use --dry-run to preview the count without deleting anything.
+Use -y to skip the confirmation prompt.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, cleanup, err := openSessionRepo()
 			if err != nil {
@@ -391,13 +411,13 @@ func cmdSessionStats() *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(os.Stderr, "  Sessions:   %d\n", stats.SessionCount)
-			fmt.Fprintf(os.Stderr, "  Messages:   %d\n", stats.MessageCount)
+			fmt.Fprintf(os.Stdout, "  Sessions:   %d\n", stats.SessionCount)
+			fmt.Fprintf(os.Stdout, "  Messages:   %d\n", stats.MessageCount)
 			if !stats.OldestAt.IsZero() {
-				fmt.Fprintf(os.Stderr, "  Oldest:     %s\n", stats.OldestAt.Format("2006-01-02"))
+				fmt.Fprintf(os.Stdout, "  Oldest:     %s\n", stats.OldestAt.Format("2006-01-02"))
 			}
 			if !stats.LatestAt.IsZero() {
-				fmt.Fprintf(os.Stderr, "  Latest:     %s\n", stats.LatestAt.Format("2006-01-02 15:04"))
+				fmt.Fprintf(os.Stdout, "  Latest:     %s\n", stats.LatestAt.Format("2006-01-02 15:04"))
 			}
 			return nil
 		},
