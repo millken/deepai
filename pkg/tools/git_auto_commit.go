@@ -26,11 +26,10 @@ Rules:
 6. Language: use the same language as the code comments and existing commit messages`
 )
 
-// GitAutoCommitTool returns a workflow tool that generates a conventional commit
-// message via LLM, commits, and optionally pushes.
+// GitAutoCommitTool generates a conventional commit message via LLM, commits,
+// and optionally pushes.
 //
-// This is a higher-order workflow (not a pure git adapter). It explicitly depends
-// on llm.LLMProvider — the caller decides which provider to inject.
+// It explicitly depends on llm.LLMProvider — the caller decides which provider to inject.
 //
 // Behavior:
 //   - If "files" is specified: verifies no extraneous pre-staged content exists,
@@ -41,7 +40,7 @@ func GitAutoCommitTool(provider llm.LLMProvider) models.Tool {
 	return models.Tool{
 		Name:        "git_auto_commit",
 		Description: "Generate a conventional commit message via AI, commit staged or specified files, and optionally push. Does NOT auto-stage all changes — pass explicit files or pre-stage with git_add. Supports author_name/author_email and set_upstream for environment-safe git automation.",
-		Groups:      []string{"workflow", "git"},
+		Groups:      []string{"git"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
