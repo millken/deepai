@@ -494,7 +494,10 @@ EventLoop:
 		r.planMode = false
 	}
 
-	// Auto-title generation after first turn (synchronous to guarantee completion).
+	// Auto-title generation after first turn. Run asynchronously so the user
+	// can keep typing while the title LLM call is in flight; a missed title
+	// (e.g. REPL exits before goroutine returns) is acceptable since the user
+	// can always rename via /title.
 	if r.turn == 1 && r.sess.Title == "" {
 		sessionID := r.sess.ID
 		var firstUserMsg string
@@ -504,7 +507,7 @@ EventLoop:
 				break
 			}
 		}
-		r.generateTitle(sessionID, firstUserMsg)
+		go r.generateTitle(sessionID, firstUserMsg)
 	}
 
 	// Record tool call distribution for preference extraction triggers.
@@ -555,7 +558,11 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 		firstUserMsg,
 	)
 	maxTokens := 60
-	resp, err := r.cfg.LLMProvider.Chat(context.Background(), llm.ChatRequest{
+	// Bounded timeout so a stuck LLM never leaks a goroutine for the lifetime
+	// of the REPL.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := r.cfg.LLMProvider.Chat(ctx, llm.ChatRequest{
 		Model:           r.cfg.Model,
 		Messages:        []models.Message{{Role: models.RoleHuman, Content: prompt}},
 		MaxTokens:       &maxTokens,

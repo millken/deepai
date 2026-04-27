@@ -298,6 +298,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 		stream, err := a.llm.Stream(ctx, req)
 		if err != nil {
+			if isContextOverflowError(err) {
+				if compacted, ok := a.compactOnOverflow(runMessages, turn, "stream"); ok {
+					runMessages = compacted
+					continue
+				}
+			}
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 			return &RunResult{Messages: runMessages, Usage: usage}, err
@@ -311,8 +317,19 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			stopReason  string
 		)
 
+		overflowRetry := false
 		for chunk := range stream {
 			if chunk.Err != nil {
+				if isContextOverflowError(chunk.Err) {
+					if compacted, ok := a.compactOnOverflow(runMessages, turn, "chunk"); ok {
+						runMessages = compacted
+						overflowRetry = true
+						// Drain remaining chunks so the upstream goroutine isn't leaked.
+						for range stream {
+						}
+						break
+					}
+				}
 				err := normalizeRunError(ctx, chunk.Err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return &RunResult{Messages: runMessages, Usage: usage}, err
@@ -339,6 +356,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					}
 				}
 			}
+		}
+		if overflowRetry {
+			continue
 		}
 		if err := ctx.Err(); err != nil {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -735,6 +755,50 @@ func isContextOverflow(stopReason string) bool {
 		return true
 	}
 	return false
+}
+
+// isContextOverflowError detects context-window overflow surfaced as a
+// transport-level error (typically HTTP 400 from OpenAI-compatible providers
+// such as DeepSeek/Qwen/GLM that don't expose stopReason in this case).
+// Matched substrings are intentionally specific to avoid false positives on
+// generic "too long" complaints.
+func isContextOverflowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	needles := []string{
+		"context_length_exceeded",       // openai
+		"context length",                // openai variants
+		"maximum context length",        // openai
+		"context window",                // generic
+		"model_context_window_exceeded", // anthropic stop reason surfaced as error
+		"prompt is too long",            // anthropic
+		"input is too long",             // anthropic / qwen
+		"request too large",             // openai
+		"reduce the length",             // openai "please reduce the length..."
+	}
+	for _, n := range needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// compactOnOverflow tries to shrink runMessages and reports whether the caller
+// should continue the outer loop (i.e. retry the LLM request).
+func (a *Agent) compactOnOverflow(runMessages []models.Message, turn int, where string) ([]models.Message, bool) {
+	compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
+	if !didCompact {
+		compacted, didCompact = compactMessages(runMessages, 4)
+	}
+	if didCompact && len(compacted) < len(runMessages) {
+		a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
+		return compacted, true
+	}
+	a.logger.Warn("context overflow and compaction cannot reduce further", "where", where, "turn", turn, "messages", len(runMessages))
+	return runMessages, false
 }
 
 func newAgentError(err error) *AgentError {
