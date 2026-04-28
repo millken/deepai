@@ -98,7 +98,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// 75%-threshold compaction loop; users who know their model can still
 	// override via config.yaml.
 	if cfg.ContextWindow <= 0 {
-		cfg.ContextWindow = 128000
+		cfg.ContextWindow = 192000
 	}
 
 	slog.Debug("chat config",
@@ -248,11 +248,13 @@ func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, auton
 	}
 }
 
+// resolveRequestTimeout converts a config value (in minutes) to a duration.
+// 0 means unlimited — the agent run is bounded only by context cancellation.
 func resolveRequestTimeout(minutes int) time.Duration {
 	if minutes > 0 {
 		return time.Duration(minutes) * time.Minute
 	}
-	return 30 * time.Minute
+	return 0
 }
 
 func mustRegisterTool(registry *tools.Registry, tool models.Tool) {

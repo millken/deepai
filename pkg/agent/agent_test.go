@@ -194,6 +194,30 @@ func TestAgentRunUsesRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestNormalizeRunError_DoesNotMaskInnerDeadlineExceeded(t *testing.T) {
+	err := normalizeRunError(context.Background(), context.DeadlineExceeded, time.Hour)
+
+	var timeoutErr *TimeoutError
+	if errors.As(err, &timeoutErr) {
+		t.Fatalf("normalizeRunError() unexpectedly wrapped inner deadline as TimeoutError: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("normalizeRunError() = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestNormalizeRunError_WrapsRunContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	<-ctx.Done()
+
+	err := normalizeRunError(ctx, ctx.Err(), time.Hour)
+	var timeoutErr *TimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("normalizeRunError() error = %T, want *TimeoutError", err)
+	}
+}
+
 func TestApplyAgentType(t *testing.T) {
 	registry := tools.NewRegistry()
 	_ = registry.Register(models.Tool{Name: "bash", Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) { return models.ToolResult{}, nil }})

@@ -92,8 +92,13 @@ func (h *InputHandler) SaveHistoryFile() {
 // Returns errInterrupted on Ctrl+C, and io.EOF on Ctrl+D.
 func (h *InputHandler) ReadPrompt(ctx context.Context) (string, error) {
 	ta := textarea.New()
-	ta.Prompt = h.styles.UserPrompt.Render("> ")
-	ta.Placeholder = "Type your message... (↑↓ history, Alt+Enter newline)"
+	// Use SetPromptFunc instead of ta.Prompt to specify the visual width (2) explicitly.
+	// ta.Prompt uses uniseg.StringWidth which doesn't strip ANSI escape codes, so a
+	// lipgloss-styled "> " would inflate promptWidth and misplace the first wide (CJK)
+	// character, making it invisible on first keystroke.
+	promptStr := h.styles.UserPrompt.Render("> ")
+	ta.SetPromptFunc(2, func(textarea.PromptInfo) string { return promptStr })
+	ta.Placeholder = "Type your message... (up/down history, Alt+Enter newline)"
 	ta.ShowLineNumbers = false
 	ta.SetHeight(5)
 	ta.SetWidth(80)

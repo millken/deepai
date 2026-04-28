@@ -15,8 +15,18 @@ import (
 
 func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 	args := call.Arguments
-	path, ok := args["path"].(string)
-	if !ok || strings.TrimSpace(path) == "" {
+	path, _ := args["path"].(string)
+	if strings.TrimSpace(path) == "" {
+		if p, ok := args["file_path"].(string); ok {
+			path = p
+		}
+	}
+	if strings.TrimSpace(path) == "" {
+		if p, ok := args["filePath"].(string); ok {
+			path = p
+		}
+	}
+	if strings.TrimSpace(path) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("path is required")
 	}
 	path = resolveReadablePath(ctx, path)
@@ -208,12 +218,13 @@ func ReadFileTool() models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"path":         map[string]any{"type": "string", "description": "File path to read"},
+				"file_path":    map[string]any{"type": "string", "description": "Alias of path (deprecated)"},
+				"filePath":     map[string]any{"type": "string", "description": "Alias of path (deprecated)"},
 				"start_line":   map[string]any{"type": "number", "description": "1-based inclusive start line; enables line-range mode"},
 				"end_line":     map[string]any{"type": "number", "description": "1-based inclusive end line; pairs with start_line"},
 				"line_numbers": map[string]any{"type": "boolean", "description": "Prefix each line with its 1-based line number (auto when range is set)"},
 				"limit":        map[string]any{"type": "number", "description": "Maximum bytes to read (ignored when range is set)"},
 			},
-			"required": []any{"path"},
 		},
 		Handler: ReadFileHandler,
 	}

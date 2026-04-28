@@ -198,6 +198,28 @@ func TestGrepHandler_RegexPattern(t *testing.T) {
 	}
 }
 
+func TestGrepHandler_QueryAlias(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"a.txt": "hello from query alias",
+	})
+
+	result, err := GrepHandler(context.Background(), models.ToolCall{
+		ID:     "grep-query-alias",
+		Name:   "grep",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"query": "hello",
+			"path":  root,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "a.txt:1:") {
+		t.Fatalf("expected alias-based match, got: %s", result.Content)
+	}
+}
+
 func TestGrepHandler_MaxResults(t *testing.T) {
 	root := createTestTree(t, map[string]string{
 		"a.txt": "match line 1\nmatch line 2\nmatch line 3\nmatch line 4\nmatch line 5",

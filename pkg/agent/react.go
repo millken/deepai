@@ -92,10 +92,10 @@ func New(cfg AgentConfig) *Agent {
 	if cfg.PresentFiles != nil {
 		registry = cloneRegistryWithPresentFileTool(registry, cfg.PresentFiles)
 	}
+	// 0 means unlimited — the caller (e.g. interactive REPL) governs
+	// lifetime via context cancellation (Ctrl+C). A positive value applies a
+	// hard deadline per Run() invocation.
 	requestTimeout := cfg.RequestTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = defaultRequestTimeout
-	}
 	a := &Agent{
 		llm:                 cfg.LLMProvider,
 		tools:               registry,
@@ -209,10 +209,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	if a.llm == nil {
 		return nil, fmt.Errorf("agent llm provider is required")
 	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, a.requestTimeout)
-		defer cancel()
+	if a.requestTimeout > 0 {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, a.requestTimeout)
+			defer cancel()
+		}
 	}
 
 	requestID := newAgentRequestID()
@@ -233,6 +235,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// When the same tool fails argument validation 3 times in a row the agent
 	// injects a synthetic human message to break the loop.
 	validationFailures := make(map[string]int)
+	consecutiveValidationFailures := 0
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -291,6 +294,25 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 						},
 					})
 					a.lastInputTokens = 0
+				}
+
+				// If still over the hard limit (ratio > 1.0), apply increasingly
+				// aggressive compaction with a shrinking tail to prevent sending
+				// an oversized payload that would cause the provider to drop the
+				// connection mid-stream ("unexpected end of JSON input").
+				afterEstimated := estimateTokens(runMessages, a.systemPrompt, 0)
+				if afterRatio := float64(afterEstimated) / float64(a.contextWindow); afterRatio > 1.0 {
+					for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
+						c2, ok := compactMessages(runMessages, tail)
+						if ok {
+							runMessages = c2
+						}
+						e2 := estimateTokens(runMessages, a.systemPrompt, 0)
+						a.logger.Debug("aggressive compaction", "turn", turn, "tail", tail, "estimated", e2, "ratio", fmt.Sprintf("%.2f", float64(e2)/float64(a.contextWindow)))
+						if float64(e2)/float64(a.contextWindow) <= 1.0 {
+							break
+						}
+					}
 				}
 			}
 		}
@@ -495,6 +517,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				})
 				// Circuit-breaker for parallel path (same logic as serial path).
 				if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+					consecutiveValidationFailures++
 					validationFailures[call.Name]++
 					if validationFailures[call.Name] >= maxValidationRetries {
 						hint := fmt.Sprintf(
@@ -511,7 +534,18 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 						})
 						validationFailures[call.Name] = 0
 					}
+					if consecutiveValidationFailures >= 8 {
+						err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", consecutiveValidationFailures, result.Error)
+						agentErr := &AgentError{
+							Code:       "tool_validation_loop",
+							Message:    err.Error(),
+							Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
+						}
+						emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
+						return &RunResult{Messages: runMessages, Usage: usage}, err
+					}
 				} else {
+					consecutiveValidationFailures = 0
 					validationFailures[call.Name] = 0
 				}
 			}
@@ -590,6 +624,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// infinite loops where the model keeps omitting required arguments.
 			const maxValidationRetries = 3
 			if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+				consecutiveValidationFailures++
 				validationFailures[call.Name]++
 				if validationFailures[call.Name] >= maxValidationRetries {
 					hint := fmt.Sprintf(
@@ -606,7 +641,18 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					})
 					validationFailures[call.Name] = 0
 				}
+				if consecutiveValidationFailures >= 8 {
+					err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", consecutiveValidationFailures, result.Error)
+					agentErr := &AgentError{
+						Code:       "tool_validation_loop",
+						Message:    err.Error(),
+						Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
+					}
+					emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
+					return &RunResult{Messages: runMessages, Usage: usage}, err
+				}
 			} else {
+				consecutiveValidationFailures = 0
 				validationFailures[call.Name] = 0
 			}
 
@@ -712,7 +758,9 @@ func normalizeRunError(ctx context.Context, err error, timeout time.Duration) er
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	// Only map to agent timeout when the run context itself hit deadline.
+	// Keep inner/tool deadline errors intact so users see the real source.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return &TimeoutError{
 			Duration: timeout,
 			Message:  "agent request timed out",
@@ -766,10 +814,14 @@ func cloneUsage(src *Usage) *Usage {
 }
 
 func toolMessageContent(result models.ToolResult) string {
+	s := result.Content
 	if result.Error != "" {
-		return result.Error
+		s = result.Error
 	}
-	return result.Content
+	if len(s) > maxToolContentBytes {
+		s = s[:maxToolContentBytes] + fmt.Sprintf("\n... [truncated: %d bytes total]", len(s))
+	}
+	return s
 }
 
 func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {
@@ -946,7 +998,8 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 // allParallelSafe reports whether every call in the batch resolves to a
 // registered tool that has declared ParallelSafe=true. Unknown tools and any
 // false flag short-circuit to false so the safe (sequential) path is taken.
-func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {	if a.tools == nil {
+func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {
+	if a.tools == nil {
 		return false
 	}
 	for _, c := range calls {

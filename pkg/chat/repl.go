@@ -145,6 +145,10 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 				if parentCtx.Err() != nil {
 					break
 				}
+				if err.cancelled {
+					r.renderer.RenderInterrupted()
+					continue
+				}
 				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 			}
 		}
@@ -343,25 +347,47 @@ type turnError struct {
 	cancelled bool
 }
 
-func (e *turnError) Error() string { return e.err.Error() }
+func (e *turnError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return "cancelled"
+}
 
 // runTurnWithSignal creates a cancellable turn context, forwards SIGINT to it,
 // runs the given turn function, and returns a turnError that distinguishes
-// cancellation (Ctrl+C) from real errors.
+// cancellation (Ctrl+C) from real errors. Returns nil on clean success.
 func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Signal, fn func(context.Context) error) *turnError {
 	turnCtx, turnCancel := context.WithCancel(parentCtx)
 	signal.Notify(sigCh, os.Interrupt)
+
+	// sigFired is written by the signal goroutine before turnCancel(); reading
+	// it after fn returns (which implies the context is done) is race-free.
+	sigFired := make(chan struct{}, 1)
 	go func() {
 		select {
 		case <-sigCh:
+			sigFired <- struct{}{}
 			turnCancel()
 		case <-turnCtx.Done():
 		}
 	}()
+
 	err := fn(turnCtx)
 	turnCancel()
 	signal.Stop(sigCh)
-	return &turnError{err: err, cancelled: turnCtx.Err() != nil}
+
+	interrupted := false
+	select {
+	case <-sigFired:
+		interrupted = true
+	default:
+	}
+
+	if err == nil && !interrupted {
+		return nil
+	}
+	return &turnError{err: err, cancelled: interrupted}
 }
 
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
@@ -438,6 +464,11 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 	var lastUsage *agent.Usage
 	var turnErr error
 	var turnToolCalls []memory.ToolCallInfo
+	turnStart := time.Now()
+	lastProgress := turnStart
+	var lastHeartbeat time.Time
+	heartbeatTicker := time.NewTicker(15 * time.Second)
+	defer heartbeatTicker.Stop()
 EventLoop:
 	for {
 		select {
@@ -446,6 +477,7 @@ EventLoop:
 				events = nil
 				continue
 			}
+			lastProgress = time.Now()
 			if evt.Usage != nil {
 				lastUsage = evt.Usage
 			}
@@ -463,9 +495,11 @@ EventLoop:
 				}
 			}
 		case out := <-outcomes:
+			lastProgress = time.Now()
 			// Drain remaining events.
 			if events != nil {
 				for evt := range events {
+					lastProgress = time.Now()
 					if evt.Usage != nil {
 						lastUsage = evt.Usage
 					}
@@ -483,6 +517,16 @@ EventLoop:
 		case <-ctx.Done():
 			turnErr = ctx.Err()
 			break EventLoop
+		case <-heartbeatTicker.C:
+			idle := time.Since(lastProgress)
+			if idle < 20*time.Second {
+				continue
+			}
+			if !lastHeartbeat.IsZero() && time.Since(lastHeartbeat) < 30*time.Second {
+				continue
+			}
+			r.renderer.RenderHeartbeat(time.Since(turnStart), idle)
+			lastHeartbeat = time.Now()
 		}
 	}
 
@@ -557,7 +601,7 @@ func (r *ChatRepl) saveSession() {
 
 func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 	if r.cfg.LLMProvider == nil || firstUserMsg == "" {
-		slog.Warn("auto-title skipped", "provider_nil", r.cfg.LLMProvider == nil, "msg_empty", firstUserMsg == "")
+		slog.Debug("auto-title skipped", "provider_nil", r.cfg.LLMProvider == nil, "msg_empty", firstUserMsg == "")
 		return
 	}
 	if len(firstUserMsg) > 500 {
@@ -580,26 +624,26 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 		ReasoningEffort: "disabled",
 	})
 	if err != nil {
-		slog.Warn("auto-title LLM failed", "err", err)
+		slog.Debug("auto-title LLM failed", "err", err)
 		fallback := firstUserMsg
 		if len([]rune(fallback)) > 20 {
 			fallback = string([]rune(fallback)[:20]) + "..."
 		}
 		if err := r.sessMgr.SetTitle(sessionID, fallback); err != nil {
-			slog.Warn("auto-title fallback SetTitle failed", "err", err)
+			slog.Debug("auto-title fallback SetTitle failed", "err", err)
 		} else {
-			slog.Info("auto-title set via fallback", "id", sessionID, "title", fallback)
+			slog.Debug("auto-title set via fallback", "id", sessionID, "title", fallback)
 		}
 		return
 	}
 
 	title := strings.TrimSpace(resp.Message.Content)
-	slog.Info("auto-title LLM response", "id", sessionID, "raw_title", resp.Message.Content, "title", title)
+	slog.Debug("auto-title LLM response", "id", sessionID, "raw_title", resp.Message.Content, "title", title)
 	if len([]rune(title)) > 30 {
 		title = string([]rune(title)[:30])
 	}
 	if title == "" {
-		slog.Warn("auto-title: LLM returned empty content, using fallback")
+		slog.Debug("auto-title: LLM returned empty content, using fallback")
 		fallback := firstUserMsg
 		if len([]rune(fallback)) > 20 {
 			fallback = string([]rune(fallback)[:20]) + "..."
@@ -609,9 +653,9 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 	}
 
 	if err := r.sessMgr.SetTitle(sessionID, title); err != nil {
-		slog.Warn("auto-title SetTitle failed", "err", err)
+		slog.Debug("auto-title SetTitle failed", "err", err)
 	}
-	slog.Info("session title set", "id", sessionID, "title", title)
+	slog.Debug("session title set", "id", sessionID, "title", title)
 }
 
 // handleSlashCommand processes a slash command. Returns true if the REPL should exit.

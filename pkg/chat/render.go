@@ -14,15 +14,21 @@ import (
 	"github.com/millken/deepai/pkg/subagent"
 )
 
+// pendingToolLine tracks an in-progress tool call whose start line has been printed.
+type pendingToolLine struct {
+	id string // tool call ID
+}
+
 // Renderer handles terminal output for agent events.
 // All public methods are safe to call from multiple goroutines.
 type Renderer struct {
-	out      io.Writer
-	styles   Styles
-	turn     int
-	start    time.Time
-	thinking bool
-	mu       sync.Mutex
+	out               io.Writer
+	styles            Styles
+	turn              int
+	start             time.Time
+	thinking          bool
+	mu                sync.Mutex
+	pendingStartLines []pendingToolLine
 }
 
 // NewRenderer creates a renderer writing to w.
@@ -107,6 +113,17 @@ func (r *Renderer) RenderInterrupted() {
 	fmt.Fprintln(r.out, r.styles.Dim.Render("  Interrupted."))
 }
 
+// RenderHeartbeat prints a lightweight progress hint when a turn is still
+// running but has had no visible activity for a while.
+func (r *Renderer) RenderHeartbeat(elapsed, idle time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clearThinking()
+	fmt.Fprintln(r.out, r.styles.Dim.Render(
+		fmt.Sprintf("  Still running... %.0fs elapsed (last activity %.0fs ago). Press Ctrl+C to stop.",
+			elapsed.Seconds(), idle.Seconds())))
+}
+
 // clearThinking replaces the "Thinking..." indicator with a newline on first output.
 // Caller must hold r.mu.
 func (r *Renderer) clearThinking() {
@@ -181,19 +198,27 @@ func PrintHistory(w io.Writer, messages []models.Message) {
 }
 
 func (r *Renderer) renderToolStart(evt agent.AgentEvent) {
-	var name, preview string
+	var id, name, preview string
 	if evt.ToolEvent != nil {
+		id = evt.ToolEvent.ID
 		name = evt.ToolEvent.Name
 		preview = toolArgsPreview(evt.ToolEvent.Arguments)
 	} else if evt.ToolCall != nil {
+		id = evt.ToolCall.ID
 		name = evt.ToolCall.Name
 		preview = toolArgsPreview(evt.ToolCall.Arguments)
 	}
 	if name == "" {
 		return
 	}
-	line := fmt.Sprintf("  [%s] %s", name, preview)
+	var line string
+	if preview != "" {
+		line = fmt.Sprintf("  ⚙ %s(%s)…", name, preview)
+	} else {
+		line = fmt.Sprintf("  ⚙ %s…", name)
+	}
 	fmt.Fprintln(r.out, r.styles.ToolCall.Render(line))
+	r.pendingStartLines = append(r.pendingStartLines, pendingToolLine{id: id})
 }
 
 func (r *Renderer) renderToolEnd(evt agent.AgentEvent) {
@@ -201,24 +226,57 @@ func (r *Renderer) renderToolEnd(evt agent.AgentEvent) {
 		return
 	}
 	te := evt.ToolEvent
+
+	// Build collapsed result line.
+	icon := "✓"
+	useErrorStyle := te.Error != ""
+	if useErrorStyle {
+		icon = "✗"
+	}
 	var detail string
 	if te.DurationMS > 0 {
 		detail = fmt.Sprintf(" (%.1fs)", float64(te.DurationMS)/1000)
 	}
-	// Show result preview only when there is no error — the error field
-	// already contains the full failure detail and showing both would
-	// duplicate the message.
 	if te.Error != "" {
-		detail += " " + r.styles.Error.Render("ERROR: "+te.Error)
+		detail += " " + te.Error
 	} else if te.ResultPreview != "" {
 		preview := te.ResultPreview
 		if lipgloss.Width(preview) > 120 {
 			preview = truncateWidth(preview, 117) + "..."
 		}
-		detail += " -> " + preview
+		detail += " → " + preview
 	}
-	line := fmt.Sprintf("  [%s] done%s", te.Name, detail)
-	fmt.Fprintln(r.out, r.styles.ToolResult.Render(line))
+	line := fmt.Sprintf("  %s %s%s", icon, te.Name, detail)
+	var rendered string
+	if useErrorStyle {
+		rendered = r.styles.Error.Render(line)
+	} else {
+		rendered = r.styles.ToolResult.Render(line)
+	}
+
+	// Find the matching pending start line by tool ID.
+	idx := -1
+	for i, p := range r.pendingStartLines {
+		if p.id == te.ID {
+			idx = i
+			break
+		}
+	}
+
+	if idx >= 0 {
+		// linesAbove = how many lines up from the current cursor position
+		// to the start line that was printed for this tool call.
+		linesAbove := len(r.pendingStartLines) - idx
+		// Move up, clear the start line, write result, then return to original position.
+		fmt.Fprintf(r.out, "\033[%dA\r\033[K", linesAbove)
+		fmt.Fprintln(r.out, rendered)
+		if linesAbove > 1 {
+			fmt.Fprintf(r.out, "\033[%dB", linesAbove-1)
+		}
+		r.pendingStartLines = append(r.pendingStartLines[:idx], r.pendingStartLines[idx+1:]...)
+	} else {
+		fmt.Fprintln(r.out, rendered)
+	}
 }
 
 func (r *Renderer) renderError(evt agent.AgentEvent) {
@@ -234,9 +292,13 @@ func (r *Renderer) renderCompact(evt agent.AgentEvent) {
 		return
 	}
 	cs := evt.CompactStats
-	fmt.Fprintln(r.out, r.styles.Compaction.Render(
-		fmt.Sprintf("  Context compacted: %d -> %d messages (%.0f%% of %d)",
-			cs.MessagesBefore, cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)))
+	line := fmt.Sprintf("  Context compacted: %d -> %d messages (%.0f%% of %d)",
+		cs.MessagesBefore, cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)
+	if cs.MessagesBefore == cs.MessagesAfter {
+		line = fmt.Sprintf("  Context compacted: %d messages (content trimmed, %.0f%% of %d)",
+			cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)
+	}
+	fmt.Fprintln(r.out, r.styles.Compaction.Render(line))
 }
 
 // toolArgsPreview builds a short string from tool call arguments.
@@ -280,4 +342,3 @@ func truncateWidth(s string, maxW int) string {
 	}
 	return s
 }
-

@@ -33,6 +33,10 @@ func AskClarificationToolWithMode(manager *Manager, autonomous bool) models.Tool
 					"type":        "string",
 					"description": "Question to present to the user.",
 				},
+				"prompt": map[string]any{
+					"type":        "string",
+					"description": "Alias of question (deprecated).",
+				},
 				"options": map[string]any{
 					"type": "array",
 					"items": map[string]any{
@@ -53,10 +57,20 @@ func AskClarificationToolWithMode(manager *Manager, autonomous bool) models.Tool
 					"description": "Whether the user must answer before work continues.",
 				},
 			},
-			"required": []any{"question"},
 		},
 		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+			normalizedArgs := make(map[string]any, len(call.Arguments)+1)
+			for k, v := range call.Arguments {
+				normalizedArgs[k] = v
+			}
+
 			question, _ := call.Arguments["question"].(string)
+			if strings.TrimSpace(question) == "" {
+				question, _ = call.Arguments["prompt"].(string)
+				if strings.TrimSpace(question) != "" {
+					normalizedArgs["question"] = question
+				}
+			}
 			if strings.TrimSpace(question) == "" {
 				return models.ToolResult{
 					CallID:   call.ID,
@@ -80,7 +94,7 @@ func AskClarificationToolWithMode(manager *Manager, autonomous bool) models.Tool
 			// CLI mode: synchronous — ask user directly via stdin
 			if ui := tools.UserInteractionFromContext(ctx); ui != nil {
 				var optionLabels []string
-				if rawOptions, ok := call.Arguments["options"].([]any); ok {
+				if rawOptions, ok := normalizedArgs["options"].([]any); ok {
 					for _, raw := range rawOptions {
 						if m, ok := raw.(map[string]any); ok {
 							if label, _ := m["label"].(string); label != "" {
@@ -117,7 +131,7 @@ func AskClarificationToolWithMode(manager *Manager, autonomous bool) models.Tool
 			}
 
 			// API mode: async — create clarification request
-			req, err := parseRequest(call.Arguments)
+			req, err := parseRequest(normalizedArgs)
 			if err != nil {
 				return models.ToolResult{
 					CallID:   call.ID,

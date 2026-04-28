@@ -13,6 +13,10 @@ const (
 	defaultCompactionKeepTail  = 6
 	compactToolResultKeep      = 300
 	compactAssistantTextKeep   = 200
+	// maxToolContentBytes is a hard cap applied when storing tool results in
+	// runMessages. Prevents individual bash/web-fetch outputs from inflating
+	// the context beyond any provider's practical limit.
+	maxToolContentBytes = 50_000
 )
 
 // compactMessages applies heuristic compression to old messages.
@@ -191,7 +195,8 @@ func resolveCompactionKeepTail(v int) int {
 func estimateTokens(messages []models.Message, systemPrompt string, _ int) int {
 	totalBytes := len(systemPrompt)
 	for _, msg := range messages {
-		// Use Content length as a fast approximation instead of full JSON marshal.
+		// msg.Content already contains the tool result text (same bytes as
+		// ToolResult.Content), so only count it once via msg.Content.
 		size := len(msg.Content)
 		for _, tc := range msg.ToolCalls {
 			argsJSON, _ := json.Marshal(tc.Arguments)
@@ -199,7 +204,7 @@ func estimateTokens(messages []models.Message, systemPrompt string, _ int) int {
 		}
 		if msg.ToolResult != nil {
 			size += len(msg.ToolResult.CallID) + len(msg.ToolResult.ToolName)
-			size += len(msg.ToolResult.Content) + len(msg.ToolResult.Error)
+			size += len(msg.ToolResult.Error)
 			size += 20
 		}
 		totalBytes += size + 30 // role/ID/metadata overhead per message

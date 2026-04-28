@@ -68,6 +68,25 @@ func TestAskClarificationToolAutonomousSkipsUI(t *testing.T) {
 	}
 }
 
+func TestAskClarificationTool_PromptAlias(t *testing.T) {
+	manager := NewManager(1)
+	tool := AskClarificationTool(manager)
+
+	result, err := tool.Handler(WithThreadID(context.Background(), "thread-prompt-alias"), models.ToolCall{
+		ID:   "call-prompt-alias",
+		Name: tool.Name,
+		Arguments: map[string]any{
+			"prompt": "Need one answer",
+		},
+	})
+	if err != nil {
+		t.Fatalf("tool handler error = %v", err)
+	}
+	if result.Status != models.CallStatusCompleted {
+		t.Fatalf("result status = %q", result.Status)
+	}
+}
+
 type failingUI struct{ t *testing.T }
 
 func (f failingUI) AskQuestion(_ context.Context, _ string, _ []string) (string, error) {

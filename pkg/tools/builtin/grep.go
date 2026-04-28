@@ -21,6 +21,10 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	args := call.Arguments
 	pattern, _ := args["pattern"].(string)
 	if strings.TrimSpace(pattern) == "" {
+		// Backward-compatible alias: some model/tooling stacks use query.
+		pattern, _ = args["query"].(string)
+	}
+	if strings.TrimSpace(pattern) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("pattern is required")
 	}
 
@@ -321,6 +325,7 @@ func GrepTool() models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"pattern":          map[string]any{"type": "string", "description": "Regex pattern to search for"},
+				"query":            map[string]any{"type": "string", "description": "Alias of pattern (deprecated)"},
 				"path":             map[string]any{"type": "string", "description": "Directory or file to search in (default: current directory)"},
 				"type":             map[string]any{"type": "string", "description": "Filter by file type: go, py, js, ts, java, rust, c, cpp, rb, php, rs, sql, sh, html, css, json, yaml, xml, md, proto"},
 				"glob":             map[string]any{"type": "string", "description": "Filter files by glob pattern (e.g. *.txt). Use 'type' instead for common languages."},
@@ -329,7 +334,6 @@ func GrepTool() models.Tool {
 				"context":          map[string]any{"type": "number", "description": "Number of context lines before and after each match (default: 0)"},
 				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 100)"},
 			},
-			"required": []any{"pattern"},
 		},
 		Handler: GrepHandler,
 	}

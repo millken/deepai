@@ -110,6 +110,30 @@ func TestReadFileHandlerResolvesACPWorkspaceVirtualPath(t *testing.T) {
 	}
 }
 
+func TestReadFileHandler_PathAliases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alias.txt")
+	if err := os.WriteFile(path, []byte("alias-content"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	for _, args := range []map[string]any{
+		{"file_path": path},
+		{"filePath": path},
+	} {
+		result, err := ReadFileHandler(context.Background(), models.ToolCall{
+			ID:        "call-read-alias",
+			Name:      "read_file",
+			Arguments: args,
+		})
+		if err != nil {
+			t.Fatalf("ReadFileHandler() alias args=%v error = %v", args, err)
+		}
+		if result.Content != "alias-content" {
+			t.Fatalf("content=%q want alias-content", result.Content)
+		}
+	}
+}
+
 func TestGlobHandlerReturnsVirtualPaths(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("DEEPAI_DATA_ROOT", root)

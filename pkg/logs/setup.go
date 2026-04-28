@@ -23,7 +23,7 @@ func Setup(cfg Config) (func(), error) {
 	// Close previous resources if Setup was called before.
 	closeClosers()
 
-	stderrH := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	stderrH := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.stderrMin()})
 
 	if cfg.DebugFile == "" && cfg.ErrorFile == "" {
 		slog.SetDefault(slog.New(stderrH))
@@ -55,7 +55,7 @@ func Setup(cfg Config) (func(), error) {
 		routes = append(routes, route{min: slog.LevelWarn, max: slog.Level(100), handler: asyncH})
 	}
 
-	routes = append(routes, route{min: cfg.Level, max: slog.Level(100), handler: stderrH})
+	routes = append(routes, route{min: cfg.stderrMin(), max: slog.Level(100), handler: stderrH})
 
 	router := NewRouterHandler(routes...)
 	slog.SetDefault(slog.New(router))

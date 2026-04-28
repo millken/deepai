@@ -33,10 +33,17 @@ func New() *cobra.Command {
 			if verbose {
 				level = slog.LevelDebug
 			}
+			// In non-verbose mode keep stderr quiet (Error only) so background
+			// goroutines and async operations don't corrupt the bubbletea TUI.
+			stderrLevel := slog.LevelError
+			if verbose {
+				stderrLevel = slog.LevelDebug
+			}
 			cleanup, err := logs.Setup(logs.Config{
-				Level:     level,
-				DebugFile: "deepai-debug.log",
-				ErrorFile: "deepai-error.log",
+				Level:       level,
+				StderrLevel: stderrLevel,
+				DebugFile:   "deepai-debug.log",
+				ErrorFile:   "deepai-error.log",
 			})
 			if err != nil {
 				slog.Warn("failed to set up logging", "err", err)
