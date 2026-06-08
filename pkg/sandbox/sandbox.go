@@ -57,7 +57,11 @@ func (e *TimeoutError) Error() string {
 // Sandbox isolates commands and files inside a per-session directory.
 type Sandbox struct {
 	sessionDir string
-	processes  []*os.Process
+	// owned is true only when this Sandbox created sessionDir. Close removes
+	// the directory only when it owns it, so a pre-existing directory (e.g. a
+	// project's own ./cli folder reused as a session dir) is never deleted.
+	owned     bool
+	processes []*os.Process
 
 	mu      sync.Mutex
 	backend backend
@@ -88,29 +92,72 @@ func NewWithConfig(sessionID string, baseDir string, cfg Config) (*Sandbox, erro
 	}
 
 	sessionDir := filepath.Join(baseDir, sessionID)
+
+	// Only take ownership (and thus delete-on-close rights) when we create the
+	// directory ourselves. Reusing a pre-existing directory and removing it on
+	// Close would destroy whatever the user already had there.
+	owned := true
+	if _, statErr := os.Stat(sessionDir); statErr == nil {
+		owned = false
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat session directory: %w", statErr)
+	}
+
 	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create session directory: %w", err)
 	}
 
 	sb := &Sandbox{
 		sessionDir: sessionDir,
+		owned:      owned,
 		backend:    backendDirect,
 		cfg:        normalizeConfig(cfg),
 	}
+	sb.detectBackend(sessionID)
+	return sb, nil
+}
 
+// NewSession creates a fresh, uniquely-named session directory under baseDir
+// and selects the best available backend. Unlike New, it never reuses an
+// existing path, so Close can always remove it without risking user data.
+// Prefer this for interactive sessions whose baseDir lives in the user's
+// workspace or any location that may contain unrelated files.
+func NewSession(baseDir string, cfg Config) (*Sandbox, error) {
+	baseDir = strings.TrimSpace(baseDir)
+	if baseDir == "" {
+		return nil, errors.New("baseDir is required")
+	}
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create sandbox base directory: %w", err)
+	}
+	sessionDir, err := os.MkdirTemp(baseDir, "session-")
+	if err != nil {
+		return nil, fmt.Errorf("create session directory: %w", err)
+	}
+
+	sb := &Sandbox{
+		sessionDir: sessionDir,
+		owned:      true,
+		backend:    backendDirect,
+		cfg:        normalizeConfig(cfg),
+	}
+	sb.detectBackend(filepath.Base(sessionDir))
+	return sb, nil
+}
+
+// detectBackend selects the strongest available isolation backend for the
+// session directory, falling back to direct execution.
+func (s *Sandbox) detectBackend(session string) {
 	if CheckLandlockAvailable() {
-		slog.Info("landlock is available, using landlock sandbox backend", "session", sessionID)
-		if err := probeLandlock(sessionDir); err == nil {
-			sb.backend = backendLandlock
-			return sb, nil
+		slog.Info("landlock is available, using landlock sandbox backend", "session", session)
+		if err := probeLandlock(s.sessionDir); err == nil {
+			s.backend = backendLandlock
+			return
 		}
 	}
-
-	if probeBubblewrap(sessionDir) == nil {
-		sb.backend = backendBwrap
+	if probeBubblewrap(s.sessionDir) == nil {
+		s.backend = backendBwrap
 	}
-
-	return sb, nil
 }
 
 // Exec executes a shell command inside the sandbox backend.
@@ -252,8 +299,12 @@ func (s *Sandbox) Close() error {
 		time.Sleep(delay)
 	}
 
-	if err := os.RemoveAll(s.sessionDir); err != nil {
-		return fmt.Errorf("remove session directory: %w", err)
+	// Never remove a directory we did not create: doing so would delete
+	// pre-existing user data (the cause of the ctrl+c data-loss bug).
+	if s.owned {
+		if err := os.RemoveAll(s.sessionDir); err != nil {
+			return fmt.Errorf("remove session directory: %w", err)
+		}
 	}
 	return nil
 }

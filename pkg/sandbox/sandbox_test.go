@@ -27,6 +27,66 @@ func TestSandboxCreate(t *testing.T) {
 	}
 }
 
+// TestSandboxClosePreservesExistingDir is the regression guard for the ctrl+c
+// data-loss bug: when the session directory already exists (e.g. a project's
+// own ./cli folder), Close must NOT delete it or its contents.
+func TestSandboxClosePreservesExistingDir(t *testing.T) {
+	baseDir := t.TempDir()
+	sessionDir := filepath.Join(baseDir, "cli")
+	if err := os.MkdirAll(filepath.Join(sessionDir, "internal"), 0o755); err != nil {
+		t.Fatalf("setup MkdirAll() error = %v", err)
+	}
+	userFile := filepath.Join(sessionDir, "main.go")
+	if err := os.WriteFile(userFile, []byte("user code"), 0o644); err != nil {
+		t.Fatalf("setup WriteFile() error = %v", err)
+	}
+
+	sb, err := New("cli", baseDir)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if _, err := os.Stat(userFile); err != nil {
+		t.Fatalf("pre-existing user file was deleted on Close: %v", err)
+	}
+}
+
+// TestNewSessionClosesOwnDir verifies NewSession creates a unique, owned
+// directory under the base and removes only that directory on Close, leaving
+// the base (and any sibling content) intact.
+func TestNewSessionClosesOwnDir(t *testing.T) {
+	baseDir := t.TempDir()
+	sibling := filepath.Join(baseDir, "keep.txt")
+	if err := os.WriteFile(sibling, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("setup WriteFile() error = %v", err)
+	}
+
+	sb, err := NewSession(baseDir, Config{})
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+	sessionDir := sb.GetDir()
+	if filepath.Dir(sessionDir) != filepath.Clean(baseDir) {
+		t.Fatalf("session dir %q is not under base %q", sessionDir, baseDir)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("session dir not created: %v", err)
+	}
+
+	if err := sb.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("owned session dir not removed on Close: err = %v", err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("sibling content under base was deleted: %v", err)
+	}
+}
+
 func TestSandboxExec(t *testing.T) {
 	baseDir := t.TempDir()
 	sb, err := New("exec", baseDir)

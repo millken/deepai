@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,6 +42,7 @@ type ReplConfig struct {
 	PreferenceExtractor memory.Extractor
 	SessionRepo         models.SessionRepository // injected from outside
 	InputHistoryFile    string                   // path for persisting input history (optional)
+	SandboxBaseDir      string                   // root for sandbox session dirs; must NOT be the user's workdir
 }
 
 // memoryExtractInterval is the turn cadence for async memory extraction in CLI.
@@ -65,7 +67,15 @@ type ChatRepl struct {
 
 // NewRepl creates a new chat REPL instance.
 func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
-	sb, err := sandbox.New("cli", cfg.WorkDir)
+	// The sandbox session directory must live outside the user's working
+	// directory; otherwise cleanup on exit (incl. ctrl+c) could delete project
+	// files — e.g. a pre-existing ./cli folder. Fall back to a temp location
+	// when no isolated base is provided.
+	sandboxBase := strings.TrimSpace(cfg.SandboxBaseDir)
+	if sandboxBase == "" {
+		sandboxBase = filepath.Join(os.TempDir(), "deepai-sandbox")
+	}
+	sb, err := sandbox.NewSession(sandboxBase, sandbox.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox init: %w", err)
 	}

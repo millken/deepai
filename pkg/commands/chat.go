@@ -217,6 +217,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		PreferenceExtractor: prefExtractor,
 		SessionRepo:         sessStore,
 		InputHistoryFile:    InputHistoryFile(),
+		SandboxBaseDir:      SandboxDir(),
 	}
 
 	repl, err := chat.NewRepl(replCfg)

@@ -41,6 +41,13 @@ func SessionsDir() string {
 	return filepath.Join(Home(), "sessions")
 }
 
+// SandboxDir returns the path to the sandbox session root (~/.deepai/sandbox).
+// Sandbox session directories are created here — outside the user's working
+// directory — so cleanup on exit can never touch project files.
+func SandboxDir() string {
+	return filepath.Join(Home(), "sandbox")
+}
+
 // DBFile returns the path to the unified SQLite database.
 func DBFile() string {
 	return filepath.Join(Home(), "deepai.db")
