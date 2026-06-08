@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -54,8 +53,8 @@ const memoryExtractInterval = 5
 // ChatRepl is the interactive chat REPL.
 type ChatRepl struct {
 	cfg               ReplConfig
-	renderer          *Renderer
-	input             *InputHandler
+	ui                *TUI
+	historyFile       string
 	sess              *models.Session
 	sessMgr           models.SessionRepository
 	sb                *sandbox.Sandbox
@@ -81,23 +80,19 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 	}
 
 	repl := &ChatRepl{
-		cfg:       cfg,
-		renderer:  NewRenderer(os.Stderr),
-		input:     NewInputHandler(),
-		sessMgr:   cfg.SessionRepo,
-		sb:        sb,
-		prefSched: memory.NewPreferenceScheduler(),
-	}
-	if cfg.InputHistoryFile != "" {
-		repl.input.LoadHistoryFile(cfg.InputHistoryFile)
+		cfg:         cfg,
+		historyFile: cfg.InputHistoryFile,
+		sessMgr:     cfg.SessionRepo,
+		sb:          sb,
+		prefSched:   memory.NewPreferenceScheduler(),
 	}
 	return repl, nil
 }
 
-// Run starts the REPL loop. It handles both interactive and single-query modes.
+// Run starts the interactive REPL loop. It requires an interactive terminal;
+// single-query (-q) and non-TTY modes are not supported.
 func (r *ChatRepl) Run(parentCtx context.Context) error {
 	defer r.sb.Close()
-	defer r.input.SaveHistoryFile()
 	defer func() {
 		if r.cfg.MemoryService != nil {
 			r.cfg.MemoryService.CleanupStale(time.Hour)
@@ -109,36 +104,33 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		return err
 	}
 
-	// Single query mode.
+	// The REPL is TUI-only: it requires an interactive terminal. Single-query
+	// (-q) and non-TTY (pipe/CI) modes are not supported.
 	if r.cfg.Query != "" {
-		return r.runSingleQuery(parentCtx)
+		return errors.New("single-query (-q) mode is no longer supported; run deepai interactively")
 	}
+	if !isInteractiveTTY() {
+		return errors.New("deepai requires an interactive terminal (stdin and stderr must be a TTY)")
+	}
+
+	bannerInfo := r.bannerInfo()
+
+	// Start the persistent Bubble Tea TUI for the whole session.
+	tui := NewTUI(os.Stdin, os.Stderr, bannerInfo)
+	tui.Start()
+	r.ui = tui
+	defer r.ui.Close()
+	if r.historyFile != "" {
+		r.ui.LoadHistory(r.historyFile)
+	}
+	defer r.ui.SaveHistory()
 
 	// Show banner.
-	toolCount := 0
-	if r.cfg.ToolRegistry != nil {
-		toolCount = len(r.cfg.ToolRegistry.List())
-	}
-	skillCount := 0
-	var skillNames []string
-	if r.cfg.SkillRegistry != nil {
-		skillCount = r.cfg.SkillRegistry.Count()
-		skillNames = r.cfg.SkillRegistry.AvailableNames()
-	}
-	RenderBanner(os.Stderr, BannerInfo{
-		Provider:   r.cfg.Provider,
-		Model:      r.cfg.Model,
-		ToolCount:  toolCount,
-		SkillCount: skillCount,
-		SkillNames: skillNames,
-		SessionID:  r.sess.ID,
-	})
+	r.ui.Banner(bannerInfo)
+	r.ui.SetStatus(r.cfg.Model, r.planMode)
 
-	// Interactive loop.
-	// SIGINT (Ctrl+C) during a turn cancels only that turn.
-	// SIGINT at the prompt exits the REPL.
-	sigCh := make(chan os.Signal, 1)
-	defer signal.Stop(sigCh)
+	// Interactive loop. Ctrl+C during a turn cancels only that turn (delivered
+	// via the TUI interrupt channel); Ctrl+C at the prompt exits the REPL.
 
 	// Auto-continue: if the resumed session was interrupted mid-task,
 	// start the agent immediately without waiting for user input.
@@ -149,31 +141,29 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// run the agent immediately without waiting for user input.
 		if autoContinue {
 			autoContinue = false
-			fmt.Fprintln(os.Stderr, "  Resuming interrupted session...")
+			r.ui.Info("  Resuming interrupted session...")
 			r.turn++
-			if err := r.runTurnWithSignal(parentCtx, sigCh, r.continueTurn); err != nil {
+			if err := r.runTurnWithSignal(parentCtx, r.continueTurn); err != nil {
 				if parentCtx.Err() != nil {
 					break
 				}
 				if err.cancelled {
-					r.renderer.RenderInterrupted()
+					r.ui.RenderInterrupted()
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+				r.ui.Info(fmt.Sprintf("  Error: %v", err))
 			}
 		}
 
 		// Wait for user input.
-		line, err := r.input.ReadPrompt(parentCtx)
+		line, err := r.ui.ReadPrompt(parentCtx)
 		if err != nil {
 			if errors.Is(err, errInterrupted) {
 				// Ctrl+C at prompt — exit REPL.
-				fmt.Fprintln(os.Stderr, "\n  Interrupted.")
+				r.ui.Info("  Interrupted.")
 				break
 			}
-			if parentCtx.Err() != nil {
-				fmt.Fprintln(os.Stderr, "\n  Interrupted.")
-			}
+			// io.EOF (Ctrl+D) or context cancellation: exit quietly.
 			break
 		}
 		if line == "" {
@@ -192,26 +182,30 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// without adding a new human message.
 		if isContinuationInput(line) && len(r.sess.Messages) > 0 {
 			r.turn++
-			if err := r.runTurnWithSignal(parentCtx, sigCh, r.continueTurn); err != nil {
+			if err := r.runTurnWithSignal(parentCtx, r.continueTurn); err != nil {
 				if parentCtx.Err() != nil {
 					break
 				}
-				fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+				if err.cancelled {
+					r.ui.RenderInterrupted()
+					continue
+				}
+				r.ui.Info(fmt.Sprintf("  Error: %v", err))
 			}
 			continue
 		}
 
 		r.turn++
 
-		turnErr := r.runTurnWithSignal(parentCtx, sigCh, func(ctx context.Context) error {
+		turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
 			return r.runTurn(ctx, line)
 		})
 		if turnErr != nil {
 			if turnErr.cancelled {
-				r.renderer.RenderInterrupted()
+				r.ui.RenderInterrupted()
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "  Error: %v\n", turnErr)
+			r.ui.Info(fmt.Sprintf("  Error: %v", turnErr))
 		}
 	}
 
@@ -219,6 +213,28 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	r.saveSession()
 	slog.Info("session ended", "session_id", r.sess.ID, "turns", r.turn)
 	return nil
+}
+
+// bannerInfo gathers the data shown in the startup banner and footer.
+func (r *ChatRepl) bannerInfo() BannerInfo {
+	toolCount := 0
+	if r.cfg.ToolRegistry != nil {
+		toolCount = len(r.cfg.ToolRegistry.List())
+	}
+	skillCount := 0
+	var skillNames []string
+	if r.cfg.SkillRegistry != nil {
+		skillCount = r.cfg.SkillRegistry.Count()
+		skillNames = r.cfg.SkillRegistry.AvailableNames()
+	}
+	return BannerInfo{
+		Provider:   r.cfg.Provider,
+		Model:      r.cfg.Model,
+		ToolCount:  toolCount,
+		SkillCount: skillCount,
+		SkillNames: skillNames,
+		SessionID:  r.sess.ID,
+	}
 }
 
 func (r *ChatRepl) resolveSession() error {
@@ -270,11 +286,6 @@ func (r *ChatRepl) resolveSession() error {
 	}
 	r.sess = sess
 	return nil
-}
-
-func (r *ChatRepl) runSingleQuery(ctx context.Context) error {
-	r.turn = 1
-	return r.runTurn(ctx, r.cfg.Query)
 }
 
 // filterUnresolvedToolUses removes assistant messages where ALL tool calls
@@ -364,19 +375,21 @@ func (e *turnError) Error() string {
 	return "cancelled"
 }
 
-// runTurnWithSignal creates a cancellable turn context, forwards SIGINT to it,
-// runs the given turn function, and returns a turnError that distinguishes
-// cancellation (Ctrl+C) from real errors. Returns nil on clean success.
-func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Signal, fn func(context.Context) error) *turnError {
+// runTurnWithSignal creates a cancellable turn context, cancels it when the user
+// presses Ctrl+C (delivered on the TUI interrupt channel, since raw mode means
+// Ctrl+C never raises SIGINT), runs the given turn function, and returns a
+// turnError that distinguishes cancellation from real errors. Returns nil on
+// clean success.
+func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.Context) error) *turnError {
 	turnCtx, turnCancel := context.WithCancel(parentCtx)
-	signal.Notify(sigCh, os.Interrupt)
+	uiInterrupt := r.ui.InterruptCh()
 
-	// sigFired is written by the signal goroutine before turnCancel(); reading
+	// sigFired is written by the watcher goroutine before turnCancel(); reading
 	// it after fn returns (which implies the context is done) is race-free.
 	sigFired := make(chan struct{}, 1)
 	go func() {
 		select {
-		case <-sigCh:
+		case <-uiInterrupt:
 			sigFired <- struct{}{}
 			turnCancel()
 		case <-turnCtx.Done():
@@ -385,7 +398,6 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Si
 
 	err := fn(turnCtx)
 	turnCancel()
-	signal.Stop(sigCh)
 
 	interrupted := false
 	select {
@@ -402,7 +414,7 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, sigCh chan os.Si
 
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-		r.renderer.RenderSubagentEvent(evt)
+		r.ui.RenderSubagentEvent(evt)
 	})
 
 	// Evaluate fact feedback from previous turn (consume-once).
@@ -428,7 +440,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		ContextWindow:   r.cfg.ContextWindow,
 		MaxTurns:        r.cfg.MaxTurns,
 		RequestTimeout:  r.cfg.RequestTimeout,
-		UserInteraction: r.input,
+		UserInteraction: r.ui,
 		PlanMode:        r.planMode,
 		WorkDir:         r.cfg.WorkDir,
 	}
@@ -445,7 +457,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		runAgent.AppendSystemPrompt(r.cfg.SystemPrompt)
 	}
 
-	r.renderer.TurnStart(r.turn, userInput)
+	r.ui.TurnStart(r.turn, userInput)
 
 	// Remember message count before agent run to only persist new messages.
 	prevMsgCount := len(r.sess.Messages)
@@ -470,15 +482,11 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		outcomes <- outcome{result: result, err: err}
 	}()
 
-	// Process events as they arrive.
+	// Process events as they arrive. The TUI shows a live spinner + elapsed
+	// timer while the agent runs, so no separate idle heartbeat is needed.
 	var lastUsage *agent.Usage
 	var turnErr error
 	var turnToolCalls []memory.ToolCallInfo
-	turnStart := time.Now()
-	lastProgress := turnStart
-	var lastHeartbeat time.Time
-	heartbeatTicker := time.NewTicker(15 * time.Second)
-	defer heartbeatTicker.Stop()
 EventLoop:
 	for {
 		select {
@@ -487,11 +495,10 @@ EventLoop:
 				events = nil
 				continue
 			}
-			lastProgress = time.Now()
 			if evt.Usage != nil {
 				lastUsage = evt.Usage
 			}
-			r.renderer.RenderEvent(evt)
+			r.ui.RenderEvent(evt)
 			// Collect tool call names for distribution tracking.
 			if evt.Type == agent.AgentEventToolCallStart {
 				name := ""
@@ -505,15 +512,13 @@ EventLoop:
 				}
 			}
 		case out := <-outcomes:
-			lastProgress = time.Now()
 			// Drain remaining events.
 			if events != nil {
 				for evt := range events {
-					lastProgress = time.Now()
 					if evt.Usage != nil {
 						lastUsage = evt.Usage
 					}
-					r.renderer.RenderEvent(evt)
+					r.ui.RenderEvent(evt)
 				}
 			}
 			if out.result != nil {
@@ -527,20 +532,10 @@ EventLoop:
 		case <-ctx.Done():
 			turnErr = ctx.Err()
 			break EventLoop
-		case <-heartbeatTicker.C:
-			idle := time.Since(lastProgress)
-			if idle < 20*time.Second {
-				continue
-			}
-			if !lastHeartbeat.IsZero() && time.Since(lastHeartbeat) < 30*time.Second {
-				continue
-			}
-			r.renderer.RenderHeartbeat(time.Since(turnStart), idle)
-			lastHeartbeat = time.Now()
 		}
 	}
 
-	r.renderer.TurnEnd(lastUsage)
+	r.ui.TurnEnd(lastUsage)
 
 	// Always persist new messages, even on timeout/cancellation.
 	for _, msg := range r.sess.Messages[prevMsgCount:] {
@@ -674,48 +669,52 @@ func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
 	case "exit", "quit", "q":
 		return true
 	case "help", "h":
-		printSlashHelp()
+		r.ui.Info(slashHelpText())
 	case "clear":
 		r.sess.Messages = nil
-		fmt.Fprintln(os.Stderr, "  Session history cleared.")
+		r.ui.Info("  Session history cleared.")
 	case "history":
-		PrintHistory(os.Stderr, r.sess.Messages)
+		var sb strings.Builder
+		PrintHistory(&sb, r.sess.Messages)
+		r.ui.Info(strings.TrimRight(sb.String(), "\n"))
 	case "compact":
-		fmt.Fprintln(os.Stderr, "  Compaction is automatic when context fills up.")
+		r.ui.Info("  Compaction is automatic when context fills up.")
 	case "new":
 		r.startNewSession()
 	case "title":
 		if cmd.Args == "" {
-			fmt.Fprintln(os.Stderr, "  Usage: /title <name>")
+			r.ui.Info("  Usage: /title <name>")
 			return false
 		}
 		_ = r.sessMgr.SetTitle(r.sess.ID, cmd.Args)
 		r.sess.Title = cmd.Args
-		fmt.Fprintf(os.Stderr, "  Title set to: %s\n", cmd.Args)
+		r.ui.Info(fmt.Sprintf("  Title set to: %s", cmd.Args))
 	case "save":
 		r.saveSession()
-		fmt.Fprintln(os.Stderr, "  Session saved.")
+		r.ui.Info("  Session saved.")
 	case "sessions":
-		r.printSessionList()
+		r.ui.Info(r.sessionListText())
 	case "undo":
 		r.undoLastTurn()
 	case "plan":
 		r.planMode = true
-		fmt.Fprintln(os.Stderr, "  Plan mode enabled. Agent will explore and plan before writing code.")
-		fmt.Fprintln(os.Stderr, "  Use /run to disable, or the agent will ask you to approve the plan.")
+		r.ui.SetStatus(r.cfg.Model, r.planMode)
+		r.ui.Info("  Plan mode enabled. Agent will explore and plan before writing code.\n  Use /run to disable, or the agent will ask you to approve the plan.")
 	case "run", "code":
 		r.planMode = false
-		fmt.Fprintln(os.Stderr, "  Plan mode disabled. Agent has full tool access.")
+		r.ui.SetStatus(r.cfg.Model, r.planMode)
+		r.ui.Info("  Plan mode disabled. Agent has full tool access.")
 	case "model":
 		if cmd.Args == "" {
-			fmt.Fprintf(os.Stderr, "  Current model: %s\n", r.cfg.Model)
+			r.ui.Info(fmt.Sprintf("  Current model: %s", r.cfg.Model))
 			return false
 		}
 		r.cfg.Model = cmd.Args
-		fmt.Fprintf(os.Stderr, "  Model changed to: %s\n  (takes effect on next turn)\n", r.cfg.Model)
+		r.ui.SetStatus(r.cfg.Model, r.planMode)
+		r.ui.Info(fmt.Sprintf("  Model changed to: %s\n  (takes effect on next turn)", r.cfg.Model))
 	default:
-		fmt.Fprintf(os.Stderr, "  Unknown command: /%s\n", cmd.Name)
-		printSlashHelp()
+		r.ui.Info(fmt.Sprintf("  Unknown command: /%s", cmd.Name))
+		r.ui.Info(slashHelpText())
 	}
 	return false
 }
@@ -731,12 +730,12 @@ func (r *ChatRepl) startNewSession() {
 		CWD:   r.cfg.WorkDir,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Error creating new session: %v\n", err)
+		r.ui.Info(fmt.Sprintf("  Error creating new session: %v", err))
 		return
 	}
 	r.sess = sess
 	r.turn = 0
-	fmt.Fprintf(os.Stderr, "  New session started: %s\n", sess.ID)
+	r.ui.Info(fmt.Sprintf("  New session started: %s", sess.ID))
 }
 
 func (r *ChatRepl) undoLastTurn() {
@@ -749,7 +748,7 @@ func (r *ChatRepl) undoLastTurn() {
 		}
 	}
 	if lastHuman < 0 {
-		fmt.Fprintln(os.Stderr, "  Nothing to undo.")
+		r.ui.Info("  Nothing to undo.")
 		return
 	}
 	removed := len(r.sess.Messages) - lastHuman
@@ -762,61 +761,46 @@ func (r *ChatRepl) undoLastTurn() {
 		slog.Warn("undo: delete messages from DB failed", "err", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "  Undone %d messages.\n", removed)
+	r.ui.Info(fmt.Sprintf("  Undone %d messages.", removed))
 }
 
-func printSlashHelp() {
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "  Commands:")
-	fmt.Fprintln(os.Stderr, "    /help      Show this help")
-	fmt.Fprintln(os.Stderr, "    /clear     Clear session history")
-	fmt.Fprintln(os.Stderr, "    /history   Show conversation history")
-	fmt.Fprintln(os.Stderr, "    /sessions  List recent sessions")
-	fmt.Fprintln(os.Stderr, "    /new       Start a new session")
-	fmt.Fprintln(os.Stderr, "    /title     Set session title")
-	fmt.Fprintln(os.Stderr, "    /save      Save session metadata")
-	fmt.Fprintln(os.Stderr, "    /undo      Undo last turn")
-	fmt.Fprintln(os.Stderr, "    /plan      Enter plan mode (read-only, explore before coding)")
-	fmt.Fprintln(os.Stderr, "    /run       Exit plan mode (full tool access)")
-	fmt.Fprintln(os.Stderr, "    /model     Show current model (/model <name> to switch)")
-	fmt.Fprintln(os.Stderr, "    /exit      Exit the REPL")
-	fmt.Fprintln(os.Stderr)
+func slashHelpText() string {
+	return strings.Join([]string{
+		"",
+		"  Commands:",
+		"    /help      Show this help",
+		"    /clear     Clear session history",
+		"    /history   Show conversation history",
+		"    /sessions  List recent sessions",
+		"    /new       Start a new session",
+		"    /title     Set session title",
+		"    /save      Save session metadata",
+		"    /undo      Undo last turn",
+		"    /plan      Enter plan mode (read-only, explore before coding)",
+		"    /run       Exit plan mode (full tool access)",
+		"    /model     Show current model (/model <name> to switch)",
+		"    /exit      Exit the REPL",
+		"",
+	}, "\n")
 }
 
-func printHistory(messages []models.Message) {
-	styles := DefaultStyles()
-	for _, msg := range messages {
-		switch msg.Role {
-		case models.RoleHuman:
-			fmt.Fprintln(os.Stderr, styles.UserPrompt.Render("  You: ")+msg.Content)
-		case models.RoleAI:
-			content := msg.Content
-			if len(content) > 100 {
-				content = content[:100] + "..."
-			}
-			fmt.Fprintln(os.Stderr, styles.Assistant.Render("  AI: ")+content)
-		}
-	}
-}
-
-// printSessionList lists recent sessions in the current REPL.
-func (r *ChatRepl) printSessionList() {
+// sessionListText renders the recent-session list as a string.
+func (r *ChatRepl) sessionListText() string {
 	if r.sessMgr == nil {
-		fmt.Fprintln(os.Stderr, "  No session repository configured.")
-		return
+		return "  No session repository configured."
 	}
 	metas, err := r.sessMgr.ListRecent(20)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Error listing sessions: %v\n", err)
-		return
+		return fmt.Sprintf("  Error listing sessions: %v", err)
 	}
 	if len(metas) == 0 {
-		fmt.Fprintln(os.Stderr, "  No sessions found.")
-		return
+		return "  No sessions found."
 	}
 	styles := DefaultStyles()
+	var sb strings.Builder
 	header := fmt.Sprintf("  %-24s %-40s %5s %s", "ID", "TITLE", "MSGS", "CREATED")
-	fmt.Fprintln(os.Stderr, styles.Dim.Render(header))
+	sb.WriteString(styles.Dim.Render(header))
+	sb.WriteString("\n")
 	for _, m := range metas {
 		title := m.Title
 		if title == "" {
@@ -830,9 +814,10 @@ func (r *ChatRepl) printSessionList() {
 		if m.ID == r.sess.ID {
 			marker = styles.Highlight.Render(" *")
 		}
-		fmt.Fprintf(os.Stderr, "%s %-24s %-40s %5d %s\n", marker, m.ID, title, m.MsgCount, created)
+		sb.WriteString(fmt.Sprintf("%s %-24s %-40s %5d %s\n", marker, m.ID, title, m.MsgCount, created))
 	}
-	fmt.Fprintf(os.Stderr, "  Use 'deepai -r <ID>' to resume a session.\n")
+	sb.WriteString("  Use 'deepai -r <ID>' to resume a session.")
+	return sb.String()
 }
 
 // evaluateFactFeedback classifies the user message for feedback purposes,
