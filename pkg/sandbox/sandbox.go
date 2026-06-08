@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -138,7 +137,7 @@ func (s *Sandbox) Exec(ctx context.Context, cmd string, timeout time.Duration) (
 
 	command := exec.CommandContext(runCtx, exePath)
 	command.Dir = s.sessionDir
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(command)
 	command.Env = append(os.Environ(),
 		helperEnvEnabled+"=1",
 		helperEnvBackend+"="+string(s.backend),
@@ -343,16 +342,6 @@ func exitCode(state *os.ProcessState, waitErr error) int {
 	return -1
 }
 
-func forceKillProcess(proc *os.Process) {
-	if proc == nil {
-		return
-	}
-	if proc.Pid > 0 {
-		_ = syscall.Kill(-proc.Pid, syscall.SIGKILL)
-	}
-	_ = proc.Kill()
-}
-
 func normalizeConfig(cfg Config) Config {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
@@ -410,14 +399,6 @@ func execBubblewrap(dir string, command string, env []string) int {
 	return execProgram(bwrapPath, args, env)
 }
 
-func execProgram(path string, args []string, env []string) int {
-	if err := syscall.Exec(path, args, env); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "exec %s: %v\n", path, err)
-		return 127
-	}
-	return 0
-}
-
 func helperEnv(base []string, dir string) []string {
 	filtered := make([]string, 0, len(base)+2)
 	for _, entry := range base {
@@ -445,7 +426,7 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		defer cancel()
 	}
 	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
-	execCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(execCmd)
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	execCmd.Stdout = &stdoutBuf
