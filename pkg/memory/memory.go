@@ -216,6 +216,9 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 	defer mu.Unlock()
 
 	captured := s.captureFlushVersion(sessionID)
+	if v, ok := capturedFlushVersionFromContext(ctx); ok {
+		captured = v
+	}
 
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -264,6 +267,9 @@ func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []m
 	defer mu.Unlock()
 
 	captured := s.captureFlushVersion(sessionID)
+	if v, ok := capturedFlushVersionFromContext(ctx); ok {
+		captured = v
+	}
 
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -313,6 +319,9 @@ func (s *Service) UpdateWithFactSource(ctx context.Context, sessionID string, me
 	defer mu.Unlock()
 
 	captured := s.captureFlushVersion(sessionID)
+	if v, ok := capturedFlushVersionFromContext(ctx); ok {
+		captured = v
+	}
 
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -357,6 +366,9 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 	defer mu.Unlock()
 
 	captured := s.captureFlushVersion(sessionID)
+	if v, ok := capturedFlushVersionFromContext(ctx); ok {
+		captured = v
+	}
 
 	// Load doc once (session lock held, no concurrent modification).
 	current, err := s.storage.Load(ctx, sessionID)

@@ -44,6 +44,9 @@ type updateJob struct {
 	scope      Scope
 	turnID     int    // turn number for dedup key
 	seq        uint64 // monotonic sequence for dedup
+
+	flushVersion    uint64 // flush version captured at submit (update jobs)
+	hasFlushVersion bool
 }
 
 // UpdateQueue serializes and deduplicates memory update operations.
@@ -119,6 +122,11 @@ func (q *UpdateQueue) submit(job updateJob) {
 	}
 	q.mu.Unlock()
 
+	if strings.HasPrefix(key, "update:") {
+		job.flushVersion = q.captureFlushVersion(job.sessionID)
+		job.hasFlushVersion = true
+	}
+
 	// Block briefly if full; only drop after timeout.
 	// Use recover() to handle TOCTOU race: closed.Load() may return false
 	// just before Close() calls close(q.ch), causing a send-on-closed-channel panic.
@@ -143,6 +151,20 @@ func (q *UpdateQueue) submit(job updateJob) {
 			q.mu.Unlock()
 		}
 	}
+}
+
+type capturedFlushVersionKey struct{}
+
+func withCapturedFlushVersion(ctx context.Context, job updateJob) context.Context {
+	if !job.hasFlushVersion {
+		return ctx
+	}
+	return context.WithValue(ctx, capturedFlushVersionKey{}, job.flushVersion)
+}
+
+func capturedFlushVersionFromContext(ctx context.Context) (uint64, bool) {
+	v, ok := ctx.Value(capturedFlushVersionKey{}).(uint64)
+	return v, ok
 }
 
 // cancelPending removes any pending dedup entry for the given dedup key
@@ -252,6 +274,7 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 	case jobUpdateWith:
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		ctx = withCapturedFlushVersion(ctx, job)
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
 			q.svc.logger.Warn("async update with extractor failed", "session", job.sessionID, "err", err)
 		}
@@ -259,6 +282,7 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 	case jobUpdate:
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		ctx = withCapturedFlushVersion(ctx, job)
 		if err := q.svc.Update(ctx, job.sessionID, job.messages); err != nil {
 			q.svc.logger.Warn("async update failed", "session", job.sessionID, "err", err)
 		}
@@ -266,6 +290,7 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 	case jobUpdateWithFactSource:
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		ctx = withCapturedFlushVersion(ctx, job)
 		if err := q.svc.UpdateWithFactSource(ctx, job.sessionID, job.messages, job.ext, job.factSource); err != nil {
 			q.svc.logger.Warn("async update with fact source failed", "session", job.sessionID, "err", err)
 		}

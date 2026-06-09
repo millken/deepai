@@ -1283,3 +1283,44 @@ func TestCleanupStale(t *testing.T) {
 		t.Fatalf("stale entry should be cleaned up, got %v", ids)
 	}
 }
+
+func TestUpdateWith_AbortsWhenSubmitCapturedVersionIsStale(t *testing.T) {
+	store, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	svc := NewService(slog.Default(), store, nil)
+	defer svc.Close(context.Background())
+
+	sid := "s-race"
+	ext := &stubExtractor{update: Update{Facts: []Fact{{ID: "f1", Content: "stale fact", Confidence: 1}}}}
+	msgs := []models.Message{{SessionID: sid, Role: models.RoleHuman, Content: "hi"}}
+
+	// A flush occurred after this async job was submitted: it bumped the version.
+	svc.queue.cancelPending("update:" + sid) // 0 -> 1
+
+	// The async job carries the version captured at submit time (0). With the
+	// fix it must detect staleness against the now-current version (1) and skip
+	// the Save, rather than overwriting the flush with its stale extraction.
+	staleCtx := context.WithValue(context.Background(), capturedFlushVersionKey{}, uint64(0))
+	if err := svc.UpdateWith(staleCtx, sid, msgs, ext); err != nil {
+		t.Fatalf("UpdateWith: %v", err)
+	}
+	got, _ := store.Load(context.Background(), sid)
+	if len(got.Facts) != 0 {
+		t.Fatalf("stale async update saved over the flush: %d facts", len(got.Facts))
+	}
+
+	// A job whose captured version matches the current version must save.
+	freshCtx := context.WithValue(context.Background(), capturedFlushVersionKey{}, uint64(1))
+	if err := svc.UpdateWith(freshCtx, sid, msgs, ext); err != nil {
+		t.Fatalf("UpdateWith (fresh): %v", err)
+	}
+	got2, _ := store.Load(context.Background(), sid)
+	if len(got2.Facts) == 0 {
+		t.Fatal("up-to-date async update should have saved")
+	}
+}
