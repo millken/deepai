@@ -73,7 +73,7 @@ func BuildTaskTool(pool taskPool, workDir string) models.Tool {
 			res, err := orchestrator.Build(ctx, cfg, prompt,
 				poolRunner{pool: pool, reviewModel: strings.TrimSpace(reviewModel), reviewerTypes: reviewerSet},
 				cmdVerifier{command: verifyCmd, workDir: workDir, timeout: 5 * time.Minute},
-				gitDiffer{workDir: workDir},
+				newGitDiffer(ctx, workDir),
 			)
 			if err != nil {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusFailed, Error: err.Error()}, err

@@ -63,11 +63,24 @@ func (v cmdVerifier) Verify(ctx context.Context) (orchestrator.VerifyResult, err
 }
 
 type gitDiffer struct {
-	workDir string
+	workDir  string
+	baseline string
+}
+
+func newGitDiffer(ctx context.Context, workDir string) gitDiffer {
+	d := gitDiffer{workDir: workDir}
+	res, err := pkgsandbox.ExecDirect(ctx, withWorkDir(workDir, "git rev-parse HEAD"), 10*time.Second)
+	if err == nil && res.ExitCode() == 0 {
+		d.baseline = strings.TrimSpace(res.Stdout())
+	}
+	return d
 }
 
 func (d gitDiffer) Diff(ctx context.Context) (string, error) {
 	cmd := "git add -N -A . >/dev/null 2>&1; git --no-pager diff"
+	if d.baseline != "" {
+		cmd = "git add -N -A . >/dev/null 2>&1; git --no-pager diff " + d.baseline
+	}
 	res, err := pkgsandbox.ExecDirect(ctx, withWorkDir(d.workDir, cmd), 30*time.Second)
 	if err != nil {
 		return "", err
@@ -158,7 +171,7 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			res, err := orchestrator.Run(ctx, cfg, prompt,
 				poolRunner{pool: pool, reviewModel: strings.TrimSpace(reviewModel), reviewerTypes: reviewerSet},
 				cmdVerifier{command: verifyCmd, workDir: workDir, timeout: 5 * time.Minute},
-				gitDiffer{workDir: workDir},
+				newGitDiffer(ctx, workDir),
 			)
 			if err != nil {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusFailed, Error: err.Error()}, err
