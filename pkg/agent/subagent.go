@@ -131,6 +131,11 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		}
 	}()
 
+	// A subagent is delegated work — it must never block on the user. Strip any
+	// inherited UserInteraction so plan confirmations auto-approve and
+	// clarifications fall back to best-judgment instead of prompting.
+	ctx = tools.WithUserInteraction(ctx, nil)
+
 	result, err := runAgent.Run(ctx, task.ID, []models.Message{
 		{
 			ID:        newSubagentMessageID("human"),
