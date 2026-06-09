@@ -172,7 +172,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 
 		// Handle slash commands.
 		if cmd, ok := ParseSlashCommand(line); ok {
-			if r.handleSlashCommand(cmd) {
+			if r.handleSlashCommand(parentCtx, cmd) {
 				break
 			}
 			continue
@@ -469,6 +469,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 	if r.cfg.SystemPrompt != "" {
 		runAgent.AppendSystemPrompt(r.cfg.SystemPrompt)
 	}
+	runAgent.AppendSystemPrompt("For larger self-contained implementation tasks (not quick edits), prefer the orchestration tools that drive work to a verified result: build_task (design+implement+verify in one shot), design_task (produce a vetted plan first), implement_task (implement→verify→review→fix loop). Pass a verify_command (build/test) when one exists so success is objectively checked.")
 
 	r.ui.TurnStart(r.turn, userInput)
 
@@ -697,9 +698,69 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 	slog.Debug("session title set", "id", sessionID, "title", title)
 }
 
+func (r *ChatRepl) runOrchestrationCommand(parentCtx context.Context, toolName, label, args string) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		r.ui.Info(fmt.Sprintf("  Usage: /%s <task>   (optionally append a shell verify command after ' -- ', e.g. /build add X -- go test ./...)", label))
+		return
+	}
+	if r.cfg.ToolRegistry == nil {
+		r.ui.Info("  No tools available.")
+		return
+	}
+	tool := r.cfg.ToolRegistry.Get(toolName)
+	if tool == nil || tool.Handler == nil {
+		r.ui.Info(fmt.Sprintf("  %s is not available.", toolName))
+		return
+	}
+
+	prompt, verifyCmd := args, ""
+	if i := strings.Index(args, " -- "); i >= 0 {
+		prompt = strings.TrimSpace(args[:i])
+		verifyCmd = strings.TrimSpace(args[i+4:])
+	}
+	toolArgs := map[string]any{"prompt": prompt}
+	if verifyCmd != "" {
+		toolArgs["verify_command"] = verifyCmd
+	}
+
+	r.turn++
+	r.ui.TurnStart(r.turn, "/"+label+" "+args)
+	var result models.ToolResult
+	terr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+			r.ui.RenderSubagentEvent(evt)
+		})
+		ctx = tools.WithSandbox(ctx, r.sb)
+		ctx = tools.WithThreadID(ctx, r.sess.ID)
+		ctx = tools.WithUserInteraction(ctx, r.ui)
+		res, err := tool.Handler(ctx, models.ToolCall{ID: "slash-" + label, Name: toolName, Arguments: toolArgs})
+		result = res
+		return err
+	})
+	r.ui.TurnEnd(nil)
+	if terr != nil {
+		if terr.cancelled {
+			r.ui.RenderInterrupted()
+		} else {
+			r.ui.Info(fmt.Sprintf("  %s failed: %v", toolName, terr))
+		}
+		return
+	}
+	if strings.TrimSpace(result.Content) != "" {
+		r.ui.Info("  " + result.Content)
+	}
+}
+
 // handleSlashCommand processes a slash command. Returns true if the REPL should exit.
-func (r *ChatRepl) handleSlashCommand(cmd SlashCommand) bool {
+func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashCommand) bool {
 	switch cmd.Name {
+	case "design":
+		r.runOrchestrationCommand(parentCtx, "design_task", "design", cmd.Args)
+	case "implement":
+		r.runOrchestrationCommand(parentCtx, "implement_task", "implement", cmd.Args)
+	case "build":
+		r.runOrchestrationCommand(parentCtx, "build_task", "build", cmd.Args)
 	case "exit", "quit", "q":
 		return true
 	case "help", "h":
@@ -807,6 +868,9 @@ func slashHelpText() string {
 		"    /undo      Undo last turn",
 		"    /plan      Enter plan mode (read-only, explore before coding)",
 		"    /run       Exit plan mode (full tool access)",
+		"    /design    Design panel: proposals + judge → a vetted plan (/design <task>)",
+		"    /implement Implement→verify→review→fix loop (/implement <task> [-- verify cmd])",
+		"    /build     Design then implement, end-to-end (/build <task> [-- verify cmd])",
 		"    /model     Show current model (/model <name> to switch)",
 		"    /exit      Exit the REPL",
 		"",

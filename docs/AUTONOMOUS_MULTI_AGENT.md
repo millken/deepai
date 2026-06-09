@@ -164,6 +164,10 @@ ImplementVerifyFix(ctx, taskPrompt, opts) Result:
 **端到端串联(已落地)**:
 - `orchestrator.Build` + `build_task` 工具:把设计面板与 implement-verify-fix **确定性地**接成一步——design 综合出的 plan 自动、完整地喂进实现阶段(coder 提示同时含原任务与 vetted plan),一次调用跑完"讨论→设计→实现→验证→修复"。这是阶段 B"声明式流水线"的一个具体两阶段实例,也是"全程不干预"最贴近的形态。design 阶段失败则不进入实现阶段。
 
+**如何触发**:
+- **手动(确定性)**:slash 命令 `/design <任务>`、`/implement <任务> [-- 验证命令]`、`/build <任务> [-- 验证命令]` 直接调对应工具,绕过模型的工具选择;`-- ` 之后是可选的 shell 验证命令(如 `/build 加缓存 -- go build ./... && go test ./...`)。Ctrl+C 可中断。
+- **自动(软)**:主 agent 的系统提示里有一句引导,对"较大、自包含的实现任务优先用 build_task/design_task/implement_task"——提高自动选用概率,但不保证;只加在主 agent(子 agent 用各自 profile 提示,且不持有这些工具)。
+
 仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、把多形态抽成可任意声明的通用流水线引擎、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
 
 ## 8. 一句话结论
