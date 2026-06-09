@@ -166,7 +166,7 @@ func ResolveVirtualPath(ctx context.Context, path string) string {
 		if root == "" {
 			return path
 		}
-		return filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(path, "/mnt/user-data/")))
+		return confineToRoot(root, strings.TrimPrefix(path, "/mnt/user-data/"))
 	case path == acpWorkspaceVirtualPath || strings.HasPrefix(path, acpWorkspaceVirtualPath+"/"):
 		root, err := ACPWorkspaceDir(ThreadIDFromContext(ctx))
 		if err != nil {
@@ -177,10 +177,19 @@ func ResolveVirtualPath(ctx context.Context, path string) string {
 		if suffix == "" {
 			return root
 		}
-		return filepath.Join(root, filepath.FromSlash(suffix))
+		return confineToRoot(root, suffix)
 	default:
 		return path
 	}
+}
+
+func confineToRoot(root, suffix string) string {
+	joined := filepath.Join(root, filepath.FromSlash(suffix))
+	rel, err := filepath.Rel(root, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return root
+	}
+	return joined
 }
 
 func ResolveVirtualCommand(ctx context.Context, cmd string) string {

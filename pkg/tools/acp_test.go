@@ -93,3 +93,35 @@ func TestInvokeACPAgentToolRequiresThreadID(t *testing.T) {
 		t.Fatalf("status=%q want %q", result.Status, models.CallStatusFailed)
 	}
 }
+
+func TestResolveVirtualPath_ConfinesTraversal(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+	ctx := WithThreadID(context.Background(), "thread-1")
+	base := filepath.Join(root, "threads", "thread-1", "user-data")
+
+	withinBase := func(p string) bool {
+		rel, err := filepath.Rel(base, p)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+	}
+
+	// Normal path resolves under the thread's user-data root.
+	if got := ResolveVirtualPath(ctx, "/mnt/user-data/notes/a.txt"); got != filepath.Join(base, "notes", "a.txt") {
+		t.Fatalf("normal resolve = %q, want %q", got, filepath.Join(base, "notes", "a.txt"))
+	}
+
+	// Parent-traversal escape must be confined (clamped within base).
+	if got := ResolveVirtualPath(ctx, "/mnt/user-data/../../../../etc/passwd"); !withinBase(got) {
+		t.Fatalf("traversal escaped confinement: %q", got)
+	}
+	// Cross-thread escape must be confined.
+	if got := ResolveVirtualPath(ctx, "/mnt/user-data/../../thread-2/user-data/secret"); !withinBase(got) {
+		t.Fatalf("cross-thread escape: %q", got)
+	}
+	// acp-workspace traversal must be confined too.
+	acpBase := filepath.Join(root, "threads", "thread-1", "acp-workspace")
+	got := ResolveVirtualPath(ctx, "/mnt/acp-workspace/../../../etc/passwd")
+	if rel, err := filepath.Rel(acpBase, got); err == nil && strings.HasPrefix(rel, "..") {
+		t.Fatalf("acp-workspace traversal escaped: %q", got)
+	}
+}

@@ -262,3 +262,25 @@ func TestGlobHandlerHonorsRoot(t *testing.T) {
 		t.Fatalf("glob result=%q, want note.txt", result.Content)
 	}
 }
+
+func TestResolveWritablePath_MatchesReadableForVirtualPaths(t *testing.T) {
+	t.Setenv("DEEPAI_DATA_ROOT", t.TempDir())
+	ctx := tools.WithThreadID(context.Background(), "thread-x")
+
+	// Writes must resolve virtual prefixes the same way reads do; previously
+	// resolveWritablePath only handled /mnt/user-data, so /mnt/acp-workspace
+	// writes leaked to a literal host path while reads went to the thread dir.
+	for _, p := range []string{
+		"/mnt/user-data/out.txt",
+		"/mnt/acp-workspace/result.txt",
+		"/some/real/path.go",
+	} {
+		if w, r := resolveWritablePath(ctx, p), resolveReadablePath(ctx, p); w != r {
+			t.Fatalf("resolve mismatch for %q: write=%q read=%q", p, w, r)
+		}
+	}
+	// And the acp-workspace write must NOT stay the literal virtual path.
+	if got := resolveWritablePath(ctx, "/mnt/acp-workspace/result.txt"); strings.HasPrefix(got, "/mnt/") {
+		t.Fatalf("acp-workspace write not resolved: %q", got)
+	}
+}

@@ -266,20 +266,7 @@ func resolveReadablePath(ctx context.Context, path string) string {
 }
 
 func resolveWritablePath(ctx context.Context, path string) string {
-	path = strings.TrimSpace(path)
-	if !strings.HasPrefix(path, "/mnt/user-data/") {
-		return path
-	}
-	threadID := tools.ThreadIDFromContext(ctx)
-	if threadID == "" {
-		return path
-	}
-	root := strings.TrimSpace(os.Getenv("DEEPAI_DATA_ROOT"))
-	if root == "" {
-		root = filepath.Join(os.TempDir(), "deepai-go-data")
-	}
-	suffix := strings.TrimPrefix(path, "/mnt/user-data/")
-	return filepath.Join(root, "threads", threadID, "user-data", filepath.FromSlash(suffix))
+	return tools.ResolveVirtualPath(ctx, path)
 }
 
 func displayVirtualPath(ctx context.Context, path string) string {
