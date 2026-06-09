@@ -115,6 +115,7 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 				"review_policy":  map[string]any{"type": "string", "description": "How reviewer votes combine: 'unanimous' (default, any fail blocks) or 'majority'."},
 				"review_model":   map[string]any{"type": "string", "description": "Optional model id used for reviewers, distinct from the coder's, to reduce self-review bias."},
 				"max_rounds":     map[string]any{"type": "integer", "description": "Max implement→verify→review→fix rounds (default 4)"},
+				"max_agent_calls": map[string]any{"type": "integer", "description": "Global cap on total subagent invocations (coder + reviewers) across the whole run. 0 = unlimited. Bounds cost for unattended use."},
 				"require_verification": map[string]any{"type": "boolean", "description": "If true, only declare success when verify_command actually ran and passed (review alone never suffices). Requires verify_command."},
 			},
 			"required": []any{"prompt"},
@@ -142,6 +143,7 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 				ReviewerType:        strings.TrimSpace(reviewerType),
 				Reviewers:           stringsFromArg(call.Arguments["reviewers"]),
 				MajorityReview:      strings.EqualFold(strings.TrimSpace(reviewPolicy), "majority"),
+				MaxAgentCalls:       intFromArg(call.Arguments["max_agent_calls"]),
 				RequireVerification: requireVerification,
 			}
 
@@ -174,10 +176,11 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 
 func summarizeOrchestration(res *orchestrator.Result) map[string]any {
 	out := map[string]any{
-		"done":     res.Done,
-		"verified": res.Verified,
-		"reason":   res.Reason,
-		"rounds":   len(res.Rounds),
+		"done":        res.Done,
+		"verified":    res.Verified,
+		"reason":      res.Reason,
+		"rounds":      len(res.Rounds),
+		"agent_calls": res.AgentCalls,
 	}
 	if n := len(res.Rounds); n > 0 {
 		last := res.Rounds[n-1]

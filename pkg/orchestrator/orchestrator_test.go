@@ -4,16 +4,21 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type scriptedRunner struct {
+	mu      sync.Mutex
 	calls   []string
 	reviews []string
 	reviewI int
 }
 
 func (r *scriptedRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, agentType)
 	if agentType == "arch-reviewer" || agentType == "security-reviewer" {
 		out := r.reviews[r.reviewI]
@@ -234,12 +239,15 @@ func TestRun_VerifiedTrueWhenVerifyRanAndPassed(t *testing.T) {
 }
 
 type perTypeRunner struct {
+	mu       sync.Mutex
 	verdicts map[string]string
 	calls    []string
 }
 
 func (r *perTypeRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
+	r.mu.Lock()
 	r.calls = append(r.calls, agentType)
+	r.mu.Unlock()
 	if v, ok := r.verdicts[agentType]; ok {
 		return v, nil
 	}
@@ -311,5 +319,65 @@ func TestAggregateVerdicts(t *testing.T) {
 	}, names, false)
 	if len(merged.Issues) != 2 {
 		t.Fatalf("expected merged 2 issues, got %d", len(merged.Issues))
+	}
+}
+
+func TestFanOutReviews_OrderDeterministicDespiteCompletionOrder(t *testing.T) {
+	// Reviewer 0 is slow and completes last; results must still be indexed by
+	// reviewer position, not completion order.
+	reviewers := []string{"arch-reviewer", "security-reviewer", "perf-reviewer"}
+	r := runnerFunc(func(ctx context.Context, agentType, d, p string) (string, error) {
+		if agentType == "arch-reviewer" {
+			time.Sleep(20 * time.Millisecond)
+		}
+		return `{"verdict":"fail","issues":[{"file":"` + agentType + `","line":1,"message":"x"}]}`, nil
+	})
+	verdicts, err := fanOutReviews(context.Background(), r, reviewers, "p", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(verdicts) != 3 {
+		t.Fatalf("got %d verdicts, want 3", len(verdicts))
+	}
+	for i, rt := range reviewers {
+		if len(verdicts[i].Issues) == 0 || verdicts[i].Issues[0].File != rt {
+			t.Fatalf("verdict[%d] not from reviewer %q: %+v", i, rt, verdicts[i])
+		}
+	}
+}
+
+func TestFanOutReviews_ErrorPropagates(t *testing.T) {
+	r := runnerFunc(func(ctx context.Context, agentType, d, p string) (string, error) {
+		if agentType == "security-reviewer" {
+			return "", errors.New("reviewer down")
+		}
+		return `{"verdict":"pass"}`, nil
+	})
+	_, err := fanOutReviews(context.Background(), r, []string{"arch-reviewer", "security-reviewer"}, "p", 2)
+	if err == nil || !strings.Contains(err.Error(), "reviewer down") {
+		t.Fatalf("expected reviewer error to propagate, got %v", err)
+	}
+}
+
+func TestRun_StopsAtAgentCallBudget(t *testing.T) {
+	// 1 reviewer → 2 calls/round. Budget 2 → exactly one round, then stop before round 2.
+	runner := &scriptedRunner{reviews: []string{`{"verdict":"fail","summary":"nope"}`}}
+	res, err := Run(context.Background(),
+		Config{MaxRounds: 10, MaxAgentCalls: 2, Reviewers: []string{"arch-reviewer"}},
+		"do X", runner, &fixedVerifier{passes: []bool{true}}, staticDiffer{diff: "d"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Done {
+		t.Fatal("should not be Done")
+	}
+	if res.AgentCalls != 2 {
+		t.Fatalf("AgentCalls = %d, want 2 (one full round only)", res.AgentCalls)
+	}
+	if !strings.Contains(res.Reason, "budget") {
+		t.Fatalf("reason = %q, want budget stop", res.Reason)
+	}
+	if len(res.Rounds) != 1 {
+		t.Fatalf("ran %d rounds, want 1 within budget", len(res.Rounds))
 	}
 }

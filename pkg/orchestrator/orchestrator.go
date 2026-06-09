@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 type Issue struct {
@@ -47,6 +48,8 @@ type Config struct {
 	ReviewerType        string
 	Reviewers           []string
 	MajorityReview      bool
+	ReviewConcurrency   int
+	MaxAgentCalls       int
 	RequireVerification bool
 }
 
@@ -62,10 +65,11 @@ type RoundResult struct {
 }
 
 type Result struct {
-	Done     bool
-	Verified bool
-	Reason   string
-	Rounds   []RoundResult
+	Done       bool
+	Verified   bool
+	Reason     string
+	Rounds     []RoundResult
+	AgentCalls int
 }
 
 const (
@@ -102,6 +106,7 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 
 	res := &Result{}
 	feedback := ""
+	perRoundCalls := 1 + len(cfg.Reviewers)
 
 	for round := 1; round <= cfg.MaxRounds; round++ {
 		if err := ctx.Err(); err != nil {
@@ -109,10 +114,16 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 			return res, err
 		}
 
+		if cfg.MaxAgentCalls > 0 && res.AgentCalls+perRoundCalls > cfg.MaxAgentCalls {
+			res.Reason = fmt.Sprintf("agent-call budget (%d) would be exceeded by round %d; stopping", cfg.MaxAgentCalls, round)
+			return res, nil
+		}
+
 		coderPrompt := taskPrompt
 		if feedback != "" {
 			coderPrompt = taskPrompt + "\n\nThe previous attempt did not pass. Address this feedback, then stop:\n" + feedback
 		}
+		res.AgentCalls++
 		implOut, err := runner.Run(ctx, cfg.CoderType, "implement", coderPrompt)
 		if err != nil {
 			res.Reason = fmt.Sprintf("coder failed in round %d: %v", round, err)
@@ -151,15 +162,12 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		}
 
 		reviewPrompt := buildReviewPrompt(taskPrompt, diff, vr.Output, vr.Ran)
-		verdicts := make([]Verdict, 0, len(cfg.Reviewers))
-		for _, reviewerType := range cfg.Reviewers {
-			reviewOut, err := runner.Run(ctx, reviewerType, "review", reviewPrompt)
-			if err != nil {
-				res.Reason = fmt.Sprintf("reviewer %q failed in round %d: %v", reviewerType, round, err)
-				res.Rounds = append(res.Rounds, rr)
-				return res, err
-			}
-			verdicts = append(verdicts, parseVerdict(reviewOut))
+		res.AgentCalls += len(cfg.Reviewers)
+		verdicts, rerr := fanOutReviews(ctx, runner, cfg.Reviewers, reviewPrompt, cfg.ReviewConcurrency)
+		if rerr != nil {
+			res.Reason = fmt.Sprintf("reviewer failed in round %d: %v", round, rerr)
+			res.Rounds = append(res.Rounds, rr)
+			return res, rerr
 		}
 		rr.Reviews = verdicts
 		rr.Verdict = aggregateVerdicts(verdicts, cfg.Reviewers, cfg.MajorityReview)
@@ -243,6 +251,40 @@ func buildFeedback(rr RoundResult) string {
 		b.WriteString(truncate(rr.Verdict.Raw, 2000))
 	}
 	return truncate(b.String(), maxFeedbackBytes)
+}
+
+func fanOutReviews(ctx context.Context, runner SubagentRunner, reviewers []string, prompt string, concurrency int) ([]Verdict, error) {
+	if concurrency <= 0 || concurrency > len(reviewers) {
+		concurrency = len(reviewers)
+	}
+	if concurrency <= 0 {
+		return nil, nil
+	}
+	verdicts := make([]Verdict, len(reviewers))
+	errs := make([]error, len(reviewers))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, reviewerType := range reviewers {
+		wg.Add(1)
+		go func(i int, reviewerType string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out, err := runner.Run(ctx, reviewerType, "review", prompt)
+			if err != nil {
+				errs[i] = fmt.Errorf("reviewer %q: %w", reviewerType, err)
+				return
+			}
+			verdicts[i] = parseVerdict(out)
+		}(i, reviewerType)
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
+		}
+	}
+	return verdicts, nil
 }
 
 func aggregateVerdicts(verdicts []Verdict, reviewers []string, majority bool) Verdict {
