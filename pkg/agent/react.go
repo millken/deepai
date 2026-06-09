@@ -509,6 +509,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				}()
 			}
 			wg.Wait()
+			batchClean := true
 			for i, call := range toolCalls {
 				result := results[i]
 				runMessages = append(runMessages, models.Message{
@@ -538,6 +539,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				})
 				// Circuit-breaker for parallel path (same logic as serial path).
 				if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+					batchClean = false
 					consecutiveValidationFailures++
 					validationFailures[call.Name]++
 					if validationFailures[call.Name] >= maxValidationRetries {
@@ -566,9 +568,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 						return &RunResult{Messages: runMessages, Usage: usage}, err
 					}
 				} else {
-					consecutiveValidationFailures = 0
 					validationFailures[call.Name] = 0
 				}
+			}
+			if batchClean {
+				consecutiveValidationFailures = 0
 			}
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -578,6 +582,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			continue
 		}
 
+		batchClean := true
 		for _, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
@@ -645,6 +650,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// infinite loops where the model keeps omitting required arguments.
 			const maxValidationRetries = 3
 			if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+				batchClean = false
 				consecutiveValidationFailures++
 				validationFailures[call.Name]++
 				if validationFailures[call.Name] >= maxValidationRetries {
@@ -673,7 +679,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					return &RunResult{Messages: runMessages, Usage: usage}, err
 				}
 			} else {
-				consecutiveValidationFailures = 0
 				validationFailures[call.Name] = 0
 			}
 
@@ -682,6 +687,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return &RunResult{Messages: runMessages, Usage: usage}, err
 			}
+		}
+		if batchClean {
+			consecutiveValidationFailures = 0
 		}
 	}
 }

@@ -313,3 +313,70 @@ func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 		t.Fatalf("bare agent should not inject memory, but did:\n%s", got)
 	}
 }
+
+type validationLoopProvider struct{}
+
+func (validationLoopProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (validationLoopProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{
+			ToolCalls: []models.ToolCall{
+				{ID: "bad", Name: "needs_arg", Arguments: map[string]any{}},
+				{ID: "ok", Name: "freebie", Arguments: map[string]any{}},
+			},
+			Stop: "tool_calls",
+			Done: true,
+		}
+	}()
+	return ch, nil
+}
+
+// TestValidationBreaker_TripsDespiteMixedBatch guards M4: a batch that always
+// contains one passing tool must not keep resetting the global consecutive-
+// validation-failure counter. The breaker must still trip within a bounded
+// number of turns rather than looping until MaxTurns.
+func TestValidationBreaker_TripsDespiteMixedBatch(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "needs_arg",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"x": map[string]any{"type": "string"}},
+			"required":   []any{"x"},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(models.Tool{
+		Name: "freebie",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{Content: "ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: validationLoopProvider{},
+		Tools:       reg,
+		MaxTurns:    50,
+	})
+
+	_, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "go"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with an error")
+	}
+	if !strings.Contains(err.Error(), "consecutive tool argument validation failures") {
+		t.Fatalf("breaker did not trip (got %v); a mixed batch is still resetting the global counter", err)
+	}
+}
