@@ -6,12 +6,14 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -398,5 +400,59 @@ func TestMergeToolCalls_EmptyIDsDoNotCollide(t *testing.T) {
 	)
 	if len(merged) != 1 || len(merged[0].Arguments) == 0 {
 		t.Fatalf("same-ID calls should merge: %+v", merged)
+	}
+}
+
+type modelCaptureProvider struct {
+	mu    sync.Mutex
+	model string
+}
+
+func (p *modelCaptureProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *modelCaptureProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.mu.Lock()
+	p.model = req.Model
+	p.mu.Unlock()
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{Message: &models.Message{Role: models.RoleAI, Content: "done"}, Done: true}
+	}()
+	return ch, nil
+}
+
+func (p *modelCaptureProvider) seen() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.model
+}
+
+func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
+	p := &modelCaptureProvider{}
+	exec := NewSubagentExecutor(p, tools.NewRegistry(), nil, "configured-model")
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose"}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := p.seen(); got != "configured-model" {
+		t.Fatalf("subagent used model %q, want configured-model (the /build 模型不存在 bug)", got)
+	}
+
+	// Per-task model override wins.
+	p2 := &modelCaptureProvider{}
+	exec2 := NewSubagentExecutor(p2, tools.NewRegistry(), nil, "configured-model")
+	_, err = exec2.Execute(context.Background(),
+		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Model: "review-model"}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute (override): %v", err)
+	}
+	if got := p2.seen(); got != "review-model" {
+		t.Fatalf("per-task model override = %q, want review-model", got)
 	}
 }

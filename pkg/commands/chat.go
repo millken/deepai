@@ -126,7 +126,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Create tool registry.
 	registry := tools.NewRegistry()
-	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir)
+	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir, modelName, cfg.ContextWindow)
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -229,12 +229,12 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir string) {
+func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir, model string, contextWindow int) {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
 
 	// Subagent tools.
-	subExecutor := agent.NewSubagentExecutor(provider, registry, nil)
+	subExecutor := agent.NewSubagentExecutor(provider, registry, nil, model).WithWorkDir(workDir).WithContextWindow(contextWindow)
 	subPool := agent.NewSubagentPool(subExecutor, 4, 0)
 	mustRegisterTool(registry, tools.TaskTool(subPool))
 	mustRegisterTool(registry, tools.ImplementTaskTool(subPool, workDir))
