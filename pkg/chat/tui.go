@@ -440,16 +440,17 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+r":
-		// Toggle AI output between markdown and raw. Switching to raw also
-		// re-emits the last reply verbatim so its code/markdown can be copied.
+		// Toggle AI output between markdown and raw, and re-emit the last reply
+		// in the new mode so you can flip the same message back and forth
+		// (raw = copyable source, markdown = rendered).
 		m.renderMD = !m.renderMD
 		mode := "raw (copyable)"
 		if m.renderMD {
 			mode = "markdown"
 		}
 		lines := []string{m.styles.Dim.Render("  ⎿ output: " + mode)}
-		if !m.renderMD && strings.TrimSpace(m.lastAIRaw) != "" {
-			lines = append(lines, m.lastAIRaw)
+		if last := m.renderLastMessage(); last != "" {
+			lines = append(lines, last)
 		}
 		return m, commit(strings.Join(lines, "\n"))
 
@@ -630,6 +631,21 @@ func (m *tuiModel) flushPartial() string {
 		}
 	}
 	return m.styles.Assistant.Render(raw)
+}
+
+// renderLastMessage formats the last AI reply in the current output mode
+// (rendered markdown or raw source). Used by the ctrl+r toggle to re-show the
+// same message after flipping modes. Empty when there is no prior reply.
+func (m *tuiModel) renderLastMessage() string {
+	if strings.TrimSpace(m.lastAIRaw) == "" {
+		return ""
+	}
+	if m.renderMD {
+		if md := m.renderMarkdown(m.lastAIRaw); md != "" {
+			return md
+		}
+	}
+	return m.lastAIRaw
 }
 
 func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {

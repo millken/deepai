@@ -232,3 +232,29 @@ func TestContextGauge(t *testing.T) {
 		t.Fatalf("expected high-usage warning, got %q", g)
 	}
 }
+
+func TestRenderLastMessageToggleSymmetry(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.width = 80
+	m.lastAIRaw = "# Title\n\ncode: `x := 1`"
+
+	// raw mode → verbatim source (copyable)
+	m.renderMD = false
+	raw := m.renderLastMessage()
+	if !strings.Contains(raw, "# Title") || !strings.Contains(raw, "`x := 1`") {
+		t.Fatalf("raw toggle should return source, got %q", raw)
+	}
+
+	// markdown mode → rendered, non-empty (this is the case that used to vanish)
+	m.renderMD = true
+	md := m.renderLastMessage()
+	if md == "" {
+		t.Fatal("markdown toggle returned empty — the reply would disappear on toggle-back")
+	}
+
+	// no prior reply → empty
+	m.lastAIRaw = ""
+	if m.renderLastMessage() != "" {
+		t.Fatal("no prior reply should yield empty")
+	}
+}
