@@ -148,7 +148,13 @@ ImplementVerifyFix(ctx, taskPrompt, opts) Result:
 - **真实适配器 + 工具**:[pkg/tools/orchestrate.go](pkg/tools/orchestrate.go) — `implement_task` 工具。`poolRunner` 用现有 subagent pool 跑 coder/reviewer;`cmdVerifier` 用 `sandbox.ExecDirect` 跑 `verify_command`(退出码判定);`gitDiffer` 用 `git diff` 取改动给评审。已在 CLI 注册([pkg/commands/chat.go](pkg/commands/chat.go))。
 - **测试**:[pkg/orchestrator/orchestrator_test.go](pkg/orchestrator/orchestrator_test.go) 用 fake 覆盖收敛、循环修复、达上限放弃、验证失败即使评审通过也不算完成、无验证器仅靠评审、coder 报错冒泡、verdict 容错解析。
 
-仍是最小原型,**尚未做**:跨 agent 树的全局 token 预算、每轮状态持久化/可恢复、并发 fan-out(阶段 B)、共享黑板(阶段 C)。当前验证信号靠调用方传 `verify_command`(留空则仅靠评审)。
+**评审客观性增强(已落地)**:
+- 客观锚点 = `verify_command` 退出码;`Result.Verified` 仅在验证真跑过且通过时为 true,仅评审完成会标注 UNVERIFIED;`require_verification` 可设为硬闸门。
+- 对抗式评审(默认找问题、判 fail)+ 证据绑定(issue 必须 file:line)+ 空 diff 直接判 fail。
+- **多评委投票**(#4):`reviewers` 可配多个角色(arch/security/perf-reviewer),`review_policy` 取 unanimous(默认,任一否决即 fail)或 majority。降单评委方差。
+- **独立评审模型**(#6):`review_model` 让评审用与 coder 不同的 model,去自评偏差;经 `SubagentConfig.Model` 按 agent 类型路由。
+
+仍**尚未做**:跨 agent 树的全局 token 预算、每轮状态持久化/可恢复、并发 fan-out(阶段 B)、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
 
 ## 8. 一句话结论
 
