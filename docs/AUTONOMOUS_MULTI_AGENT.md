@@ -154,7 +154,11 @@ ImplementVerifyFix(ctx, taskPrompt, opts) Result:
 - **多评委投票**(#4):`reviewers` 可配多个角色(arch/security/perf-reviewer),`review_policy` 取 unanimous(默认,任一否决即 fail)或 majority。降单评委方差。
 - **独立评审模型**(#6):`review_model` 让评审用与 coder 不同的 model,去自评偏差;经 `SubagentConfig.Model` 按 agent 类型路由。
 
-仍**尚未做**:跨 agent 树的全局 token 预算、每轮状态持久化/可恢复、并发 fan-out(阶段 B)、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
+**阶段 B 部分落地(编排原语)**:
+- **并发 fan-out**:多评委面板现在并发执行(`fanOutReviews`,有界并发,结果按评委顺序索引保证确定性),CLI subagent pool 并发上限从 1 提到 4 以真正并行(coder 仍串行,只读评审并行,安全)。
+- **全局 agent-call 预算**(#B2 雏形):`Config.MaxAgentCalls` / 工具参数 `max_agent_calls` 在回合边界强制——只启动预算够跑完整轮(coder + 全部评委)的回合,超出即停并在 `Result.AgentCalls`/reason 汇报。为无人值守提供确定性成本上限。
+
+仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、声明式多阶段流水线、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
 
 ## 8. 一句话结论
 
