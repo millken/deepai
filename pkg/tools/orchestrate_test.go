@@ -66,3 +66,30 @@ func TestGitDiffer_CapturesCommittedChanges(t *testing.T) {
 		t.Fatalf("baseline diff missed the new untracked file:\n%s", diff2)
 	}
 }
+
+func TestDetectVerifyCommand(t *testing.T) {
+	cases := []struct {
+		marker string
+		want   string
+	}{
+		{"go.mod", "go build ./..."},
+		{"Cargo.toml", "cargo build"},
+		{"tsconfig.json", "npx --no-install tsc --noEmit"},
+	}
+	for _, c := range cases {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, c.marker), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := detectVerifyCommand(dir); got != c.want {
+			t.Fatalf("%s: got %q, want %q", c.marker, got, c.want)
+		}
+	}
+	// Unknown stack → empty (review-only), and explicit arg always wins.
+	if got := detectVerifyCommand(t.TempDir()); got != "" {
+		t.Fatalf("unknown stack: got %q, want empty", got)
+	}
+	if got := resolveVerifyCommand("make check", t.TempDir()); got != "make check" {
+		t.Fatalf("explicit arg should win, got %q", got)
+	}
+}

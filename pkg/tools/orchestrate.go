@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,6 +14,29 @@ import (
 	pkgsandbox "github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/subagent"
 )
+
+func detectVerifyCommand(workDir string) string {
+	has := func(name string) bool {
+		_, err := os.Stat(filepath.Join(workDir, name))
+		return err == nil
+	}
+	switch {
+	case has("go.mod"):
+		return "go build ./..."
+	case has("Cargo.toml"):
+		return "cargo build"
+	case has("tsconfig.json"):
+		return "npx --no-install tsc --noEmit"
+	}
+	return ""
+}
+
+func resolveVerifyCommand(arg, workDir string) string {
+	if v := strings.TrimSpace(arg); v != "" {
+		return v
+	}
+	return detectVerifyCommand(workDir)
+}
 
 type poolRunner struct {
 	pool          taskPool
@@ -122,7 +147,7 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"prompt":         map[string]any{"type": "string", "description": "Detailed task for the coder to implement"},
-				"verify_command": map[string]any{"type": "string", "description": "Shell command that must exit 0 for success (e.g. 'go build ./... && go test ./...'). Optional; if omitted, success relies on the reviewer only."},
+				"verify_command": map[string]any{"type": "string", "description": "Shell command that must exit 0 for success (e.g. 'go build ./... && go test ./...'). Auto-detected from the project (go build ... / cargo build / tsc --noEmit) when omitted; falls back to review-only if the stack is unknown."},
 				"reviewer_type":  map[string]any{"type": "string", "description": "Single reviewer agent type (default arch-reviewer). Ignored if reviewers is set."},
 				"reviewers":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Multiple reviewer agent types to vote (e.g. [\"arch-reviewer\",\"security-reviewer\",\"perf-reviewer\"]). Each is an independent skeptic."},
 				"review_policy":  map[string]any{"type": "string", "description": "How reviewer votes combine: 'unanimous' (default, any fail blocks) or 'majority'."},
@@ -141,14 +166,15 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			if strings.TrimSpace(prompt) == "" {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("prompt is required")
 			}
-			verifyCmd, _ := call.Arguments["verify_command"].(string)
+			verifyArg, _ := call.Arguments["verify_command"].(string)
+			verifyCmd := resolveVerifyCommand(verifyArg, workDir)
 			reviewerType, _ := call.Arguments["reviewer_type"].(string)
 			reviewModel, _ := call.Arguments["review_model"].(string)
 			reviewPolicy, _ := call.Arguments["review_policy"].(string)
 			requireVerification, _ := call.Arguments["require_verification"].(bool)
 
-			if requireVerification && strings.TrimSpace(verifyCmd) == "" {
-				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("require_verification needs a verify_command")
+			if requireVerification && verifyCmd == "" {
+				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("require_verification needs a verify_command and none could be auto-detected")
 			}
 
 			cfg := orchestrator.Config{
@@ -177,7 +203,9 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusFailed, Error: err.Error()}, err
 			}
 
-			content, _ := json.Marshal(summarizeOrchestration(res))
+			summary := summarizeOrchestration(res)
+			summary["verify_command"] = verifyCmd
+			content, _ := json.Marshal(summary)
 			status := models.CallStatusCompleted
 			if !res.Done {
 				status = models.CallStatusFailed

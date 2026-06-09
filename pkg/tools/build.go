@@ -20,7 +20,7 @@ func BuildTaskTool(pool taskPool, workDir string) models.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"prompt":         map[string]any{"type": "string", "description": "The task to design and implement"},
-				"verify_command": map[string]any{"type": "string", "description": "Shell command that must exit 0 for success (e.g. 'go build ./... && go test ./...'). Optional; without it success relies on the reviewer."},
+				"verify_command": map[string]any{"type": "string", "description": "Shell command that must exit 0 for success (e.g. 'go build ./... && go test ./...'). Auto-detected from the project (go build ... / cargo build / tsc --noEmit) when omitted; review-only if the stack is unknown."},
 				"proposers":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Design proposer agent types (default [architect, coder])."},
 				"judge":          map[string]any{"type": "string", "description": "Design judge agent type (default architect)."},
 				"reviewers":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Reviewer agent types that vote during implementation (default arch-reviewer)."},
@@ -40,14 +40,15 @@ func BuildTaskTool(pool taskPool, workDir string) models.Tool {
 			if strings.TrimSpace(prompt) == "" {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("prompt is required")
 			}
-			verifyCmd, _ := call.Arguments["verify_command"].(string)
+			verifyArg, _ := call.Arguments["verify_command"].(string)
+			verifyCmd := resolveVerifyCommand(verifyArg, workDir)
 			judge, _ := call.Arguments["judge"].(string)
 			reviewModel, _ := call.Arguments["review_model"].(string)
 			reviewPolicy, _ := call.Arguments["review_policy"].(string)
 			requireVerification, _ := call.Arguments["require_verification"].(bool)
 
-			if requireVerification && strings.TrimSpace(verifyCmd) == "" {
-				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("require_verification needs a verify_command")
+			if requireVerification && verifyCmd == "" {
+				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("require_verification needs a verify_command and none could be auto-detected")
 			}
 
 			implCfg := orchestrator.Config{
@@ -79,7 +80,7 @@ func BuildTaskTool(pool taskPool, workDir string) models.Tool {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusFailed, Error: err.Error()}, err
 			}
 
-			out := map[string]any{}
+			out := map[string]any{"verify_command": verifyCmd}
 			if res.Design != nil {
 				out["plan"] = res.Design.Plan
 				out["proposal_count"] = len(res.Design.Proposals)
