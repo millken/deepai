@@ -61,6 +61,11 @@ type AgentConfig struct {
 	// Plan mode: restrict agent to read-only tools until user approves the plan
 	PlanMode bool
 	WorkDir  string // working directory for writing plan files
+
+	// NonInteractive disables plan mode entirely (no enter_plan_mode tool).
+	// Set for delegated subagents, which have no user to approve a plan and must
+	// implement directly rather than stall in read-only exploration.
+	NonInteractive bool
 }
 
 type TimeoutError struct {

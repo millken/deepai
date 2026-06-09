@@ -112,6 +112,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,
 		SystemPrompt:   systemPrompt,
+		NonInteractive: true,
 	})
 
 	eventsDone := make(chan struct{})

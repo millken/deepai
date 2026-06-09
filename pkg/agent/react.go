@@ -127,12 +127,16 @@ func New(cfg AgentConfig) *Agent {
 		workDir:             cfg.WorkDir,
 	}
 
-	// Register plan mode tools (agent self-references via closures).
-	a.registerPlanTools()
+	// Register plan mode tools (agent self-references via closures). Skipped for
+	// non-interactive agents (subagents): plan mode needs a user to approve the
+	// plan, and without one the agent stalls in read-only exploration.
+	if !cfg.NonInteractive {
+		a.registerPlanTools()
 
-	// Start in plan mode if requested (e.g. user typed /plan).
-	if cfg.PlanMode {
-		a.enterPlanMode()
+		// Start in plan mode if requested (e.g. user typed /plan).
+		if cfg.PlanMode {
+			a.enterPlanMode()
+		}
 	}
 
 	return a

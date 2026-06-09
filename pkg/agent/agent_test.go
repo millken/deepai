@@ -456,3 +456,17 @@ func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
 		t.Fatalf("per-task model override = %q, want review-model", got)
 	}
 }
+
+func TestNonInteractiveAgentHasNoPlanMode(t *testing.T) {
+	reg := tools.NewRegistry()
+	interactive := New(AgentConfig{LLMProvider: &modelCaptureProvider{}, Tools: reg, Model: "m"})
+	if interactive.tools.Get("enter_plan_mode") == nil {
+		t.Fatal("interactive agent should register enter_plan_mode")
+	}
+
+	reg2 := tools.NewRegistry()
+	sub := New(AgentConfig{LLMProvider: &modelCaptureProvider{}, Tools: reg2, Model: "m", NonInteractive: true})
+	if sub.tools.Get("enter_plan_mode") != nil {
+		t.Fatal("non-interactive subagent must NOT have enter_plan_mode (causes 15m plan-mode stalls)")
+	}
+}
