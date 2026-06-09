@@ -51,6 +51,7 @@ type Config struct {
 	ReviewConcurrency   int
 	MaxAgentCalls       int
 	RequireVerification bool
+	Plan                string
 }
 
 type RoundResult struct {
@@ -106,6 +107,7 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 
 	res := &Result{}
 	feedback := ""
+	board := &Blackboard{Plan: cfg.Plan}
 	perRoundCalls := 1 + len(cfg.Reviewers)
 
 	for round := 1; round <= cfg.MaxRounds; round++ {
@@ -120,8 +122,11 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		}
 
 		coderPrompt := taskPrompt
+		if shared := board.Render(); shared != "" {
+			coderPrompt += "\n\n" + shared
+		}
 		if feedback != "" {
-			coderPrompt = taskPrompt + "\n\nThe previous attempt did not pass. Address this feedback, then stop:\n" + feedback
+			coderPrompt += "\n\nThe previous attempt did not pass. Address this feedback, then stop:\n" + feedback
 		}
 		res.AgentCalls++
 		implOut, err := runner.Run(ctx, cfg.CoderType, "implement", coderPrompt)
@@ -161,7 +166,7 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 			continue
 		}
 
-		reviewPrompt := buildReviewPrompt(taskPrompt, diff, vr.Output, vr.Ran)
+		reviewPrompt := buildReviewPrompt(taskPrompt, diff, vr.Output, vr.Ran, board.Render())
 		res.AgentCalls += len(cfg.Reviewers)
 		verdicts, rerr := fanOutReviews(ctx, runner, cfg.Reviewers, reviewPrompt, cfg.ReviewConcurrency)
 		if rerr != nil {
@@ -186,6 +191,9 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		}
 
 		feedback = buildFeedback(rr)
+		if summary := strings.TrimSpace(rr.Verdict.Summary); summary != "" {
+			board.AddNote(fmt.Sprintf("Round %d review: %s", round, truncate(summary, 400)))
+		}
 	}
 
 	if cfg.RequireVerification {
@@ -196,7 +204,7 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 	return res, nil
 }
 
-func buildReviewPrompt(taskPrompt, diff, verifyOutput string, verifyRan bool) string {
+func buildReviewPrompt(taskPrompt, diff, verifyOutput string, verifyRan bool, shared string) string {
 	var b strings.Builder
 	b.WriteString("You are an adversarial code reviewer. Your job is to FIND PROBLEMS, not to approve. ")
 	b.WriteString("Default to verdict \"fail\" unless you are confident the change fully and correctly satisfies the task with no blocking issues.\n\n")
@@ -211,9 +219,16 @@ func buildReviewPrompt(taskPrompt, diff, verifyOutput string, verifyRan bool) st
 	} else {
 		b.WriteString("- No automated verification was run, so you cannot rely on tests passing — be more skeptical about correctness.\n")
 	}
-	b.WriteString("- Output \"pass\" only if you would stake your reputation on this change being correct and complete.\n\n")
-	b.WriteString("## Task\n")
+	b.WriteString("- Output \"pass\" only if you would stake your reputation on this change being correct and complete.\n")
+	if strings.TrimSpace(shared) != "" {
+		b.WriteString("- Judge the change against the approved plan below; do NOT flag intentional decisions listed there as defects.\n")
+	}
+	b.WriteString("\n## Task\n")
 	b.WriteString(taskPrompt)
+	if strings.TrimSpace(shared) != "" {
+		b.WriteString("\n\n")
+		b.WriteString(shared)
+	}
 	if strings.TrimSpace(verifyOutput) != "" {
 		b.WriteString("\n\n## Verification output\n")
 		b.WriteString(truncate(verifyOutput, 4000))

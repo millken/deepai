@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"strings"
 )
 
 type BuildConfig struct {
@@ -24,19 +23,11 @@ func Build(ctx context.Context, cfg BuildConfig, taskPrompt string, runner Subag
 		return res, err
 	}
 
-	plan := ""
+	implCfg := cfg.Implement
 	if design != nil {
-		plan = design.Plan
+		implCfg.Plan = design.Plan
 	}
-	impl, err := Run(ctx, cfg.Implement, combineTaskAndPlan(taskPrompt, plan), runner, verifier, differ)
+	impl, err := Run(ctx, implCfg, taskPrompt, runner, verifier, differ)
 	res.Implement = impl
 	return res, err
-}
-
-func combineTaskAndPlan(task, plan string) string {
-	if strings.TrimSpace(plan) == "" {
-		return task
-	}
-	return "Implement the task below by following the vetted plan. If the plan conflicts with the task, the task wins.\n\n## Task\n" +
-		task + "\n\n## Vetted plan\n" + plan
 }

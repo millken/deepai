@@ -76,15 +76,3 @@ func TestBuild_DesignErrorSkipsImplement(t *testing.T) {
 	}
 }
 
-func TestCombineTaskAndPlan(t *testing.T) {
-	if got := combineTaskAndPlan("T", ""); got != "T" {
-		t.Fatalf("empty plan should pass task through, got %q", got)
-	}
-	if got := combineTaskAndPlan("T", "   "); got != "T" {
-		t.Fatalf("whitespace plan should pass task through, got %q", got)
-	}
-	got := combineTaskAndPlan("TASK", "PLAN")
-	if !strings.Contains(got, "TASK") || !strings.Contains(got, "PLAN") {
-		t.Fatalf("combined prompt missing task or plan: %q", got)
-	}
-}
