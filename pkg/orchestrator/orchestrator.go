@@ -52,6 +52,7 @@ type Config struct {
 	MaxAgentCalls       int
 	RequireVerification bool
 	Plan                string
+	Progress            func(string)
 }
 
 type RoundResult struct {
@@ -154,6 +155,13 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		rr.VerifyRan = vr.Ran
 		rr.VerifyPassed = vr.Passed
 		rr.VerifyOutput = vr.Output
+		if vr.Ran {
+			if vr.Passed {
+				progress(cfg, fmt.Sprintf("round %d: verify passed", round))
+			} else {
+				progress(cfg, fmt.Sprintf("round %d: verify FAILED", round))
+			}
+		}
 
 		diffKnown := differ != nil
 		diff := ""
@@ -181,6 +189,11 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		rr.Reviews = verdicts
 		rr.Verdict = aggregateVerdicts(verdicts, cfg.Reviewers, cfg.MajorityReview)
 		res.Rounds = append(res.Rounds, rr)
+		if rr.Verdict.Pass {
+			progress(cfg, fmt.Sprintf("round %d: review passed", round))
+		} else {
+			progress(cfg, fmt.Sprintf("round %d: review FAILED — %s", round, truncate(rr.Verdict.Summary, 120)))
+		}
 
 		objectiveOK := vr.Passed || (!vr.Ran && !cfg.RequireVerification)
 		if rr.Verdict.Pass && hasDiff && objectiveOK {
@@ -206,6 +219,12 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		res.Reason = fmt.Sprintf("reached max rounds (%d) without passing", cfg.MaxRounds)
 	}
 	return res, nil
+}
+
+func progress(cfg Config, msg string) {
+	if cfg.Progress != nil {
+		cfg.Progress(msg)
+	}
 }
 
 func buildReviewPrompt(taskPrompt, diff, verifyOutput string, verifyRan bool, shared string) string {

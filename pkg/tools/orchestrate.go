@@ -31,6 +31,12 @@ func detectVerifyCommand(workDir string) string {
 	return ""
 }
 
+func loopProgress(ctx context.Context) func(string) {
+	return func(msg string) {
+		subagent.EmitEvent(ctx, subagent.TaskEvent{Type: "task_running", Description: "loop", Message: msg})
+	}
+}
+
 func resolveVerifyCommand(arg, workDir string) string {
 	if v := strings.TrimSpace(arg); v != "" {
 		return v
@@ -184,6 +190,7 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 				MajorityReview:      strings.EqualFold(strings.TrimSpace(reviewPolicy), "majority"),
 				MaxAgentCalls:       intFromArg(call.Arguments["max_agent_calls"]),
 				RequireVerification: requireVerification,
+				Progress:            loopProgress(ctx),
 			}
 
 			reviewerSet := make(map[string]struct{})

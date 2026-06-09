@@ -57,6 +57,7 @@ func BuildTaskTool(pool taskPool, workDir string) models.Tool {
 				MajorityReview:      strings.EqualFold(strings.TrimSpace(reviewPolicy), "majority"),
 				MaxAgentCalls:       intFromArg(call.Arguments["max_agent_calls"]),
 				RequireVerification: requireVerification,
+				Progress:            loopProgress(ctx),
 			}
 			cfg := orchestrator.BuildConfig{
 				Design: orchestrator.DesignConfig{
