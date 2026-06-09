@@ -448,6 +448,9 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 		UserInteraction: r.ui,
 		PlanMode:        r.planMode,
 		WorkDir:         r.cfg.WorkDir,
+		MemoryService:   r.cfg.MemoryService,
+		MemoryExtractor: r.cfg.MemoryExtractor,
+		MemoryUserID:    r.cfg.WorkDir,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -605,6 +608,9 @@ EventLoop:
 	// single turn while still capturing facts before context is compacted.
 	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil && r.turn%memoryExtractInterval == 0 {
 		r.cfg.MemoryService.ScheduleUpdateWith(r.sess.ID, r.sess.Messages, r.cfg.MemoryExtractor)
+		if uid := strings.TrimSpace(r.cfg.WorkDir); uid != "" {
+			r.cfg.MemoryService.ScheduleUpdateWith(memory.UserScope(uid).Key(), r.sess.Messages, r.cfg.MemoryExtractor)
+		}
 	}
 
 	// Schedule preference extraction (throttle is handled internally).

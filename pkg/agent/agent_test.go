@@ -3,11 +3,14 @@ package agent
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -92,7 +95,7 @@ func TestAgent_BuildSystemPrompt(t *testing.T) {
 	agent := New(cfg)
 	ctx := context.Background()
 
-	prompt := agent.BuildSystemPrompt(ctx, "test_session")
+	prompt := agent.BuildSystemPrompt(ctx, "test_session", nil)
 
 	if prompt == "" {
 		t.Error("System prompt should not be empty")
@@ -260,4 +263,53 @@ func (timeoutProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan 
 		ch <- llm.StreamChunk{Err: ctx.Err(), Done: true}
 	}()
 	return ch, nil
+}
+
+// TestBuildSystemPrompt_InjectsProjectMemory guards the fix for the CLI bug
+// where the per-turn agent was built without a MemoryService, so stored facts
+// were never injected. With a MemoryService and a project (UserScope) memoryUserID
+// set, a relevant stored fact must appear in the built system prompt.
+func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
+	ctx := context.Background()
+	store, err := memory.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	svc := memory.NewService(slog.Default(), store, nil)
+	defer svc.Close(ctx)
+
+	uid := "/projects/zephyr"
+	now := time.Now().UTC()
+	doc := memory.Document{
+		SessionID: memory.UserScope(uid).Key(),
+		Facts: []memory.Fact{{
+			ID:         "f1",
+			Content:    "Project zephyr deploys via the deploy-zephyr script",
+			Confidence: 0.9,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}},
+		UpdatedAt: now,
+	}
+	if err := svc.Save(ctx, doc); err != nil {
+		t.Fatalf("save memory: %v", err)
+	}
+
+	a := New(AgentConfig{
+		SystemPrompt:  "base",
+		MemoryService: svc,
+		MemoryUserID:  uid,
+	})
+
+	msgs := []models.Message{{Role: models.RoleHuman, Content: "how do I deploy zephyr?"}}
+	prompt := a.BuildSystemPrompt(ctx, "session-xyz", msgs)
+
+	if !strings.Contains(prompt, "deploy-zephyr script") {
+		t.Fatalf("project memory not injected into system prompt:\n%s", prompt)
+	}
+
+	bare := New(AgentConfig{SystemPrompt: "base"})
+	if got := bare.BuildSystemPrompt(ctx, "session-xyz", msgs); strings.Contains(got, "deploy-zephyr script") {
+		t.Fatalf("bare agent should not inject memory, but did:\n%s", got)
+	}
 }

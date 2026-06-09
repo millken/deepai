@@ -341,7 +341,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			ReasoningEffort: a.reasoningEffort,
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
-			SystemPrompt:    a.BuildSystemPrompt(ctx, sessionID),
+			SystemPrompt:    a.BuildSystemPrompt(ctx, sessionID, runMessages),
 		}
 
 		stream, err := a.llm.Stream(ctx, req)
@@ -686,24 +686,42 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	}
 }
 
-func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string) string {
+func recentConversationContext(messages []models.Message) string {
+	const maxMessages = 6
+	const maxBytes = 4000
+	var parts []string
+	for i := len(messages) - 1; i >= 0 && len(parts) < maxMessages; i-- {
+		m := messages[i]
+		if m.Role != models.RoleHuman && m.Role != models.RoleAI {
+			continue
+		}
+		if c := strings.TrimSpace(m.Content); c != "" {
+			parts = append(parts, c)
+		}
+	}
+	joined := strings.Join(parts, "\n")
+	if len(joined) > maxBytes {
+		joined = joined[len(joined)-maxBytes:]
+	}
+	return joined
+}
+
+func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMessages []models.Message) string {
 	sections := []string{strings.TrimSpace(a.systemPrompt)}
 
 	if a.memoryService != nil {
-		// Determine active source for memory fence.
 		activeSource := ""
 		if skillName := a.ActiveSkill(); skillName != "" {
 			activeSource = "skill:" + skillName
 		}
-		// Inject user-level memory (cross-session) first if userID is set.
+		relevanceContext := recentConversationContext(runMessages)
 		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
-			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), a.systemPrompt, activeSource); userMem != "" {
+			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
 				sections = append(sections, userMem)
 			}
 		}
-		// Inject session-level memory.
 		if strings.TrimSpace(sessionID) != "" {
-			if injection := a.memoryService.InjectWithContext(ctx, sessionID, a.systemPrompt, activeSource); injection != "" {
+			if injection := a.memoryService.InjectWithContext(ctx, sessionID, relevanceContext, activeSource); injection != "" {
 				sections = append(sections, injection)
 			}
 		}
