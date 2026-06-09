@@ -246,3 +246,70 @@ func TestGenerateTitle_EmptyMessage(t *testing.T) {
 		t.Fatalf("expected empty title, got %q", loaded.Title)
 	}
 }
+
+// TestFilterUnresolvedToolUses_PartialBatch covers the interrupted-mid-batch
+// case: an assistant message issues two tool calls but only the first received
+// a result before the user pressed ctrl+c. Resuming such history verbatim would
+// be malformed (a tool_use with no tool_result), so the unresolved call must be
+// stripped while the resolved one and its result are preserved.
+func TestFilterUnresolvedToolUses_PartialBatch(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "do two things"},
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{
+			{ID: "call_a", Name: "bash"},
+			{ID: "call_b", Name: "bash"},
+		}},
+		{Role: models.RoleTool, ToolResult: &models.ToolResult{CallID: "call_a"}},
+	}
+
+	got := filterUnresolvedToolUses(msgs)
+
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (human, ai, tool)", len(got))
+	}
+	ai := got[1]
+	if ai.Role != models.RoleAI {
+		t.Fatalf("got[1].Role = %q, want ai", ai.Role)
+	}
+	if len(ai.ToolCalls) != 1 || ai.ToolCalls[0].ID != "call_a" {
+		t.Fatalf("ai.ToolCalls = %+v, want only the resolved call_a", ai.ToolCalls)
+	}
+}
+
+// TestFilterUnresolvedToolUses_AllUnresolved drops an assistant message whose
+// every tool call lacks a result (e.g. cancelled before any tool ran), so the
+// resumed history doesn't dangle.
+func TestFilterUnresolvedToolUses_AllUnresolved(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "go"},
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "x", Name: "bash"}}},
+	}
+
+	got := filterUnresolvedToolUses(msgs)
+
+	if len(got) != 1 || got[0].Role != models.RoleHuman {
+		t.Fatalf("got = %+v, want only the human message", got)
+	}
+}
+
+// TestIsSessionInterrupted_TrailingToolResult treats a transcript ending in a
+// tool result (agent never got to respond) as interrupted, which is what drives
+// auto-continue on resume.
+func TestIsSessionInterrupted_TrailingToolResult(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "go"},
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "x", Name: "bash"}}},
+		{Role: models.RoleTool, ToolResult: &models.ToolResult{CallID: "x"}},
+	}
+	if !isSessionInterrupted(msgs) {
+		t.Fatal("isSessionInterrupted = false, want true for trailing tool result")
+	}
+
+	done := []models.Message{
+		{Role: models.RoleHuman, Content: "go"},
+		{Role: models.RoleAI, Content: "all done"},
+	}
+	if isSessionInterrupted(done) {
+		t.Fatal("isSessionInterrupted = true, want false for completed turn")
+	}
+}

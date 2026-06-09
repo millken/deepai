@@ -359,6 +359,11 @@ func isSessionInterrupted(messages []models.Message) bool {
 // continueTurn resumes the agent from an interrupted session by injecting
 // a continuation prompt instead of a real user message.
 func (r *ChatRepl) continueTurn(ctx context.Context) error {
+	// A turn interrupted mid tool-batch can leave an assistant message whose
+	// tool calls never received results. Strip those unresolved calls so the
+	// resumed request is well-formed for the provider API (the reload path does
+	// this too, but an in-session "continue" never reloads from the DB).
+	r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
 	return r.runTurn(ctx, "Continue from where you left off.")
 }
 
@@ -530,7 +535,25 @@ EventLoop:
 			turnErr = out.err
 			break EventLoop
 		case <-ctx.Done():
+			// The user interrupted (ctrl+c) or the turn timed out. The agent's
+			// Run goroutine returns promptly once ctx is cancelled, carrying the
+			// messages accumulated so far. Capture them so the partial progress
+			// is persisted and an in-session "continue" resumes with full
+			// context instead of restarting the turn from scratch. emit() never
+			// blocks (it drops on a full buffer), so Run cannot deadlock here.
 			turnErr = ctx.Err()
+			select {
+			case out := <-outcomes:
+				if out.result != nil {
+					r.sess.Messages = out.result.Messages
+					if out.result.Usage != nil {
+						lastUsage = out.result.Usage
+					}
+				}
+			case <-time.After(10 * time.Second):
+				// Defensive: a tool ignoring ctx could delay Run's return.
+				// Persist what we have rather than hanging the REPL.
+			}
 			break EventLoop
 		}
 	}

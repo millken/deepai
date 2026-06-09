@@ -51,7 +51,13 @@ type Agent struct {
 	contextWindow       int
 	compactionThreshold float64
 	compactionKeepTail  int
-	lastInputTokens     int
+	// lastInputTokens is the provider's own reported input-token count from the
+	// most recent response — authoritative for the model's real tokenizer, which
+	// the byte heuristic underestimates for CJK/multi-byte text. lastTokenCount-
+	// Msgs records how many messages that count covered, so growth since then can
+	// be added without re-counting from scratch.
+	lastInputTokens    int
+	lastTokenCountMsgs int
 
 	// Memory integration
 	memoryService   *memory.Service
@@ -260,7 +266,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 		// Context compaction: compress old messages when approaching context window.
 		if a.contextWindow > 0 {
-			estimated := estimateTokens(runMessages, a.systemPrompt, a.lastInputTokens)
+			// Tool schemas are sent on every request and count against the
+			// provider's window, but estimateTokens only sees messages. Add them
+			// here so the agent doesn't underestimate the real payload and
+			// compact too late (which is how an overflowing session still slips
+			// past the threshold and hits the provider's hard limit).
+			estimated := a.estimateContextTokens(runMessages)
 			ratio := float64(estimated) / float64(a.contextWindow)
 			if ratio >= a.compactionThreshold {
 				// Flush memory synchronously before compaction to guarantee no data loss.
@@ -294,20 +305,26 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 						},
 					})
 					a.lastInputTokens = 0
+					a.lastTokenCountMsgs = 0
 				}
 
 				// If still over the hard limit (ratio > 1.0), apply increasingly
 				// aggressive compaction with a shrinking tail to prevent sending
 				// an oversized payload that would cause the provider to drop the
 				// connection mid-stream ("unexpected end of JSON input").
-				afterEstimated := estimateTokens(runMessages, a.systemPrompt, 0)
+				afterEstimated := a.estimateContextTokens(runMessages)
 				if afterRatio := float64(afterEstimated) / float64(a.contextWindow); afterRatio > 1.0 {
+					// About to rewrite message content in place; the provider
+					// anchor no longer matches those messages, so drop it and let
+					// the byte heuristic track the shrinking payload.
+					a.lastInputTokens = 0
+					a.lastTokenCountMsgs = 0
 					for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
 						c2, ok := compactMessages(runMessages, tail)
 						if ok {
 							runMessages = c2
 						}
-						e2 := estimateTokens(runMessages, a.systemPrompt, 0)
+						e2 := a.estimateContextTokens(runMessages)
 						a.logger.Debug("aggressive compaction", "turn", turn, "tail", tail, "estimated", e2, "ratio", fmt.Sprintf("%.2f", float64(e2)/float64(a.contextWindow)))
 						if float64(e2)/float64(a.contextWindow) <= 1.0 {
 							break
@@ -400,7 +417,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if streamUsage != nil {
 			accumulateUsage(usage, streamUsage)
 			if streamUsage.InputTokens > 0 {
+				// The assistant message for this turn isn't appended yet, so
+				// len(runMessages) is exactly the message set the provider just
+				// counted. Anchor here so later estimates add only the growth.
 				a.lastInputTokens = streamUsage.InputTokens
+				a.lastTokenCountMsgs = len(runMessages)
 			}
 		}
 
@@ -915,6 +936,50 @@ func formatEventTime(ts time.Time) string {
 	return ts.UTC().Format(time.RFC3339Nano)
 }
 
+// toolSchemaTokens estimates the token cost of the tool definitions attached to
+// every request (name + description + JSON schema). These are invisible to
+// estimateTokens, which only inspects messages, so they must be added to any
+// context-window estimate or the agent will compact later than the real payload
+// warrants. Uses the same ~3-bytes-per-token heuristic as estimateTokens.
+func (a *Agent) toolSchemaTokens() int {
+	if a == nil || a.tools == nil {
+		return 0
+	}
+	totalBytes := 0
+	for _, t := range a.tools.List() {
+		totalBytes += len(t.Name) + len(t.Description) + 10 // per-tool framing
+		if t.InputSchema != nil {
+			if b, err := json.Marshal(t.InputSchema); err == nil {
+				totalBytes += len(b)
+			}
+		}
+	}
+	return totalBytes / 3
+}
+
+// estimateContextTokens returns the best estimate of how many tokens the next
+// request will occupy. It prefers the provider's own reported input-token count
+// from the previous response — accurate for the model's real tokenizer, which
+// the byte heuristic underestimates for CJK/multi-byte text — plus a byte
+// estimate of any messages appended since that count was taken. The anchor
+// (lastInputTokens/lastTokenCountMsgs) is reset to zero at every compaction
+// site, so whenever it is set the first lastTokenCountMsgs messages are exactly
+// what the provider counted. Falls back to the pure byte heuristic (plus tool
+// schemas) before the first response or right after a compaction reset.
+func (a *Agent) estimateContextTokens(runMessages []models.Message) int {
+	heuristic := estimateTokens(runMessages, a.systemPrompt, 0) + a.toolSchemaTokens()
+	if a.lastInputTokens <= 0 || a.lastTokenCountMsgs <= 0 || a.lastTokenCountMsgs > len(runMessages) {
+		return heuristic
+	}
+	// lastInputTokens already covers the system prompt, tool schemas, and the
+	// first lastTokenCountMsgs messages; add only the growth since the anchor.
+	delta := estimateTokens(runMessages[a.lastTokenCountMsgs:], "", 0)
+	if provider := a.lastInputTokens + delta; provider > heuristic {
+		return provider
+	}
+	return heuristic
+}
+
 func isContextOverflow(stopReason string) bool {
 	switch stopReason {
 	case "max_tokens", "length", "model_context_window_exceeded":
@@ -954,14 +1019,32 @@ func isContextOverflowError(err error) bool {
 
 // compactOnOverflow tries to shrink runMessages and reports whether the caller
 // should continue the outer loop (i.e. retry the LLM request).
+//
+// compactMessages rewrites message *content* but preserves message *count*, so
+// the retry must be gated on the estimated token size dropping — gating on
+// len() (as a previous version did) was always false, leaving this reactive
+// backstop dead and turning every provider context-overflow into a hard
+// failure. Progressively smaller tails are tried so a payload dominated by a
+// big tail can still be reduced.
 func (a *Agent) compactOnOverflow(runMessages []models.Message, turn int, where string) ([]models.Message, bool) {
-	compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
-	if !didCompact {
-		compacted, didCompact = compactMessages(runMessages, 4)
-	}
-	if didCompact && len(compacted) < len(runMessages) {
-		a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
-		return compacted, true
+	before := estimateTokens(runMessages, a.systemPrompt, 0)
+	for _, tail := range []int{a.compactionKeepTail, 4, 2} {
+		if tail <= 0 {
+			continue
+		}
+		compacted, didCompact := compactMessages(runMessages, tail)
+		if !didCompact {
+			continue
+		}
+		after := estimateTokens(compacted, a.systemPrompt, 0)
+		if after < before {
+			a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "tail", tail, "before_tokens", before, "after_tokens", after)
+			// Content changed under the provider anchor; invalidate it so the
+			// next estimate uses the byte heuristic on the compacted messages.
+			a.lastInputTokens = 0
+			a.lastTokenCountMsgs = 0
+			return compacted, true
+		}
 	}
 	a.logger.Warn("context overflow and compaction cannot reduce further", "where", where, "turn", turn, "messages", len(runMessages))
 	return runMessages, false

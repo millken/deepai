@@ -93,10 +93,11 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// Safety floor: when the user has not configured a context window, the
 	// agent's proactive compaction is disabled (react.go gates on >0) and a
 	// long session can grow runMessages until the model itself rejects the
-	// request. 128k is the current common-denominator across mainstream
-	// providers (Claude / GPT-4o / DeepSeek / Qwen) and just enables the
-	// 75%-threshold compaction loop; users who know their model can still
-	// override via config.yaml.
+	// request. 192k just enables the 75%-threshold compaction loop for the
+	// common large-context tier; smaller-window providers are still covered
+	// because the estimate now anchors to the provider's reported token count
+	// and the reactive overflow backstop retries with compaction. Users who
+	// know their model's exact window can override via config.yaml.
 	if cfg.ContextWindow <= 0 {
 		cfg.ContextWindow = 192000
 	}
