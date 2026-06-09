@@ -17,6 +17,7 @@ type BannerInfo struct {
 	SkillCount int
 	SkillNames []string
 	SessionID  string
+	ContextWindow int
 }
 
 // RenderBanner prints the startup banner.

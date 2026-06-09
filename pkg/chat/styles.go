@@ -22,6 +22,8 @@ type Styles struct {
 	SeveritySugg lipgloss.Style
 	ReviewPass   lipgloss.Style
 	ReviewFail   lipgloss.Style
+	DiffAdd      lipgloss.Style
+	DiffDel      lipgloss.Style
 }
 
 // DefaultStyles returns the default style palette.
@@ -66,5 +68,9 @@ func DefaultStyles() Styles {
 			Foreground(lipgloss.Color("#9ECE6A")),
 		ReviewFail: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF5555")).Bold(true),
+		DiffAdd: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9ECE6A")),
+		DiffDel: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F7768E")),
 	}
 }

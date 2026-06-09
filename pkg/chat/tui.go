@@ -250,9 +250,10 @@ type tuiModel struct {
 	turn      int
 	turnStart time.Time
 	elapsed   time.Duration
-	lastUsage *agent.Usage
-	model     string
-	planMode  bool
+	lastUsage     *agent.Usage
+	model         string
+	planMode      bool
+	contextWindow int
 
 	// input history
 	history    []string
@@ -287,11 +288,12 @@ func newTUIModel(status BannerInfo) *tuiModel {
 		styles:      styles,
 		ta:          ta,
 		sp:          sp,
-		histIdx:     -1,
-		model:       status.Model,
-		interruptCh: make(chan struct{}, 1),
-		histStore:   newHistoryStore(),
-		renderMD:    true,
+		histIdx:       -1,
+		model:         status.Model,
+		interruptCh:   make(chan struct{}, 1),
+		histStore:     newHistoryStore(),
+		renderMD:      true,
+		contextWindow: status.ContextWindow,
 	}
 }
 
@@ -741,9 +743,14 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	if te.DurationMS > 0 {
 		detail = fmt.Sprintf(" (%.1fs)", float64(te.DurationMS)/1000)
 	}
+	// For file edits, show a colored +/- diff instead of an opaque preview.
+	diff := ""
+	if !useErr {
+		diff = m.renderToolDiff(te.Name, te.Arguments)
+	}
 	if te.Error != "" {
 		detail += " " + te.Error
-	} else if te.ResultPreview != "" {
+	} else if diff == "" && te.ResultPreview != "" {
 		preview := te.ResultPreview
 		if lipgloss.Width(preview) > 120 {
 			preview = truncateWidth(preview, 117) + "..."
@@ -754,7 +761,11 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	if useErr {
 		return m.styles.Error.Render(line)
 	}
-	return m.styles.ToolResult.Render(line)
+	rendered := m.styles.ToolResult.Render(line)
+	if diff != "" {
+		rendered += "\n" + diff
+	}
+	return rendered
 }
 
 func (m *tuiModel) statsLine() string {
@@ -825,8 +836,29 @@ func (m *tuiModel) busyStatus() string {
 	if m.lastUsage != nil {
 		parts = append(parts, m.styles.Dim.Render(fmt.Sprintf("· %d tok", m.lastUsage.OutputTokens)))
 	}
+	if ctx := m.contextGauge(); ctx != "" {
+		parts = append(parts, ctx)
+	}
 	parts = append(parts, m.styles.Dim.Render("· ctrl+c to interrupt"))
 	return "  " + strings.Join(parts, " ")
+}
+
+// contextGauge renders the context-window fill as a colored "· ctx N%", warning
+// as it approaches the 0.75 auto-compaction threshold. Empty when unknown.
+func (m *tuiModel) contextGauge() string {
+	if m.contextWindow <= 0 || m.lastUsage == nil || m.lastUsage.InputTokens <= 0 {
+		return ""
+	}
+	pct := m.lastUsage.InputTokens * 100 / m.contextWindow
+	label := fmt.Sprintf("· ctx %d%%", pct)
+	switch {
+	case pct >= 75:
+		return m.styles.Error.Render(label + " (compacting soon)")
+	case pct >= 60:
+		return m.styles.SeverityWarn.Render(label)
+	default:
+		return m.styles.Dim.Render(label)
+	}
 }
 
 func (m *tuiModel) idleFooter() string {
@@ -842,7 +874,11 @@ func (m *tuiModel) idleFooter() string {
 	if !m.renderMD {
 		out = "raw"
 	}
-	return m.styles.Dim.Render(fmt.Sprintf("  %s · %s · ctrl+r:%s · /help", model, mode, out))
+	footer := m.styles.Dim.Render(fmt.Sprintf("  %s · %s · ctrl+r:%s · /help", model, mode, out))
+	if ctx := m.contextGauge(); ctx != "" {
+		footer += " " + ctx
+	}
+	return footer
 }
 
 // commit emits a permanent scrollback line above the live region.

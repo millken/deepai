@@ -188,3 +188,47 @@ func TestSlashSuggestions(t *testing.T) {
 		t.Fatalf("plain text should not suggest, got %+v", m.suggestions)
 	}
 }
+
+func TestRenderToolDiff(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+
+	// edit_file: old lines shown as removed, new as added.
+	d := m.renderToolDiff("edit_file", map[string]any{"old_string": "a\nb", "new_string": "a\nc"})
+	if !strings.Contains(d, "- a") || !strings.Contains(d, "+ c") {
+		t.Fatalf("edit diff missing -/+ lines:\n%s", d)
+	}
+
+	// write_file: only added lines.
+	d = m.renderToolDiff("write_file", map[string]any{"content": "x\ny"})
+	if !strings.Contains(d, "+ x") || strings.Contains(d, "- ") {
+		t.Fatalf("write diff should be all additions:\n%s", d)
+	}
+
+	// Oversized edits are capped with a "more lines" marker.
+	big := strings.Repeat("line\n", 50)
+	d = m.renderToolDiff("write_file", map[string]any{"content": big})
+	if !strings.Contains(d, "more lines") {
+		t.Fatalf("large diff should be truncated with a marker:\n%s", d)
+	}
+
+	// Non-edit tools produce no diff.
+	if d := m.renderToolDiff("bash", map[string]any{"command": "ls"}); d != "" {
+		t.Fatalf("bash should have no diff, got %q", d)
+	}
+}
+
+func TestContextGauge(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	if g := m.contextGauge(); g != "" {
+		t.Fatalf("no window/usage → empty gauge, got %q", g)
+	}
+	m.contextWindow = 1000
+	m.lastUsage = &agent.Usage{InputTokens: 300}
+	if g := m.contextGauge(); !strings.Contains(g, "ctx 30%") {
+		t.Fatalf("expected 'ctx 30%%', got %q", g)
+	}
+	m.lastUsage = &agent.Usage{InputTokens: 800}
+	if g := m.contextGauge(); !strings.Contains(g, "compacting soon") {
+		t.Fatalf("expected high-usage warning, got %q", g)
+	}
+}

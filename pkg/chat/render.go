@@ -55,7 +55,7 @@ func toolArgsPreview(args map[string]any) string {
 		return ""
 	}
 	// Show the first string-type argument as preview.
-	for _, key := range []string{"command", "description", "path", "query", "prompt"} {
+	for _, key := range []string{"command", "path", "file_path", "pattern", "query", "description", "prompt"} {
 		if v, ok := args[key]; ok {
 			if s, ok := v.(string); ok {
 				if lipgloss.Width(s) > 80 {

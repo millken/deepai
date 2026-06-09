@@ -228,12 +228,13 @@ func (r *ChatRepl) bannerInfo() BannerInfo {
 		skillNames = r.cfg.SkillRegistry.AvailableNames()
 	}
 	return BannerInfo{
-		Provider:   r.cfg.Provider,
-		Model:      r.cfg.Model,
-		ToolCount:  toolCount,
-		SkillCount: skillCount,
-		SkillNames: skillNames,
-		SessionID:  r.sess.ID,
+		Provider:      r.cfg.Provider,
+		Model:         r.cfg.Model,
+		ToolCount:     toolCount,
+		SkillCount:    skillCount,
+		SkillNames:    skillNames,
+		SessionID:     r.sess.ID,
+		ContextWindow: r.cfg.ContextWindow,
 	}
 }
 
