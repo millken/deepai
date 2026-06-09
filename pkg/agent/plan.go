@@ -39,7 +39,7 @@ func (a *Agent) enterPlanMode() {
 		return
 	}
 	a.fullTools = a.tools
-	restricted := a.fullTools.Restrict(planToolNames)
+	restricted := a.fullTools.RestrictTo(planToolNames)
 	// Register plan-mode-only tools into the restricted set.
 	for _, tool := range []models.Tool{a.makeWritePlanTool(), a.makeExitPlanModeTool()} {
 		if err := restricted.Register(tool); err != nil {

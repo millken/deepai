@@ -331,6 +331,13 @@ func (r *Registry) Restrict(allowed []string) *Registry {
 	if len(allowed) == 0 {
 		return r
 	}
+	return r.RestrictTo(allowed)
+}
+
+func (r *Registry) RestrictTo(allowed []string) *Registry {
+	if r == nil {
+		return NewRegistry()
+	}
 
 	allow := make(map[string]struct{}, len(allowed))
 	for _, name := range allowed {

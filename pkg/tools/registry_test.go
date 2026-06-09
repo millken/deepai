@@ -278,3 +278,34 @@ func TestNewToolCallID(t *testing.T) {
 		t.Error("Tool call ID should not be empty")
 	}
 }
+
+func TestRegistry_RestrictTo_FailsClosed(t *testing.T) {
+	r := NewRegistry()
+	for _, name := range []string{"read_file", "bash", "edit_file"} {
+		if err := r.Register(models.Tool{
+			Name:    name,
+			Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) { return models.ToolResult{}, nil },
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Restrict treats empty as "no restriction" → full set.
+	if got := len(r.Restrict(nil).List()); got != 3 {
+		t.Fatalf("Restrict(nil) = %d tools, want 3 (no restriction)", got)
+	}
+
+	// RestrictTo fails closed: empty → empty.
+	if got := len(r.RestrictTo(nil).List()); got != 0 {
+		t.Fatalf("RestrictTo(nil) = %d tools, want 0 (fail closed)", got)
+	}
+
+	// RestrictTo with names keeps only those.
+	only := r.RestrictTo([]string{"read_file"})
+	if got := len(only.List()); got != 1 {
+		t.Fatalf("RestrictTo([read_file]) = %d tools, want 1", got)
+	}
+	if only.Get("bash") != nil {
+		t.Fatal("RestrictTo leaked bash into a read-only set")
+	}
+}
