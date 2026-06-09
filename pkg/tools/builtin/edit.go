@@ -39,59 +39,123 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	}
 	content := string(data)
 
-	// Strategy 1: literal match.
-	if count := strings.Count(content, oldStr); count > 0 {
+	type candidate struct {
+		oldS, newS string
+		note       string
+	}
+	candidates := []candidate{{oldStr, newStr, ""}}
+	if uOld, uNew := unescapeLiteral(oldStr), unescapeLiteral(newStr); uOld != oldStr && uOld != uNew {
+		candidates = append(candidates, candidate{uOld, uNew, "escape-normalized"})
+	}
+
+	for _, c := range candidates {
+		updated, n, kind, err := applyEdit(content, c.oldS, c.newS, replaceAll, displayPath)
+		if err != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
+		}
+		if n == 0 {
+			continue
+		}
+		if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", writeErr)
+		}
+		notes := []string{}
+		if kind != "" {
+			notes = append(notes, kind)
+		}
+		if c.note != "" {
+			notes = append(notes, c.note)
+		}
+		msg := fmt.Sprintf("Replaced %d occurrence(s) in %s", n, displayPath)
+		if len(notes) > 0 {
+			msg += " (" + strings.Join(notes, ", ") + ")"
+		}
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: msg}, nil
+	}
+
+	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+		"old_string not found in %s; copy old_string verbatim from read_file output (real newlines and exact whitespace, not escaped \\n/\\t), then retry edit_file",
+		displayPath,
+	)
+}
+
+func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) (updated string, n int, kind string, err error) {
+	if count := strings.Count(content, oldS); count > 0 {
 		if !replaceAll && count > 1 {
-			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+			return "", 0, "", fmt.Errorf(
 				"old_string matches %d times in %s; provide more context to make it unique, or set replace_all=true",
 				count, displayPath,
 			)
 		}
-		var updated string
 		if replaceAll {
-			updated = strings.ReplaceAll(content, oldStr, newStr)
+			updated = strings.ReplaceAll(content, oldS, newS)
 		} else {
-			updated = strings.Replace(content, oldStr, newStr, 1)
+			updated = strings.Replace(content, oldS, newS, 1)
 		}
-		if err := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); err != nil {
-			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
-		}
-		return models.ToolResult{
-			CallID:   call.ID,
-			ToolName: call.Name,
-			Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s", count, displayPath),
-		}, nil
+		return updated, count, "", nil
 	}
 
-	// Strategy 2: whitespace-tolerant fallback. Only fires when the normalized
-	// needle is non-trivial, to avoid spuriously matching short strings.
-	normOld := normalizeWhitespace(oldStr)
+	normOld := normalizeWhitespace(oldS)
 	if len(strings.TrimSpace(normOld)) >= 8 {
-		spans := findWhitespaceTolerantSpans(content, oldStr)
+		spans := findWhitespaceTolerantSpans(content, oldS)
 		if len(spans) > 0 {
 			if !replaceAll && len(spans) > 1 {
-				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+				return "", 0, "", fmt.Errorf(
 					"old_string matches %d locations in %s after whitespace normalization; provide more context or set replace_all=true",
 					len(spans), displayPath,
 				)
 			}
-			updated := replaceSpans(content, spans, newStr, replaceAll)
-			if err := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); err != nil {
-				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
-			}
-			n := 1
+			conformed := conformLineEndings(newS, content)
+			updated = replaceSpans(content, spans, conformed, replaceAll)
+			count := 1
 			if replaceAll {
-				n = len(spans)
+				count = len(spans)
 			}
-			return models.ToolResult{
-				CallID:   call.ID,
-				ToolName: call.Name,
-				Content:  fmt.Sprintf("Replaced %d occurrence(s) in %s (whitespace-tolerant match)", n, displayPath),
-			}, nil
+			return updated, count, "whitespace-tolerant match", nil
 		}
 	}
 
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string not found in %s", displayPath)
+	return "", 0, "", nil
+}
+
+func unescapeLiteral(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+				i++
+				continue
+			case 'r':
+				b.WriteByte('\r')
+				i++
+				continue
+			case 't':
+				b.WriteByte('\t')
+				i++
+				continue
+			case '\\':
+				b.WriteByte('\\')
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func conformLineEndings(s, content string) string {
+	if !strings.Contains(content, "\r\n") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 // normalizeWhitespace collapses CRLF/CR to LF and runs of horizontal
@@ -200,9 +264,9 @@ func filePerm(path string, def os.FileMode) os.FileMode {
 func EditFileTool() models.Tool {
 	return models.Tool{
 		Name: "edit_file",
-		Description: "Replace exact text in a file. old_string must uniquely match (use replace_all for multiple matches). " +
+		Description: "Replace exact text in a file. Use this for in-place edits instead of sed/awk/perl -i via bash. old_string must uniquely match (use replace_all for multiple matches). " +
 			"Falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
-			"Fails safely if no match or ambiguous match.",
+			"Fails safely if no match or ambiguous match; on failure re-read the file and retry this tool rather than falling back to bash.",
 		Groups: []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",
