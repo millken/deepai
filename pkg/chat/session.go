@@ -329,6 +329,19 @@ func (s *SQLiteSessionStore) DeleteMessagesAfterSeq(sessionID string, afterSeq i
 	return err
 }
 
+func (s *SQLiteSessionStore) DeleteLastUserTurn(sessionID string) (int, error) {
+	res, err := s.db.Exec(`
+		DELETE FROM messages
+		WHERE session_id = ?
+		  AND seq >= (SELECT MAX(seq) FROM messages WHERE session_id = ? AND role = ?)
+	`, sessionID, sessionID, string(models.RoleHuman))
+	if err != nil {
+		return 0, fmt.Errorf("delete last user turn: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------

@@ -41,6 +41,7 @@ type SessionRepository interface {
 	Save(sess *Session) error
 	AppendMessage(sessionID string, msg Message) error
 	DeleteMessagesAfterSeq(sessionID string, afterSeq int) error
+	DeleteLastUserTurn(sessionID string) (int, error)
 	Delete(id string) error
 	Rename(id, title string) error
 	ListRecent(limit int) ([]SessionMeta, error)

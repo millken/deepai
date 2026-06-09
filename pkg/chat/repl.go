@@ -198,7 +198,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		r.turn++
 
 		turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-			return r.runTurn(ctx, line)
+			return r.runTurn(ctx, line, false)
 		})
 		if turnErr != nil {
 			if turnErr.cancelled {
@@ -364,7 +364,7 @@ func (r *ChatRepl) continueTurn(ctx context.Context) error {
 	// resumed request is well-formed for the provider API (the reload path does
 	// this too, but an in-session "continue" never reloads from the DB).
 	r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
-	return r.runTurn(ctx, "Continue from where you left off.")
+	return r.runTurn(ctx, "Continue from where you left off.", true)
 }
 
 // turnError wraps errors from runTurn to distinguish cancellation from real errors.
@@ -417,7 +417,7 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 	return &turnError{err: err, cancelled: interrupted}
 }
 
-func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
+func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation bool) error {
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
 		r.ui.RenderSubagentEvent(evt)
 	})
@@ -425,14 +425,19 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string) error {
 	// Evaluate fact feedback from previous turn (consume-once).
 	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
 
-	// Append user message to session history and persist.
+	// Append user message to session history. A continuation is a synthetic
+	// nudge (e.g. resume after interrupt), not a real user turn: hand it to the
+	// agent in-memory but never persist it, so it doesn't pollute the saved
+	// transcript or the FTS index.
 	userMsg := models.Message{
 		SessionID: r.sess.ID,
 		Role:      models.RoleHuman,
 		Content:   userInput,
 	}
-	if err := r.sessMgr.AppendMessage(r.sess.ID, userMsg); err != nil {
-		slog.Warn("append user message", "err", err)
+	if !continuation {
+		if err := r.sessMgr.AppendMessage(r.sess.ID, userMsg); err != nil {
+			slog.Warn("append user message", "err", err)
+		}
 	}
 	r.sess.Messages = append(r.sess.Messages, userMsg)
 
@@ -768,27 +773,22 @@ func (r *ChatRepl) startNewSession() {
 }
 
 func (r *ChatRepl) undoLastTurn() {
-	// Find the last human message and remove it and everything after it.
-	lastHuman := -1
-	for i := len(r.sess.Messages) - 1; i >= 0; i-- {
-		if r.sess.Messages[i].Role == models.RoleHuman {
-			lastHuman = i
-			break
-		}
+	removed, err := r.sessMgr.DeleteLastUserTurn(r.sess.ID)
+	if err != nil {
+		slog.Warn("undo: delete last user turn failed", "err", err)
+		r.ui.Info("  Undo failed.")
+		return
 	}
-	if lastHuman < 0 {
+	if removed == 0 {
 		r.ui.Info("  Nothing to undo.")
 		return
 	}
-	removed := len(r.sess.Messages) - lastHuman
-	r.sess.Messages = r.sess.Messages[:lastHuman]
 
-	// Delete persisted messages after the kept boundary.
-	// LoadMessages returns messages ordered by seq ASC, so index maps to seq = index+1.
-	// We keep messages 0..lastHuman-1 (seq 1..lastHuman), delete seq > lastHuman.
-	if err := r.sessMgr.DeleteMessagesAfterSeq(r.sess.ID, lastHuman); err != nil {
-		slog.Warn("undo: delete messages from DB failed", "err", err)
+	msgs, err := r.sessMgr.LoadMessages(r.sess.ID)
+	if err != nil {
+		slog.Warn("undo: reload messages failed", "err", err)
 	}
+	r.sess.Messages = filterUnresolvedToolUses(msgs)
 
 	r.ui.Info(fmt.Sprintf("  Undone %d messages.", removed))
 }

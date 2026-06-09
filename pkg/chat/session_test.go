@@ -281,3 +281,67 @@ func TestPrune_DryRun(t *testing.T) {
 		t.Fatal("session should still exist after dry-run")
 	}
 }
+
+func TestDeleteLastUserTurn(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	sess, err := store.Create(models.CreateOpts{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Simulates a session whose history diverges from a filtered in-memory view:
+	// an orphan assistant (unresolved tool call) sits before a resolved one.
+	seqRoles := []struct {
+		role    models.Role
+		content string
+	}{
+		{models.RoleHuman, "task A"},                                  // seq 1
+		{models.RoleAI, "orphan tool_use"},                            // seq 2
+		{models.RoleAI, "resolved work B"},                            // seq 3
+		{models.RoleHuman, "task C"},                                  // seq 4 (last human)
+		{models.RoleAI, "work D"},                                     // seq 5
+	}
+	for _, m := range seqRoles {
+		if err := store.AppendMessage(sess.ID, models.Message{Role: m.role, Content: m.content}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	removed, err := store.DeleteLastUserTurn(sess.ID)
+	if err != nil {
+		t.Fatalf("DeleteLastUserTurn: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2 (task C + work D)", removed)
+	}
+
+	msgs, err := store.LoadMessages(sess.ID)
+	if err != nil {
+		t.Fatalf("LoadMessages: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("remaining = %d, want 3 (task A, orphan, resolved work B)", len(msgs))
+	}
+	// The resolved work B (before the last human) must survive — the old
+	// index==seq undo would have wrongly deleted it.
+	if msgs[2].Content != "resolved work B" {
+		t.Fatalf("msgs[2] = %q, want 'resolved work B' (must not be deleted)", msgs[2].Content)
+	}
+}
+
+func TestDeleteLastUserTurn_NothingToUndo(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	sess, _ := store.Create(models.CreateOpts{})
+	// Only assistant messages, no human turn.
+	_ = store.AppendMessage(sess.ID, models.Message{Role: models.RoleAI, Content: "hi"})
+
+	removed, err := store.DeleteLastUserTurn(sess.ID)
+	if err != nil {
+		t.Fatalf("DeleteLastUserTurn: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0 (no human turn)", removed)
+	}
+}
