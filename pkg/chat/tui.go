@@ -592,6 +592,12 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 			msg = "[" + d + "] " + msg
 		}
 		return m.commitWithFlush(m.styles.Dim.Render("      " + msg))
+	case "task_completed":
+		desc := strings.TrimSpace(evt.Description)
+		if desc == "" {
+			desc = "done"
+		}
+		return m.commitWithFlush(m.styles.ToolResult.Render("  ↳ ✓ " + desc))
 	case "task_timed_out":
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] timed out: " + evt.Error))
 	case "task_failed":

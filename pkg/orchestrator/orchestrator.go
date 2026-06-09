@@ -129,7 +129,11 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 			coderPrompt += "\n\nThe previous attempt did not pass. Address this feedback, then stop:\n" + feedback
 		}
 		res.AgentCalls++
-		implOut, err := runner.Run(ctx, cfg.CoderType, "implement", coderPrompt)
+		coderLabel := fmt.Sprintf("implementing · round %d/%d", round, cfg.MaxRounds)
+		if feedback != "" {
+			coderLabel = fmt.Sprintf("fixing review feedback · round %d/%d", round, cfg.MaxRounds)
+		}
+		implOut, err := runner.Run(ctx, cfg.CoderType, coderLabel, coderPrompt)
 		if err != nil {
 			res.Reason = fmt.Sprintf("coder failed in round %d: %v", round, err)
 			return res, err
@@ -168,7 +172,7 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 
 		reviewPrompt := buildReviewPrompt(taskPrompt, diff, vr.Output, vr.Ran, board.Render())
 		res.AgentCalls += len(cfg.Reviewers)
-		verdicts, rerr := fanOutReviews(ctx, runner, cfg.Reviewers, reviewPrompt, cfg.ReviewConcurrency)
+		verdicts, rerr := fanOutReviews(ctx, runner, cfg.Reviewers, reviewPrompt, cfg.ReviewConcurrency, round)
 		if rerr != nil {
 			res.Reason = fmt.Sprintf("reviewer failed in round %d: %v", round, rerr)
 			res.Rounds = append(res.Rounds, rr)
@@ -268,7 +272,7 @@ func buildFeedback(rr RoundResult) string {
 	return truncate(b.String(), maxFeedbackBytes)
 }
 
-func fanOutReviews(ctx context.Context, runner SubagentRunner, reviewers []string, prompt string, concurrency int) ([]Verdict, error) {
+func fanOutReviews(ctx context.Context, runner SubagentRunner, reviewers []string, prompt string, concurrency, round int) ([]Verdict, error) {
 	if concurrency <= 0 || concurrency > len(reviewers) {
 		concurrency = len(reviewers)
 	}
@@ -285,7 +289,7 @@ func fanOutReviews(ctx context.Context, runner SubagentRunner, reviewers []strin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out, err := runner.Run(ctx, reviewerType, "review", prompt)
+			out, err := runner.Run(ctx, reviewerType, fmt.Sprintf("reviewing (%s) · round %d", reviewerType, round), prompt)
 			if err != nil {
 				errs[i] = fmt.Errorf("reviewer %q: %w", reviewerType, err)
 				return

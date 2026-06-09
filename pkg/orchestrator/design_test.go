@@ -19,7 +19,7 @@ type designRunner struct {
 func (r *designRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if description == "judge" {
+	if phaseOf(description) == "judge" {
 		if r.judgeErr != nil {
 			return "", r.judgeErr
 		}
@@ -89,7 +89,7 @@ func TestDesign_JudgeErrorSurfaces(t *testing.T) {
 
 func TestDesign_ProposerErrorSurfaces(t *testing.T) {
 	r := runnerFunc(func(ctx context.Context, agentType, d, p string) (string, error) {
-		if d == "propose" {
+		if phaseOf(d) == "propose" {
 			return "", errors.New("proposer down")
 		}
 		return `{"plan":"p"}`, nil
@@ -102,7 +102,7 @@ func TestDesign_ProposerErrorSurfaces(t *testing.T) {
 
 func TestDesign_ProposalsOrderedDespiteConcurrency(t *testing.T) {
 	r := runnerFunc(func(ctx context.Context, agentType, d, p string) (string, error) {
-		if d == "judge" {
+		if phaseOf(d) == "judge" {
 			return `{"plan":"x"}`, nil
 		}
 		if agentType == "architect" {

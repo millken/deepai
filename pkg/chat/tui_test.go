@@ -114,6 +114,7 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 		{"lifecycle noise dropped", subagent.TaskEvent{Type: "task_running", Message: "task started"}, false},
 		{"empty message dropped", subagent.TaskEvent{Type: "task_running", Message: ""}, false},
 		{"started renders", subagent.TaskEvent{Type: "task_started", Description: "review"}, true},
+		{"completed renders check", subagent.TaskEvent{Type: "task_completed", Description: "implementing · round 1/4"}, true},
 		{"timeout renders", subagent.TaskEvent{Type: "task_timed_out", Error: "deadline"}, true},
 	}
 	for _, c := range cases {

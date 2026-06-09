@@ -16,7 +16,7 @@ type buildRunner struct {
 func (r *buildRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	switch description {
+	switch phaseOf(description) {
 	case "judge":
 		return `{"plan":"PLAN-XYZ"}`, nil
 	case "propose":
@@ -60,7 +60,7 @@ func TestBuild_PlanFlowsIntoImplement(t *testing.T) {
 
 func TestBuild_DesignErrorSkipsImplement(t *testing.T) {
 	r := runnerFunc(func(ctx context.Context, at, d, p string) (string, error) {
-		if d == "judge" {
+		if phaseOf(d) == "judge" {
 			return "", errors.New("judge down")
 		}
 		return "x", nil
@@ -76,3 +76,17 @@ func TestBuild_DesignErrorSkipsImplement(t *testing.T) {
 	}
 }
 
+
+func phaseOf(description string) string {
+	switch {
+	case strings.HasPrefix(description, "implement"), strings.HasPrefix(description, "fixing"):
+		return "implement"
+	case strings.HasPrefix(description, "reviewing"):
+		return "review"
+	case strings.HasPrefix(description, "proposing"):
+		return "propose"
+	case strings.HasPrefix(description, "selecting"):
+		return "judge"
+	}
+	return description
+}

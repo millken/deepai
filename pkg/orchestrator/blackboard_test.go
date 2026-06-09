@@ -34,7 +34,7 @@ type promptCapturingRunner struct {
 func (r *promptCapturingRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	switch description {
+	switch phaseOf(description) {
 	case "implement":
 		r.coderPrompts = append(r.coderPrompts, prompt)
 		return "done", nil
@@ -90,7 +90,7 @@ type promptCapturingRunner2 struct {
 func (r *promptCapturingRunner2) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	switch description {
+	switch phaseOf(description) {
 	case "implement":
 		r.coderPrompts = append(r.coderPrompts, prompt)
 		return "done", nil

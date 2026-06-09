@@ -332,7 +332,7 @@ func TestFanOutReviews_OrderDeterministicDespiteCompletionOrder(t *testing.T) {
 		}
 		return `{"verdict":"fail","issues":[{"file":"` + agentType + `","line":1,"message":"x"}]}`, nil
 	})
-	verdicts, err := fanOutReviews(context.Background(), r, reviewers, "p", 0)
+	verdicts, err := fanOutReviews(context.Background(), r, reviewers, "p", 0, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestFanOutReviews_ErrorPropagates(t *testing.T) {
 		}
 		return `{"verdict":"pass"}`, nil
 	})
-	_, err := fanOutReviews(context.Background(), r, []string{"arch-reviewer", "security-reviewer"}, "p", 2)
+	_, err := fanOutReviews(context.Background(), r, []string{"arch-reviewer", "security-reviewer"}, "p", 2, 1)
 	if err == nil || !strings.Contains(err.Error(), "reviewer down") {
 		t.Fatalf("expected reviewer error to propagate, got %v", err)
 	}

@@ -64,7 +64,7 @@ func Design(ctx context.Context, cfg DesignConfig, taskPrompt string, runner Sub
 	}
 	res := &DesignResult{Proposals: proposals}
 
-	judgeOut, err := runner.Run(ctx, cfg.Judge, "judge", buildJudgePrompt(taskPrompt, proposals))
+	judgeOut, err := runner.Run(ctx, cfg.Judge, "selecting best approach", buildJudgePrompt(taskPrompt, proposals))
 	if err != nil {
 		return res, fmt.Errorf("judge %q failed: %w", cfg.Judge, err)
 	}
@@ -103,7 +103,7 @@ func fanOutProposals(ctx context.Context, runner SubagentRunner, proposers []str
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			angle := proposalAngles[i%len(proposalAngles)]
-			out, err := runner.Run(ctx, role, "propose", buildProposePrompt(taskPrompt, angle))
+			out, err := runner.Run(ctx, role, fmt.Sprintf("proposing approach (%s)", angle), buildProposePrompt(taskPrompt, angle))
 			results[i] = Proposal{Agent: role, Angle: angle, Content: out}
 			done <- indexed{i: i, err: err}
 		}(i, role)
