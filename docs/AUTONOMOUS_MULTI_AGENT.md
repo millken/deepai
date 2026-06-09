@@ -161,7 +161,10 @@ ImplementVerifyFix(ctx, taskPrompt, opts) Result:
 **设计面板(第二种编排形态,已落地)**:
 - `orchestrator.Design` + `design_task` 工具:多个 proposer 子 agent **并行**从不同角度(简单/健壮/最小改动/性能)起草方案,再由 judge 子 agent 批判并**综合出一份最终计划**。这是"从讨论/设计"的前半段,与 implement-verify-fix 是不同的形态(generate→judge→synthesize),可与 implement_task 组合:design_task 出计划 → implement_task 落地。只读,产物有序、judge 解析失败时回退原文。
 
-仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、把多形态抽成统一的声明式流水线引擎、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
+**端到端串联(已落地)**:
+- `orchestrator.Build` + `build_task` 工具:把设计面板与 implement-verify-fix **确定性地**接成一步——design 综合出的 plan 自动、完整地喂进实现阶段(coder 提示同时含原任务与 vetted plan),一次调用跑完"讨论→设计→实现→验证→修复"。这是阶段 B"声明式流水线"的一个具体两阶段实例,也是"全程不干预"最贴近的形态。design 阶段失败则不进入实现阶段。
+
+仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、把多形态抽成可任意声明的通用流水线引擎、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
 
 ## 8. 一句话结论
 
