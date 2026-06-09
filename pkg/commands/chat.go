@@ -126,7 +126,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Create tool registry.
 	registry := tools.NewRegistry()
-	registerChatTools(registry, provider, cfg.IsAutonomous())
+	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir)
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -229,7 +229,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool) {
+func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir string) {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
 
@@ -237,6 +237,7 @@ func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, auton
 	subExecutor := agent.NewSubagentExecutor(provider, registry, nil)
 	subPool := agent.NewSubagentPool(subExecutor, 1, 0)
 	mustRegisterTool(registry, tools.TaskTool(subPool))
+	mustRegisterTool(registry, tools.ImplementTaskTool(subPool, workDir))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(provider))
 
 	for _, tool := range builtin.FileTools() {
