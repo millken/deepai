@@ -487,7 +487,28 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		return NewResult("", err.Error(), -1, time.Since(start), err), nil
 	}
 
-	err := execCmd.Wait()
+	// When the context is cancelled (timeout), CommandContext only kills the
+	// direct child (sh).  Because we set Setpgid=true, child processes like
+	// GUI apps become orphans.  Kill the entire process group on cancellation.
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- execCmd.Wait()
+	}()
+
+	var err error
+	select {
+	case err = <-waitDone:
+		// Process exited normally.
+	case <-ctx.Done():
+		// Context cancelled or timed out — kill the whole process group.
+		forceKillProcess(execCmd.Process)
+		select {
+		case err = <-waitDone:
+		case <-time.After(defaultCleanupDelay):
+			err = ctx.Err()
+		}
+	}
+
 	duration := time.Since(start)
 
 	exitCode := 0
