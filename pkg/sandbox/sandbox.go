@@ -478,6 +478,23 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 	}
 	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
 	setProcessGroup(execCmd)
+
+	// When the context is cancelled (timeout), kill the whole process group
+	// rather than just the direct child (sh). Because we set Setpgid=true,
+	// children such as GUI apps would otherwise become orphans and keep running.
+	execCmd.Cancel = func() error {
+		forceKillProcess(execCmd.Process)
+		return os.ErrProcessDone
+	}
+
+	// A backgrounded child (e.g. "./app & sleep 5; kill ...") inherits the
+	// stdout/stderr pipe write-ends, so Wait() would block until that child
+	// exits even after sh has already returned. WaitDelay bounds that wait:
+	// once sh exits, Wait waits at most this long for the pipes to drain, then
+	// closes them and returns. This is why the agent no longer has to wait for
+	// the full command timeout when a generated script leaves a GUI app behind.
+	execCmd.WaitDelay = defaultCleanupDelay
+
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	execCmd.Stdout = &stdoutBuf
@@ -487,36 +504,25 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		return NewResult("", err.Error(), -1, time.Since(start), err), nil
 	}
 
-	// When the context is cancelled (timeout), CommandContext only kills the
-	// direct child (sh).  Because we set Setpgid=true, child processes like
-	// GUI apps become orphans.  Kill the entire process group on cancellation.
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- execCmd.Wait()
-	}()
+	err := execCmd.Wait()
 
-	var err error
-	select {
-	case err = <-waitDone:
-		// Process exited normally.
-	case <-ctx.Done():
-		// Context cancelled or timed out — kill the whole process group.
-		forceKillProcess(execCmd.Process)
-		select {
-		case err = <-waitDone:
-		case <-time.After(defaultCleanupDelay):
-			err = ctx.Err()
-		}
-	}
+	// Reap any lingering background children still in the process group so the
+	// app window actually closes instead of hanging around until the OS reaps
+	// it. Harmless when the group is already empty (kill returns ESRCH).
+	forceKillProcess(execCmd.Process)
 
 	duration := time.Since(start)
 
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	// Prefer the real exit status from ProcessState. ErrWaitDelay means the
+	// process exited cleanly but a backgrounded child was still holding the
+	// pipes open — that is expected here, not a command failure.
+	exitCode := -1
+	if execCmd.ProcessState != nil {
+		exitCode = execCmd.ProcessState.ExitCode()
+	} else if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
 		}
 	}
 

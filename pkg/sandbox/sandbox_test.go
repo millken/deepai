@@ -166,3 +166,32 @@ func TestExecDirectTimeout(t *testing.T) {
 		t.Fatal("ExecDirect() exit code = 0, want non-zero timeout exit")
 	}
 }
+
+// TestExecDirectBackgroundChildDoesNotBlock verifies that a command which
+// leaves a long-lived background child holding the stdout/stderr pipes (the
+// classic "./app & sleep N; kill ..." pattern used to smoke-test GUI apps) does
+// not keep ExecDirect blocked for the full timeout. The foreground shell exits
+// quickly; ExecDirect must return shortly after rather than waiting on the
+// orphaned child's inherited pipe fds.
+func TestExecDirectBackgroundChildDoesNotBlock(t *testing.T) {
+	start := time.Now()
+	// Background child sleeps far longer than the foreground script and the
+	// generous timeout, so any blocking on its inherited pipe would be obvious.
+	result, err := ExecDirect(context.Background(), "sleep 30 & echo started", 10*time.Second)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ExecDirect() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("ExecDirect() result = nil")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("ExecDirect() blocked %v on orphaned background child, want prompt return", elapsed)
+	}
+	if result.ExitCode() != 0 {
+		t.Fatalf("ExecDirect() exit code = %d, want 0", result.ExitCode())
+	}
+	if !strings.Contains(result.Stdout(), "started") {
+		t.Fatalf("ExecDirect() stdout = %q, want it to contain %q", result.Stdout(), "started")
+	}
+}
