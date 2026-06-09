@@ -117,3 +117,26 @@ func TestResolveConfig_PreservesModel(t *testing.T) {
 		t.Fatalf("unexpected Model %q for config without Model", got2.Model)
 	}
 }
+
+func TestResolveConfig_TypedAgentDoesNotInheritGeneralDefaults(t *testing.T) {
+	p := NewPool(nil, PoolConfig{})
+
+	// "coder" has no pool default → must NOT borrow general-purpose's MaxTurns(6)
+	// or Tools([file_ops]); leave them unset so the executor's profile applies.
+	coder := p.resolveConfig(SubagentConfig{AgentType: "coder"})
+	if coder.AgentType != "coder" {
+		t.Fatalf("AgentType = %q, want coder", coder.AgentType)
+	}
+	if coder.MaxTurns != 0 {
+		t.Fatalf("coder MaxTurns = %d, want 0 (profile decides), not the general-purpose cap", coder.MaxTurns)
+	}
+	if len(coder.Tools) != 0 {
+		t.Fatalf("coder Tools = %v, want empty (profile decides), not general-purpose's file_ops", coder.Tools)
+	}
+
+	// general-purpose still gets its pool default.
+	gp := p.resolveConfig(SubagentConfig{AgentType: "general-purpose"})
+	if gp.MaxTurns != 6 {
+		t.Fatalf("general-purpose MaxTurns = %d, want 6 (pool default preserved)", gp.MaxTurns)
+	}
+}

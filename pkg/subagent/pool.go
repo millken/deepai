@@ -239,10 +239,7 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 
 	base, ok := p.cfg.Defaults[agentType]
 	if !ok {
-		base, ok = p.cfg.Defaults["general-purpose"]
-	}
-	if !ok {
-		base = SubagentConfig{AgentType: "general-purpose"}
+		base = SubagentConfig{AgentType: agentType}
 	}
 
 	if cfg.AgentType != "" {

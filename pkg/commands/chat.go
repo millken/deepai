@@ -235,7 +235,7 @@ func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, auton
 
 	// Subagent tools.
 	subExecutor := agent.NewSubagentExecutor(provider, registry, nil, model).WithWorkDir(workDir).WithContextWindow(contextWindow)
-	subPool := agent.NewSubagentPool(subExecutor, 4, 0)
+	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
 	mustRegisterTool(registry, tools.TaskTool(subPool))
 	mustRegisterTool(registry, tools.ImplementTaskTool(subPool, workDir))
 	mustRegisterTool(registry, tools.DesignTaskTool(subPool))
