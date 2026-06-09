@@ -168,7 +168,11 @@ ImplementVerifyFix(ctx, taskPrompt, opts) Result:
 - **手动(确定性)**:slash 命令 `/design <任务>`、`/implement <任务> [-- 验证命令]`、`/build <任务> [-- 验证命令]` 直接调对应工具,绕过模型的工具选择;`-- ` 之后是可选的 shell 验证命令(如 `/build 加缓存 -- go build ./... && go test ./...`)。Ctrl+C 可中断。
 - **自动(软)**:主 agent 的系统提示里有一句引导,对"较大、自包含的实现任务优先用 build_task/design_task/implement_task"——提高自动选用概率,但不保证;只加在主 agent(子 agent 用各自 profile 提示,且不持有这些工具)。
 
-仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、把多形态抽成可任意声明的通用流水线引擎、共享黑板(阶段 C)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
+**共享黑板(阶段 C 的务实版,已落地)**:
+- `Blackboard`(plan + 跨轮累积的决策/笔记)贯穿一次编排运行,**注入每个子 agent 的提示**。具体收益:`build_task` 里 design 商定的 plan 现在**同时进入 coder 和 reviewer**——reviewer 据此判断,并被明确告知"不要把 plan 里的有意决策当 bug 否掉"(此前 reviewer 只看 task+diff,会误杀设计选择);修复循环里每轮的 review 摘要作为笔记累积,后续轮次的 coder 能看到"已商定/已要求"的历史,不再只拿最近一轮反馈。
+- 务实点:黑板由编排器从各阶段产物**确定性地维护**(plan 来自 design、笔记来自 review 摘要),子 agent 只读不直接写——避免了"自由写黑板"的膨胀与混乱风险。真正的多 agent 互写/辩论(阶段 D)仍未做。
+
+仍**尚未做**:跨 agent 树的全局 **token** 预算(目前是按调用次数,非 token)、每轮状态持久化/可恢复、把多形态抽成可任意声明的通用流水线引擎、子 agent 互写黑板/辩论(阶段 D)。客观性的硬锚点仍是 `verify_command`——评审已是"挑剔+多评委+可异model"的强化主观判断,但不等于客观真理。
 
 ## 8. 一句话结论
 
