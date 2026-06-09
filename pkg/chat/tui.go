@@ -259,6 +259,10 @@ type tuiModel struct {
 	histIdx    int
 	savedInput string
 	histStore  *historyStore // file load/save helpers
+
+	// slash-command autocomplete
+	suggestions []slashCmd
+	suggestIdx  int
 }
 
 func newTUIModel(status BannerInfo) *tuiModel {
@@ -269,7 +273,9 @@ func newTUIModel(status BannerInfo) *tuiModel {
 	ta.SetPromptFunc(2, func(textarea.PromptInfo) string { return promptStr })
 	ta.Placeholder = "Type a message  ·  Alt+Enter for newline  ·  /help"
 	ta.ShowLineNumbers = false
-	ta.SetHeight(1)
+	ta.DynamicHeight = true
+	ta.MinHeight = 1
+	ta.MaxHeight = 10
 	ta.SetWidth(80)
 	ta.Focus()
 
@@ -445,15 +451,33 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, commit(strings.Join(lines, "\n"))
 
+	case "tab":
+		if len(m.suggestions) > 0 {
+			m.applySuggestion()
+			return m, nil
+		}
+
+	case "esc":
+		if len(m.suggestions) > 0 {
+			m.suggestions = nil
+			m.suggestIdx = 0
+			return m, nil
+		}
+
 	case "enter":
 		if !m.inputVisible {
+			return m, nil
+		}
+		// Suggestion selected → complete instead of submitting.
+		if len(m.suggestions) > 0 {
+			m.applySuggestion()
 			return m, nil
 		}
 		// Modifier+Enter inserts a newline.
 		if msg.Mod != 0 {
 			var cmd tea.Cmd
 			m.ta, cmd = m.ta.Update(msg)
-			m.syncInputHeight()
+			m.updateSuggestions()
 			return m, cmd
 		}
 		val := m.ta.Value()
@@ -467,6 +491,10 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "up":
+		if n := len(m.suggestions); n > 0 {
+			m.suggestIdx = (m.suggestIdx - 1 + n) % n
+			return m, nil
+		}
 		if m.inputVisible && !m.askActive && !strings.Contains(m.ta.Value(), "\n") && len(m.history) > 0 {
 			if m.histIdx == -1 {
 				m.savedInput = m.ta.Value()
@@ -480,6 +508,10 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "down":
+		if n := len(m.suggestions); n > 0 {
+			m.suggestIdx = (m.suggestIdx + 1) % n
+			return m, nil
+		}
 		if m.inputVisible && !m.askActive && m.histIdx >= 0 {
 			m.histIdx--
 			if m.histIdx == -1 {
@@ -495,7 +527,7 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.inputVisible {
 		var cmd tea.Cmd
 		m.ta, cmd = m.ta.Update(msg)
-		m.syncInputHeight()
+		m.updateSuggestions()
 		return m, cmd
 	}
 	return m, nil
@@ -512,6 +544,8 @@ func (m *tuiModel) submitInput(r inputResult) {
 	m.askActive = false
 	m.askHeader = ""
 	m.ta.SetValue("")
+	m.suggestions = nil
+	m.suggestIdx = 0
 }
 
 func (m *tuiModel) recordHistory(val string) {
@@ -525,16 +559,54 @@ func (m *tuiModel) recordHistory(val string) {
 	m.histIdx = -1
 }
 
-// syncInputHeight grows the input box up to a cap as the user adds lines.
-func (m *tuiModel) syncInputHeight() {
-	lines := strings.Count(m.ta.Value(), "\n") + 1
-	if lines < 1 {
-		lines = 1
+// updateSuggestions recomputes the slash-command popup from the current input.
+// Suggestions show only while the command token is being typed (leading "/",
+// no space/newline yet); once the user moves on to arguments they disappear.
+func (m *tuiModel) updateSuggestions() {
+	prev := len(m.suggestions)
+	m.suggestions = nil
+	if m.askActive {
+		m.suggestIdx = 0
+		return
 	}
-	if lines > 6 {
-		lines = 6
+	val := m.ta.Value()
+	if !strings.HasPrefix(val, "/") || strings.ContainsAny(val, " \n") {
+		m.suggestIdx = 0
+		return
 	}
-	m.ta.SetHeight(lines)
+	m.suggestions = matchSlashCommands(val[len("/"):])
+	if len(m.suggestions) != prev || m.suggestIdx >= len(m.suggestions) {
+		m.suggestIdx = 0
+	}
+}
+
+// applySuggestion completes the input to the selected command and dismisses the
+// popup, leaving a trailing space so the user can type arguments.
+func (m *tuiModel) applySuggestion() {
+	if m.suggestIdx < 0 || m.suggestIdx >= len(m.suggestions) {
+		return
+	}
+	m.ta.SetValue("/" + m.suggestions[m.suggestIdx].Name + " ")
+	m.ta.CursorEnd()
+	m.suggestions = nil
+	m.suggestIdx = 0
+}
+
+// renderSuggestions draws the slash-command popup, highlighting the selection.
+func (m *tuiModel) renderSuggestions() string {
+	var b strings.Builder
+	for i, c := range m.suggestions {
+		line := fmt.Sprintf("  /%s  %s", padRight(c.Name, 10), c.Desc)
+		if i == m.suggestIdx {
+			b.WriteString(m.styles.Highlight.Render("▸" + line))
+		} else {
+			b.WriteString(m.styles.Dim.Render(" " + line))
+		}
+		if i < len(m.suggestions)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }
 
 func (m *tuiModel) elapsedTick() tea.Cmd {
@@ -728,6 +800,10 @@ func (m *tuiModel) View() tea.View {
 			b.WriteString("\n")
 		}
 		b.WriteString(m.ta.View())
+		if len(m.suggestions) > 0 {
+			b.WriteString("\n")
+			b.WriteString(m.renderSuggestions())
+		}
 		if !m.askActive {
 			b.WriteString("\n")
 			b.WriteString(m.idleFooter())

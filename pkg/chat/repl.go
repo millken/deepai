@@ -854,29 +854,6 @@ func (r *ChatRepl) undoLastTurn() {
 	r.ui.Info(fmt.Sprintf("  Undone %d messages.", removed))
 }
 
-func slashHelpText() string {
-	return strings.Join([]string{
-		"",
-		"  Commands:",
-		"    /help      Show this help",
-		"    /clear     Clear session history",
-		"    /history   Show conversation history",
-		"    /sessions  List recent sessions",
-		"    /new       Start a new session",
-		"    /title     Set session title",
-		"    /save      Save session metadata",
-		"    /undo      Undo last turn",
-		"    /plan      Enter plan mode (read-only, explore before coding)",
-		"    /run       Exit plan mode (full tool access)",
-		"    /design    Design panel: proposals + judge → a vetted plan (/design <task>)",
-		"    /implement Implement→verify→review→fix loop (/implement <task> [-- verify cmd])",
-		"    /build     Design then implement, end-to-end (/build <task> [-- verify cmd])",
-		"    /model     Show current model (/model <name> to switch)",
-		"    /exit      Exit the REPL",
-		"",
-	}, "\n")
-}
-
 // sessionListText renders the recent-session list as a string.
 func (r *ChatRepl) sessionListText() string {
 	if r.sessMgr == nil {
