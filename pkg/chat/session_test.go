@@ -49,6 +49,46 @@ func TestCRUD_Roundtrip(t *testing.T) {
 	}
 }
 
+// TestClear_WipesPersistedMessages reproduces the bug where `/clear` only reset
+// in-memory messages, so a later `deepai -c` (Latest + LoadMessages) replayed the
+// old conversation. `/clear` deletes all persisted messages via
+// DeleteMessagesAfterSeq(id, 0); the session must remain resumable but empty.
+func TestClear_WipesPersistedMessages(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	sess, err := store.Create(models.CreateOpts{Model: "m"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, role := range []models.Role{models.RoleHuman, models.RoleAI} {
+		if err := store.AppendMessage(sess.ID, models.Message{Role: role, Content: "hi"}); err != nil {
+			t.Fatalf("AppendMessage: %v", err)
+		}
+	}
+
+	// Simulate `/clear`.
+	if err := store.DeleteMessagesAfterSeq(sess.ID, 0); err != nil {
+		t.Fatalf("DeleteMessagesAfterSeq: %v", err)
+	}
+
+	// `deepai -c` resolves the latest session and loads its messages.
+	latest, err := store.Latest()
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if latest == nil || latest.ID != sess.ID {
+		t.Fatalf("expected latest to be the cleared session %q, got %+v", sess.ID, latest)
+	}
+	msgs, err := store.LoadMessages(sess.ID)
+	if err != nil {
+		t.Fatalf("LoadMessages: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("expected no messages after clear, got %d", len(msgs))
+	}
+}
+
 func TestAppendMessage_SeqIncrement(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()

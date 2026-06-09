@@ -19,9 +19,6 @@ var slashCommands = []slashCmd{
 	{"compact", "Compact context now"},
 	{"plan", "Enter plan mode (read-only, explore before coding)"},
 	{"run", "Exit plan mode (full tool access)"},
-	{"design", "Design panel: proposals + judge → a vetted plan (/design <task>)"},
-	{"implement", "Implement→verify→review→fix loop (/implement <task> [-- verify cmd])"},
-	{"build", "Design then implement, end-to-end (/build <task> [-- verify cmd])"},
 	{"model", "Show current model (/model <name> to switch)"},
 	{"exit", "Exit the REPL"},
 }

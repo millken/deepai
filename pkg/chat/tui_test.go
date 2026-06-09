@@ -144,8 +144,8 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 }
 
 func TestMatchSlashCommands(t *testing.T) {
-	if got := matchSlashCommands("imp"); len(got) != 1 || got[0].Name != "implement" {
-		t.Fatalf("prefix 'imp' should match only implement, got %+v", got)
+	if got := matchSlashCommands("und"); len(got) != 1 || got[0].Name != "undo" {
+		t.Fatalf("prefix 'und' should match only undo, got %+v", got)
 	}
 	if got := matchSlashCommands(""); len(got) != len(slashCommands) {
 		t.Fatalf("empty prefix should match all %d, got %d", len(slashCommands), len(got))
@@ -159,23 +159,23 @@ func TestSlashSuggestions(t *testing.T) {
 	m := newTUIModel(BannerInfo{Model: "test"})
 
 	// Typing the command token shows matching suggestions.
-	m.ta.SetValue("/de")
+	m.ta.SetValue("/sa")
 	m.updateSuggestions()
-	if len(m.suggestions) != 1 || m.suggestions[0].Name != "design" {
-		t.Fatalf("/de should suggest design, got %+v", m.suggestions)
+	if len(m.suggestions) != 1 || m.suggestions[0].Name != "save" {
+		t.Fatalf("/sa should suggest save, got %+v", m.suggestions)
 	}
 
-	// Applying completes to "/design " and dismisses the popup.
+	// Applying completes to "/save " and dismisses the popup.
 	m.applySuggestion()
-	if m.ta.Value() != "/design " {
-		t.Fatalf("applySuggestion = %q, want %q", m.ta.Value(), "/design ")
+	if m.ta.Value() != "/save " {
+		t.Fatalf("applySuggestion = %q, want %q", m.ta.Value(), "/save ")
 	}
 	if len(m.suggestions) != 0 {
 		t.Fatalf("suggestions should clear after apply")
 	}
 
 	// A space (moved to args) hides suggestions.
-	m.ta.SetValue("/design my task")
+	m.ta.SetValue("/save my task")
 	m.updateSuggestions()
 	if len(m.suggestions) != 0 {
 		t.Fatalf("suggestions should hide once typing arguments, got %+v", m.suggestions)
