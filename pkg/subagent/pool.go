@@ -263,6 +263,9 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 	if len(cfg.Tools) > 0 {
 		base.Tools = append([]string(nil), cfg.Tools...)
 	}
+	if strings.TrimSpace(cfg.Model) != "" {
+		base.Model = strings.TrimSpace(cfg.Model)
+	}
 	if base.Timeout <= 0 {
 		base.Timeout = p.cfg.Timeout
 	}

@@ -45,6 +45,8 @@ type Config struct {
 	MaxRounds           int
 	CoderType           string
 	ReviewerType        string
+	Reviewers           []string
+	MajorityReview      bool
 	RequireVerification bool
 }
 
@@ -56,6 +58,7 @@ type RoundResult struct {
 	VerifyOutput string
 	Diff         string
 	Verdict      Verdict
+	Reviews      []Verdict
 }
 
 type Result struct {
@@ -81,6 +84,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if strings.TrimSpace(cfg.ReviewerType) == "" {
 		cfg.ReviewerType = defaultReviewerType
+	}
+	if len(cfg.Reviewers) == 0 {
+		cfg.Reviewers = []string{cfg.ReviewerType}
 	}
 	return cfg
 }
@@ -145,13 +151,18 @@ func Run(ctx context.Context, cfg Config, taskPrompt string, runner SubagentRunn
 		}
 
 		reviewPrompt := buildReviewPrompt(taskPrompt, diff, vr.Output, vr.Ran)
-		reviewOut, err := runner.Run(ctx, cfg.ReviewerType, "review", reviewPrompt)
-		if err != nil {
-			res.Reason = fmt.Sprintf("reviewer failed in round %d: %v", round, err)
-			res.Rounds = append(res.Rounds, rr)
-			return res, err
+		verdicts := make([]Verdict, 0, len(cfg.Reviewers))
+		for _, reviewerType := range cfg.Reviewers {
+			reviewOut, err := runner.Run(ctx, reviewerType, "review", reviewPrompt)
+			if err != nil {
+				res.Reason = fmt.Sprintf("reviewer %q failed in round %d: %v", reviewerType, round, err)
+				res.Rounds = append(res.Rounds, rr)
+				return res, err
+			}
+			verdicts = append(verdicts, parseVerdict(reviewOut))
 		}
-		rr.Verdict = parseVerdict(reviewOut)
+		rr.Reviews = verdicts
+		rr.Verdict = aggregateVerdicts(verdicts, cfg.Reviewers, cfg.MajorityReview)
 		res.Rounds = append(res.Rounds, rr)
 
 		objectiveOK := vr.Passed || (!vr.Ran && !cfg.RequireVerification)
@@ -232,6 +243,38 @@ func buildFeedback(rr RoundResult) string {
 		b.WriteString(truncate(rr.Verdict.Raw, 2000))
 	}
 	return truncate(b.String(), maxFeedbackBytes)
+}
+
+func aggregateVerdicts(verdicts []Verdict, reviewers []string, majority bool) Verdict {
+	agg := Verdict{}
+	passCount := 0
+	var summaries []string
+	for i, v := range verdicts {
+		if v.Parsed {
+			agg.Parsed = true
+		}
+		if v.Pass {
+			passCount++
+		}
+		agg.Issues = append(agg.Issues, v.Issues...)
+		if strings.TrimSpace(v.Summary) != "" {
+			label := "reviewer"
+			if i < len(reviewers) {
+				label = reviewers[i]
+			}
+			summaries = append(summaries, label+": "+v.Summary)
+		}
+	}
+	agg.Summary = strings.Join(summaries, " | ")
+	if len(verdicts) == 0 {
+		return agg
+	}
+	if majority {
+		agg.Pass = passCount*2 > len(verdicts)
+	} else {
+		agg.Pass = passCount == len(verdicts)
+	}
+	return agg
 }
 
 func parseVerdict(raw string) Verdict {

@@ -77,3 +77,33 @@ func TestTaskToolFailed(t *testing.T) {
 		t.Fatalf("error = %q, want boom", result.Error)
 	}
 }
+
+func TestPoolRunner_RoutesReviewModelToReviewersOnly(t *testing.T) {
+	captured := map[string]string{} // agentType -> model
+	pool := fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			captured[cfg.AgentType] = cfg.Model
+			return &subagent.Task{ID: "t"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}
+	r := poolRunner{
+		pool:          pool,
+		reviewModel:   "review-model-x",
+		reviewerTypes: map[string]struct{}{"arch-reviewer": {}},
+	}
+	if _, err := r.Run(context.Background(), "coder", "impl", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Run(context.Background(), "arch-reviewer", "review", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if captured["coder"] != "" {
+		t.Fatalf("coder should use default model, got override %q", captured["coder"])
+	}
+	if captured["arch-reviewer"] != "review-model-x" {
+		t.Fatalf("reviewer should use review model, got %q", captured["arch-reviewer"])
+	}
+}

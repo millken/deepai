@@ -105,3 +105,15 @@ func TestPoolWaitUnknownTask(t *testing.T) {
 		t.Fatal("Wait() expected error for missing task")
 	}
 }
+
+func TestResolveConfig_PreservesModel(t *testing.T) {
+	p := NewPool(nil, PoolConfig{})
+	got := p.resolveConfig(SubagentConfig{AgentType: "coder", Model: "m-1"})
+	if got.Model != "m-1" {
+		t.Fatalf("resolveConfig dropped Model: got %q, want m-1", got.Model)
+	}
+	// empty Model must not be forced onto the resolved config
+	if got2 := p.resolveConfig(SubagentConfig{AgentType: "coder"}); got2.Model != "" {
+		t.Fatalf("unexpected Model %q for config without Model", got2.Model)
+	}
+}

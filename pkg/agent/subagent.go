@@ -98,11 +98,16 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		systemPrompt += "\n\nOutput your response as JSON matching this schema:\n" + profileCfg.OutputSchema.Prompt
 	}
 
+	model := e.model
+	if strings.TrimSpace(task.Config.Model) != "" {
+		model = strings.TrimSpace(task.Config.Model)
+	}
+
 	runAgent := New(AgentConfig{
 		LLMProvider:    e.llm,
 		Tools:          registry,
 		MaxTurns:       maxTurns,
-		Model:          e.model,
+		Model:          model,
 		Sandbox:        e.sandbox,
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,

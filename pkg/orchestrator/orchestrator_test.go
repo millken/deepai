@@ -232,3 +232,84 @@ func TestRun_VerifiedTrueWhenVerifyRanAndPassed(t *testing.T) {
 		t.Fatalf("expected Done+Verified, got done=%v verified=%v reason=%q", res.Done, res.Verified, res.Reason)
 	}
 }
+
+type perTypeRunner struct {
+	verdicts map[string]string
+	calls    []string
+}
+
+func (r *perTypeRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
+	r.calls = append(r.calls, agentType)
+	if v, ok := r.verdicts[agentType]; ok {
+		return v, nil
+	}
+	return "implemented", nil
+}
+
+func TestRun_UnanimousReviewBlockedByOneFail(t *testing.T) {
+	runner := &perTypeRunner{verdicts: map[string]string{
+		"arch-reviewer":     `{"verdict":"pass"}`,
+		"security-reviewer": `{"verdict":"fail","issues":[{"file":"a.go","line":1,"message":"injection"}]}`,
+	}}
+	res, err := Run(context.Background(),
+		Config{MaxRounds: 1, Reviewers: []string{"arch-reviewer", "security-reviewer"}},
+		"do X", runner, &fixedVerifier{passes: []bool{true}}, staticDiffer{diff: "d"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Done {
+		t.Fatal("unanimous policy must fail when any reviewer fails")
+	}
+	if got := len(res.Rounds[0].Reviews); got != 2 {
+		t.Fatalf("expected 2 reviews recorded, got %d", got)
+	}
+}
+
+func TestRun_MajorityReviewPasses(t *testing.T) {
+	runner := &perTypeRunner{verdicts: map[string]string{
+		"arch-reviewer":     `{"verdict":"pass"}`,
+		"security-reviewer": `{"verdict":"pass"}`,
+		"perf-reviewer":     `{"verdict":"fail"}`,
+	}}
+	res, err := Run(context.Background(),
+		Config{MaxRounds: 1, MajorityReview: true,
+			Reviewers: []string{"arch-reviewer", "security-reviewer", "perf-reviewer"}},
+		"do X", runner, &fixedVerifier{passes: []bool{true}}, staticDiffer{diff: "d"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Done {
+		t.Fatalf("majority (2/3) should pass, reason=%q", res.Reason)
+	}
+}
+
+func TestAggregateVerdicts(t *testing.T) {
+	pass := Verdict{Pass: true, Parsed: true}
+	fail := Verdict{Pass: false, Parsed: true}
+	unparsed := Verdict{Pass: false, Parsed: false}
+	names := []string{"a", "b", "c"}
+
+	if !aggregateVerdicts([]Verdict{pass, pass}, names, false).Pass {
+		t.Error("unanimous: all pass should pass")
+	}
+	if aggregateVerdicts([]Verdict{pass, fail}, names, false).Pass {
+		t.Error("unanimous: one fail should fail")
+	}
+	if aggregateVerdicts([]Verdict{pass, unparsed}, names, false).Pass {
+		t.Error("unanimous: unparseable verdict counts as fail")
+	}
+	if !aggregateVerdicts([]Verdict{pass, pass, fail}, names, true).Pass {
+		t.Error("majority: 2/3 should pass")
+	}
+	if aggregateVerdicts([]Verdict{pass, fail, fail}, names, true).Pass {
+		t.Error("majority: 1/3 should fail")
+	}
+	// issues from all reviewers are merged
+	merged := aggregateVerdicts([]Verdict{
+		{Pass: false, Parsed: true, Issues: []Issue{{File: "a.go"}}},
+		{Pass: false, Parsed: true, Issues: []Issue{{File: "b.go"}}},
+	}, names, false)
+	if len(merged.Issues) != 2 {
+		t.Fatalf("expected merged 2 issues, got %d", len(merged.Issues))
+	}
+}

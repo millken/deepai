@@ -39,6 +39,7 @@ type SubagentConfig struct {
 	Timeout      time.Duration
 	SystemPrompt string
 	Tools        []string
+	Model        string
 }
 
 // EffectiveAgentType returns the resolved agent type string.

@@ -14,11 +14,19 @@ import (
 )
 
 type poolRunner struct {
-	pool taskPool
+	pool          taskPool
+	reviewModel   string
+	reviewerTypes map[string]struct{}
 }
 
 func (r poolRunner) Run(ctx context.Context, agentType, description, prompt string) (string, error) {
-	task, err := r.pool.StartTask(ctx, description, prompt, subagent.SubagentConfig{AgentType: agentType})
+	cfg := subagent.SubagentConfig{AgentType: agentType}
+	if r.reviewModel != "" {
+		if _, ok := r.reviewerTypes[agentType]; ok {
+			cfg.Model = r.reviewModel
+		}
+	}
+	task, err := r.pool.StartTask(ctx, description, prompt, cfg)
 	if err != nil {
 		return "", err
 	}
@@ -67,6 +75,20 @@ func (d gitDiffer) Diff(ctx context.Context) (string, error) {
 	return res.Stdout(), nil
 }
 
+func stringsFromArg(raw any) []string {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
 func withWorkDir(dir, cmd string) string {
 	if strings.TrimSpace(dir) == "" {
 		return cmd
@@ -88,7 +110,10 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			"properties": map[string]any{
 				"prompt":         map[string]any{"type": "string", "description": "Detailed task for the coder to implement"},
 				"verify_command": map[string]any{"type": "string", "description": "Shell command that must exit 0 for success (e.g. 'go build ./... && go test ./...'). Optional; if omitted, success relies on the reviewer only."},
-				"reviewer_type":  map[string]any{"type": "string", "description": "Reviewer agent type (default arch-reviewer; e.g. security-reviewer, perf-reviewer)"},
+				"reviewer_type":  map[string]any{"type": "string", "description": "Single reviewer agent type (default arch-reviewer). Ignored if reviewers is set."},
+				"reviewers":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Multiple reviewer agent types to vote (e.g. [\"arch-reviewer\",\"security-reviewer\",\"perf-reviewer\"]). Each is an independent skeptic."},
+				"review_policy":  map[string]any{"type": "string", "description": "How reviewer votes combine: 'unanimous' (default, any fail blocks) or 'majority'."},
+				"review_model":   map[string]any{"type": "string", "description": "Optional model id used for reviewers, distinct from the coder's, to reduce self-review bias."},
 				"max_rounds":     map[string]any{"type": "integer", "description": "Max implement→verify→review→fix rounds (default 4)"},
 				"require_verification": map[string]any{"type": "boolean", "description": "If true, only declare success when verify_command actually ran and passed (review alone never suffices). Requires verify_command."},
 			},
@@ -104,6 +129,8 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			}
 			verifyCmd, _ := call.Arguments["verify_command"].(string)
 			reviewerType, _ := call.Arguments["reviewer_type"].(string)
+			reviewModel, _ := call.Arguments["review_model"].(string)
+			reviewPolicy, _ := call.Arguments["review_policy"].(string)
 			requireVerification, _ := call.Arguments["require_verification"].(bool)
 
 			if requireVerification && strings.TrimSpace(verifyCmd) == "" {
@@ -113,11 +140,21 @@ func ImplementTaskTool(pool taskPool, workDir string) models.Tool {
 			cfg := orchestrator.Config{
 				MaxRounds:           intFromArg(call.Arguments["max_rounds"]),
 				ReviewerType:        strings.TrimSpace(reviewerType),
+				Reviewers:           stringsFromArg(call.Arguments["reviewers"]),
+				MajorityReview:      strings.EqualFold(strings.TrimSpace(reviewPolicy), "majority"),
 				RequireVerification: requireVerification,
 			}
 
+			reviewerSet := make(map[string]struct{})
+			for _, r := range cfg.Reviewers {
+				reviewerSet[r] = struct{}{}
+			}
+			if strings.TrimSpace(cfg.ReviewerType) != "" {
+				reviewerSet[strings.TrimSpace(cfg.ReviewerType)] = struct{}{}
+			}
+
 			res, err := orchestrator.Run(ctx, cfg, prompt,
-				poolRunner{pool: pool},
+				poolRunner{pool: pool, reviewModel: strings.TrimSpace(reviewModel), reviewerTypes: reviewerSet},
 				cmdVerifier{command: verifyCmd, workDir: workDir, timeout: 5 * time.Minute},
 				gitDiffer{workDir: workDir},
 			)
