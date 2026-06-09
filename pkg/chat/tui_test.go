@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/subagent"
 )
 
 // feed sends a text chunk through the agent-event handler and returns whether a
@@ -99,5 +100,26 @@ func TestSubmitInputDeliversAndHides(t *testing.T) {
 	}
 	if m.inputVisible || m.askActive || m.inputReply != nil {
 		t.Fatalf("submitInput should reset input state")
+	}
+}
+
+func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
+	m := &tuiModel{}
+	cases := []struct {
+		name   string
+		evt    subagent.TaskEvent
+		render bool
+	}{
+		{"tool progress renders", subagent.TaskEvent{Type: "task_running", Description: "implement", Message: "⚙ edit_file"}, true},
+		{"lifecycle noise dropped", subagent.TaskEvent{Type: "task_running", Message: "task started"}, false},
+		{"empty message dropped", subagent.TaskEvent{Type: "task_running", Message: ""}, false},
+		{"started renders", subagent.TaskEvent{Type: "task_started", Description: "review"}, true},
+		{"timeout renders", subagent.TaskEvent{Type: "task_timed_out", Error: "deadline"}, true},
+	}
+	for _, c := range cases {
+		got := m.handleSubagentEvent(c.evt) != nil
+		if got != c.render {
+			t.Errorf("%s: rendered=%v, want %v", c.name, got, c.render)
+		}
 	}
 }

@@ -199,21 +199,18 @@ func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
 
 func subagentMessageFromAgentEvent(evt AgentEvent) string {
 	switch evt.Type {
-	case AgentEventChunk, AgentEventTextChunk:
-		return strings.TrimSpace(evt.Text)
 	case AgentEventToolCallStart:
 		if evt.ToolEvent != nil {
-			return fmt.Sprintf("calling tool %s", evt.ToolEvent.Name)
+			return "⚙ " + evt.ToolEvent.Name
 		}
 	case AgentEventToolCallEnd:
-		if evt.ToolEvent != nil {
-			if evt.ToolEvent.Error != "" {
-				return fmt.Sprintf("tool %s failed: %s", evt.ToolEvent.Name, evt.ToolEvent.Error)
-			}
-			return fmt.Sprintf("tool %s completed", evt.ToolEvent.Name)
+		if evt.ToolEvent != nil && evt.ToolEvent.Error != "" {
+			return "✗ " + evt.ToolEvent.Name + ": " + evt.ToolEvent.Error
 		}
 	case AgentEventError:
-		return strings.TrimSpace(evt.Err)
+		if s := strings.TrimSpace(evt.Err); s != "" {
+			return "✗ " + s
+		}
 	}
 	return ""
 }

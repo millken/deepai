@@ -583,6 +583,17 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 			desc = string([]rune(desc)[:77]) + "..."
 		}
 		return m.commitWithFlush(m.styles.Dim.Render("  ↳ [subagent] " + desc))
+	case "task_running":
+		msg := strings.TrimSpace(evt.Message)
+		if msg == "" || msg == "task started" {
+			return nil
+		}
+		if d := strings.TrimSpace(evt.Description); d != "" {
+			msg = "[" + d + "] " + msg
+		}
+		return m.commitWithFlush(m.styles.Dim.Render("      " + msg))
+	case "task_timed_out":
+		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] timed out: " + evt.Error))
 	case "task_failed":
 		errMsg := evt.Error
 		if errMsg == "" {
