@@ -239,6 +239,7 @@ func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, auton
 	mustRegisterTool(registry, tools.TaskTool(subPool))
 	mustRegisterTool(registry, tools.ImplementTaskTool(subPool, workDir))
 	mustRegisterTool(registry, tools.DesignTaskTool(subPool))
+	mustRegisterTool(registry, tools.BuildTaskTool(subPool, workDir))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(provider))
 
 	for _, tool := range builtin.FileTools() {
