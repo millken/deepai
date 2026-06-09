@@ -706,13 +706,7 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 	case "help", "h":
 		r.ui.Info(slashHelpText())
 	case "clear":
-		r.sess.Messages = nil
-		r.turn = 0
-		if r.sessMgr != nil && r.sess != nil && r.sess.ID != "" {
-			if err := r.sessMgr.DeleteMessagesAfterSeq(r.sess.ID, 0); err != nil {
-				slog.Warn("clear persisted messages failed", "err", err)
-			}
-		}
+		r.clearSession()
 		r.ui.Info("  Session history cleared.")
 	case "history":
 		var sb strings.Builder
@@ -758,6 +752,19 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.ui.Info(slashHelpText())
 	}
 	return false
+}
+
+// clearSession wipes the current session's history — both the in-memory
+// messages and the persisted rows — so a later `deepai -c` resumes it empty
+// instead of replaying a cleared conversation.
+func (r *ChatRepl) clearSession() {
+	r.sess.Messages = nil
+	r.turn = 0
+	if r.sessMgr != nil {
+		if err := r.sessMgr.DeleteMessagesAfterSeq(r.sess.ID, 0); err != nil {
+			slog.Warn("clear persisted messages failed", "err", err)
+		}
+	}
 }
 
 func (r *ChatRepl) startNewSession() {
