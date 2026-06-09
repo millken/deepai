@@ -135,6 +135,8 @@ type CompactStats struct {
 	MessagesBefore int     `json:"messages_before"`
 	MessagesAfter  int     `json:"messages_after"`
 	InputTokens    int     `json:"input_tokens"`
+	AfterTokens    int     `json:"after_tokens"`
 	ContextWindow  int     `json:"context_window"`
 	Ratio          float64 `json:"ratio"`
+	AfterRatio     float64 `json:"after_ratio"`
 }

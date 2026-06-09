@@ -743,12 +743,12 @@ func toolEventNamePreview(evt agent.AgentEvent) (string, string) {
 }
 
 func compactLine(cs *agent.CompactStats) string {
-	if cs.MessagesBefore == cs.MessagesAfter {
-		return fmt.Sprintf("  Context compacted: %d messages (content trimmed, %.0f%% of %d)",
-			cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)
+	if cs.AfterTokens > 0 {
+		return fmt.Sprintf("  Context compacted: %d messages, %.0f%% -> %.0f%% of %d",
+			cs.MessagesAfter, cs.Ratio*100, cs.AfterRatio*100, cs.ContextWindow)
 	}
-	return fmt.Sprintf("  Context compacted: %d -> %d messages (%.0f%% of %d)",
-		cs.MessagesBefore, cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)
+	return fmt.Sprintf("  Context compacted: %d messages (%.0f%% of %d)",
+		cs.MessagesAfter, cs.Ratio*100, cs.ContextWindow)
 }
 
 // renderBannerString renders the startup banner into a string for committing to

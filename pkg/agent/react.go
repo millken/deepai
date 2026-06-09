@@ -292,44 +292,38 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 				if didCompact {
-					a.logger.Debug("context compaction", "turn", turn, "before", before, "after", len(compacted), "estimated_tokens", estimated, "ratio", fmt.Sprintf("%.2f", ratio))
 					runMessages = compacted
+					a.lastInputTokens = 0
+					a.lastTokenCountMsgs = 0
+
+					afterEstimated := a.estimateContextTokens(runMessages)
+					if afterEstimated > a.contextWindow {
+						for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
+							c2, ok := compactMessages(runMessages, tail)
+							if ok {
+								runMessages = c2
+							}
+							afterEstimated = a.estimateContextTokens(runMessages)
+							if afterEstimated <= a.contextWindow {
+								break
+							}
+						}
+					}
+
+					afterRatio := float64(afterEstimated) / float64(a.contextWindow)
+					a.logger.Debug("context compaction", "turn", turn, "before_msgs", before, "after_msgs", len(runMessages), "before_tokens", estimated, "after_tokens", afterEstimated, "before_ratio", fmt.Sprintf("%.2f", ratio), "after_ratio", fmt.Sprintf("%.2f", afterRatio))
 					emit(AgentEvent{
 						Type: AgentEventCompact,
 						CompactStats: &CompactStats{
 							MessagesBefore: before,
-							MessagesAfter:  len(compacted),
+							MessagesAfter:  len(runMessages),
 							InputTokens:    estimated,
+							AfterTokens:    afterEstimated,
 							ContextWindow:  a.contextWindow,
 							Ratio:          ratio,
+							AfterRatio:     afterRatio,
 						},
 					})
-					a.lastInputTokens = 0
-					a.lastTokenCountMsgs = 0
-				}
-
-				// If still over the hard limit (ratio > 1.0), apply increasingly
-				// aggressive compaction with a shrinking tail to prevent sending
-				// an oversized payload that would cause the provider to drop the
-				// connection mid-stream ("unexpected end of JSON input").
-				afterEstimated := a.estimateContextTokens(runMessages)
-				if afterRatio := float64(afterEstimated) / float64(a.contextWindow); afterRatio > 1.0 {
-					// About to rewrite message content in place; the provider
-					// anchor no longer matches those messages, so drop it and let
-					// the byte heuristic track the shrinking payload.
-					a.lastInputTokens = 0
-					a.lastTokenCountMsgs = 0
-					for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
-						c2, ok := compactMessages(runMessages, tail)
-						if ok {
-							runMessages = c2
-						}
-						e2 := a.estimateContextTokens(runMessages)
-						a.logger.Debug("aggressive compaction", "turn", turn, "tail", tail, "estimated", e2, "ratio", fmt.Sprintf("%.2f", float64(e2)/float64(a.contextWindow)))
-						if float64(e2)/float64(a.contextWindow) <= 1.0 {
-							break
-						}
-					}
 				}
 			}
 		}
