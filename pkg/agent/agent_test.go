@@ -380,3 +380,23 @@ func TestValidationBreaker_TripsDespiteMixedBatch(t *testing.T) {
 		t.Fatalf("breaker did not trip (got %v); a mixed batch is still resetting the global counter", err)
 	}
 }
+
+func TestMergeToolCalls_EmptyIDsDoNotCollide(t *testing.T) {
+	// Two parallel tool calls streamed across chunks with empty IDs must remain
+	// distinct, not overwrite each other via the empty-string map key.
+	out := mergeToolCalls(
+		[]models.ToolCall{{ID: "", Name: "bash", Arguments: map[string]any{"cmd": "a"}}},
+		[]models.ToolCall{{ID: "", Name: "read_file", Arguments: map[string]any{"path": "b"}}},
+	)
+	if len(out) != 2 {
+		t.Fatalf("empty-ID calls collided: got %d, want 2", len(out))
+	}
+	// Non-empty IDs still merge.
+	merged := mergeToolCalls(
+		[]models.ToolCall{{ID: "x", Name: "bash"}},
+		[]models.ToolCall{{ID: "x", Arguments: map[string]any{"cmd": "ls"}}},
+	)
+	if len(merged) != 1 || len(merged[0].Arguments) == 0 {
+		t.Fatalf("same-ID calls should merge: %+v", merged)
+	}
+}

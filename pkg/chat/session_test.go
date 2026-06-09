@@ -345,3 +345,32 @@ func TestDeleteLastUserTurn_NothingToUndo(t *testing.T) {
 		t.Fatalf("removed = %d, want 0 (no human turn)", removed)
 	}
 }
+
+func TestLatest_DeterministicOnTiedUpdatedAt(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	a, _ := store.Create(models.CreateOpts{})
+	b, _ := store.Create(models.CreateOpts{})
+
+	// Force both sessions to the SAME updated_at (a same-second tie). Without a
+	// deterministic tiebreaker, Latest() could return either nondeterministically.
+	const tied = 1700000000.0
+	if _, err := store.db.Exec(`UPDATE sessions SET updated_at = ? WHERE id IN (?, ?)`, tied, a.ID, b.ID); err != nil {
+		t.Fatalf("force tie: %v", err)
+	}
+
+	expected := a.ID
+	if b.ID > a.ID {
+		expected = b.ID
+	}
+	for i := 0; i < 5; i++ {
+		sess, err := store.Latest()
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if sess.ID != expected {
+			t.Fatalf("Latest() = %q, want deterministic %q (id DESC tiebreaker)", sess.ID, expected)
+		}
+	}
+}

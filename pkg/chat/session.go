@@ -169,7 +169,7 @@ func (s *SQLiteSessionStore) Create(opts models.CreateOpts) (*models.Session, er
 	_, err := s.db.Exec(`
 		INSERT INTO sessions (id, title, model, cwd, source, state, created_at, updated_at, metadata)
 		VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
-	`, id, opts.Title, opts.Model, opts.CWD, source, now.Unix(), now.Unix(), string(metaJSON))
+	`, id, opts.Title, opts.Model, opts.CWD, source, unixFrac(now), unixFrac(now), string(metaJSON))
 	if err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
@@ -257,7 +257,7 @@ func (s *SQLiteSessionStore) Save(sess *models.Session) error {
 	_, err := s.db.Exec(`
 		UPDATE sessions SET state = ?, updated_at = ?, metadata = ?
 		WHERE id = ?
-	`, string(sess.State), time.Now().Unix(), string(metaJSON), sess.ID)
+	`, string(sess.State), unixFrac(time.Now()), string(metaJSON), sess.ID)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
@@ -304,13 +304,13 @@ func (s *SQLiteSessionStore) AppendMessage(sessionID string, msg models.Message)
 	_, err = tx.Exec(`
 		INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, msg.ID, sessionID, seq, string(msg.Role), msg.Content, toolCallsJSON, toolResultJSON, msg.CreatedAt.Unix())
+	`, msg.ID, sessionID, seq, string(msg.Role), msg.Content, toolCallsJSON, toolResultJSON, unixFrac(msg.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append message: %w", err)
 	}
 
 	// Update session updated_at.
-	_, err = tx.Exec(`UPDATE sessions SET updated_at = ? WHERE id = ?`, msg.CreatedAt.Unix(), sessionID)
+	_, err = tx.Exec(`UPDATE sessions SET updated_at = ? WHERE id = ?`, unixFrac(msg.CreatedAt), sessionID)
 	if err != nil {
 		return fmt.Errorf("update session timestamp: %w", err)
 	}
@@ -414,7 +414,7 @@ func (s *SQLiteSessionStore) ListRecent(limit int) ([]models.SessionMeta, error)
 	rows, err := s.db.Query(`
 		SELECT s.id, s.title, COUNT(m.id) AS msg_count, s.created_at, s.updated_at
 		FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
-		GROUP BY s.id ORDER BY s.updated_at DESC LIMIT ?
+		GROUP BY s.id ORDER BY s.updated_at DESC, s.id DESC LIMIT ?
 	`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -510,7 +510,7 @@ func (s *SQLiteSessionStore) ExportSession(id string) (*models.SessionExport, er
 }
 
 func (s *SQLiteSessionStore) ExportAll() ([]models.SessionExport, error) {
-	rows, err := s.db.Query(`SELECT id FROM sessions ORDER BY updated_at DESC`)
+	rows, err := s.db.Query(`SELECT id FROM sessions ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list all sessions for export: %w", err)
 	}
@@ -625,7 +625,7 @@ func (s *SQLiteSessionStore) Resolve(input string) (*models.Session, error) {
 
 func (s *SQLiteSessionStore) Latest() (*models.Session, error) {
 	var id string
-	err := s.db.QueryRow(`SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1`).Scan(&id)
+	err := s.db.QueryRow(`SELECT id FROM sessions ORDER BY updated_at DESC, id DESC LIMIT 1`).Scan(&id)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -643,6 +643,10 @@ func generateSessionID(t time.Time) string {
 	b := make([]byte, 2)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%s_%s", t.Format("20060102_150405"), hex.EncodeToString(b))
+}
+
+func unixFrac(t time.Time) float64 {
+	return float64(t.UnixNano()) / 1e9
 }
 
 func nextSeqID() string {

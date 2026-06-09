@@ -133,11 +133,7 @@ func (q *UpdateQueue) submit(job updateJob) {
 	defer func() {
 		if r := recover(); r != nil {
 			q.svc.logger.Warn("update queue submit recovered panic", "err", r)
-			if key != "" {
-				q.mu.Lock()
-				delete(q.pendingSeq, key)
-				q.mu.Unlock()
-			}
+			q.clearPendingSeq(key, job.seq)
 		}
 	}()
 	select {
@@ -145,12 +141,19 @@ func (q *UpdateQueue) submit(job updateJob) {
 		return
 	case <-time.After(submitTimeout):
 		q.svc.logger.Warn("update queue submit timeout, dropping job", "timeout", submitTimeout, "type", job.typ, "session", job.sessionID)
-		if key != "" {
-			q.mu.Lock()
-			delete(q.pendingSeq, key)
-			q.mu.Unlock()
-		}
+		q.clearPendingSeq(key, job.seq)
 	}
+}
+
+func (q *UpdateQueue) clearPendingSeq(key string, seq uint64) {
+	if key == "" {
+		return
+	}
+	q.mu.Lock()
+	if q.pendingSeq[key] == seq {
+		delete(q.pendingSeq, key)
+	}
+	q.mu.Unlock()
 }
 
 type capturedFlushVersionKey struct{}

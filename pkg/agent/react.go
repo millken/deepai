@@ -827,19 +827,21 @@ func mergeToolCalls(existing, incoming []models.ToolCall) []models.ToolCall {
 	}
 
 	for _, call := range incoming {
-		if idx, ok := indexByID[call.ID]; ok {
-			if existing[idx].Name == "" {
-				existing[idx].Name = call.Name
+		if call.ID != "" {
+			if idx, ok := indexByID[call.ID]; ok {
+				if existing[idx].Name == "" {
+					existing[idx].Name = call.Name
+				}
+				if len(call.Arguments) > 0 {
+					existing[idx].Arguments = call.Arguments
+				}
+				if call.Status != "" {
+					existing[idx].Status = call.Status
+				}
+				continue
 			}
-			if len(call.Arguments) > 0 {
-				existing[idx].Arguments = call.Arguments
-			}
-			if call.Status != "" {
-				existing[idx].Status = call.Status
-			}
-			continue
+			indexByID[call.ID] = len(existing)
 		}
-		indexByID[call.ID] = len(existing)
 		existing = append(existing, call)
 	}
 
