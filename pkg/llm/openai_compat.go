@@ -352,17 +352,14 @@ func mapToolsToOpenAI(tools []models.Tool) []openai.ChatCompletionToolParam {
 func isRetryableOpenAIStreamErr(err error) bool {
 	var apierr *openai.Error
 	if errors.As(err, &apierr) {
-		return apierr.StatusCode == 429 || apierr.StatusCode >= 500
+		if apierr.StatusCode == 429 || apierr.StatusCode >= 500 {
+			return true
+		}
+		if apierr.StatusCode != 0 {
+			return false
+		}
 	}
-	// Transient network / SSE-parse errors (truncated stream, connection reset)
-	// are worth retrying once before surfacing to the caller.
-	var syntaxErr *json.SyntaxError
-	if errors.As(err, &syntaxErr) {
-		return true
-	}
-	s := err.Error()
-	return strings.Contains(s, "unexpected end of JSON input") ||
-		strings.Contains(s, "unexpected EOF")
+	return isTransientStreamError(err)
 }
 
 // isReasoningEffortError reports whether a 400 error was caused by the

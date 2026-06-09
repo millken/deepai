@@ -373,16 +373,43 @@ func toStrSlice(v any) ([]string, bool) {
 func isRetryableAnthropicStreamErr(err error) bool {
 	var apierr *anthropic.Error
 	if errors.As(err, &apierr) {
-		return apierr.StatusCode == 429 || apierr.StatusCode == 529 || apierr.StatusCode >= 500
+		if apierr.StatusCode == 429 || apierr.StatusCode == 529 || apierr.StatusCode >= 500 {
+			return true
+		}
+		if apierr.StatusCode != 0 {
+			return false
+		}
 	}
-	// Transient network / SSE-parse errors
+	return isTransientStreamError(err)
+}
+
+func isTransientStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &syntaxErr) {
 		return true
 	}
-	s := err.Error()
-	return strings.Contains(s, "unexpected end of JSON input") ||
-		strings.Contains(s, "unexpected EOF")
+	s := strings.ToLower(err.Error())
+	needles := []string{
+		"unexpected end of json input", "unexpected eof", "eof",
+		"connection reset", "connection refused", "broken pipe", "no such host",
+		"api_error", "overloaded", "internal server error", "service unavailable",
+		"bad gateway", "gateway timeout", "upstream",
+		"rate limit", "rate_limit",
+		"try again", "please retry", "retry later", "temporarily", "temporary",
+		"网络错误", "请稍后重试", "请重试", "稍后再试", "稍后重试", "服务繁忙", "系统繁忙",
+	}
+	for _, n := range needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- shared helpers ---

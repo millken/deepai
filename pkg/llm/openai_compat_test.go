@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -170,5 +171,40 @@ func TestAssembleToolCalls_MalformedArgs(t *testing.T) {
 	}
 	if bad != "bash" {
 		t.Fatalf("bad tool name = %q, want bash", bad)
+	}
+}
+
+func TestIsTransientStreamError(t *testing.T) {
+	// The exact in-band SSE error event the user hit: HTTP 200, transient
+	// "网络错误，请稍后重试" delivered as an error event. Must be retryable.
+	userErr := errors.New(`received error while streaming: {"type":"error","error":{"type":"api_error","code":"1234","message":"[1234][网络错误，错误id：202606091444139caa2f31f60240f3，请稍后重试][202606091444139caa2f31f60240f3]"},"request_id":"202606091444139caa2f31f60240f3"}`)
+	if !isTransientStreamError(userErr) {
+		t.Fatal("user's in-band network error must be classified retryable")
+	}
+
+	retryable := []error{
+		errors.New("unexpected EOF"),
+		errors.New("connection reset by peer"),
+		errors.New(`{"type":"error","error":{"type":"overloaded_error"}}`),
+		errors.New("502 Bad Gateway"),
+		errors.New("服务繁忙，请稍后重试"),
+	}
+	for _, e := range retryable {
+		if !isTransientStreamError(e) {
+			t.Errorf("expected retryable: %v", e)
+		}
+	}
+
+	notRetryable := []error{
+		errors.New("invalid_request_error: messages.0 missing"),
+		errors.New("authentication_error: invalid x-api-key"),
+		errors.New("model not found"),
+		context.Canceled,
+		context.DeadlineExceeded,
+	}
+	for _, e := range notRetryable {
+		if isTransientStreamError(e) {
+			t.Errorf("expected NOT retryable: %v", e)
+		}
 	}
 }
