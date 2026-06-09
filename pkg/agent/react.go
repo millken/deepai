@@ -727,7 +727,7 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 		}
 	}
 
-	sections = append(sections, "Tool preference: use dedicated tools over bash for file operations \xe2\x80\x94 read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools.")
+	sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. Reserve bash for building, running, testing, package managers, git, and operations no dedicated tool covers.")
 	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
 }

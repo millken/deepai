@@ -318,7 +318,7 @@ func isBinaryExt(ext string) bool {
 func GrepTool() models.Tool {
 	return models.Tool{
 		Name:        "grep",
-		Description: "Search file contents by regex pattern. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
+		Description: "Search file contents by regex pattern. Use this instead of grep/rg/ag via bash. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
 		Groups:      []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{

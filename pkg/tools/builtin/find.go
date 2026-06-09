@@ -96,7 +96,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 func FindTool() models.Tool {
 	return models.Tool{
 		Name:         "find",
-		Description:  "Recursively find files and directories. name is an optional glob (e.g. *_test.go); when omitted, every entry is listed.",
+		Description:  "Recursively find files and directories. Use this instead of the find command via bash. name is an optional glob (e.g. *_test.go); when omitted, every entry is listed.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{

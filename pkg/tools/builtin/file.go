@@ -193,7 +193,7 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 func GlobTool() models.Tool {
 	return models.Tool{
 		Name:         "glob",
-		Description:  "List files matching a glob pattern.",
+		Description:  "List files matching a glob pattern. Use this instead of ls/find globs via bash.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -211,7 +211,7 @@ func GlobTool() models.Tool {
 func ReadFileTool() models.Tool {
 	return models.Tool{
 		Name:         "read_file",
-		Description:  "Read a file. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number.",
+		Description:  "Read a file's contents. Use this instead of cat/head/tail/sed via bash. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -233,7 +233,7 @@ func ReadFileTool() models.Tool {
 func WriteFileTool() models.Tool {
 	return models.Tool{
 		Name:        "write_file",
-		Description: "Write content to a file.",
+		Description: "Write content to a file, creating parent directories as needed. Use this instead of echo>/cat>/tee via bash.",
 		Groups:      []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",
