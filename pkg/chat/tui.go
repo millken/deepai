@@ -14,6 +14,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/glamour"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/subagent"
@@ -233,7 +234,13 @@ type tuiModel struct {
 	agentActive  bool   // agent running -> show spinner/elapsed
 	askActive    bool   // currently asking a tool question
 	askHeader    string // rendered question + options shown above the input
-	aiPartial    string // trailing partial line of streamed assistant text
+	aiPartial    string // accumulated streamed assistant text (rendered on flush)
+
+	// markdown rendering
+	renderMD   bool                    // render AI output as markdown (toggle with ctrl+r)
+	lastAIRaw  string                  // raw text of the last AI message, for raw re-emit
+	mdRenderer *glamour.TermRenderer   // cached, rebuilt on width change
+	mdWidth    int
 
 	// channels to the controller
 	inputReply  chan inputResult
@@ -278,6 +285,7 @@ func newTUIModel(status BannerInfo) *tuiModel {
 		model:       status.Model,
 		interruptCh: make(chan struct{}, 1),
 		histStore:   newHistoryStore(),
+		renderMD:    true,
 	}
 }
 
@@ -423,6 +431,20 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "ctrl+r":
+		// Toggle AI output between markdown and raw. Switching to raw also
+		// re-emits the last reply verbatim so its code/markdown can be copied.
+		m.renderMD = !m.renderMD
+		mode := "raw (copyable)"
+		if m.renderMD {
+			mode = "markdown"
+		}
+		lines := []string{m.styles.Dim.Render("  ⎿ output: " + mode)}
+		if !m.renderMD && strings.TrimSpace(m.lastAIRaw) != "" {
+			lines = append(lines, m.lastAIRaw)
+		}
+		return m, commit(strings.Join(lines, "\n"))
+
 	case "enter":
 		if !m.inputVisible {
 			return m, nil
@@ -525,9 +547,15 @@ func (m *tuiModel) flushPartial() string {
 	if m.aiPartial == "" {
 		return ""
 	}
-	s := m.styles.Assistant.Render(m.aiPartial)
+	raw := m.aiPartial
 	m.aiPartial = ""
-	return s
+	m.lastAIRaw = raw
+	if m.renderMD {
+		if md := m.renderMarkdown(raw); md != "" {
+			return md
+		}
+	}
+	return m.styles.Assistant.Render(raw)
 }
 
 func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
@@ -536,13 +564,10 @@ func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
 		if evt.Text == "" {
 			return nil
 		}
+		// Accumulate the whole message; it is markdown-rendered and committed as
+		// one block at the next message boundary (tool call, turn end). The live
+		// region shows the raw stream until then.
 		m.aiPartial += evt.Text
-		// Commit all complete lines, keep the trailing partial in the live region.
-		if idx := strings.LastIndex(m.aiPartial, "\n"); idx >= 0 {
-			complete := m.aiPartial[:idx]
-			m.aiPartial = m.aiPartial[idx+1:]
-			return commit(m.styles.Assistant.Render(complete))
-		}
 		return nil
 
 	case agent.AgentEventToolCallStart:
@@ -682,9 +707,11 @@ func (m *tuiModel) renderAskHeader(question string, options []string) string {
 func (m *tuiModel) View() tea.View {
 	var b strings.Builder
 
-	// Live trailing assistant text (streamed, not yet committed).
+	// Live streamed assistant text (raw, not yet committed). Bounded to a tail
+	// so a long message doesn't blow up the live region; the full message is
+	// markdown-rendered into scrollback on completion.
 	if m.aiPartial != "" {
-		b.WriteString(m.styles.Assistant.Render(m.aiPartial))
+		b.WriteString(m.styles.Assistant.Render(tailLines(m.aiPartial, 16)))
 		b.WriteString("\n")
 	}
 
@@ -735,7 +762,11 @@ func (m *tuiModel) idleFooter() string {
 	if model == "" {
 		model = "model"
 	}
-	return m.styles.Dim.Render(fmt.Sprintf("  %s · %s · /help", model, mode))
+	out := "markdown"
+	if !m.renderMD {
+		out = "raw"
+	}
+	return m.styles.Dim.Render(fmt.Sprintf("  %s · %s · ctrl+r:%s · /help", model, mode, out))
 }
 
 // commit emits a permanent scrollback line above the live region.

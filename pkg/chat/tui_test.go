@@ -8,36 +8,54 @@ import (
 	"github.com/millken/deepai/pkg/subagent"
 )
 
-// feed sends a text chunk through the agent-event handler and returns whether a
-// commit command was produced.
-func TestStreamingBufferCommitsCompleteLines(t *testing.T) {
+// Streamed text accumulates without committing; the whole message is rendered
+// and committed at the next boundary (via flushPartial).
+func TestStreamingBuffersUntilFlush(t *testing.T) {
 	m := newTUIModel(BannerInfo{Model: "test"})
 
-	// Partial line stays buffered, no commit.
+	// Chunks accumulate; nothing is committed mid-stream, even across newlines.
 	if cmd := m.handleAgentEvent(agent.AgentEvent{Type: agent.AgentEventTextChunk, Text: "hello"}); cmd != nil {
-		t.Fatalf("expected no commit for partial line")
+		t.Fatalf("expected no commit mid-stream")
 	}
-	if m.aiPartial != "hello" {
-		t.Fatalf("aiPartial = %q, want %q", m.aiPartial, "hello")
+	if cmd := m.handleAgentEvent(agent.AgentEvent{Type: agent.AgentEventTextChunk, Text: " world\nrest"}); cmd != nil {
+		t.Fatalf("expected no commit mid-stream across newline")
 	}
-
-	// Newline commits the complete line, keeps the remainder.
-	if cmd := m.handleAgentEvent(agent.AgentEvent{Type: agent.AgentEventTextChunk, Text: " world\nrest"}); cmd == nil {
-		t.Fatalf("expected commit when a newline arrives")
-	}
-	if m.aiPartial != "rest" {
-		t.Fatalf("aiPartial = %q, want %q", m.aiPartial, "rest")
+	if m.aiPartial != "hello world\nrest" {
+		t.Fatalf("aiPartial = %q, want full accumulated text", m.aiPartial)
 	}
 
-	// flushPartial drains and clears.
+	// flushPartial drains, records the raw text for re-emit, and clears.
 	if got := m.flushPartial(); !strings.Contains(got, "rest") {
 		t.Fatalf("flushPartial = %q, want it to contain %q", got, "rest")
 	}
 	if m.aiPartial != "" {
 		t.Fatalf("aiPartial not cleared after flush: %q", m.aiPartial)
 	}
+	if m.lastAIRaw != "hello world\nrest" {
+		t.Fatalf("lastAIRaw = %q, want the raw message for raw re-emit", m.lastAIRaw)
+	}
 	if m.flushPartial() != "" {
 		t.Fatalf("flushPartial on empty buffer should return empty")
+	}
+}
+
+func TestMarkdownRenderToggle(t *testing.T) {
+	m := newTUIModel(BannerInfo{Model: "test"})
+	m.width = 80
+	if !m.renderMD {
+		t.Fatal("markdown rendering should default on")
+	}
+	// Rendered markdown decorates a heading (ANSI styling), so it differs from raw.
+	rendered := m.renderMarkdown("# Title\n\nsome **bold** text")
+	if rendered == "" {
+		t.Fatal("renderMarkdown returned empty for valid markdown")
+	}
+	// Raw mode: flushPartial must return the text verbatim (copyable).
+	m.renderMD = false
+	m.aiPartial = "# Title\n\ncode: `x := 1`"
+	got := m.flushPartial()
+	if !strings.Contains(got, "# Title") || !strings.Contains(got, "`x := 1`") {
+		t.Fatalf("raw mode should preserve markdown source, got %q", got)
 	}
 }
 
