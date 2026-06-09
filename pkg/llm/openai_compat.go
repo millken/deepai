@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,6 +65,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req ChatRequest) (<-c
 		return nil, err
 	}
 	params := p.buildParams(req)
+	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params, option.WithMaxRetries(0))
 
 	ch := make(chan StreamChunk, 128)
@@ -191,26 +193,16 @@ func (p *OpenAICompatProvider) consumeStream(
 		return false, false
 	}
 	// Finalize tool call builders.
-	for i := int64(0); int(i) < len(toolCallBuilders); i++ {
-		if b, ok := toolCallBuilders[i]; ok {
-			tc := models.ToolCall{ID: b.id, Name: b.name}
-			if strings.TrimSpace(b.args) != "" {
-				var args map[string]any
-				if err := json.Unmarshal([]byte(b.args), &args); err != nil {
-					// Arguments JSON is malformed (e.g. stream was truncated).
-					// Surface as a retryable error instead of silently dropping.
-					if retryable {
-						slog.Debug("tool call arguments JSON invalid, will retry", "tool", b.name, "err", err)
-						return true, false
-					}
-					ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", b.name, err), Done: true}
-					return false, false
-				}
-				tc.Arguments = args
-			}
-			toolCalls = append(toolCalls, tc)
+	assembled, badTool, assembleErr := assembleToolCalls(toolCallBuilders)
+	if assembleErr != nil {
+		if retryable {
+			slog.Debug("tool call arguments JSON invalid, will retry", "tool", badTool, "err", assembleErr)
+			return true, false
 		}
+		ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", badTool, assembleErr), Done: true}
+		return false, false
 	}
+	toolCalls = append(toolCalls, assembled...)
 	// If no intermediate tool call chunks were sent, include in final chunk.
 	if len(toolCalls) > 0 && !emittedToolCall {
 		ch <- StreamChunk{Model: model, ToolCalls: toolCalls}
@@ -218,6 +210,29 @@ func (p *OpenAICompatProvider) consumeStream(
 	msg := models.Message{Role: models.RoleAI, Content: contentBuf.String(), ToolCalls: toolCalls}
 	ch <- StreamChunk{Model: model, Message: &msg, ToolCalls: toolCalls, Usage: lastUsage, Stop: stopReason, Done: true}
 	return false, false
+}
+
+func assembleToolCalls(builders map[int64]*toolCallBuilder) ([]models.ToolCall, string, error) {
+	indices := make([]int64, 0, len(builders))
+	for idx := range builders {
+		indices = append(indices, idx)
+	}
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+
+	calls := make([]models.ToolCall, 0, len(indices))
+	for _, idx := range indices {
+		b := builders[idx]
+		tc := models.ToolCall{ID: b.id, Name: b.name}
+		if strings.TrimSpace(b.args) != "" {
+			var args map[string]any
+			if err := json.Unmarshal([]byte(b.args), &args); err != nil {
+				return nil, b.name, err
+			}
+			tc.Arguments = args
+		}
+		calls = append(calls, tc)
+	}
+	return calls, "", nil
 }
 
 func (p *OpenAICompatProvider) mapResponse(resp *openai.ChatCompletion, model string) ChatResponse {

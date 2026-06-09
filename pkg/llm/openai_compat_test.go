@@ -126,3 +126,49 @@ func TestNewOpenAICompatProvider_NoAPIKey(t *testing.T) {
 		t.Error("expected error for empty API key")
 	}
 }
+
+func TestAssembleToolCalls_SparseAndOutOfOrderIndices(t *testing.T) {
+	// Non-contiguous, non-zero-based indices arriving out of order. The old
+	// 0..len-1 positional loop dropped these; assembly must keep all of them,
+	// ordered by index.
+	builders := map[int64]*toolCallBuilder{
+		2: {id: "c2", name: "grep", args: `{"q":"b"}`},
+		5: {id: "c5", name: "bash", args: `{"cmd":"ls"}`},
+	}
+	calls, bad, err := assembleToolCalls(builders)
+	if err != nil {
+		t.Fatalf("unexpected error (%s): %v", bad, err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want 2 (sparse indices dropped)", len(calls))
+	}
+	if calls[0].Name != "grep" || calls[1].Name != "bash" {
+		t.Fatalf("calls not ordered by index: %s, %s", calls[0].Name, calls[1].Name)
+	}
+}
+
+func TestAssembleToolCalls_SingleNonZeroIndex(t *testing.T) {
+	builders := map[int64]*toolCallBuilder{
+		1: {id: "c1", name: "read_file", args: `{"path":"x"}`},
+	}
+	calls, _, err := assembleToolCalls(builders)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 1 || calls[0].Name != "read_file" {
+		t.Fatalf("single non-zero-index tool call lost: %+v", calls)
+	}
+}
+
+func TestAssembleToolCalls_MalformedArgs(t *testing.T) {
+	builders := map[int64]*toolCallBuilder{
+		0: {id: "c0", name: "bash", args: `{"cmd":`},
+	}
+	_, bad, err := assembleToolCalls(builders)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON args")
+	}
+	if bad != "bash" {
+		t.Fatalf("bad tool name = %q, want bash", bad)
+	}
+}
