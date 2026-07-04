@@ -13,6 +13,7 @@ import (
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/skill"
@@ -143,6 +144,16 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		slog.Debug("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
+	// Load MCP servers from <workdir>/.mcp.json and ~/.deepai/mcp.json.
+	// ctx is the session ctx — it is bound to each server's lifetime, so it
+	// must outlive the REPL; closers tear clients down at session end.
+	mcpClosers, mcpReport := mcp.Load(ctx, registry, workDir)
+	defer func() {
+		for _, closeFn := range mcpClosers {
+			closeFn()
+		}
+	}()
+
 	// Open unified SQLite database.
 	dbPath := DBFile()
 	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -219,6 +230,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		SessionRepo:         sessStore,
 		InputHistoryFile:    InputHistoryFile(),
 		SandboxBaseDir:      SandboxDir(),
+		MCPReport:           mcpReport,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

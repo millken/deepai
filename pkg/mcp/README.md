@@ -68,5 +68,39 @@ fmt.Println("result:", res.Status, res.Content)
 如需扩展
 - 可根据需要实现其它 transport（非 stdio）或在包装 `Tool` 时添加更多 `Groups`/元数据。
 
+配置驱动的批量加载（loader.go）
+
+`Discover(workdir)` 与 `Load(ctx, registry, workdir)` 从配置文件发现并连接一组 MCP server，把工具直接注册进 `*tools.Registry`。配置采用与 Claude Code / Cursor 相同的 `.mcp.json` 格式，可零摩擦复用已有配置：
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    },
+    "linear": {
+      "type": "sse",
+      "url": "https://mcp.linear.app/sse",
+      "headers": { "Authorization": "Bearer ${LINEAR_TOKEN}" }
+    },
+    "remote": { "type": "http", "url": "https://example.com/mcp" }
+  }
+}
+```
+
+发现路径（按优先级合并，后者覆盖同名 server）：
+1. `~/.deepai/mcp.json` —— 全局
+2. `<workdir>/.mcp.json` —— 项目级（与 Claude / Cursor 共用同一文件）
+
+说明：
+- `type` 省略时默认 `stdio`，支持 `stdio` / `sse` / `http`。
+- `env` 与 `headers` 中的 `${VAR}` 会用 `os.Getenv` 展开；未设置的环境变量展开为空串。
+- `Load` 接收的 ctx 必须是长期存活的 session ctx（会被绑定到各 server 子进程/监听器生命周期）；握手超时（`defaultHandshakeTimeout`，30s）由 client 内部独立控制，仅作用于 `Initialize`，不影响连接生命周期。
+- MCP server 是用户自行安装的本地/远程进程，以用户权限运行，**不进入** deepai 沙箱。
+- 单个 server 连接/握手/tools-list 失败只会记录 `slog.Warn` 并跳过，不会中断其余 server 或整个会话。
+- 配置文件不可读或 JSON 损坏：记录 `slog.Warn` 并跳过该文件，其余来源照常加载；损坏文件路径还会并入启动 report（如 `MCP: 0 loaded, config error in ~/.deepai/mcp.json`），避免"静默失效"。
+
 联系方式
 - 有问题请在仓库中打开 issue 或联系维护者。

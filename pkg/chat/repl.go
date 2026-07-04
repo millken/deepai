@@ -42,6 +42,7 @@ type ReplConfig struct {
 	SessionRepo         models.SessionRepository // injected from outside
 	InputHistoryFile    string                   // path for persisting input history (optional)
 	SandboxBaseDir      string                   // root for sandbox session dirs; must NOT be the user's workdir
+	MCPReport           string                   // one-line MCP load summary; printed after banner when non-empty
 }
 
 // memoryExtractInterval is the turn cadence for async memory extraction in CLI.
@@ -127,6 +128,9 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 
 	// Show banner.
 	r.ui.Banner(bannerInfo)
+	if r.cfg.MCPReport != "" {
+		r.ui.Info("  " + r.cfg.MCPReport)
+	}
 	r.ui.SetStatus(r.cfg.Model, r.planMode)
 
 	// Interactive loop. Ctrl+C during a turn cancels only that turn (delivered

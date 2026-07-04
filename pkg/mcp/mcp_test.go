@@ -44,6 +44,24 @@ func TestClose_NilReceiver(t *testing.T) {
 	}
 }
 
+func TestConnectStdio_HandshakeCtxDoesNotLeak(t *testing.T) {
+	// The handshake ctx is cancelled the instant initializeClient returns
+	// (via defer cancel()). If Start had been given that handshake ctx, the
+	// transport's stored ctx would already be cancelled here and Tools()
+	// would fail with ctx.Err(). A successful Tools() proves Start bound the
+	// long-lived session ctx instead of the short-lived handshake ctx.
+	ctx := context.Background()
+	client, err := ConnectStdio(ctx, "mock", "go", nil, "run", "../../cmd/mcp-example/main.go")
+	if err != nil {
+		t.Fatalf("ConnectStdio: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+	if _, err := client.Tools(ctx); err != nil {
+		t.Fatalf("Tools after connect failed — handshake ctx likely leaked into Start: %v", err)
+	}
+}
+
 func TestConnectStdio_WithExampleServer(t *testing.T) {
 	ctx := context.Background()
 

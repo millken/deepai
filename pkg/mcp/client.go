@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	mcptransport "github.com/mark3labs/mcp-go/client/transport"
@@ -55,11 +56,24 @@ func ConnectHTTP(ctx context.Context, name, baseURL string, headers map[string]s
 	return initializeClient(ctx, name, client)
 }
 
+// defaultHandshakeTimeout bounds only the MCP Initialize handshake. It must NOT
+// be applied to Start: mcp-go's transports bind the Start ctx to the subprocess
+// / listener lifetime and store it for request handling, so a timeout there
+// would kill the server and fail every later tool call. Initialize is per-call
+// (its ctx is not stored), so bounding it is safe.
+const defaultHandshakeTimeout = 30 * time.Second
+
 func initializeClient(ctx context.Context, name string, client *mcpclient.Client) (*Client, error) {
+	// Start binds ctx to the transport/subprocess lifetime — must be the
+	// long-lived session ctx, never a timeout ctx.
 	if err := client.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start mcp transport: %w", err)
 	}
-	if _, err := client.Initialize(ctx, mcpproto.InitializeRequest{
+	// The handshake is bounded independently; initCtx is per-call and not
+	// stored, so its cancellation cannot affect later tool calls.
+	initCtx, cancel := context.WithTimeout(ctx, defaultHandshakeTimeout)
+	defer cancel()
+	if _, err := client.Initialize(initCtx, mcpproto.InitializeRequest{
 		Params: mcpproto.InitializeParams{
 			ProtocolVersion: mcpproto.LATEST_PROTOCOL_VERSION,
 			ClientInfo: mcpproto.Implementation{
