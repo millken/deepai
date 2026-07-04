@@ -43,6 +43,7 @@ type ReplConfig struct {
 	InputHistoryFile    string                   // path for persisting input history (optional)
 	SandboxBaseDir      string                   // root for sandbox session dirs; must NOT be the user's workdir
 	MCPReport           string                   // one-line MCP load summary; printed after banner when non-empty
+	Commands            map[string]Command       // file-based slash commands; body injected as a user turn
 }
 
 // memoryExtractInterval is the turn cadence for async memory extraction in CLI.
@@ -176,6 +177,22 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 
 		// Handle slash commands.
 		if cmd, ok := ParseSlashCommand(line); ok {
+			// File-based command: inject its expanded body as a user turn.
+			if c, ok := r.cfg.Commands[cmd.Name]; ok {
+				r.turn++
+				body := Expand(c.Body, cmd.Args)
+				turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+					return r.runTurn(ctx, body, false)
+				})
+				if turnErr != nil {
+					if turnErr.cancelled {
+						r.ui.RenderInterrupted()
+						continue
+					}
+					r.ui.Info(fmt.Sprintf("  Error: %v", turnErr))
+				}
+				continue
+			}
 			if r.handleSlashCommand(parentCtx, cmd) {
 				break
 			}
@@ -708,7 +725,7 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 	case "exit", "quit", "q":
 		return true
 	case "help", "h":
-		r.ui.Info(slashHelpText())
+		r.ui.Info(slashHelpText(SortedCommands(r.cfg.Commands)))
 	case "clear":
 		r.clearSession()
 		r.ui.Info("  Session history cleared.")
@@ -753,7 +770,7 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.ui.Info(fmt.Sprintf("  Model changed to: %s\n  (takes effect on next turn)", r.cfg.Model))
 	default:
 		r.ui.Info(fmt.Sprintf("  Unknown command: /%s", cmd.Name))
-		r.ui.Info(slashHelpText())
+		r.ui.Info(slashHelpText(SortedCommands(r.cfg.Commands)))
 	}
 	return false
 }

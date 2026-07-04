@@ -36,10 +36,16 @@ func matchSlashCommands(prefix string) []slashCmd {
 	return out
 }
 
-func slashHelpText() string {
+func slashHelpText(custom []Command) string {
 	lines := []string{"", "  Commands:"}
 	for _, c := range slashCommands {
 		lines = append(lines, "    /"+padRight(c.Name, 10)+c.Desc)
+	}
+	if len(custom) > 0 {
+		lines = append(lines, "  Custom commands:")
+		for _, c := range custom {
+			lines = append(lines, "    /"+padRight(c.Name, 22)+c.Description)
+		}
 	}
 	lines = append(lines, "")
 	return strings.Join(lines, "\n")

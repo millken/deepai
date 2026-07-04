@@ -41,6 +41,10 @@ func (p *Plugin) SkillRoot() string { return p.Dir }
 // executor (resolveAgentTypeConfigWithPlugins), preserving discovery order.
 func (p *Plugin) AgentDir() string { return filepath.Join(p.Dir, "agents") }
 
+// CommandDir returns the plugin's commands directory (<plugin>/commands).
+// Plugin commands are registered as "plugin:cmd" to avoid collisions.
+func (p *Plugin) CommandDir() string { return filepath.Join(p.Dir, "commands") }
+
 // pluginRoots returns the discovery roots in priority order (global first,
 // project overrides).
 func pluginRoots(workdir string) []string {
@@ -113,6 +117,19 @@ func loadPlugin(dir string) (Plugin, string) {
 	}
 	return Plugin{Dir: dir, Name: m.Name, man: m}, ""
 }
+
+// LoadPlugin validates and parses a plugin directory; exported so the plugin
+// CLI can validate a clone/symlink before placing it. Returns a non-empty
+// problem string (and a zero Plugin) when the dir is missing, unreadable,
+// unparseable, or lacks a name; returns an empty Plugin AND empty problem when
+// no manifest exists (not a plugin).
+func LoadPlugin(dir string) (Plugin, string) { return loadPlugin(dir) }
+
+// Version returns the plugin's declared version (empty if unset).
+func (p *Plugin) Version() string { return p.man.Version }
+
+// Description returns the plugin's declared description (empty if unset).
+func (p *Plugin) Description() string { return p.man.Description }
 
 // mcpServerEntry mirrors the per-server object in .mcp.json / plugin.json.
 type mcpServerEntry struct {

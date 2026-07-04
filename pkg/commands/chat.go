@@ -133,10 +133,12 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// advertised agent_type list. claudeplugin owns discovery/parsing.
 	plugins, pluginProblems := claudeplugin.Discover(workDir)
 	var pluginRoots, pluginAgentDirs []string
+	var pluginCommandDirs []chat.PluginCommandDir
 	pluginServers := map[string]mcp.ServerConfig{}
 	for _, p := range plugins {
 		pluginRoots = append(pluginRoots, p.SkillRoot())
 		pluginAgentDirs = append(pluginAgentDirs, p.AgentDir())
+		pluginCommandDirs = append(pluginCommandDirs, chat.PluginCommandDir{Plugin: p.Name, Dir: p.CommandDir()})
 		servers, mcpProblem := p.MCPServers()
 		if mcpProblem != "" {
 			pluginProblems = append(pluginProblems, fmt.Sprintf("%s: %s", p.Name, mcpProblem))
@@ -146,6 +148,10 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 			pluginServers[name] = sc
 		}
 	}
+
+	// Load file-based slash commands (user + project + plugin).
+	commands, cmdProblems := chat.LoadCommands(workDir, pluginCommandDirs)
+	pluginProblems = append(pluginProblems, cmdProblems...)
 
 	// Enumerate advertised agents (project + plugin + builtin). The same
 	// pluginAgentDirs slice is handed to the executor so advertising and
@@ -277,6 +283,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		InputHistoryFile:    InputHistoryFile(),
 		SandboxBaseDir:      SandboxDir(),
 		MCPReport:           startupReport,
+		Commands:            commands,
 	}
 
 	repl, err := chat.NewRepl(replCfg)
