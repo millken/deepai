@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
@@ -35,7 +36,7 @@ func TestTaskToolCompleted(t *testing.T) {
 		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
 			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
 		},
-	})
+	}, nil)
 
 	result, err := tool.Handler(context.Background(), models.ToolCall{
 		ID:   "call-1",
@@ -63,7 +64,7 @@ func TestTaskToolFailed(t *testing.T) {
 		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
 			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusFailed, Error: "boom"}, nil
 		},
-	})
+	}, nil)
 
 	result, err := tool.Handler(context.Background(), models.ToolCall{
 		ID:        "call-2",
@@ -75,5 +76,22 @@ func TestTaskToolFailed(t *testing.T) {
 	}
 	if result.Error != "boom" {
 		t.Fatalf("error = %q, want boom", result.Error)
+	}
+}
+
+func TestTaskTool_AdvertisesAgents(t *testing.T) {
+	// No agents → description has no agent_type list.
+	bare := TaskTool(nil, nil)
+	if strings.Contains(bare.Description, "Available agent_type") {
+		t.Fatalf("bare description should not list agents: %q", bare.Description)
+	}
+	// With agents → both types appear in the description.
+	withAgents := TaskTool(nil, []AgentOption{
+		{Type: "code-reviewer", Description: "Reviews code"},
+		{Type: "devops", Description: "Deploys things"},
+	})
+	if !strings.Contains(withAgents.Description, "code-reviewer — Reviews code") ||
+		!strings.Contains(withAgents.Description, "devops — Deploys things") {
+		t.Fatalf("description should advertise agents: %q", withAgents.Description)
 	}
 }

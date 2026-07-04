@@ -5,6 +5,9 @@ build:
 	mkdir -p bin
 	go build -o ./bin/deepai ./cmd/deepai
 
+install: build
+	cp ./bin/deepai ~/.local/bin/deepai
+
 # Build the proxy server
 build-proxy:
 	mkdir -p bin

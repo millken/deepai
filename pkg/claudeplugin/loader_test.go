@@ -255,3 +255,12 @@ func TestMCPServers_NoneWhenAbsent(t *testing.T) {
 
 // ensure mcp.ServerConfig is referenced (import sanity).
 var _ mcp.ServerConfig
+
+func TestAgentDir(t *testing.T) {
+	dir := makePlugin(t, t.TempDir(), "p", `{"name":"p"}`)
+	p, _ := loadPlugin(dir)
+	want := filepath.Join(dir, "agents")
+	if got := p.AgentDir(); got != want {
+		t.Fatalf("AgentDir = %q, want %q", got, want)
+	}
+}

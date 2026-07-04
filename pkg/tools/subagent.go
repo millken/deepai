@@ -14,10 +14,22 @@ type taskPool interface {
 	Wait(ctx context.Context, taskID string) (*subagent.Task, error)
 }
 
-func TaskTool(pool taskPool) models.Tool {
+// AgentOption advertises one available agent type in the task tool description.
+// Local to pkg/tools to avoid an agent↔tools import cycle; callers convert from
+// pkg/agent.AgentInfo.
+type AgentOption struct {
+	Type        string
+	Description string
+}
+
+func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
+	desc := "Spawn a bounded subagent, stream lifecycle updates, and return its final result."
+	if extras := formatAgentOptions(agents); extras != "" {
+		desc += " " + extras
+	}
 	return models.Tool{
 		Name:        "task",
-		Description: "Spawn a bounded subagent, stream lifecycle updates, and return its final result.",
+		Description: desc,
 		Groups:      []string{"agent"},
 		InputSchema: map[string]any{
 			"type": "object",
@@ -114,4 +126,28 @@ func intFromArg(raw any) int {
 	default:
 		return 0
 	}
+}
+
+// formatAgentOptions renders the available-agent list for the task tool
+// description: "Available agent_type values: type1 — desc; type2 — desc."
+// Descriptions are capped to keep the tool description bounded.
+func formatAgentOptions(agents []AgentOption) string {
+	if len(agents) == 0 {
+		return ""
+	}
+	const maxDesc = 100
+	parts := make([]string, 0, len(agents))
+	for _, a := range agents {
+		d := strings.TrimSpace(a.Description)
+		d = strings.ReplaceAll(d, "\n", " ")
+		if len([]rune(d)) > maxDesc {
+			d = string([]rune(d)[:maxDesc-1]) + "…"
+		}
+		if d == "" {
+			parts = append(parts, a.Type)
+		} else {
+			parts = append(parts, a.Type+" — "+d)
+		}
+	}
+	return "Available agent_type values: " + strings.Join(parts, "; ") + "."
 }

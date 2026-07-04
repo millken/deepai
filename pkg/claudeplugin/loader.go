@@ -36,6 +36,11 @@ type Plugin struct {
 // so this must NOT already include /skills).
 func (p *Plugin) SkillRoot() string { return p.Dir }
 
+// AgentDir returns the plugin's agents directory (<plugin>/agents). Callers
+// collect these into the slice shared by EnumerateAgents and the subagent
+// executor (resolveAgentTypeConfigWithPlugins), preserving discovery order.
+func (p *Plugin) AgentDir() string { return filepath.Join(p.Dir, "agents") }
+
 // pluginRoots returns the discovery roots in priority order (global first,
 // project overrides).
 func pluginRoots(workdir string) []string {

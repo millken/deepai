@@ -133,15 +133,48 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig) AgentTypeConfi
 	return result
 }
 
-// resolveAgentTypeConfig is the unified agent type resolver.
-// Priority: YAML file > builtin > fallback to general.
+// resolveAgentTypeConfig is the unified agent type resolver for the main agent
+// (no plugin agents). Priority: project YAML/MD > builtin > fallback to general.
 func resolveAgentTypeConfig(t AgentType, workDir string) AgentTypeConfig {
-	if yamlCfg, err := loadAgentYAML(t, workDir); err == nil && yamlCfg != nil {
-		base := BuiltinAgentTypes[t] // may be zero-value for pure custom agents
-		return mergeConfig(base, yamlCfg)
+	return resolveAgentTypeConfigWithPlugins(t, workDir, nil)
+}
+
+// resolveAgentTypeConfigWithPlugins resolves an agent type for subagent
+// execution, including plugin-bundled agents. Priority: project YAML > project
+// MD > plugin MD (in pluginAgentDirs order, MUST be the same slice
+// EnumerateAgents uses) > builtin > general. pluginAgentDirs elements are agent
+// directories (<plugin>/agents). Per-source parse errors are skipped silently
+// (EnumerateAgents warns once at startup).
+func resolveAgentTypeConfigWithPlugins(t AgentType, workDir string, pluginAgentDirs []string) AgentTypeConfig {
+	if err := validateSafeName(string(t)); err == nil {
+		if cfg, err := loadAgentYAML(t, workDir); err == nil && cfg != nil {
+			return mergeConfig(BuiltinAgentTypes[t], cfg)
+		}
+		if cfg := loadAgentMDFile(filepath.Join(workDir, ".deepai", "agents", string(t)+".md")); cfg != nil {
+			return mergeConfig(BuiltinAgentTypes[t], cfg)
+		}
+		for _, dir := range pluginAgentDirs {
+			if cfg := loadAgentMDFile(filepath.Join(dir, string(t)+".md")); cfg != nil {
+				return mergeConfig(BuiltinAgentTypes[t], cfg)
+			}
+		}
 	}
 	if cfg, ok := BuiltinAgentTypes[t]; ok {
 		return cfg
 	}
 	return BuiltinAgentTypes[AgentTypeGeneral]
+}
+
+// loadAgentMDFile parses an agent .md if it exists; returns nil for missing or
+// unparseable (resolution is lazy and per-invocation, so errors are silent here
+// — EnumerateAgents surfaces them once at startup).
+func loadAgentMDFile(path string) *AgentTypeConfig {
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	cfg, err := ParseAgentMarkdown(path)
+	if err != nil {
+		return nil
+	}
+	return cfg
 }

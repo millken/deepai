@@ -128,18 +128,15 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Create tool registry.
 	registry := tools.NewRegistry()
-	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir, modelName, cfg.ContextWindow)
-	if cfg.IsAutonomous() {
-		slog.Info("autonomous mode enabled: ask_clarification will not block")
-	}
 
-	// Discover Claude plugins (2a: skills + mcp only). claudeplugin owns
-	// discovery/parsing; this loop is the single aggregation point.
+	// Discover Claude plugins early — the agent catalog feeds the task tool's
+	// advertised agent_type list. claudeplugin owns discovery/parsing.
 	plugins, pluginProblems := claudeplugin.Discover(workDir)
-	var pluginRoots []string
+	var pluginRoots, pluginAgentDirs []string
 	pluginServers := map[string]mcp.ServerConfig{}
 	for _, p := range plugins {
 		pluginRoots = append(pluginRoots, p.SkillRoot())
+		pluginAgentDirs = append(pluginAgentDirs, p.AgentDir())
 		servers, mcpProblem := p.MCPServers()
 		if mcpProblem != "" {
 			pluginProblems = append(pluginProblems, fmt.Sprintf("%s: %s", p.Name, mcpProblem))
@@ -148,6 +145,19 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		for name, sc := range servers {
 			pluginServers[name] = sc
 		}
+	}
+
+	// Enumerate advertised agents (project + plugin + builtin). The same
+	// pluginAgentDirs slice is handed to the executor so advertising and
+	// execution agree on each type's source.
+	agentCatalog := agent.EnumerateAgents(workDir, pluginAgentDirs)
+	agentOpts := make([]tools.AgentOption, 0, len(agentCatalog))
+	for _, a := range agentCatalog {
+		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})
+	}
+	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir, modelName, cfg.ContextWindow, pluginAgentDirs, agentOpts)
+	if cfg.IsAutonomous() {
+		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
 
 	// Load skills (plugin roots included; LoadAllReported appends /skills itself).
@@ -277,14 +287,18 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir, model string, contextWindow int) {
+func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir, model string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
 
-	// Subagent tools.
-	subExecutor := agent.NewSubagentExecutor(provider, registry, nil, model).WithWorkDir(workDir).WithContextWindow(contextWindow)
+	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
+	// advertised agents resolve to the same source at execution time.
+	subExecutor := agent.NewSubagentExecutor(provider, registry, nil, model).
+		WithWorkDir(workDir).
+		WithContextWindow(contextWindow).
+		WithPluginAgentDirs(pluginAgentDirs)
 	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
-	mustRegisterTool(registry, tools.TaskTool(subPool))
+	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(provider))
 
 	for _, tool := range builtin.FileTools() {

@@ -17,12 +17,13 @@ import (
 var subagentMessageSeq uint64
 
 type SubagentExecutor struct {
-	llm           llm.LLMProvider
-	tools         *tools.Registry
-	sandbox       *sandbox.Sandbox
-	model         string
-	contextWindow int
-	workDir       string
+	llm             llm.LLMProvider
+	tools           *tools.Registry
+	sandbox         *sandbox.Sandbox
+	model           string
+	contextWindow   int
+	workDir         string
+	pluginAgentDirs []string
 }
 
 func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, model ...string) *SubagentExecutor {
@@ -57,17 +58,28 @@ func (e *SubagentExecutor) WithContextWindow(n int) *SubagentExecutor {
 	return e
 }
 
+// WithPluginAgentDirs sets the plugin agent directories (<plugin>/agents) used
+// to resolve plugin-bundled agents. The slice must be the claudeplugin.Discover
+// result order — the same slice EnumerateAgents consumes — so advertising and
+// execution agree on which source backs a given agent type.
+func (e *SubagentExecutor) WithPluginAgentDirs(dirs []string) *SubagentExecutor {
+	if e != nil {
+		e.pluginAgentDirs = dirs
+	}
+	return e
+}
+
 func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
 	if e == nil || e.llm == nil {
 		return subagent.ExecutionResult{}, fmt.Errorf("subagent llm provider is required")
 	}
 
-	// Resolve agent type config: YAML > builtin > fallback general
+	// Resolve agent type config: project YAML/MD > plugin MD > builtin > general
 	agentType := AgentType(task.Config.EffectiveAgentType())
 	if agentType == "" {
 		agentType = AgentTypeGeneral
 	}
-	profileCfg := resolveAgentTypeConfig(agentType, e.workDir)
+	profileCfg := resolveAgentTypeConfigWithPlugins(agentType, e.workDir, e.pluginAgentDirs)
 
 	// Determine tools: explicit Tools > AgentType DefaultTools > all
 	var toolSelectors []string
