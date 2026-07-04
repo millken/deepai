@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
-	"github.com/millken/deepai/pkg/tools"
 )
 
 const maxViewImageBytes = 8 << 20
@@ -22,7 +21,7 @@ func ViewImageHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("image_path is required")
 	}
 
-	resolved := tools.ResolveVirtualPath(ctx, path)
+	resolved := resolveReadablePath(ctx, path)
 	if resolved == path && strings.HasPrefix(path, "/mnt/user-data/") {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("thread context is required for virtual image paths")
 	}

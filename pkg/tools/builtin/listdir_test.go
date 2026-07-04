@@ -132,6 +132,29 @@ func TestListDirHandler_EmptyDir(t *testing.T) {
 	}
 }
 
+func TestListDirHandler_ExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	result, err := ListDirHandler(context.Background(), models.ToolCall{
+		ID:     "ls-home",
+		Name:   "list_dir",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"path": "~",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "a.txt") {
+		t.Fatalf("missing a.txt in home dir listing: %s", result.Content)
+	}
+}
+
 func mustStatMode(t *testing.T, path string) string {
 	t.Helper()
 	info, err := os.Stat(path)

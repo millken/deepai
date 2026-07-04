@@ -77,3 +77,28 @@ func TestViewImageHandlerRejectsUnsupportedExtension(t *testing.T) {
 		t.Fatal("expected error for unsupported extension")
 	}
 }
+
+func TestViewImageHandler_ExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "pixel.png")
+	image := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(target, image, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	result, err := ViewImageHandler(context.Background(), models.ToolCall{
+		ID:   "call-view-image-home",
+		Name: "view_image",
+		Arguments: map[string]any{
+			"image_path": "~/pixel.png",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ViewImageHandler() error = %v", err)
+	}
+	images, _ := result.Data["viewed_images"].([]map[string]any)
+	if len(images) != 1 {
+		t.Fatalf("viewed_images=%v", result.Data["viewed_images"])
+	}
+}

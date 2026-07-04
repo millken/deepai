@@ -273,11 +273,27 @@ func FileTools() []models.Tool {
 }
 
 func resolveReadablePath(ctx context.Context, path string) string {
-	return tools.ResolveVirtualPath(ctx, path)
+	return expandHomePath(tools.ResolveVirtualPath(ctx, path))
 }
 
 func resolveWritablePath(ctx context.Context, path string) string {
-	return tools.ResolveVirtualPath(ctx, path)
+	return expandHomePath(tools.ResolveVirtualPath(ctx, path))
+}
+
+func expandHomePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return home
+		}
+		return path
+	}
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
 }
 
 func displayVirtualPath(ctx context.Context, path string) string {

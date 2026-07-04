@@ -349,3 +349,39 @@ func TestResolveWritablePath_MatchesReadableForVirtualPaths(t *testing.T) {
 		t.Fatalf("acp-workspace write not resolved: %q", got)
 	}
 }
+
+func TestResolvePaths_ExpandHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	if got := resolveReadablePath(ctx, "~"); got != home {
+		t.Fatalf("resolveReadablePath(~) = %q, want %q", got, home)
+	}
+	if got := resolveWritablePath(ctx, "~/notes.txt"); got != filepath.Join(home, "notes.txt") {
+		t.Fatalf("resolveWritablePath(~/notes.txt) = %q", got)
+	}
+}
+
+func TestReadFileHandler_ExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "sample.txt")
+	if err := os.WriteFile(target, []byte("from-home"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	result, err := ReadFileHandler(context.Background(), models.ToolCall{
+		ID:   "call-home-read",
+		Name: "read_file",
+		Arguments: map[string]any{
+			"path": "~/sample.txt",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReadFileHandler() error = %v", err)
+	}
+	if result.Content != "from-home" {
+		t.Fatalf("content=%q want from-home", result.Content)
+	}
+}
