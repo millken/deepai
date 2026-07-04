@@ -7,4 +7,5 @@ func AddCommands(topLevel *cobra.Command) {
 	addSetup(topLevel)
 	addSession(topLevel)
 	addVersion(topLevel)
+	addPlugin(topLevel)
 }
