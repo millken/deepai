@@ -3,10 +3,12 @@ package chat
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // mockLLMProvider implements llm.LLMProvider for testing.
@@ -311,5 +313,57 @@ func TestIsSessionInterrupted_TrailingToolResult(t *testing.T) {
 	}
 	if isSessionInterrupted(done) {
 		t.Fatal("isSessionInterrupted = true, want false for completed turn")
+	}
+}
+
+func TestStatusText_ShowsLoadedAndUsage(t *testing.T) {
+	reg := tools.NewRegistry()
+	h := func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusCompleted}, nil
+	}
+	if err := reg.Register(models.Tool{Name: "bash", Description: "run shell", Handler: h}); err != nil {
+		t.Fatalf("register bash: %v", err)
+	}
+	if err := reg.Register(models.Tool{
+		Name:        "zig-mcp.build",
+		Description: "build zig",
+		Groups:      []string{"mcp", "zig-mcp"},
+		Handler:     h,
+	}); err != nil {
+		t.Fatalf("register mcp tool: %v", err)
+	}
+
+	r := &ChatRepl{
+		cfg: ReplConfig{
+			Model:        "test-model",
+			ToolRegistry: reg,
+			MCPReport:    "MCP: 1 loaded (zig-mcp)",
+			Commands: map[string]Command{
+				"zig-mcp:build": {Name: "zig-mcp:build", Source: "plugin"},
+				"review":        {Name: "review", Source: "user"},
+			},
+		},
+		sess: &models.Session{
+			ID: "s1",
+			Messages: []models.Message{
+				{Role: models.RoleTool, ToolResult: &models.ToolResult{ToolName: "zig-mcp.build", Status: models.CallStatusCompleted}},
+				{Role: models.RoleTool, ToolResult: &models.ToolResult{ToolName: "zig-mcp.build", Status: models.CallStatusFailed, Error: "boom"}},
+				{Role: models.RoleTool, ToolResult: &models.ToolResult{ToolName: "bash", Status: models.CallStatusCompleted}},
+			},
+		},
+	}
+
+	text := r.statusText()
+	checks := []string{
+		"Loaded tools: 2",
+		"MCP servers: zig-mcp(1)",
+		"Plugin commands: 1 (zig-mcp:build)",
+		"Tool calls this session: 3 total, 1 failed",
+		"zig-mcp.build: 2 (failed 1)",
+	}
+	for _, c := range checks {
+		if !strings.Contains(text, c) {
+			t.Fatalf("status text missing %q:\n%s", c, text)
+		}
 	}
 }

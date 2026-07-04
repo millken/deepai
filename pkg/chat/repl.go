@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -768,6 +769,8 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.cfg.Model = cmd.Args
 		r.ui.SetStatus(r.cfg.Model, r.planMode)
 		r.ui.Info(fmt.Sprintf("  Model changed to: %s\n  (takes effect on next turn)", r.cfg.Model))
+	case "status", "st":
+		r.ui.Info(r.statusText())
 	default:
 		r.ui.Info(fmt.Sprintf("  Unknown command: /%s", cmd.Name))
 		r.ui.Info(slashHelpText(SortedCommands(r.cfg.Commands)))
@@ -862,6 +865,154 @@ func (r *ChatRepl) sessionListText() string {
 	}
 	sb.WriteString("  Use 'deepai -r <ID>' to resume a session.")
 	return sb.String()
+}
+
+func (r *ChatRepl) statusText() string {
+	var sb strings.Builder
+	sessionID := ""
+	if r.sess != nil {
+		sessionID = r.sess.ID
+	}
+	tools := []models.Tool(nil)
+	if r.cfg.ToolRegistry != nil {
+		tools = r.cfg.ToolRegistry.List()
+	}
+
+	mcpTools := 0
+	mcpServers := map[string]int{}
+	for _, t := range tools {
+		if !toolHasGroup(t, "mcp") {
+			continue
+		}
+		mcpTools++
+		server := mcpServerFromTool(t)
+		if server == "" {
+			server = "(unknown)"
+		}
+		mcpServers[server]++
+	}
+
+	pluginCmds := make([]string, 0)
+	for _, c := range r.cfg.Commands {
+		if c.Source == "plugin" {
+			pluginCmds = append(pluginCmds, c.Name)
+		}
+	}
+	sort.Strings(pluginCmds)
+
+	type usage struct {
+		count  int
+		failed int
+	}
+	usageByTool := map[string]usage{}
+	totalCalls := 0
+	failedCalls := 0
+	var messages []models.Message
+	if r.sess != nil {
+		messages = r.sess.Messages
+	}
+	for _, m := range messages {
+		if m.Role != models.RoleTool || m.ToolResult == nil {
+			continue
+		}
+		name := strings.TrimSpace(m.ToolResult.ToolName)
+		if name == "" {
+			continue
+		}
+		u := usageByTool[name]
+		u.count++
+		totalCalls++
+		if m.ToolResult.Status == models.CallStatusFailed {
+			u.failed++
+			failedCalls++
+		}
+		usageByTool[name] = u
+	}
+
+	type kv struct {
+		name string
+		cnt  int
+		fail int
+	}
+	toolUsage := make([]kv, 0, len(usageByTool))
+	for name, u := range usageByTool {
+		toolUsage = append(toolUsage, kv{name: name, cnt: u.count, fail: u.failed})
+	}
+	sort.Slice(toolUsage, func(i, j int) bool {
+		if toolUsage[i].cnt != toolUsage[j].cnt {
+			return toolUsage[i].cnt > toolUsage[j].cnt
+		}
+		return toolUsage[i].name < toolUsage[j].name
+	})
+
+	fmt.Fprintf(&sb, "  Runtime status:\n")
+	fmt.Fprintf(&sb, "  Model: %s\n", r.cfg.Model)
+	fmt.Fprintf(&sb, "  Session: %s\n", sessionID)
+	fmt.Fprintf(&sb, "  Loaded tools: %d (builtin/custom: %d, mcp: %d)\n", len(tools), len(tools)-mcpTools, mcpTools)
+
+	if len(mcpServers) == 0 {
+		sb.WriteString("  MCP servers: none\n")
+	} else {
+		names := make([]string, 0, len(mcpServers))
+		for name := range mcpServers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		parts := make([]string, 0, len(names))
+		for _, name := range names {
+			parts = append(parts, fmt.Sprintf("%s(%d)", name, mcpServers[name]))
+		}
+		fmt.Fprintf(&sb, "  MCP servers: %s\n", strings.Join(parts, ", "))
+	}
+
+	if len(pluginCmds) == 0 {
+		sb.WriteString("  Plugin commands: none\n")
+	} else {
+		fmt.Fprintf(&sb, "  Plugin commands: %d (%s)\n", len(pluginCmds), strings.Join(pluginCmds, ", "))
+	}
+
+	if strings.TrimSpace(r.cfg.MCPReport) != "" {
+		fmt.Fprintf(&sb, "  Startup report: %s\n", r.cfg.MCPReport)
+	}
+
+	fmt.Fprintf(&sb, "  Tool calls this session: %d total, %d failed\n", totalCalls, failedCalls)
+	if len(toolUsage) > 0 {
+		sb.WriteString("  Most used tools:\n")
+		maxItems := 8
+		if len(toolUsage) < maxItems {
+			maxItems = len(toolUsage)
+		}
+		for i := 0; i < maxItems; i++ {
+			line := fmt.Sprintf("    - %s: %d", toolUsage[i].name, toolUsage[i].cnt)
+			if toolUsage[i].fail > 0 {
+				line += fmt.Sprintf(" (failed %d)", toolUsage[i].fail)
+			}
+			sb.WriteString(line + "\n")
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func toolHasGroup(t models.Tool, group string) bool {
+	for _, g := range t.Groups {
+		if g == group {
+			return true
+		}
+	}
+	return false
+}
+
+func mcpServerFromTool(t models.Tool) string {
+	for _, g := range t.Groups {
+		if g != "" && g != "mcp" {
+			return g
+		}
+	}
+	if idx := strings.Index(t.Name, "."); idx > 0 {
+		return t.Name[:idx]
+	}
+	return ""
 }
 
 // evaluateFactFeedback classifies the user message for feedback purposes,
