@@ -273,6 +273,44 @@ func TestRenderToolDiff(t *testing.T) {
 	}
 }
 
+func TestLineDiffFallbackOnLargeInput(t *testing.T) {
+	// Small identical input → LCS keeps everything as context, no -/+ ops.
+	ops := lineDiff([]string{"a", "b"}, []string{"a", "b"})
+	for _, op := range ops {
+		if op.kind != ' ' {
+			t.Fatalf("small identical diff should be all context, got %c", op.kind)
+		}
+	}
+
+	// Input exceeding the LCS cell ceiling falls back to remove-all/add-all,
+	// so a huge edit can't spike memory or freeze the render loop.
+	n := 1001 // n*n = 1,002,001 > maxLCSCells (1,000,000)
+	oldLines := make([]string, n)
+	newLines := make([]string, n)
+	for i := range oldLines {
+		oldLines[i] = "same" // identical → LCS would mark all context
+		newLines[i] = "same"
+	}
+	ops = lineDiff(oldLines, newLines)
+	if len(ops) != 2*n {
+		t.Fatalf("fallback op count = %d, want %d", len(ops), 2*n)
+	}
+	ctx, del, add := 0, 0, 0
+	for _, op := range ops {
+		switch op.kind {
+		case ' ':
+			ctx++
+		case '-':
+			del++
+		case '+':
+			add++
+		}
+	}
+	if ctx != 0 || del != n || add != n {
+		t.Fatalf("fallback should be all -/+, got ctx=%d del=%d add=%d", ctx, del, add)
+	}
+}
+
 func TestContextGauge(t *testing.T) {
 	m := newTUIModel(BannerInfo{})
 	if g := m.contextGauge(); g != "" {

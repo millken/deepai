@@ -148,7 +148,13 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("mkdir failed: %w", err)
 	}
 	perm := filePerm(path, 0644)
+	// start_line is the 1-based file line where the written content begins.
+	// Overwrite starts at line 1; append starts after the file's existing lines.
+	startLine := 1
 	if appendMode {
+		if existing, rerr := os.ReadFile(path); rerr == nil {
+			startLine = 1 + strings.Count(string(existing), "\n")
+		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, perm)
 		if err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("open failed: %w", err)
@@ -165,7 +171,7 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		CallID:   call.ID,
 		ToolName: call.Name,
 		Content:  fmt.Sprintf("Written %d bytes to %s", len(content), displayPath),
-		Data:     map[string]any{"start_line": 1},
+		Data:     map[string]any{"start_line": startLine},
 	}, nil
 }
 

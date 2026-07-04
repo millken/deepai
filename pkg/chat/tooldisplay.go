@@ -61,11 +61,19 @@ func diffSplit(s string) []string {
 	return strings.Split(strings.TrimRight(s, "\n"), "\n")
 }
 
+// maxLCSCells bounds the LCS matrix size (n*m). Beyond it, lineDiff falls back
+// to a plain remove-all-then-add-all diff so a pathological large edit can't
+// spike memory or freeze the Bubble Tea render goroutine. 1M cells ≈ 8 MB.
+const maxLCSCells = 1_000_000
+
 // lineDiff computes a line-level diff between old and new via LCS, so lines the
 // model included only for context appear as unchanged rows rather than being
 // duplicated as a remove + add pair.
 func lineDiff(oldLines, newLines []string) []diffOp {
 	n, mm := len(oldLines), len(newLines)
+	if n > 0 && mm > 0 && n*mm > maxLCSCells {
+		return fallbackDiff(oldLines, newLines)
+	}
 	// dp[i][j] = LCS length of oldLines[i:] and newLines[j:].
 	dp := make([][]int, n+1)
 	for i := range dp {
@@ -102,6 +110,19 @@ func lineDiff(oldLines, newLines []string) []diffOp {
 	}
 	for ; j < mm; j++ {
 		ops = append(ops, diffOp{'+', newLines[j]})
+	}
+	return ops
+}
+
+// fallbackDiff is the pre-LCS behavior: all old lines as removed, then all new
+// lines as added. Used when the LCS matrix would exceed maxLCSCells.
+func fallbackDiff(oldLines, newLines []string) []diffOp {
+	ops := make([]diffOp, 0, len(oldLines)+len(newLines))
+	for _, l := range oldLines {
+		ops = append(ops, diffOp{'-', l})
+	}
+	for _, l := range newLines {
+		ops = append(ops, diffOp{'+', l})
 	}
 	return ops
 }

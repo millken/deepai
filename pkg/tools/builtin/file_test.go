@@ -206,6 +206,71 @@ func TestWriteFileHandlerAppendsContent(t *testing.T) {
 	}
 }
 
+func TestWriteFileHandlerAppendStartLine(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEEPAI_DATA_ROOT", root)
+	threadID := "thread-append-line"
+	ctx := tools.WithThreadID(context.Background(), threadID)
+
+	// Seed a 3-line file (trailing newline → 3 complete lines).
+	if _, err := WriteFileHandler(ctx, models.ToolCall{
+		ID:   "call-seed",
+		Name: "write_file",
+		Arguments: map[string]any{
+			"path":    "/mnt/user-data/uploads/lines.txt",
+			"content": "l1\nl2\nl3\n",
+		},
+	}); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	// Overwrite reports start_line 1.
+	over, err := WriteFileHandler(ctx, models.ToolCall{
+		ID:   "call-over",
+		Name: "write_file",
+		Arguments: map[string]any{
+			"path":    "/mnt/user-data/uploads/over.txt",
+			"content": "x\n",
+		},
+	})
+	if err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if got := dataLine(over); got != 1 {
+		t.Fatalf("overwrite start_line = %v, want 1", got)
+	}
+
+	// Append to the 3-line file → appended content begins at line 4.
+	app, err := WriteFileHandler(ctx, models.ToolCall{
+		ID:   "call-app",
+		Name: "write_file",
+		Arguments: map[string]any{
+			"path":    "/mnt/user-data/uploads/lines.txt",
+			"content": "l4\n",
+			"append":  true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if got := dataLine(app); got != 4 {
+		t.Fatalf("append start_line = %v, want 4", got)
+	}
+}
+
+// dataLine extracts the "start_line" int from a ToolResult's Data side channel.
+func dataLine(r models.ToolResult) int {
+	switch v := r.Data["start_line"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
 func TestGlobHandlerResolvesVirtualPattern(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("DEEPAI_DATA_ROOT", root)
