@@ -487,3 +487,32 @@ func namesOf(skills []*Skill) []string {
 	}
 	return names
 }
+
+func TestLoadAllReported_ReadDirFailureWarns(t *testing.T) {
+	// <pluginRoot>/skills is a file (not a dir) → ReadDir fails → warning.
+	pluginRoot := t.TempDir()
+	skillsPath := filepath.Join(pluginRoot, "skills")
+	if err := os.WriteFile(skillsPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry()
+	warnings := reg.LoadAllReported("", []string{pluginRoot})
+	if len(warnings) != 1 {
+		t.Fatalf("want 1 warning, got %+v", warnings)
+	}
+	w := warnings[0]
+	if w.Source != "plugin" {
+		t.Fatalf("source = %q, want plugin", w.Source)
+	}
+	if w.Dir != skillsPath {
+		t.Fatalf("dir = %q, want %q", w.Dir, skillsPath)
+	}
+}
+
+func TestLoadAllReported_MissingDirSilent(t *testing.T) {
+	reg := NewRegistry()
+	warnings := reg.LoadAllReported("", []string{"/nonexistent/deepai-plugin"})
+	if len(warnings) != 0 {
+		t.Fatalf("missing dir should produce no warning, got %+v", warnings)
+	}
+}

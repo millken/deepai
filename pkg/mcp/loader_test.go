@@ -184,3 +184,53 @@ func TestLoad_CorruptConfigSurfacesReport(t *testing.T) {
 		t.Fatalf("report should mention config error: %q", report)
 	}
 }
+
+func TestExpandServerConfig_EnvExpansion(t *testing.T) {
+	t.Setenv("MCP_TOK", "sekrit")
+	sc := expandServerConfig(ServerConfig{
+		Command: "x",
+		Args:    []string{"${MCP_TOK}"},
+		Env:     map[string]string{"K": "${MCP_TOK}"},
+		URL:     "https://${MCP_TOK}.example.com",
+		Headers: map[string]string{"H": "${MCP_TOK}"},
+	})
+	if sc.Args[0] != "sekrit" {
+		t.Fatalf("args: %v", sc.Args)
+	}
+	if sc.Env["K"] != "sekrit" {
+		t.Fatalf("env: %+v", sc.Env)
+	}
+	if sc.URL != "https://sekrit.example.com" {
+		t.Fatalf("url: %q", sc.URL)
+	}
+	if sc.Headers["H"] != "sekrit" {
+		t.Fatalf("headers: %+v", sc.Headers)
+	}
+}
+
+func TestLoadWithServers_ConnectsExtra(t *testing.T) {
+	// Disk config is empty (isolated HOME, no project .mcp.json); the extra
+	// (plugin-style) server must still connect and register its tools.
+	t.Setenv("HOME", t.TempDir())
+	proj := t.TempDir()
+	reg := tools.NewRegistry()
+	extra := map[string]ServerConfig{
+		"mock": {Command: "go", Args: []string{"run", "../../cmd/mcp-example/main.go"}},
+	}
+	closers, report := LoadWithServers(context.Background(), reg, proj, extra)
+	defer func() {
+		for _, c := range closers {
+			c()
+		}
+	}()
+	if !strings.Contains(report, "1 loaded") {
+		t.Fatalf("report should show 1 loaded: %q", report)
+	}
+	if reg.Get("mock.test-tool") == nil {
+		var names []string
+		for _, tl := range reg.List() {
+			names = append(names, tl.Name)
+		}
+		t.Fatalf("mock.test-tool not registered; have %v", names)
+	}
+}

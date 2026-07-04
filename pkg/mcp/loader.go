@@ -124,8 +124,32 @@ func Load(ctx context.Context, registry *tools.Registry, workdir string) (closer
 	if len(servers) == 0 && len(badFiles) == 0 {
 		return nil, ""
 	}
+	closers, loaded, failed := loadServers(ctx, registry, servers)
+	return closers, buildReport(loaded, failed, badFiles)
+}
 
-	var loaded, failed []string
+// LoadWithServers is like Load but additionally connects a caller-supplied set
+// of servers (e.g. bundled in discovered plugins), merged on top of the on-disk
+// config (same-named extra server overrides disk). extra values get the same
+// ${VAR} expansion as disk config. This is the integration seam for plugins;
+// the plugin loader expands ${CLAUDE_PLUGIN_ROOT} before calling.
+func LoadWithServers(ctx context.Context, registry *tools.Registry, workdir string, extra map[string]ServerConfig) (closers []func(), report string) {
+	servers, badFiles := Discover(workdir)
+	for name, sc := range extra {
+		servers[name] = expandServerConfig(sc)
+	}
+	if len(servers) == 0 && len(badFiles) == 0 {
+		return nil, ""
+	}
+	closers, loaded, failed := loadServers(ctx, registry, servers)
+	return closers, buildReport(loaded, failed, badFiles)
+}
+
+// loadServers connects each server, lists its tools, and registers them. It is
+// the shared connect loop used by both Load and LoadWithServers. Per-server
+// failures are collected into failed (not returned as an error); the caller
+// folds them into the report.
+func loadServers(ctx context.Context, registry *tools.Registry, servers map[string]ServerConfig) (closers []func(), loaded, failed []string) {
 	for name, sc := range servers {
 		c, connectErr := connectServer(ctx, name, sc)
 		if connectErr != nil {
@@ -154,8 +178,19 @@ func Load(ctx context.Context, registry *tools.Registry, workdir string) (closer
 		}
 		loaded = append(loaded, name)
 	}
+	return closers, loaded, failed
+}
 
-	return closers, buildReport(loaded, failed, badFiles)
+// expandServerConfig applies ${VAR} env expansion to every string field. Disk
+// configs are expanded at parse time (loadConfigFile); programmatic configs
+// supplied via LoadWithServers are expanded here so they behave identically.
+func expandServerConfig(sc ServerConfig) ServerConfig {
+	sc.Command = expandVars(sc.Command)
+	sc.URL = expandVars(sc.URL)
+	sc.Args = expandSlice(sc.Args)
+	sc.Env = expandMap(sc.Env)
+	sc.Headers = expandMap(sc.Headers)
+	return sc
 }
 
 func connectServer(ctx context.Context, name string, sc ServerConfig) (*Client, error) {

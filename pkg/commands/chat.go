@@ -12,6 +12,7 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
+	"github.com/millken/deepai/pkg/claudeplugin"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
@@ -132,10 +133,29 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
 
-	// Load skills.
+	// Discover Claude plugins (2a: skills + mcp only). claudeplugin owns
+	// discovery/parsing; this loop is the single aggregation point.
+	plugins, pluginProblems := claudeplugin.Discover(workDir)
+	var pluginRoots []string
+	pluginServers := map[string]mcp.ServerConfig{}
+	for _, p := range plugins {
+		pluginRoots = append(pluginRoots, p.SkillRoot())
+		servers, mcpProblem := p.MCPServers()
+		if mcpProblem != "" {
+			pluginProblems = append(pluginProblems, fmt.Sprintf("%s: %s", p.Name, mcpProblem))
+			continue
+		}
+		for name, sc := range servers {
+			pluginServers[name] = sc
+		}
+	}
+
+	// Load skills (plugin roots included; LoadAllReported appends /skills itself).
+	// Warnings are surfaced below for plugin-source dirs.
 	skillReg := skill.NewRegistry()
-	if err := skillReg.LoadAll(workDir, nil); err != nil {
-		slog.Warn("skill load failed", "err", err)
+	skillWarnings := skillReg.LoadAllReported(workDir, pluginRoots)
+	for _, w := range skillWarnings {
+		slog.Warn("skill load issue", "source", w.Source, "dir", w.Dir, "err", w.Msg)
 	}
 	if skillReg.Count() > 0 {
 		if err := registry.Register(skill.SkillToolWithRegistry(skillReg)); err != nil {
@@ -144,15 +164,31 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		slog.Debug("loaded skills", "count", skillReg.Count(), "names", strings.Join(skillReg.AvailableNames(), ", "))
 	}
 
-	// Load MCP servers from <workdir>/.mcp.json and ~/.deepai/mcp.json.
-	// ctx is the session ctx — it is bound to each server's lifetime, so it
-	// must outlive the REPL; closers tear clients down at session end.
-	mcpClosers, mcpReport := mcp.Load(ctx, registry, workDir)
+	// Load MCP servers: disk config (<workdir>/.mcp.json, ~/.deepai/mcp.json)
+	// plus plugin-bundled servers, merged. ctx is the session ctx — it is bound
+	// to each server's lifetime, so it must outlive the REPL; closers tear
+	// clients down at session end.
+	mcpClosers, mcpReport := mcp.LoadWithServers(ctx, registry, workDir, pluginServers)
 	defer func() {
 		for _, closeFn := range mcpClosers {
 			closeFn()
 		}
 	}()
+
+	// Combine the startup report: plugin/skill problems first, then MCP summary.
+	var reportParts []string
+	for _, pp := range pluginProblems {
+		reportParts = append(reportParts, "plugin "+pp)
+	}
+	for _, w := range skillWarnings {
+		if w.Source == "plugin" {
+			reportParts = append(reportParts, "plugin skill "+w.Dir+": "+w.Msg)
+		}
+	}
+	if mcpReport != "" {
+		reportParts = append(reportParts, mcpReport)
+	}
+	startupReport := strings.Join(reportParts, ", ")
 
 	// Open unified SQLite database.
 	dbPath := DBFile()
@@ -230,7 +266,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		SessionRepo:         sessStore,
 		InputHistoryFile:    InputHistoryFile(),
 		SandboxBaseDir:      SandboxDir(),
-		MCPReport:           mcpReport,
+		MCPReport:           startupReport,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

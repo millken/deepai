@@ -2,6 +2,7 @@ package skill
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -104,38 +105,55 @@ func (r *Registry) maybeRefreshDescriptions() {
 
 // LoadAll loads skills from all standard locations.
 // Priority (highest wins): plugin > project > global.
-// Non-existent directories are silently skipped.
+// Non-existent directories are silently skipped; load errors (read/parse) are
+// logged via slog. For access to the warnings (e.g. to surface plugin-skill
+// failures in the UI), use LoadAllReported.
 func (r *Registry) LoadAll(projectDir string, pluginDirs []string) error {
-	// Global: ~/.deepai/skills/
-	home, err := os.UserHomeDir()
-	if err == nil {
-		r.loadDirSilent(filepath.Join(home, ".deepai", "skills"), "global")
+	for _, w := range r.LoadAllReported(projectDir, pluginDirs) {
+		slog.Warn("skill load issue", "source", w.Source, "dir", w.Dir, "err", w.Msg)
 	}
-
-	// Project: <projectDir>/.deepai/skills/
-	if projectDir != "" {
-		r.loadDirSilent(filepath.Join(projectDir, ".deepai", "skills"), "project")
-	}
-
-	// Plugin: <pluginDir>/skills/
-	for _, pDir := range pluginDirs {
-		r.loadDirSilent(filepath.Join(pDir, "skills"), "plugin")
-	}
-
 	return nil
 }
 
-// loadDirSilent loads from dir with source tag, ignoring non-existent dirs.
-// Skills loaded from this dir are tagged with the given source.
-func (r *Registry) loadDirSilent(dir string, source string) {
+// SkillWarning describes a skill load failure at a directory.
+type SkillWarning struct {
+	Source string // "global" | "project" | "plugin"
+	Dir    string
+	Msg    string
+}
+
+// LoadAllReported is like LoadAll but returns per-directory load warnings
+// instead of logging them, so the caller can surface them (e.g. plugin-source
+// warnings in the startup report). Missing directories are NOT warnings
+// (legitimate); ReadDir/LoadFromDir failures are.
+func (r *Registry) LoadAllReported(projectDir string, pluginDirs []string) []SkillWarning {
+	var warnings []SkillWarning
+	// Global: ~/.deepai/skills/
+	if home, err := os.UserHomeDir(); err == nil {
+		warnings = append(warnings, r.loadDirReported(filepath.Join(home, ".deepai", "skills"), "global")...)
+	}
+	// Project: <projectDir>/.deepai/skills/
+	if projectDir != "" {
+		warnings = append(warnings, r.loadDirReported(filepath.Join(projectDir, ".deepai", "skills"), "project")...)
+	}
+	// Plugin: <pluginDir>/skills/
+	for _, pDir := range pluginDirs {
+		warnings = append(warnings, r.loadDirReported(filepath.Join(pDir, "skills"), "plugin")...)
+	}
+	return warnings
+}
+
+// loadDirReported loads skills from dir, tagging them with source. Missing dir
+// → nil (legitimate); ReadDir/LoadFromDir failure → a warning describing it.
+func (r *Registry) loadDirReported(dir string, source string) []SkillWarning {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return
+		return nil
 	}
 
 	// Collect skill names that exist in this directory
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return []SkillWarning{{Source: source, Dir: dir, Msg: "read dir: " + err.Error()}}
 	}
 	localNames := make(map[string]struct{})
 	for _, entry := range entries {
@@ -149,7 +167,7 @@ func (r *Registry) loadDirSilent(dir string, source string) {
 	}
 
 	if err := r.LoadFromDir(dir); err != nil {
-		return
+		return []SkillWarning{{Source: source, Dir: dir, Msg: err.Error()}}
 	}
 
 	// Tag skills that came from this dir
@@ -160,6 +178,7 @@ func (r *Registry) loadDirSilent(dir string, source string) {
 		}
 	}
 	r.mu.Unlock()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +239,10 @@ func (r *Registry) LoadFromDir(dir string) error {
 		}
 
 		if err := r.loadSkill(skillDir); err != nil {
+			// Best-effort: a broken SKILL.md shouldn't block the rest, but it
+			// shouldn't be silent either — log so plugin/global skill parse
+			// failures are diagnosable.
+			slog.Warn("skill parse failed; skipping", "dir", skillDir, "err", err)
 			continue
 		}
 	}
