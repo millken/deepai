@@ -161,7 +161,12 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
 
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: fmt.Sprintf("Written %d bytes to %s", len(content), displayPath)}, nil
+	return models.ToolResult{
+		CallID:   call.ID,
+		ToolName: call.Name,
+		Content:  fmt.Sprintf("Written %d bytes to %s", len(content), displayPath),
+		Data:     map[string]any{"start_line": 1},
+	}, nil
 }
 
 func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {

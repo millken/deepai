@@ -49,7 +49,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	}
 
 	for _, c := range candidates {
-		updated, n, kind, err := applyEdit(content, c.oldS, c.newS, replaceAll, displayPath)
+		updated, n, offset, kind, err := applyEdit(content, c.oldS, c.newS, replaceAll, displayPath)
 		if err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 		}
@@ -70,7 +70,14 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if len(notes) > 0 {
 			msg += " (" + strings.Join(notes, ", ") + ")"
 		}
-		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: msg}, nil
+		// start_line lets the TUI render the diff with real file line numbers
+		// (1-based, in original-file coordinates at the first replacement).
+		return models.ToolResult{
+			CallID:   call.ID,
+			ToolName: call.Name,
+			Content:  msg,
+			Data:     map[string]any{"start_line": 1 + strings.Count(content[:offset], "\n")},
+		}, nil
 	}
 
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
@@ -79,10 +86,13 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	)
 }
 
-func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) (updated string, n int, kind string, err error) {
+// applyEdit returns the rewritten content, the number of replacements, the
+// byte offset of the first replacement (for line-number reporting), an optional
+// match-kind note, and any error.
+func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) (updated string, n int, offset int, kind string, err error) {
 	if count := strings.Count(content, oldS); count > 0 {
 		if !replaceAll && count > 1 {
-			return "", 0, "", fmt.Errorf(
+			return "", 0, 0, "", fmt.Errorf(
 				"old_string matches %d times in %s; provide more context to make it unique, or set replace_all=true",
 				count, displayPath,
 			)
@@ -92,7 +102,7 @@ func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) 
 		} else {
 			updated = strings.Replace(content, oldS, newS, 1)
 		}
-		return updated, count, "", nil
+		return updated, count, strings.Index(content, oldS), "", nil
 	}
 
 	normOld := normalizeWhitespace(oldS)
@@ -100,7 +110,7 @@ func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) 
 		spans := findWhitespaceTolerantSpans(content, oldS)
 		if len(spans) > 0 {
 			if !replaceAll && len(spans) > 1 {
-				return "", 0, "", fmt.Errorf(
+				return "", 0, 0, "", fmt.Errorf(
 					"old_string matches %d locations in %s after whitespace normalization; provide more context or set replace_all=true",
 					len(spans), displayPath,
 				)
@@ -111,11 +121,11 @@ func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) 
 			if replaceAll {
 				count = len(spans)
 			}
-			return updated, count, "whitespace-tolerant match", nil
+			return updated, count, spans[0][0], "whitespace-tolerant match", nil
 		}
 	}
 
-	return "", 0, "", nil
+	return "", 0, 0, "", nil
 }
 
 func unescapeLiteral(s string) string {

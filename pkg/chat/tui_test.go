@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
 )
 
@@ -80,6 +81,45 @@ func TestToolEndLineFormatting(t *testing.T) {
 	}
 	if l := m.toolEndLine(errEvt); !strings.Contains(l, "✗") || !strings.Contains(l, "boom") {
 		t.Fatalf("error tool end line missing parts: %q", l)
+	}
+}
+
+func TestToolStartLineBashBlock(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	cmd := "zig build 2>&1 | grep error\necho done"
+	evt := agent.AgentEvent{
+		Type: agent.AgentEventToolCallStart,
+		ToolCall: &models.ToolCall{
+			Name:      "bash",
+			Arguments: map[string]any{"command": cmd},
+		},
+	}
+	line := m.toolStartLine(evt)
+	if !strings.Contains(line, "Bash") {
+		t.Fatalf("bash block missing header: %q", line)
+	}
+	// Both source lines must appear in the rendered (highlighted) block. Tokens
+	// are separated by ANSI codes, so check the individual words, not substrings.
+	for _, tok := range []string{"zig", "build", "grep", "error", "echo", "done"} {
+		if !strings.Contains(line, tok) {
+			t.Fatalf("bash block dropped token %q: %q", tok, line)
+		}
+	}
+	// Two source lines → two bar prefixes, plus the header line.
+	if got := strings.Count(line, "\n"); got != 2 {
+		t.Fatalf("bash block line count = %d, want 2 (header + 2 cmd lines): %q", got, line)
+	}
+}
+
+func TestBashCommandBlockCapsLongInput(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	var sb strings.Builder
+	for i := 0; i < maxToolCmdLines+5; i++ {
+		sb.WriteString("echo line\n")
+	}
+	block := m.bashCommandBlock(sb.String())
+	if !strings.Contains(block, "5 more lines") {
+		t.Fatalf("expected overflow footer for >cap lines, got: %q", block)
 	}
 }
 
@@ -192,27 +232,43 @@ func TestSlashSuggestions(t *testing.T) {
 func TestRenderToolDiff(t *testing.T) {
 	m := newTUIModel(BannerInfo{})
 
-	// edit_file: old lines shown as removed, new as added.
-	d := m.renderToolDiff("edit_file", map[string]any{"old_string": "a\nb", "new_string": "a\nc"})
-	if !strings.Contains(d, "- a") || !strings.Contains(d, "+ c") {
+	// edit_file: the shared line "a" is context; only "b"→"c" changes. The
+	// header shows the path and the +1/-1 counts.
+	d := m.renderToolDiff("edit_file",
+		map[string]any{"path": "foo.go", "old_string": "a\nb", "new_string": "a\nc"}, nil)
+	if !strings.Contains(d, "- b") || !strings.Contains(d, "+ c") {
 		t.Fatalf("edit diff missing -/+ lines:\n%s", d)
+	}
+	if strings.Contains(d, "- a") || strings.Contains(d, "+ a") {
+		t.Fatalf("shared line should be context, not -/+:\n%s", d)
+	}
+	if !strings.Contains(d, "foo.go") || !strings.Contains(d, "+1") || !strings.Contains(d, "-1") {
+		t.Fatalf("diff header missing path/counts:\n%s", d)
 	}
 
 	// write_file: only added lines.
-	d = m.renderToolDiff("write_file", map[string]any{"content": "x\ny"})
+	d = m.renderToolDiff("write_file", map[string]any{"path": "x.txt", "content": "x\ny"}, nil)
 	if !strings.Contains(d, "+ x") || strings.Contains(d, "- ") {
 		t.Fatalf("write diff should be all additions:\n%s", d)
 	}
 
+	// start_line drives real file line numbers in the gutter.
+	d = m.renderToolDiff("edit_file",
+		map[string]any{"path": "foo.go", "old_string": "b", "new_string": "c"},
+		map[string]any{"start_line": 42})
+	if !strings.Contains(d, "42") {
+		t.Fatalf("expected line number 42 in gutter:\n%s", d)
+	}
+
 	// Oversized edits are capped with a "more lines" marker.
 	big := strings.Repeat("line\n", 50)
-	d = m.renderToolDiff("write_file", map[string]any{"content": big})
+	d = m.renderToolDiff("write_file", map[string]any{"path": "big.txt", "content": big}, nil)
 	if !strings.Contains(d, "more lines") {
 		t.Fatalf("large diff should be truncated with a marker:\n%s", d)
 	}
 
 	// Non-edit tools produce no diff.
-	if d := m.renderToolDiff("bash", map[string]any{"command": "ls"}); d != "" {
+	if d := m.renderToolDiff("bash", map[string]any{"command": "ls"}, nil); d != "" {
 		t.Fatalf("bash should have no diff, got %q", d)
 	}
 }

@@ -7,6 +7,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.3
 	codeberg.org/readeck/go-readability/v2 v2.1.1
 	github.com/Masterminds/semver/v3 v3.5.0
+	github.com/alecthomas/chroma/v2 v2.26.1
 	github.com/anthropics/anthropic-sdk-go v1.48.0
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/chromedp/chromedp v0.15.1
@@ -24,7 +25,6 @@ require (
 )
 
 require (
-	github.com/alecthomas/chroma/v2 v2.26.1 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect

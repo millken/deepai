@@ -739,10 +739,64 @@ func (m *tuiModel) toolStartLine(evt agent.AgentEvent) string {
 	if name == "" {
 		return ""
 	}
+	// Bash commands get a full, shell-highlighted block instead of a truncated
+	// inline preview so the user can see exactly what is being executed.
+	if name == "bash" {
+		if cmd := toolEventCommand(evt); strings.TrimSpace(cmd) != "" {
+			return m.bashCommandBlock(cmd)
+		}
+	}
 	if preview != "" {
 		return m.styles.ToolCall.Render(fmt.Sprintf("  ⚙ %s(%s)…", name, preview))
 	}
 	return m.styles.ToolCall.Render(fmt.Sprintf("  ⚙ %s…", name))
+}
+
+// maxToolCmdLines caps how many command lines a bash block prints before
+// collapsing the remainder into a "… (N more lines)" footer. Matches the diff
+// block cap so multi-line tool output stays consistent in the transcript.
+const maxToolCmdLines = 16
+
+// bashCommandBlock renders a bash command as a "⚙ Bash" header followed by the
+// full command, shell-syntax-highlighted, one bar-prefixed line per source line.
+func (m *tuiModel) bashCommandBlock(cmd string) string {
+	lines := strings.Split(strings.TrimRight(cmd, "\n"), "\n")
+	var b strings.Builder
+	b.WriteString(m.styles.ToolCall.Render("  ⚙ Bash"))
+	bar := m.styles.Dim.Render("  │ ")
+	shown := 0
+	for _, ln := range lines {
+		if shown >= maxToolCmdLines {
+			break
+		}
+		// Truncate raw text (no ANSI yet) so width math and highlighting stay correct.
+		if lipgloss.Width(ln) > 120 {
+			ln = truncateWidth(ln, 117) + "..."
+		}
+		b.WriteString("\n")
+		b.WriteString(bar)
+		b.WriteString(highlightShellLine(ln))
+		shown++
+	}
+	if more := len(lines) - shown; more > 0 {
+		b.WriteString("\n")
+		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  … (%d more lines)", more)))
+	}
+	return b.String()
+}
+
+// toolEventCommand extracts the "command" argument from a bash tool-call event,
+// handling both the ToolEvent and ToolCall carriers.
+func toolEventCommand(evt agent.AgentEvent) string {
+	var args map[string]any
+	switch {
+	case evt.ToolEvent != nil:
+		args = evt.ToolEvent.Arguments
+	case evt.ToolCall != nil:
+		args = evt.ToolCall.Arguments
+	}
+	s, _ := args["command"].(string)
+	return s
 }
 
 func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
@@ -762,7 +816,11 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	// For file edits, show a colored +/- diff instead of an opaque preview.
 	diff := ""
 	if !useErr {
-		diff = m.renderToolDiff(te.Name, te.Arguments)
+		var data map[string]any
+		if te.Result != nil {
+			data = te.Result.Data
+		}
+		diff = m.renderToolDiff(te.Name, te.Arguments, data)
 	}
 	if te.Error != "" {
 		detail += " " + te.Error
