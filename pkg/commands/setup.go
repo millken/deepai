@@ -27,6 +27,29 @@ type Config struct {
 	// block on user input. "autonomous": ask_clarification short-circuits to a
 	// best-judgment response so unattended runs never block.
 	Mode          string `yaml:"mode,omitempty"`
+
+	// TokenMetrics enables Phase 0 token measurement (JSONL records per turn and
+	// per tool result). "1"/"true" writes to $TMPDIR/deepai-token-metrics.jsonl;
+	// any other non-empty value is used as the output file path. Empty = off.
+	// The DEEPAI_TOKEN_METRICS env var, when set, takes precedence.
+	TokenMetrics string `yaml:"token_metrics,omitempty"`
+	// TokenAging enables T1 tool-result aging (docs/spec/token-efficiency.md):
+	// historical tool results in the outgoing prompt are compressed by age once
+	// context pressure passes 40% of the window. The DEEPAI_TOKEN_AGING env var,
+	// when set, takes precedence.
+	TokenAging bool `yaml:"token_aging,omitempty"`
+}
+
+// applyTokenEfficiencyEnv bridges config.yaml token-efficiency settings to the
+// environment variables read at the agent.New() chokepoint, so REPL agents and
+// subagents pick them up uniformly. Explicit env values win over config.yaml.
+func applyTokenEfficiencyEnv(cfg Config) {
+	if v := strings.TrimSpace(cfg.TokenMetrics); v != "" && os.Getenv("DEEPAI_TOKEN_METRICS") == "" {
+		os.Setenv("DEEPAI_TOKEN_METRICS", v)
+	}
+	if cfg.TokenAging && os.Getenv("DEEPAI_TOKEN_AGING") == "" {
+		os.Setenv("DEEPAI_TOKEN_AGING", "1")
+	}
 }
 
 // IsAutonomous reports whether the configured mode skips user prompts.

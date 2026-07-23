@@ -36,7 +36,9 @@ type AgentTypeConfig struct {
 
 const (
 	// generalPurposeSystemPrompt is the default profile prompt for balanced assistant behavior.
-	generalPurposeSystemPrompt = "You are a helpful assistant. Work step by step, use tools when needed, ask for clarification with ask_clarification instead of guessing when requirements are ambiguous, and stop when you have a complete answer.\n\nTool preference: use dedicated tools over bash for file operations — read_file (not cat/head/tail), edit_file (not sed/awk), write_file (not echo/cat>), list_dir (not ls), find (not find), grep (not grep/rg). Reserve bash for building, testing, git, and operations not covered by dedicated tools."
+	// T5c: the file-operation routing guidance lives in the single authoritative
+	// rule appended by BuildSystemPrompt (react.go), so it is not duplicated here.
+	generalPurposeSystemPrompt = "You are a helpful assistant. Work step by step, use tools when needed, ask for clarification with ask_clarification instead of guessing when requirements are ambiguous, and stop when you have a complete answer."
 	// researcherSystemPrompt keeps the agent focused on gathering evidence and synthesizing findings.
 	researcherSystemPrompt = "You are a research assistant. Prioritize gathering evidence, reading available material carefully, summarizing findings precisely, and asking for clarification with ask_clarification when the research scope is unclear."
 	// coderSystemPrompt keeps the agent focused on code changes, debugging, and verification.
@@ -78,7 +80,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Researcher",
 		Description:  "Profile for research, reading, and synthesis tasks.",
 		SystemPrompt: researcherSystemPrompt,
-		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task"},
+		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task"},
 		MaxTurns:     0,
 		Temperature:  0.1,
 	},
@@ -87,7 +89,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Coder",
 		Description:  "Profile for code generation, debugging, and implementation tasks.",
 		SystemPrompt: coderSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task", "skill", "git_status", "git_diff", "git_log", "git_add", "git_commit", "git_reset", "git_auto_commit", "git_push"},
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task", "skill", "git_status", "git_diff", "git_log", "git_add", "git_commit", "git_reset", "git_auto_commit", "git_push"},
 		MaxTurns:     0,
 		Temperature:  0.1,
 	},
@@ -96,7 +98,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Analyst",
 		Description:  "Profile for structured analysis and artifact generation.",
 		SystemPrompt: analystSystemPrompt,
-		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification"},
+		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
 		MaxTurns:     0,
 		Temperature:  0.15,
 	},
@@ -105,7 +107,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Security Reviewer",
 		Description:  "Reviews code for security vulnerabilities, injection risks, and permission issues.",
 		SystemPrompt: securityReviewerSystemPrompt,
-		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find"},
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxTurns:     10,
 		Temperature:  0.2,
 	},
@@ -114,7 +116,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Architecture Reviewer",
 		Description:  "Reviews code for design patterns, coupling, extensibility, and maintainability.",
 		SystemPrompt: archReviewerSystemPrompt,
-		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find"},
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxTurns:     10,
 		Temperature:  0.2,
 	},
@@ -123,7 +125,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Performance Reviewer",
 		Description:  "Reviews code for algorithm complexity, memory, I/O, and concurrency issues.",
 		SystemPrompt: perfReviewerSystemPrompt,
-		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "bash"},
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
 		MaxTurns:     10,
 		Temperature:  0.2,
 	},
@@ -132,7 +134,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Product Manager",
 		Description:  "Plans features, decomposes requirements, and defines acceptance criteria.",
 		SystemPrompt: productManagerSystemPrompt,
-		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "ask_clarification"},
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "ask_clarification"},
 		MaxTurns:     0,
 		Temperature:  0.15,
 	},
@@ -141,7 +143,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Architect",
 		Description:  "Produces technical design documents, system decomposition, and interface definitions.",
 		SystemPrompt: architectSystemPrompt,
-		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find"},
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxTurns:     0,
 		Temperature:  0.2,
 	},
@@ -159,7 +161,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Frontend Developer",
 		Description:  "Profile for frontend development: HTML/CSS/JS, React/Vue/Angular, responsive design, accessibility, and performance.",
 		SystemPrompt: frontendSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "task", "web_search", "web_fetch", "image_search"},
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task", "web_search", "web_fetch", "image_search"},
 		MaxTurns:     0,
 		Temperature:  0.15,
 	},
@@ -168,7 +170,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "UI Designer",
 		Description:  "Profile for UI/UX design: design systems, wireframes, component specs, color, typography, and interaction patterns.",
 		SystemPrompt: uiDesignerSystemPrompt,
-		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
+		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
 		MaxTurns:     0,
 		Temperature:  0.2,
 	},

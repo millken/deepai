@@ -51,6 +51,10 @@ type Agent struct {
 	contextWindow       int
 	compactionThreshold float64
 	compactionKeepTail  int
+	// aging derives a per-request compressed prompt view (T1/T4). nil = disabled.
+	aging *AgingConfig
+	// metrics is the Phase 0 measurement sink. nil = disabled (zero overhead).
+	metrics MetricsSink
 	// lastInputTokens is the provider's own reported input-token count from the
 	// most recent response — authoritative for the model's real tokenizer, which
 	// the byte heuristic underestimates for CJK/multi-byte text. lastTokenCount-
@@ -87,6 +91,9 @@ func New(cfg AgentConfig) *Agent {
 		cfg.AgentType = AgentTypeGeneral
 		_ = ApplyAgentType(&cfg, AgentTypeGeneral)
 	}
+	// Opt-in token-efficiency features (metrics/aging) from env, unless the
+	// caller set them explicitly. No-op by default.
+	applyTokenEfficiencyDefaults(&cfg)
 	maxTurns := cfg.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = defaultMaxTurns
@@ -120,6 +127,8 @@ func New(cfg AgentConfig) *Agent {
 		contextWindow:       cfg.ContextWindow,
 		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
 		compactionKeepTail:  resolveCompactionKeepTail(cfg.CompactionKeepTail),
+		aging:               cfg.Aging,
+		metrics:             cfg.Metrics,
 		memoryService:       cfg.MemoryService,
 		memoryExtractor:     cfg.MemoryExtractor,
 		memoryUserID:        cfg.MemoryUserID,
@@ -332,14 +341,29 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 		}
 
+		// T1/T4: derive a per-request compressed prompt view from the canonical
+		// runMessages. When aging is disabled this is a zero-copy pass-through.
+		// The canonical runMessages (persisted, replayed, mined for memory) are
+		// never modified — only the view sent to the provider is compressed.
+		promptView := buildPromptView(runMessages, a.aging, a.contextWindow)
+		systemPrompt := a.BuildSystemPrompt(ctx, sessionID, runMessages)
+
+		// Phase 0 auxiliary metric: byte breakdown of the outgoing prompt.
+		// Captured before the request; combined with the provider's real token
+		// counts into one per-turn record once the response arrives.
+		var pendingContext ContextBytes
+		if a.metrics != nil {
+			pendingContext = computeContextBytes(promptView, systemPrompt, a.toolSchemaBytes())
+		}
+
 		req := llm.ChatRequest{
 			Model:           a.model,
-			Messages:        runMessages,
+			Messages:        promptView,
 			Tools:           a.tools.List(),
 			ReasoningEffort: a.reasoningEffort,
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
-			SystemPrompt:    a.BuildSystemPrompt(ctx, sessionID, runMessages),
+			SystemPrompt:    systemPrompt,
 		}
 
 		stream, err := a.llm.Stream(ctx, req)
@@ -421,6 +445,18 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				a.lastInputTokens = streamUsage.InputTokens
 				a.lastTokenCountMsgs = len(runMessages)
 			}
+		}
+
+		// Phase 0 primary metric: provider-reported tokens for this turn, joined
+		// with the pre-request byte breakdown. Emitted even when the provider
+		// omits usage (tokens = 0) so the byte buckets are still captured.
+		if a.metrics != nil {
+			m := TurnMetrics{Turn: turn, Context: pendingContext}
+			if streamUsage != nil {
+				m.InputTokens = streamUsage.InputTokens
+				m.OutputTokens = streamUsage.OutputTokens
+			}
+			a.metrics.RecordTurn(m)
 		}
 
 		a.logger.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
@@ -518,6 +554,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					ToolResult: &result,
 					CreatedAt:  time.Now().UTC(),
 				})
+				if a.metrics != nil {
+					a.metrics.RecordToolResult(ToolResultMetric{Turn: turn, ToolName: result.ToolName, ResultBytes: len(result.Content)})
+				}
 				toolMessage := runMessages[len(runMessages)-1]
 				emit(AgentEvent{
 					Type:      AgentEventToolResult,
@@ -625,6 +664,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				ToolResult: &result,
 				CreatedAt:  time.Now().UTC(),
 			})
+			if a.metrics != nil {
+				a.metrics.RecordToolResult(ToolResultMetric{Turn: turn, ToolName: result.ToolName, ResultBytes: len(result.Content)})
+			}
 			toolMessage := runMessages[len(runMessages)-1]
 			emit(AgentEvent{
 				Type:      AgentEventToolResult,
@@ -733,9 +775,29 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 		}
 	}
 
-	sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. Reserve bash for building, running, testing, package managers, git, and operations no dedicated tool covers.")
+	// T5c: only carry the file-operation routing rule when the agent has ANY of
+	// the dedicated file tools it references — an agent with edit_file but not
+	// read_file still needs "use edit_file, not sed -i". Only a truly file-tool-
+	// less agent (e.g. bash-only) omits the ~400-char rule.
+	if a.hasAnyFileTool() {
+		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. Reserve bash for building, running, testing, package managers, git, and operations no dedicated tool covers.")
+	}
 	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
+}
+
+// hasAnyFileTool reports whether any of the dedicated file tools named by the
+// file-operation rule is registered.
+func (a *Agent) hasAnyFileTool() bool {
+	if a == nil || a.tools == nil {
+		return false
+	}
+	for _, name := range []string{"read_file", "edit_file", "write_file", "list_dir", "find", "grep"} {
+		if a.tools.Get(name) != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agent) emit(evt AgentEvent) {
@@ -968,6 +1030,13 @@ func formatEventTime(ts time.Time) string {
 // context-window estimate or the agent will compact later than the real payload
 // warrants. Uses the same ~3-bytes-per-token heuristic as estimateTokens.
 func (a *Agent) toolSchemaTokens() int {
+	return a.toolSchemaBytes() / 3
+}
+
+// toolSchemaBytes estimates the byte size of all registered tool schemas
+// (name + description + JSON input schema). Used by token estimation and by the
+// Phase 0 metrics framework.
+func (a *Agent) toolSchemaBytes() int {
 	if a == nil || a.tools == nil {
 		return 0
 	}
@@ -980,7 +1049,7 @@ func (a *Agent) toolSchemaTokens() int {
 			}
 		}
 	}
-	return totalBytes / 3
+	return totalBytes
 }
 
 // estimateContextTokens returns the best estimate of how many tokens the next

@@ -85,8 +85,26 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
 
-	if limit, ok := args["limit"].(float64); ok && limit > 0 && int(limit) < len(data) {
-		data = data[:int(limit)]
+	// T2a structural outline: a large CODE file read without a range, byte
+	// limit, or full=true returns head + symbol signatures + tail instead of
+	// full content. Restricted to extensions with a symbol extractor — for
+	// non-code files (CSV, YAML, wordlists) an outline is silent data loss, so
+	// they keep the original full-content behavior. limit=0 counts as "no
+	// limit" (matching the limit branch below), not as an outline bypass.
+	limitArg, hasLimit := args["limit"].(float64)
+	hasLimit = hasLimit && limitArg > 0
+	full, _ := args["full"].(bool)
+	if ReadFileOutlineThreshold > 0 && !full && !hasLimit &&
+		len(lines) > ReadFileOutlineThreshold && extToLang(filepath.Ext(path)) != "" {
+		return models.ToolResult{
+			CallID:   call.ID,
+			ToolName: call.Name,
+			Content:  buildFileOutline(lines, filepath.Ext(path)),
+		}, nil
+	}
+
+	if hasLimit && int(limitArg) < len(data) {
+		data = data[:int(limitArg)]
 		text = string(data)
 		lines = splitFileLines(text)
 	}
@@ -204,7 +222,7 @@ func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 func GlobTool() models.Tool {
 	return models.Tool{
 		Name:         "glob",
-		Description:  "List files matching a glob pattern. Use this instead of ls/find globs via bash.",
+		Description:  "List files matching a glob pattern (e.g. *.go).",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -222,7 +240,7 @@ func GlobTool() models.Tool {
 func ReadFileTool() models.Tool {
 	return models.Tool{
 		Name:         "read_file",
-		Description:  "Read a file's contents. Use this instead of cat/head/tail/sed via bash. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number.",
+		Description:  "Read a file's contents. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number. Very large files return a structural outline (head + symbol signatures with line numbers + tail); pass full=true or a start_line/end_line range to get exact content.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -235,6 +253,7 @@ func ReadFileTool() models.Tool {
 				"end_line":     map[string]any{"type": "number", "description": "1-based inclusive end line; pairs with start_line"},
 				"line_numbers": map[string]any{"type": "boolean", "description": "Prefix each line with its 1-based line number (auto when range is set)"},
 				"limit":        map[string]any{"type": "number", "description": "Maximum bytes to read (ignored when range is set)"},
+				"full":         map[string]any{"type": "boolean", "description": "Force full content for large files instead of the structural outline"},
 			},
 		},
 		Handler: ReadFileHandler,
@@ -244,7 +263,7 @@ func ReadFileTool() models.Tool {
 func WriteFileTool() models.Tool {
 	return models.Tool{
 		Name:        "write_file",
-		Description: "Write content to a file, creating parent directories as needed. Use this instead of echo>/cat>/tee via bash.",
+		Description: "Write content to a file, creating parent directories as needed.",
 		Groups:      []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",
@@ -269,6 +288,7 @@ func FileTools() []models.Tool {
 		GlobTool(),
 		GrepTool(),
 		FindTool(),
+		CodeMapTool(),
 	}
 }
 

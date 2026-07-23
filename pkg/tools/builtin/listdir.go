@@ -32,6 +32,7 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 	}
 
 	showAll, _ := args["all"].(bool)
+	expandDirs, _ := args["expand_dirs"].(bool)
 
 	entries := make([]dirEntry, 0, len(dirs))
 	for _, d := range dirs {
@@ -60,8 +61,15 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 		return entries[i].Name < entries[j].Name
 	})
 
+	// T2c: collapse generated/dependency directories to a one-line marker so
+	// they don't crowd the listing. Data["entries"] stays complete; only the
+	// rendered text folds. expand_dirs=true shows them normally.
 	var b strings.Builder
 	for _, e := range entries {
+		if e.IsDir && !expandDirs && listDirFoldDirs[e.Name] {
+			b.WriteString(foldDirLine(path, e.Name))
+			continue
+		}
 		fmt.Fprintf(&b, "%s %8d %s  %s\n", e.Mode, e.Size, e.ModTime, e.Name)
 	}
 
@@ -78,14 +86,15 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 func ListDirTool() models.Tool {
 	return models.Tool{
 		Name:        "list_dir",
-		Description: "List directory contents with file metadata. Use this instead of ls via bash. Shows files and subdirectories sorted (dirs first); use it to understand project structure.",
+		Description: "List directory contents with file metadata. Shows files and subdirectories sorted (dirs first); use it to understand project structure.",
 		Groups:      []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": "Directory path to list (default: current directory)"},
-				"all":  map[string]any{"type": "boolean", "description": "Show hidden entries like .claude, .git (default: false)"},
+				"path":        map[string]any{"type": "string", "description": "Directory path to list (default: current directory)"},
+				"all":         map[string]any{"type": "boolean", "description": "Show hidden entries like .claude, .git (default: false)"},
+				"expand_dirs": map[string]any{"type": "boolean", "description": "Show generated/dependency dirs (vendor, node_modules, ...) normally instead of collapsing them (default: false)"},
 			},
 			"required": []any{},
 		},

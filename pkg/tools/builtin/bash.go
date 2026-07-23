@@ -49,7 +49,7 @@ type BashOutput struct {
 func BashTool() models.Tool {
 	return models.Tool{
 		Name:        "bash",
-		Description: "Execute shell commands for building, running, testing, package managers, git, and any task without a dedicated tool. Do NOT use bash for file operations: prefer read_file (not cat/head/tail/sed -n), edit_file (not sed/awk/perl -i), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag) — these run in the sandbox and are more reliable. Returns stdout, stderr, and exit code as JSON.",
+		Description: "Execute shell commands for building, running, testing, package managers, git, and any task without a dedicated tool. Do NOT use bash for file operations — the dedicated file tools are more reliable in the sandbox. Returns stdout, stderr, and exit code as JSON.",
 		Groups:      []string{"builtin"},
 		InputSchema: map[string]any{
 			"type": "object",

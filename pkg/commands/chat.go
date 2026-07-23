@@ -78,6 +78,10 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		return err
 	}
 
+	// Bridge config.yaml token-efficiency settings (token_metrics/token_aging)
+	// to the env vars agent.New() reads, so they persist without shell exports.
+	applyTokenEfficiencyEnv(cfg)
+
 	if cfg.Provider == "" {
 		fmt.Fprintln(os.Stderr, "  No provider configured. Run `deepai setup` first.")
 		return fmt.Errorf("no provider configured")

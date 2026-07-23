@@ -274,9 +274,9 @@ func filePerm(path string, def os.FileMode) os.FileMode {
 func EditFileTool() models.Tool {
 	return models.Tool{
 		Name: "edit_file",
-		Description: "Replace exact text in a file. Use this for in-place edits instead of sed/awk/perl -i via bash. old_string must uniquely match (use replace_all for multiple matches). " +
+		Description: "Replace exact text in a file for in-place edits. old_string must uniquely match (use replace_all for multiple matches). " +
 			"Falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
-			"Fails safely if no match or ambiguous match; on failure re-read the file and retry this tool rather than falling back to bash.",
+			"Fails safely if no match or ambiguous match; on failure, re-read the file with read_file and retry this tool.",
 		Groups: []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",

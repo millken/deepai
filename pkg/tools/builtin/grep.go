@@ -50,7 +50,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		globPatterns = []string{strings.TrimSpace(globArg)}
 	}
 
-	maxResults := 100
+	maxResults := GrepMaxResults
 	if v, ok := args["max_results"].(float64); ok && int(v) > 0 {
 		maxResults = int(v)
 	}
@@ -112,7 +112,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 
 	truncated := ""
 	if len(matches) == maxResults {
-		truncated = fmt.Sprintf("\n(results capped at %d)", maxResults)
+		truncated = fmt.Sprintf("\n(results capped at %d; refine the pattern or raise max_results for more)", maxResults)
 	}
 
 	return models.ToolResult{
@@ -318,7 +318,7 @@ func isBinaryExt(ext string) bool {
 func GrepTool() models.Tool {
 	return models.Tool{
 		Name:        "grep",
-		Description: "Search file contents by regex pattern. Use this instead of grep/rg/ag via bash. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
+		Description: "Search file contents by regex pattern. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
 		Groups:      []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -332,7 +332,7 @@ func GrepTool() models.Tool {
 				"case_insensitive": map[string]any{"type": "boolean", "description": "Case-insensitive search (default: false)"},
 				"include_hidden":   map[string]any{"type": "boolean", "description": "Search inside .git/.github/vendor/node_modules/__pycache__ and dotfiles"},
 				"context":          map[string]any{"type": "number", "description": "Number of context lines before and after each match (default: 0)"},
-				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 100)"},
+				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 50)"},
 			},
 		},
 		Handler: GrepHandler,

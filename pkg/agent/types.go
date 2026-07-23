@@ -50,6 +50,15 @@ type AgentConfig struct {
 	CompactionThreshold float64 // fraction of ContextWindow to trigger compaction (default 0.75)
 	CompactionKeepTail  int     // number of recent messages to preserve (default 6)
 
+	// Aging controls the prompt-view information-decay compression (T1 tool
+	// results + T4 conversation text). nil = disabled (behavior unchanged). It
+	// derives a per-request compressed view; canonical messages are untouched.
+	Aging *AgingConfig
+
+	// Metrics is the Phase 0 measurement sink (per-turn provider tokens + byte
+	// buckets, per-tool result sizes). nil = disabled (zero overhead).
+	Metrics MetricsSink
+
 	// Memory integration
 	MemoryService   *memory.Service  // used for Inject into system prompt
 	MemoryExtractor memory.Extractor // per-request extractor (matches the LLM model of the current request)

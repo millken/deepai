@@ -39,12 +39,13 @@ func New() *cobra.Command {
 			if verbose {
 				stderrLevel = slog.LevelDebug
 			}
-			cleanup, err := logs.Setup(logs.Config{
-				Level:       level,
-				StderrLevel: stderrLevel,
-				DebugFile:   "deepai-debug.log",
-				ErrorFile:   "deepai-error.log",
-			})
+			cfg := logs.FromEnv()
+			cfg.Level = level
+			cfg.StderrLevel = stderrLevel
+			if verbose && cfg.DebugFile == "" {
+				cfg.DebugFile = os.TempDir() + "/deepai-debug.log"
+			}
+			cleanup, err := logs.Setup(cfg)
 			if err != nil {
 				slog.Warn("failed to set up logging", "err", err)
 				return

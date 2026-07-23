@@ -23,20 +23,23 @@ func (m *tuiModel) renderMarkdown(s string) string {
 		w = mdMaxWidth
 	}
 	if m.mdRenderer == nil || m.mdWidth != w {
+		// Use minimal ANSI styling to avoid terminal state corruption
+		// - No emoji (can cause encoding issues)
+		// - No background colors (reduce ANSI sequence complexity)
+		// - Standard style with minimal overhead
 		r, err := glamour.NewTermRenderer(
-			glamour.WithStandardStyle("dark"),
+			glamour.WithStandardStyle("notty"), // Use no-style to avoid ANSI issues
 			glamour.WithWordWrap(w),
-			glamour.WithEmoji(),
 		)
 		if err != nil {
-			return ""
+			return s // Fallback to plain text
 		}
 		m.mdRenderer = r
 		m.mdWidth = w
 	}
 	out, err := m.mdRenderer.Render(s)
 	if err != nil {
-		return ""
+		return s // Fallback to plain text on error
 	}
 	return strings.Trim(out, "\n")
 }

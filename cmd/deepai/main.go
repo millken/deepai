@@ -14,7 +14,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	if err := root.ExecuteContext(ctx); err != nil {
-		cancel()
-		os.Exit(1)
+		// Exit with error code, but without os.Exit to allow defer cleanup
+		// (including TUI terminal state restoration)
+		return
 	}
 }

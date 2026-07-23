@@ -15,7 +15,7 @@ import (
 // planToolNames are the tools available while in plan mode (read-only).
 // exit_plan_mode and write_plan are registered dynamically after Restrict.
 var planToolNames = []string{
-	"read_file", "list_dir", "glob", "grep", "find",
+	"read_file", "list_dir", "glob", "grep", "find", "code_map",
 	"ask_clarification", "present_file",
 }
 

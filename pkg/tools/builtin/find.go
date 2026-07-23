@@ -23,7 +23,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	fileType, _ := args["type"].(string)
 	includeHidden, _ := args["include_hidden"].(bool)
 
-	maxResults := 200
+	maxResults := FindMaxResults
 	if v, ok := args["max_results"].(float64); ok && int(v) > 0 {
 		maxResults = int(v)
 	}
@@ -83,7 +83,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 
 	truncated := ""
 	if len(results) == maxResults {
-		truncated = fmt.Sprintf("\n(results capped at %d)", maxResults)
+		truncated = fmt.Sprintf("\n(results capped at %d; narrow the name/path or raise max_results for more)", maxResults)
 	}
 
 	return models.ToolResult{
@@ -96,7 +96,7 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 func FindTool() models.Tool {
 	return models.Tool{
 		Name:         "find",
-		Description:  "Recursively find files and directories. Use this instead of the find command via bash. name is an optional glob (e.g. *_test.go); when omitted, every entry is listed.",
+		Description:  "Recursively find files and directories. name is an optional glob (e.g. *_test.go); when omitted, every entry is listed.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -106,7 +106,7 @@ func FindTool() models.Tool {
 				"name":           map[string]any{"type": "string", "description": "Optional file/dir name glob (e.g. *_test.go, *.yaml, main.*)"},
 				"type":           map[string]any{"type": "string", "description": "Filter by type: 'file' or 'dir'"},
 				"include_hidden": map[string]any{"type": "boolean", "description": "Descend into .git/.github/vendor/node_modules/__pycache__ and other dotted dirs"},
-				"max_results":    map[string]any{"type": "number", "description": "Maximum number of results (default: 200)"},
+				"max_results":    map[string]any{"type": "number", "description": "Maximum number of results (default: 50)"},
 			},
 			"required": []any{},
 		},
