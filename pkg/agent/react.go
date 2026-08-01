@@ -17,6 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -813,6 +814,12 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 	if a.hasAnyFileTool() {
 		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. Reserve bash for building, running, testing, package managers, git, and operations no dedicated tool covers.")
 	}
+	
+	// M2.2+: Smart tool selection guidance for search operations
+	if a.hasSearchTools() {
+		sections = append(sections, builtin.GetToolRecommendations())
+	}
+	
 	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
 }
@@ -824,6 +831,20 @@ func (a *Agent) hasAnyFileTool() bool {
 		return false
 	}
 	for _, name := range []string{"read_file", "edit_file", "write_file", "list_dir", "find", "grep"} {
+		if a.tools.Get(name) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSearchTools reports whether search-related tools are registered
+func (a *Agent) hasSearchTools() bool {
+	if a == nil || a.tools == nil {
+		return false
+	}
+	// Check for grep and bash (bash can be used for file searches)
+	for _, name := range []string{"grep", "bash"} {
 		if a.tools.Get(name) != nil {
 			return true
 		}
