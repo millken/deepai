@@ -447,17 +447,21 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 		}
 
-		// Phase 0 primary metric: provider-reported tokens for this turn, joined
-		// with the pre-request byte breakdown. Emitted even when the provider
-		// omits usage (tokens = 0) so the byte buckets are still captured.
-		if a.metrics != nil {
-			m := TurnMetrics{Turn: turn, Context: pendingContext}
-			if streamUsage != nil {
-				m.InputTokens = streamUsage.InputTokens
-				m.OutputTokens = streamUsage.OutputTokens
+			// Phase 0 primary metric: provider-reported tokens for this turn, joined
+			// with the pre-request byte breakdown. Emitted even when the provider
+			// omits usage (tokens = 0) so the byte buckets are still captured.
+			if a.metrics != nil {
+				m := TurnMetrics{Turn: turn, Context: pendingContext}
+				if streamUsage != nil {
+					m.InputTokens = streamUsage.InputTokens
+					m.OutputTokens = streamUsage.OutputTokens
+				}
+				// If provider doesn't return input_tokens, estimate from bytes
+				if m.InputTokens == 0 && pendingContext.TotalBytes > 0 {
+					m.InputTokens = estimateInputTokens(pendingContext)
+				}
+				a.metrics.RecordTurn(m)
 			}
-			a.metrics.RecordTurn(m)
-		}
 
 		a.logger.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
 		assistantMetadata := map[string]string{"stop_reason": stopReason}

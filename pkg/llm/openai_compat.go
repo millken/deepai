@@ -171,13 +171,23 @@ func (p *OpenAICompatProvider) consumeStream(
 				stopReason = choice.FinishReason
 			}
 		}
-		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
-			lastUsage = &Usage{
-				InputTokens:  int(chunk.Usage.PromptTokens),
-				OutputTokens: int(chunk.Usage.CompletionTokens),
-				TotalTokens:  int(chunk.Usage.TotalTokens),
+			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+				lastUsage = &Usage{
+					InputTokens:  int(chunk.Usage.PromptTokens),
+					OutputTokens: int(chunk.Usage.CompletionTokens),
+					TotalTokens:  int(chunk.Usage.TotalTokens),
+				}
 			}
-		}
+			// Debug: log all usage fields to diagnose provider behavior
+			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 || chunk.Usage.TotalTokens > 0 {
+				slog.Debug("provider usage chunk",
+					"provider", p.provider,
+					"model", model,
+					"prompt_tokens", chunk.Usage.PromptTokens,
+					"completion_tokens", chunk.Usage.CompletionTokens,
+					"total_tokens", chunk.Usage.TotalTokens,
+				)
+			}
 	}
 	if err := stream.Err(); err != nil {
 		// reasoning_effort rejection: signal caller to strip the field and retry.
