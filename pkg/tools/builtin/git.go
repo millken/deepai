@@ -9,8 +9,17 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
 )
+
+// gitAutoCommitToolFunc is the function to create git_auto_commit tool
+var gitAutoCommitToolFunc func(llm.LLMProvider) models.Tool
+
+// InitGitAutoCommit initializes the git_auto_commit tool dependency
+func InitGitAutoCommit(toolFunc func(llm.LLMProvider) models.Tool) {
+	gitAutoCommitToolFunc = toolFunc
+}
 
 // workingDirFromArgs extracts the optional "working_dir" argument from a tool call.
 // Returns "" if not specified (caller should use process CWD).
@@ -566,13 +575,12 @@ func GitResetTool() models.Tool {
 
 // GitTools returns all deterministic git operation tools.
 func GitTools() []models.Tool {
-	return []models.Tool{
-		GitStatusTool(),
-		GitDiffTool(),
-		GitLogTool(),
-		GitAddTool(),
-		GitCommitTool(),
-		GitResetTool(),
-		GitPushTool(),
+	// M2.3: Removed basic git tools - modern models can use bash for git commands
+	// Only keep git_auto_commit for advanced automated workflows
+	if gitAutoCommitToolFunc != nil {
+		return []models.Tool{
+			gitAutoCommitToolFunc(nil), // Provider will be injected by registry
+		}
 	}
+	return []models.Tool{}
 }

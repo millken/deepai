@@ -811,9 +811,9 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 	// the dedicated file tools it references — an agent with edit_file but not
 	// read_file still needs "use edit_file, not sed -i". Only a truly file-tool-
 	// less agent (e.g. bash-only) omits the ~400-char rule.
-	if a.hasAnyFileTool() {
-		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. Reserve bash for building, running, testing, package managers, git, and operations no dedicated tool covers.")
-	}
+		if a.hasAnyFileTool() {
+			sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools.")
+		}
 	
 	// M2.2+: Smart tool selection guidance for search operations
 	if a.hasSearchTools() {
@@ -843,7 +843,7 @@ func (a *Agent) hasSearchTools() bool {
 	if a == nil || a.tools == nil {
 		return false
 	}
-	// Check for grep and bash (bash can be used for file searches)
+	// Check for grep and bash (bash can be used for file searches and git operations)
 	for _, name := range []string{"grep", "bash"} {
 		if a.tools.Get(name) != nil {
 			return true
