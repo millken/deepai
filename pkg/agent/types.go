@@ -75,6 +75,10 @@ type AgentConfig struct {
 	// Set for delegated subagents, which have no user to approve a plan and must
 	// implement directly rather than stall in read-only exploration.
 	NonInteractive bool
+
+	// OffloadDir is where tool results exceeding the offload threshold are
+	// written to disk. Empty = auto-derive ~/.deepai/offload in New().
+	OffloadDir string
 }
 
 type TimeoutError struct {

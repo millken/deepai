@@ -68,6 +68,13 @@ func MemoriesDir() string {
 	return filepath.Join(Home(), "memories")
 }
 
+// OffloadDir returns the path to the offload directory (~/.deepai/offload).
+// Large tool results (>24KB) are written here so the full content is
+// recoverable while only a summary stays in the context window.
+func OffloadDir() string {
+	return filepath.Join(Home(), "offload")
+}
+
 // GlobalInstructions returns the path to the global DEEPAI.md.
 func GlobalInstructions() string {
 	return filepath.Join(Home(), "DEEPAI.md")
@@ -84,7 +91,7 @@ func EnsureHome() error {
 	if dir == "" {
 		return fmt.Errorf("cannot determine home directory")
 	}
-	for _, sub := range []string{"sessions", "logs", "memories"} {
+	for _, sub := range []string{"sessions", "logs", "memories", "offload"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
 			return fmt.Errorf("create %s/%s: %w", dir, sub, err)
 		}

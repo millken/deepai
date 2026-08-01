@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -76,11 +77,15 @@ type Agent struct {
 	// User interaction
 	userInteraction tools.UserInteraction
 
-	// Plan mode: restrict to read-only tools until user approves
+	// Plan mode: restrict agent to read-only tools until user approves
 	planMode  atomic.Bool
 	fullTools *tools.Registry // saved full tool set, restored on exit
 	workDir   string          // working directory for plan files
 	planFile  string          // path to the current plan file
+
+	// offloadDir is where tool results exceeding offloadThresholdBytes are
+	// written to disk. Empty = offload disabled.
+	offloadDir string
 
 	// Diagnostic: warn at most once when the events channel overflows so the
 	// silent drop is visible in logs without flooding when the slow consumer
@@ -111,6 +116,14 @@ func New(cfg AgentConfig) *Agent {
 	// lifetime via context cancellation (Ctrl+C). A positive value applies a
 	// hard deadline per Run() invocation.
 	requestTimeout := cfg.RequestTimeout
+	// Auto-derive offload directory so all entry points (REPL, gateway,
+	// subagent) get offload without each passing it explicitly.
+	offloadDir := cfg.OffloadDir
+	if offloadDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			offloadDir = filepath.Join(home, ".deepai", "offload")
+		}
+	}
 	a := &Agent{
 		llm:                 cfg.LLMProvider,
 		tools:               registry,
@@ -136,6 +149,7 @@ func New(cfg AgentConfig) *Agent {
 		memoryUserID:        cfg.MemoryUserID,
 		userInteraction:     cfg.UserInteraction,
 		workDir:             cfg.WorkDir,
+		offloadDir:          offloadDir,
 	}
 
 	// Register plan mode tools (agent self-references via closures). Skipped for
@@ -257,6 +271,16 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// injects a synthetic human message to break the loop.
 	validationFailures := make(map[string]int)
 	consecutiveValidationFailures := 0
+
+	// Repeat-call circuit-breaker state: tracks consecutive identical tool
+	// invocations (same name + args hash). Unlike validationFailures, this
+	// catches loops where the tool *succeeds* (e.g. `go test` returning
+	// exit_code 1 as CallStatusCompleted) but the model keeps retrying the
+	// exact same command. prevRepeatKey provides "consecutive" semantics —
+	// switching to a different call resets the counters.
+	repeatCalls := make(map[string]int)
+	repeatFails := make(map[string]int)
+	prevRepeatKey := ""
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -552,6 +576,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			batchClean := true
 			for i, call := range toolCalls {
 				result := results[i]
+				offloaded := a.offloadIfNeeded(&result, a.offloadDir)
 				runMessages = append(runMessages, models.Message{
 					ID:         newMessageID("tool"),
 					SessionID:  sessionID,
@@ -572,7 +597,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 							ResultBytes: len(result.Content),
 							ArgsHash:    argsHash,
 							Path:        filePath,
-							Offloaded:   false, // TODO: implement offload detection in M2.3
+							Offloaded:   offloaded,
 							DurationMs:  durationMs,
 						})
 					}
@@ -675,6 +700,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				}
 			}
 
+			offloaded := a.offloadIfNeeded(&result, a.offloadDir)
 			runMessages = append(runMessages, models.Message{
 				ID:         newMessageID("tool"),
 				SessionID:  sessionID,
@@ -695,7 +721,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 							ResultBytes: len(result.Content),
 							ArgsHash:    argsHash,
 							Path:        filePath,
-							Offloaded:   false, // TODO: implement offload detection in M2.3
+							Offloaded:   offloaded,
 							DurationMs:  durationMs,
 						})
 					}
@@ -716,6 +742,53 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				Result:    &result,
 				ToolEvent: newToolEventFromResult(completedCall, result),
 			})
+
+			// Repeat-call circuit-breaker: detect when the model re-runs the
+			// exact same tool with the same arguments without progress. This
+			// catches loops the validation breaker misses — e.g. `go test`
+			// returning exit_code 1 as a "completed" bash result, causing the
+			// model to retry the identical command dozens of times.
+			rKey := repeatKey(call.Name, call.Arguments)
+			if rKey != prevRepeatKey {
+				// Model switched to a different call → not a loop; reset.
+				repeatCalls = make(map[string]int)
+				repeatFails = make(map[string]int)
+				prevRepeatKey = rKey
+			}
+			repeatCalls[rKey]++
+			if isResultFailed(result) {
+				repeatFails[rKey]++
+			} else {
+				repeatFails[rKey] = 0
+			}
+
+			// Fatal: repeated identical failures mean retrying won't help.
+			if repeatFails[rKey] >= maxRepeatFails {
+				err := fmt.Errorf("repeated identical failed tool call (%q x%d): %s",
+					call.Name, repeatFails[rKey], result.Error)
+				agentErr := &AgentError{
+					Code:    "tool_repeat_loop",
+					Message: err.Error(),
+					Suggestion: "The model repeatedly ran the same failing command. " +
+						"Inspect the failing tool output and try a different approach.",
+				}
+				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
+				return &RunResult{Messages: runMessages, Usage: usage}, err
+			}
+			// Non-fatal hint: nudge the model to change approach (inject once).
+			if repeatCalls[rKey] == maxRepeatCalls {
+				runMessages = append(runMessages, models.Message{
+					ID:        newMessageID("human"),
+					SessionID: sessionID,
+					Role:      models.RoleHuman,
+					Content: fmt.Sprintf(
+						"You have run %q %d times with identical arguments. "+
+							"If the result isn't changing, you are in a loop. "+
+							"Try a different command, inspect the output more carefully, or move on.",
+						call.Name, repeatCalls[rKey]),
+					CreatedAt: time.Now().UTC(),
+				})
+			}
 
 			// Circuit-breaker: if the same tool fails argument validation 3 times
 			// in a row, inject a human hint and reset the counter. This prevents
@@ -983,6 +1056,65 @@ func toolMessageContent(result models.ToolResult) string {
 		s = s[:maxToolContentBytes] + fmt.Sprintf("\n... [truncated: %d bytes total]", len(s))
 	}
 	return s
+}
+
+// offloadIfNeeded checks if a tool result exceeds the offload threshold.
+// If so, it writes the full content to a file under offloadDir and replaces
+// result.Content with a compact reference (path + first/last 50 lines).
+// Returns true if offload occurred. Errors during file write are logged but
+// non-fatal — the result stays in-context (degraded but functional).
+func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bool {
+	if offloadDir == "" || len(result.Content) <= offloadThresholdBytes {
+		return false
+	}
+	// CallID is unique per invocation, making a safe filename.
+	callID := result.CallID
+	if callID == "" {
+		callID = newMessageID("offload")
+	}
+	offloadPath := filepath.Join(offloadDir, callID+".txt")
+
+	if err := os.MkdirAll(offloadDir, 0700); err != nil {
+		a.logger.Warn("offload mkdir failed", "dir", offloadDir, "err", err)
+		return false
+	}
+	if err := os.WriteFile(offloadPath, []byte(result.Content), 0644); err != nil {
+		a.logger.Warn("offload write failed", "path", offloadPath, "err", err)
+		return false
+	}
+
+	result.Content = buildOffloadedContent(result.Content, result.ToolName, offloadPath)
+	return true
+}
+
+// buildOffloadedContent creates the in-context replacement for an offloaded
+// result: a reference header, first 50 lines, last 50 lines, and an omission
+// notice for the middle.
+func buildOffloadedContent(original, toolName, offloadPath string) string {
+	lines := strings.Split(original, "\n")
+	totalLines := len(lines)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[offloaded: full output (%d bytes, %d lines) saved to %s]\n",
+		len(original), totalLines, offloadPath)
+
+	const headLimit = 50
+	const tailLimit = 50
+
+	if totalLines <= headLimit+tailLimit {
+		// Content fits in head+tail, include everything (still offloaded for recovery).
+		b.WriteString("\n")
+		b.WriteString(original)
+		return b.String()
+	}
+
+	b.WriteString("\n--- first 50 lines ---\n")
+	b.WriteString(strings.Join(lines[:headLimit], "\n"))
+	fmt.Fprintf(&b, "\n\n... (%d lines omitted) ...\n\n", totalLines-headLimit-tailLimit)
+	b.WriteString("--- last 50 lines ---\n")
+	b.WriteString(strings.Join(lines[totalLines-tailLimit:], "\n"))
+
+	return b.String()
 }
 
 func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {
@@ -1285,6 +1417,55 @@ func isValidationError(errMsg string) bool {
 // maxValidationRetries is the number of consecutive validation failures for the
 // same tool before the circuit-breaker injects a corrective human hint.
 const maxValidationRetries = 3
+
+// Repeat-call circuit-breaker thresholds.
+//
+// The validation breaker above only catches tools that fail argument schema
+// validation (CallStatusFailed + isValidationError). It cannot detect the much
+// more common loop pattern where a tool *succeeds* (e.g. bash runs `go test`,
+// returns exit_code 1 buried in the JSON output, CallStatusCompleted) but the
+// model keeps re-running the exact same command hoping for a different result.
+//
+// maxRepeatCalls: consecutive identical tool invocations (same name + args)
+// before injecting a non-fatal hint nudging the model to change approach.
+// maxRepeatFails: consecutive identical invocations that also fail (including
+// bash non-zero exit) before hard-stopping the run.
+const (
+	maxRepeatCalls = 5
+	maxRepeatFails = 8
+)
+
+// repeatKey builds a deduplication key from tool name and arguments hash.
+// Two calls with the same key are "the same operation" for loop detection.
+func repeatKey(toolName string, args map[string]any) string {
+	return toolName + "\x00" + computeArgsHash(args)
+}
+
+// extractBashExitCode parses the exit_code from a bash tool result's JSON
+// content. Returns 0 for non-bash tools or unparseable content. bash is the
+// primary tool whose "failure" (non-zero exit) is reported as a successful
+// tool execution (CallStatusCompleted) with the code buried in the output JSON.
+func extractBashExitCode(toolName, content string) int {
+	if toolName != "bash" || content == "" {
+		return 0
+	}
+	var parsed struct {
+		ExitCode int `json:"exit_code"`
+	}
+	if json.Unmarshal([]byte(content), &parsed) != nil {
+		return 0
+	}
+	return parsed.ExitCode
+}
+
+// isResultFailed reports whether a tool result represents a real failure,
+// including bash commands that exited non-zero despite CallStatusCompleted.
+func isResultFailed(result models.ToolResult) bool {
+	if result.Status == models.CallStatusFailed {
+		return true
+	}
+	return extractBashExitCode(result.ToolName, result.Content) != 0
+}
 
 // M1.2: Enhanced metrics collection helpers
 

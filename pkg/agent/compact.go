@@ -17,6 +17,10 @@ const (
 	// runMessages. Prevents individual bash/web-fetch outputs from inflating
 	// the context beyond any provider's practical limit.
 	maxToolContentBytes = 50_000
+	// offloadThresholdBytes is the size above which a tool result is written
+	// to disk and replaced in-context with a summary + first/last 50 lines.
+	// Per design doc §9 (l0_source_guard.offload_threshold_bytes).
+	offloadThresholdBytes = 24 * 1024
 )
 
 // compactMessages applies heuristic compression to old messages.
