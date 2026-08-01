@@ -11,6 +11,9 @@ import (
 	"github.com/millken/deepai/pkg/sandbox"
 )
 
+// M2.3: Bash output size limit to prevent extreme results
+const BashMaxOutputBytes = 50 * 1024 // 50KB hard limit
+
 func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 	args := call.Arguments
 
@@ -30,10 +33,22 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("bash failed: %w", err)
 	}
-
+	
+	// M2.3: Apply output size limit
+	stdout := result.Stdout()
+	stderr := result.Stderr()
+	
+	// Check total output size
+	totalSize := len(stdout) + len(stderr)
+	if totalSize > BashMaxOutputBytes {
+		// Truncate output to fit within limit
+		stdout = truncateOutput(stdout, BashMaxOutputBytes)
+		stderr = truncateOutput(stderr, BashMaxOutputBytes-len(stdout))
+	}
+	
 	output := &BashOutput{
-		Stdout:   result.Stdout(),
-		Stderr:   result.Stderr(),
+		Stdout:   stdout,
+		Stderr:   stderr,
 		ExitCode: result.ExitCode(),
 	}
 	data, _ := json.Marshal(output)
@@ -46,10 +61,35 @@ type BashOutput struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+// truncateOutput truncates output to fit within maxBytes, preserving head 70% and tail 30%
+func truncateOutput(output string, maxBytes int) string {
+	if len(output) <= maxBytes {
+		return output
+	}
+	
+	// Reserve space for truncation message
+	truncationMsg := "\n... (output truncated)"
+	msgSize := len(truncationMsg)
+	if maxBytes <= msgSize {
+		return output[:maxBytes]
+	}
+	
+	availableBytes := maxBytes - msgSize
+	headSize := int(float64(availableBytes) * 0.7)  // 70% for head
+	tailSize := availableBytes - headSize              // 30% for tail
+	
+	if len(output) > headSize+tailSize {
+		return output[:headSize] + truncationMsg + output[len(output)-tailSize:]
+	}
+	
+	// If output is smaller than expected, just truncate to maxBytes
+	return output[:maxBytes-msgSize] + truncationMsg
+}
+
 func BashTool() models.Tool {
 	return models.Tool{
 		Name:        "bash",
-		Description: "Execute shell commands for building, running, testing, package managers, git, and any task without a dedicated tool. Do NOT use bash for file operations — the dedicated file tools are more reliable in the sandbox. Returns stdout, stderr, and exit code as JSON.",
+		Description: "Execute shell commands for building, running, testing, package managers, git, and any task without a dedicated tool. Do NOT use bash for file operations — the dedicated file tools are more reliable in the sandbox. Output is limited to 50KB to prevent context overflow; large outputs are truncated with head 70% + tail 30% preserved. Returns stdout, stderr, and exit code as JSON.",
 		Groups:      []string{"builtin"},
 		InputSchema: map[string]any{
 			"type": "object",
