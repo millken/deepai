@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -558,9 +559,22 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					ToolResult: &result,
 					CreatedAt:  time.Now().UTC(),
 				})
-				if a.metrics != nil {
-					a.metrics.RecordToolResult(ToolResultMetric{Turn: turn, ToolName: result.ToolName, ResultBytes: len(result.Content)})
-				}
+					if a.metrics != nil {
+						// M1.2: Enhanced metrics collection
+						argsHash := computeArgsHash(call.Arguments)
+						filePath := extractPathFromArgs(result.ToolName, call.Arguments)
+						durationMs := result.Duration.Milliseconds()
+						
+						a.metrics.RecordToolResult(ToolResultMetric{
+							Turn:        turn,
+							ToolName:    result.ToolName,
+							ResultBytes: len(result.Content),
+							ArgsHash:    argsHash,
+							Path:        filePath,
+							Offloaded:   false, // TODO: implement offload detection in M2.3
+							DurationMs:  durationMs,
+						})
+					}
 				toolMessage := runMessages[len(runMessages)-1]
 				emit(AgentEvent{
 					Type:      AgentEventToolResult,
@@ -668,9 +682,22 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				ToolResult: &result,
 				CreatedAt:  time.Now().UTC(),
 			})
-			if a.metrics != nil {
-				a.metrics.RecordToolResult(ToolResultMetric{Turn: turn, ToolName: result.ToolName, ResultBytes: len(result.Content)})
-			}
+					if a.metrics != nil {
+						// M1.2: Enhanced metrics collection
+						argsHash := computeArgsHash(call.Arguments)
+						filePath := extractPathFromArgs(result.ToolName, call.Arguments)
+						durationMs := result.Duration.Milliseconds()
+						
+						a.metrics.RecordToolResult(ToolResultMetric{
+							Turn:        turn,
+							ToolName:    result.ToolName,
+							ResultBytes: len(result.Content),
+							ArgsHash:    argsHash,
+							Path:        filePath,
+							Offloaded:   false, // TODO: implement offload detection in M2.3
+							DurationMs:  durationMs,
+						})
+					}
 			toolMessage := runMessages[len(runMessages)-1]
 			emit(AgentEvent{
 				Type:      AgentEventToolResult,
@@ -1237,3 +1264,61 @@ func isValidationError(errMsg string) bool {
 // maxValidationRetries is the number of consecutive validation failures for the
 // same tool before the circuit-breaker injects a corrective human hint.
 const maxValidationRetries = 3
+
+// M1.2: Enhanced metrics collection helpers
+
+// computeArgsHash generates a hash of tool arguments for deduplication detection
+func computeArgsHash(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	// Sort keys for consistent hashing
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	
+	var hashContent strings.Builder
+	for _, k := range keys {
+		hashContent.WriteString(k)
+		hashContent.WriteString("=")
+		// Simple string representation for hashing
+		hashContent.WriteString(fmt.Sprintf("%v", args[k]))
+		hashContent.WriteString("&")
+	}
+	
+	// Use the content string itself as hash for simplicity (can be upgraded to crypto hash)
+	// For deduplication purposes, exact string match is sufficient
+	return hashContent.String()
+}
+
+// extractPathFromArgs extracts file path from tool arguments if applicable
+func extractPathFromArgs(toolName string, args map[string]any) string {
+	// File-based tools that typically have a "path" argument
+	fileTools := map[string]bool{
+		"read_file":  true,
+		"edit_file":  true,
+		"write_file": true,
+		"list_dir":   true,
+		"find":       true,
+		"code_map":   true,
+	}
+	
+	if !fileTools[toolName] {
+		return ""
+	}
+	
+	if path, ok := args["path"].(string); ok && path != "" {
+		return path
+	}
+	
+	// Some tools might use different parameter names
+	if toolName == "code_map" {
+		if path, ok := args["directory"].(string); ok && path != "" {
+			return path
+		}
+	}
+	
+	return ""
+}

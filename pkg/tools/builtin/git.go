@@ -162,23 +162,60 @@ func GitDiffHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 	dir := workingDirFromArgs(args)
 	staged, _ := args["staged"].(bool)
 
-	gitArgs := []string{"diff"}
-	if staged {
-		gitArgs = []string{"diff", "--cached"}
+	// M2.1: Support format selection, default to stat for large result reduction
+	format := "stat" // Default to stat format (80%+ byte reduction)
+	if f, ok := args["format"].(string); ok && (f == "full" || f == "stat") {
+		format = f
 	}
 
-	cmd := gitCmd(ctx, dir, gitArgs...)
+	// Build base git args
+	baseGitArgs := []string{"diff"}
+	if staged {
+		baseGitArgs = []string{"diff", "--cached"}
+	}
+
+	if format == "stat" {
+		// Return stat format by default (much smaller, sufficient for most cases)
+		statArgs := append([]string(nil), baseGitArgs...)
+		statArgs = append(statArgs, "--stat")
+		statOutput, err := gitCmd(ctx, dir, statArgs...).CombinedOutput()
+		if err != nil {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("git diff --stat failed: %w", err)
+		}
+
+		// Get file list
+		nameArgs := append([]string(nil), baseGitArgs...)
+		nameArgs = append(nameArgs, "--name-only")
+		nameOutput, _ := gitCmd(ctx, dir, nameArgs...).CombinedOutput()
+		files := splitLines(string(nameOutput))
+
+		result := map[string]any{
+			"staged": staged,
+			"format": "stat",
+			"files":  files,
+			"stats":  strings.TrimSpace(string(statOutput)),
+			"note":   "Full diff available with format: \"full\" or per-file drill-down",
+		}
+		data, _ := json.Marshal(result)
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data), Data: result}, nil
+	}
+
+	// Original full diff logic (when format == "full")
+	cmd := gitCmd(ctx, dir, baseGitArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("git diff failed: %w", err)
 	}
-	nameArgs := append(append([]string(nil), gitArgs...), "--name-only")
+	nameArgs := append([]string(nil), baseGitArgs...)
+	nameArgs = append(nameArgs, "--name-only")
 	nameOutput, _ := gitCmd(ctx, dir, nameArgs...).CombinedOutput()
-	statArgs := append(append([]string(nil), gitArgs...), "--stat")
+	statArgs := append([]string(nil), baseGitArgs...)
+	statArgs = append(statArgs, "--stat")
 	statOutput, _ := gitCmd(ctx, dir, statArgs...).CombinedOutput()
 	files := splitLines(string(nameOutput))
 	result := map[string]any{
 		"staged": staged,
+		"format": "full",
 		"files":  files,
 		"stats":  strings.TrimSpace(string(statOutput)),
 		"diff":   string(output),
@@ -374,13 +411,21 @@ func GitStatusTool() models.Tool {
 func GitDiffTool() models.Tool {
 	return models.Tool{
 		Name:         "git_diff",
-		Description:  "Show the diff of changes in the repository.",
+		Description:  "Show the diff of changes in the repository. Defaults to stat format for efficiency; use format: \"full\" for complete diff when needed.",
 		Groups:       []string{"builtin", "git"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"staged":      map[string]any{"type": "boolean", "description": "Show staged changes instead of working directory changes"},
+				"staged": map[string]any{
+					"type":        "boolean",
+					"description": "Show staged changes instead of working directory changes",
+				},
+				"format": map[string]any{
+					"type":        "string",
+					"enum":        []string{"stat", "full"},
+					"description": "Output format: \"stat\" (default, shows file statistics) or \"full\" (shows complete diff). Stat format is sufficient for most cases and uses 80%+ fewer tokens.",
+				},
 				"working_dir": workingDirSchema,
 			},
 		},

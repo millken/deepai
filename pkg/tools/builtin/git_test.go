@@ -154,6 +154,8 @@ func TestGitDiffHandler_StructuredData(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitOutput(t, dir, "add", "--", "diff.txt")
+	
+	// Test M2.1: Default stat format
 	result, err := GitDiffHandler(context.Background(), models.ToolCall{
 		ID:        callID(t),
 		Name:      "git_diff",
@@ -164,17 +166,62 @@ func TestGitDiffHandler_StructuredData(t *testing.T) {
 	}
 	var payload struct {
 		Staged bool     `json:"staged"`
+		Format string   `json:"format"`
+		Files  []string `json:"files"`
+		Stats  string   `json:"stats"`
+		Diff   string   `json:"diff,omitempty"` // Only present in full format
+	}
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	// Verify default stat format behavior
+	if payload.Format != "stat" {
+		t.Fatalf("expected default format 'stat', got '%s'", payload.Format)
+	}
+	if !payload.Staged || len(payload.Files) != 1 || payload.Files[0] != "diff.txt" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	// In stat format, diff field should not be present
+	if payload.Diff != "" {
+		t.Fatal("stat format should not include full diff")
+	}
+	// Stats should contain file statistics
+	if !strings.Contains(payload.Stats, "diff.txt") {
+		t.Fatalf("stats should contain file name, got: %q", payload.Stats)
+	}
+}
+
+func TestGitDiffHandler_FullFormat(t *testing.T) {
+	dir := initGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "diff.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, dir, "add", "--", "diff.txt")
+	
+	// Test M2.1: Explicit full format request
+	result, err := GitDiffHandler(context.Background(), models.ToolCall{
+		ID:        callID(t),
+		Name:      "git_diff",
+		Arguments: map[string]any{"working_dir": dir, "staged": true, "format": "full"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Staged bool     `json:"staged"`
+		Format string   `json:"format"`
 		Files  []string `json:"files"`
 		Diff   string   `json:"diff"`
 	}
 	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if !payload.Staged || len(payload.Files) != 1 || payload.Files[0] != "diff.txt" {
-		t.Fatalf("unexpected payload: %+v", payload)
+	// Verify full format behavior
+	if payload.Format != "full" {
+		t.Fatalf("expected format 'full', got '%s'", payload.Format)
 	}
 	if !strings.Contains(payload.Diff, "+hello") {
-		t.Fatalf("unexpected diff: %q", payload.Diff)
+		t.Fatalf("full format should include diff, got: %q", payload.Diff)
 	}
 }
 
