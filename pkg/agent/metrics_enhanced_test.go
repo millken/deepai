@@ -24,9 +24,9 @@ func TestComputeArgsHash(t *testing.T) {
 		{
 			name: "multiple args",
 			args: map[string]any{
-				"path":      "/tmp/test",
-				"pattern":   "foo",
-				"context":   2,
+				"path":             "/tmp/test",
+				"pattern":          "foo",
+				"context":          2,
 				"case_insensitive": true,
 			},
 			wantHash: "case_insensitive=true&context=2&path=/tmp/test&pattern=foo&",

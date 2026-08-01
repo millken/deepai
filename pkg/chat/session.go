@@ -277,6 +277,18 @@ func (s *SQLiteSessionStore) AppendMessage(sessionID string, msg models.Message)
 		msg.CreatedAt = time.Now()
 	}
 
+	// Images are not persisted (they can be large base64 blobs). Replace them
+	// with a text placeholder so the transcript remains coherent on reload.
+	content := msg.Content
+	if len(msg.Images) > 0 {
+		placeholder := fmt.Sprintf("[%d image(s) attached — not persisted]", len(msg.Images))
+		if content == "" {
+			content = placeholder
+		} else {
+			content = content + "\n" + placeholder
+		}
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin append message: %w", err)
@@ -304,7 +316,7 @@ func (s *SQLiteSessionStore) AppendMessage(sessionID string, msg models.Message)
 	_, err = tx.Exec(`
 		INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, msg.ID, sessionID, seq, string(msg.Role), msg.Content, toolCallsJSON, toolResultJSON, unixFrac(msg.CreatedAt))
+	`, msg.ID, sessionID, seq, string(msg.Role), content, toolCallsJSON, toolResultJSON, unixFrac(msg.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append message: %w", err)
 	}

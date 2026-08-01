@@ -59,10 +59,10 @@ type ToolResultMetric struct {
 	ToolName    string `json:"tool_name"`
 	ResultBytes int    `json:"result_bytes"`
 	// M1.2: Enhanced metrics for compression evaluation
-	ArgsHash    string `json:"args_hash,omitempty"`    // tool arguments hash for deduplication detection
-	Path        string `json:"path,omitempty"`         // file path for file-based tools
-	Offloaded   bool   `json:"offloaded,omitempty"`     // whether result was offloaded to disk
-	DurationMs  int64  `json:"duration_ms,omitempty"`   // tool execution duration in milliseconds
+	ArgsHash   string `json:"args_hash,omitempty"`   // tool arguments hash for deduplication detection
+	Path       string `json:"path,omitempty"`        // file path for file-based tools
+	Offloaded  bool   `json:"offloaded,omitempty"`   // whether result was offloaded to disk
+	DurationMs int64  `json:"duration_ms,omitempty"` // tool execution duration in milliseconds
 }
 
 // MetricsSink receives Phase 0 measurements. Implementations must be safe for

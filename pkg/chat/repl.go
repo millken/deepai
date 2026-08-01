@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/imageproc"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
@@ -60,7 +61,7 @@ type ReplUI interface {
 	SetStatus(model string, planMode bool)
 	Banner(info BannerInfo)
 	AskQuestion(ctx context.Context, question string, options []string) (string, error)
-	ReadPrompt(ctx context.Context) (string, error)
+	ReadPrompt(ctx context.Context) (string, []models.MessageImage, error)
 	TurnStart(turn int, userInput string)
 	TurnEnd(usage *agent.Usage)
 	RenderEvent(evt agent.AgentEvent)
@@ -86,6 +87,7 @@ type ChatRepl struct {
 	planMode          bool   // restrict to read-only tools until user approves plan
 	currentModel      string // selected model alias (from ModelRegistry)
 	currentEffort     string // reasoning effort: "low", "medium", "high", "disabled", or "" (provider default)
+	imageDetail       string // vision detail: "low" (default), "high", or "" (use "low")
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -184,7 +186,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		}
 
 		// Wait for user input.
-		line, err := r.ui.ReadPrompt(parentCtx)
+		line, images, err := r.ui.ReadPrompt(parentCtx)
 		if err != nil {
 			if errors.Is(err, errInterrupted) {
 				// Ctrl+C at prompt — exit REPL.
@@ -194,7 +196,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			// io.EOF (Ctrl+D) or context cancellation: exit quietly.
 			break
 		}
-		if line == "" {
+		if line == "" && len(images) == 0 {
 			continue
 		}
 
@@ -205,7 +207,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 				r.turn++
 				body := Expand(c.Body, cmd.Args)
 				turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-					return r.runTurn(ctx, body, false)
+					return r.runTurn(ctx, body, nil, false)
 				})
 				if turnErr != nil {
 					if turnErr.cancelled {
@@ -241,8 +243,11 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 
 		r.turn++
 
+		// Capture images for this turn (may be nil).
+		turnImages := images
+
 		turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-			return r.runTurn(ctx, line, false)
+			return r.runTurn(ctx, line, turnImages, false)
 		})
 		if turnErr != nil {
 			if turnErr.cancelled {
@@ -419,7 +424,7 @@ func (r *ChatRepl) continueTurn(ctx context.Context) error {
 	// resumed request is well-formed for the provider API (the reload path does
 	// this too, but an in-session "continue" never reloads from the DB).
 	r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
-	return r.runTurn(ctx, "Continue from where you left off.", true)
+	return r.runTurn(ctx, "Continue from where you left off.", nil, true)
 }
 
 // turnError wraps errors from runTurn to distinguish cancellation from real errors.
@@ -472,13 +477,20 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 	return &turnError{err: err, cancelled: interrupted}
 }
 
-func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation bool) error {
+func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []models.MessageImage, continuation bool) error {
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
 		r.ui.RenderSubagentEvent(evt)
 	})
 
 	// Evaluate fact feedback from previous turn (consume-once).
 	r.evaluateFactFeedback(r.sess.ID, r.turn, userInput)
+
+	// Parse @path image references from the input text.
+	cleanedInput, pathImages := parseImageReferences(userInput, r.cfg.WorkDir)
+	if len(pathImages) > 0 {
+		images = append(images, pathImages...)
+		userInput = cleanedInput
+	}
 
 	// Append user message to session history. A continuation is a synthetic
 	// nudge (e.g. resume after interrupt), not a real user turn: hand it to the
@@ -488,6 +500,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 		SessionID: r.sess.ID,
 		Role:      models.RoleHuman,
 		Content:   userInput,
+		Images:    images,
 	}
 	if !continuation {
 		if err := r.sessMgr.AppendMessage(r.sess.ID, userMsg); err != nil {
@@ -518,6 +531,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 		MemoryService:   r.cfg.MemoryService,
 		MemoryExtractor: r.cfg.MemoryExtractor,
 		MemoryUserID:    r.cfg.WorkDir,
+		ImageDetail:     r.currentImageDetail(),
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -840,6 +854,10 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.handleModelCommand(parentCtx, cmd.Args)
 	case "effort":
 		r.handleEffortCommand(parentCtx, cmd.Args)
+	case "image":
+		r.handleImageCommand(parentCtx, cmd.Args)
+	case "imagedetail", "imagequality":
+		r.handleImageDetailCommand(cmd.Args)
 	case "doctor":
 		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":
@@ -968,6 +986,15 @@ func (r *ChatRepl) currentReasoningEffort() string {
 	return def.Effort
 }
 
+// currentImageDetail returns the vision detail level for image attachments.
+// Default is "low" (single tile, ~170 tokens) for token efficiency.
+func (r *ChatRepl) currentImageDetail() string {
+	if d := strings.TrimSpace(r.imageDetail); d != "" {
+		return d
+	}
+	return "low"
+}
+
 // handleEffortCommand implements /effort: show current, list valid values, or set effort.
 func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
 	args = strings.TrimSpace(args)
@@ -1005,6 +1032,72 @@ func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
 	r.persistModel()
 	r.ui.Info(fmt.Sprintf("  Reasoning effort set to: %s", r.currentEffort))
 	r.ui.Info("  (takes effect on next turn)")
+}
+
+// handleImageCommand implements /image: show clipboard support status or
+// attach an image file by path for the next turn.
+func (r *ChatRepl) handleImageCommand(ctx context.Context, args string) {
+	args = strings.TrimSpace(args)
+
+	if args == "" {
+		// Show clipboard support status.
+		r.ui.Info(fmt.Sprintf("  Clipboard image support: %s", imageproc.ClipboardSupport()))
+		r.ui.Info("  Usage:")
+		r.ui.Info("    Ctrl+V     Paste image from clipboard")
+		r.ui.Info("    @path.png  Reference image file in your message")
+		r.ui.Info("    /image <path>  Attach image file explicitly")
+		return
+	}
+
+	// /image <path> — read and optimize the image, then run a turn with it.
+	resolved := args
+	if !filepath.IsAbs(resolved) && r.cfg.WorkDir != "" {
+		resolved = filepath.Join(r.cfg.WorkDir, resolved)
+	}
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		r.ui.Info(fmt.Sprintf("  Error reading image: %v", err))
+		return
+	}
+	result, err := imageproc.Optimize(raw, imageproc.DefaultOptions)
+	if err != nil {
+		r.ui.Info(fmt.Sprintf("  Error optimizing image: %v", err))
+		return
+	}
+	images := []models.MessageImage{{MimeType: result.MimeType, Base64: result.Base64}}
+	r.ui.Info(fmt.Sprintf("  Attached: %s (%s, %dKB, ~%d tokens)",
+		filepath.Base(args), result.MimeType, result.Bytes/1024,
+		imageproc.EstimateTilesToTokens(1, "low")))
+
+	r.turn++
+	turnErr := r.runTurnWithSignal(ctx, func(ctx context.Context) error {
+		return r.runTurn(ctx, fmt.Sprintf("Please analyze this image: %s", filepath.Base(args)), images, false)
+	})
+	if turnErr != nil {
+		if turnErr.cancelled {
+			r.ui.RenderInterrupted()
+			return
+		}
+		r.ui.Info(fmt.Sprintf("  Error: %v", turnErr))
+	}
+}
+
+// handleImageDetailCommand implements /imagedetail: set vision detail level.
+func (r *ChatRepl) handleImageDetailCommand(args string) {
+	args = strings.TrimSpace(strings.ToLower(args))
+	if args == "" {
+		current := r.currentImageDetail()
+		r.ui.Info(fmt.Sprintf("  Current image detail: %s", current))
+		r.ui.Info("  Valid values: low (default, ~170 tokens), high (multi-tile, finer detail)")
+		r.ui.Info("  Usage: /imagedetail <low|high>")
+		return
+	}
+	if args != "low" && args != "high" && args != "auto" {
+		r.ui.Info(fmt.Sprintf("  Invalid value %q. Valid: low, high, auto", args))
+		return
+	}
+	r.imageDetail = args
+	r.ui.Info(fmt.Sprintf("  Image detail set to: %s (takes effect on next turn)", args))
 }
 
 // currentContextWindow returns the effective context window for the current
@@ -1197,6 +1290,8 @@ func (r *ChatRepl) statusText() string {
 	}
 	fmt.Fprintf(&sb, "  Session: %s\n", sessionID)
 	fmt.Fprintf(&sb, "  Loaded tools: %d (builtin/custom: %d, mcp: %d)\n", len(tools), len(tools)-mcpTools, mcpTools)
+	fmt.Fprintf(&sb, "  Image clipboard: %s\n", imageproc.ClipboardSupport())
+	fmt.Fprintf(&sb, "  Image detail: %s\n", r.currentImageDetail())
 
 	if len(mcpServers) == 0 {
 		sb.WriteString("  MCP servers: none\n")
@@ -1542,4 +1637,72 @@ func (r *ChatRepl) monitorFalseReward(classification memory.FeedbackClassificati
 		}
 		r.consecCorrections = 0
 	}
+}
+
+var imageFileExts = map[string]bool{
+	".png":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".webp": true,
+	".gif":  true,
+}
+
+// parseImageReferences scans input for @path tokens pointing to image files,
+// reads and optimizes them, and returns the cleaned text (with image refs
+// replaced by placeholders) and the parsed images.
+// Non-image @path references are left untouched. Original whitespace is
+// preserved.
+func parseImageReferences(input string, workDir string) (string, []models.MessageImage) {
+	var images []models.MessageImage
+	cleaned := input
+	slog.Debug("parseImageReferences", "input", input, "workDir", workDir)
+
+	for _, w := range strings.Fields(input) {
+		if !strings.HasPrefix(w, "@") {
+			continue
+		}
+		pathStr := strings.TrimPrefix(w, "@")
+		// Strip surrounding quotes.
+		pathStr = strings.Trim(pathStr, `"'`)
+		if pathStr == "" {
+			continue
+		}
+
+		ext := strings.ToLower(filepath.Ext(pathStr))
+		if !imageFileExts[ext] {
+			slog.Debug("parseImageReferences: not an image ext", "word", w, "ext", ext)
+			continue
+		}
+
+		// Resolve relative to workDir.
+		resolved := pathStr
+		if !filepath.IsAbs(resolved) && workDir != "" {
+			resolved = filepath.Join(workDir, resolved)
+		}
+
+		raw, err := os.ReadFile(resolved)
+		if err != nil {
+			slog.Debug("parseImageReferences: read failed", "path", resolved, "err", err)
+			continue // not readable → leave the @ref as-is
+		}
+
+		result, err := imageproc.Optimize(raw, imageproc.DefaultOptions)
+		if err != nil {
+			slog.Warn("image optimization failed", "path", resolved, "err", err)
+			continue
+		}
+
+		slog.Debug("parseImageReferences: image loaded", "path", resolved, "mime", result.MimeType, "bytes", result.Bytes)
+
+		// Replace just this @path token with a placeholder (preserves spacing).
+		// Keep the full resolved path so the model can pass it to vision MCP tools.
+		idx := len(images) // 1-based after append below
+		images = append(images, models.MessageImage{
+			MimeType: result.MimeType,
+			Base64:   result.Base64,
+		})
+		cleaned = strings.Replace(cleaned, w, fmt.Sprintf("[image#%d:%s]", idx, resolved), 1)
+	}
+
+	return cleaned, images
 }

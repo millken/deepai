@@ -14,7 +14,7 @@ func TestMapMessagesToOpenAI_SystemPrompt(t *testing.T) {
 	msgs := []models.Message{
 		{Role: models.RoleHuman, Content: "hello"},
 	}
-	result := mapMessagesToOpenAI("you are helpful", msgs)
+	result := mapMessagesToOpenAI("you are helpful", msgs, "low")
 	if len(result) != 2 {
 		t.Fatalf("expected 2 messages (system + user), got %d", len(result))
 	}
@@ -31,7 +31,7 @@ func TestMapMessagesToOpenAI_ToolResult(t *testing.T) {
 		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "c1", Name: "test"}}, Content: ""},
 		{Role: models.RoleTool, Content: "result", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "test"}},
 	}
-	result := mapMessagesToOpenAI("", msgs)
+	result := mapMessagesToOpenAI("", msgs, "low")
 	if len(result) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(result))
 	}
@@ -52,7 +52,7 @@ func TestMapMessagesToOpenAI_AssistantWithToolCalls(t *testing.T) {
 			{ID: "c1", Name: "read_file", Arguments: map[string]any{"path": "/test.go"}},
 		}, Content: "thinking..."},
 	}
-	result := mapMessagesToOpenAI("", msgs)
+	result := mapMessagesToOpenAI("", msgs, "low")
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
 	}
@@ -76,13 +76,45 @@ func TestMapMessagesToOpenAI_EmptyContent(t *testing.T) {
 		{Role: models.RoleAI, Content: ""},
 		{Role: models.RoleTool, Content: "", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "t"}},
 	}
-	result := mapMessagesToOpenAI("", msgs)
+	result := mapMessagesToOpenAI("", msgs, "low")
 	for _, m := range result {
 		if m.OfTool != nil {
 			if m.OfTool.Content.OfString.Value == "" {
 				t.Error("tool content should not be empty")
 			}
 		}
+	}
+}
+
+func TestMapMessagesToOpenAI_WithImages(t *testing.T) {
+	msgs := []models.Message{
+		{
+			Role:    models.RoleHuman,
+			Content: "What's in this image?",
+			Images: []models.MessageImage{
+				{MimeType: "image/png", Base64: "iVBORw0KGgo="},
+			},
+		},
+	}
+	result := mapMessagesToOpenAI("", msgs, "low")
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	if result[0].OfUser == nil {
+		t.Fatal("expected user message")
+	}
+	parts := result[0].OfUser.Content.OfArrayOfContentParts
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 content parts (text + image), got %d", len(parts))
+	}
+	if parts[0].OfText == nil {
+		t.Error("first part should be text")
+	}
+	if parts[1].OfImageURL == nil {
+		t.Error("second part should be image")
+	}
+	if parts[1].OfImageURL.ImageURL.Detail != "low" {
+		t.Errorf("detail: got %q, want %q", parts[1].OfImageURL.ImageURL.Detail, "low")
 	}
 }
 

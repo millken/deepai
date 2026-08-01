@@ -190,6 +190,16 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 			continue // current turn (or pre-first-AI): keep full fidelity
 		}
 
+		// Images: strip base64 data from aged messages to save tokens. The
+		// image is no longer useful for historical context — a text placeholder
+		// suffices to indicate an image was once attached.
+		if len(msg.Images) > 0 {
+			msg.Images = nil
+			if msg.Content == "" {
+				msg.Content = "[image attachments removed for context compression]"
+			}
+		}
+
 		switch msg.Role {
 		case models.RoleTool: // T1
 			toolName := ""

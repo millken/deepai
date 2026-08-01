@@ -555,7 +555,7 @@ func TestRepeatBreaker_ResetsOnDifferentCall(t *testing.T) {
 	if err := reg.Register(models.Tool{
 		Name: "a",
 		InputSchema: map[string]any{
-			"type": "object",
+			"type":       "object",
 			"properties": map[string]any{"v": map[string]any{"type": "string"}},
 		},
 		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
@@ -567,7 +567,7 @@ func TestRepeatBreaker_ResetsOnDifferentCall(t *testing.T) {
 	if err := reg.Register(models.Tool{
 		Name: "b",
 		InputSchema: map[string]any{
-			"type": "object",
+			"type":       "object",
 			"properties": map[string]any{"v": map[string]any{"type": "string"}},
 		},
 		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {

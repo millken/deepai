@@ -79,6 +79,10 @@ type AgentConfig struct {
 	// OffloadDir is where tool results exceeding the offload threshold are
 	// written to disk. Empty = auto-derive ~/.deepai/offload in New().
 	OffloadDir string
+
+	// ImageDetail controls the vision detail level for image attachments.
+	// "low" (default, ~170 tokens/image) or "high" (multi-tile, finer detail).
+	ImageDetail string
 }
 
 type TimeoutError struct {

@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"github.com/charmbracelet/glamour"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/imageproc"
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
 )
 
@@ -119,16 +122,16 @@ func (t *TUI) SetStatus(model string, planMode bool) {
 
 // ReadPrompt focuses the input box and blocks until the user submits a line,
 // presses Ctrl+C at an empty prompt (errInterrupted), or Ctrl+D (io.EOF).
-func (t *TUI) ReadPrompt(ctx context.Context) (string, error) {
+func (t *TUI) ReadPrompt(ctx context.Context) (string, []models.MessageImage, error) {
 	reply := make(chan inputResult, 1)
 	t.p.Send(requestInputMsg{reply: reply})
 	select {
 	case r := <-reply:
-		return r.value, r.err
+		return r.value, r.images, r.err
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", nil, ctx.Err()
 	case <-t.done:
-		return "", io.EOF
+		return "", nil, io.EOF
 	}
 }
 
@@ -192,8 +195,9 @@ func (t *TUI) SaveHistory() {
 // ---------------------------------------------------------------------------
 
 type inputResult struct {
-	value string
-	err   error
+	value  string
+	images []models.MessageImage
+	err    error
 }
 
 type printMsg struct{ text string }
@@ -264,6 +268,10 @@ type tuiModel struct {
 	// slash-command autocomplete
 	suggestions []slashCmd
 	suggestIdx  int
+
+	// pendingImages holds images attached via Ctrl+V clipboard paste, to be
+	// sent with the next submitted message.
+	pendingImages []models.MessageImage
 }
 
 func newTUIModel(status BannerInfo) *tuiModel {
@@ -439,6 +447,15 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "ctrl+v":
+		// Try to read an image from the system clipboard. If the clipboard
+		// has an image, attach it and consume the event. If not, fall
+		// through to the default handler so the textarea performs a normal
+		// text paste.
+		if m.inputVisible && m.tryPasteClipboardImage() {
+			return m, nil
+		}
+
 	case "ctrl+r":
 		// Toggle AI output between markdown and raw, and re-emit the last reply
 		// in the new mode so you can flip the same message back and forth
@@ -466,6 +483,11 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.suggestIdx = 0
 			return m, nil
 		}
+		// Clear pending clipboard images if any.
+		if len(m.pendingImages) > 0 {
+			m.pendingImages = nil
+			return m, nil
+		}
 
 	case "enter":
 		if !m.inputVisible {
@@ -484,7 +506,8 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		val := m.ta.Value()
-		if !m.askActive && strings.TrimSpace(val) == "" {
+		// Allow submit with empty text if there are pending images.
+		if !m.askActive && strings.TrimSpace(val) == "" && len(m.pendingImages) == 0 {
 			return m, nil
 		}
 		if !m.askActive {
@@ -536,9 +559,62 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// tryPasteClipboardImage attempts to read an image from the system clipboard.
+// If successful, it saves the optimized image to a temp file (so vision MCP
+// tools can access it by path), appends it to pendingImages, and inserts an
+// [image:/path] token into the textarea. Returns false if the clipboard has
+// no image or processing fails, so the caller falls through to text-paste.
+func (m *tuiModel) tryPasteClipboardImage() bool {
+	raw, err := imageproc.ReadClipboardImage()
+	if err != nil || len(raw) == 0 {
+		return false
+	}
+
+	result, err := imageproc.Optimize(raw, imageproc.DefaultOptions)
+	if err != nil {
+		return false
+	}
+
+	// Save to temp file so vision MCP tools can access by path.
+	ext := ".jpg"
+	if result.MimeType == "image/png" {
+		ext = ".png"
+	}
+	tmpFile, err := os.CreateTemp("", "deepai-clipboard-*"+ext)
+	if err != nil {
+		return false
+	}
+	imgBytes, err := base64.StdEncoding.DecodeString(result.Base64)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return false
+	}
+	if _, err := tmpFile.Write(imgBytes); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return false
+	}
+	tmpFile.Close()
+
+	idx := len(m.pendingImages)
+	m.pendingImages = append(m.pendingImages, models.MessageImage{
+		MimeType: result.MimeType,
+		Base64:   result.Base64,
+	})
+	// Insert path placeholder so the model can call MCP vision tools.
+	m.ta.InsertString(fmt.Sprintf("[image#%d:%s] ", idx, tmpFile.Name()))
+	return true
+}
+
 // submitInput delivers a result to the waiting ReadPrompt/AskQuestion call and
 // hides the input box.
 func (m *tuiModel) submitInput(r inputResult) {
+	// Attach any pending clipboard images to the result (only for normal
+	// prompt submissions, not for tool-question answers).
+	if r.images == nil && len(m.pendingImages) > 0 && !m.askActive {
+		r.images = m.pendingImages
+	}
 	if m.inputReply != nil {
 		m.inputReply <- r
 		m.inputReply = nil
@@ -549,6 +625,7 @@ func (m *tuiModel) submitInput(r inputResult) {
 	m.ta.SetValue("")
 	m.suggestions = nil
 	m.suggestIdx = 0
+	m.pendingImages = nil
 }
 
 func (m *tuiModel) recordHistory(val string) {
@@ -885,6 +962,10 @@ func (m *tuiModel) View() tea.View {
 			b.WriteString("\n")
 		}
 		b.WriteString(m.ta.View())
+		if len(m.pendingImages) > 0 {
+			b.WriteString("\n")
+			b.WriteString(m.renderPendingImages())
+		}
 		if len(m.suggestions) > 0 {
 			b.WriteString("\n")
 			b.WriteString(m.renderSuggestions())
@@ -948,11 +1029,24 @@ func (m *tuiModel) idleFooter() string {
 	if !m.renderMD {
 		out = "raw"
 	}
-	footer := m.styles.Dim.Render(fmt.Sprintf("  %s · %s · ctrl+r:%s · /help", model, mode, out))
+	footer := m.styles.Dim.Render(fmt.Sprintf("  %s · %s · ctrl+r:%s · ctrl+v:image · /help", model, mode, out))
 	if ctx := m.contextGauge(); ctx != "" {
 		footer += " " + ctx
 	}
 	return footer
+}
+
+// renderPendingImages shows a summary line for clipboard-attached images.
+func (m *tuiModel) renderPendingImages() string {
+	parts := make([]string, 0, len(m.pendingImages))
+	for i, img := range m.pendingImages {
+		// Approximate decoded size from base64 length.
+		sizeKB := len(img.Base64) * 3 / 4 / 1024
+		label := fmt.Sprintf("📎 image#%d %s ~%dKB", i+1, img.MimeType, sizeKB)
+		parts = append(parts, m.styles.Highlight.Render(label))
+	}
+	hint := m.styles.Dim.Render("Enter to send · Ctrl+V for more · Esc to clear")
+	return "  " + strings.Join(parts, "  ") + "\n  " + hint
 }
 
 // commit emits a permanent scrollback line above the live region.

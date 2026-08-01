@@ -74,10 +74,10 @@ func TestRecommendSearchTool(t *testing.T) {
 
 func TestIsFileNameSearch(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		query string
-		args map[string]any
-		want bool
+		args  map[string]any
+		want  bool
 	}{
 		{"file name indicator", "find files named test", map[string]any{}, true},
 		{"filename keyword", "search for filename main.go", map[string]any{}, true},
@@ -98,9 +98,9 @@ func TestIsFileNameSearch(t *testing.T) {
 
 func TestIsComplexOperation(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		query string
-		want bool
+		want  bool
 	}{
 		{"pipe operation", "find files and count them", true},
 		{"combine keyword", "combine grep and sort", true},
@@ -121,9 +121,9 @@ func TestIsComplexOperation(t *testing.T) {
 
 func TestIsGitRelatedSearch(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		query string
-		want bool
+		want  bool
 	}{
 		{"git commit search", "find commits by author", true},
 		{"git history", "show git history for file", true},
@@ -147,7 +147,7 @@ func TestGetToolRecommendations(t *testing.T) {
 	if rec == "" {
 		t.Error("Expected non-empty recommendations")
 	}
-	
+
 	// Check that it contains key sections
 	keySections := []string{
 		"When to use grep",
@@ -155,7 +155,7 @@ func TestGetToolRecommendations(t *testing.T) {
 		"Decision Tree",
 		"Performance Tips",
 	}
-	
+
 	for _, section := range keySections {
 		if !contains(rec, section) {
 			t.Errorf("Expected recommendations to contain %q", section)

@@ -33,11 +33,11 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("bash failed: %w", err)
 	}
-	
+
 	// M2.3: Apply output size limit
 	stdout := result.Stdout()
 	stderr := result.Stderr()
-	
+
 	// Check total output size
 	totalSize := len(stdout) + len(stderr)
 	if totalSize > BashMaxOutputBytes {
@@ -45,7 +45,7 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		stdout = truncateOutput(stdout, BashMaxOutputBytes)
 		stderr = truncateOutput(stderr, BashMaxOutputBytes-len(stdout))
 	}
-	
+
 	output := &BashOutput{
 		Stdout:   stdout,
 		Stderr:   stderr,
@@ -66,22 +66,22 @@ func truncateOutput(output string, maxBytes int) string {
 	if len(output) <= maxBytes {
 		return output
 	}
-	
+
 	// Reserve space for truncation message
 	truncationMsg := "\n... (output truncated)"
 	msgSize := len(truncationMsg)
 	if maxBytes <= msgSize {
 		return output[:maxBytes]
 	}
-	
+
 	availableBytes := maxBytes - msgSize
-	headSize := int(float64(availableBytes) * 0.7)  // 70% for head
-	tailSize := availableBytes - headSize              // 30% for tail
-	
+	headSize := int(float64(availableBytes) * 0.7) // 70% for head
+	tailSize := availableBytes - headSize          // 30% for tail
+
 	if len(output) > headSize+tailSize {
 		return output[:headSize] + truncationMsg + output[len(output)-tailSize:]
 	}
-	
+
 	// If output is smaller than expected, just truncate to maxBytes
 	return output[:maxBytes-msgSize] + truncationMsg
 }

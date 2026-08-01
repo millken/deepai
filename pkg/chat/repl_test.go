@@ -75,16 +75,18 @@ func (m *mockUI) Banner(_ BannerInfo) {}
 func (m *mockUI) AskQuestion(_ context.Context, _ string, _ []string) (string, error) {
 	return m.askResult, m.askErr
 }
-func (m *mockUI) ReadPrompt(_ context.Context) (string, error) { return "", nil }
-func (m *mockUI) TurnStart(_ int, _ string)                    {}
-func (m *mockUI) TurnEnd(_ *agent.Usage)                       {}
-func (m *mockUI) RenderEvent(_ agent.AgentEvent)               {}
-func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent)     {}
-func (m *mockUI) RenderInterrupted()                           {}
-func (m *mockUI) InterruptCh() <-chan struct{}                 { return nil }
-func (m *mockUI) LoadHistory(_ string)                         {}
-func (m *mockUI) SaveHistory()                                 {}
-func (m *mockUI) Close()                                       {}
+func (m *mockUI) ReadPrompt(_ context.Context) (string, []models.MessageImage, error) {
+	return "", nil, nil
+}
+func (m *mockUI) TurnStart(_ int, _ string)                {}
+func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
+func (m *mockUI) RenderEvent(_ agent.AgentEvent)           {}
+func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
+func (m *mockUI) RenderInterrupted()                       {}
+func (m *mockUI) InterruptCh() <-chan struct{}             { return nil }
+func (m *mockUI) LoadHistory(_ string)                     {}
+func (m *mockUI) SaveHistory()                             {}
+func (m *mockUI) Close()                                   {}
 
 // lastInfo returns the most recent Info message, or "" if none.
 func (m *mockUI) lastInfo() string {

@@ -6,10 +6,10 @@ import (
 
 // SearchRecommendation represents a tool recommendation for search operations
 type SearchRecommendation struct {
-	PrimaryTool   string   `json:"primary_tool"`
-	Reasoning      string   `json:"reasoning"`
-	Alternative    string   `json:"alternative,omitempty"`
-	Tips          []string `json:"tips"`
+	PrimaryTool string   `json:"primary_tool"`
+	Reasoning   string   `json:"reasoning"`
+	Alternative string   `json:"alternative,omitempty"`
+	Tips        []string `json:"tips"`
 }
 
 // RecommendSearchTool analyzes the search intent and recommends the most appropriate tool
@@ -20,7 +20,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 		pattern = strings.ToLower(p)
 	}
 	queryLower := strings.ToLower(query)
-	
+
 	// Analyze search intent
 	switch {
 	case isFileNameSearch(queryLower, args):
@@ -34,7 +34,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 				"Limit depth: -maxdepth 2",
 			},
 		}
-	
+
 	case isComplexOperation(queryLower):
 		return SearchRecommendation{
 			PrimaryTool: "bash",
@@ -45,7 +45,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 				"Use shell features: loops, conditions, variables",
 			},
 		}
-	
+
 	case isFileContentSearch(pattern, args):
 		return SearchRecommendation{
 			PrimaryTool: "grep",
@@ -58,7 +58,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 				"Limit results: max_results:100",
 			},
 		}
-	
+
 	case isGitRelatedSearch(queryLower):
 		return SearchRecommendation{
 			PrimaryTool: "bash",
@@ -70,7 +70,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 				"File history: git log --follow -- file.txt",
 			},
 		}
-	
+
 	case isSystemInfoQuery(queryLower):
 		return SearchRecommendation{
 			PrimaryTool: "bash",
@@ -82,7 +82,7 @@ func RecommendSearchTool(query string, args map[string]any) SearchRecommendation
 				"Network: netstat -tuln",
 			},
 		}
-	
+
 	default:
 		return SearchRecommendation{
 			PrimaryTool: "grep",
@@ -105,20 +105,20 @@ func isFileNameSearch(query string, args map[string]any) bool {
 		"file name", "filename", "named", "files called",
 		"find file", "list files", "search file",
 	}
-	
+
 	for _, indicator := range fileNameIndicators {
 		if strings.Contains(query, indicator) {
 			return true
 		}
 	}
-	
+
 	// Check if pattern looks like a file extension
 	if pattern, ok := args["pattern"].(string); ok {
 		if strings.HasPrefix(pattern, "*.") || strings.HasPrefix(pattern, ".") {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -128,13 +128,13 @@ func isComplexOperation(query string) bool {
 		"pipe", "and then", "after that", "combine",
 		"count", "sort", "unique", "filter",
 	}
-	
+
 	for _, indicator := range complexIndicators {
 		if strings.Contains(query, indicator) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -143,7 +143,7 @@ func isFileContentSearch(pattern string, args map[string]any) bool {
 	if pattern == "" {
 		return false
 	}
-	
+
 	// If there's a pattern but no file-specific indicators, assume content search
 	return true
 }
@@ -153,13 +153,13 @@ func isGitRelatedSearch(query string) bool {
 		"git", "commit", "branch", "author", "history",
 		"blame", "log", "diff", "merge", "rebase", "wrote",
 	}
-	
+
 	for _, indicator := range gitIndicators {
 		if strings.Contains(query, indicator) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -168,13 +168,13 @@ func isSystemInfoQuery(query string) bool {
 		"process", "memory", "disk", "cpu", "network",
 		"running", "system", "environment", "variable",
 	}
-	
+
 	for _, indicator := range systemIndicators {
 		if strings.Contains(query, indicator) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 

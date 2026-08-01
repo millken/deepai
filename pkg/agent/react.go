@@ -18,8 +18,8 @@ import (
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
-	builtin "github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/millken/deepai/pkg/tools"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
@@ -87,6 +87,10 @@ type Agent struct {
 	// written to disk. Empty = offload disabled.
 	offloadDir string
 
+	// imageDetail controls vision detail level ("low"/"high") for image
+	// attachments in ChatRequest.
+	imageDetail string
+
 	// Diagnostic: warn at most once when the events channel overflows so the
 	// silent drop is visible in logs without flooding when the slow consumer
 	// stays slow for many events in a row.
@@ -150,6 +154,7 @@ func New(cfg AgentConfig) *Agent {
 		userInteraction:     cfg.UserInteraction,
 		workDir:             cfg.WorkDir,
 		offloadDir:          offloadDir,
+		imageDetail:         cfg.ImageDetail,
 	}
 
 	// Register plan mode tools (agent self-references via closures). Skipped for
@@ -390,6 +395,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
 			SystemPrompt:    systemPrompt,
+			ImageDetail:     a.imageDetail,
 		}
 
 		stream, err := a.llm.Stream(ctx, req)
@@ -473,21 +479,21 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 		}
 
-			// Phase 0 primary metric: provider-reported tokens for this turn, joined
-			// with the pre-request byte breakdown. Emitted even when the provider
-			// omits usage (tokens = 0) so the byte buckets are still captured.
-			if a.metrics != nil {
-				m := TurnMetrics{Turn: turn, Context: pendingContext}
-				if streamUsage != nil {
-					m.InputTokens = streamUsage.InputTokens
-					m.OutputTokens = streamUsage.OutputTokens
-				}
-				// If provider doesn't return input_tokens, estimate from bytes
-				if m.InputTokens == 0 && pendingContext.TotalBytes > 0 {
-					m.InputTokens = estimateInputTokens(pendingContext)
-				}
-				a.metrics.RecordTurn(m)
+		// Phase 0 primary metric: provider-reported tokens for this turn, joined
+		// with the pre-request byte breakdown. Emitted even when the provider
+		// omits usage (tokens = 0) so the byte buckets are still captured.
+		if a.metrics != nil {
+			m := TurnMetrics{Turn: turn, Context: pendingContext}
+			if streamUsage != nil {
+				m.InputTokens = streamUsage.InputTokens
+				m.OutputTokens = streamUsage.OutputTokens
 			}
+			// If provider doesn't return input_tokens, estimate from bytes
+			if m.InputTokens == 0 && pendingContext.TotalBytes > 0 {
+				m.InputTokens = estimateInputTokens(pendingContext)
+			}
+			a.metrics.RecordTurn(m)
+		}
 
 		a.logger.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
 		assistantMetadata := map[string]string{"stop_reason": stopReason}
@@ -577,30 +583,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			for i, call := range toolCalls {
 				result := results[i]
 				offloaded := a.offloadIfNeeded(&result, a.offloadDir)
-				runMessages = append(runMessages, models.Message{
-					ID:         newMessageID("tool"),
-					SessionID:  sessionID,
-					Role:       models.RoleTool,
-					Content:    toolMessageContent(result),
-					ToolResult: &result,
-					CreatedAt:  time.Now().UTC(),
-				})
-					if a.metrics != nil {
-						// M1.2: Enhanced metrics collection
-						argsHash := computeArgsHash(call.Arguments)
-						filePath := extractPathFromArgs(result.ToolName, call.Arguments)
-						durationMs := result.Duration.Milliseconds()
-						
-						a.metrics.RecordToolResult(ToolResultMetric{
-							Turn:        turn,
-							ToolName:    result.ToolName,
-							ResultBytes: len(result.Content),
-							ArgsHash:    argsHash,
-							Path:        filePath,
-							Offloaded:   offloaded,
-							DurationMs:  durationMs,
-						})
-					}
+				runMessages = appendToolResultMessage(runMessages, sessionID, result)
+				if a.metrics != nil {
+					// M1.2: Enhanced metrics collection
+					argsHash := computeArgsHash(call.Arguments)
+					filePath := extractPathFromArgs(result.ToolName, call.Arguments)
+					durationMs := result.Duration.Milliseconds()
+
+					a.metrics.RecordToolResult(ToolResultMetric{
+						Turn:        turn,
+						ToolName:    result.ToolName,
+						ResultBytes: len(result.Content),
+						ArgsHash:    argsHash,
+						Path:        filePath,
+						Offloaded:   offloaded,
+						DurationMs:  durationMs,
+					})
+				}
 				toolMessage := runMessages[len(runMessages)-1]
 				emit(AgentEvent{
 					Type:      AgentEventToolResult,
@@ -701,30 +700,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 
 			offloaded := a.offloadIfNeeded(&result, a.offloadDir)
-			runMessages = append(runMessages, models.Message{
-				ID:         newMessageID("tool"),
-				SessionID:  sessionID,
-				Role:       models.RoleTool,
-				Content:    toolMessageContent(result),
-				ToolResult: &result,
-				CreatedAt:  time.Now().UTC(),
-			})
-					if a.metrics != nil {
-						// M1.2: Enhanced metrics collection
-						argsHash := computeArgsHash(call.Arguments)
-						filePath := extractPathFromArgs(result.ToolName, call.Arguments)
-						durationMs := result.Duration.Milliseconds()
-						
-						a.metrics.RecordToolResult(ToolResultMetric{
-							Turn:        turn,
-							ToolName:    result.ToolName,
-							ResultBytes: len(result.Content),
-							ArgsHash:    argsHash,
-							Path:        filePath,
-							Offloaded:   offloaded,
-							DurationMs:  durationMs,
-						})
-					}
+			runMessages = appendToolResultMessage(runMessages, sessionID, result)
+			if a.metrics != nil {
+				// M1.2: Enhanced metrics collection
+				argsHash := computeArgsHash(call.Arguments)
+				filePath := extractPathFromArgs(result.ToolName, call.Arguments)
+				durationMs := result.Duration.Milliseconds()
+
+				a.metrics.RecordToolResult(ToolResultMetric{
+					Turn:        turn,
+					ToolName:    result.ToolName,
+					ResultBytes: len(result.Content),
+					ArgsHash:    argsHash,
+					Path:        filePath,
+					Offloaded:   offloaded,
+					DurationMs:  durationMs,
+				})
+			}
 			toolMessage := runMessages[len(runMessages)-1]
 			emit(AgentEvent{
 				Type:      AgentEventToolResult,
@@ -884,15 +876,15 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 	// the dedicated file tools it references — an agent with edit_file but not
 	// read_file still needs "use edit_file, not sed -i". Only a truly file-tool-
 	// less agent (e.g. bash-only) omits the ~400-char rule.
-		if a.hasAnyFileTool() {
-			sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools.")
-		}
-	
+	if a.hasAnyFileTool() {
+		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools.")
+	}
+
 	// M2.2+: Smart tool selection guidance for search operations
 	if a.hasSearchTools() {
 		sections = append(sections, builtin.GetToolRecommendations())
 	}
-	
+
 	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
 }
@@ -1480,7 +1472,7 @@ func computeArgsHash(args map[string]any) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	
+
 	var hashContent strings.Builder
 	for _, k := range keys {
 		hashContent.WriteString(k)
@@ -1489,7 +1481,7 @@ func computeArgsHash(args map[string]any) string {
 		hashContent.WriteString(fmt.Sprintf("%v", args[k]))
 		hashContent.WriteString("&")
 	}
-	
+
 	// Use the content string itself as hash for simplicity (can be upgraded to crypto hash)
 	// For deduplication purposes, exact string match is sufficient
 	return hashContent.String()
@@ -1506,21 +1498,21 @@ func extractPathFromArgs(toolName string, args map[string]any) string {
 		"find":       true,
 		"code_map":   true,
 	}
-	
+
 	if !fileTools[toolName] {
 		return ""
 	}
-	
+
 	if path, ok := args["path"].(string); ok && path != "" {
 		return path
 	}
-	
+
 	// Some tools might use different parameter names
 	if toolName == "code_map" {
 		if path, ok := args["directory"].(string); ok && path != "" {
 			return path
 		}
 	}
-	
+
 	return ""
 }

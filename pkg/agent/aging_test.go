@@ -253,7 +253,7 @@ func TestToolResultBudget_PerToolDifferentiation(t *testing.T) {
 	}{
 		{"read_file", 1, 8192}, // high: preserve latest reads
 		{"bash", 1, 4096},      // medium
-		{"edit_file", 1, 300},   // low: confirmation messages
+		{"edit_file", 1, 300},  // low: confirmation messages
 		{"write_file", 1, 300},
 		{"grep", 1, 4096},
 		{"git_diff", 1, 2048},

@@ -21,6 +21,8 @@ var slashCommands = []slashCmd{
 	{"run", "Exit plan mode (full tool access)"},
 	{"model", "Show or switch model (/model <name>, /model ? for picker)"},
 	{"effort", "Show or set reasoning effort (/effort [low|medium|high|disabled])"},
+	{"image", "Attach image: Ctrl+V, @path, or /image <path>"},
+	{"imagedetail", "Set vision detail: /imagedetail [low|high]"},
 	{"doctor", "Check environment: probe models, skills, and MCP servers"},
 	{"status", "Show loaded tools/plugins and tool call stats"},
 	{"exit", "Exit the REPL"},

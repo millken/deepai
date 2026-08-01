@@ -19,10 +19,10 @@ func TestCalibrateBytesPerToken(t *testing.T) {
 			name:         "典型工具调用场景 (200KB 工具结果)",
 			contextBytes: 204491, // 平均工具结果字节数
 			expectedTokens: map[float64]int{
-				3.0: 68164,   // 当前保守估计
-				3.3: 61967,   // 理论计算值
-				3.5: 58426,   // 代码优化值
-				4.0: 51123,   // 纯英文假设
+				3.0: 68164, // 当前保守估计
+				3.3: 61967, // 理论计算值
+				3.5: 58426, // 代码优化值
+				4.0: 51123, // 纯英文假设
 			},
 		},
 		{
@@ -81,9 +81,9 @@ func ratioToString(r float64) string {
 func TestOptimalBytesPerToken(t *testing.T) {
 	// 内容构成权重
 	weights := struct {
-		code    float64 // 代码和工具结果
-		json    float64 // JSON 参数
-		text    float64 // 中英文混合文本
+		code float64 // 代码和工具结果
+		json float64 // JSON 参数
+		text float64 // 中英文混合文本
 	}{
 		code: 0.587,
 		json: 0.289,
@@ -115,15 +115,15 @@ func TestOptimalBytesPerToken(t *testing.T) {
 
 // TestCurrentVsOptimalRate 比较当前保守估计与最优估计
 func TestCurrentVsOptimalRate(t *testing.T) {
-	currentRate := 3.0  // 当前保守估计
-	optimalRate := 3.3  // 理论最优值
+	currentRate := 3.0 // 当前保守估计
+	optimalRate := 3.3 // 理论最优值
 
 	// 测试不同上下文大小
 	testSizes := []int{
-		50000,    // 小型上下文
-		150000,   // 中型上下文  
-		350000,   // 大型上下文 (平均值)
-		1000000,  // 超大上下文
+		50000,   // 小型上下文
+		150000,  // 中型上下文
+		350000,  // 大型上下文 (平均值)
+		1000000, // 超大上下文
 	}
 
 	for _, size := range testSizes {

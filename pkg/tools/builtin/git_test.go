@@ -154,7 +154,7 @@ func TestGitDiffHandler_StructuredData(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitOutput(t, dir, "add", "--", "diff.txt")
-	
+
 	// Test M2.1: Default stat format
 	result, err := GitDiffHandler(context.Background(), models.ToolCall{
 		ID:        callID(t),
@@ -197,7 +197,7 @@ func TestGitDiffHandler_FullFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitOutput(t, dir, "add", "--", "diff.txt")
-	
+
 	// Test M2.1: Explicit full format request
 	result, err := GitDiffHandler(context.Background(), models.ToolCall{
 		ID:        callID(t),

@@ -120,7 +120,7 @@ func (p *OpenAICompatProvider) buildParams(req ChatRequest) openai.ChatCompletio
 	if len(req.Tools) > 0 {
 		params.Tools = mapToolsToOpenAI(req.Tools)
 	}
-	params.Messages = mapMessagesToOpenAI(req.SystemPrompt, req.Messages)
+	params.Messages = mapMessagesToOpenAI(req.SystemPrompt, req.Messages, req.ImageDetail)
 	return params
 }
 
@@ -171,23 +171,23 @@ func (p *OpenAICompatProvider) consumeStream(
 				stopReason = choice.FinishReason
 			}
 		}
-			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
-				lastUsage = &Usage{
-					InputTokens:  int(chunk.Usage.PromptTokens),
-					OutputTokens: int(chunk.Usage.CompletionTokens),
-					TotalTokens:  int(chunk.Usage.TotalTokens),
-				}
+		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+			lastUsage = &Usage{
+				InputTokens:  int(chunk.Usage.PromptTokens),
+				OutputTokens: int(chunk.Usage.CompletionTokens),
+				TotalTokens:  int(chunk.Usage.TotalTokens),
 			}
-			// Debug: log all usage fields to diagnose provider behavior
-			if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 || chunk.Usage.TotalTokens > 0 {
-				slog.Debug("provider usage chunk",
-					"provider", p.provider,
-					"model", model,
-					"prompt_tokens", chunk.Usage.PromptTokens,
-					"completion_tokens", chunk.Usage.CompletionTokens,
-					"total_tokens", chunk.Usage.TotalTokens,
-				)
-			}
+		}
+		// Debug: log all usage fields to diagnose provider behavior
+		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 || chunk.Usage.TotalTokens > 0 {
+			slog.Debug("provider usage chunk",
+				"provider", p.provider,
+				"model", model,
+				"prompt_tokens", chunk.Usage.PromptTokens,
+				"completion_tokens", chunk.Usage.CompletionTokens,
+				"total_tokens", chunk.Usage.TotalTokens,
+			)
+		}
 	}
 	if err := stream.Err(); err != nil {
 		// reasoning_effort rejection: signal caller to strip the field and retry.
@@ -273,7 +273,10 @@ func (p *OpenAICompatProvider) mapResponse(resp *openai.ChatCompletion, model st
 
 // --- message mapping ---
 
-func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message) []openai.ChatCompletionMessageParamUnion {
+func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message, imageDetail string) []openai.ChatCompletionMessageParamUnion {
+	if imageDetail == "" {
+		imageDetail = "low"
+	}
 	var result []openai.ChatCompletionMessageParamUnion
 	if systemPrompt != "" {
 		result = append(result, openai.SystemMessage(systemPrompt))
@@ -281,8 +284,12 @@ func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message) []openai.Ch
 	for _, m := range msgs {
 		switch m.Role {
 		case models.RoleHuman:
-			content := ensureContent(m.Content, "user")
-			result = append(result, openai.UserMessage(content))
+			if len(m.Images) > 0 {
+				result = append(result, mapHumanWithImages(m, imageDetail))
+			} else {
+				content := ensureContent(m.Content, "user")
+				result = append(result, openai.UserMessage(content))
+			}
 		case models.RoleAI:
 			if len(m.ToolCalls) > 0 {
 				result = append(result, mapAssistantWithToolCalls(m))
@@ -298,6 +305,25 @@ func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message) []openai.Ch
 		}
 	}
 	return result
+}
+
+// mapHumanWithImages constructs a multimodal user message with text + image
+// content parts. The imageDetail parameter ("low"/"auto"/"high") controls
+// OpenAI vision token cost.
+func mapHumanWithImages(m models.Message, imageDetail string) openai.ChatCompletionMessageParamUnion {
+	parts := make([]openai.ChatCompletionContentPartUnionParam, 0, len(m.Images)+1)
+	if content := strings.TrimSpace(m.Content); content != "" {
+		parts = append(parts, openai.TextContentPart(content))
+	}
+	for _, img := range m.Images {
+		parts = append(parts, openai.ImageContentPart(
+			openai.ChatCompletionContentPartImageImageURLParam{
+				URL:    "data:" + img.MimeType + ";base64," + img.Base64,
+				Detail: imageDetail,
+			},
+		))
+	}
+	return openai.UserMessage(parts)
 }
 
 func mapAssistantWithToolCalls(m models.Message) openai.ChatCompletionMessageParamUnion {

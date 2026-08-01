@@ -244,9 +244,20 @@ func mapMessagesToAnthropic(msgs []models.Message) []anthropic.MessageParam {
 	for _, m := range msgs {
 		switch m.Role {
 		case models.RoleHuman:
-			result = append(result, anthropic.NewUserMessage(
-				anthropic.NewTextBlock(ensureContent(m.Content, "user")),
-			))
+			if len(m.Images) > 0 {
+				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Images)+1)
+				for _, img := range m.Images {
+					blocks = append(blocks, anthropic.NewImageBlockBase64(img.MimeType, img.Base64))
+				}
+				if content := strings.TrimSpace(m.Content); content != "" {
+					blocks = append(blocks, anthropic.NewTextBlock(content))
+				}
+				result = append(result, anthropic.NewUserMessage(blocks...))
+			} else {
+				result = append(result, anthropic.NewUserMessage(
+					anthropic.NewTextBlock(ensureContent(m.Content, "user")),
+				))
+			}
 		case models.RoleAI:
 			blocks := mapAssistantToBlocks(m)
 			result = append(result, anthropic.NewAssistantMessage(blocks...))
@@ -450,12 +461,14 @@ func payloadMiddleware(provider string) option.Middleware {
 					Tools    []any  `json:"tools"`
 				}
 				if json.Unmarshal(body, &summary) == nil {
+					hasImage := bytes.Contains(body, []byte(`"type":"image"`))
 					slog.Debug("provider payload",
 						"provider", provider,
 						"model", summary.Model,
 						"messages", len(summary.Messages),
 						"tools", len(summary.Tools),
-						"body_bytes", len(body))
+						"body_bytes", len(body),
+						"has_image", hasImage)
 				} else {
 					slog.Debug("provider payload", "provider", provider, "body_bytes", len(body))
 				}

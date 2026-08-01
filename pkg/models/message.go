@@ -115,11 +115,20 @@ func (r ToolResult) Validate() error {
 }
 
 // Message is the canonical unit of conversation state within a session.
+// MessageImage is an image attachment on a message (provider-agnostic).
+// The Base64 data should already be optimized (see pkg/imageproc) to minimize
+// token cost.
+type MessageImage struct {
+	MimeType string `json:"mime_type"` // "image/png", "image/jpeg", "image/webp", "image/gif"
+	Base64   string `json:"base64"`    // base64-encoded image data
+}
+
 type Message struct {
 	ID         string            `json:"id"`
 	SessionID  string            `json:"session_id"`
 	Role       Role              `json:"role"`
 	Content    string            `json:"content,omitempty"`
+	Images     []MessageImage    `json:"images,omitempty"`
 	ToolCalls  []ToolCall        `json:"tool_calls,omitempty"`
 	ToolResult *ToolResult       `json:"tool_result,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
@@ -137,8 +146,8 @@ func (m Message) Validate() error {
 	if err := m.Role.Validate(); err != nil {
 		return err
 	}
-	if strings.TrimSpace(m.Content) == "" && len(m.ToolCalls) == 0 && m.ToolResult == nil {
-		return errors.New("message must include content, tool calls, or a tool result")
+	if strings.TrimSpace(m.Content) == "" && len(m.ToolCalls) == 0 && m.ToolResult == nil && len(m.Images) == 0 {
+		return errors.New("message must include content, images, tool calls, or a tool result")
 	}
 	if m.Role == RoleTool && m.ToolResult == nil {
 		return errors.New("tool messages must include a tool result")

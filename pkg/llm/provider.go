@@ -16,14 +16,19 @@ type LLMProvider interface {
 
 // ChatRequest is the provider-agnostic request payload.
 type ChatRequest struct {
-	Model           string            `json:"model"`
-	Messages        []models.Message  `json:"messages"`
-	Tools           []models.Tool     `json:"tools,omitempty"`
-	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
-	Temperature     *float64          `json:"temperature,omitempty"`
-	MaxTokens       *int              `json:"max_tokens,omitempty"`
-	SystemPrompt    string            `json:"system_prompt,omitempty"`
-	OnChunk         func(StreamChunk) `json:"-"`
+	Model           string           `json:"model"`
+	Messages        []models.Message `json:"messages"`
+	Tools           []models.Tool    `json:"tools,omitempty"`
+	ReasoningEffort string           `json:"reasoning_effort,omitempty"`
+	Temperature     *float64         `json:"temperature,omitempty"`
+	MaxTokens       *int             `json:"max_tokens,omitempty"`
+	SystemPrompt    string           `json:"system_prompt,omitempty"`
+	// ImageDetail controls the vision detail level for OpenAI-compatible
+	// providers. "low" (default) uses a single tile (~170 tokens); "high" uses
+	// multiple tiles for finer detail. Anthropic ignores this field (it uses
+	// automatic rescaling).
+	ImageDetail string            `json:"image_detail,omitempty"`
+	OnChunk     func(StreamChunk) `json:"-"`
 }
 
 // ChatResponse is the normalized provider response.
