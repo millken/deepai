@@ -112,9 +112,9 @@ func (p *OpenAICompatProvider) buildParams(req ChatRequest) openai.ChatCompletio
 		switch strings.ToLower(strings.TrimSpace(req.ReasoningEffort)) {
 		case "low", "medium", "high":
 			params.ReasoningEffort = openai.ReasoningEffort(strings.ToLower(strings.TrimSpace(req.ReasoningEffort)))
-		// "disabled", "none", "off", "auto" etc. → do not set the field;
-		// the server default applies. Prevents 400 errors from providers that
-		// only accept low/medium/high.
+			// "disabled", "none", "off", "auto" etc. → do not set the field;
+			// the server default applies. Prevents 400 errors from providers that
+			// only accept low/medium/high.
 		}
 	}
 	if len(req.Tools) > 0 {
@@ -253,7 +253,12 @@ func (p *OpenAICompatProvider) mapResponse(resp *openai.ChatCompletion, model st
 			TotalTokens:  int(resp.Usage.TotalTokens),
 		}
 	}
-	return ChatResponse{Model: model, Message: m, Usage: usage, Stop: string(choice.FinishReason)}
+	// 优先使用服务端返回的模型名，如果为空则回退到请求时的模型名
+	actualModel := resp.Model
+	if actualModel == "" {
+		actualModel = model
+	}
+	return ChatResponse{Model: actualModel, Message: m, Usage: usage, Stop: string(choice.FinishReason)}
 }
 
 // --- message mapping ---

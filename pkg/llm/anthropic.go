@@ -229,7 +229,12 @@ func (p *AnthropicProvider) mapResponse(msg *anthropic.Message, model string) Ch
 			OutputTokens: int(msg.Usage.OutputTokens),
 		}
 	}
-	return ChatResponse{Model: model, Message: m, Usage: usage, Stop: string(msg.StopReason)}
+	// 优先使用服务端返回的模型名，如果为空则回退到请求时的模型名
+	actualModel := string(msg.Model)
+	if actualModel == "" {
+		actualModel = model
+	}
+	return ChatResponse{Model: actualModel, Message: m, Usage: usage, Stop: string(msg.StopReason)}
 }
 
 // --- message mapping ---

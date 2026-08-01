@@ -258,6 +258,55 @@ func (u *unavailableProviderForTest) Chat(_ context.Context, _ ChatRequest) (Cha
 	return ChatResponse{}, nil
 }
 
+func TestResolveBaseURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		def    ModelDef
+		envKey string
+		envVal string
+		want   string
+	}{
+		{
+			name: "explicit BaseURL takes precedence",
+			def:  ModelDef{Provider: "openai", BaseURL: "https://custom.example.com"},
+			want: "https://custom.example.com",
+		},
+		{
+			name:   "falls back to provider env var",
+			def:    ModelDef{Provider: "openai"},
+			envKey: "OPENAI_BASE_URL",
+			envVal: "https://proxy.example.com",
+			want:   "https://proxy.example.com",
+		},
+		{
+			name: "empty when no BaseURL and no env",
+			def:  ModelDef{Provider: "qwen"}, // qwen has no baseURLVar
+			want: "",
+		},
+		{
+			name:   "explicit overrides env",
+			def:    ModelDef{Provider: "openai", BaseURL: "https://explicit.com"},
+			envKey: "OPENAI_BASE_URL",
+			envVal: "https://env.com",
+			want:   "https://explicit.com",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envKey != "" {
+				t.Setenv(tt.envKey, tt.envVal)
+			} else {
+				// Ensure OPENAI_BASE_URL is unset for the "no env" case.
+				t.Setenv("OPENAI_BASE_URL", "")
+			}
+			got := ResolveBaseURL(tt.def)
+			if got != tt.want {
+				t.Fatalf("ResolveBaseURL(%+v) = %q, want %q", tt.def, got, tt.want)
+			}
+		})
+	}
+}
+
 func (u *unavailableProviderForTest) Stream(_ context.Context, _ ChatRequest) (<-chan StreamChunk, error) {
 	return nil, nil
 }

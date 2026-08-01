@@ -3,12 +3,15 @@ package chat
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -16,6 +19,7 @@ import (
 // mockLLMProvider implements llm.LLMProvider for testing.
 type mockLLMProvider struct {
 	response string
+	model    string // 服务端返回的模型名
 	err      error
 }
 
@@ -24,6 +28,7 @@ func (m *mockLLMProvider) Chat(ctx context.Context, req llm.ChatRequest) (llm.Ch
 		return llm.ChatResponse{}, m.err
 	}
 	return llm.ChatResponse{
+		Model: m.model,
 		Message: models.Message{
 			Role:    models.RoleAI,
 			Content: m.response,
@@ -407,6 +412,244 @@ func TestStatusText_ShowsLoadedAndUsage(t *testing.T) {
 		if !strings.Contains(text, c) {
 			t.Fatalf("status text missing %q:\n%s", c, text)
 		}
+	}
+}
+
+// TestDoctorModels_AllHealthy verifies that the model probe reports success
+// when all configured models respond to the hello request.
+func TestDoctorModels_AllHealthy(t *testing.T) {
+	defs := []llm.ModelDef{
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini", APIKeyEnv: "DOCTOR_TEST_KEY"},
+		{Name: "smart", Provider: "anthropic", Model: "claude-sonnet-4-20250514", APIKeyEnv: "DOCTOR_TEST_KEY"},
+	}
+	reg, err := llm.NewModelRegistry(defs, "fast")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	// Inject mock providers so no real network calls are made.
+	// smart 返回不同的模型名，测试实际模型显示逻辑。
+	reg.InjectProvider("openai", "", "", &mockLLMProvider{response: "hello", model: "gpt-4o-mini"})
+	reg.InjectProvider("anthropic", "", "", &mockLLMProvider{response: "hello", model: "glm-5.2"})
+
+	r := &ChatRepl{cfg: ReplConfig{ModelRegistry: reg}, currentModel: "fast"}
+
+	text := r.doctorModels(context.Background())
+	checks := []string{
+		"Models:",
+		"✓ fast",
+		"gpt-4o-mini",
+		"endpoint:",
+		"✓ smart",
+		"claude-sonnet-4-20250514",
+		"[actual: glm-5.2]", // 关键断言：显示实际模型
+		"All 2 model(s) healthy",
+	}
+	for _, c := range checks {
+		if !strings.Contains(text, c) {
+			t.Fatalf("doctor models text missing %q:\n%s", c, text)
+		}
+	}
+}
+
+// TestDoctorModels_PartialFailure verifies that the model probe reports errors
+// for unreachable models while still showing healthy ones.
+func TestDoctorModels_PartialFailure(t *testing.T) {
+	defs := []llm.ModelDef{
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini", APIKeyEnv: "DOCTOR_TEST_KEY"},
+		{Name: "smart", Provider: "anthropic", Model: "claude-sonnet-4-20250514", APIKeyEnv: "DOCTOR_TEST_KEY"},
+	}
+	reg, err := llm.NewModelRegistry(defs, "fast")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	reg.InjectProvider("openai", "", "", &mockLLMProvider{response: "hello"})
+	reg.InjectProvider("anthropic", "", "", &mockLLMProvider{err: errors.New("401 unauthorized")})
+
+	r := &ChatRepl{cfg: ReplConfig{ModelRegistry: reg}, currentModel: "fast"}
+
+	text := r.doctorModels(context.Background())
+	if !strings.Contains(text, "✓ fast") {
+		t.Fatalf("doctor models should show fast as healthy:\n%s", text)
+	}
+	if !strings.Contains(text, "✗ smart") {
+		t.Fatalf("doctor models should show smart as failed:\n%s", text)
+	}
+	if !strings.Contains(text, "1/2 model(s) healthy") {
+		t.Fatalf("doctor models should show 1/2 healthy:\n%s", text)
+	}
+	if !strings.Contains(text, "401 unauthorized") {
+		t.Fatalf("doctor models should include error message:\n%s", text)
+	}
+}
+
+// TestDoctorSkills_Loaded verifies that the skill section lists loaded skills
+// with their source.
+func TestDoctorSkills_Loaded(t *testing.T) {
+	skillReg := skill.NewRegistry()
+	root := t.TempDir()
+	// LoadFromDir expects <root>/<skill-name>/SKILL.md subdirectories.
+	skillDir := filepath.Join(root, "golang")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	body := "---\nname: golang\ndescription: Go best practices\n---\n\nBody.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(body), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := skillReg.LoadFromDir(root); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	r := &ChatRepl{cfg: ReplConfig{SkillRegistry: skillReg}}
+	text := r.doctorSkills()
+	if !strings.Contains(text, "Skills (1):") {
+		t.Fatalf("doctor skills should show count:\n%s", text)
+	}
+	if !strings.Contains(text, "✓ golang") {
+		t.Fatalf("doctor skills should list golang:\n%s", text)
+	}
+	if !strings.Contains(text, "All 1 skill(s) loaded") {
+		t.Fatalf("doctor skills should show summary:\n%s", text)
+	}
+}
+
+// TestDoctorSkills_None verifies the empty state.
+func TestDoctorSkills_None(t *testing.T) {
+	r := &ChatRepl{cfg: ReplConfig{SkillRegistry: skill.NewRegistry()}}
+	text := r.doctorSkills()
+	if !strings.Contains(text, "Skills: none loaded") {
+		t.Fatalf("doctor skills should report none loaded:\n%s", text)
+	}
+}
+
+// TestDoctorMCP_Connected verifies that MCP tools registered in the tool
+// registry are grouped by server and reported.
+func TestDoctorMCP_Connected(t *testing.T) {
+	reg := tools.NewRegistry()
+	h := func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusCompleted}, nil
+	}
+	if err := reg.Register(models.Tool{
+		Name: "zig-mcp.build", Description: "build", Groups: []string{"mcp", "zig-mcp"}, Handler: h,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := reg.Register(models.Tool{
+		Name: "fs.read", Description: "read", Groups: []string{"mcp", "fs"}, Handler: h,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	r := &ChatRepl{cfg: ReplConfig{ToolRegistry: reg}}
+	text := r.doctorMCP()
+	if !strings.Contains(text, "✓ zig-mcp") {
+		t.Fatalf("doctor mcp should list zig-mcp:\n%s", text)
+	}
+	if !strings.Contains(text, "✓ fs") {
+		t.Fatalf("doctor mcp should list fs:\n%s", text)
+	}
+	if !strings.Contains(text, "2 server(s) connected") {
+		t.Fatalf("doctor mcp should show 2 servers:\n%s", text)
+	}
+}
+
+// TestDoctorMCP_None verifies the empty state surfaces the startup report.
+func TestDoctorMCP_None(t *testing.T) {
+	reg := tools.NewRegistry()
+	r := &ChatRepl{cfg: ReplConfig{
+		ToolRegistry: reg,
+		MCPReport:    "MCP: 0 loaded, 1 failed (bad: connect refused)",
+	}}
+	text := r.doctorMCP()
+	if !strings.Contains(text, "none connected") {
+		t.Fatalf("doctor mcp should report none connected:\n%s", text)
+	}
+	if !strings.Contains(text, "1 failed") {
+		t.Fatalf("doctor mcp should surface startup failure:\n%s", text)
+	}
+}
+
+// TestDoctorText_Combined verifies that the full /doctor output contains all
+// three sections.
+func TestDoctorText_Combined(t *testing.T) {
+	defs := []llm.ModelDef{
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini", APIKeyEnv: "DOCTOR_TEST_KEY"},
+	}
+	reg, err := llm.NewModelRegistry(defs, "fast")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	reg.InjectProvider("openai", "", "", &mockLLMProvider{response: "hello"})
+
+	r := &ChatRepl{cfg: ReplConfig{ModelRegistry: reg}, currentModel: "fast", currentEffort: "medium"}
+	text := r.doctorText(context.Background())
+	for _, section := range []string{"Models:", "Skills:", "MCP servers:", "Current reasoning effort: medium"} {
+		if !strings.Contains(text, section) {
+			t.Fatalf("doctor text missing section %q:\n%s", section, text)
+		}
+	}
+}
+
+
+// TestHandleEffortCommand verifies that /effort shows current, validates input,
+// updates the setting, persists to session, and supports default reset.
+func TestHandleEffortCommand(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	
+	sess, err := store.Create(models.CreateOpts{Model: "default", CWD: "/tmp"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	
+	r := &ChatRepl{
+		cfg:     ReplConfig{},
+		ui:      &mockUI{},
+		sess:    sess,
+		sessMgr: store,
+	}
+	
+	// /effort (no args) — shows current
+	r.handleEffortCommand(context.Background(), "")
+	if len(r.ui.(*mockUI).infoMsgs) != 3 {
+		t.Fatalf("expected 3 info lines, got %d", len(r.ui.(*mockUI).infoMsgs))
+	}
+	
+	// /effort high — sets to high and persists
+	r.ui.(*mockUI).infoMsgs = nil
+	r.handleEffortCommand(context.Background(), "high")
+	if r.currentEffort != "high" {
+		t.Fatalf("currentEffort = %q, want high", r.currentEffort)
+	}
+	if len(r.ui.(*mockUI).infoMsgs) != 2 {
+		t.Fatalf("expected 2 info lines, got %d", len(r.ui.(*mockUI).infoMsgs))
+	}
+	// Verify persistence
+	updated, _ := store.Resolve(sess.ID)
+	if updated.Metadata["effort"] != "high" {
+		t.Fatalf("effort not persisted, got %q", updated.Metadata["effort"])
+	}
+	
+	// /effort default — resets to empty and persists
+	r.ui.(*mockUI).infoMsgs = nil
+	r.handleEffortCommand(context.Background(), "default")
+	if r.currentEffort != "" {
+		t.Fatalf("currentEffort should be empty after default, got %q", r.currentEffort)
+	}
+	updated, _ = store.Resolve(sess.ID)
+	if updated.Metadata["effort"] != "" {
+		t.Fatalf("effort should be empty after default, got %q", updated.Metadata["effort"])
+	}
+	
+	// /effort invalid — shows error and doesn't change
+	r.currentEffort = "medium"
+	r.ui.(*mockUI).infoMsgs = nil
+	r.handleEffortCommand(context.Background(), "invalid")
+	if r.currentEffort != "medium" {
+		t.Fatalf("currentEffort should stay medium after invalid input, got %q", r.currentEffort)
+	}
+	if len(r.ui.(*mockUI).infoMsgs) != 1 {
+		t.Fatalf("expected 1 info line for error, got %d", len(r.ui.(*mockUI).infoMsgs))
 	}
 }
 

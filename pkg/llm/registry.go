@@ -114,11 +114,13 @@ func buildProvider(name string, cfg resolvedConfig) (LLMProvider, error) {
 // human-friendly alias (Name) to a concrete provider + model pair, with
 // optional BaseURL and APIKeyEnv overrides.
 type ModelDef struct {
-	Name      string `yaml:"name" json:"name"`
-	Provider  string `yaml:"provider" json:"provider"`
-	Model     string `yaml:"model" json:"model"`
-	BaseURL   string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
-	APIKeyEnv string `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
+	Name          string `yaml:"name" json:"name"`
+	Provider      string `yaml:"provider" json:"provider"`
+	Model         string `yaml:"model" json:"model"`
+	BaseURL       string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	APIKeyEnv     string `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
+	ContextWindow int    `yaml:"context_window,omitempty" json:"context_window,omitempty"` // 模型级别上下文覆盖，0 表示使用全局默认
+	Effort        string `yaml:"effort,omitempty" json:"effort,omitempty"`                 // 模型级别推理深度覆盖，如 "low", "medium", "high"，空表示使用全局默认
 }
 
 // ModelRegistry manages a set of named model definitions and lazily creates
@@ -274,6 +276,22 @@ func providerCacheKey(def ModelDef) string {
 	apiKey := resolveAPIKey(def)
 	return strings.ToLower(strings.TrimSpace(def.Provider)) + "|" +
 		strings.TrimSpace(def.BaseURL) + "|" + apiKey
+}
+
+// ResolveBaseURL returns the effective base URL for a ModelDef after applying
+// the same env-var fallback as resolveConfig: def.BaseURL → provider's default
+// env var → "". Callers can display this to show where requests are sent.
+// When the result is "", the provider SDK uses its own hardcoded default
+// (e.g. "https://api.anthropic.com", "https://api.openai.com").
+func ResolveBaseURL(def ModelDef) string {
+	if strings.TrimSpace(def.BaseURL) != "" {
+		return def.BaseURL
+	}
+	pd, ok := providerDefs[strings.ToLower(strings.TrimSpace(def.Provider))]
+	if !ok || pd.baseURLVar == "" {
+		return ""
+	}
+	return strings.TrimSpace(env.Get(pd.baseURLVar, ""))
 }
 
 // resolveAPIKey determines the API key for a ModelDef: if APIKeyEnv is set,

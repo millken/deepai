@@ -23,6 +23,10 @@ type Config struct {
 	ContextWindow  int    `yaml:"context_window,omitempty"`
 	BaseURL        string `yaml:"base_url,omitempty"`
 	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes (default 30)
+	// ReasoningEffort sets the default reasoning effort for models that support it
+	// (e.g., Claude's "thinking" feature). Valid values: "low", "medium", "high", "disabled".
+	// Empty means provider default. Model-level config overrides this.
+	ReasoningEffort string `yaml:"reasoning_effort,omitempty"`
 	// Mode controls whether the agent stops to ask clarifying questions.
 	// Empty or "interactive" (default): the agent may use ask_clarification to
 	// block on user input. "autonomous": ask_clarification short-circuits to a

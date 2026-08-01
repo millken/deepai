@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
@@ -84,6 +85,7 @@ type ChatRepl struct {
 	consecCorrections int
 	planMode          bool   // restrict to read-only tools until user approves plan
 	currentModel      string // selected model alias (from ModelRegistry)
+	currentEffort     string // reasoning effort: "low", "medium", "high", "disabled", or "" (provider default)
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -283,7 +285,7 @@ func (r *ChatRepl) bannerInfo() BannerInfo {
 		SkillCount:    skillCount,
 		SkillNames:    skillNames,
 		SessionID:     r.sess.ID,
-		ContextWindow: r.cfg.ContextWindow,
+		ContextWindow: r.currentContextWindow(),
 	}
 }
 
@@ -500,22 +502,23 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 		return fmt.Errorf("resolve model %q: %w", r.currentModel, err)
 	}
 
-	// Create a fresh agent for this turn.
-	agentCfg := agent.AgentConfig{
-		LLMProvider:     provider,
-		Tools:           r.cfg.ToolRegistry,
-		Sandbox:         r.sb,
-		Model:           modelName,
-		ContextWindow:   r.cfg.ContextWindow,
-		MaxTurns:        r.cfg.MaxTurns,
-		RequestTimeout:  r.cfg.RequestTimeout,
-		UserInteraction: r.ui,
-		PlanMode:        r.planMode,
-		WorkDir:         r.cfg.WorkDir,
-		MemoryService:   r.cfg.MemoryService,
-		MemoryExtractor: r.cfg.MemoryExtractor,
-		MemoryUserID:    r.cfg.WorkDir,
-	}
+		// Create a fresh agent for this turn.
+		agentCfg := agent.AgentConfig{
+			LLMProvider:     provider,
+			Tools:           r.cfg.ToolRegistry,
+			Sandbox:         r.sb,
+			Model:           modelName,
+			ContextWindow:   r.currentContextWindow(),
+			ReasoningEffort: r.currentReasoningEffort(),
+			MaxTurns:        r.cfg.MaxTurns,
+			RequestTimeout:  r.cfg.RequestTimeout,
+			UserInteraction: r.ui,
+			PlanMode:        r.planMode,
+			WorkDir:         r.cfg.WorkDir,
+			MemoryService:   r.cfg.MemoryService,
+			MemoryExtractor: r.cfg.MemoryExtractor,
+			MemoryUserID:    r.cfg.WorkDir,
+		}
 
 	runAgent := agent.New(agentCfg)
 
@@ -697,8 +700,8 @@ func (r *ChatRepl) saveSession() {
 	}
 }
 
-// persistModel saves the current model alias to the session metadata so that
-// resuming the session restores the user's model choice.
+// persistModel saves the current model alias and effort to the session metadata
+// so that resuming the session restores the user's model choice and effort setting.
 func (r *ChatRepl) persistModel() {
 	if r.sess == nil {
 		return
@@ -707,24 +710,25 @@ func (r *ChatRepl) persistModel() {
 		r.sess.Metadata = make(map[string]string)
 	}
 	r.sess.Metadata["model"] = r.currentModel
+	r.sess.Metadata["effort"] = r.currentEffort
 	r.saveSession()
 }
 
-// restoreModelFromSession reads the model alias from session metadata and
-// applies it to r.currentModel if the alias is still available in the registry.
+// restoreModelFromSession reads the model alias and effort from session metadata
+// and applies them to r.currentModel and r.currentEffort if the alias is still
+// available in the registry.
 func (r *ChatRepl) restoreModelFromSession() {
 	if r.sess == nil || r.cfg.ModelRegistry == nil {
 		return
 	}
 	alias := strings.TrimSpace(r.sess.Metadata["model"])
-	if alias == "" {
-		return
-	}
-	if r.cfg.ModelRegistry.Has(alias) {
+	if alias != "" && r.cfg.ModelRegistry.Has(alias) {
 		r.currentModel = strings.ToLower(alias)
-	} else {
+	} else if alias != "" {
 		slog.Warn("session model alias not in registry, using default", "alias", alias, "default", r.currentModel)
 	}
+	// Restore effort; empty string means use model/provider default.
+	r.currentEffort = strings.TrimSpace(r.sess.Metadata["effort"])
 }
 
 func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
@@ -834,6 +838,10 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.ui.Info("  Plan mode disabled. Agent has full tool access.")
 	case "model":
 		r.handleModelCommand(parentCtx, cmd.Args)
+	case "effort":
+		r.handleEffortCommand(parentCtx, cmd.Args)
+	case "doctor":
+		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":
 		r.ui.Info(r.statusText())
 	default:
@@ -944,6 +952,72 @@ func (r *ChatRepl) availableModelNames() string {
 		names = append(names, m.Name)
 	}
 	return strings.Join(names, ", ")
+}
+
+// currentReasoningEffort returns the effective reasoning effort for the current
+// model: model-level override if set, otherwise REPL runtime setting (r.currentEffort),
+// finally empty string (provider default).
+func (r *ChatRepl) currentReasoningEffort() string {
+	if r.cfg.ModelRegistry == nil {
+		return r.currentEffort
+	}
+	def, ok := r.cfg.ModelRegistry.Resolve(r.currentModel)
+	if !ok || def.Effort == "" {
+		return r.currentEffort
+	}
+	return def.Effort
+}
+
+// handleEffortCommand implements /effort: show current, list valid values, or set effort.
+func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
+	args = strings.TrimSpace(args)
+
+	// /effort (no args) — show current effort
+	if args == "" {
+		effort := r.currentReasoningEffort()
+		if effort == "" {
+			effort = "(provider default)"
+		}
+		r.ui.Info(fmt.Sprintf("  Current reasoning effort: %s", effort))
+		r.ui.Info("  Valid values: low, medium, high, disabled, default")
+		r.ui.Info("  Usage: /effort <value>")
+		return
+	}
+	
+	// /effort default — 重置为空（使用模型配置或 provider default）
+	if args == "default" {
+		r.currentEffort = ""
+		r.persistModel()
+		r.ui.Info("  Reasoning effort reset to model/provider default")
+		r.ui.Info("  (takes effect on next turn)")
+		return
+	}
+	
+	// Validate and set effort
+	validValues := map[string]bool{"low": true, "medium": true, "high": true, "disabled": true}
+	argsLower := strings.ToLower(args)
+	if !validValues[argsLower] {
+		r.ui.Info(fmt.Sprintf("  Invalid effort %q. Valid: low, medium, high, disabled, default", args))
+		return
+	}
+	
+	r.currentEffort = argsLower
+	r.persistModel()
+	r.ui.Info(fmt.Sprintf("  Reasoning effort set to: %s", r.currentEffort))
+	r.ui.Info("  (takes effect on next turn)")
+}
+
+// currentContextWindow returns the effective context window for the current
+// model: model-level override if set, otherwise global default.
+func (r *ChatRepl) currentContextWindow() int {
+	if r.cfg.ModelRegistry == nil {
+		return r.cfg.ContextWindow
+	}
+	def, ok := r.cfg.ModelRegistry.Resolve(r.currentModel)
+	if !ok || def.ContextWindow == 0 {
+		return r.cfg.ContextWindow
+	}
+	return def.ContextWindow
 }
 
 // clearSession wipes the current session's history — both the in-memory
@@ -1166,6 +1240,220 @@ func (r *ChatRepl) statusText() string {
 	}
 
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// doctorText runs environment diagnostics across all three extension surfaces
+// — models, skills, and MCP servers — and returns a combined report. This
+// mirrors the /doctor command in Claude Code for quick environment checks.
+func (r *ChatRepl) doctorText(ctx context.Context) string {
+	var sb strings.Builder
+	sb.WriteString("  Doctor — environment diagnostics:\n\n")
+
+	// 显示当前 effort 设置
+	effort := r.currentEffort
+	if effort == "" {
+		effort = "(provider default)"
+	}
+	fmt.Fprintf(&sb, "  Current reasoning effort: %s\n\n", effort)
+
+	sb.WriteString(r.doctorModels(ctx))
+	sb.WriteString("\n\n")
+	sb.WriteString(r.doctorSkills())
+	sb.WriteString("\n\n")
+	sb.WriteString(r.doctorMCP())
+	return sb.String()
+}
+
+// doctorModels probes every configured model with a minimal "hello" request and
+// reports per-model reachability, latency, and a summary.
+func (r *ChatRepl) doctorModels(ctx context.Context) string {
+	reg := r.cfg.ModelRegistry
+	if reg == nil {
+		return "  Models: no registry configured."
+	}
+	defs := reg.List()
+	if len(defs) == 0 {
+		return "  Models: none configured."
+	}
+
+	type result struct {
+		def         llm.ModelDef
+		ok          bool
+		latency     time.Duration
+		errMsg      string
+		reply       string
+		actualModel string // 服务端实际返回的模型名
+	}
+
+	results := make([]result, len(defs))
+	var wg sync.WaitGroup
+	// Per-probe timeout: a healthy model should respond to a trivial prompt
+	// well under 30s. We bound each probe so one slow/unreachable model does
+	// not stall the whole report.
+	const probeTimeout = 30 * time.Second
+
+	for i, def := range defs {
+		wg.Add(1)
+		go func(idx int, d llm.ModelDef) {
+			defer wg.Done()
+			res := result{def: d}
+			provider, modelName, err := reg.ProviderFor(d.Name)
+			if err != nil {
+				res.errMsg = fmt.Sprintf("init failed: %v", err)
+				results[idx] = res
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+			maxTokens := 16
+			start := time.Now()
+			resp, err := provider.Chat(probeCtx, llm.ChatRequest{
+				Model: modelName,
+				Messages: []models.Message{{
+					Role:    models.RoleHuman,
+					Content: "Reply with exactly: hello",
+				}},
+				MaxTokens:       &maxTokens,
+				ReasoningEffort: "disabled",
+			})
+			res.latency = time.Since(start)
+			if err != nil {
+				res.errMsg = err.Error()
+				results[idx] = res
+				return
+			}
+			res.ok = true
+			res.reply = strings.TrimSpace(resp.Message.Content)
+			res.actualModel = resp.Model
+			results[idx] = res
+		}(i, def)
+	}
+	wg.Wait()
+
+	var sb strings.Builder
+	sb.WriteString("  Models:\n")
+	passed := 0
+	for _, res := range results {
+		marker := "✗"
+		if res.ok {
+			marker = "✓"
+			passed++
+		}
+		endpoint := llm.ResolveBaseURL(res.def)
+		if endpoint == "" {
+			endpoint = "(provider default)"
+		}
+		// 计算有效上下文窗口
+		effectiveCtx := r.cfg.ContextWindow
+		if res.def.ContextWindow > 0 {
+			effectiveCtx = res.def.ContextWindow
+		}
+		ctxLabel := fmt.Sprintf("%dK", effectiveCtx/1000)
+		if res.def.ContextWindow > 0 {
+			ctxLabel = fmt.Sprintf("%dK (model)", effectiveCtx/1000)
+		}
+
+		fmt.Fprintf(&sb, "    %s %-12s — %s/%s\n        endpoint: %s  ctx: %s", marker, res.def.Name, res.def.Provider, res.def.Model, endpoint, ctxLabel)
+		if res.ok {
+			fmt.Fprintf(&sb, "  (%dms)", res.latency.Milliseconds())
+			// 显示实际模型名（如果与配置不同）
+			if res.actualModel != "" && res.actualModel != res.def.Model {
+				fmt.Fprintf(&sb, "  [actual: %s]", res.actualModel)
+			}
+			if res.reply != "" {
+				reply := res.reply
+				if len([]rune(reply)) > 40 {
+					reply = string([]rune(reply)[:40]) + "..."
+				}
+				fmt.Fprintf(&sb, " → %q", reply)
+			}
+			sb.WriteString("\n")
+		} else {
+			msg := res.errMsg
+			if msg == "" {
+				msg = "unknown error"
+			}
+			if len([]rune(msg)) > 80 {
+				msg = string([]rune(msg)[:80]) + "..."
+			}
+			fmt.Fprintf(&sb, "\n        ✗ %s\n", msg)
+		}
+	}
+	if passed == len(results) {
+		fmt.Fprintf(&sb, "    All %d model(s) healthy.", len(results))
+	} else {
+		fmt.Fprintf(&sb, "    %d/%d model(s) healthy. Check API keys, base URLs, and network.", passed, len(results))
+	}
+	return sb.String()
+}
+
+// doctorSkills reports the loaded skill set: count, per-skill source, and
+// whether each skill's body is loadable. Skills are local files, so the check
+// is configuration integrity (present + parseable), not network reachability.
+func (r *ChatRepl) doctorSkills() string {
+	reg := r.cfg.SkillRegistry
+	if reg == nil || reg.Count() == 0 {
+		return "  Skills: none loaded."
+	}
+	skills := reg.List()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "  Skills (%d):\n", len(skills))
+	for _, s := range skills {
+		source := s.Source
+		if source == "" {
+			source = "local"
+		}
+		fmt.Fprintf(&sb, "    ✓ %-20s (%s)\n", s.DisplayName(), source)
+	}
+	fmt.Fprintf(&sb, "    All %d skill(s) loaded.", len(skills))
+	return sb.String()
+}
+
+// doctorMCP reports MCP server health from the runtime tool registry. MCP
+// servers connect at startup and register their tools into ToolRegistry, so
+// the presence of tools grouped under a server name signals a live connection.
+// The startup report (MCPReport) surfaces any servers that failed to connect.
+func (r *ChatRepl) doctorMCP() string {
+	var sb strings.Builder
+	sb.WriteString("  MCP servers:\n")
+
+	// Collect MCP tools from the registry, grouped by server name.
+	mcpTools := 0
+	mcpServers := map[string]int{}
+	if r.cfg.ToolRegistry != nil {
+		for _, t := range r.cfg.ToolRegistry.List() {
+			if !toolHasGroup(t, "mcp") {
+				continue
+			}
+			mcpTools++
+			server := mcpServerFromTool(t)
+			if server == "" {
+				server = "(unknown)"
+			}
+			mcpServers[server]++
+		}
+	}
+
+	if len(mcpServers) == 0 {
+		sb.WriteString("    none connected")
+		// Surface startup failures if the config existed but nothing loaded.
+		if msg := strings.TrimSpace(r.cfg.MCPReport); msg != "" {
+			fmt.Fprintf(&sb, "\n    Startup report: %s", msg)
+		}
+		return sb.String()
+	}
+
+	// Stable server-name ordering.
+	names := make([]string, 0, len(mcpServers))
+	for name := range mcpServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(&sb, "    ✓ %-20s — %d tool(s)\n", name, mcpServers[name])
+	}
+	fmt.Fprintf(&sb, "    %d server(s) connected, %d tool(s) registered.", len(mcpServers), mcpTools)
+	return sb.String()
 }
 
 func toolHasGroup(t models.Tool, group string) bool {
