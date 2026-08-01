@@ -502,23 +502,23 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 		return fmt.Errorf("resolve model %q: %w", r.currentModel, err)
 	}
 
-		// Create a fresh agent for this turn.
-		agentCfg := agent.AgentConfig{
-			LLMProvider:     provider,
-			Tools:           r.cfg.ToolRegistry,
-			Sandbox:         r.sb,
-			Model:           modelName,
-			ContextWindow:   r.currentContextWindow(),
-			ReasoningEffort: r.currentReasoningEffort(),
-			MaxTurns:        r.cfg.MaxTurns,
-			RequestTimeout:  r.cfg.RequestTimeout,
-			UserInteraction: r.ui,
-			PlanMode:        r.planMode,
-			WorkDir:         r.cfg.WorkDir,
-			MemoryService:   r.cfg.MemoryService,
-			MemoryExtractor: r.cfg.MemoryExtractor,
-			MemoryUserID:    r.cfg.WorkDir,
-		}
+	// Create a fresh agent for this turn.
+	agentCfg := agent.AgentConfig{
+		LLMProvider:     provider,
+		Tools:           r.cfg.ToolRegistry,
+		Sandbox:         r.sb,
+		Model:           modelName,
+		ContextWindow:   r.currentContextWindow(),
+		ReasoningEffort: r.currentReasoningEffort(),
+		MaxTurns:        r.cfg.MaxTurns,
+		RequestTimeout:  r.cfg.RequestTimeout,
+		UserInteraction: r.ui,
+		PlanMode:        r.planMode,
+		WorkDir:         r.cfg.WorkDir,
+		MemoryService:   r.cfg.MemoryService,
+		MemoryExtractor: r.cfg.MemoryExtractor,
+		MemoryUserID:    r.cfg.WorkDir,
+	}
 
 	runAgent := agent.New(agentCfg)
 
@@ -983,7 +983,7 @@ func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
 		r.ui.Info("  Usage: /effort <value>")
 		return
 	}
-	
+
 	// /effort default — 重置为空（使用模型配置或 provider default）
 	if args == "default" {
 		r.currentEffort = ""
@@ -992,7 +992,7 @@ func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
 		r.ui.Info("  (takes effect on next turn)")
 		return
 	}
-	
+
 	// Validate and set effort
 	validValues := map[string]bool{"low": true, "medium": true, "high": true, "disabled": true}
 	argsLower := strings.ToLower(args)
@@ -1000,7 +1000,7 @@ func (r *ChatRepl) handleEffortCommand(ctx context.Context, args string) {
 		r.ui.Info(fmt.Sprintf("  Invalid effort %q. Valid: low, medium, high, disabled, default", args))
 		return
 	}
-	
+
 	r.currentEffort = argsLower
 	r.persistModel()
 	r.ui.Info(fmt.Sprintf("  Reasoning effort set to: %s", r.currentEffort))

@@ -590,31 +590,30 @@ func TestDoctorText_Combined(t *testing.T) {
 	}
 }
 
-
 // TestHandleEffortCommand verifies that /effort shows current, validates input,
 // updates the setting, persists to session, and supports default reset.
 func TestHandleEffortCommand(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
-	
+
 	sess, err := store.Create(models.CreateOpts{Model: "default", CWD: "/tmp"})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	
+
 	r := &ChatRepl{
 		cfg:     ReplConfig{},
 		ui:      &mockUI{},
 		sess:    sess,
 		sessMgr: store,
 	}
-	
+
 	// /effort (no args) — shows current
 	r.handleEffortCommand(context.Background(), "")
 	if len(r.ui.(*mockUI).infoMsgs) != 3 {
 		t.Fatalf("expected 3 info lines, got %d", len(r.ui.(*mockUI).infoMsgs))
 	}
-	
+
 	// /effort high — sets to high and persists
 	r.ui.(*mockUI).infoMsgs = nil
 	r.handleEffortCommand(context.Background(), "high")
@@ -629,7 +628,7 @@ func TestHandleEffortCommand(t *testing.T) {
 	if updated.Metadata["effort"] != "high" {
 		t.Fatalf("effort not persisted, got %q", updated.Metadata["effort"])
 	}
-	
+
 	// /effort default — resets to empty and persists
 	r.ui.(*mockUI).infoMsgs = nil
 	r.handleEffortCommand(context.Background(), "default")
@@ -640,7 +639,7 @@ func TestHandleEffortCommand(t *testing.T) {
 	if updated.Metadata["effort"] != "" {
 		t.Fatalf("effort should be empty after default, got %q", updated.Metadata["effort"])
 	}
-	
+
 	// /effort invalid — shows error and doesn't change
 	r.currentEffort = "medium"
 	r.ui.(*mockUI).infoMsgs = nil
