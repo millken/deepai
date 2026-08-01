@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
-	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/v3"
 )
 
 func TestMapMessagesToOpenAI_SystemPrompt(t *testing.T) {
@@ -62,8 +62,11 @@ func TestMapMessagesToOpenAI_AssistantWithToolCalls(t *testing.T) {
 	if len(result[0].OfAssistant.ToolCalls) != 1 {
 		t.Errorf("expected 1 tool call, got %d", len(result[0].OfAssistant.ToolCalls))
 	}
-	if result[0].OfAssistant.ToolCalls[0].ID != "c1" {
-		t.Errorf("tool call id: got %q", result[0].OfAssistant.ToolCalls[0].ID)
+	if result[0].OfAssistant.ToolCalls[0].OfFunction == nil {
+		t.Fatal("expected function tool call")
+	}
+	if result[0].OfAssistant.ToolCalls[0].OfFunction.ID != "c1" {
+		t.Errorf("tool call id: got %q", result[0].OfAssistant.ToolCalls[0].OfFunction.ID)
 	}
 }
 
@@ -116,8 +119,11 @@ func TestMapToolsToOpenAI(t *testing.T) {
 	if len(result) != 1 {
 		t.Fatalf("expected 1 tool, got %d", len(result))
 	}
-	if result[0].Function.Name != "read_file" {
-		t.Errorf("tool name: got %q", result[0].Function.Name)
+	if result[0].OfFunction == nil {
+		t.Fatal("expected function tool")
+	}
+	if result[0].OfFunction.Function.Name != "read_file" {
+		t.Errorf("tool name: got %q", result[0].OfFunction.Function.Name)
 	}
 }
 

@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/packages/param"
-	"github.com/openai/openai-go/packages/ssestream"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/packages/ssestream"
 )
 
 // OpenAICompatProvider implements LLMProvider using the official openai-go SDK.
@@ -286,17 +286,19 @@ func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message) []openai.Ch
 }
 
 func mapAssistantWithToolCalls(m models.Message) openai.ChatCompletionMessageParamUnion {
-	tcs := make([]openai.ChatCompletionMessageToolCallParam, 0, len(m.ToolCalls))
+	tcs := make([]openai.ChatCompletionMessageToolCallUnionParam, 0, len(m.ToolCalls))
 	for _, tc := range m.ToolCalls {
 		argsJSON, _ := json.Marshal(tc.Arguments)
 		if tc.Arguments == nil {
 			argsJSON = []byte("{}")
 		}
-		tcs = append(tcs, openai.ChatCompletionMessageToolCallParam{
-			ID: tc.ID,
-			Function: openai.ChatCompletionMessageToolCallFunctionParam{
-				Name:      tc.Name,
-				Arguments: string(argsJSON),
+		tcs = append(tcs, openai.ChatCompletionMessageToolCallUnionParam{
+			OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+				ID: tc.ID,
+				Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+					Name:      tc.Name,
+					Arguments: string(argsJSON),
+				},
 			},
 		})
 	}
@@ -314,7 +316,7 @@ func mapAssistantWithToolCalls(m models.Message) openai.ChatCompletionMessagePar
 	}
 }
 
-func mapOpenAIToolCalls(calls []openai.ChatCompletionMessageToolCall) []models.ToolCall {
+func mapOpenAIToolCalls(calls []openai.ChatCompletionMessageToolCallUnion) []models.ToolCall {
 	if len(calls) == 0 {
 		return nil
 	}
@@ -332,19 +334,21 @@ func mapOpenAIToolCalls(calls []openai.ChatCompletionMessageToolCall) []models.T
 	return result
 }
 
-func mapToolsToOpenAI(tools []models.Tool) []openai.ChatCompletionToolParam {
-	result := make([]openai.ChatCompletionToolParam, 0, len(tools))
+func mapToolsToOpenAI(tools []models.Tool) []openai.ChatCompletionToolUnionParam {
+	result := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
 	for _, t := range tools {
-		p := openai.ChatCompletionToolParam{
-			Function: openai.FunctionDefinitionParam{
-				Name:       t.Name,
-				Parameters: openai.FunctionParameters(t.InputSchema),
-			},
+		fn := openai.FunctionDefinitionParam{
+			Name:       t.Name,
+			Parameters: openai.FunctionParameters(t.InputSchema),
 		}
 		if t.Description != "" {
-			p.Function.Description = openai.String(t.Description)
+			fn.Description = openai.String(t.Description)
 		}
-		result = append(result, p)
+		result = append(result, openai.ChatCompletionToolUnionParam{
+			OfFunction: &openai.ChatCompletionFunctionToolParam{
+				Function: fn,
+			},
+		})
 	}
 	return result
 }
