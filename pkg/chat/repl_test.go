@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -34,6 +36,59 @@ func (m *mockLLMProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-ch
 	return nil, nil
 }
 
+// newMockModelRegistry builds a single-entry ModelRegistry with a mock provider
+// injected, so tests don't need real API keys. Returns the registry for
+// ReplConfig.ModelRegistry.
+func newMockModelRegistry(mock llm.LLMProvider) *llm.ModelRegistry {
+	reg := llm.NewSingleModelRegistry("test", "test-model", "")
+	reg.InjectProvider("test", "", "", mock)
+	return reg
+}
+
+// newNilMockModelRegistry returns a registry with no injected provider — used
+// for testing the "no provider" path. ProviderFor will fail if called.
+func newNilMockModelRegistry() *llm.ModelRegistry {
+	return llm.NewSingleModelRegistry("test", "test-model", "")
+}
+
+// mockUI is a minimal ReplUI for testing slash commands. It captures Info
+// messages and AskQuestion responses.
+type mockUI struct {
+	infoMsgs    []string
+	askResult   string
+	askErr      error
+	statusModel string
+	statusPlan  bool
+}
+
+func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
+func (m *mockUI) SetStatus(model string, planMode bool) {
+	m.statusModel = model
+	m.statusPlan = planMode
+}
+func (m *mockUI) Banner(_ BannerInfo) {}
+func (m *mockUI) AskQuestion(_ context.Context, _ string, _ []string) (string, error) {
+	return m.askResult, m.askErr
+}
+func (m *mockUI) ReadPrompt(_ context.Context) (string, error) { return "", nil }
+func (m *mockUI) TurnStart(_ int, _ string)                    {}
+func (m *mockUI) TurnEnd(_ *agent.Usage)                       {}
+func (m *mockUI) RenderEvent(_ agent.AgentEvent)               {}
+func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent)     {}
+func (m *mockUI) RenderInterrupted()                           {}
+func (m *mockUI) InterruptCh() <-chan struct{}                 { return nil }
+func (m *mockUI) LoadHistory(_ string)                         {}
+func (m *mockUI) SaveHistory()                                 {}
+func (m *mockUI) Close()                                       {}
+
+// lastInfo returns the most recent Info message, or "" if none.
+func (m *mockUI) lastInfo() string {
+	if len(m.infoMsgs) == 0 {
+		return ""
+	}
+	return m.infoMsgs[len(m.infoMsgs)-1]
+}
+
 func TestGenerateTitle_Success(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
@@ -45,11 +100,9 @@ func TestGenerateTitle_Success(t *testing.T) {
 
 	mock := &mockLLMProvider{response: "Test Title"}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
@@ -76,11 +129,9 @@ func TestGenerateTitle_LongTitle(t *testing.T) {
 	longTitle := "This is a very long title that exceeds thirty characters"
 	mock := &mockLLMProvider{response: longTitle}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	r.generateTitle(sess.ID, "Hello")
@@ -107,11 +158,9 @@ func TestGenerateTitle_EmptyResponse(t *testing.T) {
 
 	mock := &mockLLMProvider{response: ""}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
@@ -138,11 +187,9 @@ func TestGenerateTitle_LLMError(t *testing.T) {
 
 	mock := &mockLLMProvider{err: errors.New("unavailable")}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
@@ -169,11 +216,9 @@ func TestGenerateTitle_ShortFallback(t *testing.T) {
 
 	mock := &mockLLMProvider{err: errors.New("unavailable")}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	r.generateTitle(sess.ID, "Short")
@@ -198,11 +243,9 @@ func TestGenerateTitle_NoProvider(t *testing.T) {
 	}
 
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: nil,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: nil},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	// Should not panic, should skip.
@@ -229,11 +272,9 @@ func TestGenerateTitle_EmptyMessage(t *testing.T) {
 
 	mock := &mockLLMProvider{response: "Test Title"}
 	r := &ChatRepl{
-		cfg: ReplConfig{
-			LLMProvider: mock,
-			Model:       "test-model",
-		},
-		sessMgr: store,
+		cfg:          ReplConfig{ModelRegistry: newMockModelRegistry(mock)},
+		currentModel: "default",
+		sessMgr:      store,
 	}
 
 	// Should skip when firstUserMsg is empty.
@@ -335,14 +376,15 @@ func TestStatusText_ShowsLoadedAndUsage(t *testing.T) {
 
 	r := &ChatRepl{
 		cfg: ReplConfig{
-			Model:        "test-model",
-			ToolRegistry: reg,
-			MCPReport:    "MCP: 1 loaded (zig-mcp)",
+			ModelRegistry: newNilMockModelRegistry(),
+			ToolRegistry:  reg,
+			MCPReport:     "MCP: 1 loaded (zig-mcp)",
 			Commands: map[string]Command{
 				"zig-mcp:build": {Name: "zig-mcp:build", Source: "plugin"},
 				"review":        {Name: "review", Source: "user"},
 			},
 		},
+		currentModel: "default",
 		sess: &models.Session{
 			ID: "s1",
 			Messages: []models.Message{
@@ -365,5 +407,215 @@ func TestStatusText_ShowsLoadedAndUsage(t *testing.T) {
 		if !strings.Contains(text, c) {
 			t.Fatalf("status text missing %q:\n%s", c, text)
 		}
+	}
+}
+
+// TestModelPersistAndRestore verifies that /model <alias> persists the model
+// alias to session metadata and restoreModelFromSession recovers it.
+func TestModelPersistAndRestore(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	sess, err := store.Create(models.CreateOpts{Model: "default", CWD: "/tmp"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Build a multi-model registry.
+	reg, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "m1"},
+		{Name: "fast", Provider: "test", Model: "m2"},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		sess:         sess,
+		sessMgr:      store,
+		currentModel: "default",
+	}
+
+	// Simulate /model fast — should persist.
+	r.currentModel = "fast"
+	r.persistModel()
+
+	// Verify metadata was saved.
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := loaded.Metadata["model"]; got != "fast" {
+		t.Fatalf("persisted model = %q, want fast", got)
+	}
+
+	// Simulate resume: new REPL with default model, then restore from session.
+	r2 := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		sess:         loaded,
+		currentModel: "default",
+	}
+	r2.restoreModelFromSession()
+	if r2.currentModel != "fast" {
+		t.Fatalf("restored model = %q, want fast", r2.currentModel)
+	}
+}
+
+// TestRestoreModel_AliasNotInRegistry verifies graceful fallback when the
+// persisted model alias is no longer available.
+func TestRestoreModel_AliasNotInRegistry(t *testing.T) {
+	reg, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "m1"},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+
+	sess := &models.Session{
+		Metadata: map[string]string{"model": "deleted-alias"},
+	}
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		sess:         sess,
+		currentModel: "default",
+	}
+	r.restoreModelFromSession()
+	// Should stay at default, not crash.
+	if r.currentModel != "default" {
+		t.Fatalf("currentModel = %q, want default (fallback)", r.currentModel)
+	}
+}
+
+// TestRestoreModel_NoMetadata verifies no-op when session has no model metadata.
+func TestRestoreModel_NoMetadata(t *testing.T) {
+	reg, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "m1"},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		sess:         &models.Session{},
+		currentModel: "default",
+	}
+	r.restoreModelFromSession()
+	if r.currentModel != "default" {
+		t.Fatalf("currentModel = %q, want default", r.currentModel)
+	}
+}
+
+// --- handleModelCommand tests ---
+
+func TestHandleModelCommand_ShowCurrent(t *testing.T) {
+	reg, _ := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "openai", Model: "gpt-4o"},
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini"},
+	}, "default")
+	ui := &mockUI{}
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		ui:           ui,
+		sess:         &models.Session{},
+		currentModel: "default",
+	}
+	r.handleModelCommand(context.Background(), "")
+	if len(ui.infoMsgs) == 0 {
+		t.Fatal("expected Info output")
+	}
+	if !strings.Contains(ui.lastInfo(), "default") || !strings.Contains(ui.lastInfo(), "gpt-4o") {
+		t.Fatalf("Info should show current model, got: %s", ui.lastInfo())
+	}
+	if !strings.Contains(ui.lastInfo(), "fast") {
+		t.Fatalf("Info should list available models, got: %s", ui.lastInfo())
+	}
+}
+
+func TestHandleModelCommand_SwitchByAlias(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	sess, _ := store.Create(models.CreateOpts{Model: "default"})
+
+	reg, _ := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "openai", Model: "gpt-4o"},
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini"},
+	}, "default")
+	ui := &mockUI{}
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		ui:           ui,
+		sess:         sess,
+		sessMgr:      store,
+		currentModel: "default",
+	}
+	r.handleModelCommand(context.Background(), "fast")
+	if r.currentModel != "fast" {
+		t.Fatalf("currentModel = %q, want fast", r.currentModel)
+	}
+	if ui.statusModel != "fast" {
+		t.Fatalf("statusModel = %q, want fast", ui.statusModel)
+	}
+	// Verify persisted to session.
+	loaded, _ := store.Load(sess.ID)
+	if got := loaded.Metadata["model"]; got != "fast" {
+		t.Fatalf("persisted model = %q, want fast", got)
+	}
+}
+
+func TestHandleModelCommand_UnknownAlias(t *testing.T) {
+	reg, _ := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "openai", Model: "gpt-4o"},
+	}, "default")
+	ui := &mockUI{}
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		ui:           ui,
+		sess:         &models.Session{},
+		currentModel: "default",
+	}
+	r.handleModelCommand(context.Background(), "nonexistent")
+	if r.currentModel != "default" {
+		t.Fatalf("currentModel should not change for unknown alias")
+	}
+	if !strings.Contains(ui.lastInfo(), "Unknown model") {
+		t.Fatalf("should show error for unknown alias, got: %s", ui.lastInfo())
+	}
+}
+
+func TestHandleModelCommand_Picker(t *testing.T) {
+	reg, _ := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "openai", Model: "gpt-4o"},
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini"},
+	}, "default")
+	ui := &mockUI{askResult: "fast"}
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		ui:           ui,
+		sess:         &models.Session{},
+		currentModel: "default",
+	}
+	r.handleModelCommand(context.Background(), "?")
+	if r.currentModel != "fast" {
+		t.Fatalf("currentModel = %q, want fast after picker", r.currentModel)
+	}
+}
+
+func TestHandleModelCommand_PickerCancel(t *testing.T) {
+	reg, _ := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "openai", Model: "gpt-4o"},
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini"},
+	}, "default")
+	ui := &mockUI{askResult: ""} // empty = cancel
+	r := &ChatRepl{
+		cfg:          ReplConfig{ModelRegistry: reg},
+		ui:           ui,
+		sess:         &models.Session{},
+		currentModel: "default",
+	}
+	r.handleModelCommand(context.Background(), "?")
+	if r.currentModel != "default" {
+		t.Fatalf("currentModel should not change on cancel")
 	}
 }

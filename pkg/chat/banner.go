@@ -10,13 +10,14 @@ import (
 
 // BannerInfo holds data displayed in the startup banner.
 type BannerInfo struct {
-	Version    string
-	Provider   string
-	Model      string
-	ToolCount  int
-	SkillCount int
-	SkillNames []string
-	SessionID  string
+	Version       string
+	Provider      string
+	Model         string
+	ModelAlias    string
+	ToolCount     int
+	SkillCount    int
+	SkillNames    []string
+	SessionID     string
 	ContextWindow int
 }
 
@@ -39,7 +40,11 @@ func RenderBanner(w io.Writer, info BannerInfo) {
 	fmt.Fprintln(w, "  ├"+border+"┤")
 
 	fmt.Fprintln(w, boxLine("Provider", info.Provider, innerWidth))
-	fmt.Fprintln(w, boxLine("Model", info.Model, innerWidth))
+	modelDisplay := info.Model
+	if info.ModelAlias != "" && info.ModelAlias != "default" {
+		modelDisplay = info.ModelAlias + " (" + info.Model + ")"
+	}
+	fmt.Fprintln(w, boxLine("Model", modelDisplay, innerWidth))
 	fmt.Fprintln(w, boxLine("Session", info.SessionID, innerWidth))
 
 	toolsLine := fmt.Sprintf("%d tools", info.ToolCount)

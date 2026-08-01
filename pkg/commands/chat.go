@@ -82,18 +82,49 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// to the env vars agent.New() reads, so they persist without shell exports.
 	applyTokenEfficiencyEnv(cfg)
 
-	if cfg.Provider == "" {
+	if cfg.Provider == "" && len(cfg.Models) == 0 {
 		fmt.Fprintln(os.Stderr, "  No provider configured. Run `deepai setup` first.")
 		return fmt.Errorf("no provider configured")
 	}
 
-	// Resolve model.
-	modelName := cfg.Model
-	if modelOverride != "" {
-		modelName = modelOverride
-	}
-	if modelName == "" {
-		modelName = "default"
+	// Build the model registry: explicit multi-model config takes precedence;
+	// otherwise fall back to the top-level provider/model (backward compat).
+	var modelRegistry *llm.ModelRegistry
+	if len(cfg.Models) > 0 {
+		// Resolve the default model alias from -m override or config Model.
+		// Accept alias name, bare model name, or provider/model ref.
+		defaultName := resolveDefaultAlias(cfg.Models, modelOverride, cfg.Model)
+		modelRegistry, err = llm.NewModelRegistry(cfg.Models, defaultName)
+		if err != nil {
+			return fmt.Errorf("build model registry: %w", err)
+		}
+
+		// If -m specified a bare model name not in the registry, inject it as a
+		// temporary entry under the top-level provider so the session can use it.
+		if modelOverride != "" && !modelRegistry.Has(modelOverride) {
+			def, _ := modelRegistry.Resolve(defaultName)
+			provider := def.Provider
+			if provider == "" {
+				provider = cfg.Provider
+			}
+			tmpReg, err2 := llm.NewModelRegistry(append(cfg.Models, llm.ModelDef{
+				Name: modelOverride, Provider: provider, Model: modelOverride, BaseURL: cfg.BaseURL,
+			}), modelOverride)
+			if err2 != nil {
+				return fmt.Errorf("build model registry with -m override: %w", err2)
+			}
+			modelRegistry = tmpReg
+		}
+	} else {
+		// Backward compat: single provider/model from top-level config.
+		modelName := cfg.Model
+		if modelOverride != "" {
+			modelName = modelOverride
+		}
+		if modelName == "" {
+			modelName = "default"
+		}
+		modelRegistry = llm.NewSingleModelRegistry(cfg.Provider, modelName, cfg.BaseURL)
 	}
 
 	// Safety floor: when the user has not configured a context window, the
@@ -109,19 +140,17 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	}
 
 	slog.Debug("chat config",
-		"provider", cfg.Provider,
-		"model", modelName,
-		"base_url", cfg.BaseURL,
+		"models", len(modelRegistry.List()),
+		"default_model", modelRegistry.DefaultName(),
 		"context_window", cfg.ContextWindow,
 		"database_url_set", cfg.DatabaseURL != "",
 	)
 
-	// Create LLM provider.
-	provider, err := llm.NewProviderFromConfig(cfg.Provider, llm.ProviderConfig{
-		BaseURL: cfg.BaseURL,
-	})
+	// Get the default provider for tools that need a provider at registration
+	// time (git_auto_commit) and for memory extractors.
+	defaultProvider, defaultModelName, err := modelRegistry.ProviderFor(modelRegistry.DefaultName())
 	if err != nil {
-		return fmt.Errorf("create provider %q: %w", cfg.Provider, err)
+		return fmt.Errorf("resolve default model: %w", err)
 	}
 
 	// Create sandbox.
@@ -165,7 +194,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	for _, a := range agentCatalog {
 		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})
 	}
-	registerChatTools(registry, provider, cfg.IsAutonomous(), workDir, modelName, cfg.ContextWindow, pluginAgentDirs, agentOpts)
+	registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, pluginAgentDirs, agentOpts)
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -233,8 +262,8 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	if err := memService.AutoMigrate(ctx); err != nil {
 		slog.Warn("memory auto-migrate failed", "err", err)
 	}
-	memExtractor = memory.NewLLMClient(provider, modelName)
-	prefExtractor = memory.NewPreferenceExtractor(provider, modelName)
+	memExtractor = memory.NewLLMClient(defaultProvider, defaultModelName)
+	prefExtractor = memory.NewPreferenceExtractor(defaultProvider, defaultModelName)
 	slog.Debug("memory service enabled", "store", dbPath)
 
 	// Handle -r with no argument: interactive picker.
@@ -267,8 +296,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// Build REPL config.
 	replCfg := chat.ReplConfig{
 		Provider:            cfg.Provider,
-		Model:               modelName,
-		LLMProvider:         provider,
+		ModelRegistry:       modelRegistry,
 		DatabaseURL:         cfg.DatabaseURL,
 		ContextWindow:       cfg.ContextWindow,
 		MaxTurns:            maxTurns,
@@ -298,19 +326,19 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, provider llm.LLMProvider, autonomous bool, workDir, model string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) {
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
 	// advertised agents resolve to the same source at execution time.
-	subExecutor := agent.NewSubagentExecutor(provider, registry, nil, model).
+	subExecutor := agent.NewSubagentExecutor(modelRegistry, registry, nil).
 		WithWorkDir(workDir).
 		WithContextWindow(contextWindow).
 		WithPluginAgentDirs(pluginAgentDirs)
 	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
-	mustRegisterTool(registry, tools.GitAutoCommitTool(provider))
+	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))
 
 	for _, tool := range builtin.FileTools() {
 		mustRegisterTool(registry, tool)
@@ -330,6 +358,40 @@ func resolveRequestTimeout(minutes int) time.Duration {
 		return time.Duration(minutes) * time.Minute
 	}
 	return 0
+}
+
+// resolveDefaultAlias resolves the default model alias from -m override or
+// config top-level Model. Accepts: alias name, bare model name, or
+// provider/model ref. Returns "" to let the registry pick the first entry.
+func resolveDefaultAlias(defs []llm.ModelDef, modelOverride, configModel string) string {
+	candidates := []string{modelOverride, configModel}
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		// Exact alias match (case-insensitive).
+		for _, d := range defs {
+			if strings.EqualFold(d.Name, c) {
+				return d.Name
+			}
+		}
+		// Bare model name match.
+		for _, d := range defs {
+			if d.Model == c {
+				return d.Name
+			}
+		}
+		// provider/model ref match.
+		if parts := strings.SplitN(c, "/", 2); len(parts) == 2 {
+			for _, d := range defs {
+				if strings.EqualFold(d.Provider, parts[0]) && d.Model == parts[1] {
+					return d.Name
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func mustRegisterTool(registry *tools.Registry, tool models.Tool) {

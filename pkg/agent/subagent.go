@@ -17,28 +17,22 @@ import (
 var subagentMessageSeq uint64
 
 type SubagentExecutor struct {
-	llm             llm.LLMProvider
+	registry        *llm.ModelRegistry
 	tools           *tools.Registry
 	sandbox         *sandbox.Sandbox
-	model           string
 	contextWindow   int
 	workDir         string
 	pluginAgentDirs []string
 }
 
-func NewSubagentExecutor(provider llm.LLMProvider, registry *tools.Registry, sb *sandbox.Sandbox, model ...string) *SubagentExecutor {
-	if registry == nil {
-		registry = tools.NewRegistry()
-	}
-	selectedModel := resolveModel("")
-	if len(model) > 0 {
-		selectedModel = resolveModel(model[0])
+func NewSubagentExecutor(registry *llm.ModelRegistry, toolReg *tools.Registry, sb *sandbox.Sandbox) *SubagentExecutor {
+	if toolReg == nil {
+		toolReg = tools.NewRegistry()
 	}
 	return &SubagentExecutor{
-		llm:     provider,
-		tools:   registry,
-		sandbox: sb,
-		model:   selectedModel,
+		registry: registry,
+		tools:    toolReg,
+		sandbox:  sb,
 	}
 }
 
@@ -70,8 +64,8 @@ func (e *SubagentExecutor) WithPluginAgentDirs(dirs []string) *SubagentExecutor 
 }
 
 func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
-	if e == nil || e.llm == nil {
-		return subagent.ExecutionResult{}, fmt.Errorf("subagent llm provider is required")
+	if e == nil || e.registry == nil {
+		return subagent.ExecutionResult{}, fmt.Errorf("subagent model registry is required")
 	}
 
 	// Resolve agent type config: project YAML/MD > plugin MD > builtin > general
@@ -110,16 +104,21 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		systemPrompt += "\n\nOutput your response as JSON matching this schema:\n" + profileCfg.OutputSchema.Prompt
 	}
 
-	model := e.model
-	if strings.TrimSpace(task.Config.Model) != "" {
-		model = strings.TrimSpace(task.Config.Model)
+	// Resolve model alias: task.Config.Model > agent type YAML model > registry default.
+	modelAlias := strings.TrimSpace(task.Config.Model)
+	if modelAlias == "" {
+		modelAlias = strings.TrimSpace(profileCfg.Model)
+	}
+	provider, modelName, err := e.registry.ProviderFor(modelAlias)
+	if err != nil {
+		return subagent.ExecutionResult{}, fmt.Errorf("resolve subagent model: %w", err)
 	}
 
 	runAgent := New(AgentConfig{
-		LLMProvider:    e.llm,
+		LLMProvider:    provider,
 		Tools:          registry,
 		MaxTurns:       maxTurns,
-		Model:          model,
+		Model:          modelName,
 		Sandbox:        e.sandbox,
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,

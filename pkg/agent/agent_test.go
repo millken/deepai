@@ -432,7 +432,10 @@ func (p *modelCaptureProvider) seen() string {
 
 func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
 	p := &modelCaptureProvider{}
-	exec := NewSubagentExecutor(p, tools.NewRegistry(), nil, "configured-model")
+	reg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	reg.InjectProvider("test", "", "", p)
+
+	exec := NewSubagentExecutor(reg, tools.NewRegistry(), nil)
 	_, err := exec.Execute(context.Background(),
 		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose"}},
 		func(subagent.TaskEvent) {})
@@ -445,9 +448,18 @@ func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
 
 	// Per-task model override wins.
 	p2 := &modelCaptureProvider{}
-	exec2 := NewSubagentExecutor(p2, tools.NewRegistry(), nil, "configured-model")
+	regOverride, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "configured-model"},
+		{Name: "review", Provider: "test", Model: "review-model"},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	regOverride.InjectProvider("test", "", "", p2)
+
+	exec2 := NewSubagentExecutor(regOverride, tools.NewRegistry(), nil)
 	_, err = exec2.Execute(context.Background(),
-		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Model: "review-model"}},
+		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Model: "review"}},
 		func(subagent.TaskEvent) {})
 	if err != nil {
 		t.Fatalf("Execute (override): %v", err)

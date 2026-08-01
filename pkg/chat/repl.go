@@ -24,8 +24,7 @@ import (
 // ReplConfig holds configuration for the chat REPL.
 type ReplConfig struct {
 	Provider            string
-	Model               string
-	LLMProvider         llm.LLMProvider
+	ModelRegistry       *llm.ModelRegistry
 	DatabaseURL         string
 	ContextWindow       int
 	MaxTurns            int
@@ -53,10 +52,29 @@ type ReplConfig struct {
 // are never lost across the context boundary.
 const memoryExtractInterval = 5
 
+// ReplUI is the subset of TUI methods the REPL needs. *TUI satisfies it
+// implicitly. Defining it as an interface lets tests inject a mock.
+type ReplUI interface {
+	Info(msg string)
+	SetStatus(model string, planMode bool)
+	Banner(info BannerInfo)
+	AskQuestion(ctx context.Context, question string, options []string) (string, error)
+	ReadPrompt(ctx context.Context) (string, error)
+	TurnStart(turn int, userInput string)
+	TurnEnd(usage *agent.Usage)
+	RenderEvent(evt agent.AgentEvent)
+	RenderSubagentEvent(evt subagent.TaskEvent)
+	RenderInterrupted()
+	InterruptCh() <-chan struct{}
+	LoadHistory(path string)
+	SaveHistory()
+	Close()
+}
+
 // ChatRepl is the interactive chat REPL.
 type ChatRepl struct {
 	cfg               ReplConfig
-	ui                *TUI
+	ui                ReplUI
 	historyFile       string
 	sess              *models.Session
 	sessMgr           models.SessionRepository
@@ -64,7 +82,8 @@ type ChatRepl struct {
 	turn              int
 	prefSched         *memory.PreferenceScheduler
 	consecCorrections int
-	planMode          bool // restrict to read-only tools until user approves plan
+	planMode          bool   // restrict to read-only tools until user approves plan
+	currentModel      string // selected model alias (from ModelRegistry)
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -83,11 +102,12 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 	}
 
 	repl := &ChatRepl{
-		cfg:         cfg,
-		historyFile: cfg.InputHistoryFile,
-		sessMgr:     cfg.SessionRepo,
-		sb:          sb,
-		prefSched:   memory.NewPreferenceScheduler(),
+		cfg:          cfg,
+		historyFile:  cfg.InputHistoryFile,
+		sessMgr:      cfg.SessionRepo,
+		sb:           sb,
+		prefSched:    memory.NewPreferenceScheduler(),
+		currentModel: cfg.ModelRegistry.DefaultName(),
 	}
 	return repl, nil
 }
@@ -133,7 +153,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	if r.cfg.MCPReport != "" {
 		r.ui.Info("  " + r.cfg.MCPReport)
 	}
-	r.ui.SetStatus(r.cfg.Model, r.planMode)
+	r.ui.SetStatus(r.currentModel, r.planMode)
 
 	// Interactive loop. Ctrl+C during a turn cancels only that turn (delivered
 	// via the TUI interrupt channel); Ctrl+C at the prompt exits the REPL.
@@ -249,9 +269,16 @@ func (r *ChatRepl) bannerInfo() BannerInfo {
 		skillCount = r.cfg.SkillRegistry.Count()
 		skillNames = r.cfg.SkillRegistry.AvailableNames()
 	}
+	// Resolve provider/model from the current model alias for display.
+	provider, model := r.cfg.Provider, r.currentModel
+	if def, ok := r.cfg.ModelRegistry.Resolve(r.currentModel); ok {
+		provider = def.Provider
+		model = def.Model
+	}
 	return BannerInfo{
-		Provider:      r.cfg.Provider,
-		Model:         r.cfg.Model,
+		Provider:      provider,
+		Model:         model,
+		ModelAlias:    r.currentModel,
 		ToolCount:     toolCount,
 		SkillCount:    skillCount,
 		SkillNames:    skillNames,
@@ -277,6 +304,7 @@ func (r *ChatRepl) resolveSession() error {
 		slog.Info("resumed session", "id", sess.ID, "messages", len(msgs))
 		// Clean up incomplete tool calls from interrupted turn.
 		r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
+		r.restoreModelFromSession()
 		return nil
 	}
 
@@ -295,19 +323,21 @@ func (r *ChatRepl) resolveSession() error {
 			r.sess.Messages = msgs
 			slog.Info("continued session", "id", sess.ID, "messages", len(msgs))
 			r.sess.Messages = filterUnresolvedToolUses(r.sess.Messages)
+			r.restoreModelFromSession()
 			return nil
 		}
 	}
 
 	// New session.
 	sess, err := r.sessMgr.Create(models.CreateOpts{
-		Model: r.cfg.Model,
+		Model: r.currentModel,
 		CWD:   r.cfg.WorkDir,
 	})
 	if err != nil {
 		return err
 	}
 	r.sess = sess
+	r.persistModel()
 	return nil
 }
 
@@ -464,12 +494,18 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, continuation b
 	}
 	r.sess.Messages = append(r.sess.Messages, userMsg)
 
+	// Resolve the current model's provider + model name.
+	provider, modelName, err := r.cfg.ModelRegistry.ProviderFor(r.currentModel)
+	if err != nil {
+		return fmt.Errorf("resolve model %q: %w", r.currentModel, err)
+	}
+
 	// Create a fresh agent for this turn.
 	agentCfg := agent.AgentConfig{
-		LLMProvider:     r.cfg.LLMProvider,
+		LLMProvider:     provider,
 		Tools:           r.cfg.ToolRegistry,
 		Sandbox:         r.sb,
-		Model:           r.cfg.Model,
+		Model:           modelName,
 		ContextWindow:   r.cfg.ContextWindow,
 		MaxTurns:        r.cfg.MaxTurns,
 		RequestTimeout:  r.cfg.RequestTimeout,
@@ -661,9 +697,44 @@ func (r *ChatRepl) saveSession() {
 	}
 }
 
+// persistModel saves the current model alias to the session metadata so that
+// resuming the session restores the user's model choice.
+func (r *ChatRepl) persistModel() {
+	if r.sess == nil {
+		return
+	}
+	if r.sess.Metadata == nil {
+		r.sess.Metadata = make(map[string]string)
+	}
+	r.sess.Metadata["model"] = r.currentModel
+	r.saveSession()
+}
+
+// restoreModelFromSession reads the model alias from session metadata and
+// applies it to r.currentModel if the alias is still available in the registry.
+func (r *ChatRepl) restoreModelFromSession() {
+	if r.sess == nil || r.cfg.ModelRegistry == nil {
+		return
+	}
+	alias := strings.TrimSpace(r.sess.Metadata["model"])
+	if alias == "" {
+		return
+	}
+	if r.cfg.ModelRegistry.Has(alias) {
+		r.currentModel = strings.ToLower(alias)
+	} else {
+		slog.Warn("session model alias not in registry, using default", "alias", alias, "default", r.currentModel)
+	}
+}
+
 func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
-	if r.cfg.LLMProvider == nil || firstUserMsg == "" {
-		slog.Debug("auto-title skipped", "provider_nil", r.cfg.LLMProvider == nil, "msg_empty", firstUserMsg == "")
+	if r.cfg.ModelRegistry == nil || firstUserMsg == "" {
+		slog.Debug("auto-title skipped", "registry_nil", r.cfg.ModelRegistry == nil, "msg_empty", firstUserMsg == "")
+		return
+	}
+	provider, modelName, err := r.cfg.ModelRegistry.ProviderFor(r.currentModel)
+	if err != nil {
+		slog.Debug("auto-title skipped: model resolve failed", "err", err)
 		return
 	}
 	if len(firstUserMsg) > 500 {
@@ -679,8 +750,8 @@ func (r *ChatRepl) generateTitle(sessionID, firstUserMsg string) {
 	// of the REPL.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := r.cfg.LLMProvider.Chat(ctx, llm.ChatRequest{
-		Model:           r.cfg.Model,
+	resp, err := provider.Chat(ctx, llm.ChatRequest{
+		Model:           modelName,
 		Messages:        []models.Message{{Role: models.RoleHuman, Content: prompt}},
 		MaxTokens:       &maxTokens,
 		ReasoningEffort: "disabled",
@@ -755,20 +826,14 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.undoLastTurn()
 	case "plan":
 		r.planMode = true
-		r.ui.SetStatus(r.cfg.Model, r.planMode)
+		r.ui.SetStatus(r.currentModel, r.planMode)
 		r.ui.Info("  Plan mode enabled. Agent will explore and plan before writing code.\n  Use /run to disable, or the agent will ask you to approve the plan.")
 	case "run", "code":
 		r.planMode = false
-		r.ui.SetStatus(r.cfg.Model, r.planMode)
+		r.ui.SetStatus(r.currentModel, r.planMode)
 		r.ui.Info("  Plan mode disabled. Agent has full tool access.")
 	case "model":
-		if cmd.Args == "" {
-			r.ui.Info(fmt.Sprintf("  Current model: %s", r.cfg.Model))
-			return false
-		}
-		r.cfg.Model = cmd.Args
-		r.ui.SetStatus(r.cfg.Model, r.planMode)
-		r.ui.Info(fmt.Sprintf("  Model changed to: %s\n  (takes effect on next turn)", r.cfg.Model))
+		r.handleModelCommand(parentCtx, cmd.Args)
 	case "status", "st":
 		r.ui.Info(r.statusText())
 	default:
@@ -776,6 +841,109 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.ui.Info(slashHelpText(SortedCommands(r.cfg.Commands)))
 	}
 	return false
+}
+
+// handleModelCommand implements /model: show current, list available, switch by
+// alias, or launch an interactive picker via the persistent TUI input box.
+func (r *ChatRepl) handleModelCommand(ctx context.Context, args string) {
+	args = strings.TrimSpace(args)
+	reg := r.cfg.ModelRegistry
+
+	// /model (no args) or /model list — show current + available.
+	if args == "" || args == "list" {
+		var sb strings.Builder
+		def, _ := reg.Resolve(r.currentModel)
+		fmt.Fprintf(&sb, "  Current model: %s (%s/%s)", r.currentModel, def.Provider, def.Model)
+		models := reg.List()
+		if len(models) > 1 {
+			fmt.Fprintf(&sb, "\n  Available models:")
+			for _, m := range models {
+				marker := "  "
+				if strings.EqualFold(m.Name, r.currentModel) {
+					marker = "→ "
+				}
+				fmt.Fprintf(&sb, "\n    %s%-12s — %s/%s", marker, m.Name, m.Provider, m.Model)
+			}
+		}
+		r.ui.Info(sb.String())
+		return
+	}
+
+	// /model ? — interactive picker through the TUI's own input box.
+	if args == "?" {
+		r.pickModel(ctx)
+		return
+	}
+
+	// /model <alias> — switch by name.
+	if !reg.Has(args) {
+		r.ui.Info(fmt.Sprintf("  Unknown model %q. Available: %s", args, r.availableModelNames()))
+		return
+	}
+	r.applyModel(ctx, strings.ToLower(args))
+}
+
+// pickModel presents an interactive model picker through the persistent TUI
+// input box (AskQuestion), avoiding a nested huh/tea.Program that would
+// conflict with the running Bubble Tea program.
+func (r *ChatRepl) pickModel(ctx context.Context) {
+	reg := r.cfg.ModelRegistry
+	models := reg.List()
+	if len(models) <= 1 {
+		r.ui.Info("  Only one model configured.")
+		return
+	}
+	var options []string
+	for _, m := range models {
+		label := fmt.Sprintf("%s (%s/%s)", m.Name, m.Provider, m.Model)
+		if strings.EqualFold(m.Name, r.currentModel) {
+			label += " *"
+		}
+		options = append(options, label)
+	}
+	header := "Select model:\n"
+	for i, opt := range options {
+		header += fmt.Sprintf("  %d. %s\n", i+1, opt)
+	}
+	header += "Enter number or alias (empty to cancel):"
+	answer, err := r.ui.AskQuestion(ctx, header, options)
+	if err != nil || strings.TrimSpace(answer) == "" {
+		return
+	}
+	answer = strings.TrimSpace(answer)
+	// AskQuestion returns the option text when a number is entered; extract alias.
+	// Otherwise the user may have typed an alias directly.
+	for _, m := range models {
+		if strings.EqualFold(answer, m.Name) {
+			r.applyModel(ctx, strings.ToLower(m.Name))
+			return
+		}
+		// Match "alias (provider/model)" or "alias (provider/model) *"
+		prefix := m.Name + " ("
+		if strings.HasPrefix(strings.ToLower(answer), strings.ToLower(prefix)) {
+			r.applyModel(ctx, strings.ToLower(m.Name))
+			return
+		}
+	}
+	r.ui.Info(fmt.Sprintf("  Unknown selection %q.", answer))
+}
+
+// applyModel switches to the named alias, updates UI, and persists to session.
+func (r *ChatRepl) applyModel(_ context.Context, alias string) {
+	r.currentModel = alias
+	r.ui.SetStatus(r.currentModel, r.planMode)
+	def, _ := r.cfg.ModelRegistry.Resolve(r.currentModel)
+	r.persistModel()
+	r.ui.Info(fmt.Sprintf("  Model changed to: %s (%s/%s)\n  (takes effect on next turn)", r.currentModel, def.Provider, def.Model))
+}
+
+// availableModelNames returns a comma-separated list of model aliases.
+func (r *ChatRepl) availableModelNames() string {
+	var names []string
+	for _, m := range r.cfg.ModelRegistry.List() {
+		names = append(names, m.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
 // clearSession wipes the current session's history — both the in-memory
@@ -798,7 +966,7 @@ func (r *ChatRepl) startNewSession() {
 
 	// Create new session.
 	sess, err := r.sessMgr.Create(models.CreateOpts{
-		Model: r.cfg.Model,
+		Model: r.currentModel,
 		CWD:   r.cfg.WorkDir,
 	})
 	if err != nil {
@@ -807,6 +975,7 @@ func (r *ChatRepl) startNewSession() {
 	}
 	r.sess = sess
 	r.turn = 0
+	r.persistModel()
 	r.ui.Info(fmt.Sprintf("  New session started: %s", sess.ID))
 }
 
@@ -946,7 +1115,12 @@ func (r *ChatRepl) statusText() string {
 	})
 
 	fmt.Fprintf(&sb, "  Runtime status:\n")
-	fmt.Fprintf(&sb, "  Model: %s\n", r.cfg.Model)
+	// Show alias + provider/model for clarity.
+	if def, ok := r.cfg.ModelRegistry.Resolve(r.currentModel); ok {
+		fmt.Fprintf(&sb, "  Model: %s (%s/%s)\n", r.currentModel, def.Provider, def.Model)
+	} else {
+		fmt.Fprintf(&sb, "  Model: %s\n", r.currentModel)
+	}
 	fmt.Fprintf(&sb, "  Session: %s\n", sessionID)
 	fmt.Fprintf(&sb, "  Loaded tools: %d (builtin/custom: %d, mcp: %d)\n", len(tools), len(tools)-mcpTools, mcpTools)
 

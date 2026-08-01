@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/millken/deepai/pkg/llm"
 )
 
 func TestApplyTokenEfficiencyEnv_SetsFromConfig(t *testing.T) {
@@ -67,5 +69,37 @@ func TestConfig_TokenFieldsYAMLRoundTrip(t *testing.T) {
 	}
 	if !cfg.TokenAging {
 		t.Error("token_aging should parse as true")
+	}
+}
+
+func TestResolveDefaultAlias(t *testing.T) {
+	defs := []llm.ModelDef{
+		{Name: "smart", Provider: "anthropic", Model: "claude-sonnet-4-20250514"},
+		{Name: "fast", Provider: "openai", Model: "gpt-4o-mini"},
+	}
+	tests := []struct {
+		name          string
+		modelOverride string
+		configModel   string
+		want          string
+	}{
+		{"override by alias", "fast", "", "fast"},
+		{"override by bare model name", "gpt-4o-mini", "", "fast"},
+		{"override by provider/model ref", "openai/gpt-4o-mini", "", "fast"},
+		{"override case-insensitive alias", "FAST", "", "fast"},
+		{"config model by alias", "", "smart", "smart"},
+		{"config model by bare name", "", "claude-sonnet-4-20250514", "smart"},
+		{"override not found returns empty", "nonexistent", "", ""},
+		{"both empty returns empty", "", "", ""},
+		{"override wins over config", "fast", "smart", "fast"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveDefaultAlias(defs, tt.modelOverride, tt.configModel)
+			if got != tt.want {
+				t.Errorf("resolveDefaultAlias(%q, %q) = %q, want %q",
+					tt.modelOverride, tt.configModel, got, tt.want)
+			}
+		})
 	}
 }

@@ -31,6 +31,7 @@ type AgentTypeConfig struct {
 	DefaultTools []string      `json:"default_tools,omitempty" yaml:"default_tools,omitempty"`
 	MaxTurns     int           `json:"max_turns" yaml:"max_turns"`
 	Temperature  float64       `json:"temperature" yaml:"temperature"`
+	Model        string        `json:"model,omitempty" yaml:"model,omitempty"`
 	OutputSchema *OutputSchema `json:"-" yaml:"-"`
 }
 

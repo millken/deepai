@@ -19,6 +19,7 @@ type yamlAgentConfig struct {
 	DefaultTools     []string `yaml:"tools"`
 	MaxTurns         int      `yaml:"max_turns"`
 	Temperature      float64  `yaml:"temperature"`
+	Model            string   `yaml:"model"`
 }
 
 // validateSafeName rejects names containing path separators or ".." to prevent path traversal.
@@ -60,6 +61,7 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 		DefaultTools: yc.DefaultTools,
 		MaxTurns:     yc.MaxTurns,
 		Temperature:  yc.Temperature,
+		Model:        yc.Model,
 	}
 
 	if yc.SystemPromptFile != "" {
@@ -123,6 +125,9 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig) AgentTypeConfi
 	}
 	if override.Temperature > 0 {
 		result.Temperature = override.Temperature
+	}
+	if strings.TrimSpace(override.Model) != "" {
+		result.Model = override.Model
 	}
 
 	// No builtin tools and no YAML tools -> default minimal read-only set

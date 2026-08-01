@@ -19,7 +19,7 @@ var slashCommands = []slashCmd{
 	{"compact", "Compact context now"},
 	{"plan", "Enter plan mode (read-only, explore before coding)"},
 	{"run", "Exit plan mode (full tool access)"},
-	{"model", "Show current model (/model <name> to switch)"},
+	{"model", "Show or switch model (/model <name>, /model ? for picker)"},
 	{"status", "Show loaded tools/plugins and tool call stats"},
 	{"exit", "Exit the REPL"},
 }

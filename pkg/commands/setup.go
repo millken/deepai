@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"charm.land/huh/v2"
+	"github.com/millken/deepai/pkg/llm"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -16,17 +17,17 @@ import (
 // Config represents the deepai configuration stored in ~/.deepai/config.yaml.
 // Secrets (API keys) are stored separately in ~/.deepai/.env.
 type Config struct {
-	Provider      string `yaml:"provider,omitempty"`
-	Model         string `yaml:"model,omitempty"`
-	DatabaseURL   string `yaml:"database_url,omitempty"`
-	ContextWindow int    `yaml:"context_window,omitempty"`
-	BaseURL       string `yaml:"base_url,omitempty"`
+	Provider       string `yaml:"provider,omitempty"`
+	Model          string `yaml:"model,omitempty"`
+	DatabaseURL    string `yaml:"database_url,omitempty"`
+	ContextWindow  int    `yaml:"context_window,omitempty"`
+	BaseURL        string `yaml:"base_url,omitempty"`
 	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes (default 30)
 	// Mode controls whether the agent stops to ask clarifying questions.
 	// Empty or "interactive" (default): the agent may use ask_clarification to
 	// block on user input. "autonomous": ask_clarification short-circuits to a
 	// best-judgment response so unattended runs never block.
-	Mode          string `yaml:"mode,omitempty"`
+	Mode string `yaml:"mode,omitempty"`
 
 	// TokenMetrics enables Phase 0 token measurement (JSONL records per turn and
 	// per tool result). "1"/"true" writes to $TMPDIR/deepai-token-metrics.jsonl;
@@ -38,6 +39,12 @@ type Config struct {
 	// context pressure passes 40% of the window. The DEEPAI_TOKEN_AGING env var,
 	// when set, takes precedence.
 	TokenAging bool `yaml:"token_aging,omitempty"`
+
+	// Models defines multiple named model entries for multi-model support.
+	// Each entry binds an alias to a provider+model pair. When non-empty, the
+	// /model command can switch between them and subagents can select per-task.
+	// When empty, the top-level Provider/Model fields are used as the sole model.
+	Models []llm.ModelDef `yaml:"models,omitempty"`
 }
 
 // applyTokenEfficiencyEnv bridges config.yaml token-efficiency settings to the
@@ -108,7 +115,7 @@ func addSetup(topLevel *cobra.Command) {
 and configure its API key. The key is saved to ~/.deepai/.env, the provider
 name is written to ~/.deepai/config.yaml.`,
 			Example: "  deepai setup provider",
-			RunE: runSetupProvider,
+			RunE:    runSetupProvider,
 		},
 		&cobra.Command{
 			Use:   "model",
@@ -117,7 +124,7 @@ name is written to ~/.deepai/config.yaml.`,
 The model name is written to ~/.deepai/config.yaml and used as the default
 for every chat session unless overridden with -m.`,
 			Example: "  deepai setup model",
-			RunE: runSetupModel,
+			RunE:    runSetupModel,
 		},
 		&cobra.Command{
 			Use:   "database",
@@ -126,7 +133,7 @@ for every chat session unless overridden with -m.`,
 storage. Leave blank to keep using the default local SQLite database at
 ~/.deepai/deepai.db.`,
 			Example: "  deepai setup database",
-			RunE: runSetupDatabase,
+			RunE:    runSetupDatabase,
 		},
 	)
 
