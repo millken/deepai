@@ -339,14 +339,8 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))
-	
-	// Initialize git_auto_commit for builtin package
-	builtin.InitGitAutoCommit(tools.GitAutoCommitTool)
 
 	for _, tool := range builtin.FileTools() {
-		mustRegisterTool(registry, tool)
-	}
-	for _, tool := range builtin.GitTools() {
 		mustRegisterTool(registry, tool)
 	}
 	for _, tool := range builtin.WebTools() {
