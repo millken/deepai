@@ -356,9 +356,9 @@ var workingDirSchema = map[string]any{
 // GitStatusTool returns the git status tool
 func GitStatusTool() models.Tool {
 	return models.Tool{
-		Name:        "git_status",
-		Description: "Show the current git repository status.",
-		Groups:      []string{"builtin", "git"},
+		Name:         "git_status",
+		Description:  "Show the current git repository status.",
+		Groups:       []string{"builtin", "git"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -373,9 +373,9 @@ func GitStatusTool() models.Tool {
 // GitDiffTool returns the git diff tool
 func GitDiffTool() models.Tool {
 	return models.Tool{
-		Name:        "git_diff",
-		Description: "Show the diff of changes in the repository.",
-		Groups:      []string{"builtin", "git"},
+		Name:         "git_diff",
+		Description:  "Show the diff of changes in the repository.",
+		Groups:       []string{"builtin", "git"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -391,9 +391,9 @@ func GitDiffTool() models.Tool {
 // GitLogTool returns the git log tool
 func GitLogTool() models.Tool {
 	return models.Tool{
-		Name:        "git_log",
-		Description: "Show recent git commit history.",
-		Groups:      []string{"builtin", "git"},
+		Name:         "git_log",
+		Description:  "Show recent git commit history.",
+		Groups:       []string{"builtin", "git"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",

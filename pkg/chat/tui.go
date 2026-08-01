@@ -237,9 +237,9 @@ type tuiModel struct {
 	aiPartial    string // accumulated streamed assistant text (rendered on flush)
 
 	// markdown rendering
-	renderMD   bool                    // render AI output as markdown (toggle with ctrl+r)
-	lastAIRaw  string                  // raw text of the last AI message, for raw re-emit
-	mdRenderer *glamour.TermRenderer   // cached, rebuilt on width change
+	renderMD   bool                  // render AI output as markdown (toggle with ctrl+r)
+	lastAIRaw  string                // raw text of the last AI message, for raw re-emit
+	mdRenderer *glamour.TermRenderer // cached, rebuilt on width change
 	mdWidth    int
 
 	// channels to the controller
@@ -247,9 +247,9 @@ type tuiModel struct {
 	interruptCh chan struct{}
 
 	// turn/status
-	turn      int
-	turnStart time.Time
-	elapsed   time.Duration
+	turn          int
+	turnStart     time.Time
+	elapsed       time.Duration
 	lastUsage     *agent.Usage
 	model         string
 	planMode      bool
@@ -285,9 +285,9 @@ func newTUIModel(status BannerInfo) *tuiModel {
 	sp.Style = styles.Highlight
 
 	return &tuiModel{
-		styles:      styles,
-		ta:          ta,
-		sp:          sp,
+		styles:        styles,
+		ta:            ta,
+		sp:            sp,
 		histIdx:       -1,
 		model:         status.Model,
 		interruptCh:   make(chan struct{}, 1),

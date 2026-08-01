@@ -283,8 +283,10 @@ func TestRegistry_RestrictTo_FailsClosed(t *testing.T) {
 	r := NewRegistry()
 	for _, name := range []string{"read_file", "bash", "edit_file"} {
 		if err := r.Register(models.Tool{
-			Name:    name,
-			Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) { return models.ToolResult{}, nil },
+			Name: name,
+			Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+				return models.ToolResult{}, nil
+			},
 		}); err != nil {
 			t.Fatal(err)
 		}

@@ -60,12 +60,12 @@ func TestBuildPromptView_AgesToolResultsByStep(t *testing.T) {
 	// 3 tool-call turns; the last tool result is the current turn (age 0).
 	msgs := []models.Message{
 		{Role: models.RoleHuman, Content: "q"},
-		aiTools(""),                 // aiTurnIndex 0
-		toolMsg("read_file", big),   // owner 0 -> age 2
-		aiTools(""),                 // aiTurnIndex 1
-		toolMsg("grep", big),        // owner 1 -> age 1
-		aiTools(""),                 // aiTurnIndex 2 (current)
-		toolMsg("list_dir", big),    // owner 2 -> age 0
+		aiTools(""),               // aiTurnIndex 0
+		toolMsg("read_file", big), // owner 0 -> age 2
+		aiTools(""),               // aiTurnIndex 1
+		toolMsg("grep", big),      // owner 1 -> age 1
+		aiTools(""),               // aiTurnIndex 2 (current)
+		toolMsg("list_dir", big),  // owner 2 -> age 0
 	}
 	out := buildPromptView(msgs, t1Config(), 0)
 

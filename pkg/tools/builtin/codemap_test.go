@@ -236,9 +236,9 @@ func TestCodeMapHandler_IncludeHiddenDescendsFoldDirs(t *testing.T) {
 	// include_hidden=true is the documented recovery path for repos whose real
 	// sources live in vendor/build/etc. — it must descend into fold dirs.
 	root := createTestTree(t, map[string]string{
-		"main.go":        "package main\nfunc Main() {}\n",
-		"vendor/dep.go":  "package dep\nfunc Dep() {}\n",
-		"build/gen.go":   "package gen\nfunc Gen() {}\n",
+		"main.go":       "package main\nfunc Main() {}\n",
+		"vendor/dep.go": "package dep\nfunc Dep() {}\n",
+		"build/gen.go":  "package gen\nfunc Gen() {}\n",
 	})
 
 	res, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{

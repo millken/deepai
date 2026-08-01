@@ -131,8 +131,8 @@ func SessionSearchTool(searcher MessageSearcher) models.Tool {
 	}
 
 	return models.Tool{
-		Name:        "session_search",
-		Description: "Search across past session messages using full-text search. Returns relevance-ranked snippets and supports optional session_id / role filtering.",
+		Name:         "session_search",
+		Description:  "Search across past session messages using full-text search. Returns relevance-ranked snippets and supports optional session_id / role filtering.",
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",

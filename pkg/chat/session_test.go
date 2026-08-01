@@ -336,11 +336,11 @@ func TestDeleteLastUserTurn(t *testing.T) {
 		role    models.Role
 		content string
 	}{
-		{models.RoleHuman, "task A"},                                  // seq 1
-		{models.RoleAI, "orphan tool_use"},                            // seq 2
-		{models.RoleAI, "resolved work B"},                            // seq 3
-		{models.RoleHuman, "task C"},                                  // seq 4 (last human)
-		{models.RoleAI, "work D"},                                     // seq 5
+		{models.RoleHuman, "task A"},       // seq 1
+		{models.RoleAI, "orphan tool_use"}, // seq 2
+		{models.RoleAI, "resolved work B"}, // seq 3
+		{models.RoleHuman, "task C"},       // seq 4 (last human)
+		{models.RoleAI, "work D"},          // seq 5
 	}
 	for _, m := range seqRoles {
 		if err := store.AppendMessage(sess.ID, models.Message{Role: m.role, Content: m.content}); err != nil {

@@ -83,9 +83,9 @@ func ViewImageHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 
 func ViewImageTool() models.Tool {
 	return models.Tool{
-		Name:        "view_image",
-		Description: "Load an image file so the agent can inspect it in a later model turn.",
-		Groups:      []string{"builtin", "image"},
+		Name:         "view_image",
+		Description:  "Load an image file so the agent can inspect it in a later model turn.",
+		Groups:       []string{"builtin", "image"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",

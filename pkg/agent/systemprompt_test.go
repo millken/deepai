@@ -50,8 +50,10 @@ func TestT5c_FileOpRuleOmittedWithoutFileTools(t *testing.T) {
 func TestT5c_FileOpRulePresentWithAnyFileTool(t *testing.T) {
 	reg := tools.NewRegistry()
 	_ = reg.Register(models.Tool{
-		Name:    "edit_file",
-		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) { return models.ToolResult{}, nil },
+		Name: "edit_file",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
 	})
 	a := New(AgentConfig{LLMProvider: &captureProvider{}, Tools: reg, Model: "m"})
 
@@ -80,7 +82,9 @@ func TestPlanMode_IncludesCodeMap(t *testing.T) {
 // risk in agent tests).
 func builtinFileToolsForTest() []models.Tool {
 	return []models.Tool{{
-		Name:    "read_file",
-		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) { return models.ToolResult{}, nil },
+		Name: "read_file",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
 	}}
 }

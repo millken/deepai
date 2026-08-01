@@ -283,9 +283,9 @@ func ImageSearchHandler(ctx context.Context, call models.ToolCall) (models.ToolR
 
 func WebSearchTool() models.Tool {
 	return models.Tool{
-		Name:        "web_search",
-		Description: "Search the web for current information and return relevant results.",
-		Groups:      []string{"builtin", "web"},
+		Name:         "web_search",
+		Description:  "Search the web for current information and return relevant results.",
+		Groups:       []string{"builtin", "web"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -301,9 +301,9 @@ func WebSearchTool() models.Tool {
 
 func WebFetchTool() models.Tool {
 	return models.Tool{
-		Name:        "web_fetch",
-		Description: "Fetch the contents of a web page URL and return a readable text summary. Uses readability extraction to get clean article content.",
-		Groups:      []string{"builtin", "web"},
+		Name:         "web_fetch",
+		Description:  "Fetch the contents of a web page URL and return a readable text summary. Uses readability extraction to get clean article content.",
+		Groups:       []string{"builtin", "web"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -320,9 +320,9 @@ func WebFetchTool() models.Tool {
 
 func ImageSearchTool() models.Tool {
 	return models.Tool{
-		Name:        "image_search",
-		Description: "Search for reference images online and return image URLs plus thumbnails.",
-		Groups:      []string{"builtin", "web"},
+		Name:         "image_search",
+		Description:  "Search for reference images online and return image URLs plus thumbnails.",
+		Groups:       []string{"builtin", "web"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -424,9 +424,9 @@ func WebFetchBatchHandler(ctx context.Context, call models.ToolCall) (models.Too
 
 func WebFetchBatchTool() models.Tool {
 	return models.Tool{
-		Name:        "web_fetch_batch",
-		Description: "Fetches multiple web pages in parallel and returns results for all URLs.",
-		Groups:      []string{"builtin", "web"},
+		Name:         "web_fetch_batch",
+		Description:  "Fetches multiple web pages in parallel and returns results for all URLs.",
+		Groups:       []string{"builtin", "web"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",

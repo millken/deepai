@@ -50,9 +50,9 @@ func TestAging_EndToEnd(t *testing.T) {
 	big := strings.Repeat("x", 10000)
 	history := []models.Message{
 		{Role: models.RoleHuman, Content: "explore the repo"},
-		aiTools(""),                 // aiTurnIndex 0
-		toolMsg("read_file", big),   // owner 0 -> age 1 in the view -> compressed
-		aiTools(""),                 // aiTurnIndex 1 (latest)
+		aiTools(""),                  // aiTurnIndex 0
+		toolMsg("read_file", big),    // owner 0 -> age 1 in the view -> compressed
+		aiTools(""),                  // aiTurnIndex 1 (latest)
 		toolMsg("grep", "small hit"), // owner 1 -> age 0 -> untouched
 	}
 
@@ -64,7 +64,7 @@ func TestAging_EndToEnd(t *testing.T) {
 		ContextWindow: 100000,
 		Aging: &AgingConfig{
 			Enabled:             true,
-			MinContextPressure:  0, // gate off so aging is deterministic here
+			MinContextPressure:  0,             // gate off so aging is deterministic here
 			ConversationBudgets: map[int]int{}, // T1 only
 		},
 	})

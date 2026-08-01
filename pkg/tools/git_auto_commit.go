@@ -49,7 +49,7 @@ func GitAutoCommitTool(provider llm.LLMProvider) models.Tool {
 					"items":       map[string]any{"type": "string"},
 					"description": "Specific files to stage before committing. If empty, only commits what is already staged.",
 				},
-				"description": map[string]any{"type": "string", "description": "Brief context of what was done (e.g., 'Fix login bug')"},
+				"description":  map[string]any{"type": "string", "description": "Brief context of what was done (e.g., 'Fix login bug')"},
 				"author_name":  map[string]any{"type": "string", "description": "Optional git author/committer name override for environments without configured identity"},
 				"author_email": map[string]any{"type": "string", "description": "Optional git author/committer email override for environments without configured identity"},
 				"auto_push":    map[string]any{"type": "boolean", "description": "Push to remote after commit (default: false)"},

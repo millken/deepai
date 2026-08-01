@@ -95,7 +95,7 @@ func TestGitStatusHandler_StructuredData(t *testing.T) {
 		t.Fatal(err)
 	}
 	var payload struct {
-		Clean     bool `json:"clean"`
+		Clean     bool     `json:"clean"`
 		Untracked []string `json:"untracked"`
 	}
 	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {

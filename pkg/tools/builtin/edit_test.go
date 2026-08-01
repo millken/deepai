@@ -2,9 +2,9 @@ package builtin
 
 import (
 	"context"
-	"strings"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"

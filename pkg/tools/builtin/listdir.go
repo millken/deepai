@@ -85,9 +85,9 @@ func ListDirHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 
 func ListDirTool() models.Tool {
 	return models.Tool{
-		Name:        "list_dir",
-		Description: "List directory contents with file metadata. Shows files and subdirectories sorted (dirs first); use it to understand project structure.",
-		Groups:      []string{"builtin", "file_ops"},
+		Name:         "list_dir",
+		Description:  "List directory contents with file metadata. Shows files and subdirectories sorted (dirs first); use it to understand project structure.",
+		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
