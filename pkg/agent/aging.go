@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
@@ -10,6 +11,25 @@ import (
 // occupied before aging kicks in. Below it, buildPromptView returns messages
 // untouched — short sessions and early exploration pay no fidelity cost.
 const defaultMinContextPressure = 0.4
+
+// defaultToolBudgetsByTool maps tool name -> age -> byte cap.
+// Based on §5.4 measured p90/p99 percentiles. The "default" key is the
+// catch-all for any tool not explicitly listed (global p90 = 3.1KB).
+//
+// Layering note: L0 source guards (offload at 24KB, bash 50KB truncate,
+// git_diff --stat default) run BEFORE aging in react.go. So by the time
+// aging sees a tool result, extreme tails are already removed. The budgets
+// below handle the remaining long-tail of "moderately large" results.
+var defaultToolBudgetsByTool = map[string]map[int]int{
+	"default":    {1: 4096, 2: 1024, 3: 300}, // §5.4 "其他/默认", global p90=3.1KB
+	"read_file":  {1: 8192, 2: 2048, 3: 300}, // high: preserve latest reads, prevent re-read
+	"bash":       {1: 4096, 2: 1024, 3: 300},
+	"edit_file":  {1: 300, 2: 300, 3: 300}, // confirmation messages, p99 < 105B
+	"write_file": {1: 300, 2: 300, 3: 300},
+	"grep":       {1: 4096, 2: 1024, 3: 300}, // grep p99=168KB tail is eaten by L0 offload (24KB) first
+	"git_diff":   {1: 2048, 2: 1024, 3: 300}, // L0 defaults to --stat; full diff tail eaten by offload
+	"web_fetch":  {1: 8192, 2: 2048, 3: 300},
+}
 
 // Default per-age byte budgets. See docs/spec/token-efficiency.md §T1.
 var (
@@ -38,6 +58,12 @@ type AgingConfig struct {
 	// "don't compress". nil uses defaultToolResultBudgets. age 0 is never
 	// compressed (current turn).
 	ToolResultBudgets map[int]int
+
+	// ToolResultBudgetsByTool maps tool name -> age -> byte cap, overriding
+	// the per-tool defaults from §5.4. nil = use built-in defaults.
+	// ToolResultBudgets (the age-only map above) is the fallback for any tool
+	// name not found in either the override or the built-in defaults.
+	ToolResultBudgetsByTool map[string]map[int]int
 
 	// ConversationBudgets maps age -> byte cap for RoleAI Content (T4). nil uses
 	// defaultConversationBudgets; an empty (non-nil) map disables T4 entirely
@@ -73,7 +99,24 @@ func budgetForAge(budgets map[int]int, age int) int {
 	return val
 }
 
-func (c *AgingConfig) toolResultBudget(age int) int {
+func (c *AgingConfig) toolResultBudget(age int, toolName string) int {
+	// 1. Caller-provided per-tool overrides win.
+	if byTool := c.ToolResultBudgetsByTool; byTool != nil {
+		if budgets, ok := byTool[toolName]; ok {
+			return budgetForAge(budgets, age)
+		}
+	}
+	// 2. Built-in per-tool defaults (§5.4 measured p90/p99).
+	if budgets, ok := defaultToolBudgetsByTool[toolName]; ok {
+		return budgetForAge(budgets, age)
+	}
+	// 3. Fallback to the "default" row in the per-tool table (§5.4 "其他/默认").
+	//    This is tighter than the legacy defaultToolResultBudgets (which was
+	//    {1:8192, 2:2048, 3:300}) because global p90 is only 3.1KB.
+	if budgets, ok := defaultToolBudgetsByTool["default"]; ok {
+		return budgetForAge(budgets, age)
+	}
+	// 4. Last resort: legacy age-only budget (should never reach here).
 	b := c.ToolResultBudgets
 	if b == nil {
 		b = defaultToolResultBudgets
@@ -149,13 +192,13 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 
 		switch msg.Role {
 		case models.RoleTool: // T1
-			budget := cfg.toolResultBudget(age)
+			toolName := ""
+			if msg.ToolResult != nil {
+				toolName = msg.ToolResult.ToolName
+			}
+			budget := cfg.toolResultBudget(age, toolName)
 			if budget > 0 && len(msg.Content) > budget {
-				toolName := ""
-				if msg.ToolResult != nil {
-					toolName = msg.ToolResult.ToolName
-				}
-				msg.Content = truncateRuneSafe(msg.Content, budget) + "\n[...aged: re-call " + toolName + " to see full output]"
+				msg.Content = truncateRuneSafe(msg.Content, budget) + agedToolHint(toolName, age)
 			}
 		case models.RoleAI: // T4 (only Content; ToolCalls untouched)
 			budget := cfg.conversationBudget(age)
@@ -165,4 +208,17 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 		}
 	}
 	return view
+}
+
+// agedToolHint generates the suffix appended to a truncated tool result.
+// Tools whose output can look "complete" even when heavily truncated (grep,
+// git_diff, web_fetch) get a stronger warning that the visible content is
+// only a fragment and important matches/details may have been omitted.
+func agedToolHint(toolName string, age int) string {
+	switch toolName {
+	case "grep", "git_diff", "web_fetch":
+		return fmt.Sprintf("\n[...aged %d: this output was truncated to fit context — re-call %s for the complete result, important content may be missing]", age, toolName)
+	default:
+		return fmt.Sprintf("\n[...aged: re-call %s to see full output]", toolName)
+	}
 }

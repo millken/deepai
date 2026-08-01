@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -380,6 +382,443 @@ func TestValidationBreaker_TripsDespiteMixedBatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "consecutive tool argument validation failures") {
 		t.Fatalf("breaker did not trip (got %v); a mixed batch is still resetting the global counter", err)
+	}
+}
+
+// repeatLoopProvider emits the same bash tool call every turn, simulating a
+// model stuck re-running `go test` after a failed build.
+type repeatLoopProvider struct {
+	callCount int
+}
+
+func (p *repeatLoopProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *repeatLoopProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	// After enough turns, stop emitting tool calls so the agent terminates
+	// cleanly if the breaker doesn't catch it (safety net for the test).
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{
+			ToolCalls: []models.ToolCall{
+				{ID: "bash1", Name: "bash", Arguments: map[string]any{"command": "go test ./..."}},
+			},
+			Stop: "tool_calls",
+			Done: true,
+		}
+	}()
+	return ch, nil
+}
+
+// TestRepeatBreaker_StopsOnRepeatedFailedBash verifies the repeat-call circuit
+// breaker terminates the run when the model re-runs the exact same bash command
+// (which exits non-zero) more than maxRepeatFails times. This is the exact loop
+// pattern observed in session 20260801_091600_6f08 (420 identical `go test`
+// calls). The key insight: bash returns CallStatusCompleted with exit_code in
+// the JSON body, so the existing validation breaker cannot catch it.
+func TestRepeatBreaker_StopsOnRepeatedFailedBash(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "bash",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string"},
+			},
+			"required": []any{"command"},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			// Simulate `go test` failure: exit_code 1 but tool "completed".
+			return models.ToolResult{
+				CallID:   c.ID,
+				ToolName: c.Name,
+				Content:  `{"stdout":"FAIL\texample [build failed]\n","stderr":"undefined: fmt\n","exit_code":1}`,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &repeatLoopProvider{},
+		Tools:       reg,
+		MaxTurns:    50, // safety net; breaker should trip well before this
+	})
+
+	_, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run tests"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with tool_repeat_loop error")
+	}
+	// The error message contains "repeated identical failed tool call".
+	if !strings.Contains(err.Error(), "repeated identical failed tool call") {
+		t.Fatalf("expected repeat-loop error, got: %v", err)
+	}
+}
+
+// TestRepeatBreaker_HintOnRepeatedIdenticalCalls verifies that when the model
+// repeats the same successful tool call, a non-fatal hint is injected at
+// maxRepeatCalls but the run continues.
+func TestRepeatBreaker_HintOnRepeatedIdenticalCalls(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "echo",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"msg": map[string]any{"type": "string"},
+			},
+			"required": []any{"msg"},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{CallID: c.ID, ToolName: c.Name, Content: "ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &repeatSuccessProvider{}
+	a := New(AgentConfig{
+		LLMProvider: provider,
+		Tools:       reg,
+		MaxTurns:    50,
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "echo"},
+	})
+	if err != nil {
+		t.Fatalf("expected no fatal error for successful repeats, got: %v", err)
+	}
+	// Check that a hint was injected (human message with "loop" in content).
+	hintFound := false
+	for _, msg := range result.Messages {
+		if msg.Role == models.RoleHuman && strings.Contains(strings.ToLower(msg.Content), "loop") {
+			hintFound = true
+			break
+		}
+	}
+	if !hintFound {
+		t.Fatal("expected a non-fatal hint about the loop to be injected into messages")
+	}
+}
+
+// repeatSuccessProvider emits the same successful tool call every turn, then
+// stops after enough turns.
+type repeatSuccessProvider struct {
+	callCount int
+}
+
+func (p *repeatSuccessProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *repeatSuccessProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	if p.callCount > 12 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{
+			ToolCalls: []models.ToolCall{
+				{ID: "e1", Name: "echo", Arguments: map[string]any{"msg": "hi"}},
+			},
+			Stop: "tool_calls",
+			Done: true,
+		}
+	}()
+	return ch, nil
+}
+
+// TestRepeatBreaker_ResetsOnDifferentCall verifies that alternating between
+// two different tool calls does NOT trigger the breaker — the model is making
+// progress, not looping.
+func TestRepeatBreaker_ResetsOnDifferentCall(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "a",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{"v": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{CallID: c.ID, ToolName: c.Name, Content: "a-ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(models.Tool{
+		Name: "b",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{"v": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{CallID: c.ID, ToolName: c.Name, Content: "b-ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &alternatingProvider{}
+	a := New(AgentConfig{
+		LLMProvider: provider,
+		Tools:       reg,
+		MaxTurns:    50,
+	})
+
+	_, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "alternate"},
+	})
+	if err != nil {
+		t.Fatalf("alternating calls should not trigger the breaker, got: %v", err)
+	}
+	if provider.callCount < 15 {
+		t.Fatalf("expected at least 15 turns of alternating calls (no breaker trip), got %d", provider.callCount)
+	}
+}
+
+// alternatingProvider emits tool "a" then "b" then "a" ... never repeating the
+// same call twice in a row.
+type alternatingProvider struct {
+	callCount int
+}
+
+func (p *alternatingProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *alternatingProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	name := "a"
+	if p.callCount%2 == 0 {
+		name = "b"
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{
+			ToolCalls: []models.ToolCall{
+				{ID: name, Name: name, Arguments: map[string]any{"v": "x"}},
+			},
+			Stop: "tool_calls",
+			Done: true,
+		}
+	}()
+	return ch, nil
+}
+
+// offloadTestProvider emits one tool call then stops, so the agent terminates
+// after a single tool execution.
+type offloadTestProvider struct {
+	done bool
+}
+
+func (p *offloadTestProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *offloadTestProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		if p.done {
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			return
+		}
+		p.done = true
+		ch <- llm.StreamChunk{
+			ToolCalls: []models.ToolCall{
+				{ID: "big1", Name: "big_tool", Arguments: map[string]any{}},
+			},
+			Stop: "tool_calls",
+			Done: true,
+		}
+	}()
+	return ch, nil
+}
+
+// TestOffload_LargeResultWrittenToDisk verifies that a tool result exceeding
+// the offload threshold (24KB) is written to disk and replaced in-context with
+// a compact reference containing first/last 50 lines.
+func TestOffload_LargeResultWrittenToDisk(t *testing.T) {
+	tmpDir := t.TempDir()
+	offloadDir := tmpDir + "/offload"
+
+	// Generate 30KB of content (200 lines × ~150 chars).
+	var contentBuilder strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&contentBuilder, "line %03d: %s\n", i, strings.Repeat("x", 140))
+	}
+	largeContent := contentBuilder.String()
+
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "big_tool",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   "big1",
+				ToolName: "big_tool",
+				Content:  largeContent,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &offloadTestProvider{},
+		Tools:       reg,
+		OffloadDir:  offloadDir,
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find the tool result message.
+	var toolMsg *models.Message
+	for i := range result.Messages {
+		if result.Messages[i].Role == models.RoleTool {
+			toolMsg = &result.Messages[i]
+			break
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("no tool result message found")
+	}
+
+	// Content should contain the offload reference, not the full output.
+	if !strings.Contains(toolMsg.Content, "[offloaded:") {
+		t.Fatalf("expected [offloaded:] marker in content, got first 200 chars: %q", toolMsg.Content[:min(200, len(toolMsg.Content))])
+	}
+	// Content should be much smaller than the original 30KB.
+	// First+last 50 lines at ~145 chars/line ≈ 14.5KB, which is expected.
+	if len(toolMsg.Content) > 20000 {
+		t.Fatalf("offloaded content too large: %d bytes (expected <20KB)", len(toolMsg.Content))
+	}
+	// The full output should be on disk.
+	entries, err := os.ReadDir(offloadDir)
+	if err != nil {
+		t.Fatalf("cannot read offload dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 offload file, got %d", len(entries))
+	}
+	// Disk file should contain the full original content.
+	diskContent, err := os.ReadFile(filepath.Join(offloadDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("cannot read offload file: %v", err)
+	}
+	if len(diskContent) != len(largeContent) {
+		t.Fatalf("disk content size %d != original %d", len(diskContent), len(largeContent))
+	}
+}
+
+// TestOffload_SmallResultNotOffloaded verifies that results under the threshold
+// are left untouched.
+func TestOffload_SmallResultNotOffloaded(t *testing.T) {
+	tmpDir := t.TempDir()
+	offloadDir := tmpDir + "/offload"
+
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "small_tool",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   "s1",
+				ToolName: "small_tool",
+				Content:  "small result",
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Provider that emits a small_tool call.
+	provider := &offloadTestProvider{}
+	// Override: emit small_tool instead of big_tool.
+	a := New(AgentConfig{
+		LLMProvider: provider,
+		Tools:       reg,
+		OffloadDir:  offloadDir,
+	})
+	// We need the provider to call "small_tool". Since offloadTestProvider is
+	// hardcoded to "big_tool", register big_tool name but with small handler.
+	// Simpler: just test offloadIfNeeded directly.
+
+	_ = a // keep linter happy
+
+	// Direct unit test of the offload logic.
+	result := models.ToolResult{
+		CallID:   "test1",
+		ToolName: "small_tool",
+		Content:  "small result",
+	}
+	offloaded := a.offloadIfNeeded(&result, offloadDir)
+	if offloaded {
+		t.Fatal("small result should not be offloaded")
+	}
+	if result.Content != "small result" {
+		t.Fatalf("content modified unexpectedly: %q", result.Content)
+	}
+	// No file should exist.
+	if entries, _ := os.ReadDir(offloadDir); len(entries) > 0 {
+		t.Fatalf("expected no offload files, got %d", len(entries))
+	}
+}
+
+// TestOffload_DisabledWhenDirEmpty verifies that offload is a no-op when
+// OffloadDir is empty (offload disabled).
+func TestOffload_DisabledWhenDirEmpty(t *testing.T) {
+	// Create agent with empty offload dir by setting it explicitly.
+	a := New(AgentConfig{
+		LLMProvider: &offloadTestProvider{},
+		Tools:       tools.NewRegistry(),
+		OffloadDir:  "", // explicitly disabled
+	})
+	// Override the auto-derived dir.
+	a.offloadDir = ""
+
+	largeContent := strings.Repeat("x", 30000)
+	result := models.ToolResult{
+		CallID:   "test2",
+		ToolName: "big_tool",
+		Content:  largeContent,
+	}
+	offloaded := a.offloadIfNeeded(&result, a.offloadDir)
+	if offloaded {
+		t.Fatal("offload should be disabled when dir is empty")
+	}
+	if result.Content != largeContent {
+		t.Fatal("content should be unchanged when offload is disabled")
 	}
 }
 

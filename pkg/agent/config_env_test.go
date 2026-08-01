@@ -116,9 +116,9 @@ func TestTokenEfficiency_AgingEnvEnables(t *testing.T) {
 	if a.aging.ConversationBudgets == nil || len(a.aging.ConversationBudgets) != 0 {
 		t.Errorf("ConversationBudgets should be empty (T4 off), got %v", a.aging.ConversationBudgets)
 	}
-	// T1 tool-result budgets fall back to defaults (nil -> default map at use).
-	if budget := a.aging.toolResultBudget(1); budget != defaultToolResultBudgets[1] {
-		t.Errorf("age-1 tool budget = %d, want default %d", budget, defaultToolResultBudgets[1])
+	// T1 tool-result budgets: unknown tools fall back to §5.4 "default" row.
+	if budget := a.aging.toolResultBudget(1, "unknown_tool"); budget != 4096 {
+		t.Errorf("age-1 unknown tool budget = %d, want 4096 (§5.4 default)", budget)
 	}
 }
 

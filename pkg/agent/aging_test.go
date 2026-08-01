@@ -69,16 +69,21 @@ func TestBuildPromptView_AgesToolResultsByStep(t *testing.T) {
 	}
 	out := buildPromptView(msgs, t1Config(), 0)
 
-	// age 2 -> budget 2048
-	if got := len(out[2].Content); got != 2048+len("\n[...aged: re-call read_file to see full output]") {
+	// age 2 -> budget 2048 (read_file per-tool default)
+	hintReadFile := "\n[...aged: re-call read_file to see full output]"
+	if got := len(out[2].Content); got != 2048+len(hintReadFile) {
 		t.Errorf("age2 tool: want 2048+hint bytes, got %d", got)
 	}
 	if !strings.Contains(out[2].Content, "re-call read_file") {
 		t.Errorf("age2 tool: missing re-call hint: %q", out[2].Content[len(out[2].Content)-80:])
 	}
-	// age 1 -> budget 8192
-	if got := len(out[4].Content); got != 8192+len("\n[...aged: re-call grep to see full output]") {
-		t.Errorf("age1 tool: want 8192+hint bytes, got %d", got)
+	// age 1 -> budget 4096 (grep per-tool default, §5.4).
+	// grep gets a stronger hint (P3: "truncated ... important content may be missing").
+	if got := len(out[4].Content); got <= 4096 || got > 4096+200 {
+		t.Errorf("age1 tool: want ~4096+hint bytes, got %d", got)
+	}
+	if !strings.Contains(out[4].Content, "truncated") {
+		t.Errorf("age1 grep: missing truncation warning: %q", out[4].Content[len(out[4].Content)-120:])
 	}
 	// age 0 -> untouched
 	if len(out[6].Content) != 10000 {
@@ -210,7 +215,7 @@ func TestBuildPromptView_UTF8SafeTruncation(t *testing.T) {
 		aiTools(""),               // idx 0
 		toolMsg("read_file", cjk), // age 2 -> 2048-byte budget
 		aiTools(""),               // idx 1
-		toolMsg("grep", cjk),      // age 1 -> 8192-byte budget
+		toolMsg("grep", cjk),      // age 1 -> 4096-byte budget (§5.4)
 		aiTools(""),               // idx 2 (current)
 	}
 	out := buildPromptView(msgs, t1Config(), 0)
@@ -231,5 +236,57 @@ func TestBudgetForAge_StepFunction(t *testing.T) {
 		if got := budgetForAge(b, age); got != want {
 			t.Errorf("budgetForAge(age=%d) = %d, want %d", age, got, want)
 		}
+	}
+}
+
+// TestToolResultBudget_PerToolDifferentiation verifies that the per-tool
+// budget table (§5.4) assigns different budgets to different tools at the
+// same age, and falls back to the age-only default for unknown tools.
+func TestToolResultBudget_PerToolDifferentiation(t *testing.T) {
+	cfg := &AgingConfig{Enabled: true}
+
+	// Known tools: per-tool defaults from §5.4.
+	tests := []struct {
+		toolName string
+		age      int
+		want     int
+	}{
+		{"read_file", 1, 8192}, // high: preserve latest reads
+		{"bash", 1, 4096},      // medium
+		{"edit_file", 1, 300},   // low: confirmation messages
+		{"write_file", 1, 300},
+		{"grep", 1, 4096},
+		{"git_diff", 1, 2048},
+		{"web_fetch", 1, 8192},
+		// Age progression for bash
+		{"bash", 2, 1024},
+		{"bash", 3, 300},
+		// Unknown tool falls back to §5.4 "default" row {4096, 1024, 300}
+		{"unknown_tool", 1, 4096},
+		{"unknown_tool", 2, 1024},
+	}
+	for _, tt := range tests {
+		got := cfg.toolResultBudget(tt.age, tt.toolName)
+		if got != tt.want {
+			t.Errorf("toolResultBudget(age=%d, %q) = %d, want %d", tt.age, tt.toolName, got, tt.want)
+		}
+	}
+}
+
+// TestToolResultBudget_CallOverrideWins verifies that caller-provided
+// ToolResultBudgetsByTool overrides the built-in defaults.
+func TestToolResultBudget_CallOverrideWins(t *testing.T) {
+	cfg := &AgingConfig{
+		Enabled: true,
+		ToolResultBudgetsByTool: map[string]map[int]int{
+			"bash": {1: 999}, // override
+		},
+	}
+	if got := cfg.toolResultBudget(1, "bash"); got != 999 {
+		t.Errorf("override: bash age1 = %d, want 999", got)
+	}
+	// Non-overridden tool still uses built-in default.
+	if got := cfg.toolResultBudget(1, "read_file"); got != 8192 {
+		t.Errorf("non-override: read_file age1 = %d, want 8192", got)
 	}
 }
