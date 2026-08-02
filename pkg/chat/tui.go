@@ -272,6 +272,10 @@ type tuiModel struct {
 	// pendingImages holds images attached via Ctrl+V clipboard paste, to be
 	// sent with the next submitted message.
 	pendingImages []models.MessageImage
+
+	// subagentStatus is the live status line for an active subagent task,
+	// rendered in the live region (not scrollback) so it updates in place.
+	subagentStatus string
 }
 
 func newTUIModel(status BannerInfo) *tuiModel {
@@ -774,7 +778,8 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if len([]rune(desc)) > 80 {
 			desc = string([]rune(desc)[:77]) + "..."
 		}
-		return m.commitWithFlush(m.styles.Dim.Render("  ↳ [subagent] " + desc))
+		m.subagentStatus = "  ↳ [subagent] " + desc
+		return nil
 	case "task_running":
 		msg := strings.TrimSpace(evt.Message)
 		if msg == "" || msg == "task started" {
@@ -783,16 +788,20 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if d := strings.TrimSpace(evt.Description); d != "" {
 			msg = "[" + d + "] " + msg
 		}
-		return m.commitWithFlush(m.styles.Dim.Render("      " + msg))
+		m.subagentStatus = "  ↳ " + msg
+		return nil
 	case "task_completed":
+		m.subagentStatus = ""
 		desc := strings.TrimSpace(evt.Description)
 		if desc == "" {
 			desc = "done"
 		}
 		return m.commitWithFlush(m.styles.ToolResult.Render("  ↳ ✓ " + desc))
 	case "task_timed_out":
+		m.subagentStatus = ""
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] timed out: " + evt.Error))
 	case "task_failed":
+		m.subagentStatus = ""
 		errMsg := evt.Error
 		if errMsg == "" {
 			errMsg = evt.Message
@@ -952,6 +961,12 @@ func (m *tuiModel) View() tea.View {
 	// Status line.
 	if m.agentActive {
 		b.WriteString(m.busyStatus())
+		b.WriteString("\n")
+	}
+
+	// Subagent live status (updates in place, not scrollback).
+	if m.subagentStatus != "" {
+		b.WriteString(m.styles.Dim.Render(m.subagentStatus))
 		b.WriteString("\n")
 	}
 

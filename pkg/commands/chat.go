@@ -332,9 +332,11 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
 	// advertised agents resolve to the same source at execution time.
+	subMaxTokens := 16384 // larger than provider default (8192) to avoid truncating big tool args
 	subExecutor := agent.NewSubagentExecutor(modelRegistry, registry, nil).
 		WithWorkDir(workDir).
 		WithContextWindow(contextWindow).
+		WithMaxTokens(&subMaxTokens).
 		WithPluginAgentDirs(pluginAgentDirs)
 	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))

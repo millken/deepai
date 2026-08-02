@@ -21,6 +21,7 @@ type SubagentExecutor struct {
 	tools           *tools.Registry
 	sandbox         *sandbox.Sandbox
 	contextWindow   int
+	maxTokens       *int
 	workDir         string
 	pluginAgentDirs []string
 }
@@ -48,6 +49,16 @@ func (e *SubagentExecutor) WithWorkDir(dir string) *SubagentExecutor {
 func (e *SubagentExecutor) WithContextWindow(n int) *SubagentExecutor {
 	if e != nil {
 		e.contextWindow = n
+	}
+	return e
+}
+
+// WithMaxTokens sets the max output tokens for subagent LLM calls. When nil,
+// the provider default applies (e.g. 8192 for Anthropic), which may truncate
+// large tool call arguments (e.g. write_file with a big file).
+func (e *SubagentExecutor) WithMaxTokens(n *int) *SubagentExecutor {
+	if e != nil {
+		e.maxTokens = n
 	}
 	return e
 }
@@ -119,6 +130,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		Tools:          registry,
 		MaxTurns:       maxTurns,
 		Model:          modelName,
+		MaxTokens:      e.maxTokens,
 		Sandbox:        e.sandbox,
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,
@@ -221,8 +233,11 @@ func subagentMessageFromAgentEvent(evt AgentEvent) string {
 			return "⚙ " + evt.ToolEvent.Name
 		}
 	case AgentEventToolCallEnd:
-		if evt.ToolEvent != nil && evt.ToolEvent.Error != "" {
-			return "✗ " + evt.ToolEvent.Name + ": " + evt.ToolEvent.Error
+		if evt.ToolEvent != nil {
+			if evt.ToolEvent.Error != "" {
+				return "✗ " + evt.ToolEvent.Name + ": " + evt.ToolEvent.Error
+			}
+			return "✓ " + evt.ToolEvent.Name
 		}
 	case AgentEventError:
 		if s := strings.TrimSpace(evt.Err); s != "" {
