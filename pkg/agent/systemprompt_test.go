@@ -102,6 +102,18 @@ func TestTeamDelegation_InjectedWithTaskToolAndCatalog(t *testing.T) {
 	if !strings.Contains(sp, "coder") {
 		t.Errorf("catalog entry 'coder' not rendered:\n%s", sp)
 	}
+	if !strings.Contains(sp, "## Parallel delegation") {
+		t.Errorf("delegation prompt missing '## Parallel delegation' section:\n%s", sp)
+	}
+}
+
+// TestTeamDelegation_MentionsContextFiles is the RED test for M2-4: the "How
+// to delegate" section must tell the model to pass needed files via
+// context_files instead of pasting their contents into the prompt.
+func TestTeamDelegation_MentionsContextFiles(t *testing.T) {
+	if !strings.Contains(delegationStrategy, "context_files") {
+		t.Errorf("delegationStrategy missing a context_files mention:\n%s", delegationStrategy)
+	}
 }
 
 // TestTeamDelegation_OmittedForSubagent: NonInteractive agents (sub-agents) must

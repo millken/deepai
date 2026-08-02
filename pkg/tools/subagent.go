@@ -23,14 +23,30 @@ type AgentOption struct {
 }
 
 func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
-	desc := "Spawn a bounded subagent, stream lifecycle updates, and return its final result."
+	desc := "Spawn a bounded subagent, stream lifecycle updates, and return its final result. Multiple task calls issued in one turn run concurrently (bounded by the pool)."
 	if extras := formatAgentOptions(agents); extras != "" {
 		desc += " " + extras
 	}
 	return models.Tool{
-		Name:        "task",
-		Description: desc,
-		Groups:      []string{"agent"},
+		Name: "task",
+		// ParallelSafe: a batch of task calls issued in one assistant turn is
+		// safe to run concurrently. Concurrency is bounded by the pool's
+		// semaphore (pkg/subagent/pool.go), each subagent gets its own
+		// isolated tool registry/agent instance, and this handler only calls
+		// StartTask+Wait — it holds no shared mutable state of its own that
+		// concurrent invocations could race on.
+		//
+		// This is a handler-level thread-safety guarantee only: spawned
+		// subagents share the working tree and the git index, so concurrent
+		// git operations across subagents (e.g. git_auto_commit staging or
+		// committing at the same time) can still interleave and race at the
+		// filesystem/git level. That hazard is mitigated by prompt-level
+		// guidance (delegationStrategy's "Parallel delegation" section tells
+		// the model not to fan out concurrent git operations); it is an
+		// accepted risk, not something this handler enforces.
+		ParallelSafe: true,
+		Description:  desc,
+		Groups:       []string{"agent"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -40,6 +56,12 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				"agent_type":    map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
 				"model":         map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
 				"max_turns":     map[string]any{"type": "integer", "description": "Optional max turns override"},
+				"token_budget":  map[string]any{"type": "integer", "description": "Optional max total tokens for this subagent; 0 = unlimited"},
+				"context_files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Repo-relative or absolute file paths whose contents are injected into the subagent's first message. Use for the files the subagent must read anyway; keeps its context focused.",
+				},
 			},
 			"required": []any{"description", "prompt"},
 		},
@@ -52,6 +74,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 			prompt, _ := call.Arguments["prompt"].(string)
 			maxTurns := intFromArg(call.Arguments["max_turns"])
 			model, _ := call.Arguments["model"].(string)
+			tokenBudget := intFromArg(call.Arguments["token_budget"])
 
 			// Resolve agent type: agent_type > subagent_type > general-purpose
 			agentType, _ := call.Arguments["agent_type"].(string)
@@ -59,10 +82,26 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				agentType = string(parseSubagentType(call.Arguments["subagent_type"]))
 			}
 
+			contextFiles, err := stringsFromArg(call.Arguments["context_files"])
+			if err != nil {
+				// Reject rather than silently coerce/skip: a non-string entry
+				// is a model mistake (e.g. a number or object where a path
+				// string belongs) and hiding it would let the subagent run
+				// with a silently incomplete context bundle.
+				return models.ToolResult{
+					CallID:   call.ID,
+					ToolName: call.Name,
+					Status:   models.CallStatusFailed,
+					Error:    err.Error(),
+				}, err
+			}
+
 			task, err := pool.StartTask(ctx, strings.TrimSpace(description), strings.TrimSpace(prompt), subagent.SubagentConfig{
-				AgentType: agentType,
-				MaxTurns:  maxTurns,
-				Model:     strings.TrimSpace(model),
+				AgentType:    agentType,
+				MaxTurns:     maxTurns,
+				Model:        strings.TrimSpace(model),
+				TokenBudget:  tokenBudget,
+				ContextFiles: contextFiles,
 			})
 			if err != nil {
 				return models.ToolResult{
@@ -87,6 +126,14 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				CallID:   call.ID,
 				ToolName: call.Name,
 				Content:  completed.Result,
+			}
+			// Surface the subagent's token consumption for react.go's parent-run
+			// roll-up (M2-2 12a/12b). Nil-safe: a task that never reported usage
+			// (or never reached the executor) leaves Data unset. Content is left
+			// byte-for-byte untouched — the usage summary lives only in Data, so
+			// model-visible text stays clean.
+			if completed.Usage != nil {
+				result.Data = map[string]any{"subagent_usage": completed.Usage}
 			}
 			switch completed.Status {
 			case subagent.TaskStatusCompleted:
@@ -120,6 +167,31 @@ func parseSubagentType(raw any) subagent.SubagentType {
 	default:
 		return subagent.SubagentGeneralPurpose
 	}
+}
+
+// stringsFromArg converts a JSON array argument (decoded as []any) into a
+// []string. A non-string entry is rejected outright (rather than silently
+// coerced or dropped) so a model mistake — e.g. a number or object where a
+// path string belongs — surfaces as a failed tool call instead of hiding
+// behind a silently incomplete context bundle. raw == nil (argument omitted)
+// returns (nil, nil).
+func stringsFromArg(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("context_files must be an array of strings, got %T", raw)
+	}
+	out := make([]string, 0, len(items))
+	for i, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("context_files[%d] must be a string, got %v (%T)", i, item, item)
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 func intFromArg(raw any) int {

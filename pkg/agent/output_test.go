@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
@@ -143,6 +144,79 @@ func (m *mockAgentRunner) Create() *Agent {
 // Note: RunWithSchema requires a working Agent, which needs LLM provider.
 // We test it indirectly through ParseOutput + the retry logic is tested
 // by verifying the wrapper's error handling path.
+
+// --- ValidateOutput tests ---
+//
+// ValidateOutput is the non-generic sibling of ParseOutput[T]: the subagent
+// executor (pkg/agent/subagent.go) validates OutputSchema without a concrete
+// Go type to unmarshal into, so it needs a schema-check-only entry point.
+// RED today: ValidateOutput does not exist.
+
+func TestValidateOutputValid(t *testing.T) {
+	schema := FromStruct[ReviewResult]()
+	input := `{"agent":"security-reviewer","verdict":"pass","summary":"clean","issues":[]}`
+	if err := ValidateOutput(schema, input); err != nil {
+		t.Fatalf("ValidateOutput error = %v, want nil", err)
+	}
+}
+
+func TestValidateOutputSchemaViolation(t *testing.T) {
+	schema := FromStruct[ReviewResult]()
+	// verdict is required, missing here.
+	input := `{"agent":"sec","summary":"no verdict"}`
+	err := ValidateOutput(schema, input)
+	if err == nil {
+		t.Fatal("expected schema validation error for missing required field")
+	}
+	if !strings.Contains(err.Error(), "schema validation failed") {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), "schema validation failed")
+	}
+}
+
+func TestValidateOutputProseWrapped(t *testing.T) {
+	schema := FromStruct[ReviewResult]()
+	input := `Here is my review:
+{"agent":"sec","verdict":"issues_found","summary":"SQL injection","issues":[{"severity":"critical","file":"db.go","line":42,"message":"SQL injection","suggestion":"use params"}]}
+End of review.`
+	if err := ValidateOutput(schema, input); err != nil {
+		t.Fatalf("ValidateOutput error = %v, want nil (JSON should be extracted from prose)", err)
+	}
+}
+
+func TestValidateOutputNoJSON(t *testing.T) {
+	schema := FromStruct[ReviewResult]()
+	err := ValidateOutput(schema, "no json here")
+	if err == nil {
+		t.Fatal("expected error for input without JSON")
+	}
+	if !strings.Contains(err.Error(), "no JSON object found in output") {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), "no JSON object found in output")
+	}
+}
+
+func TestValidateOutputInvalidJSON(t *testing.T) {
+	schema := FromStruct[ReviewResult]()
+	err := ValidateOutput(schema, "{invalid}")
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+	if !strings.Contains(err.Error(), "invalid JSON:") {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), "invalid JSON:")
+	}
+}
+
+func TestValidateOutputNilSchema(t *testing.T) {
+	if err := ValidateOutput(nil, `not even json`); err != nil {
+		t.Fatalf("ValidateOutput(nil, ...) error = %v, want nil", err)
+	}
+}
+
+func TestValidateOutputNilResolved(t *testing.T) {
+	schema := &OutputSchema{} // Resolved is nil
+	if err := ValidateOutput(schema, `not even json`); err != nil {
+		t.Fatalf("ValidateOutput with nil Resolved error = %v, want nil", err)
+	}
+}
 
 func TestAppendParseError(t *testing.T) {
 	msgs := []models.Message{

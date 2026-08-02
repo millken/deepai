@@ -158,7 +158,7 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
 			status = TaskStatusTimedOut
 		}
-		p.finishTask(parentCtx, task, status, "", parentCtx.Err(), nil)
+		p.finishTask(parentCtx, task, status, "", parentCtx.Err(), nil, nil)
 		return
 	}
 	defer func() { <-p.sem }()
@@ -210,14 +210,15 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		status = TaskStatusFailed
 	}
 
-	p.finishTask(parentCtx, task, status, result.Result, err, result.Messages)
+	p.finishTask(parentCtx, task, status, result.Result, err, result.Messages, result.Usage)
 }
 
-func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, result string, err error, messages []models.Message) {
+func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, result string, err error, messages []models.Message, usage *TokenUsage) {
 	task.mu.Lock()
 	task.Status = status
 	task.Result = result
 	task.Messages = append([]models.Message(nil), messages...)
+	task.Usage = usage
 	task.completedAt = time.Now().UTC()
 	if err != nil {
 		task.Error = err.Error()
@@ -293,8 +294,14 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 	if len(cfg.Tools) > 0 {
 		base.Tools = append([]string(nil), cfg.Tools...)
 	}
+	if len(cfg.ContextFiles) > 0 {
+		base.ContextFiles = append([]string(nil), cfg.ContextFiles...)
+	}
 	if strings.TrimSpace(cfg.Model) != "" {
 		base.Model = strings.TrimSpace(cfg.Model)
+	}
+	if cfg.TokenBudget > 0 {
+		base.TokenBudget = cfg.TokenBudget
 	}
 	if base.Timeout <= 0 {
 		base.Timeout = p.cfg.Timeout

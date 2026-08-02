@@ -41,6 +41,15 @@ type SubagentConfig struct {
 	SystemPrompt string
 	Tools        []string
 	Model        string
+	// TokenBudget is an optional per-task total-token cap passed through to
+	// the subagent's AgentConfig.MaxTokensBudget. 0 = unlimited.
+	TokenBudget int
+	// ContextFiles is an optional list of repo-relative or absolute file
+	// paths whose contents are read and prepended to the subagent's first
+	// message as a <context-files> block (pkg/agent's SubagentExecutor.Execute).
+	// The parent names files explicitly rather than context being shared
+	// automatically — see docs/ARCHITECTURE_REVIEW.md M2.4.
+	ContextFiles []string
 }
 
 // EffectiveAgentType returns the resolved agent type string.
@@ -72,16 +81,37 @@ type Task struct {
 	Result      string
 	Error       string
 	Messages    []models.Message
+	// Usage is the subagent's total token consumption, populated in
+	// finishTask once the executor returns. nil if the task never reached
+	// the executor (e.g. it bailed pre-semaphore) or the executor reported
+	// no usage.
+	Usage       *TokenUsage
 	createdAt   time.Time
 	completedAt time.Time
 	done        chan struct{}
 	mu          sync.RWMutex
 }
 
+// TokenUsage tracks token consumption for a subagent task. Defined locally
+// (rather than reusing agent.Usage) to avoid an import cycle: pkg/agent
+// already imports pkg/subagent. json tags use lowercase snake_case so
+// persisted sessions (which marshal Task/TokenUsage values) stay consistent
+// with the rest of the models/session JSON, rather than leaking Go field
+// names.
+type TokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 // ExecutionResult holds the result of a task execution.
 type ExecutionResult struct {
 	Result   string
 	Messages []models.Message
+	// Usage is the subagent run's total token consumption, nil if the
+	// executor's agent run never reported any (e.g. it errored before any
+	// response, or the provider omitted usage).
+	Usage *TokenUsage
 }
 
 // Executor is the interface for executing subagent tasks.
@@ -107,8 +137,21 @@ func (t *Task) snapshot() *Task {
 		Result:      t.Result,
 		Error:       t.Error,
 		Messages:    append([]models.Message(nil), t.Messages...),
+		Usage:       cloneTokenUsage(t.Usage),
 		createdAt:   t.createdAt,
 		completedAt: t.completedAt,
 		done:        nil,
 	}
+}
+
+// cloneTokenUsage returns a copy of the TokenUsage value pointed to by u, so
+// snapshot() callers get their own isolated Usage rather than sharing the
+// live Task's pointer — the same isolation contract snapshot() already
+// applies to Messages (a fresh slice, not the live one).
+func cloneTokenUsage(u *TokenUsage) *TokenUsage {
+	if u == nil {
+		return nil
+	}
+	v := *u
+	return &v
 }

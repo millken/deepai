@@ -273,10 +273,26 @@ type tuiModel struct {
 	// sent with the next submitted message.
 	pendingImages []models.MessageImage
 
-	// subagentStatus is the live status line for an active subagent task,
-	// rendered in the live region (not scrollback) so it updates in place.
-	subagentStatus string
+	// subagentTasks holds the live status line for each active subagent
+	// task, rendered in the live region (not scrollback) so each task
+	// updates in place independently, keyed by TaskID. Order is insertion
+	// order (first-started first).
+	subagentTasks []subagentTaskLine
 }
+
+// subagentTaskLine is one entry in tuiModel.subagentTasks: the live status
+// line for a single in-flight subagent task.
+type subagentTaskLine struct {
+	taskID string
+	line   string
+}
+
+// maxLiveSubagentLines caps how many subagent status lines View() renders in
+// the live region at once. Beyond the cap, the remainder collapses into a
+// single "+N more" summary line so a wide fan-out (e.g. 12 concurrent tasks)
+// can't push the input prompt off-screen. Every task stays tracked in
+// m.subagentTasks regardless — only the rendering is bounded.
+const maxLiveSubagentLines = 5
 
 func newTUIModel(status BannerInfo) *tuiModel {
 	styles := DefaultStyles()
@@ -778,7 +794,7 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if len([]rune(desc)) > 80 {
 			desc = string([]rune(desc)[:77]) + "..."
 		}
-		m.subagentStatus = "  ↳ [subagent] " + desc
+		m.setSubagentLine(evt.TaskID, "  ↳ [subagent] "+desc)
 		return nil
 	case "task_running":
 		msg := strings.TrimSpace(evt.Message)
@@ -788,27 +804,27 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if d := strings.TrimSpace(evt.Description); d != "" {
 			msg = "[" + d + "] " + msg
 		}
-		m.subagentStatus = "  ↳ " + msg
+		m.setSubagentLine(evt.TaskID, "  ↳ "+msg)
 		return nil
 	case "task_completed":
-		m.subagentStatus = ""
+		m.clearSubagentLine(evt.TaskID)
 		desc := strings.TrimSpace(evt.Description)
 		if desc == "" {
 			desc = "done"
 		}
 		return m.commitWithFlush(m.styles.ToolResult.Render("  ↳ ✓ " + desc))
 	case "task_timed_out":
-		m.subagentStatus = ""
+		m.clearSubagentLine(evt.TaskID)
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] timed out: " + evt.Error))
 	case "task_failed":
-		m.subagentStatus = ""
+		m.clearSubagentLine(evt.TaskID)
 		errMsg := evt.Error
 		if errMsg == "" {
 			errMsg = evt.Message
 		}
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] failed: " + errMsg))
 	case "task_cancelled":
-		m.subagentStatus = ""
+		m.clearSubagentLine(evt.TaskID)
 		errMsg := evt.Error
 		if errMsg == "" {
 			errMsg = evt.Message
@@ -816,6 +832,29 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ ⊘ [subagent] cancelled: " + errMsg))
 	}
 	return nil
+}
+
+// setSubagentLine appends a new live status line for taskID, or updates it
+// in place if taskID already has an entry (order-preserving).
+func (m *tuiModel) setSubagentLine(taskID, line string) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks[i].line = line
+			return
+		}
+	}
+	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{taskID: taskID, line: line})
+}
+
+// clearSubagentLine removes the live status line for taskID, if present,
+// leaving every other task's line untouched.
+func (m *tuiModel) clearSubagentLine(taskID string) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks = append(m.subagentTasks[:i], m.subagentTasks[i+1:]...)
+			return
+		}
+	}
 }
 
 // commitWithFlush commits the trailing assistant partial (if any) before the
@@ -971,9 +1010,24 @@ func (m *tuiModel) View() tea.View {
 		b.WriteString("\n")
 	}
 
-	// Subagent live status (updates in place, not scrollback).
-	if m.subagentStatus != "" {
-		b.WriteString(m.styles.Dim.Render(m.subagentStatus))
+	// Subagent live status (updates in place, not scrollback), one line per
+	// in-flight task, in insertion (start) order. Capped at
+	// maxLiveSubagentLines so a wide fan-out can't push the input prompt
+	// off-screen; every task beyond the cap is still tracked in
+	// m.subagentTasks (terminal events for hidden tasks still fire and
+	// commit to scrollback normally) — only the live rendering is bounded.
+	visible := m.subagentTasks
+	overflow := 0
+	if len(visible) > maxLiveSubagentLines {
+		overflow = len(visible) - maxLiveSubagentLines
+		visible = visible[:maxLiveSubagentLines]
+	}
+	for _, task := range visible {
+		b.WriteString(m.styles.Dim.Render(task.line))
+		b.WriteString("\n")
+	}
+	if overflow > 0 {
+		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more", overflow)))
 		b.WriteString("\n")
 	}
 

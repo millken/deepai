@@ -782,6 +782,11 @@ func TestRepeatBreaker_FatalMidBatchKeepsAllToolResults(t *testing.T) {
 				ToolName: c.Name,
 				Status:   models.CallStatusFailed,
 				Error:    "boom",
+				// Every call reports usage so the M1 assertion below can
+				// verify ALL of them (including the mid-batch-fatal tail
+				// append) rolled into RunResult.Usage, not just the ones
+				// processed by the normal per-index loop.
+				Data: map[string]any{"subagent_usage": &subagent.TokenUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}},
 			}, nil
 		},
 	}); err != nil {
@@ -832,6 +837,26 @@ func TestRepeatBreaker_FatalMidBatchKeepsAllToolResults(t *testing.T) {
 			t.Errorf("tool_use ID %q from the final assistant message has no matching tool_result in runMessages "+
 				"(a batch with a mid-batch fatal breaker trip must not drop already-computed trailing results)", call.ID)
 		}
+	}
+
+	// M1: the mid-batch-fatal tail-append loop (which appends already-computed
+	// trailing results to runMessages after a fatal breaker trip) must also
+	// roll each one's usage into RunResult.Usage, not just the results
+	// processed by the normal per-index loop before the trip. Count actual
+	// pfail3 tool_results rather than hardcoding a turn/call count, so this
+	// holds regardless of exactly which turn/index the breaker trips on.
+	pfail3Count := 0
+	for _, msg := range result.Messages {
+		if msg.Role == models.RoleTool && msg.ToolResult != nil && msg.ToolResult.ToolName == "pfail3" {
+			pfail3Count++
+		}
+	}
+	if pfail3Count == 0 {
+		t.Fatal("expected at least one pfail3 tool result")
+	}
+	wantTotal := pfail3Count * 15
+	if result.Usage == nil || result.Usage.TotalTokens != wantTotal {
+		t.Fatalf("RunResult.Usage.TotalTokens = %v, want %d (usage from all %d pfail3 results, including the mid-batch-fatal tail append)", result.Usage, wantTotal, pfail3Count)
 	}
 }
 

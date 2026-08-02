@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -185,12 +186,139 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 }
 
 func TestHandleSubagentEvent_CancelledClearsStatus(t *testing.T) {
-	m := &tuiModel{subagentStatus: "  ↳ [subagent] working"}
+	m := &tuiModel{subagentTasks: []subagentTaskLine{{line: "  ↳ [subagent] working"}}}
 	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}); cmd == nil {
 		t.Fatal("expected a scrollback commit command for task_cancelled")
 	}
-	if m.subagentStatus != "" {
-		t.Fatalf("subagentStatus = %q, want cleared", m.subagentStatus)
+	if len(m.subagentTasks) != 0 {
+		t.Fatalf("subagentTasks = %+v, want empty", m.subagentTasks)
+	}
+}
+
+// --- Multi-task subagent status (M2-1a) ---
+//
+// The subagent pool runs up to 4 concurrent tasks. Each task's live status
+// line must be independent: one task starting, updating, or finishing must
+// not clobber another task's line.
+
+func TestHandleSubagentEvent_MultiTask_BothStartedLinesPresentInOrder(t *testing.T) {
+	m := &tuiModel{}
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
+
+	view := m.View().Content
+	idxA := strings.Index(view, "task A")
+	idxB := strings.Index(view, "task B")
+	if idxA == -1 || idxB == -1 {
+		t.Fatalf("expected both task lines present in view, got %q", view)
+	}
+	if idxA > idxB {
+		t.Fatalf("expected insertion order (A before B) in view, got %q", view)
+	}
+}
+
+func TestHandleSubagentEvent_MultiTask_RunningUpdatesOnlyThatTask(t *testing.T) {
+	m := &tuiModel{}
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
+
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_running", TaskID: "A", Message: "⚙ edit_file"})
+
+	view := m.View().Content
+	if !strings.Contains(view, "⚙ edit_file") {
+		t.Fatalf("expected A's line updated to running message, got %q", view)
+	}
+	if strings.Contains(view, "task A") {
+		t.Fatalf("expected A's started line replaced, got %q", view)
+	}
+	if !strings.Contains(view, "task B") {
+		t.Fatalf("expected B's line untouched by A's update, got %q", view)
+	}
+}
+
+// This is the core bug: today a terminal event for one task clears the
+// single shared status string, wiping out every other in-flight task's
+// line. It must only remove that task's own entry.
+func TestHandleSubagentEvent_MultiTask_TerminalClearsOnlyThatTask(t *testing.T) {
+	m := &tuiModel{}
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
+
+	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"}); cmd == nil {
+		t.Fatal("expected a scrollback commit command for task_completed")
+	}
+
+	view := m.View().Content
+	if strings.Contains(view, "task A") {
+		t.Fatalf("expected A's live line removed after its terminal event, got %q", view)
+	}
+	if !strings.Contains(view, "task B") {
+		t.Fatalf("expected B's live line to survive A's terminal event, got %q", view)
+	}
+}
+
+func TestHandleSubagentEvent_MultiTask_TerminalStillCommitsScrollbackLine(t *testing.T) {
+	m := &tuiModel{}
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
+
+	cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"})
+	if cmd == nil {
+		t.Fatal("expected a scrollback commit command for task_completed")
+	}
+	got := fmt.Sprintf("%v", cmd())
+	got = strings.TrimSuffix(strings.TrimPrefix(got, "{"), "}")
+	want := m.styles.ToolResult.Render("  ↳ ✓ task A")
+	if got != want {
+		t.Fatalf("commit content = %q, want %q", got, want)
+	}
+}
+
+// TestView_SubagentTasks_CapsRenderedLinesWithOverflowSummary is the RED test
+// for the unbounded live subagent region (View(), ~tui.go:1005-1010): a
+// 12-task fan-out would render 12 lines and could push the input prompt
+// off-screen. With 7 concurrent tasks, View() must render only the first 5
+// task lines plus a dimmed "+2 more" summary line — not all 7 — while
+// m.subagentTasks itself keeps tracking every task (so a terminal event for
+// a hidden task still works: it's removed from subagentTasks and still
+// commits its scrollback line, exactly like the already-visible ones).
+func TestView_SubagentTasks_CapsRenderedLinesWithOverflowSummary(t *testing.T) {
+	m := &tuiModel{}
+	for i := 0; i < 7; i++ {
+		id := fmt.Sprintf("T%d", i)
+		desc := fmt.Sprintf("task %d", i)
+		m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: id, Description: desc})
+	}
+
+	view := m.View().Content
+	for i := 0; i < 5; i++ {
+		want := fmt.Sprintf("task %d", i)
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing visible task %q, got %q", want, view)
+		}
+	}
+	for i := 5; i < 7; i++ {
+		hidden := fmt.Sprintf("task %d", i)
+		if strings.Contains(view, hidden) {
+			t.Fatalf("view should not render hidden task %q beyond the cap, got %q", hidden, view)
+		}
+	}
+	if !strings.Contains(view, "+2 more") {
+		t.Fatalf("view missing overflow summary for the 2 hidden tasks, got %q", view)
+	}
+	if len(m.subagentTasks) != 7 {
+		t.Fatalf("subagentTasks = %d, want all 7 still tracked even though only 5 render", len(m.subagentTasks))
+	}
+
+	// A terminal event for a hidden task (T6, beyond the cap) must still work:
+	// removed from subagentTasks and still commits a scrollback line, just
+	// like a visible task's terminal event does.
+	cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "T6", Description: "task 6"})
+	if cmd == nil {
+		t.Fatal("expected a scrollback commit command for the hidden task's terminal event")
+	}
+	if len(m.subagentTasks) != 6 {
+		t.Fatalf("subagentTasks after hidden task's completion = %d, want 6", len(m.subagentTasks))
 	}
 }
 

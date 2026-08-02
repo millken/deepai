@@ -220,6 +220,127 @@ func TestPoolWaitUnknownTask(t *testing.T) {
 	}
 }
 
+// TestPoolStartTaskCompletes_CarriesUsage is the RED test for M2-2 (12a):
+// the executor's ExecutionResult now carries a Usage, and finishTask/snapshot
+// must propagate it onto the Task so callers (pkg/tools' task tool) can read
+// completed.Usage. Before ExecutionResult.Usage and Task.Usage exist, this
+// fails to compile; that is the RED signature for this sub-item.
+func TestPoolStartTaskCompletes_CarriesUsage(t *testing.T) {
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			return ExecutionResult{
+				Result: "done",
+				Usage:  &TokenUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+			}, nil
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	task, err := pool.StartTask(context.Background(), "test task", "do work", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	completed, err := pool.Wait(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if completed.Usage == nil {
+		t.Fatal("completed.Usage = nil, want the executor's TokenUsage propagated through finishTask/snapshot")
+	}
+	if completed.Usage.PromptTokens != 100 || completed.Usage.CompletionTokens != 50 || completed.Usage.TotalTokens != 150 {
+		t.Fatalf("completed.Usage = %+v, want {100,50,150}", completed.Usage)
+	}
+}
+
+// TestPoolSnapshot_CopiesTokenUsageNotSharesPointer covers review nit #3:
+// snapshot() must copy the TokenUsage value, matching the isolation contract
+// it already applies to Messages (a fresh slice per snapshot, not the live
+// one), instead of handing out the same *TokenUsage the executor returned.
+func TestPoolSnapshot_CopiesTokenUsageNotSharesPointer(t *testing.T) {
+	srcUsage := &TokenUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			return ExecutionResult{Result: "done", Usage: srcUsage}, nil
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	task, err := pool.StartTask(context.Background(), "test task", "do work", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	completed, err := pool.Wait(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if completed.Usage == srcUsage {
+		t.Fatal("snapshot's Usage shares the executor's TokenUsage pointer; want an isolated copy")
+	}
+	if completed.Usage == nil || *completed.Usage != *srcUsage {
+		t.Fatalf("completed.Usage = %+v, want a value-equal copy of %+v", completed.Usage, srcUsage)
+	}
+	completed.Usage.TotalTokens = 999
+	if srcUsage.TotalTokens == 999 {
+		t.Fatal("mutating the snapshot's Usage mutated the executor's original — pointer was shared, not copied")
+	}
+}
+
+// TestPoolFinishTask_NilUsageOnPreSemaphoreBail verifies the pre-semaphore and
+// cancel bail paths (which never reach the executor) still finish cleanly
+// with a nil Usage rather than panicking or leaving a stale value.
+func TestPoolFinishTask_NilUsageOnPreSemaphoreBail(t *testing.T) {
+	release := make(chan struct{})
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			<-release
+			return ExecutionResult{Result: "done"}, nil
+		},
+	}, PoolConfig{MaxConcurrent: 1, Timeout: time.Minute})
+	defer close(release)
+
+	holder, err := pool.StartTask(context.Background(), "holder", "hold the slot", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() (holder) error = %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	waiter, err := pool.StartTask(shortCtx, "waiter", "wait for the slot", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() (waiter) error = %v", err)
+	}
+
+	completed, err := pool.Wait(context.Background(), waiter.ID)
+	if err != nil {
+		t.Fatalf("Wait() (waiter) error = %v", err)
+	}
+	if completed.Usage != nil {
+		t.Fatalf("completed.Usage = %+v, want nil for a task that never reached the executor", completed.Usage)
+	}
+
+	release <- struct{}{}
+	if _, err := pool.Wait(context.Background(), holder.ID); err != nil {
+		t.Fatalf("Wait() (holder) error = %v", err)
+	}
+}
+
+// TestResolveConfig_PreservesTokenBudget is the RED test for M2-2 (12d)'s
+// pool-level plumbing: without resolveConfig forwarding TokenBudget, the
+// task tool's token_budget arg would be silently dropped before it ever
+// reaches the executor.
+func TestResolveConfig_PreservesTokenBudget(t *testing.T) {
+	p := NewPool(nil, PoolConfig{})
+	got := p.resolveConfig(SubagentConfig{AgentType: "coder", TokenBudget: 500})
+	if got.TokenBudget != 500 {
+		t.Fatalf("resolveConfig dropped TokenBudget: got %d, want 500", got.TokenBudget)
+	}
+	if got2 := p.resolveConfig(SubagentConfig{AgentType: "coder"}); got2.TokenBudget != 0 {
+		t.Fatalf("unexpected TokenBudget %d for config without TokenBudget", got2.TokenBudget)
+	}
+}
+
 func TestResolveConfig_PreservesModel(t *testing.T) {
 	p := NewPool(nil, PoolConfig{})
 	got := p.resolveConfig(SubagentConfig{AgentType: "coder", Model: "m-1"})
@@ -229,6 +350,47 @@ func TestResolveConfig_PreservesModel(t *testing.T) {
 	// empty Model must not be forced onto the resolved config
 	if got2 := p.resolveConfig(SubagentConfig{AgentType: "coder"}); got2.Model != "" {
 		t.Fatalf("unexpected Model %q for config without Model", got2.Model)
+	}
+}
+
+// TestPoolStartTask_ContextFilesReachExecutor is the RED test for the M2-4
+// no-op bug: resolveConfig (pool.go) copies Tools, Model, TokenBudget, etc.
+// from the caller's SubagentConfig onto the resolved config, but never
+// ContextFiles — so the task tool's context_files argument (pkg/tools/subagent.go)
+// is silently dropped before it ever reaches the executor, even though
+// SubagentExecutor.Execute (pkg/agent/subagent.go) fully supports it. This
+// test crosses the real StartTask seam (not resolveConfig directly) with a
+// capturing fake executor, asserting the executor actually observes
+// task.Config.ContextFiles.
+func TestPoolStartTask_ContextFilesReachExecutor(t *testing.T) {
+	var gotContextFiles []string
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			gotContextFiles = task.Config.ContextFiles
+			return ExecutionResult{Result: "done"}, nil
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	wantFiles := []string{"a.go", "b.md"}
+	task, err := pool.StartTask(context.Background(), "test task", "do work", SubagentConfig{
+		AgentType:    "general-purpose",
+		ContextFiles: wantFiles,
+	})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	if _, err := pool.Wait(context.Background(), task.ID); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	if len(gotContextFiles) != len(wantFiles) {
+		t.Fatalf("executor saw ContextFiles = %v, want %v", gotContextFiles, wantFiles)
+	}
+	for i, f := range wantFiles {
+		if gotContextFiles[i] != f {
+			t.Fatalf("executor saw ContextFiles = %v, want %v", gotContextFiles, wantFiles)
+		}
 	}
 }
 

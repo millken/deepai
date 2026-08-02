@@ -19,11 +19,19 @@ import (
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
+
+// maxTaskCallsPerRun caps how many "task" tool calls a single Run will
+// execute — a cost backstop for unattended runs. Deliberately generous
+// relative to the subagent pool's own concurrency limit (4 by default):
+// this bounds total fan-out across the whole run, not concurrent fan-out at
+// any one instant.
+const maxTaskCallsPerRun = 20
 
 var messageSeq uint64
 var agentRequestSeq uint64
@@ -286,6 +294,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// below feed every (call, result) pair through breaker.observe in batch
 	// order, so the two paths enforce identical limits from one implementation.
 	breaker := newToolCallBreaker()
+	// taskCallCount is the per-Run fan-out cap counter (M2-2 12c): persists
+	// across turns (NOT reset per turn), incremented only for "task" tool
+	// calls, and checked before execution in both the serial and parallel
+	// dispatch paths below. Both paths run on the single goroutine driving
+	// this loop (the parallel path only fans out the actual tool.Execute
+	// calls, deciding admission up front on this goroutine), so no atomic is
+	// needed.
+	taskCallCount := 0
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -546,8 +562,15 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// When ALL tool calls in this batch are declared ParallelSafe, run
 		// them concurrently and only serialize the surrounding event/message
 		// bookkeeping. A single non-parallel-safe call (bash, edit_file,
-		// skill, ...) forces the whole batch to run sequentially so mutating
-		// tools observe each other's effects deterministically.
+		// skill, ...) forces the whole batch to run sequentially. ParallelSafe
+		// is a handler-level thread-safety promise, not a side-effect-freedom
+		// promise: a ParallelSafe tool's Go code has no shared mutable state
+		// that concurrent invocations could race on, but its effects (e.g.
+		// task spawning subagents that write files or run git) can still
+		// collide with each other across goroutines. That cross-goroutine
+		// side-effect discipline is governed by prompt-level constraints
+		// (see delegationStrategy's "Parallel delegation" section), not by
+		// this loop.
 		if a.allParallelSafe(toolCalls) && len(toolCalls) > 1 {
 			runningCalls := make([]models.ToolCall, len(toolCalls))
 			for i, call := range toolCalls {
@@ -567,10 +590,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					ToolEvent: newToolCallEvent(running, nil),
 				})
 			}
+			// Decide fan-out cap admission for the WHOLE batch up front, on
+			// this single goroutine, before any tool actually executes. A
+			// batch straddling the cap runs the calls under it and refuses
+			// the calls over it (M2-2 12c) — admission order follows batch
+			// order, not completion order.
+			overCap := make([]bool, len(toolCalls))
+			for i, call := range toolCalls {
+				overCap[i] = taskCallOverCap(&taskCallCount, call)
+			}
 			results := make([]models.ToolResult, len(toolCalls))
 			var wg sync.WaitGroup
 			for i, call := range toolCalls {
 				i, call := i, call
+				if overCap[i] {
+					results[i] = synthesizeTaskCapResult(call)
+					continue
+				}
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -586,6 +622,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			var pendingHints []models.Message
 			for i, call := range toolCalls {
 				result := results[i]
+				addSubagentUsage(usage, result)
 				offloaded := a.offloadIfNeeded(&result, a.offloadDir)
 				runMessages = appendToolResultMessage(runMessages, sessionID, result)
 				if a.metrics != nil {
@@ -648,8 +685,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					// starts), so append them now even though the breaker
 					// already decided to stop; skip metrics/events for them
 					// to keep this simple, since only the tool_result
-					// pairing invariant is required for correctness.
+					// pairing invariant is required for correctness. Usage
+					// roll-up (M1) is NOT skipped, though — these results
+					// still represent real subagent token consumption that
+					// already happened and must not be silently dropped from
+					// RunResult.Usage just because the breaker tripped on an
+					// earlier result in the same batch.
 					for j := i + 1; j < len(toolCalls); j++ {
+						addSubagentUsage(usage, results[j])
 						runMessages = appendToolResultMessage(runMessages, sessionID, results[j])
 					}
 					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
@@ -693,7 +736,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				ToolEvent: newToolCallEvent(runningCall, nil),
 			})
 
-			result := a.runOneTool(ctx, sessionID, call)
+			var result models.ToolResult
+			if taskCallOverCap(&taskCallCount, call) {
+				// Fan-out cap (M2-2 12c): refuse without executing — never
+				// reaches the subagent pool's StartTask.
+				result = synthesizeTaskCapResult(call)
+			} else {
+				result = a.runOneTool(ctx, sessionID, call)
+			}
 
 			// If a skill was loaded, inject its body into the system prompt
 			// so it doesn't need to be repeated in every turn's history.
@@ -712,6 +762,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				}
 			}
 
+			addSubagentUsage(usage, result)
 			offloaded := a.offloadIfNeeded(&result, a.offloadDir)
 			runMessages = appendToolResultMessage(runMessages, sessionID, result)
 			if a.metrics != nil {
@@ -947,7 +998,15 @@ You lead a team of specialized sub-agents. Use the task tool to delegate when a 
 
 - Give the sub-agent a self-contained prompt with all needed context (file paths, requirements, constraints).
 - Sub-agents cannot see your conversation history. They start fresh. Always include: what to do, what input/context it needs, and what its final answer should contain.
-- After a sub-agent completes, review its output before proceeding. If wrong, re-invoke with corrections.`
+- Pass the files the sub-agent needs via context_files instead of pasting their contents into the prompt.
+- After a sub-agent completes, review its output before proceeding. If wrong, re-invoke with corrections.
+
+## Parallel delegation
+
+- Fan out independent sub-tasks as multiple task calls in ONE response; they run concurrently (bounded by the pool).
+- Parallel tasks MUST operate on disjoint file sets and MUST NOT both run git operations (they share the working tree and git index).
+- Prefer parallel fan-out for independent read/analysis work; use serial, dependency-ordered calls when a later step needs an earlier one's result.
+- Each sub-agent costs tokens — don't fan out for trivial work.`
 
 // renderDelegationPrompt combines the static strategy text with a dynamically
 // rendered agent catalog, so the prompt always reflects the actual available
@@ -1039,6 +1098,62 @@ func accumulateUsage(dst *Usage, src *llm.Usage) {
 	dst.InputTokens += src.InputTokens
 	dst.OutputTokens += src.OutputTokens
 	dst.TotalTokens += src.TotalTokens
+}
+
+// addSubagentUsage rolls a completed subagent's token consumption into the
+// parent run's usage accumulator (M2-2 12b), so RunResult.Usage (TUI stats)
+// and the parent's own token budget check (a.maxTokensBudget, above) include
+// the full subagent tree, not just the parent's own LLM calls. Liberal in
+// what it accepts: result.Data["subagent_usage"]'s value is the concrete
+// *subagent.TokenUsage type populated by the task tool
+// (pkg/tools/subagent.go), but a type switch keeps this robust rather than a
+// hard cast. No-op when the key is absent, nil, or a different type.
+func addSubagentUsage(dst *Usage, result models.ToolResult) {
+	if dst == nil || len(result.Data) == 0 {
+		return
+	}
+	raw, ok := result.Data["subagent_usage"]
+	if !ok {
+		return
+	}
+	switch v := raw.(type) {
+	case *subagent.TokenUsage:
+		if v == nil {
+			return
+		}
+		dst.InputTokens += v.PromptTokens
+		dst.OutputTokens += v.CompletionTokens
+		dst.TotalTokens += v.TotalTokens
+	}
+}
+
+// taskCallOverCap increments *counter for "task" tool calls only and reports
+// whether THIS call exceeds maxTaskCallsPerRun (M2-2 12c). Non-task calls
+// are always allowed and never touch the counter. Must be called from a
+// single goroutine per Run (the serial dispatch loop, or the parallel path's
+// pre-dispatch admission pass) — it is not safe for concurrent use.
+func taskCallOverCap(counter *int, call models.ToolCall) bool {
+	if call.Name != "task" {
+		return false
+	}
+	*counter++
+	return *counter > maxTaskCallsPerRun
+}
+
+// synthesizeTaskCapResult builds the refusal ToolResult for a "task" call
+// that was never executed because it would exceed maxTaskCallsPerRun. This
+// is a per-call refusal, not a fatal run error: it is fed through the normal
+// result path (message history, metrics, events, breaker observation) so
+// the run continues with the model informed of the limit.
+func synthesizeTaskCapResult(call models.ToolCall) models.ToolResult {
+	msg := fmt.Sprintf("task call limit reached for this run (%d); finish with what you have or ask the user to continue", maxTaskCallsPerRun)
+	return models.ToolResult{
+		CallID:      call.ID,
+		ToolName:    call.Name,
+		Status:      models.CallStatusFailed,
+		Error:       msg,
+		CompletedAt: time.Now().UTC(),
+	}
 }
 
 func cloneUsage(src *Usage) *Usage {
@@ -1344,11 +1459,17 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 	result, err := a.tools.Execute(toolCtx, call)
 	if err != nil {
 		err = normalizeRunError(ctx, err, a.requestTimeout)
+		// H1: preserve the tool's own result.Data (e.g. the task tool sets
+		// Data["subagent_usage"] on its timed-out/cancelled/failed branches
+		// before returning an error) instead of discarding it along with the
+		// rest of the original result — otherwise addSubagentUsage never
+		// sees a failed subagent's token consumption.
 		result = models.ToolResult{
 			CallID:      call.ID,
 			ToolName:    call.Name,
 			Status:      models.CallStatusFailed,
 			Error:       err.Error(),
+			Data:        result.Data,
 			CompletedAt: time.Now().UTC(),
 		}
 	}

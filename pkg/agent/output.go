@@ -80,6 +80,32 @@ func ParseOutput[T any](schema *OutputSchema, text string) (*T, error) {
 	return &result, nil
 }
 
+// ValidateOutput checks raw text output against schema without unmarshaling
+// into a concrete Go type. It exists for call sites (e.g. SubagentExecutor.Execute)
+// that hold an *OutputSchema but have no type parameter T to hand ParseOutput —
+// the executor works generically across agent-type profiles, so it cannot be
+// generic itself. Error wording mirrors ParseOutput so retry prompts built via
+// appendParseError stay identical regardless of which entry point produced the
+// error. Nil-safe: a nil schema, or a schema with no resolved validator (e.g.
+// zero-value &OutputSchema{}), means "nothing to validate" and returns nil.
+func ValidateOutput(schema *OutputSchema, text string) error {
+	if schema == nil || schema.Resolved == nil {
+		return nil
+	}
+	jsonStr := extractJSON(text)
+	if jsonStr == "" {
+		return fmt.Errorf("no JSON object found in output")
+	}
+	var raw any
+	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	if err := schema.Resolved.Validate(raw); err != nil {
+		return fmt.Errorf("schema validation failed: %w", err)
+	}
+	return nil
+}
+
 // extractJSON finds the last balanced JSON object in text.
 // Returns the last match to handle cases where the model includes
 // JSON examples in preamble text before the actual structured output.
