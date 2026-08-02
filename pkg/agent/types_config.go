@@ -33,6 +33,14 @@ type AgentTypeConfig struct {
 	Temperature  float64       `json:"temperature" yaml:"temperature"`
 	Model        string        `json:"model,omitempty" yaml:"model,omitempty"`
 	OutputSchema *OutputSchema `json:"-" yaml:"-"`
+
+	// maxTurnsSet/temperatureSet mark MaxTurns/Temperature as an explicit
+	// override even when the value is the zero value (0). Only the YAML
+	// loader (yaml_loader.go) sets these, since only YAML can distinguish an
+	// explicit `max_turns: 0` from the key being absent; mergeConfig reads
+	// them to avoid treating an explicit 0 as "unset".
+	maxTurnsSet    bool
+	temperatureSet bool
 }
 
 const (
@@ -81,7 +89,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Researcher",
 		Description:  "Profile for research, reading, and synthesis tasks.",
 		SystemPrompt: researcherSystemPrompt,
-		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task"},
+		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
 		MaxTurns:     0,
 		Temperature:  0.1,
 	},
@@ -90,7 +98,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Coder",
 		Description:  "Profile for code generation, debugging, and implementation tasks.",
 		SystemPrompt: coderSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task", "skill", "git_status", "git_diff", "git_log", "git_add", "git_commit", "git_reset", "git_auto_commit", "git_push"},
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "skill", "git_auto_commit"},
 		MaxTurns:     0,
 		Temperature:  0.1,
 	},
@@ -162,7 +170,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Frontend Developer",
 		Description:  "Profile for frontend development: HTML/CSS/JS, React/Vue/Angular, responsive design, accessibility, and performance.",
 		SystemPrompt: frontendSystemPrompt,
-		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "task", "web_search", "web_fetch", "image_search"},
+		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
 		MaxTurns:     0,
 		Temperature:  0.15,
 	},

@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -195,5 +196,147 @@ func TestResolveAgentTypeConfigWithPlugins(t *testing.T) {
 	cfgUnk := resolveAgentTypeConfigWithPlugins("nope-not-real", workDir, []string{plug})
 	if cfgUnk.Type != AgentTypeGeneral {
 		t.Fatalf("unknown should fall back to general; got %q", cfgUnk.Type)
+	}
+}
+
+// TestEnumerateAgentsReported_ProjectYAMLParseError: a syntactically invalid
+// project YAML must surface exactly one warning, and the type must still be
+// listed (resolution falls back to builtin/general, execution is unchanged).
+func TestEnumerateAgentsReported_ProjectYAMLParseError(t *testing.T) {
+	workDir := t.TempDir()
+	agentsDir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badYAML := filepath.Join(agentsDir, "broken.yaml")
+	if err := os.WriteFile(badYAML, []byte("type: [unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	agents, warnings := EnumerateAgentsReported(workDir, nil)
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly 1", warnings)
+	}
+	if !strings.Contains(warnings[0], "broken.yaml") {
+		t.Errorf("warning = %q, want mention of broken.yaml", warnings[0])
+	}
+	var listed bool
+	for _, a := range agents {
+		if a.Type == "broken" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Errorf("expected type %q still listed (fallback to builtin/general)", "broken")
+	}
+}
+
+// TestEnumerateAgentsReported_ProjectMDParseError: a project .md with a
+// malformed frontmatter block (missing closing delimiter) must surface
+// exactly one warning.
+func TestEnumerateAgentsReported_ProjectMDParseError(t *testing.T) {
+	workDir := t.TempDir()
+	writeAgentMD(t, filepath.Join(workDir, ".deepai", "agents", "brokenmd.md"),
+		"---\nname: brokenmd\nno closing delimiter here")
+
+	agents, warnings := EnumerateAgentsReported(workDir, nil)
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly 1", warnings)
+	}
+	if !strings.Contains(warnings[0], "brokenmd.md") {
+		t.Errorf("warning = %q, want mention of brokenmd.md", warnings[0])
+	}
+	var listed bool
+	for _, a := range agents {
+		if a.Type == "brokenmd" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Errorf("expected type %q still listed (fallback to builtin/general)", "brokenmd")
+	}
+}
+
+// TestEnumerateAgentsReported_PluginMDParseError: a plugin-bundled .md with
+// malformed frontmatter must surface exactly one warning.
+func TestEnumerateAgentsReported_PluginMDParseError(t *testing.T) {
+	plug := t.TempDir()
+	writeAgentMD(t, filepath.Join(plug, "brokenplug.md"),
+		"---\nname: brokenplug\nno closing delimiter here")
+
+	agents, warnings := EnumerateAgentsReported("", []string{plug})
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly 1", warnings)
+	}
+	if !strings.Contains(warnings[0], "brokenplug.md") {
+		t.Errorf("warning = %q, want mention of brokenplug.md", warnings[0])
+	}
+	var listed bool
+	for _, a := range agents {
+		if a.Type == "brokenplug" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Errorf("expected type %q still listed (fallback to builtin/general)", "brokenplug")
+	}
+}
+
+// TestEnumerateAgentsReported_UnsafeStemNameRejected: a stem collected from
+// the agents directory that fails validateSafeName (contains "..") must
+// surface as a warning, not be silently dropped. Before this fix,
+// resolveAgentTypeConfigWithPluginsReported's `if err == nil` guard discarded
+// the validateSafeName error entirely, so a hostile/malformed stem produced
+// no problems entry and no startup warning at all — the type still fell back
+// to builtin/general (safe), but the operator never learned why their file
+// was ignored.
+func TestEnumerateAgentsReported_UnsafeStemNameRejected(t *testing.T) {
+	workDir := t.TempDir()
+	agentsDir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// ".." is a legal filename substring (only the exact components "." and
+	// ".." are special to the filesystem), so this file is real and gets
+	// picked up by collectStems as the stem "..evil".
+	unsafe := filepath.Join(agentsDir, "..evil.yaml")
+	if err := os.WriteFile(unsafe, []byte("description: hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, warnings := EnumerateAgentsReported(workDir, nil)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "..evil") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want one naming the rejected stem %q", warnings, "..evil")
+	}
+}
+
+// TestEnumerateAgents_StillDiscardsWarnings: EnumerateAgents is a thin
+// wrapper — it must still resolve and list types even when a warning would
+// have been produced, just without surfacing it.
+func TestEnumerateAgents_StillDiscardsWarnings(t *testing.T) {
+	workDir := t.TempDir()
+	agentsDir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "broken2.yaml"), []byte("type: [unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agents := EnumerateAgents(workDir, nil)
+	var listed bool
+	for _, a := range agents {
+		if a.Type == "broken2" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Errorf("expected type %q still listed", "broken2")
 	}
 }

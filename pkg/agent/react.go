@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -23,7 +24,6 @@ import (
 )
 
 const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
-const defaultRequestTimeout = 10 * time.Minute
 
 var messageSeq uint64
 var agentRequestSeq uint64
@@ -44,7 +44,6 @@ type Agent struct {
 	maxTokensBudget int
 	requestTimeout  time.Duration
 	events          chan AgentEvent
-	requests        sync.Map
 	runMu           sync.Mutex
 	eventsMu        sync.RWMutex
 	eventsClosed    bool
@@ -169,6 +168,11 @@ func New(cfg AgentConfig) *Agent {
 	// non-interactive agents (subagents): plan mode needs a user to approve the
 	// plan, and without one the agent stalls in read-only exploration.
 	if !cfg.NonInteractive {
+		// Clone before registering: cfg.Tools may be a registry shared across
+		// agents (e.g. the REPL reuses one process-wide registry every turn).
+		// Registering into it directly would leak this agent's plan tools
+		// (bound via closure to this agent) into every other agent sharing it.
+		a.tools = a.tools.Clone()
 		a.registerPlanTools()
 
 		// Start in plan mode if requested (e.g. user typed /plan).
@@ -266,8 +270,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	}
 
 	requestID := newAgentRequestID()
-	a.requests.Store(requestID, sessionID)
-	defer a.requests.Delete(requestID)
 
 	emit := func(evt AgentEvent) {
 		evt.RequestID = requestID
@@ -279,21 +281,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 	runMessages := append([]models.Message(nil), messages...)
 	usage := &Usage{}
-	// validationFailures tracks consecutive tool-validation errors per tool name.
-	// When the same tool fails argument validation 3 times in a row the agent
-	// injects a synthetic human message to break the loop.
-	validationFailures := make(map[string]int)
-	consecutiveValidationFailures := 0
-
-	// Repeat-call circuit-breaker state: tracks consecutive identical tool
-	// invocations (same name + args hash). Unlike validationFailures, this
-	// catches loops where the tool *succeeds* (e.g. `go test` returning
-	// exit_code 1 as CallStatusCompleted) but the model keeps retrying the
-	// exact same command. prevRepeatKey provides "consecutive" semantics —
-	// switching to a different call resets the counters.
-	repeatCalls := make(map[string]int)
-	repeatFails := make(map[string]int)
-	prevRepeatKey := ""
+	// breaker holds all circuit-breaker state (validation-failure loop and
+	// repeat-call loop). Both the serial and parallel tool-execution paths
+	// below feed every (call, result) pair through breaker.observe in batch
+	// order, so the two paths enforce identical limits from one implementation.
+	breaker := newToolCallBreaker()
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -446,7 +438,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 			if chunk.Delta != "" {
 				textBuilder.WriteString(chunk.Delta)
-				emit(AgentEvent{Type: AgentEventChunk, MessageID: aiMessageID, Text: chunk.Delta})
 				emit(AgentEvent{Type: AgentEventTextChunk, MessageID: aiMessageID, Text: chunk.Delta})
 			}
 			if len(chunk.ToolCalls) > 0 {
@@ -588,6 +579,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 			wg.Wait()
 			batchClean := true
+			// pendingHints accumulates breaker hint messages during the batch;
+			// they are appended to runMessages only after the batch's last
+			// tool result so a hint (RoleHuman) never lands between an
+			// assistant tool_calls message and any of its tool results (M1-7).
+			var pendingHints []models.Message
 			for i, call := range toolCalls {
 				result := results[i]
 				offloaded := a.offloadIfNeeded(&result, a.offloadDir)
@@ -625,42 +621,46 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					Result:    &result,
 					ToolEvent: newToolEventFromResult(completed, result),
 				})
-				// Circuit-breaker for parallel path (same logic as serial path).
-				if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+				// Circuit-breaker bookkeeping — identical logic to the serial
+				// path below, run through the shared helper in batch order.
+				obs := breaker.observe(sessionID, call, result)
+				if len(obs.hintMessages) > 0 {
+					pendingHints = append(pendingHints, obs.hintMessages...)
+				}
+				if obs.validationFailure {
 					batchClean = false
-					consecutiveValidationFailures++
-					validationFailures[call.Name]++
-					if validationFailures[call.Name] >= maxValidationRetries {
-						hint := fmt.Sprintf(
-							"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
-								"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
-							call.Name, validationFailures[call.Name], result.Error,
-						)
-						runMessages = append(runMessages, models.Message{
-							ID:        newMessageID("human"),
-							SessionID: sessionID,
-							Role:      models.RoleHuman,
-							Content:   hint,
-							CreatedAt: time.Now().UTC(),
-						})
-						validationFailures[call.Name] = 0
+				}
+				if obs.fatalErr != nil {
+					// The run ends here; append any pending hints now so they
+					// are still persisted, but they still come after every
+					// tool result observed so far.
+					if len(pendingHints) > 0 {
+						runMessages = append(runMessages, pendingHints...)
 					}
-					if consecutiveValidationFailures >= 8 {
-						err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", consecutiveValidationFailures, result.Error)
-						agentErr := &AgentError{
-							Code:       "tool_validation_loop",
-							Message:    err.Error(),
-							Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
-						}
-						emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
-						return &RunResult{Messages: runMessages, Usage: usage}, err
+					// Invariant that matters here: every tool_use ID on the
+					// assistant message that started this batch MUST have a
+					// matching tool_result in runMessages, or the next
+					// Anthropic request is malformed — and the REPL persists
+					// runMessages even on error, so a dropped result would
+					// permanently poison the session. results[i+1:] were
+					// already computed by the goroutines above (the whole
+					// batch runs concurrently before this observation loop
+					// starts), so append them now even though the breaker
+					// already decided to stop; skip metrics/events for them
+					// to keep this simple, since only the tool_result
+					// pairing invariant is required for correctness.
+					for j := i + 1; j < len(toolCalls); j++ {
+						runMessages = appendToolResultMessage(runMessages, sessionID, results[j])
 					}
-				} else {
-					validationFailures[call.Name] = 0
+					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
+					return &RunResult{Messages: runMessages, Usage: usage}, obs.fatalErr
 				}
 			}
+			if len(pendingHints) > 0 {
+				runMessages = append(runMessages, pendingHints...)
+			}
 			if batchClean {
-				consecutiveValidationFailures = 0
+				breaker.resetOnCleanBatch()
 			}
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -671,6 +671,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		}
 
 		batchClean := true
+		// pendingHints accumulates breaker hint messages during the batch;
+		// they are appended to runMessages only after the batch's last tool
+		// result so a hint (RoleHuman) never lands between an assistant
+		// tool_calls message and any of its tool results (M1-7).
+		var pendingHints []models.Message
 		for _, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
@@ -743,98 +748,41 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				ToolEvent: newToolEventFromResult(completedCall, result),
 			})
 
-			// Repeat-call circuit-breaker: detect when the model re-runs the
-			// exact same tool with the same arguments without progress. This
-			// catches loops the validation breaker misses — e.g. `go test`
-			// returning exit_code 1 as a "completed" bash result, causing the
-			// model to retry the identical command dozens of times.
-			rKey := repeatKey(call.Name, call.Arguments)
-			if rKey != prevRepeatKey {
-				// Model switched to a different call → not a loop; reset.
-				repeatCalls = make(map[string]int)
-				repeatFails = make(map[string]int)
-				prevRepeatKey = rKey
+			// Circuit-breaker bookkeeping (repeat-call loop, then
+			// validation-failure loop) via the shared helper — see
+			// toolCallBreaker.observe for the combined logic.
+			obs := breaker.observe(sessionID, call, result)
+			if len(obs.hintMessages) > 0 {
+				pendingHints = append(pendingHints, obs.hintMessages...)
 			}
-			repeatCalls[rKey]++
-			if isResultFailed(result) {
-				repeatFails[rKey]++
-			} else {
-				repeatFails[rKey] = 0
-			}
-
-			// Fatal: repeated identical failures mean retrying won't help.
-			if repeatFails[rKey] >= maxRepeatFails {
-				err := fmt.Errorf("repeated identical failed tool call (%q x%d): %s",
-					call.Name, repeatFails[rKey], result.Error)
-				agentErr := &AgentError{
-					Code:    "tool_repeat_loop",
-					Message: err.Error(),
-					Suggestion: "The model repeatedly ran the same failing command. " +
-						"Inspect the failing tool output and try a different approach.",
-				}
-				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
-			}
-			// Non-fatal hint: nudge the model to change approach (inject once).
-			if repeatCalls[rKey] == maxRepeatCalls {
-				runMessages = append(runMessages, models.Message{
-					ID:        newMessageID("human"),
-					SessionID: sessionID,
-					Role:      models.RoleHuman,
-					Content: fmt.Sprintf(
-						"You have run %q %d times with identical arguments. "+
-							"If the result isn't changing, you are in a loop. "+
-							"Try a different command, inspect the output more carefully, or move on.",
-						call.Name, repeatCalls[rKey]),
-					CreatedAt: time.Now().UTC(),
-				})
-			}
-
-			// Circuit-breaker: if the same tool fails argument validation 3 times
-			// in a row, inject a human hint and reset the counter. This prevents
-			// infinite loops where the model keeps omitting required arguments.
-			const maxValidationRetries = 3
-			if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+			if obs.validationFailure {
 				batchClean = false
-				consecutiveValidationFailures++
-				validationFailures[call.Name]++
-				if validationFailures[call.Name] >= maxValidationRetries {
-					hint := fmt.Sprintf(
-						"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
-							"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
-						call.Name, validationFailures[call.Name], result.Error,
-					)
-					runMessages = append(runMessages, models.Message{
-						ID:        newMessageID("human"),
-						SessionID: sessionID,
-						Role:      models.RoleHuman,
-						Content:   hint,
-						CreatedAt: time.Now().UTC(),
-					})
-					validationFailures[call.Name] = 0
+			}
+			if obs.fatalErr != nil {
+				// The run ends here; append any pending hints now so they are
+				// still persisted, but they still come after every tool
+				// result observed so far.
+				if len(pendingHints) > 0 {
+					runMessages = append(runMessages, pendingHints...)
 				}
-				if consecutiveValidationFailures >= 8 {
-					err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", consecutiveValidationFailures, result.Error)
-					agentErr := &AgentError{
-						Code:       "tool_validation_loop",
-						Message:    err.Error(),
-						Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
-					}
-					emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
-					return &RunResult{Messages: runMessages, Usage: usage}, err
-				}
-			} else {
-				validationFailures[call.Name] = 0
+				emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
+				return &RunResult{Messages: runMessages, Usage: usage}, obs.fatalErr
 			}
 
 			if err := ctx.Err(); err != nil {
+				if len(pendingHints) > 0 {
+					runMessages = append(runMessages, pendingHints...)
+				}
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return &RunResult{Messages: runMessages, Usage: usage}, err
 			}
 		}
+		if len(pendingHints) > 0 {
+			runMessages = append(runMessages, pendingHints...)
+		}
 		if batchClean {
-			consecutiveValidationFailures = 0
+			breaker.resetOnCleanBatch()
 		}
 	}
 }
@@ -1472,6 +1420,11 @@ func isValidationError(errMsg string) bool {
 // same tool before the circuit-breaker injects a corrective human hint.
 const maxValidationRetries = 3
 
+// maxConsecutiveValidationFailures is the global (all-tools) consecutive
+// validation-failure count that hard-stops the run, even when the model
+// alternates between different badly-called tools instead of retrying one.
+const maxConsecutiveValidationFailures = 8
+
 // Repeat-call circuit-breaker thresholds.
 //
 // The validation breaker above only catches tools that fail argument schema
@@ -1493,6 +1446,152 @@ const (
 // Two calls with the same key are "the same operation" for loop detection.
 func repeatKey(toolName string, args map[string]any) string {
 	return toolName + "\x00" + computeArgsHash(args)
+}
+
+// toolCallBreaker holds all circuit-breaker state for one Run(): the
+// validation-failure loop and the repeat-call loop. Run()'s serial and
+// parallel tool-execution paths both feed every (call, result) pair through
+// observe(), in batch order, so a model looping on a parallel-safe batch is
+// stopped exactly as it would be on the serial path — one implementation,
+// two call sites.
+type toolCallBreaker struct {
+	// validationFailures tracks consecutive tool-validation errors per tool
+	// name; consecutiveValidationFailures is the same count across all tools,
+	// so alternating between two badly-called tools still trips the breaker.
+	validationFailures            map[string]int
+	consecutiveValidationFailures int
+
+	// repeatCalls/repeatFails/prevRepeatKey track consecutive identical tool
+	// invocations (same name + args hash). prevRepeatKey gives "consecutive"
+	// semantics — switching to a different call resets both counters.
+	repeatCalls   map[string]int
+	repeatFails   map[string]int
+	prevRepeatKey string
+}
+
+func newToolCallBreaker() *toolCallBreaker {
+	return &toolCallBreaker{
+		validationFailures: make(map[string]int),
+		repeatCalls:        make(map[string]int),
+		repeatFails:        make(map[string]int),
+	}
+}
+
+// breakerObservation is the outcome of feeding one (call, result) pair
+// through toolCallBreaker.observe.
+type breakerObservation struct {
+	// hintMessages are synthetic human messages to append to runMessages
+	// (repeat-call hint, validation-failure hint, or both).
+	hintMessages []models.Message
+	// validationFailure reports whether this call counted as a validation
+	// failure, so the caller can clear its per-batch "clean" flag.
+	validationFailure bool
+	// fatalErr/fatalAgentErr are set when a breaker trips fatally; the
+	// caller must stop processing the batch and return immediately.
+	fatalErr      error
+	fatalAgentErr *AgentError
+}
+
+// observe runs the repeat-call breaker and then the validation-failure
+// breaker for one tool call result, mirroring the original inline order: the
+// repeat-call breaker sees every result (success or failure), the validation
+// breaker only failed-validation results. A fatal trip short-circuits before
+// the validation breaker runs, matching the original code's early return.
+func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result models.ToolResult) breakerObservation {
+	var out breakerObservation
+
+	// Repeat-call circuit-breaker: detect when the model re-runs the exact
+	// same tool with the same arguments without progress. This catches loops
+	// the validation breaker misses — e.g. `go test` returning exit_code 1 as
+	// a "completed" bash result, causing the model to retry the identical
+	// command dozens of times.
+	rKey := repeatKey(call.Name, call.Arguments)
+	if rKey != b.prevRepeatKey {
+		// Model switched to a different call → not a loop; reset.
+		b.repeatCalls = make(map[string]int)
+		b.repeatFails = make(map[string]int)
+		b.prevRepeatKey = rKey
+	}
+	b.repeatCalls[rKey]++
+	if isResultFailed(result) {
+		b.repeatFails[rKey]++
+	} else {
+		b.repeatFails[rKey] = 0
+	}
+
+	// Fatal: repeated identical failures mean retrying won't help.
+	if b.repeatFails[rKey] >= maxRepeatFails {
+		err := fmt.Errorf("repeated identical failed tool call (%q x%d): %s",
+			call.Name, b.repeatFails[rKey], result.Error)
+		out.fatalErr = err
+		out.fatalAgentErr = &AgentError{
+			Code:    "tool_repeat_loop",
+			Message: err.Error(),
+			Suggestion: "The model repeatedly ran the same failing command. " +
+				"Inspect the failing tool output and try a different approach.",
+		}
+		return out
+	}
+	// Non-fatal hint: nudge the model to change approach (inject once).
+	if b.repeatCalls[rKey] == maxRepeatCalls {
+		out.hintMessages = append(out.hintMessages, models.Message{
+			ID:        newMessageID("human"),
+			SessionID: sessionID,
+			Role:      models.RoleHuman,
+			Content: fmt.Sprintf(
+				"You have run %q %d times with identical arguments. "+
+					"If the result isn't changing, you are in a loop. "+
+					"Try a different command, inspect the output more carefully, or move on.",
+				call.Name, b.repeatCalls[rKey]),
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+
+	// Circuit-breaker: if the same tool fails argument validation
+	// maxValidationRetries times in a row, inject a human hint and reset the
+	// counter. This prevents infinite loops where the model keeps omitting
+	// required arguments.
+	if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
+		out.validationFailure = true
+		b.consecutiveValidationFailures++
+		b.validationFailures[call.Name]++
+		if b.validationFailures[call.Name] >= maxValidationRetries {
+			hint := fmt.Sprintf(
+				"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
+					"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
+				call.Name, b.validationFailures[call.Name], result.Error,
+			)
+			out.hintMessages = append(out.hintMessages, models.Message{
+				ID:        newMessageID("human"),
+				SessionID: sessionID,
+				Role:      models.RoleHuman,
+				Content:   hint,
+				CreatedAt: time.Now().UTC(),
+			})
+			b.validationFailures[call.Name] = 0
+		}
+		if b.consecutiveValidationFailures >= maxConsecutiveValidationFailures {
+			err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", b.consecutiveValidationFailures, result.Error)
+			out.fatalErr = err
+			out.fatalAgentErr = &AgentError{
+				Code:       "tool_validation_loop",
+				Message:    err.Error(),
+				Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
+			}
+			return out
+		}
+	} else {
+		b.validationFailures[call.Name] = 0
+	}
+
+	return out
+}
+
+// resetOnCleanBatch clears the global consecutive-validation-failure counter
+// after a batch where every call passed validation — the same batchClean
+// semantics the original inline code applied per turn.
+func (b *toolCallBreaker) resetOnCleanBatch() {
+	b.consecutiveValidationFailures = 0
 }
 
 // extractBashExitCode parses the exit_code from a bash tool result's JSON
@@ -1523,12 +1622,18 @@ func isResultFailed(result models.ToolResult) bool {
 
 // M1.2: Enhanced metrics collection helpers
 
-// computeArgsHash generates a hash of tool arguments for deduplication detection
+// computeArgsHash generates a hash of tool arguments for deduplication
+// detection. It returns a fixed-width hex FNV-1a 64 digest rather than the
+// raw "k=v&" argument text: the metrics sink writes this value verbatim to
+// the JSONL metrics file, and raw argument VALUES (bash commands, secrets,
+// etc.) must not land there unhashed. This narrows only ArgsHash's exposure —
+// ToolResultMetric.Path still carries the raw file path by design (a
+// separate field, populated from extractPathFromArgs, not from this hash) so
+// file-based tools remain traceable in the metrics JSONL. Equality is all
+// callers need (the metrics ArgsHash field and the repeat-call breaker's
+// rKey), so hashing is behavior-preserving.
 func computeArgsHash(args map[string]any) string {
-	if len(args) == 0 {
-		return ""
-	}
-	// Sort keys for consistent hashing
+	// Sort keys for consistent hashing regardless of map iteration order.
 	keys := make([]string, 0, len(args))
 	for k := range args {
 		keys = append(keys, k)
@@ -1544,9 +1649,9 @@ func computeArgsHash(args map[string]any) string {
 		hashContent.WriteString("&")
 	}
 
-	// Use the content string itself as hash for simplicity (can be upgraded to crypto hash)
-	// For deduplication purposes, exact string match is sufficient
-	return hashContent.String()
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(hashContent.String()))
+	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // extractPathFromArgs extracts file path from tool arguments if applicable

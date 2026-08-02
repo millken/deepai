@@ -174,12 +174,23 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 		{"started is live", subagent.TaskEvent{Type: "task_started", Description: "review"}, false},
 		{"completed renders check", subagent.TaskEvent{Type: "task_completed", Description: "implementing · round 1/4"}, true},
 		{"timeout renders", subagent.TaskEvent{Type: "task_timed_out", Error: "deadline"}, true},
+		{"cancelled renders", subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}, true},
 	}
 	for _, c := range cases {
 		got := m.handleSubagentEvent(c.evt) != nil
 		if got != c.render {
 			t.Errorf("%s: rendered=%v, want %v", c.name, got, c.render)
 		}
+	}
+}
+
+func TestHandleSubagentEvent_CancelledClearsStatus(t *testing.T) {
+	m := &tuiModel{subagentStatus: "  ↳ [subagent] working"}
+	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}); cmd == nil {
+		t.Fatal("expected a scrollback commit command for task_cancelled")
+	}
+	if m.subagentStatus != "" {
+		t.Fatalf("subagentStatus = %q, want cleared", m.subagentStatus)
 	}
 }
 

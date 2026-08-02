@@ -27,6 +27,7 @@ const (
 	TaskStatusCompleted TaskStatus = "completed"
 	TaskStatusFailed    TaskStatus = "failed"
 	TaskStatusTimedOut  TaskStatus = "timed_out"
+	TaskStatusCancelled TaskStatus = "cancelled"
 )
 
 // SubagentConfig holds the configuration for a subagent task.

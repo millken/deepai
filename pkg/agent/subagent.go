@@ -94,8 +94,12 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		toolSelectors = profileCfg.DefaultTools
 	}
 
+	selectedTools, err := selectSubagentTools(e.tools.List(), toolSelectors)
+	if err != nil {
+		return subagent.ExecutionResult{}, err
+	}
 	registry := tools.NewRegistry()
-	for _, tool := range selectSubagentTools(e.tools.List(), toolSelectors) {
+	for _, tool := range selectedTools {
 		_ = registry.Register(tool)
 	}
 
@@ -134,12 +138,15 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}
 
 	runAgent := New(AgentConfig{
-		LLMProvider:    provider,
-		Tools:          registry,
-		MaxTurns:       maxTurns,
-		Model:          modelName,
-		MaxTokens:      e.maxTokens,
-		Sandbox:        e.sandbox,
+		LLMProvider: provider,
+		Tools:       registry,
+		MaxTurns:    maxTurns,
+		Model:       modelName,
+		MaxTokens:   e.maxTokens,
+		Sandbox:     e.sandbox,
+		// runCtx (built by Pool.runTask via context.WithTimeout) always carries
+		// a deadline, so react.go's requestTimeout-from-bare-ctx branch never
+		// fires here — this value only feeds TimeoutError.Duration reporting.
 		RequestTimeout: task.Config.Timeout,
 		ContextWindow:  e.contextWindow,
 		SystemPrompt:   systemPrompt,
@@ -196,9 +203,9 @@ func NewSubagentPool(executor *SubagentExecutor, maxConcurrent int, timeout time
 	})
 }
 
-func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
+func selectSubagentTools(all []models.Tool, selectors []string) ([]models.Tool, error) {
 	if len(selectors) == 0 {
-		return filterTaskTool(all)
+		return filterTaskTool(all), nil
 	}
 
 	allowNames := make(map[string]struct{}, len(selectors))
@@ -229,11 +236,25 @@ func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
 		}
 	}
 	if len(selected) > 0 {
-		return selected
+		return selected, nil
 	}
-	// Fallback: no selectors matched. Return all tools EXCEPT task to prevent
-	// unbounded recursion (a sub-agent spawning its own sub-agents).
-	return filterTaskTool(all)
+	// Selectors were given but none matched a registered tool: this is a
+	// misconfiguration (e.g. a typo'd tools list), not "no restriction" —
+	// widening to all tools here would be a privilege escalation. Fail hard
+	// so the model sees the error and can correct the tools list.
+	err := fmt.Errorf("agent type tools list matched no registered tools: %v", selectors)
+	// "task" is unconditionally stripped from `all` above (subagents never
+	// recurse into further subagents), so it can never satisfy a selector —
+	// naming it verbatim in the plain error above reads as a typo/missing
+	// tool rather than "categorically unavailable here". Clarify when it's
+	// among the selectors so the misconfiguration is actionable.
+	for _, selector := range selectors {
+		if strings.TrimSpace(selector) == "task" {
+			err = fmt.Errorf("%w (note: \"task\" is unavailable to subagents and is always excluded)", err)
+			break
+		}
+	}
+	return nil, err
 }
 
 // filterTaskTool returns a copy of tools with the task tool removed.

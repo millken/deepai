@@ -1,5 +1,7 @@
 # 自治多 Agent 协同 — 现状评估与设计笔记
 
+> **⚠️ 2026-08 勘误**：§9 描述的 orchestrator（`pkg/orchestrator`、implement_task/design_task/build_task、黑板、多评委投票、`MaxAgentCalls`）已于 `87772b6`（2026-06-09，"实测编排功能不可用"）**整体删除**，§9 全节不再反映现状。另：§3 所述"CLI 并发为 1"现为 4；§4-#7 所述"coder 含 task 可嵌套"不成立（task 恒被剥离，深度封顶 1）。当前路线与最新评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
+
 > 目标场景:**给定一个任务,多个 agent 从讨论/设计开始,经规划、实施、自我验证,直到最终完成,全程无人干预。**
 >
 > 本文基于 2026-06 的代码现状评估 deepai 距离该目标的差距,并给出分阶段的设计建议。结论先行:deepai 目前处于"主管 + 专家委派"阶段,要达到"团队自治协同"还缺一个**编排层**。

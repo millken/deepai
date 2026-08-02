@@ -80,6 +80,90 @@ func TestMapMessagesToAnthropic_ConsecutiveToolResults(t *testing.T) {
 	}
 }
 
+// TestMapMessagesToAnthropic_TrailingHumanHintMergesIntoToolResultUser
+// pins the M1-7 fix: a RoleHuman breaker-hint message immediately following
+// tool results must merge into the SAME user message as the tool_result
+// blocks (appended after them), not start a new user message. A trailing
+// standalone user message after tool_result blocks leaves a tool_use id
+// without an immediately-following tool_result, which the Anthropic API
+// rejects.
+func TestMapMessagesToAnthropic_TrailingHumanHintMergesIntoToolResultUser(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "c1", Name: "a"}, {ID: "c2", Name: "b"}}, Content: ""},
+		{Role: models.RoleTool, Content: "r1", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "a"}},
+		{Role: models.RoleTool, Content: "r2", ToolResult: &models.ToolResult{CallID: "c2", ToolName: "b"}},
+		{Role: models.RoleHuman, Content: "hint"},
+	}
+	result := mapMessagesToAnthropic(msgs)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages ([assistant, user]), got %d", len(result))
+	}
+	if result[0].Role != anthropic.MessageParamRoleAssistant {
+		t.Errorf("msg[0]: expected assistant, got %s", result[0].Role)
+	}
+	if result[1].Role != anthropic.MessageParamRoleUser {
+		t.Errorf("msg[1]: expected user, got %s", result[1].Role)
+	}
+	blocks := result[1].Content
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 content blocks in merged user message, got %d", len(blocks))
+	}
+	if blocks[0].OfToolResult == nil {
+		t.Errorf("block[0]: expected tool_result, got %+v", blocks[0])
+	}
+	if blocks[1].OfToolResult == nil {
+		t.Errorf("block[1]: expected tool_result, got %+v", blocks[1])
+	}
+	if blocks[2].OfText == nil {
+		t.Errorf("block[2]: expected text (the human hint), got %+v", blocks[2])
+	}
+}
+
+// TestMapMessagesToAnthropic_TrailingHumanHintWithImagesMergesIntoToolResultUser
+// covers the images variant of the same M1-7 fix: a RoleHuman message that
+// carries Images (e.g. a vision-tool hint) must ALSO merge into the same
+// user message as preceding tool_result blocks — image and text blocks
+// appended after the tool_result blocks, tool_result-first ordering
+// preserved.
+func TestMapMessagesToAnthropic_TrailingHumanHintWithImagesMergesIntoToolResultUser(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "c1", Name: "a"}, {ID: "c2", Name: "b"}}, Content: ""},
+		{Role: models.RoleTool, Content: "r1", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "a"}},
+		{Role: models.RoleTool, Content: "r2", ToolResult: &models.ToolResult{CallID: "c2", ToolName: "b"}},
+		{
+			Role:    models.RoleHuman,
+			Content: "hint",
+			Images:  []models.MessageImage{{MimeType: "image/png", Base64: "AAAA"}},
+		},
+	}
+	result := mapMessagesToAnthropic(msgs)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages ([assistant, user]), got %d", len(result))
+	}
+	if result[0].Role != anthropic.MessageParamRoleAssistant {
+		t.Errorf("msg[0]: expected assistant, got %s", result[0].Role)
+	}
+	if result[1].Role != anthropic.MessageParamRoleUser {
+		t.Errorf("msg[1]: expected user, got %s", result[1].Role)
+	}
+	blocks := result[1].Content
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 content blocks in merged user message ([tool_result, tool_result, image, text]), got %d", len(blocks))
+	}
+	if blocks[0].OfToolResult == nil {
+		t.Errorf("block[0]: expected tool_result, got %+v", blocks[0])
+	}
+	if blocks[1].OfToolResult == nil {
+		t.Errorf("block[1]: expected tool_result, got %+v", blocks[1])
+	}
+	if blocks[2].OfImage == nil {
+		t.Errorf("block[2]: expected image, got %+v", blocks[2])
+	}
+	if blocks[3].OfText == nil {
+		t.Errorf("block[3]: expected text (the human hint), got %+v", blocks[3])
+	}
+}
+
 func TestMapMessagesToAnthropic_AssistantWithToolCalls(t *testing.T) {
 	msgs := []models.Message{
 		{Role: models.RoleAI, ToolCalls: []models.ToolCall{

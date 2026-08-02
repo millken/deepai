@@ -95,6 +95,10 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				result.Status = models.CallStatusFailed
 				result.Error = completed.Error
 				return result, fmt.Errorf("subagent task timed out: %s", completed.Error)
+			case subagent.TaskStatusCancelled:
+				result.Status = models.CallStatusFailed
+				result.Error = "subagent task cancelled"
+				return result, fmt.Errorf("subagent task cancelled")
 			default:
 				result.Status = models.CallStatusFailed
 				result.Error = completed.Error

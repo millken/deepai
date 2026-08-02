@@ -189,7 +189,10 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	// Enumerate advertised agents (project + plugin + builtin). The same
 	// pluginAgentDirs slice is handed to the executor so advertising and
 	// execution agree on each type's source.
-	agentCatalog := agent.EnumerateAgents(workDir, pluginAgentDirs)
+	agentCatalog, agentProblems := agent.EnumerateAgentsReported(workDir, pluginAgentDirs)
+	for _, p := range agentProblems {
+		slog.Warn("agent config load issue", "err", p)
+	}
 	agentOpts := make([]tools.AgentOption, 0, len(agentCatalog))
 	for _, a := range agentCatalog {
 		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})

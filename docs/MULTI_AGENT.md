@@ -1,5 +1,7 @@
 # Multi-Agent 协同设计
 
+> **⚠️ 2026-08 勘误**："Environment 发布/订阅消息总线"从未实现，代码中不存在 Publish/Subscribe/MessageBus；agent 表中的温度等参数与代码不符（以 `pkg/agent/types_config.go` 为准，如 general-purpose 实为 0.2、coder 实为 0.1）。现状评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
+
 ## 概述
 
 deepai 多 agent 系统通过以下机制实现 agent 协同：

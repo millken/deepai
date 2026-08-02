@@ -199,30 +199,77 @@ func TestTeamDelegation_OmittedInPlanMode(t *testing.T) {
 	}
 }
 
-// TestSelectSubagentTools_FiltersTaskInFallback: the no-selectors and
-// no-match fallback paths must both exclude the task tool to prevent
-// unbounded sub-agent recursion.
-func TestSelectSubagentTools_FiltersTaskInFallback(t *testing.T) {
+// TestSelectSubagentTools_NoSelectorsFiltersTask: no selectors is the
+// intentional "no restriction" path — all tools minus task (to prevent
+// unbounded sub-agent recursion), never an error.
+func TestSelectSubagentTools_NoSelectorsFiltersTask(t *testing.T) {
 	tools := []models.Tool{
 		{Name: "bash"},
 		{Name: "task"},
 		{Name: "read_file"},
 	}
 
-	// No selectors → fallback path.
-	got := selectSubagentTools(tools, nil)
+	got, err := selectSubagentTools(tools, nil)
+	if err != nil {
+		t.Fatalf("no-selectors must not error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected all tools minus task (2), got %v", got)
+	}
 	for _, tt := range got {
 		if tt.Name == "task" {
 			t.Error("task tool should be filtered in no-selectors fallback")
 		}
 	}
+}
 
-	// Non-matching selectors → fallback path.
-	got = selectSubagentTools(tools, []string{"nonexistent_tool"})
-	for _, tt := range got {
-		if tt.Name == "task" {
-			t.Error("task tool should be filtered in no-match fallback")
-		}
+// TestSelectSubagentTools_NoMatchErrors: selectors that match nothing must
+// hard-error instead of silently widening to all tools — a typo'd tools list
+// must narrow privileges, never escalate them.
+func TestSelectSubagentTools_NoMatchErrors(t *testing.T) {
+	tools := []models.Tool{
+		{Name: "bash"},
+		{Name: "task"},
+		{Name: "read_file"},
+	}
+
+	got, err := selectSubagentTools(tools, []string{"nonexistent_tool"})
+	if err == nil {
+		t.Fatalf("expected error for no-match selectors, got tools=%v", got)
+	}
+	if got != nil {
+		t.Errorf("expected nil tools on error, got %v", got)
+	}
+	if !strings.Contains(err.Error(), "nonexistent_tool") {
+		t.Errorf("error should mention the unmatched selector: %v", err)
+	}
+}
+
+// TestSelectSubagentTools_TaskOnlySelectorClarifiesUnavailability: "task" is
+// always stripped from the candidate tool list before matching (subagents
+// never recurse into further subagents), so a tools list of exactly ["task"]
+// can never match — but the plain no-match error naming "task" verbatim reads
+// as if the tool is merely missing/mistyped, not that it is categorically
+// unavailable to subagents. The error must say so explicitly.
+func TestSelectSubagentTools_TaskOnlySelectorClarifiesUnavailability(t *testing.T) {
+	tools := []models.Tool{
+		{Name: "bash"},
+		{Name: "task"},
+		{Name: "read_file"},
+	}
+
+	got, err := selectSubagentTools(tools, []string{"task"})
+	if err == nil {
+		t.Fatalf("expected error for selectors == [\"task\"], got tools=%v", got)
+	}
+	if got != nil {
+		t.Errorf("expected nil tools on error, got %v", got)
+	}
+	if !strings.Contains(err.Error(), "task") {
+		t.Errorf("error should mention the unmatched selector %q: %v", "task", err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "unavailable to subagent") {
+		t.Errorf("error should clarify that task is unavailable to subagents, got: %v", err)
 	}
 }
 

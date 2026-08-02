@@ -2,6 +2,7 @@ package subagent
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +92,119 @@ func TestPoolStartTaskTimesOut(t *testing.T) {
 	}
 	if completed.Error == "" {
 		t.Fatalf("expected timeout error, got %q", completed.Error)
+	}
+}
+
+func TestPoolWaitDeletesCompletedTaskFromMap(t *testing.T) {
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			return ExecutionResult{Result: "done"}, nil
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	task, err := pool.StartTask(context.Background(), "test task", "do work", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	if _, err := pool.Wait(context.Background(), task.ID); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	if got, ok := pool.GetTask(task.ID); ok {
+		t.Fatalf("GetTask() after Wait completed = (%v, true), want (nil, false); task map leaked the transcript", got)
+	}
+}
+
+func TestPoolStartTaskParentCancelledReportsCancelledNotFailed(t *testing.T) {
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			<-ctx.Done()
+			return ExecutionResult{}, ctx.Err()
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	var events []TaskEvent
+	var mu sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+	sinkCtx := WithEventSink(ctx, func(evt TaskEvent) {
+		mu.Lock()
+		events = append(events, evt)
+		mu.Unlock()
+	})
+
+	task, err := pool.StartTask(sinkCtx, "cancel task", "do work", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	// Give runTask a moment to enter the executor before cancelling.
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	completed, err := pool.Wait(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if completed.Status != TaskStatusCancelled {
+		t.Fatalf("status = %s, want %s", completed.Status, TaskStatusCancelled)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, evt := range events {
+		if evt.Type == "task_cancelled" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a task_cancelled event, got %+v", events)
+	}
+}
+
+func TestPoolPreSemaphoreBailDistinguishesDeadlineFromCancel(t *testing.T) {
+	// MaxConcurrent 1, first task holds the only slot indefinitely, so the
+	// second task must wait at the pre-semaphore select in runTask. Its
+	// parent ctx has a short deadline (not an explicit cancel), so the bail
+	// must classify as TimedOut, not Cancelled, mirroring the post-execution
+	// ordering (DeadlineExceeded checked before Canceled).
+	release := make(chan struct{})
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			<-release
+			return ExecutionResult{Result: "done"}, nil
+		},
+	}, PoolConfig{MaxConcurrent: 1, Timeout: time.Minute})
+	defer close(release)
+
+	holder, err := pool.StartTask(context.Background(), "holder", "hold the slot", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() (holder) error = %v", err)
+	}
+	// Give the holder task time to acquire the only semaphore slot.
+	time.Sleep(20 * time.Millisecond)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	waiter, err := pool.StartTask(shortCtx, "waiter", "wait for the slot", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() (waiter) error = %v", err)
+	}
+
+	completed, err := pool.Wait(context.Background(), waiter.ID)
+	if err != nil {
+		t.Fatalf("Wait() (waiter) error = %v", err)
+	}
+	if completed.Status != TaskStatusTimedOut {
+		t.Fatalf("waiter status = %s, want %s (parent ctx deadline, not an explicit cancel)", completed.Status, TaskStatusTimedOut)
+	}
+
+	release <- struct{}{}
+	if _, err := pool.Wait(context.Background(), holder.ID); err != nil {
+		t.Fatalf("Wait() (holder) error = %v", err)
 	}
 }
 

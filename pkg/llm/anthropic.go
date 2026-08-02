@@ -252,11 +252,11 @@ func mapMessagesToAnthropic(msgs []models.Message) []anthropic.MessageParam {
 				if content := strings.TrimSpace(m.Content); content != "" {
 					blocks = append(blocks, anthropic.NewTextBlock(content))
 				}
-				result = append(result, anthropic.NewUserMessage(blocks...))
+				result = appendOrMergeUser(result, blocks)
 			} else {
-				result = append(result, anthropic.NewUserMessage(
+				result = appendOrMergeUser(result, []anthropic.ContentBlockParamUnion{
 					anthropic.NewTextBlock(ensureContent(m.Content, "user")),
-				))
+				})
 			}
 		case models.RoleAI:
 			blocks := mapAssistantToBlocks(m)
@@ -311,7 +311,10 @@ func mapToolResultToUserBlocks(m models.Message) []anthropic.ContentBlockParamUn
 	return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(content)}
 }
 
-// appendOrMergeUser merges tool result blocks into the last user message if it's also user role.
+// appendOrMergeUser merges blocks (tool_result blocks, or a RoleHuman
+// message's text/image blocks) into the last user message if it's also user
+// role, appending at the tail so tool_result-first ordering within a merged
+// turn is preserved; otherwise it starts a new user message.
 func appendOrMergeUser(msgs []anthropic.MessageParam, blocks []anthropic.ContentBlockParamUnion) []anthropic.MessageParam {
 	if len(msgs) > 0 && msgs[len(msgs)-1].Role == anthropic.MessageParamRoleUser {
 		msgs[len(msgs)-1].Content = append(msgs[len(msgs)-1].Content, blocks...)

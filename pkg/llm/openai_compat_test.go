@@ -46,6 +46,38 @@ func TestMapMessagesToOpenAI_ToolResult(t *testing.T) {
 	}
 }
 
+// TestMapMessagesToOpenAI_ToolMessagesContiguousBeforeHumanHint pins the
+// OpenAI-compat side of the M1-7 contract: once the agent loop (7a) defers
+// breaker-hint injection to the end of the batch, the tool messages for a
+// batch stay directly and contiguously after the assistant tool_calls
+// message, with any human hint appended after all of them. The mapper
+// itself needs no change for this — it never reorders messages — but this
+// test pins the contract against regression.
+func TestMapMessagesToOpenAI_ToolMessagesContiguousBeforeHumanHint(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleAI, ToolCalls: []models.ToolCall{{ID: "c1", Name: "a"}, {ID: "c2", Name: "b"}}, Content: ""},
+		{Role: models.RoleTool, Content: "r1", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "a"}},
+		{Role: models.RoleTool, Content: "r2", ToolResult: &models.ToolResult{CallID: "c2", ToolName: "b"}},
+		{Role: models.RoleHuman, Content: "hint"},
+	}
+	result := mapMessagesToOpenAI("", msgs, "low")
+	if len(result) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(result))
+	}
+	if result[0].OfAssistant == nil {
+		t.Errorf("msg[0]: expected assistant, got %+v", result[0])
+	}
+	if result[1].OfTool == nil {
+		t.Errorf("msg[1]: expected tool (directly following assistant), got %+v", result[1])
+	}
+	if result[2].OfTool == nil {
+		t.Errorf("msg[2]: expected tool (contiguous with msg[1]), got %+v", result[2])
+	}
+	if result[3].OfUser == nil {
+		t.Errorf("msg[3]: expected user (the hint, after both tool messages), got %+v", result[3])
+	}
+}
+
 func TestMapMessagesToOpenAI_AssistantWithToolCalls(t *testing.T) {
 	msgs := []models.Message{
 		{Role: models.RoleAI, ToolCalls: []models.ToolCall{

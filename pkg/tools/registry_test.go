@@ -311,3 +311,71 @@ func TestRegistry_RestrictTo_FailsClosed(t *testing.T) {
 		t.Fatal("RestrictTo leaked bash into a read-only set")
 	}
 }
+
+func TestRegistry_Clone(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(models.Tool{Name: "orig", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	clone := r.Clone()
+	if clone.Get("orig") == nil {
+		t.Fatal("clone should carry over pre-existing tools")
+	}
+
+	// Registering into the clone must not affect the original.
+	if err := clone.Register(models.Tool{Name: "clone_only", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if r.Get("clone_only") != nil {
+		t.Fatal("registering into the clone leaked into the original")
+	}
+
+	// Registering into the original must not affect the clone.
+	if err := r.Register(models.Tool{Name: "orig_only", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if clone.Get("orig_only") != nil {
+		t.Fatal("registering into the original leaked into the clone")
+	}
+}
+
+func TestRegistry_Clone_NilReceiver(t *testing.T) {
+	var r *Registry
+	clone := r.Clone()
+	if clone == nil {
+		t.Fatal("Clone on nil receiver should return a usable empty registry")
+	}
+	if err := clone.Register(models.Tool{Name: "t", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistry_Restrict_EmptyDoesNotAlias(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(models.Tool{Name: "shared", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, allowed := range [][]string{nil, {}} {
+		restricted := r.Restrict(allowed)
+		if err := restricted.Register(models.Tool{Name: "new_tool", Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if r.Get("new_tool") != nil {
+			t.Fatalf("Restrict(%v) aliased the original registry", allowed)
+		}
+	}
+}

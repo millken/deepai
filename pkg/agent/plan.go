@@ -100,7 +100,9 @@ func (a *Agent) registerPlanTools() {
 	if a.tools == nil {
 		return
 	}
-	a.tools.Register(a.makeEnterPlanModeTool())
+	if err := a.tools.Register(a.makeEnterPlanModeTool()); err != nil {
+		a.logger.Error("register enter_plan_mode tool", "err", err)
+	}
 }
 
 func (a *Agent) makeEnterPlanModeTool() models.Tool {

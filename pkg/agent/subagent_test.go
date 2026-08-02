@@ -31,7 +31,6 @@ func TestSubagentMessageFromAgentEvent(t *testing.T) {
 		{"tool start", AgentEvent{Type: AgentEventToolCallStart, ToolEvent: &ToolCallEvent{Name: "edit_file"}}, "⚙ edit_file"},
 		{"tool ok end", AgentEvent{Type: AgentEventToolCallEnd, ToolEvent: &ToolCallEvent{Name: "edit_file"}}, "✓ edit_file"},
 		{"tool error end", AgentEvent{Type: AgentEventToolCallEnd, ToolEvent: &ToolCallEvent{Name: "bash", Error: "boom"}}, "✗ bash: boom"},
-		{"raw token chunk dropped", AgentEvent{Type: AgentEventChunk, Text: "thinking..."}, ""},
 		{"agent error", AgentEvent{Type: AgentEventError, Err: "blew up"}, "✗ blew up"},
 	}
 	for _, c := range cases {

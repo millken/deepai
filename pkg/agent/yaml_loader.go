@@ -10,6 +10,10 @@ import (
 )
 
 // yamlAgentConfig represents the YAML file structure for agent definitions.
+// MaxTurns and Temperature are pointers so an explicit zero (`max_turns: 0`,
+// `temperature: 0`) is distinguishable from the key being absent — see
+// loadAgentYAML's use of maxTurnsSet/temperatureSet on the resulting
+// AgentTypeConfig.
 type yamlAgentConfig struct {
 	Type             string   `yaml:"type"`
 	Name             string   `yaml:"name"`
@@ -17,8 +21,8 @@ type yamlAgentConfig struct {
 	SystemPrompt     string   `yaml:"system_prompt"`
 	SystemPromptFile string   `yaml:"system_prompt_file"`
 	DefaultTools     []string `yaml:"tools"`
-	MaxTurns         int      `yaml:"max_turns"`
-	Temperature      float64  `yaml:"temperature"`
+	MaxTurns         *int     `yaml:"max_turns"`
+	Temperature      *float64 `yaml:"temperature"`
 	Model            string   `yaml:"model"`
 }
 
@@ -59,9 +63,15 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 		Description:  yc.Description,
 		SystemPrompt: yc.SystemPrompt,
 		DefaultTools: yc.DefaultTools,
-		MaxTurns:     yc.MaxTurns,
-		Temperature:  yc.Temperature,
 		Model:        yc.Model,
+	}
+	if yc.MaxTurns != nil {
+		cfg.MaxTurns = *yc.MaxTurns
+		cfg.maxTurnsSet = true
+	}
+	if yc.Temperature != nil {
+		cfg.Temperature = *yc.Temperature
+		cfg.temperatureSet = true
 	}
 
 	if yc.SystemPromptFile != "" {
@@ -97,9 +107,15 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 	return cfg, nil
 }
 
-// mergeConfig overlays YAML config onto the builtin base.
-// Non-zero YAML fields override the base.
-func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig) AgentTypeConfig {
+// mergeConfig overlays YAML/MD config onto base — the resolved builtin
+// profile for the type, or the zero AgentTypeConfig when the type has no
+// builtin entry (a custom/unknown type). baseIsBuiltin must be an explicit
+// signal from the caller (a BuiltinAgentTypes lookup, e.g. `_, ok :=
+// BuiltinAgentTypes[t]`) — never inferred from base's field emptiness —
+// because a real builtin's nil DefaultTools legitimately means
+// "unrestricted" (e.g. general-purpose), while a custom type's absent
+// DefaultTools should fall back to a conservative read-only set instead.
+func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig, baseIsBuiltin bool) AgentTypeConfig {
 	if override == nil {
 		return base
 	}
@@ -120,21 +136,33 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig) AgentTypeConfi
 	if len(override.DefaultTools) > 0 {
 		result.DefaultTools = append([]string(nil), override.DefaultTools...)
 	}
-	if override.MaxTurns > 0 {
+	// override.MaxTurns/Temperature > 0 catches a positive explicit value;
+	// maxTurnsSet/temperatureSet additionally catches an explicit zero, which
+	// is otherwise indistinguishable from "absent" and would leave the base's
+	// value stuck. The flags are set on result too (not just checked on
+	// override) so a further merge layer that reuses this result as ITS
+	// override still sees the value as explicit, instead of resurrecting a
+	// stale base value.
+	if override.MaxTurns > 0 || override.maxTurnsSet {
 		result.MaxTurns = override.MaxTurns
+		result.maxTurnsSet = true
 	}
-	if override.Temperature > 0 {
+	if override.Temperature > 0 || override.temperatureSet {
 		result.Temperature = override.Temperature
+		result.temperatureSet = true
 	}
 	if strings.TrimSpace(override.Model) != "" {
 		result.Model = override.Model
 	}
 
-	// No builtin tools and no YAML tools -> default minimal read-only set
-	if len(result.DefaultTools) == 0 {
+	// A real builtin's nil/absent DefaultTools means "unrestricted" and must
+	// be respected as-is (ApplyAgentType skips Restrict when empty; the
+	// subagent executor's empty-selectors path keeps all tools). A
+	// custom/unknown type has no builtin profile to default to unrestricted —
+	// an absent tools: key there falls back to a conservative read-only set.
+	if !baseIsBuiltin && len(result.DefaultTools) == 0 {
 		result.DefaultTools = []string{"read_file", "list_dir", "glob", "grep", "find"}
 	}
-
 	return result
 }
 
@@ -149,37 +177,78 @@ func resolveAgentTypeConfig(t AgentType, workDir string) AgentTypeConfig {
 // MD > plugin MD (in pluginAgentDirs order, MUST be the same slice
 // EnumerateAgents uses) > builtin > general. pluginAgentDirs elements are agent
 // directories (<plugin>/agents). Per-source parse errors are skipped silently
-// (EnumerateAgents warns once at startup).
+// here — use resolveAgentTypeConfigWithPluginsReported (EnumerateAgentsReported
+// wires it up) to observe them.
 func resolveAgentTypeConfigWithPlugins(t AgentType, workDir string, pluginAgentDirs []string) AgentTypeConfig {
-	if err := validateSafeName(string(t)); err == nil {
-		if cfg, err := loadAgentYAML(t, workDir); err == nil && cfg != nil {
-			return mergeConfig(BuiltinAgentTypes[t], cfg)
+	cfg, _ := resolveAgentTypeConfigWithPluginsReported(t, workDir, pluginAgentDirs)
+	return cfg
+}
+
+// resolveAgentTypeConfigWithPluginsReported is resolveAgentTypeConfigWithPlugins
+// plus the human-readable problems (file + error) hit while trying each
+// candidate source. A source that fails to parse does not abort resolution:
+// it is recorded and resolution falls through to the next source in priority
+// order, ending at builtin/general — execution-path behavior is identical to
+// resolveAgentTypeConfigWithPlugins, only the reporting differs.
+func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, pluginAgentDirs []string) (AgentTypeConfig, []string) {
+	var problems []string
+	// Explicit builtin-ness check, passed to every mergeConfig call below —
+	// mergeConfig must never infer this from base's field emptiness.
+	_, isBuiltin := BuiltinAgentTypes[t]
+	if err := validateSafeName(string(t)); err != nil {
+		// Rejected stem (e.g. contains ".." or a path separator): resolution
+		// still falls through to builtin/general below (safe), but the
+		// rejection must not be silently swallowed — record it so it surfaces
+		// as a startup warning identifying the offending stem.
+		problems = append(problems, fmt.Sprintf("%s: %v", string(t), err))
+	} else {
+		yamlPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".yaml")
+		if cfg, err := loadAgentYAML(t, workDir); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", yamlPath, err))
+		} else if cfg != nil {
+			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 		}
-		if cfg := loadAgentMDFile(filepath.Join(workDir, ".deepai", "agents", string(t)+".md")); cfg != nil {
-			return mergeConfig(BuiltinAgentTypes[t], cfg)
+
+		mdPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".md")
+		if cfg, err := loadAgentMDFileReported(mdPath); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", mdPath, err))
+		} else if cfg != nil {
+			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 		}
+
 		for _, dir := range pluginAgentDirs {
-			if cfg := loadAgentMDFile(filepath.Join(dir, string(t)+".md")); cfg != nil {
-				return mergeConfig(BuiltinAgentTypes[t], cfg)
+			pluginPath := filepath.Join(dir, string(t)+".md")
+			if cfg, err := loadAgentMDFileReported(pluginPath); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %v", pluginPath, err))
+			} else if cfg != nil {
+				return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 			}
 		}
 	}
 	if cfg, ok := BuiltinAgentTypes[t]; ok {
-		return cfg
+		return cfg, problems
 	}
-	return BuiltinAgentTypes[AgentTypeGeneral]
+	return BuiltinAgentTypes[AgentTypeGeneral], problems
 }
 
 // loadAgentMDFile parses an agent .md if it exists; returns nil for missing or
-// unparseable (resolution is lazy and per-invocation, so errors are silent here
-// — EnumerateAgents surfaces them once at startup).
+// unparseable. Use loadAgentMDFileReported to distinguish "missing" from
+// "unparseable".
 func loadAgentMDFile(path string) *AgentTypeConfig {
+	cfg, _ := loadAgentMDFileReported(path)
+	return cfg
+}
+
+// loadAgentMDFileReported parses an agent .md if it exists. Returns (nil, nil)
+// when the file does not exist (not an error — a source simply isn't present);
+// returns (nil, err) when the file exists but fails to parse.
+func loadAgentMDFileReported(path string) (*AgentTypeConfig, error) {
 	if _, err := os.Stat(path); err != nil {
-		return nil
+		return nil, nil
 	}
 	cfg, err := ParseAgentMarkdown(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return cfg
+	return cfg, nil
 }

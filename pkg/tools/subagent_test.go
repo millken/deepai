@@ -79,6 +79,32 @@ func TestTaskToolFailed(t *testing.T) {
 	}
 }
 
+func TestTaskToolCancelled(t *testing.T) {
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			return &subagent.Task{ID: "task-3"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCancelled, Error: "context canceled"}, nil
+		},
+	}, nil)
+
+	result, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "call-3",
+		Name:      "task",
+		Arguments: map[string]any{"description": "cancel me", "prompt": "do work"},
+	})
+	if err == nil {
+		t.Fatal("Handler() expected error for cancelled task")
+	}
+	if result.Status != models.CallStatusFailed {
+		t.Fatalf("status = %s, want %s", result.Status, models.CallStatusFailed)
+	}
+	if !strings.Contains(err.Error(), "subagent task cancelled") {
+		t.Fatalf("error = %q, want it to mention 'subagent task cancelled'", err.Error())
+	}
+}
+
 func TestTaskTool_AdvertisesAgents(t *testing.T) {
 	// No agents → description has no agent_type list.
 	bare := TaskTool(nil, nil)

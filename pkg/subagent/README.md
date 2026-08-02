@@ -16,14 +16,14 @@
 - `PoolConfig`：池级配置，例如最大并发数、默认超时、日志器和默认任务模板。
 - `Executor`：执行接口，负责真正跑任务并产出结果。
 - `ExecutionResult`：执行返回值，包含最终 `Result` 和 `Messages`。
-- `TaskEvent`：任务事件，用于通知开始、运行中、完成、失败或超时。
+- `TaskEvent`：任务事件，用于通知开始、运行中、完成、失败、超时或取消。
 - `EventSink`：事件回调函数类型。
 
 任务生命周期
 1. 调用 `Pool.StartTask(...)` 创建任务并进入 `pending`。
 2. 任务获得并发许可后切换到 `running`。
 3. `Executor.Execute(...)` 产出最终结果和过程消息。
-4. 任务结束后切换到 `completed`、`failed` 或 `timed_out`。
+4. 任务结束后切换到 `completed`、`failed`、`timed_out` 或 `cancelled`。
 5. 调用 `Pool.Wait(...)` 可以等待任务完成并拿到快照。
 
 预置类型
@@ -36,6 +36,7 @@
 - `task_completed`：任务成功完成。
 - `task_failed`：任务失败。
 - `task_timed_out`：任务超时。
+- `task_cancelled`：父级上下文被取消，任务被中止。
 
 事件可通过 `WithEventSink(ctx, sink)` 绑定到上下文中，执行过程中的事件会自动回调。
 
@@ -95,7 +96,7 @@ func main() {
 - `Task.CompletedAt()`：返回完成时间，格式为 RFC3339Nano。
 
 调度策略
-- `PoolConfig.MaxConcurrent` 控制同时运行的任务数，默认值为 1。
+- `PoolConfig.MaxConcurrent` 控制同时运行的任务数，默认值为 3。
 - `PoolConfig.Timeout` 作为任务默认超时，默认值为 2 分钟。
 - `PoolConfig.Logger` 用于输出任务状态日志，默认使用标准日志器。
 - `PoolConfig.Defaults` 用于按子代理类型覆盖默认配置。
@@ -110,5 +111,5 @@ func main() {
 
 注意事项
 - `StartTask` 传入的 `prompt` 不能为空。
-- 若 `cfg.Type` 没有对应默认配置，会回退到 `general-purpose`。
+- 若 `cfg.Type` 没有对应的池级默认配置（`PoolConfig.Defaults`），`Pool` 只会保留其 `AgentType`，不会套用 `general-purpose` 的 `MaxTurns`/`Tools`；具体的 `MaxTurns`、`Tools` 等由 `Executor` 按该 agent 类型的画像（builtin/YAML/MD）解析决定，画像也没有时再由 `Executor` 应用安全下限。
 - `Wait` 只等待任务结束，不负责重新执行或恢复失败任务。

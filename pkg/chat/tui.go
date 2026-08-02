@@ -807,6 +807,13 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 			errMsg = evt.Message
 		}
 		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] failed: " + errMsg))
+	case "task_cancelled":
+		m.subagentStatus = ""
+		errMsg := evt.Error
+		if errMsg == "" {
+			errMsg = evt.Message
+		}
+		return m.commitWithFlush(m.styles.Error.Render("  ↳ ⊘ [subagent] cancelled: " + errMsg))
 	}
 	return nil
 }

@@ -40,9 +40,10 @@ type AgentConfig struct {
 	MaxTokens       *int
 	Sandbox         *sandbox.Sandbox
 	// RequestTimeout bounds the *entire* Run (all turns + tool calls).
-	// Despite the name it is run-level, not per-request. A long multi-turn
-	// task that legitimately needs hours should set this to 0 only via a
-	// caller that imposes its own ctx deadline. Default: 10 minutes.
+	// Despite the name it is run-level, not per-request. It is used as-is
+	// with no floor or fallback: 0 means unlimited, and the caller (e.g. the
+	// interactive REPL) governs the run's lifetime via context cancellation
+	// instead.
 	RequestTimeout time.Duration
 
 	// Context compaction
@@ -108,6 +109,11 @@ func (e *TimeoutError) Error() string {
 type AgentEventType string
 
 const (
+	// AgentEventChunk is no longer emitted by the ReAct loop (superseded by
+	// AgentEventTextChunk, which every internal consumer already used); the
+	// constant is kept only for external consumers that may still switch on it.
+	//
+	// Deprecated: use AgentEventTextChunk instead.
 	AgentEventChunk         AgentEventType = "chunk"
 	AgentEventTextChunk     AgentEventType = "text_chunk"
 	AgentEventToolCall      AgentEventType = "tool_call"

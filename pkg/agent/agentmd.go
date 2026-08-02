@@ -112,13 +112,27 @@ type AgentInfo struct {
 }
 
 // EnumerateAgents lists all resolvable agent types with the description the
-// model would actually get if it invoked them. It collects candidate type stems
-// (project yaml/md, then plugin md in pluginAgentDirs order, then builtins),
-// then resolves each via resolveAgentTypeConfigWithPlugins — the SAME resolver
-// execution uses — so the advertised description is always the one execution
-// will apply (e.g. a project foo.yaml wins over a coexisting foo.md for both).
-// pluginAgentDirs MUST be the claudeplugin.Discover result order.
+// model would actually get if it invoked them. Load problems (invalid project
+// YAML/MD, invalid plugin MD) are discarded; use EnumerateAgentsReported to
+// see them.
 func EnumerateAgents(workDir string, pluginAgentDirs []string) []AgentInfo {
+	agents, _ := EnumerateAgentsReported(workDir, pluginAgentDirs)
+	return agents
+}
+
+// EnumerateAgentsReported is like EnumerateAgents but also returns
+// human-readable load problems (file + error) encountered while resolving
+// each candidate type — one per failing source, in priority order. It
+// collects candidate type stems (project yaml/md, then plugin md in
+// pluginAgentDirs order, then builtins), then resolves each via
+// resolveAgentTypeConfigWithPluginsReported — the SAME resolver execution
+// uses — so the advertised description is always the one execution will
+// apply (e.g. a project foo.yaml wins over a coexisting foo.md for both). A
+// source that fails to parse does not stop resolution: it falls through to
+// the next source in priority order (project MD, then plugin MD, then
+// builtin/general), same as before this warning surfaced. pluginAgentDirs
+// MUST be the claudeplugin.Discover result order.
+func EnumerateAgentsReported(workDir string, pluginAgentDirs []string) ([]AgentInfo, []string) {
 	seen := make(map[AgentType]bool)
 	var stems []AgentType
 	add := func(t AgentType) {
@@ -143,11 +157,13 @@ func EnumerateAgents(workDir string, pluginAgentDirs []string) []AgentInfo {
 	}
 
 	out := make([]AgentInfo, 0, len(stems))
+	var warnings []string
 	for _, t := range stems {
-		cfg := resolveAgentTypeConfigWithPlugins(t, workDir, pluginAgentDirs)
+		cfg, problems := resolveAgentTypeConfigWithPluginsReported(t, workDir, pluginAgentDirs)
+		warnings = append(warnings, problems...)
 		out = append(out, AgentInfo{Type: t, Description: cfg.Description})
 	}
-	return out
+	return out, warnings
 }
 
 // collectStems adds filename stems (without extension) found in dir. yaml stems

@@ -99,6 +99,9 @@ func (p *Pool) StartTask(ctx context.Context, description, prompt string, cfg Su
 	return task.snapshot(), nil
 }
 
+// Wait blocks until taskID finishes and returns its final snapshot. The task
+// entry is consumed (deleted from the pool) by the first successful Wait, so
+// a later Wait or GetTask for the same taskID returns not-found.
 func (p *Pool) Wait(ctx context.Context, taskID string) (*Task, error) {
 	task, ok := p.getTask(taskID)
 	if !ok {
@@ -107,12 +110,25 @@ func (p *Pool) Wait(ctx context.Context, taskID string) (*Task, error) {
 
 	select {
 	case <-task.done:
-		return task.snapshot(), nil
+		snap := task.snapshot()
+		// The task has finished (completed/failed/timed out/cancelled) and its
+		// snapshot has been taken, so it's safe to drop the map entry —
+		// otherwise the Prompt, Result, and full message transcript are
+		// retained for the rest of the process lifetime.
+		p.tasks.Delete(taskID)
+		return snap, nil
 	case <-ctx.Done():
+		// Do NOT delete here: the task itself is still running (only this
+		// waiter is bailing on its own ctx). Known remaining window: if every
+		// waiter for a task bails via ctx cancellation, the entry stays in
+		// the map until process exit. Acceptable for now — out of scope.
 		return nil, ctx.Err()
 	}
 }
 
+// GetTask returns the current snapshot for taskID. Once the first successful
+// Wait for taskID has consumed (deleted) its entry, GetTask returns (nil, false)
+// even though the task did in fact run to completion.
 func (p *Pool) GetTask(taskID string) (*Task, bool) {
 	task, ok := p.getTask(taskID)
 	if !ok {
@@ -136,7 +152,13 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 	select {
 	case p.sem <- struct{}{}:
 	case <-parentCtx.Done():
-		p.finishTask(parentCtx, task, TaskStatusFailed, "", parentCtx.Err(), nil)
+		// Mirror the post-execution classification ordering: a deadline on
+		// the parent ctx is a timeout, not an explicit cancel.
+		status := TaskStatusCancelled
+		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+			status = TaskStatusTimedOut
+		}
+		p.finishTask(parentCtx, task, status, "", parentCtx.Err(), nil)
 		return
 	}
 	defer func() { <-p.sem }()
@@ -180,6 +202,10 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		status = TaskStatusTimedOut
 	case errors.Is(err, context.DeadlineExceeded):
 		status = TaskStatusTimedOut
+	case errors.Is(parentCtx.Err(), context.Canceled):
+		status = TaskStatusCancelled
+	case errors.Is(err, context.Canceled):
+		status = TaskStatusCancelled
 	default:
 		status = TaskStatusFailed
 	}
@@ -216,6 +242,10 @@ func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, re
 	case TaskStatusFailed:
 		event.Type = "task_failed"
 		event.Message = "task failed"
+		event.Error = task.Error
+	case TaskStatusCancelled:
+		event.Type = "task_cancelled"
+		event.Message = "task cancelled"
 		event.Error = task.Error
 	default:
 		event.Type = "task_failed"

@@ -55,6 +55,23 @@ func NewRegistry() *Registry {
 	return &Registry{tools: make(map[string]models.Tool)}
 }
 
+// Clone returns a new Registry with the same tool entries. The returned
+// registry is independent: registering or unregistering on one does not
+// affect the other. Tool values are copied; Handler func values are shared,
+// which is expected since handlers are stateless closures over shared deps.
+func (r *Registry) Clone() *Registry {
+	if r == nil {
+		return NewRegistry()
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cloned := make(map[string]models.Tool, len(r.tools))
+	for name, tool := range r.tools {
+		cloned[name] = tool
+	}
+	return &Registry{tools: cloned}
+}
+
 func (r *Registry) Register(tool models.Tool) error {
 	if err := tool.Validate(); err != nil {
 		return err
@@ -329,7 +346,7 @@ func (r *Registry) Restrict(allowed []string) *Registry {
 		return NewRegistry()
 	}
 	if len(allowed) == 0 {
-		return r
+		return r.Clone()
 	}
 	return r.RestrictTo(allowed)
 }
