@@ -161,9 +161,77 @@ func EnumerateAgentsReported(workDir string, pluginAgentDirs []string) ([]AgentI
 	for _, t := range stems {
 		cfg, problems := resolveAgentTypeConfigWithPluginsReported(t, workDir, pluginAgentDirs)
 		warnings = append(warnings, problems...)
+		warnings = append(warnings, checkShadowedSources(t, workDir, pluginAgentDirs)...)
 		out = append(out, AgentInfo{Type: t, Description: cfg.Description})
 	}
 	return out, warnings
+}
+
+// shadowedSource is one file-backed candidate in agent-type resolution
+// priority order (project yaml > project md > plugin md, in pluginAgentDirs
+// order), captured with its parse outcome for checkShadowedSources.
+type shadowedSource struct {
+	path string
+	cfg  *AgentTypeConfig
+	err  error
+}
+
+// checkShadowedSources re-attempts to parse every lower-priority source for
+// a type that already resolved from a higher-priority one, purely to surface
+// a warning when a file a human placed on disk is silently shadowed AND
+// broken (M1-final Minor #6). resolveAgentTypeConfigWithPluginsReported
+// (the execution-path resolver, also used for enumeration's description)
+// intentionally never reaches these — first source that parses wins, no
+// further I/O — so a broken foo.md sitting next to a working foo.yaml would
+// otherwise never surface anywhere: not an error (yaml still resolves fine)
+// and not a warning (the resolver stopped before ever looking at the md).
+// Called ONLY from the Reported enumeration path (EnumerateAgentsReported);
+// execution-path resolution stays untouched (still first-win, no extra I/O).
+func checkShadowedSources(t AgentType, workDir string, pluginAgentDirs []string) []string {
+	if err := validateSafeName(string(t)); err != nil {
+		return nil
+	}
+
+	var candidates []shadowedSource
+	if workDir != "" {
+		yamlPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".yaml")
+		cfg, err := loadAgentYAML(t, workDir)
+		candidates = append(candidates, shadowedSource{path: yamlPath, cfg: cfg, err: err})
+
+		mdPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".md")
+		cfg, err = loadAgentMDFileReported(mdPath)
+		candidates = append(candidates, shadowedSource{path: mdPath, cfg: cfg, err: err})
+	}
+	for _, dir := range pluginAgentDirs {
+		pluginPath := filepath.Join(dir, string(t)+".md")
+		cfg, err := loadAgentMDFileReported(pluginPath)
+		candidates = append(candidates, shadowedSource{path: pluginPath, cfg: cfg, err: err})
+	}
+
+	// The winner is the first candidate (in priority order) that parsed
+	// successfully — the same source resolveAgentTypeConfigWithPluginsReported
+	// would have returned. Any candidate BEFORE the winner that failed is
+	// already captured in that resolver's own `problems` (it walks the same
+	// order and only stops once it finds a winner), so only candidates AFTER
+	// the winner are new information here.
+	winner := -1
+	for i, c := range candidates {
+		if c.err == nil && c.cfg != nil {
+			winner = i
+			break
+		}
+	}
+	if winner < 0 {
+		return nil
+	}
+	var warnings []string
+	for i := winner + 1; i < len(candidates); i++ {
+		if candidates[i].err != nil {
+			warnings = append(warnings, fmt.Sprintf("shadowed by %s and failed to parse: %v",
+				filepath.Base(candidates[winner].path), candidates[i].err))
+		}
+	}
+	return warnings
 }
 
 // collectStems adds filename stems (without extension) found in dir. yaml stems

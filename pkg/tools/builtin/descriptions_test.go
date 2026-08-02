@@ -12,7 +12,6 @@ func allBuiltinTools() []models.Tool {
 	var all []models.Tool
 	all = append(all, BashTool())
 	all = append(all, FileTools()...) // includes read/write/edit/list/glob/grep/find/code_map
-	all = append(all, GitTools()...)
 	all = append(all, WebTools()...)
 	return all
 }

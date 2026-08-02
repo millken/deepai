@@ -23,6 +23,23 @@ const (
 	offloadThresholdBytes = 24 * 1024
 )
 
+// bytesPerToken is the single calibrated bytes-per-token ratio used by every
+// fallback byte-based token estimate in this package (estimateTokens,
+// toolSchemaTokens, and metrics.go's estimateInputTokens). Derived in commit
+// 695bd80 from content-weighted measurement of real sessions: 58.7% code
+// (~3.5 B/tok) + 28.9% JSON (~3.0) + 12.4% text (~3.0) ≈ 3.3 bytes/token,
+// about 9% more accurate than a flat /3. Before this constant, three call
+// sites used two different literals (/3 vs /3.3); provider-reported token
+// counts usually override the heuristic, but the fallback ratio decides the
+// very first request of every turn (provider anchors reset at every
+// compaction), so the disagreement mattered. Migrating the trigger's fallback
+// path from the uncalibrated /3 to /3.3 moves the effective compaction point
+// LATER (fewer estimated tokens per byte, ~9% for large ASCII-heavy
+// histories) — compactionThreshold (0.75) was not re-tuned to compensate:
+// 0.75 against this calibrated ratio is the intended real threshold, not an
+// artifact carried over from the old ratio.
+const bytesPerToken = 3.3
+
 // compactMessages applies heuristic compression to old messages.
 // It preserves: system messages, the first human message, and the last keepTail messages.
 // Messages in the middle ("old" region) are summarized:
@@ -213,9 +230,11 @@ func estimateTokens(messages []models.Message, systemPrompt string, _ int) int {
 		}
 		totalBytes += size + 30 // role/ID/metadata overhead per message
 	}
-	// ~4 chars per token for English/code, ~2 for CJK. Use 3 as compromise.
-	if totalBytes/3 == 0 && totalBytes > 0 {
+	// Calibrated bytes/token ratio (see bytesPerToken) rather than a flat
+	// per-language guess.
+	tokens := int(float64(totalBytes) / bytesPerToken)
+	if tokens == 0 && totalBytes > 0 {
 		return 1
 	}
-	return totalBytes / 3
+	return tokens
 }

@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -165,43 +164,9 @@ func extractJSON(text string) string {
 	return ""
 }
 
-// AgentRunner creates new Agent instances for RunWithSchema retry.
-type AgentRunner interface {
-	Create() *Agent
-}
-
-// RunWithSchema wraps Agent.Run() with structured output parsing and optional retry.
-// Agent.Run() remains unaware of OutputSchema.
-func RunWithSchema[T any](ctx context.Context, factory AgentRunner, schema *OutputSchema,
-	sessionID string, messages []models.Message) (*T, *RunResult, error) {
-
-	agent := factory.Create()
-	result, err := agent.Run(ctx, sessionID, messages)
-	if err != nil {
-		return nil, result, err
-	}
-
-	parsed, parseErr := ParseOutput[T](schema, result.FinalOutput)
-	if parseErr == nil || !schema.Strict {
-		return parsed, result, parseErr
-	}
-
-	for retry := 0; retry < schema.MaxRetries; retry++ {
-		retryMsgs := appendParseError(result.Messages, result.FinalOutput, parseErr)
-		retryAgent := factory.Create()
-		result, err = retryAgent.Run(ctx, sessionID, retryMsgs)
-		if err != nil {
-			return nil, result, err
-		}
-		parsed, parseErr = ParseOutput[T](schema, result.FinalOutput)
-		if parseErr == nil {
-			return parsed, result, nil
-		}
-	}
-	return parsed, result, parseErr
-}
-
 // appendParseError adds a user message describing the parse failure for retry.
+// Used by SubagentExecutor.Execute's Strict-schema retry loop (subagent.go)
+// to seed the retry request with what went wrong.
 func appendParseError(msgs []models.Message, output string, parseErr error) []models.Message {
 	return append(msgs[:len(msgs):len(msgs)],
 		models.Message{Role: models.RoleHuman, Content: fmt.Sprintf(

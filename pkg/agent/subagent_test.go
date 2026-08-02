@@ -270,11 +270,11 @@ func (p *scriptedOutputProvider) callCount() int {
 
 // reviewerExecutor builds a SubagentExecutor whose Execute call resolves the
 // builtin "security-reviewer" agent type — the only way to reach a real,
-// Strict+MaxRetries(1) OutputSchema without touching RunWithSchema (which the
-// task forbids modifying) or the YAML loader (OutputSchema is `yaml:"-"`, so
-// it can only come from a builtin profile). task.Config.Tools=["noop"]
-// overrides the profile's DefaultTools (read_file/grep/...), so only the
-// fake noop tool needs to be registered for the run to proceed.
+// Strict+MaxRetries(1) OutputSchema, since the YAML loader can't set one
+// (OutputSchema is `yaml:"-"`, so it can only come from a builtin profile).
+// task.Config.Tools=["noop"] overrides the profile's DefaultTools
+// (read_file/grep/...), so only the fake noop tool needs to be registered
+// for the run to proceed.
 func reviewerExecutor(t *testing.T, provider llm.LLMProvider) *SubagentExecutor {
 	t.Helper()
 	reg := llm.NewSingleModelRegistry("test", "configured-model", "")
@@ -715,6 +715,53 @@ func TestSubagentExecutor_NoOutputSchema_NoRetryBehaviorChange(t *testing.T) {
 	}
 	if provider.callCount() != 1 {
 		t.Fatalf("provider callCount = %d, want 1 (no retry without OutputSchema)", provider.callCount())
+	}
+}
+
+// TestSubagentExecutor_NonStrictOutputSchema_SkipsValidation is the RED test
+// for schema leftover L3 (coordinator decision): a non-Strict OutputSchema
+// must skip validation entirely — no retry, and no WARNING-prefixed result —
+// exactly the prompt-suffix-only behavior from before M2-3. Before this fix,
+// Execute called ValidateOutput unconditionally and, since the non-Strict
+// branch never retries, always fell through to the fail-soft WARNING-prefix
+// return on any mismatch — even though Strict is false. All three real
+// builtin reviewer schemas are Strict, so this can only be exercised via a
+// synthetic BuiltinAgentTypes entry (temporarily registered, restored via
+// defer) with an explicitly non-Strict schema.
+func TestSubagentExecutor_NonStrictOutputSchema_SkipsValidation(t *testing.T) {
+	nonStrictSchema := FromStruct[ReviewResult](WithStrict(false), WithMaxRetries(3))
+	const fakeType = AgentType("nonstrict-fake-reviewer")
+	BuiltinAgentTypes[fakeType] = AgentTypeConfig{
+		Type:         fakeType,
+		Name:         "nonstrict-fake-reviewer",
+		SystemPrompt: "test",
+		OutputSchema: nonStrictSchema,
+	}
+	defer delete(BuiltinAgentTypes, fakeType)
+
+	// Missing required "verdict" field — would fail ReviewResult schema
+	// validation if ValidateOutput were called.
+	invalidOutput := `{"agent":"x","summary":"no verdict","issues":[]}`
+	provider := &scriptedOutputProvider{outputs: map[int]string{0: invalidOutput}}
+	exec := reviewerExecutor(t, provider)
+
+	execResult, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t-nonstrict", Prompt: "review", Config: subagent.SubagentConfig{
+			AgentType: string(fakeType),
+			Tools:     []string{"noop"},
+		}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if provider.callCount() != 1 {
+		t.Fatalf("provider callCount = %d, want 1 (non-Strict schema must never retry)", provider.callCount())
+	}
+	if strings.HasPrefix(execResult.Result, outputSchemaWarningPrefix) {
+		t.Fatalf("Result = %q, must NOT carry the WARNING prefix for a non-Strict schema (L3: skip validation entirely, prompt-suffix behavior only)", execResult.Result)
+	}
+	if execResult.Result != invalidOutput {
+		t.Fatalf("Result = %q, want the raw output unchanged: %q", execResult.Result, invalidOutput)
 	}
 }
 

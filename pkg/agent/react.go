@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,22 +17,16 @@ import (
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
-	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
-	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
 
-// maxTaskCallsPerRun caps how many "task" tool calls a single Run will
-// execute — a cost backstop for unattended runs. Deliberately generous
-// relative to the subagent pool's own concurrency limit (4 by default):
-// this bounds total fan-out across the whole run, not concurrent fan-out at
-// any one instant.
-const maxTaskCallsPerRun = 20
-
-var messageSeq uint64
-var agentRequestSeq uint64
+// defaultStreamIdleTimeout bounds the max silence BETWEEN chunks of a single
+// streaming request (not the total request time — see Agent.streamIdleTimeout).
+// Generous relative to any real provider's chunk cadence, so it only trips on
+// a genuinely stalled request.
+const defaultStreamIdleTimeout = 2 * time.Minute
 
 // Agent runs our custom ReAct loop while delegating model streaming and tool schemas to the LLM provider abstraction.
 type Agent struct {
@@ -51,11 +43,19 @@ type Agent struct {
 	maxTurns        int
 	maxTokensBudget int
 	requestTimeout  time.Duration
-	events          chan AgentEvent
-	runMu           sync.Mutex
-	eventsMu        sync.RWMutex
-	eventsClosed    bool
-	started         bool
+	// streamIdleTimeout bounds the max silence BETWEEN chunks of a single
+	// streaming request — NOT the total request time (that's requestTimeout).
+	// The HTTP client deliberately has no per-request timeout (pkg/llm/http.go),
+	// so without this a stream that emits nothing can hang until the outer
+	// deadline (or forever, if there is none). Defaults to
+	// defaultStreamIdleTimeout; not exposed via AgentConfig — tests in this
+	// package set the field directly.
+	streamIdleTimeout time.Duration
+	events            chan AgentEvent
+	runMu             sync.Mutex
+	eventsMu          sync.RWMutex
+	eventsClosed      bool
+	started           bool
 
 	// Context compaction
 	contextWindow       int
@@ -72,6 +72,25 @@ type Agent struct {
 	// be added without re-counting from scratch.
 	lastInputTokens    int
 	lastTokenCountMsgs int
+	// compactionStalled is set when a compaction pass fails to bring the
+	// ratio back under compactionThreshold. This is NOT necessarily a
+	// permanent floor: the escalating retry loop inside the compaction
+	// branch only tries to get the estimate under the raw context window
+	// (afterEstimated <= a.contextWindow), so landing in the
+	// [compactionThreshold, 1.0) band after a real, productive compaction is
+	// routine, not a sign nothing more can ever be compacted. While
+	// compactionStalled is set, the proactive branch is skipped so a session
+	// genuinely stuck at its floor doesn't re-evaluate and re-compact
+	// (including the synchronous, potentially 30s-timeout memory flush) on
+	// every single subsequent turn for no benefit — but compactionStalledAt
+	// (the canonical message count at the moment of stalling) lets the guard
+	// clear itself once enough new messages have been appended that the
+	// messages protected as "tail" at stall time have slid into the
+	// compactable head region, so a long-running, still-growing session
+	// keeps getting compacted every ~compactionKeepTail turns instead of
+	// never again after the first inconclusive attempt.
+	compactionStalled   bool
+	compactionStalledAt int
 
 	// Memory integration
 	memoryService   *memory.Service
@@ -155,6 +174,7 @@ func New(cfg AgentConfig) *Agent {
 		maxTurns:            maxTurns,
 		maxTokensBudget:     cfg.MaxTokensBudget,
 		requestTimeout:      requestTimeout,
+		streamIdleTimeout:   defaultStreamIdleTimeout,
 		events:              make(chan AgentEvent, 128),
 		contextWindow:       cfg.ContextWindow,
 		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
@@ -324,46 +344,103 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
+		// Assemble the system prompt ONCE per turn, before the compaction check,
+		// so the check measures the same prompt the request below actually
+		// sends (BuildSystemPrompt layers memory injections, the file-op rule,
+		// tool recommendations, the delegation prompt + catalog, and plan-mode
+		// text on top of the base a.systemPrompt — all of that was previously
+		// invisible to the compaction trigger). Built from PRE-compaction
+		// runMessages: BuildSystemPrompt's memory relevance context is a
+		// heuristic (a recency-based excerpt), so it doesn't need the
+		// post-compaction view to stay correct, and rebuilding it a second time
+		// after compaction would cost another memory-service round trip for a
+		// once-per-turn compaction check. Not recomputed even if compaction
+		// fires below — a behavior consequence worth noting: on a turn where
+		// compaction fires, the synchronous memory flush below runs (and
+		// writes its extracted facts to storage) AFTER this BuildSystemPrompt
+		// call, so the injected memory this turn still reflects PRE-flush
+		// state; facts the flush just extracted only become visible to
+		// InjectWithContext/InjectScopeWithContext starting next turn.
+		systemPrompt := a.BuildSystemPrompt(ctx, sessionID, runMessages)
+
+		// T1/T4: derive a per-request compressed prompt view from the canonical
+		// runMessages. When aging is disabled this is a zero-copy pass-through.
+		// The canonical runMessages (persisted, replayed, mined for memory) are
+		// never modified — only the view sent to the provider is compressed.
+		// Computed before the compaction check (and recomputed after, if
+		// compaction fires) so the check measures what is actually sent, not
+		// canonical history that aging may have shrunk considerably.
+		promptView := buildPromptView(runMessages, a.aging, a.contextWindow)
+
+		// Clear a previous stall once new material has slid into the
+		// compactable region: enough messages have been appended since the
+		// stall point that the messages protected as the tail back then are
+		// no longer the tail now, so a fresh compaction attempt has new
+		// ground to work with instead of just re-deriving the same
+		// inconclusive result.
+		if a.compactionStalled && len(runMessages) >= a.compactionStalledAt+a.compactionKeepTail {
+			a.compactionStalled = false
+		}
+
 		// Context compaction: compress old messages when approaching context window.
-		if a.contextWindow > 0 {
-			// Tool schemas are sent on every request and count against the
-			// provider's window, but estimateTokens only sees messages. Add them
-			// here so the agent doesn't underestimate the real payload and
-			// compact too late (which is how an overflowing session still slips
-			// past the threshold and hits the provider's hard limit).
-			estimated := a.estimateContextTokens(runMessages)
+		// Skipped entirely while compactionStalled is set: a previous turn
+		// already discovered that compacting doesn't bring the ratio back
+		// under threshold, and re-evaluating and re-compacting every
+		// subsequent turn before enough new material has accumulated (see
+		// the unstall check above) would only thrash (repeated synchronous
+		// memory flushes and re-deriving the same inconclusive compaction)
+		// for no benefit.
+		if a.contextWindow > 0 && !a.compactionStalled {
+			// Measure the assembled prompt + aged view (what the request below
+			// actually sends), not canonical messages or the base system prompt —
+			// otherwise compaction can fire too late (assembled prompt bigger than
+			// base) or too early (aged view much smaller than canonical, so
+			// compacting on the canonical estimate destroys history the provider
+			// was never even going to see). Tool schemas are sent on every request
+			// too; estimateContextTokens adds them internally.
+			estimated := a.estimateContextTokens(promptView, systemPrompt)
 			ratio := float64(estimated) / float64(a.contextWindow)
 			if ratio >= a.compactionThreshold {
-				// Flush memory synchronously before compaction to guarantee no data loss.
-				// This blocks while the LLM extracts, but compaction is infrequent
-				// and losing information is worse than the latency cost.
-				if a.memoryService != nil && a.memoryExtractor != nil {
-					// Cancel any queued update for this session so the
-					// stale async job won't overwrite our sync flush.
-					a.memoryService.CancelPendingUpdates(sessionID)
-					flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
-					if skillName := a.ActiveSkill(); skillName != "" {
-						_ = a.memoryService.UpdateWithFactSource(flushCtx, sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
-					} else {
-						_ = a.memoryService.UpdateWith(flushCtx, sessionID, runMessages, a.memoryExtractor)
-					}
-					flushCancel()
-				}
 				before := len(runMessages)
 				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 				if didCompact {
+					// Flush memory synchronously before compaction to guarantee no
+					// data loss. This blocks while the LLM extracts, but compaction
+					// is infrequent and losing information is worse than the
+					// latency cost. Moved inside didCompact (rather than gated only
+					// on ratio >= threshold) so a trigger turn where
+					// compactMessages finds nothing left to compact — already at
+					// the head/tail floor — doesn't still pay a 30s-timeout flush
+					// for a compaction that's not going to happen.
+					if a.memoryService != nil && a.memoryExtractor != nil {
+						// Cancel any queued update for this session so the
+						// stale async job won't overwrite our sync flush.
+						a.memoryService.CancelPendingUpdates(sessionID)
+						flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
+						if skillName := a.ActiveSkill(); skillName != "" {
+							_ = a.memoryService.UpdateWithFactSource(flushCtx, sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
+						} else {
+							_ = a.memoryService.UpdateWith(flushCtx, sessionID, runMessages, a.memoryExtractor)
+						}
+						flushCancel()
+					}
+
 					runMessages = compacted
 					a.lastInputTokens = 0
 					a.lastTokenCountMsgs = 0
+					// Canonical messages changed; the view sent to the provider
+					// must be re-derived from them.
+					promptView = buildPromptView(runMessages, a.aging, a.contextWindow)
 
-					afterEstimated := a.estimateContextTokens(runMessages)
+					afterEstimated := a.estimateContextTokens(promptView, systemPrompt)
 					if afterEstimated > a.contextWindow {
 						for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
 							c2, ok := compactMessages(runMessages, tail)
 							if ok {
 								runMessages = c2
 							}
-							afterEstimated = a.estimateContextTokens(runMessages)
+							promptView = buildPromptView(runMessages, a.aging, a.contextWindow)
+							afterEstimated = a.estimateContextTokens(promptView, systemPrompt)
 							if afterEstimated <= a.contextWindow {
 								break
 							}
@@ -384,16 +461,17 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 							AfterRatio:     afterRatio,
 						},
 					})
+					if afterRatio >= a.compactionThreshold {
+						a.compactionStalled = true
+						a.compactionStalledAt = len(runMessages)
+						a.logger.Warn("context compaction did not drop the ratio under threshold; suppressing "+
+							"further compaction attempts until enough new messages accumulate to make the "+
+							"current tail compactable again", "turn", turn, "after_tokens", afterEstimated,
+							"context_window", a.contextWindow, "threshold", a.compactionThreshold)
+					}
 				}
 			}
 		}
-
-		// T1/T4: derive a per-request compressed prompt view from the canonical
-		// runMessages. When aging is disabled this is a zero-copy pass-through.
-		// The canonical runMessages (persisted, replayed, mined for memory) are
-		// never modified — only the view sent to the provider is compressed.
-		promptView := buildPromptView(runMessages, a.aging, a.contextWindow)
-		systemPrompt := a.BuildSystemPrompt(ctx, sessionID, runMessages)
 
 		// Phase 0 auxiliary metric: byte breakdown of the outgoing prompt.
 		// Captured before the request; combined with the provider's real token
@@ -414,10 +492,22 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			ImageDetail:     a.imageDetail,
 		}
 
-		stream, err := a.llm.Stream(ctx, req)
+		aiMessageID := newMessageID("ai")
+
+		// Per-request cancellable ctx (stream idle watchdog, plan #8): a
+		// stream that goes silent must not be allowed to hang until the
+		// outer deadline (or forever, if there is none — the HTTP client
+		// deliberately has no per-request timeout, see pkg/llm/http.go).
+		// cancel is handed to consumeStream below, which defers it so the
+		// per-request ctx is released on every exit path from this turn's
+		// stream consumption; on the early Stream()-error return here it is
+		// called explicitly instead, since consumeStream is never reached.
+		reqCtx, cancel := context.WithCancel(ctx)
+		stream, err := a.llm.Stream(reqCtx, req)
 		if err != nil {
+			cancel()
 			if isContextOverflowError(err) {
-				if compacted, ok := a.compactOnOverflow(runMessages, turn, "stream"); ok {
+				if compacted, ok := a.compactOnOverflow(runMessages, systemPrompt, turn, "stream"); ok {
 					runMessages = compacted
 					continue
 				}
@@ -427,55 +517,27 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 
-		var (
-			aiMessageID = newMessageID("ai")
-			textBuilder strings.Builder
-			toolCalls   []models.ToolCall
-			streamUsage *llm.Usage
-			stopReason  string
-		)
+		streamRes := a.consumeStream(stream, cancel, emit, aiMessageID)
+		text := streamRes.text
+		toolCalls := streamRes.toolCalls
+		streamUsage := streamRes.usage
+		stopReason := streamRes.stopReason
 
-		overflowRetry := false
-		for chunk := range stream {
-			if chunk.Err != nil {
-				if isContextOverflowError(chunk.Err) {
-					if compacted, ok := a.compactOnOverflow(runMessages, turn, "chunk"); ok {
-						runMessages = compacted
-						overflowRetry = true
-						// Drain remaining chunks so the upstream goroutine isn't leaked.
-						for range stream {
-						}
-						break
-					}
-				}
-				err := normalizeRunError(ctx, chunk.Err, a.requestTimeout)
-				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
-			}
-			if chunk.Delta != "" {
-				textBuilder.WriteString(chunk.Delta)
-				emit(AgentEvent{Type: AgentEventTextChunk, MessageID: aiMessageID, Text: chunk.Delta})
-			}
-			if len(chunk.ToolCalls) > 0 {
-				toolCalls = mergeToolCalls(toolCalls, chunk.ToolCalls)
-			}
-			if chunk.Usage != nil {
-				streamUsage = chunk.Usage
-			}
-			if chunk.Done {
-				stopReason = chunk.Stop
-				if chunk.Message != nil {
-					if textBuilder.Len() == 0 && chunk.Message.Content != "" {
-						textBuilder.WriteString(chunk.Message.Content)
-					}
-					if len(toolCalls) == 0 && len(chunk.Message.ToolCalls) > 0 {
-						toolCalls = append(toolCalls, chunk.Message.ToolCalls...)
-					}
+		if streamRes.err != nil {
+			// Covers both a provider-surfaced chunk error (context overflow
+			// or otherwise) and the stream idle watchdog's *TimeoutError —
+			// both are handled identically to how the pre-existing chunk-
+			// error branch always has: check for context overflow first
+			// (compact-and-retry), otherwise normalize and fail the turn.
+			if isContextOverflowError(streamRes.err) {
+				if compacted, ok := a.compactOnOverflow(runMessages, systemPrompt, turn, "chunk"); ok {
+					runMessages = compacted
+					continue
 				}
 			}
-		}
-		if overflowRetry {
-			continue
+			err := normalizeRunError(ctx, streamRes.err, a.requestTimeout)
+			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
+			return &RunResult{Messages: runMessages, Usage: usage}, err
 		}
 		if err := ctx.Err(); err != nil {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
@@ -510,7 +572,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			a.metrics.RecordTurn(m)
 		}
 
-		a.logger.Debug("llm response", "turn", turn, "text_len", textBuilder.Len(), "tool_calls", len(toolCalls), "stop", stopReason)
+		a.logger.Debug("llm response", "turn", turn, "text_len", len(text), "tool_calls", len(toolCalls), "stop", stopReason)
 		assistantMetadata := map[string]string{"stop_reason": stopReason}
 		if streamUsage != nil {
 			if raw, err := json.Marshal(streamUsage); err == nil {
@@ -521,7 +583,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			ID:        aiMessageID,
 			SessionID: sessionID,
 			Role:      models.RoleAI,
-			Content:   textBuilder.String(),
+			Content:   text,
 			ToolCalls: toolCalls,
 			Metadata:  assistantMetadata,
 			CreatedAt: time.Now().UTC(),
@@ -531,19 +593,26 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		}
 
 		if len(toolCalls) == 0 {
-			// If the model hit context length limits, compact and retry
-			// instead of silently ending with empty output.
-			if isContextOverflow(stopReason) {
-				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
-				if !didCompact {
-					compacted, didCompact = compactMessages(runMessages, 4)
-				}
-				if didCompact && len(compacted) < len(runMessages) {
-					a.logger.Debug("compacting after context overflow", "turn", turn, "before", len(runMessages), "after", len(compacted))
+			// Only a genuine INPUT-overflow stop reason (the provider
+			// rejected the request itself, no tool calls, no text) is worth
+			// a compact-and-retry: compactMessages rewrites content but
+			// preserves message *count*, so the previous gate here
+			// (didCompact && len(compacted) < len(runMessages)) was
+			// provably always false — the same defect compactOnOverflow's
+			// comment documents for the chunk.Err path. Delegate to that
+			// already-fixed helper (it does its own token-size comparison
+			// and provider-anchor invalidation) and retry on success,
+			// mirroring the chunk.Err overflow path above.
+			if isInputContextOverflow(stopReason) {
+				if compacted, ok := a.compactOnOverflow(runMessages, systemPrompt, turn, "no-tool-calls"); ok {
 					runMessages = compacted
 					continue
 				}
-				a.logger.Warn("context overflow and compaction cannot reduce further", "turn", turn, "messages", len(runMessages))
+			} else if isOutputTruncation(stopReason) {
+				// The request fit fine; the provider truncated its
+				// *response*. Compacting conversation history cannot fix
+				// output truncation, so just warn and end the run below.
+				a.logger.Warn("output truncated (max_tokens/length) and no tool calls; compaction cannot help output truncation", "turn", turn, "stop_reason", stopReason)
 			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
@@ -556,6 +625,39 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				FinalOutput: assistantMessage.Content,
 				Usage:       usage,
 			}, nil
+		}
+
+		// Parent-budget passthrough (plan §M2.2 carry-forward): compute the
+		// REMAINING token budget once per batch, here on the Run goroutine —
+		// usage is loop state and must not be read from inside the parallel
+		// path's goroutines below. Injected into the tool ctx so a subagent
+		// spawned via the task tool can't be handed an unlimited budget
+		// underneath a parent that itself is running under MaxTokensBudget
+		// (pkg/tools/subagent.go folds this into SubagentConfig.TokenBudget).
+		// A parent without a budget (maxTokensBudget<=0) leaves ctx
+		// untouched, so downstream behavior is unchanged.
+		//
+		// Staleness consequence (accepted): remaining is a snapshot of
+		// usage as of the TOP of this batch, computed once and reused for
+		// every call in it — a batch of N task calls (e.g. a ParallelSafe
+		// fan-out) each independently sees that SAME pre-batch remaining,
+		// not remaining-minus-what-earlier-calls-in-this-batch-already-
+		// spent. Since none of those calls' own usage is known until they
+		// complete, N concurrent subagents could jointly draw up to N times
+		// the parent's actual remaining budget before anything notices.
+		// This is bounded, not unbounded: the parent's own turn-top budget
+		// check (`usage.TotalTokens >= a.maxTokensBudget`, above) rolls up
+		// every subagent's usage via addSubagentUsage and will catch the
+		// overage at the START of the NEXT turn, ending the run. Tightening
+		// this further (e.g. reserving remaining/N per call, or serializing
+		// budget decisions across a batch) is out of scope here.
+		dispatchCtx := ctx
+		if a.maxTokensBudget > 0 {
+			remaining := a.maxTokensBudget - usage.TotalTokens
+			if remaining < 0 {
+				remaining = 0
+			}
+			dispatchCtx = tools.WithRemainingTokenBudget(ctx, remaining)
 		}
 
 		// Tool calls execution.
@@ -610,7 +712,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					results[i] = a.runOneTool(ctx, sessionID, call)
+					results[i] = a.runOneTool(dispatchCtx, sessionID, call)
 				}()
 			}
 			wg.Wait()
@@ -668,12 +770,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					batchClean = false
 				}
 				if obs.fatalErr != nil {
-					// The run ends here; append any pending hints now so they
-					// are still persisted, but they still come after every
-					// tool result observed so far.
-					if len(pendingHints) > 0 {
-						runMessages = append(runMessages, pendingHints...)
-					}
 					// Invariant that matters here: every tool_use ID on the
 					// assistant message that started this batch MUST have a
 					// matching tool_result in runMessages, or the next
@@ -693,7 +789,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					// earlier result in the same batch.
 					for j := i + 1; j < len(toolCalls); j++ {
 						addSubagentUsage(usage, results[j])
+						// Mirror the normal per-index loop above: a large
+						// trailing result must still be shrunk to its
+						// offload stub before being persisted, or it lands
+						// in runMessages at full size (M1 gap — the normal
+						// path applies offload before appending, this tail
+						// loop did not).
+						a.offloadIfNeeded(&results[j], a.offloadDir)
 						runMessages = appendToolResultMessage(runMessages, sessionID, results[j])
+					}
+					// Append any pending hints only AFTER every tool result of
+					// this batch (including the tail append above) — a hint
+					// (RoleHuman) must never land between the assistant
+					// tool_calls message that started this batch and any of
+					// its tool results (M1-7), and flushing it before the
+					// tail append violated that invariant on the fatal path.
+					if len(pendingHints) > 0 {
+						runMessages = append(runMessages, pendingHints...)
 					}
 					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
 					return &RunResult{Messages: runMessages, Usage: usage}, obs.fatalErr
@@ -719,7 +831,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// result so a hint (RoleHuman) never lands between an assistant
 		// tool_calls message and any of its tool results (M1-7).
 		var pendingHints []models.Message
-		for _, call := range toolCalls {
+		for idx, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
 				MessageID: aiMessageID,
@@ -742,7 +854,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// reaches the subagent pool's StartTask.
 				result = synthesizeTaskCapResult(call)
 			} else {
-				result = a.runOneTool(ctx, sessionID, call)
+				result = a.runOneTool(dispatchCtx, sessionID, call)
 			}
 
 			// If a skill was loaded, inject its body into the system prompt
@@ -810,9 +922,28 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				batchClean = false
 			}
 			if obs.fatalErr != nil {
-				// The run ends here; append any pending hints now so they are
-				// still persisted, but they still come after every tool
-				// result observed so far.
+				// Invariant that matters here: every tool_use ID on the
+				// assistant message that started this batch MUST have a
+				// matching tool_result in runMessages, or the next Anthropic
+				// request is malformed. Unlike the parallel path, the serial
+				// loop never executed the remaining calls in this batch —
+				// there are no computed results to append, so synthesize a
+				// failed placeholder for each one instead.
+				for _, remaining := range toolCalls[idx+1:] {
+					synthetic := models.ToolResult{
+						CallID:      remaining.ID,
+						ToolName:    remaining.Name,
+						Status:      models.CallStatusFailed,
+						Error:       "not executed: batch aborted by circuit breaker",
+						CompletedAt: time.Now().UTC(),
+					}
+					runMessages = appendToolResultMessage(runMessages, sessionID, synthetic)
+				}
+				// Append any pending hints only AFTER the synthesized tail
+				// results above — a hint (RoleHuman) must never land between
+				// the assistant tool_calls message that started this batch
+				// and any of its tool results (M1-7); flushing it before the
+				// synthesize loop violated that invariant.
 				if len(pendingHints) > 0 {
 					runMessages = append(runMessages, pendingHints...)
 				}
@@ -836,103 +967,6 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			breaker.resetOnCleanBatch()
 		}
 	}
-}
-
-func recentConversationContext(messages []models.Message) string {
-	const maxMessages = 6
-	const maxBytes = 4000
-	var parts []string
-	for i := len(messages) - 1; i >= 0 && len(parts) < maxMessages; i-- {
-		m := messages[i]
-		if m.Role != models.RoleHuman && m.Role != models.RoleAI {
-			continue
-		}
-		if c := strings.TrimSpace(m.Content); c != "" {
-			parts = append(parts, c)
-		}
-	}
-	joined := strings.Join(parts, "\n")
-	if len(joined) > maxBytes {
-		joined = joined[len(joined)-maxBytes:]
-	}
-	return joined
-}
-
-func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMessages []models.Message) string {
-	sections := []string{strings.TrimSpace(a.systemPrompt)}
-
-	if a.memoryService != nil {
-		activeSource := ""
-		if skillName := a.ActiveSkill(); skillName != "" {
-			activeSource = "skill:" + skillName
-		}
-		relevanceContext := recentConversationContext(runMessages)
-		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
-			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
-				sections = append(sections, userMem)
-			}
-		}
-		if strings.TrimSpace(sessionID) != "" {
-			if injection := a.memoryService.InjectWithContext(ctx, sessionID, relevanceContext, activeSource); injection != "" {
-				sections = append(sections, injection)
-			}
-		}
-	}
-
-	// T5c: only carry the file-operation routing rule when the agent has ANY of
-	// the dedicated file tools it references — an agent with edit_file but not
-	// read_file still needs "use edit_file, not sed -i". Only a truly file-tool-
-	// less agent (e.g. bash-only) omits the ~400-char rule.
-	if a.hasAnyFileTool() {
-		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools.")
-	}
-
-	// M2.2+: Smart tool selection guidance for search operations
-	if a.hasSearchTools() {
-		sections = append(sections, builtin.GetToolRecommendations())
-	}
-
-	// Team awareness: when the agent can spawn sub-agents (has the task tool),
-	// inject delegation guidance so it knows when to delegate vs do itself.
-	// Skipped for non-interactive agents (sub-agents) to avoid recursion, and
-	// when the catalog is empty (no agents to delegate to).
-	// Note: plan mode replaces a.tools (enterPlanMode), removing the task tool,
-	// so this block is naturally skipped — that prevents using sub-agents to
-	// bypass plan-mode file restrictions.
-	if !a.nonInteractive && a.tools.Get("task") != nil && len(a.agentCatalog) > 0 {
-		sections = append(sections, renderDelegationPrompt(a.agentCatalog))
-	}
-
-	sections = a.appendPlanModePrompt(sections)
-	return strings.Join(sections, "\n\n")
-}
-
-// hasAnyFileTool reports whether any of the dedicated file tools named by the
-// file-operation rule is registered.
-func (a *Agent) hasAnyFileTool() bool {
-	if a == nil || a.tools == nil {
-		return false
-	}
-	for _, name := range []string{"read_file", "edit_file", "write_file", "list_dir", "find", "grep"} {
-		if a.tools.Get(name) != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// hasSearchTools reports whether search-related tools are registered
-func (a *Agent) hasSearchTools() bool {
-	if a == nil || a.tools == nil {
-		return false
-	}
-	// Check for grep and bash (bash can be used for file searches and git operations)
-	for _, name := range []string{"grep", "bash"} {
-		if a.tools.Get(name) != nil {
-			return true
-		}
-	}
-	return false
 }
 
 func (a *Agent) emit(evt AgentEvent) {
@@ -962,845 +996,4 @@ func (a *Agent) closeEvents() {
 	}
 	close(a.events)
 	a.eventsClosed = true
-}
-
-func buildSystemPrompt(base string, date string) string {
-	var b strings.Builder
-	if base != "" {
-		b.WriteString(base)
-		b.WriteString("\n\n")
-	}
-	b.WriteString("# Current date\nToday's date is ")
-	b.WriteString(date)
-	b.WriteByte('.')
-	return b.String()
-}
-
-// delegationStrategy is the static policy text for team delegation. The agent
-// catalog (available types) is rendered separately from the live EnumerateAgents
-// result, so this text never lists specific agent names.
-const delegationStrategy = `# Team Delegation
-
-You lead a team of specialized sub-agents. Use the task tool to delegate when a sub-agent can do a better job than you.
-
-## When to delegate
-
-- Complex feature (new page, new module, multi-file change) → delegate implementation.
-- UI/design work, requirements analysis, technical design, deep code review → delegate to the matching specialist.
-- For multi-step projects, run sub-agents in dependency order. A sub-agent's result comes back as the task tool's return value; pass relevant context from prior steps in the next sub-agent's prompt.
-
-## When NOT to delegate
-
-- Simple edits, quick fixes, answering questions → do it yourself.
-- You already know the answer from context → just answer.
-
-## How to delegate
-
-- Give the sub-agent a self-contained prompt with all needed context (file paths, requirements, constraints).
-- Sub-agents cannot see your conversation history. They start fresh. Always include: what to do, what input/context it needs, and what its final answer should contain.
-- Pass the files the sub-agent needs via context_files instead of pasting their contents into the prompt.
-- After a sub-agent completes, review its output before proceeding. If wrong, re-invoke with corrections.
-
-## Parallel delegation
-
-- Fan out independent sub-tasks as multiple task calls in ONE response; they run concurrently (bounded by the pool).
-- Parallel tasks MUST operate on disjoint file sets and MUST NOT both run git operations (they share the working tree and git index).
-- Prefer parallel fan-out for independent read/analysis work; use serial, dependency-ordered calls when a later step needs an earlier one's result.
-- Each sub-agent costs tokens — don't fan out for trivial work.`
-
-// renderDelegationPrompt combines the static strategy text with a dynamically
-// rendered agent catalog, so the prompt always reflects the actual available
-// types (project > plugin > builtin) instead of a hardcoded list.
-func renderDelegationPrompt(catalog []AgentInfo) string {
-	var b strings.Builder
-	b.WriteString(delegationStrategy)
-	b.WriteString("\n\n## Available agents\n")
-	b.WriteString("Use these agent_type values with the task tool:\n\n")
-	for _, a := range catalog {
-		desc := strings.TrimSpace(a.Description)
-		desc = strings.ReplaceAll(desc, "\n", " ")
-		if len([]rune(desc)) > 100 {
-			desc = string([]rune(desc)[:99]) + "…"
-		}
-		fmt.Fprintf(&b, "- **%s** — %s\n", a.Type, desc)
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func resolveModel(model string) string {
-	if model = strings.TrimSpace(model); model != "" {
-		return model
-	}
-	if model := strings.TrimSpace(os.Getenv("DEFAULT_LLM_MODEL")); model != "" {
-		return model
-	}
-	return "gpt-4.1-mini"
-}
-
-func newMessageID(prefix string) string {
-	seq := atomic.AddUint64(&messageSeq, 1)
-	return fmt.Sprintf("%s_%d_%d", prefix, time.Now().UTC().UnixNano(), seq)
-}
-
-func newAgentRequestID() string {
-	seq := atomic.AddUint64(&agentRequestSeq, 1)
-	return fmt.Sprintf("req_%d_%d", time.Now().UTC().UnixNano(), seq)
-}
-
-func normalizeRunError(ctx context.Context, err error, timeout time.Duration) error {
-	if err == nil {
-		return nil
-	}
-	// Only map to agent timeout when the run context itself hit deadline.
-	// Keep inner/tool deadline errors intact so users see the real source.
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return &TimeoutError{
-			Duration: timeout,
-			Message:  "agent request timed out",
-		}
-	}
-	return err
-}
-
-func mergeToolCalls(existing, incoming []models.ToolCall) []models.ToolCall {
-	if len(existing) == 0 {
-		return append([]models.ToolCall(nil), incoming...)
-	}
-
-	indexByID := make(map[string]int, len(existing))
-	for i, call := range existing {
-		indexByID[call.ID] = i
-	}
-
-	for _, call := range incoming {
-		if call.ID != "" {
-			if idx, ok := indexByID[call.ID]; ok {
-				if existing[idx].Name == "" {
-					existing[idx].Name = call.Name
-				}
-				if len(call.Arguments) > 0 {
-					existing[idx].Arguments = call.Arguments
-				}
-				if call.Status != "" {
-					existing[idx].Status = call.Status
-				}
-				continue
-			}
-			indexByID[call.ID] = len(existing)
-		}
-		existing = append(existing, call)
-	}
-
-	return existing
-}
-
-func accumulateUsage(dst *Usage, src *llm.Usage) {
-	dst.InputTokens += src.InputTokens
-	dst.OutputTokens += src.OutputTokens
-	dst.TotalTokens += src.TotalTokens
-}
-
-// addSubagentUsage rolls a completed subagent's token consumption into the
-// parent run's usage accumulator (M2-2 12b), so RunResult.Usage (TUI stats)
-// and the parent's own token budget check (a.maxTokensBudget, above) include
-// the full subagent tree, not just the parent's own LLM calls. Liberal in
-// what it accepts: result.Data["subagent_usage"]'s value is the concrete
-// *subagent.TokenUsage type populated by the task tool
-// (pkg/tools/subagent.go), but a type switch keeps this robust rather than a
-// hard cast. No-op when the key is absent, nil, or a different type.
-func addSubagentUsage(dst *Usage, result models.ToolResult) {
-	if dst == nil || len(result.Data) == 0 {
-		return
-	}
-	raw, ok := result.Data["subagent_usage"]
-	if !ok {
-		return
-	}
-	switch v := raw.(type) {
-	case *subagent.TokenUsage:
-		if v == nil {
-			return
-		}
-		dst.InputTokens += v.PromptTokens
-		dst.OutputTokens += v.CompletionTokens
-		dst.TotalTokens += v.TotalTokens
-	}
-}
-
-// taskCallOverCap increments *counter for "task" tool calls only and reports
-// whether THIS call exceeds maxTaskCallsPerRun (M2-2 12c). Non-task calls
-// are always allowed and never touch the counter. Must be called from a
-// single goroutine per Run (the serial dispatch loop, or the parallel path's
-// pre-dispatch admission pass) — it is not safe for concurrent use.
-func taskCallOverCap(counter *int, call models.ToolCall) bool {
-	if call.Name != "task" {
-		return false
-	}
-	*counter++
-	return *counter > maxTaskCallsPerRun
-}
-
-// synthesizeTaskCapResult builds the refusal ToolResult for a "task" call
-// that was never executed because it would exceed maxTaskCallsPerRun. This
-// is a per-call refusal, not a fatal run error: it is fed through the normal
-// result path (message history, metrics, events, breaker observation) so
-// the run continues with the model informed of the limit.
-func synthesizeTaskCapResult(call models.ToolCall) models.ToolResult {
-	msg := fmt.Sprintf("task call limit reached for this run (%d); finish with what you have or ask the user to continue", maxTaskCallsPerRun)
-	return models.ToolResult{
-		CallID:      call.ID,
-		ToolName:    call.Name,
-		Status:      models.CallStatusFailed,
-		Error:       msg,
-		CompletedAt: time.Now().UTC(),
-	}
-}
-
-func cloneUsage(src *Usage) *Usage {
-	if src == nil {
-		return nil
-	}
-	out := *src
-	return &out
-}
-
-func toolMessageContent(result models.ToolResult) string {
-	s := result.Content
-	if result.Error != "" {
-		s = result.Error
-	}
-	if len(s) > maxToolContentBytes {
-		s = s[:maxToolContentBytes] + fmt.Sprintf("\n... [truncated: %d bytes total]", len(s))
-	}
-	return s
-}
-
-// offloadIfNeeded checks if a tool result exceeds the offload threshold.
-// If so, it writes the full content to a file under offloadDir and replaces
-// result.Content with a compact reference (path + first/last 50 lines).
-// Returns true if offload occurred. Errors during file write are logged but
-// non-fatal — the result stays in-context (degraded but functional).
-func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bool {
-	if offloadDir == "" || len(result.Content) <= offloadThresholdBytes {
-		return false
-	}
-	// CallID is unique per invocation, making a safe filename.
-	callID := result.CallID
-	if callID == "" {
-		callID = newMessageID("offload")
-	}
-	offloadPath := filepath.Join(offloadDir, callID+".txt")
-
-	if err := os.MkdirAll(offloadDir, 0700); err != nil {
-		a.logger.Warn("offload mkdir failed", "dir", offloadDir, "err", err)
-		return false
-	}
-	if err := os.WriteFile(offloadPath, []byte(result.Content), 0644); err != nil {
-		a.logger.Warn("offload write failed", "path", offloadPath, "err", err)
-		return false
-	}
-
-	result.Content = buildOffloadedContent(result.Content, result.ToolName, offloadPath)
-	return true
-}
-
-// buildOffloadedContent creates the in-context replacement for an offloaded
-// result: a reference header, first 50 lines, last 50 lines, and an omission
-// notice for the middle.
-func buildOffloadedContent(original, toolName, offloadPath string) string {
-	lines := strings.Split(original, "\n")
-	totalLines := len(lines)
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "[offloaded: full output (%d bytes, %d lines) saved to %s]\n",
-		len(original), totalLines, offloadPath)
-
-	const headLimit = 50
-	const tailLimit = 50
-
-	if totalLines <= headLimit+tailLimit {
-		// Content fits in head+tail, include everything (still offloaded for recovery).
-		b.WriteString("\n")
-		b.WriteString(original)
-		return b.String()
-	}
-
-	b.WriteString("\n--- first 50 lines ---\n")
-	b.WriteString(strings.Join(lines[:headLimit], "\n"))
-	fmt.Fprintf(&b, "\n\n... (%d lines omitted) ...\n\n", totalLines-headLimit-tailLimit)
-	b.WriteString("--- last 50 lines ---\n")
-	b.WriteString(strings.Join(lines[totalLines-tailLimit:], "\n"))
-
-	return b.String()
-}
-
-func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {
-	event := &ToolCallEvent{
-		ID:            call.ID,
-		Name:          call.Name,
-		Arguments:     cloneArguments(call.Arguments),
-		ArgumentsText: formatToolArguments(call.Arguments),
-		Status:        call.Status,
-		RequestedAt:   formatEventTime(call.RequestedAt),
-		StartedAt:     formatEventTime(call.StartedAt),
-		CompletedAt:   formatEventTime(call.CompletedAt),
-	}
-	if result != nil {
-		event.Result = cloneToolResult(result)
-		event.ResultPreview = toolResultPreview(*result)
-		event.Error = result.Error
-		event.DurationMS = result.Duration.Milliseconds()
-		if event.Status == "" {
-			event.Status = result.Status
-		}
-		if event.CompletedAt == "" {
-			event.CompletedAt = formatEventTime(result.CompletedAt)
-		}
-	}
-	return event
-}
-
-func newToolEventFromResult(call models.ToolCall, result models.ToolResult) *ToolCallEvent {
-	return newToolCallEvent(call, &result)
-}
-
-func cloneArguments(args map[string]any) map[string]any {
-	if len(args) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(args))
-	for k, v := range args {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneToolResult(result *models.ToolResult) *models.ToolResult {
-	if result == nil {
-		return nil
-	}
-	copyResult := *result
-	if len(result.Data) > 0 {
-		copyResult.Data = make(map[string]any, len(result.Data))
-		for k, v := range result.Data {
-			copyResult.Data[k] = v
-		}
-	}
-	return &copyResult
-}
-
-func formatToolArguments(args map[string]any) string {
-	if len(args) == 0 {
-		return ""
-	}
-	raw, err := json.MarshalIndent(args, "", "  ")
-	if err != nil {
-		return ""
-	}
-	return string(raw)
-}
-
-func toolResultPreview(result models.ToolResult) string {
-	content := strings.TrimSpace(result.Content)
-	if content == "" {
-		content = strings.TrimSpace(result.Error)
-	}
-	if content == "" && len(result.Data) > 0 {
-		raw, err := json.Marshal(result.Data)
-		if err == nil {
-			content = string(raw)
-		}
-	}
-	content = strings.ReplaceAll(content, "\n", " ")
-	if len(content) > 240 {
-		return content[:240] + "..."
-	}
-	return content
-}
-
-func formatEventTime(ts time.Time) string {
-	if ts.IsZero() {
-		return ""
-	}
-	return ts.UTC().Format(time.RFC3339Nano)
-}
-
-// toolSchemaTokens estimates the token cost of the tool definitions attached to
-// every request (name + description + JSON schema). These are invisible to
-// estimateTokens, which only inspects messages, so they must be added to any
-// context-window estimate or the agent will compact later than the real payload
-// warrants. Uses the same ~3-bytes-per-token heuristic as estimateTokens.
-func (a *Agent) toolSchemaTokens() int {
-	return a.toolSchemaBytes() / 3
-}
-
-// toolSchemaBytes estimates the byte size of all registered tool schemas
-// (name + description + JSON input schema). Used by token estimation and by the
-// Phase 0 metrics framework.
-func (a *Agent) toolSchemaBytes() int {
-	if a == nil || a.tools == nil {
-		return 0
-	}
-	totalBytes := 0
-	for _, t := range a.tools.List() {
-		totalBytes += len(t.Name) + len(t.Description) + 10 // per-tool framing
-		if t.InputSchema != nil {
-			if b, err := json.Marshal(t.InputSchema); err == nil {
-				totalBytes += len(b)
-			}
-		}
-	}
-	return totalBytes
-}
-
-// estimateContextTokens returns the best estimate of how many tokens the next
-// request will occupy. It prefers the provider's own reported input-token count
-// from the previous response — accurate for the model's real tokenizer, which
-// the byte heuristic underestimates for CJK/multi-byte text — plus a byte
-// estimate of any messages appended since that count was taken. The anchor
-// (lastInputTokens/lastTokenCountMsgs) is reset to zero at every compaction
-// site, so whenever it is set the first lastTokenCountMsgs messages are exactly
-// what the provider counted. Falls back to the pure byte heuristic (plus tool
-// schemas) before the first response or right after a compaction reset.
-func (a *Agent) estimateContextTokens(runMessages []models.Message) int {
-	heuristic := estimateTokens(runMessages, a.systemPrompt, 0) + a.toolSchemaTokens()
-	if a.lastInputTokens <= 0 || a.lastTokenCountMsgs <= 0 || a.lastTokenCountMsgs > len(runMessages) {
-		return heuristic
-	}
-	// lastInputTokens already covers the system prompt, tool schemas, and the
-	// first lastTokenCountMsgs messages; add only the growth since the anchor.
-	delta := estimateTokens(runMessages[a.lastTokenCountMsgs:], "", 0)
-	if provider := a.lastInputTokens + delta; provider > heuristic {
-		return provider
-	}
-	return heuristic
-}
-
-func isContextOverflow(stopReason string) bool {
-	switch stopReason {
-	case "max_tokens", "length", "model_context_window_exceeded":
-		return true
-	}
-	return false
-}
-
-// isContextOverflowError detects context-window overflow surfaced as a
-// transport-level error (typically HTTP 400 from OpenAI-compatible providers
-// such as DeepSeek/Qwen/GLM that don't expose stopReason in this case).
-// Matched substrings are intentionally specific to avoid false positives on
-// generic "too long" complaints.
-func isContextOverflowError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	needles := []string{
-		"context_length_exceeded",       // openai
-		"context length",                // openai variants
-		"maximum context length",        // openai
-		"context window",                // generic
-		"model_context_window_exceeded", // anthropic stop reason surfaced as error
-		"prompt is too long",            // anthropic
-		"input is too long",             // anthropic / qwen
-		"request too large",             // openai
-		"reduce the length",             // openai "please reduce the length..."
-	}
-	for _, n := range needles {
-		if strings.Contains(s, n) {
-			return true
-		}
-	}
-	return false
-}
-
-// compactOnOverflow tries to shrink runMessages and reports whether the caller
-// should continue the outer loop (i.e. retry the LLM request).
-//
-// compactMessages rewrites message *content* but preserves message *count*, so
-// the retry must be gated on the estimated token size dropping — gating on
-// len() (as a previous version did) was always false, leaving this reactive
-// backstop dead and turning every provider context-overflow into a hard
-// failure. Progressively smaller tails are tried so a payload dominated by a
-// big tail can still be reduced.
-func (a *Agent) compactOnOverflow(runMessages []models.Message, turn int, where string) ([]models.Message, bool) {
-	before := estimateTokens(runMessages, a.systemPrompt, 0)
-	for _, tail := range []int{a.compactionKeepTail, 4, 2} {
-		if tail <= 0 {
-			continue
-		}
-		compacted, didCompact := compactMessages(runMessages, tail)
-		if !didCompact {
-			continue
-		}
-		after := estimateTokens(compacted, a.systemPrompt, 0)
-		if after < before {
-			a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "tail", tail, "before_tokens", before, "after_tokens", after)
-			// Content changed under the provider anchor; invalidate it so the
-			// next estimate uses the byte heuristic on the compacted messages.
-			a.lastInputTokens = 0
-			a.lastTokenCountMsgs = 0
-			return compacted, true
-		}
-	}
-	a.logger.Warn("context overflow and compaction cannot reduce further", "where", where, "turn", turn, "messages", len(runMessages))
-	return runMessages, false
-}
-
-// runOneTool executes a single tool call with the standard sandbox/thread/UI
-// context plumbing and normalizes errors into a Failed ToolResult so callers
-// can treat success and failure uniformly.
-func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.ToolCall) models.ToolResult {
-	toolStarted := time.Now().UTC()
-	toolCtx := tools.WithSandbox(ctx, a.sandbox)
-	toolCtx = tools.WithThreadID(toolCtx, sessionID)
-	if a.userInteraction != nil {
-		toolCtx = tools.WithUserInteraction(toolCtx, a.userInteraction)
-	}
-	result, err := a.tools.Execute(toolCtx, call)
-	if err != nil {
-		err = normalizeRunError(ctx, err, a.requestTimeout)
-		// H1: preserve the tool's own result.Data (e.g. the task tool sets
-		// Data["subagent_usage"] on its timed-out/cancelled/failed branches
-		// before returning an error) instead of discarding it along with the
-		// rest of the original result — otherwise addSubagentUsage never
-		// sees a failed subagent's token consumption.
-		result = models.ToolResult{
-			CallID:      call.ID,
-			ToolName:    call.Name,
-			Status:      models.CallStatusFailed,
-			Error:       err.Error(),
-			Data:        result.Data,
-			CompletedAt: time.Now().UTC(),
-		}
-	}
-	result.Duration = time.Since(toolStarted)
-	if result.CompletedAt.IsZero() {
-		result.CompletedAt = time.Now().UTC()
-	}
-	return result
-}
-
-// allParallelSafe reports whether every call in the batch resolves to a
-// registered tool that has declared ParallelSafe=true. Unknown tools and any
-// false flag short-circuit to false so the safe (sequential) path is taken.
-func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {
-	if a.tools == nil {
-		return false
-	}
-	for _, c := range calls {
-		t := a.tools.Get(c.Name)
-		if t == nil || !t.ParallelSafe {
-			return false
-		}
-	}
-	return true
-}
-
-func newAgentError(err error) *AgentError {
-	if err == nil {
-		return nil
-	}
-	agentErr := &AgentError{
-		Message: err.Error(),
-	}
-	switch {
-	case errors.Is(err, context.Canceled):
-		agentErr.Code = "context_canceled"
-		agentErr.Suggestion = "Retry the run if the cancellation was unintended."
-		agentErr.Retryable = true
-	case errors.Is(err, context.DeadlineExceeded):
-		agentErr.Code = "deadline_exceeded"
-		agentErr.Suggestion = "Retry with a longer timeout or lower max_tokens."
-		agentErr.Retryable = true
-	case strings.Contains(strings.ToLower(err.Error()), "max turns"):
-		agentErr.Code = "max_turns_exceeded"
-		agentErr.Suggestion = "Increase max turns or simplify the request."
-	case strings.Contains(strings.ToLower(err.Error()), "token budget"):
-		agentErr.Code = "token_budget_exceeded"
-		agentErr.Suggestion = "Increase token budget or simplify the request."
-	case strings.Contains(strings.ToLower(err.Error()), "api key"):
-		agentErr.Code = "provider_auth"
-		agentErr.Suggestion = "Verify the provider credentials and base URL."
-	default:
-		agentErr.Code = "run_error"
-		agentErr.Suggestion = "Retry the run or inspect the previous tool and model events."
-		agentErr.Retryable = true
-	}
-	return agentErr
-}
-
-// isValidationError reports whether a tool error string originates from
-// argument validation (missing required args, invalid schema). Used by the
-// circuit-breaker to distinguish fixable model mistakes from real failures.
-func isValidationError(errMsg string) bool {
-	return strings.HasPrefix(errMsg, "missing required argument") ||
-		strings.HasPrefix(errMsg, "invalid tool arguments")
-}
-
-// maxValidationRetries is the number of consecutive validation failures for the
-// same tool before the circuit-breaker injects a corrective human hint.
-const maxValidationRetries = 3
-
-// maxConsecutiveValidationFailures is the global (all-tools) consecutive
-// validation-failure count that hard-stops the run, even when the model
-// alternates between different badly-called tools instead of retrying one.
-const maxConsecutiveValidationFailures = 8
-
-// Repeat-call circuit-breaker thresholds.
-//
-// The validation breaker above only catches tools that fail argument schema
-// validation (CallStatusFailed + isValidationError). It cannot detect the much
-// more common loop pattern where a tool *succeeds* (e.g. bash runs `go test`,
-// returns exit_code 1 buried in the JSON output, CallStatusCompleted) but the
-// model keeps re-running the exact same command hoping for a different result.
-//
-// maxRepeatCalls: consecutive identical tool invocations (same name + args)
-// before injecting a non-fatal hint nudging the model to change approach.
-// maxRepeatFails: consecutive identical invocations that also fail (including
-// bash non-zero exit) before hard-stopping the run.
-const (
-	maxRepeatCalls = 5
-	maxRepeatFails = 8
-)
-
-// repeatKey builds a deduplication key from tool name and arguments hash.
-// Two calls with the same key are "the same operation" for loop detection.
-func repeatKey(toolName string, args map[string]any) string {
-	return toolName + "\x00" + computeArgsHash(args)
-}
-
-// toolCallBreaker holds all circuit-breaker state for one Run(): the
-// validation-failure loop and the repeat-call loop. Run()'s serial and
-// parallel tool-execution paths both feed every (call, result) pair through
-// observe(), in batch order, so a model looping on a parallel-safe batch is
-// stopped exactly as it would be on the serial path — one implementation,
-// two call sites.
-type toolCallBreaker struct {
-	// validationFailures tracks consecutive tool-validation errors per tool
-	// name; consecutiveValidationFailures is the same count across all tools,
-	// so alternating between two badly-called tools still trips the breaker.
-	validationFailures            map[string]int
-	consecutiveValidationFailures int
-
-	// repeatCalls/repeatFails/prevRepeatKey track consecutive identical tool
-	// invocations (same name + args hash). prevRepeatKey gives "consecutive"
-	// semantics — switching to a different call resets both counters.
-	repeatCalls   map[string]int
-	repeatFails   map[string]int
-	prevRepeatKey string
-}
-
-func newToolCallBreaker() *toolCallBreaker {
-	return &toolCallBreaker{
-		validationFailures: make(map[string]int),
-		repeatCalls:        make(map[string]int),
-		repeatFails:        make(map[string]int),
-	}
-}
-
-// breakerObservation is the outcome of feeding one (call, result) pair
-// through toolCallBreaker.observe.
-type breakerObservation struct {
-	// hintMessages are synthetic human messages to append to runMessages
-	// (repeat-call hint, validation-failure hint, or both).
-	hintMessages []models.Message
-	// validationFailure reports whether this call counted as a validation
-	// failure, so the caller can clear its per-batch "clean" flag.
-	validationFailure bool
-	// fatalErr/fatalAgentErr are set when a breaker trips fatally; the
-	// caller must stop processing the batch and return immediately.
-	fatalErr      error
-	fatalAgentErr *AgentError
-}
-
-// observe runs the repeat-call breaker and then the validation-failure
-// breaker for one tool call result, mirroring the original inline order: the
-// repeat-call breaker sees every result (success or failure), the validation
-// breaker only failed-validation results. A fatal trip short-circuits before
-// the validation breaker runs, matching the original code's early return.
-func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result models.ToolResult) breakerObservation {
-	var out breakerObservation
-
-	// Repeat-call circuit-breaker: detect when the model re-runs the exact
-	// same tool with the same arguments without progress. This catches loops
-	// the validation breaker misses — e.g. `go test` returning exit_code 1 as
-	// a "completed" bash result, causing the model to retry the identical
-	// command dozens of times.
-	rKey := repeatKey(call.Name, call.Arguments)
-	if rKey != b.prevRepeatKey {
-		// Model switched to a different call → not a loop; reset.
-		b.repeatCalls = make(map[string]int)
-		b.repeatFails = make(map[string]int)
-		b.prevRepeatKey = rKey
-	}
-	b.repeatCalls[rKey]++
-	if isResultFailed(result) {
-		b.repeatFails[rKey]++
-	} else {
-		b.repeatFails[rKey] = 0
-	}
-
-	// Fatal: repeated identical failures mean retrying won't help.
-	if b.repeatFails[rKey] >= maxRepeatFails {
-		err := fmt.Errorf("repeated identical failed tool call (%q x%d): %s",
-			call.Name, b.repeatFails[rKey], result.Error)
-		out.fatalErr = err
-		out.fatalAgentErr = &AgentError{
-			Code:    "tool_repeat_loop",
-			Message: err.Error(),
-			Suggestion: "The model repeatedly ran the same failing command. " +
-				"Inspect the failing tool output and try a different approach.",
-		}
-		return out
-	}
-	// Non-fatal hint: nudge the model to change approach (inject once).
-	if b.repeatCalls[rKey] == maxRepeatCalls {
-		out.hintMessages = append(out.hintMessages, models.Message{
-			ID:        newMessageID("human"),
-			SessionID: sessionID,
-			Role:      models.RoleHuman,
-			Content: fmt.Sprintf(
-				"You have run %q %d times with identical arguments. "+
-					"If the result isn't changing, you are in a loop. "+
-					"Try a different command, inspect the output more carefully, or move on.",
-				call.Name, b.repeatCalls[rKey]),
-			CreatedAt: time.Now().UTC(),
-		})
-	}
-
-	// Circuit-breaker: if the same tool fails argument validation
-	// maxValidationRetries times in a row, inject a human hint and reset the
-	// counter. This prevents infinite loops where the model keeps omitting
-	// required arguments.
-	if result.Status == models.CallStatusFailed && isValidationError(result.Error) {
-		out.validationFailure = true
-		b.consecutiveValidationFailures++
-		b.validationFailures[call.Name]++
-		if b.validationFailures[call.Name] >= maxValidationRetries {
-			hint := fmt.Sprintf(
-				"You have called %q %d times without providing the required arguments and each attempt failed with: %s. "+
-					"Please re-read the tool schema carefully, provide ALL required arguments, or ask the user for the missing information instead of retrying.",
-				call.Name, b.validationFailures[call.Name], result.Error,
-			)
-			out.hintMessages = append(out.hintMessages, models.Message{
-				ID:        newMessageID("human"),
-				SessionID: sessionID,
-				Role:      models.RoleHuman,
-				Content:   hint,
-				CreatedAt: time.Now().UTC(),
-			})
-			b.validationFailures[call.Name] = 0
-		}
-		if b.consecutiveValidationFailures >= maxConsecutiveValidationFailures {
-			err := fmt.Errorf("too many consecutive tool argument validation failures (%d): %s", b.consecutiveValidationFailures, result.Error)
-			out.fatalErr = err
-			out.fatalAgentErr = &AgentError{
-				Code:       "tool_validation_loop",
-				Message:    err.Error(),
-				Suggestion: "Model repeatedly called tools without required arguments. Try a shorter request or explicitly provide missing parameters.",
-			}
-			return out
-		}
-	} else {
-		b.validationFailures[call.Name] = 0
-	}
-
-	return out
-}
-
-// resetOnCleanBatch clears the global consecutive-validation-failure counter
-// after a batch where every call passed validation — the same batchClean
-// semantics the original inline code applied per turn.
-func (b *toolCallBreaker) resetOnCleanBatch() {
-	b.consecutiveValidationFailures = 0
-}
-
-// extractBashExitCode parses the exit_code from a bash tool result's JSON
-// content. Returns 0 for non-bash tools or unparseable content. bash is the
-// primary tool whose "failure" (non-zero exit) is reported as a successful
-// tool execution (CallStatusCompleted) with the code buried in the output JSON.
-func extractBashExitCode(toolName, content string) int {
-	if toolName != "bash" || content == "" {
-		return 0
-	}
-	var parsed struct {
-		ExitCode int `json:"exit_code"`
-	}
-	if json.Unmarshal([]byte(content), &parsed) != nil {
-		return 0
-	}
-	return parsed.ExitCode
-}
-
-// isResultFailed reports whether a tool result represents a real failure,
-// including bash commands that exited non-zero despite CallStatusCompleted.
-func isResultFailed(result models.ToolResult) bool {
-	if result.Status == models.CallStatusFailed {
-		return true
-	}
-	return extractBashExitCode(result.ToolName, result.Content) != 0
-}
-
-// M1.2: Enhanced metrics collection helpers
-
-// computeArgsHash generates a hash of tool arguments for deduplication
-// detection. It returns a fixed-width hex FNV-1a 64 digest rather than the
-// raw "k=v&" argument text: the metrics sink writes this value verbatim to
-// the JSONL metrics file, and raw argument VALUES (bash commands, secrets,
-// etc.) must not land there unhashed. This narrows only ArgsHash's exposure —
-// ToolResultMetric.Path still carries the raw file path by design (a
-// separate field, populated from extractPathFromArgs, not from this hash) so
-// file-based tools remain traceable in the metrics JSONL. Equality is all
-// callers need (the metrics ArgsHash field and the repeat-call breaker's
-// rKey), so hashing is behavior-preserving.
-func computeArgsHash(args map[string]any) string {
-	// Sort keys for consistent hashing regardless of map iteration order.
-	keys := make([]string, 0, len(args))
-	for k := range args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var hashContent strings.Builder
-	for _, k := range keys {
-		hashContent.WriteString(k)
-		hashContent.WriteString("=")
-		// Simple string representation for hashing
-		hashContent.WriteString(fmt.Sprintf("%v", args[k]))
-		hashContent.WriteString("&")
-	}
-
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(hashContent.String()))
-	return fmt.Sprintf("%016x", h.Sum64())
-}
-
-// extractPathFromArgs extracts file path from tool arguments if applicable
-func extractPathFromArgs(toolName string, args map[string]any) string {
-	// File-based tools that typically have a "path" argument
-	fileTools := map[string]bool{
-		"read_file":  true,
-		"edit_file":  true,
-		"write_file": true,
-		"list_dir":   true,
-		"find":       true,
-		"code_map":   true,
-	}
-
-	if !fileTools[toolName] {
-		return ""
-	}
-
-	if path, ok := args["path"].(string); ok && path != "" {
-		return path
-	}
-
-	// Some tools might use different parameter names
-	if toolName == "code_map" {
-		if path, ok := args["directory"].(string); ok && path != "" {
-			return path
-		}
-	}
-
-	return ""
 }

@@ -21,10 +21,11 @@ type Sandbox = pkgsandbox.Sandbox
 type contextKey string
 
 const (
-	sandboxContextKey         contextKey = "tool_sandbox"
-	threadIDContextKey        contextKey = "tool_thread_id"
-	runtimeContextKey         contextKey = "tool_runtime_context"
-	userInteractionContextKey contextKey = "tool_user_interaction"
+	sandboxContextKey              contextKey = "tool_sandbox"
+	threadIDContextKey             contextKey = "tool_thread_id"
+	runtimeContextKey              contextKey = "tool_runtime_context"
+	userInteractionContextKey      contextKey = "tool_user_interaction"
+	remainingTokenBudgetContextKey contextKey = "tool_remaining_token_budget"
 )
 
 // UserInteraction handles prompting the human user for input.
@@ -42,6 +43,35 @@ func WithUserInteraction(ctx context.Context, ui UserInteraction) context.Contex
 func UserInteractionFromContext(ctx context.Context) UserInteraction {
 	ui, _ := ctx.Value(userInteractionContextKey).(UserInteraction)
 	return ui
+}
+
+// WithRemainingTokenBudget attaches the parent agent's remaining token
+// budget (MaxTokensBudget - tokens consumed so far) to ctx so a tool that
+// spawns further work (e.g. the task tool) can cap its own budget to what
+// the parent actually has left, instead of allowing unlimited fan-out
+// beneath a budget-constrained parent (plan §M2.2 carry-forward). Callers
+// inject this once per tool-dispatch batch; a remaining value of 0 (budget
+// exhausted) is a valid, meaningful value, distinguished from "no parent
+// budget configured at all" via RemainingTokenBudgetFromContext's second
+// return.
+func WithRemainingTokenBudget(ctx context.Context, remaining int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, remainingTokenBudgetContextKey, remaining)
+}
+
+// RemainingTokenBudgetFromContext returns the parent's remaining token
+// budget injected via WithRemainingTokenBudget and whether one was present
+// at all. ok=false means no parent budget is in play (parent has no budget,
+// or this ctx never flowed through a budget-aware dispatch); ok=true with
+// remaining=0 means the parent budget is currently exhausted.
+func RemainingTokenBudgetFromContext(ctx context.Context) (int, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	remaining, ok := ctx.Value(remainingTokenBudgetContextKey).(int)
+	return remaining, ok
 }
 
 var toolCallSeq uint64
@@ -134,28 +164,6 @@ func (r *Registry) List() []models.Tool {
 		out = append(out, r.tools[name])
 	}
 	return out
-}
-
-func (r *Registry) ListByGroup(group string) []models.Tool {
-	if r == nil {
-		return nil
-	}
-	group = strings.TrimSpace(group)
-	if group == "" {
-		return r.List()
-	}
-
-	all := r.List()
-	filtered := make([]models.Tool, 0, len(all))
-	for _, tool := range all {
-		for _, candidate := range tool.Groups {
-			if candidate == group {
-				filtered = append(filtered, tool)
-				break
-			}
-		}
-	}
-	return filtered
 }
 
 func (r *Registry) Descriptions() string {

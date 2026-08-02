@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,18 +16,6 @@ import (
 )
 
 var subagentMessageSeq uint64
-
-const (
-	// contextFilePerFileCap bounds how much of any single context_files
-	// entry is inlined into the subagent's seed message: keeps the bundle
-	// bounded — the subagent has read_file for more.
-	contextFilePerFileCap = 64 * 1024
-	// contextFilesTotalCap bounds the sum of all context_files content
-	// injected into the seed message. Exceeding it fails the task (naming
-	// the offending file) rather than silently dropping files — the parent
-	// should trim the list instead.
-	contextFilesTotalCap = 256 * 1024
-)
 
 type SubagentExecutor struct {
 	registry        *llm.ModelRegistry
@@ -260,9 +246,18 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// later never aliases result.Usage.
 	totalUsage := sumUsage(nil, result.Usage)
 
-	if profileCfg.OutputSchema != nil {
+	// L3 (schema leftover, coordinator decision): a non-Strict OutputSchema
+	// only ever contributed a prompt suffix (the "Output your response as
+	// JSON matching this schema" injection above) — it must never validate,
+	// retry, or fail-soft. Gating the whole block on Strict here (rather
+	// than just the retry loop below) means ValidateOutput is never even
+	// called for a non-Strict schema, so a mismatch can no longer produce
+	// the WARNING-prefixed fail-soft Result for a schema that was never
+	// supposed to be enforced. All three builtin reviewer schemas are
+	// Strict, so this is a no-op for them.
+	if profileCfg.OutputSchema != nil && profileCfg.OutputSchema.Strict {
 		valErr := ValidateOutput(profileCfg.OutputSchema, result.FinalOutput)
-		if valErr != nil && profileCfg.OutputSchema.Strict {
+		if valErr != nil {
 			for retry := 0; retry < profileCfg.OutputSchema.MaxRetries; retry++ {
 				// M2-3 MEDIUM (budget multiplication): a retry must draw down
 				// the SAME task-level budget, not get a fresh one — otherwise
@@ -287,12 +282,11 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 				}
 
 				retryMsgs := appendParseError(result.Messages, result.FinalOutput, valErr)
-				// appendParseError is shared with RunWithSchema and
-				// deliberately leaves the seeded message's ID/SessionID/
-				// CreatedAt at their zero value — stamp them here (not in
-				// appendParseError itself) so the retry's seed message is
-				// consistent with the initial human message constructed
-				// above.
+				// appendParseError deliberately leaves the seeded message's
+				// ID/SessionID/CreatedAt at their zero value — stamp them
+				// here (not in appendParseError itself) so the retry's seed
+				// message is consistent with the initial human message
+				// constructed above.
 				seeded := &retryMsgs[len(retryMsgs)-1]
 				seeded.ID = newSubagentMessageID("human")
 				seeded.SessionID = task.ID
@@ -361,7 +355,8 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		}
 		if valErr != nil {
 			// M2-3 HIGH (fail-soft): do NOT return an error here, even though
-			// every retry (or the non-Strict schema) still failed validation.
+			// every retry still failed validation (this block only runs at
+			// all for a Strict schema — see the L3 gate above).
 			// react.go's runOneTool rebuilds a brand-new ToolResult on any
 			// non-nil Execute error (react.go, the `if err != nil` branch in
 			// runOneTool) and does NOT copy the original result.Content across
@@ -385,121 +380,14 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}, nil
 }
 
-// buildContextFilesBlock reads each path in paths and renders a
-// <context-files> block to prepend to the subagent's seed message:
-//
-//	<context-files>
-//	## <path>
-//	<content>
-//	## <path2>
-//	...
-//	</context-files>
-//
-// Relative paths resolve against e.workDir, falling back to the process cwd
-// when empty — the same convention initPlanFile (plan.go) uses for plan
-// files. Absolute paths outside workDir are allowed as-is (logs, /tmp
-// artifacts are legitimate context) and read with a plain os.ReadFile, the
-// same as other executor-side reads: the task tool is parent-invoked, so the
-// parent already has full file access and this is not a privilege
-// escalation, just a direct read (no sandbox indirection needed).
-//
-// An unreadable file fails the whole task with the path and the underlying
-// os error (the parent named a wrong path; surfacing beats a subagent
-// hallucinating around a missing file). A file over contextFilePerFileCap is
-// truncated to the cap with a marker line rather than failing. Exceeding
-// contextFilesTotalCap across all files fails the task naming the offending
-// file — files are never silently dropped to fit.
-func (e *SubagentExecutor) buildContextFilesBlock(paths []string) (string, error) {
-	var b strings.Builder
-	b.WriteString("<context-files>\n")
-	total := 0
-	for _, p := range paths {
-		resolved := p
-		if !filepath.IsAbs(resolved) {
-			dir := e.workDir
-			if dir == "" {
-				dir, _ = os.Getwd()
-			}
-			resolved = filepath.Join(dir, resolved)
-		}
-
-		data, err := os.ReadFile(resolved)
-		if err != nil {
-			return "", fmt.Errorf("context_files: could not read %s: %w", p, err)
-		}
-
-		content := data
-		truncated := false
-		if len(content) > contextFilePerFileCap {
-			// truncateRuneSafe (aging.go) backs up to the nearest rune
-			// boundary instead of cutting the raw byte slice — a plain
-			// content[:cap] can split a multi-byte UTF-8 rune in half,
-			// which would reach the provider as invalid UTF-8 (U+FFFD).
-			content = []byte(truncateRuneSafe(string(data), contextFilePerFileCap))
-			truncated = true
-		}
-
-		total += len(content)
-		if total > contextFilesTotalCap {
-			return "", fmt.Errorf("context_files: bundle exceeds the %d byte total cap at %s (contributes %d bytes) — trim the context_files list", contextFilesTotalCap, p, len(content))
-		}
-
-		b.WriteString("## ")
-		b.WriteString(p)
-		b.WriteString("\n")
-		b.Write(content)
-		if len(content) == 0 || content[len(content)-1] != '\n' {
-			b.WriteString("\n")
-		}
-		if truncated {
-			fmt.Fprintf(&b, "[truncated: %s is %d bytes, showing first %d]\n", p, len(data), contextFilePerFileCap)
-		}
-	}
-	b.WriteString("</context-files>\n\n")
-	return b.String(), nil
-}
-
 // outputSchemaWarningPrefix marks a fail-soft ExecutionResult.Result: the
-// output never passed OutputSchema validation (after retries were exhausted,
-// or immediately for a non-Strict schema), but Execute still returns a nil
-// error so the raw content is not dropped by react.go's runOneTool (see the
-// comment at the fail-soft return site above for why that matters). Tests
-// assert this prefix rather than an error string.
+// output never passed OutputSchema validation after retries were exhausted
+// (Strict schemas only — see the L3 gate above; a non-Strict schema never
+// validates at all, so this prefix never applies to one), but Execute still
+// returns a nil error so the raw content is not dropped by react.go's
+// runOneTool (see the comment at the fail-soft return site above for why
+// that matters). Tests assert this prefix rather than an error string.
 const outputSchemaWarningPrefix = "WARNING: output failed schema validation: "
-
-// convertSubagentUsage converts the subagent's own run Usage (pkg/agent) into
-// the subagent package's local TokenUsage (pkg/subagent), avoiding an import
-// cycle (pkg/agent already imports pkg/subagent, so the conversion lives on
-// this side). nil in, nil out.
-func convertSubagentUsage(u *Usage) *subagent.TokenUsage {
-	if u == nil {
-		return nil
-	}
-	return &subagent.TokenUsage{
-		PromptTokens:     u.InputTokens,
-		CompletionTokens: u.OutputTokens,
-		TotalTokens:      u.TotalTokens,
-	}
-}
-
-// sumUsage adds b's token counts into a copy of a and returns it, for
-// summing Usage across a subagent's schema-validation retry attempts. Nil
-// safe in both directions: nil+nil = nil, nil+b = clone of b, a+nil = a
-// unchanged (same pointer, no allocation).
-func sumUsage(a, b *Usage) *Usage {
-	if b == nil {
-		return a
-	}
-	if a == nil {
-		out := *b
-		return &out
-	}
-	return &Usage{
-		InputTokens:  a.InputTokens + b.InputTokens,
-		OutputTokens: a.OutputTokens + b.OutputTokens,
-		TotalTokens:  a.TotalTokens + b.TotalTokens,
-	}
-}
 
 // NewSubagentPool creates a pool with a SubagentExecutor.
 // Chain WithContextWindow on the result of NewSubagentExecutor if needed.

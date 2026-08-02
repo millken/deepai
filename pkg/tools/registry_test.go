@@ -236,6 +236,37 @@ func TestWithSandbox(t *testing.T) {
 	}
 }
 
+// TestWithRemainingTokenBudget is the RED test for M2.2 carry-forward's ctx
+// helper pair: WithRemainingTokenBudget must round-trip through
+// RemainingTokenBudgetFromContext, and the absent case must be
+// distinguishable (ok=false) from a present-but-zero budget (ok=true, 0) so
+// callers can tell "no parent budget configured" apart from "parent budget
+// is currently exhausted".
+func TestWithRemainingTokenBudget(t *testing.T) {
+	ctx := context.Background()
+
+	if _, ok := RemainingTokenBudgetFromContext(ctx); ok {
+		t.Fatal("RemainingTokenBudgetFromContext(bare ctx) ok = true, want false (nothing injected)")
+	}
+
+	withBudget := WithRemainingTokenBudget(ctx, 600)
+	got, ok := RemainingTokenBudgetFromContext(withBudget)
+	if !ok {
+		t.Fatal("RemainingTokenBudgetFromContext ok = false after WithRemainingTokenBudget, want true")
+	}
+	if got != 600 {
+		t.Fatalf("RemainingTokenBudgetFromContext = %d, want 600", got)
+	}
+
+	// Present but zero (parent budget exhausted) must still report ok=true so
+	// callers can distinguish this from "no parent budget at all".
+	zeroBudget := WithRemainingTokenBudget(ctx, 0)
+	got, ok = RemainingTokenBudgetFromContext(zeroBudget)
+	if !ok || got != 0 {
+		t.Fatalf("RemainingTokenBudgetFromContext(zero budget) = (%d, %v), want (0, true)", got, ok)
+	}
+}
+
 func TestValidateArgs(t *testing.T) {
 	schema := map[string]any{
 		"type": "object",

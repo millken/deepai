@@ -332,7 +332,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) {
 	mustRegisterTool(registry, builtin.BashTool())
-	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(nil, autonomous))
+	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
 	// advertised agents resolve to the same source at execution time.

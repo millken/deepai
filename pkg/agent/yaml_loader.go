@@ -202,16 +202,31 @@ func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, plug
 		// as a startup warning identifying the offending stem.
 		problems = append(problems, fmt.Sprintf("%s: %v", string(t), err))
 	} else {
+		// loadAgentYAML/loadAgentMDFileReported errors USUALLY already embed
+		// the full path they came from ("parse agent yaml <path>: ...",
+		// "parse agent md <path>: ..."), so appending err.Error() directly
+		// avoids prepending the SAME path a second time (M1-final Minor #5).
+		// The one exception: loadAgentYAML's system_prompt_file error family
+		// ("prompt file escapes agents directory", "resolve prompt file
+		// path", "resolve agents dir", "read prompt file") names the prompt
+		// file, not the yaml that declared it — so for THOSE errors the
+		// declaring yaml's own path would otherwise vanish from the warning
+		// entirely (security-relevant: an operator needs to know which file
+		// to fix). Only prefix when the path isn't already present.
 		yamlPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".yaml")
 		if cfg, err := loadAgentYAML(t, workDir); err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", yamlPath, err))
+			msg := err.Error()
+			if !strings.Contains(msg, yamlPath) {
+				msg = fmt.Sprintf("%s: %s", yamlPath, msg)
+			}
+			problems = append(problems, msg)
 		} else if cfg != nil {
 			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 		}
 
 		mdPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".md")
 		if cfg, err := loadAgentMDFileReported(mdPath); err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", mdPath, err))
+			problems = append(problems, err.Error())
 		} else if cfg != nil {
 			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 		}
@@ -219,7 +234,7 @@ func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, plug
 		for _, dir := range pluginAgentDirs {
 			pluginPath := filepath.Join(dir, string(t)+".md")
 			if cfg, err := loadAgentMDFileReported(pluginPath); err != nil {
-				problems = append(problems, fmt.Sprintf("%s: %v", pluginPath, err))
+				problems = append(problems, err.Error())
 			} else if cfg != nil {
 				return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
 			}

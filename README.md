@@ -22,7 +22,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - [会话与记忆](#会话与记忆)
 - [沙箱与安全](#沙箱与安全)
 - [Token 效率](#token-效率)
-- [HTTP 网关](#http-网关)
+- [API 代理（开发调试）](#api-代理开发调试)
 - [项目结构](#项目结构)
 - [开发](#开发)
 - [文档](#文档)
@@ -443,9 +443,7 @@ deepai plugin remove my-plugin
 
 详见 [`docs/PLUGIN_SYSTEM_DESIGN.md`](docs/PLUGIN_SYSTEM_DESIGN.md) 与 [`docs/spec/PLUGIN_INTEGRATION_SPEC.md`](docs/spec/PLUGIN_INTEGRATION_SPEC.md)。
 
-### 原生工具插件（实验性）
-
-`pkg/plugin` 提供基于 `.so`/`.dll` 的原生插件加载（Go/Rust/C），通过 `plugin.yaml` 声明权限与配置。示例见 [`plugins/`](plugins/)。
+> 早前基于 `.so`/`.dll` 的原生工具插件加载（`pkg/plugin`）已移除，改用上述 Claude 插件包格式。
 
 ---
 
@@ -543,33 +541,9 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 
 ---
 
-## HTTP 网关
+## API 代理（开发调试）
 
-`pkg/gateway` 把 agent 能力作为 HTTP 服务暴露，支持多用户、多会话、SSE 流式响应。
-
-### 运行
-
-网关作为库嵌入，典型用法：
-
-```go
-srv, _ := gateway.NewServer(logger, gateway.Config{
-    Addr:         ":8080",
-    DatabaseURL:  "postgres://...",
-    DefaultModel: "openai/gpt-4o",
-})
-srv.ListenAndServe()
-```
-
-### 特性
-
-- REST + SSE 接口，兼容 OpenAI 风格请求
-- 多用户隔离（每请求 user_id）
-- 会话持久化（内存或 Postgres）
-- 每会话独立的偏好调度器，避免跨会话污染
-- 僵尸记忆清理（定期回收）
-- 动态 provider 工厂，按请求选择模型
-
-### API 代理（开发调试）
+> 早前的 HTTP/SSE 网关服务（`pkg/gateway`）已移除（未接入主 CLI，无命令注册它）。
 
 `cmd/proxy` 提供独立的 LLM API 反向代理，转发 OpenAI/Anthropic 请求并记录完整 JSONL 事件流，用于调试与性能分析：
 

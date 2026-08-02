@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -177,7 +179,8 @@ func TestEstimateTokens(t *testing.T) {
 		{Role: models.RoleHuman, Content: strings.Repeat("b", 200)},
 		{Role: models.RoleAI, Content: strings.Repeat("c", 300)},
 	}
-	// 400 + 200 + 300 + overhead ~= 900+ bytes. At /3, should be ~300 tokens.
+	// 400 + 200 + 300 + overhead ~= 900+ bytes. At the calibrated bytesPerToken
+	// (3.3), should be ~300 tokens.
 	est := estimateTokens(msgs, "sys", 0)
 	if est <= 0 {
 		t.Error("estimate should be positive")
@@ -193,6 +196,35 @@ func TestEstimateTokens(t *testing.T) {
 	}
 	if est2 != est {
 		t.Errorf("estimate changed with lastInputTokens: %d vs %d", est, est2)
+	}
+}
+
+// TestEstimateTokens_UsesCalibratedRatio pins estimateTokens to the calibrated
+// 3.3 bytes/token ratio (commit 695bd80's content-weighted measurement),
+// replacing the old flat /3 heuristic. metrics.go's estimateInputTokens
+// already used 3.3; this guards that estimateTokens (the compaction-trigger
+// path) and toolSchemaTokens agree with it via one shared constant
+// (bytesPerToken), rather than three independent literals drifting apart.
+func TestEstimateTokens_UsesCalibratedRatio(t *testing.T) {
+	// A single message whose content length is exactly known, no system
+	// prompt, so totalBytes == len(content) + the fixed per-message overhead
+	// (30 bytes, see estimateTokens). Pick a byte count where /3 and /3.3
+	// disagree by more than rounding noise so the test is a real pin, not a
+	// coincidence.
+	content := strings.Repeat("a", 3300) // + 30 overhead = 3330 bytes
+	msgs := []models.Message{{Role: models.RoleHuman, Content: content}}
+
+	totalBytes := 3300 + 30
+	wantOld := totalBytes / 3                           // 1110
+	wantNew := int(float64(totalBytes) / bytesPerToken) // 1009
+	if wantOld == wantNew {
+		t.Fatal("test setup does not distinguish /3 from /bytesPerToken(3.3); pick a different byte count")
+	}
+
+	got := estimateTokens(msgs, "", 0)
+	if got != wantNew {
+		t.Fatalf("estimateTokens = %d, want %d (calibrated %.1f bytes/token); got the old /3 value %d instead",
+			got, wantNew, bytesPerToken, wantOld)
 	}
 }
 
@@ -246,26 +278,26 @@ func TestEstimateContextTokens_PrefersProviderCount(t *testing.T) {
 		{Role: models.RoleAI, Content: "世界"},
 	}
 
-	heuristic := a.estimateContextTokens(msgs) // no anchor yet → small heuristic
+	heuristic := a.estimateContextTokens(msgs, "") // no anchor yet → small heuristic
 
 	// Provider reports the real (much larger) count for these same messages.
 	a.lastInputTokens = 50000
 	a.lastTokenCountMsgs = len(msgs)
-	got := a.estimateContextTokens(msgs)
+	got := a.estimateContextTokens(msgs, "")
 	if got < 50000 {
 		t.Fatalf("estimate = %d, want >= provider count 50000 (heuristic was %d)", got, heuristic)
 	}
 
 	// Growth since the anchor must be added on top of the provider count.
 	msgs = append(msgs, models.Message{Role: models.RoleTool, Content: strings.Repeat("x", 3000)})
-	if grown := a.estimateContextTokens(msgs); grown <= got {
+	if grown := a.estimateContextTokens(msgs, ""); grown <= got {
 		t.Fatalf("estimate did not grow after appending a message: %d <= %d", grown, got)
 	}
 
 	// A stale anchor (more messages counted than now present, e.g. after a
 	// compaction) must fall back to the heuristic rather than over-report.
 	a.lastTokenCountMsgs = len(msgs) + 5
-	if fallback := a.estimateContextTokens(msgs); fallback >= 50000 {
+	if fallback := a.estimateContextTokens(msgs, ""); fallback >= 50000 {
 		t.Fatalf("stale anchor not ignored: estimate=%d still reflects old provider count", fallback)
 	}
 }
@@ -282,11 +314,98 @@ func TestCompactOnOverflow_ActuallyCompacts(t *testing.T) {
 	}
 
 	before := estimateTokens(msgs, "sys", 0)
-	out, ok := a.compactOnOverflow(msgs, 1, "test")
+	out, ok := a.compactOnOverflow(msgs, "sys", 1, "test")
 	if !ok {
 		t.Fatal("compactOnOverflow returned false: reactive overflow backstop is dead")
 	}
 	if after := estimateTokens(out, "sys", 0); after >= before {
 		t.Fatalf("compactOnOverflow did not reduce tokens: before=%d after=%d", before, after)
+	}
+}
+
+// TestCompactOnOverflow_StaleProviderAnchorDoesNotBlockCompaction guards a
+// code-review finding on M3-3: the provider anchor (lastInputTokens /
+// lastTokenCountMsgs) describes the request that JUST overflowed, so inside
+// compactOnOverflow it is stale by definition. compactMessages preserves
+// message *count*, so the anchor's cutoff index is still valid for the
+// compacted messages too — meaning both the "before" and "after" estimates
+// resolve to the same stale provider count (lastInputTokens + 0 delta),
+// before==after, "after < before" is never true, and every tail candidate is
+// rejected. Since this repo targets DeepSeek/Qwen/GLM (which do report
+// input_tokens), the anchor is populated on the common path, so this isn't a
+// rare edge case — it's the expected shape of a real overflow. This also
+// doubles as M3-3 item 3's aging-off coverage: a is built without an aging
+// config, so buildPromptView's view equals canonical here, and the fix must
+// still hold under that pass-through case.
+func TestCompactOnOverflow_StaleProviderAnchorDoesNotBlockCompaction(t *testing.T) {
+	a := &Agent{compactionKeepTail: 6, systemPrompt: "sys", logger: slog.Default()}
+	msgs := []models.Message{{Role: models.RoleHuman, Content: "start"}}
+	for i := 0; i < 20; i++ {
+		msgs = append(msgs, models.Message{Role: models.RoleAI, Content: strings.Repeat("x", 4000)})
+	}
+
+	// Simulate the provider having just reported usage for exactly this
+	// message set — the request that then overflowed.
+	a.lastInputTokens = 999999
+	a.lastTokenCountMsgs = len(msgs)
+
+	out, ok := a.compactOnOverflow(msgs, "sys", 1, "test")
+	if !ok {
+		t.Fatal("compactOnOverflow returned false with a stale provider anchor active: " +
+			"the reactive overflow backstop is dead whenever the provider reports usage " +
+			"(the common case for DeepSeek/Qwen/GLM)")
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("compactMessages must preserve message count: got %d, want %d", len(out), len(msgs))
+	}
+}
+
+// TestCompactOnOverflow_MeasuresAgedViewNotCanonicalBytes guards M3-3 item 3:
+// compactOnOverflow must measure the same aged VIEW the main compaction
+// trigger sends (buildPromptView's output), not raw canonical message bytes,
+// even though it still mutates and returns canonical messages. With Aging
+// enabled and most of the history old enough to be heavily compressed by the
+// §5.4 read_file budget, the view is far smaller than canonical — this pins
+// that compactOnOverflow's logged "before_tokens" reflects the (much
+// smaller) view, not the raw canonical estimate.
+func TestCompactOnOverflow_MeasuresAgedViewNotCanonicalBytes(t *testing.T) {
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	big := strings.Repeat("z", 8000)
+	var msgs []models.Message
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, aiTools(""), toolMsg("read_file", big))
+	}
+
+	a := &Agent{
+		compactionKeepTail: 6,
+		logger:             logger,
+		contextWindow:      100000,
+		aging: &AgingConfig{
+			Enabled:             true,
+			MinContextPressure:  0,
+			ConversationBudgets: map[int]int{},
+		},
+	}
+
+	rawCanonicalEstimate := estimateTokens(msgs, "sys", 0)
+
+	_, ok := a.compactOnOverflow(msgs, "sys", 1, "test")
+	if !ok {
+		t.Fatal("compactOnOverflow returned false")
+	}
+
+	m := regexp.MustCompile(`before_tokens=(\d+)`).FindStringSubmatch(logBuf.String())
+	if m == nil {
+		t.Fatalf("could not find before_tokens in log output: %s", logBuf.String())
+	}
+	beforeTokens, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("parse before_tokens: %v", err)
+	}
+	if beforeTokens >= rawCanonicalEstimate {
+		t.Fatalf("compactOnOverflow's before-estimate (%d) was not smaller than the raw canonical "+
+			"estimate (%d); it is measuring canonical bytes instead of the aged view", beforeTokens, rawCanonicalEstimate)
 	}
 }

@@ -220,6 +220,12 @@ func TestEnumerateAgentsReported_ProjectYAMLParseError(t *testing.T) {
 	if !strings.Contains(warnings[0], "broken.yaml") {
 		t.Errorf("warning = %q, want mention of broken.yaml", warnings[0])
 	}
+	// M1-final Minor #5: loadAgentYAML's error already embeds the path
+	// ("parse agent yaml <path>: ..."); the Reported-path wrapper must not
+	// prepend the SAME path a second time.
+	if n := strings.Count(warnings[0], "broken.yaml"); n != 1 {
+		t.Errorf("warning = %q, want broken.yaml mentioned exactly once, got %d times (path double-prefixed)", warnings[0], n)
+	}
 	var listed bool
 	for _, a := range agents {
 		if a.Type == "broken" {
@@ -228,6 +234,40 @@ func TestEnumerateAgentsReported_ProjectYAMLParseError(t *testing.T) {
 	}
 	if !listed {
 		t.Errorf("expected type %q still listed (fallback to builtin/general)", "broken")
+	}
+}
+
+// TestEnumerateAgentsReported_SystemPromptFileEscapeNamesYAMLPath is the RED
+// test for the coordinator review LOW-MEDIUM finding: loadAgentYAML's
+// system_prompt_file error family ("prompt file escapes agents directory",
+// "resolve prompt file path", "resolve agents dir", "read prompt file") does
+// NOT embed the declaring agent yaml's own path — only the (relative or
+// resolved prompt) path. Item 3a's fix (drop the Reported-path wrapper
+// unconditionally, since loadAgentYAML/loadAgentMDFileReported errors
+// "always" embed the path) was too broad: for this error family the
+// warning silently stops naming the yaml file that declared the escaping
+// system_prompt_file — a security-relevant regression, since an operator
+// auditing a path-traversal warning needs to know WHICH file to fix.
+func TestEnumerateAgentsReported_SystemPromptFileEscapeNamesYAMLPath(t *testing.T) {
+	workDir := t.TempDir()
+	agentsDir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	escYAML := filepath.Join(agentsDir, "esc.yaml")
+	if err := os.WriteFile(escYAML, []byte("type: esc\nsystem_prompt_file: ../../x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, warnings := EnumerateAgentsReported(workDir, nil)
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly 1", warnings)
+	}
+	if n := strings.Count(warnings[0], escYAML); n != 1 {
+		t.Errorf("warning = %q, want the declaring yaml path %q mentioned exactly once, got %d times", warnings[0], escYAML, n)
+	}
+	if !strings.Contains(warnings[0], "escapes agents directory") {
+		t.Errorf("warning = %q, want mention of the escape reason", warnings[0])
 	}
 }
 
@@ -245,6 +285,9 @@ func TestEnumerateAgentsReported_ProjectMDParseError(t *testing.T) {
 	}
 	if !strings.Contains(warnings[0], "brokenmd.md") {
 		t.Errorf("warning = %q, want mention of brokenmd.md", warnings[0])
+	}
+	if n := strings.Count(warnings[0], "brokenmd.md"); n != 1 {
+		t.Errorf("warning = %q, want brokenmd.md mentioned exactly once, got %d times (path double-prefixed)", warnings[0], n)
 	}
 	var listed bool
 	for _, a := range agents {
@@ -270,6 +313,9 @@ func TestEnumerateAgentsReported_PluginMDParseError(t *testing.T) {
 	}
 	if !strings.Contains(warnings[0], "brokenplug.md") {
 		t.Errorf("warning = %q, want mention of brokenplug.md", warnings[0])
+	}
+	if n := strings.Count(warnings[0], "brokenplug.md"); n != 1 {
+		t.Errorf("warning = %q, want brokenplug.md mentioned exactly once, got %d times (path double-prefixed)", warnings[0], n)
 	}
 	var listed bool
 	for _, a := range agents {
@@ -314,6 +360,56 @@ func TestEnumerateAgentsReported_UnsafeStemNameRejected(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("warnings = %v, want one naming the rejected stem %q", warnings, "..evil")
+	}
+}
+
+// TestEnumerateAgentsReported_ShadowedBrokenMDWarns is the RED test for
+// M1-final Minor #6: a valid foo.yaml resolves cleanly (yaml wins over md by
+// priority), but a broken foo.md sitting right beside it is never even
+// attempted by resolveAgentTypeConfigWithPluginsReported (it returns as soon
+// as the yaml source succeeds) — so the broken file is silently ignored
+// forever, with no warning anywhere. The Reported ENUMERATION path (this
+// function) must additionally attempt-parse lower-priority shadowed sources
+// for stems that already resolved, and surface a warning naming both the
+// broken file and the source that shadows it. Execution-path resolution
+// (resolveAgentTypeConfigWithPlugins) must stay first-win with no extra I/O —
+// this test only exercises the enumeration path.
+func TestEnumerateAgentsReported_ShadowedBrokenMDWarns(t *testing.T) {
+	workDir := t.TempDir()
+	agentsDir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "foo.yaml"), []byte("description: valid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentMD(t, filepath.Join(agentsDir, "foo.md"), "---\nname: foo\nno closing delimiter here")
+
+	// Resolution itself must still win from the valid yaml.
+	cfg := resolveAgentTypeConfigWithPlugins("foo", workDir, nil)
+	if cfg.Description != "valid" {
+		t.Fatalf("resolution must still prefer the valid yaml; got %+v", cfg)
+	}
+
+	agents, warnings := EnumerateAgentsReported(workDir, nil)
+	var listed bool
+	for _, a := range agents {
+		if a.Type == "foo" && a.Description == "valid" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("expected type %q listed with the yaml's description; agents=%+v", "foo", agents)
+	}
+
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "foo.md") && strings.Contains(w, "shadowed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want one about foo.md being shadowed and failing to parse", warnings)
 	}
 }
 

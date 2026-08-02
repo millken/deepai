@@ -860,6 +860,241 @@ func TestRepeatBreaker_FatalMidBatchKeepsAllToolResults(t *testing.T) {
 	}
 }
 
+// serialRepeatLoopProvider3 emits 7 turns of a single failing, non-parallel-
+// safe tool call (bringing the repeat-fail counter to maxRepeatFails-1 = 7),
+// then one turn with a batch of 3 identical calls. The 8th consecutive
+// identical failure is the FIRST call of that batch, so the fatal
+// repeat-loop trip happens on batch index 0 — the serial loop never reaches
+// (never executes) the batch's remaining two calls.
+type serialRepeatLoopProvider3 struct {
+	callCount int
+}
+
+func (p *serialRepeatLoopProvider3) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *serialRepeatLoopProvider3) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	// Safety net well beyond the turn at which the breaker must trip (8).
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	turn := p.callCount
+	var calls []models.ToolCall
+	if turn <= 7 {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("sfail-%d-0", turn), Name: "sfail", Arguments: map[string]any{"x": "y"}},
+		}
+	} else {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("sfail-%d-0", turn), Name: "sfail", Arguments: map[string]any{"x": "y"}},
+			{ID: fmt.Sprintf("sfail-%d-1", turn), Name: "sfail", Arguments: map[string]any{"x": "y"}},
+			{ID: fmt.Sprintf("sfail-%d-2", turn), Name: "sfail", Arguments: map[string]any{"x": "y"}},
+		}
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{ToolCalls: calls, Stop: "tool_calls", Done: true}
+	}()
+	return ch, nil
+}
+
+// TestSerialBreaker_FatalMidBatchSynthesizesRemainingResults is the RED test
+// for the serial-path analogue of M1's parallel mid-batch-fatal fix: unlike
+// the parallel path (whose whole batch is already computed by goroutines
+// before the fatal observation loop runs, so the remaining results just need
+// appending), the serial loop executes one call at a time and genuinely
+// never runs the calls after the one that trips the breaker. Those tool_use
+// IDs must still get a synthesized failed tool_result, or the assistant
+// message that started this batch carries tool_use IDs with no matching
+// tool_result — poisoning the session for the next Anthropic request.
+func TestSerialBreaker_FatalMidBatchSynthesizesRemainingResults(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "sfail",
+		// Deliberately NOT ParallelSafe: forces the serial dispatch path even
+		// for a batch of 3.
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"x": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   c.ID,
+				ToolName: c.Name,
+				Status:   models.CallStatusFailed,
+				Error:    "boom",
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &serialRepeatLoopProvider3{},
+		Tools:       reg,
+		MaxTurns:    50, // safety net; breaker should trip on turn 8
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run serial"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with a fatal repeat-loop error")
+	}
+	if !strings.Contains(err.Error(), "repeated identical failed tool call") {
+		t.Fatalf("expected repeat-loop error, got: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected a non-nil RunResult even on fatal breaker error")
+	}
+
+	// Find the final assistant (RoleAI) message carrying tool calls — the
+	// batch of 3 from turn 8.
+	var lastAI *models.Message
+	for i := range result.Messages {
+		if result.Messages[i].Role == models.RoleAI && len(result.Messages[i].ToolCalls) > 0 {
+			lastAI = &result.Messages[i]
+		}
+	}
+	if lastAI == nil {
+		t.Fatal("expected an assistant message with tool calls in the run result")
+	}
+	if len(lastAI.ToolCalls) != 3 {
+		t.Fatalf("expected the final assistant message to carry 3 tool calls, got %d", len(lastAI.ToolCalls))
+	}
+
+	toolResultIDs := make(map[string]bool)
+	for _, msg := range result.Messages {
+		if msg.Role == models.RoleTool && msg.ToolResult != nil {
+			toolResultIDs[msg.ToolResult.CallID] = true
+		}
+	}
+	for _, call := range lastAI.ToolCalls {
+		if !toolResultIDs[call.ID] {
+			t.Errorf("tool_use ID %q from the final assistant message has no matching tool_result in runMessages "+
+				"(serial mid-batch fatal trip must synthesize failed results for calls the loop never executed)", call.ID)
+		}
+	}
+}
+
+// parallelRepeatLoopProviderOffload emits 7 turns of a single failing,
+// ParallelSafe tool call, then one turn with a batch of 3 identical calls
+// (each returning content above the offload threshold). The 8th consecutive
+// identical failure lands on batch index 0, so the fatal trip's tail-append
+// loop (results[1], results[2] — already computed by the parallel path's
+// goroutines) is what gets exercised.
+type parallelRepeatLoopProviderOffload struct {
+	callCount int
+}
+
+func (p *parallelRepeatLoopProviderOffload) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *parallelRepeatLoopProviderOffload) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	turn := p.callCount
+	var calls []models.ToolCall
+	if turn <= 7 {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("poff-%d-0", turn), Name: "poff", Arguments: map[string]any{"x": "y"}},
+		}
+	} else {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("poff-%d-0", turn), Name: "poff", Arguments: map[string]any{"x": "y"}},
+			{ID: fmt.Sprintf("poff-%d-1", turn), Name: "poff", Arguments: map[string]any{"x": "y"}},
+			{ID: fmt.Sprintf("poff-%d-2", turn), Name: "poff", Arguments: map[string]any{"x": "y"}},
+		}
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{ToolCalls: calls, Stop: "tool_calls", Done: true}
+	}()
+	return ch, nil
+}
+
+// TestParallelBreaker_FatalTailAppendAppliesOffload is the RED test for the
+// M1 gap in the parallel path's fatal tail-append loop: it appends
+// results[j] straight to runMessages without running it through
+// a.offloadIfNeeded first (the normal per-index loop above it does apply
+// offload before appending). A large trailing result that never goes
+// through the normal path must still get shrunk to the offload stub, not
+// persisted at full size.
+func TestParallelBreaker_FatalTailAppendAppliesOffload(t *testing.T) {
+	// Many short lines (not one giant line) so buildOffloadedContent's
+	// head+tail truncation actually shrinks the content, rather than just
+	// wrapping a single line in a header that's larger than the original.
+	bigContent := strings.Repeat("line of filler text\n", (offloadThresholdBytes/20)+200)
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name:         "poff",
+		ParallelSafe: true,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"x": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   c.ID,
+				ToolName: c.Name,
+				Status:   models.CallStatusFailed,
+				Error:    "boom",
+				Content:  bigContent,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &parallelRepeatLoopProviderOffload{},
+		Tools:       reg,
+		MaxTurns:    50, // safety net; breaker should trip on turn 8
+		OffloadDir:  t.TempDir(),
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run parallel"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with a fatal repeat-loop error")
+	}
+	if result == nil {
+		t.Fatal("expected a non-nil RunResult even on fatal breaker error")
+	}
+
+	foundShrunk := false
+	for _, msg := range result.Messages {
+		if msg.Role != models.RoleTool || msg.ToolResult == nil || msg.ToolResult.ToolName != "poff" {
+			continue
+		}
+		if len(msg.ToolResult.Content) >= len(bigContent) {
+			t.Errorf("persisted tool result %s content is %d bytes (>= original %d), want the offload stub applied "+
+				"even to the fatal tail-append path", msg.ToolResult.CallID, len(msg.ToolResult.Content), len(bigContent))
+			continue
+		}
+		foundShrunk = true
+	}
+	if !foundShrunk {
+		t.Fatal("expected at least one persisted poff tool result with offload-shrunk content")
+	}
+}
+
 // parallelRepeatSuccessProvider emits one batch of 5 identical successful
 // ParallelSafe tool calls, then stops — enough in a single turn to land the
 // repeat-call counter exactly on maxRepeatCalls and trigger the one-time hint.
@@ -1118,6 +1353,252 @@ func TestRepeatBreaker_HintDeferredToBatchEnd_SerialPath(t *testing.T) {
 	if hintIdx < lastToolIdx {
 		t.Fatalf("hint message at index %d appeared before the batch's last tool result at index %d (serial path); "+
 			"hint must be appended after ALL of the batch's tool results", hintIdx, lastToolIdx)
+	}
+}
+
+// serialRepeatLoopProviderHintThenFatal emits 4 turns of a single failing,
+// non-parallel-safe call (bringing the repeat counters to 4), then a single
+// turn with a batch of 5 identical calls. Within that batch: call index 0
+// brings the count to exactly 5 (the non-fatal repeat-hint threshold —
+// queued into pendingHints, not yet flushed), and call index 3 brings the
+// count to 8 (the fatal repeat-fail threshold) — a hint queued mid-batch,
+// then a LATER fatal trip in the SAME batch, with call index 4 never
+// executed by the serial loop (requiring a synthesized tail result).
+type serialRepeatLoopProviderHintThenFatal struct {
+	callCount int
+}
+
+func (p *serialRepeatLoopProviderHintThenFatal) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *serialRepeatLoopProviderHintThenFatal) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	turn := p.callCount
+	var calls []models.ToolCall
+	if turn <= 4 {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("shf-%d-0", turn), Name: "shf", Arguments: map[string]any{"x": "y"}},
+		}
+	} else {
+		calls = make([]models.ToolCall, 5)
+		for i := range calls {
+			calls[i] = models.ToolCall{ID: fmt.Sprintf("shf-%d-%d", turn, i), Name: "shf", Arguments: map[string]any{"x": "y"}}
+		}
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{ToolCalls: calls, Stop: "tool_calls", Done: true}
+	}()
+	return ch, nil
+}
+
+// TestSerialBreaker_HintFlushedAfterSynthesizedResults is the RED test for
+// the coordinator review MEDIUM finding: on the fatal path, pendingHints was
+// flushed BEFORE the synthesized tail tool_results were appended, producing
+// tr(0..3), HINT, tr(4) — a hint landing between the batch's earlier tool
+// results and its LAST one, violating the M1-7 invariant that a hint
+// (RoleHuman) never lands between an assistant tool_calls message and any of
+// its tool results.
+func TestSerialBreaker_HintFlushedAfterSynthesizedResults(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name: "shf",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"x": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   c.ID,
+				ToolName: c.Name,
+				Status:   models.CallStatusFailed,
+				Error:    "boom",
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &serialRepeatLoopProviderHintThenFatal{},
+		Tools:       reg,
+		MaxTurns:    50,
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run serial"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with a fatal repeat-loop error")
+	}
+	if result == nil {
+		t.Fatal("expected a non-nil RunResult even on fatal breaker error")
+	}
+
+	var lastAI *models.Message
+	for i := range result.Messages {
+		if result.Messages[i].Role == models.RoleAI && len(result.Messages[i].ToolCalls) > 0 {
+			lastAI = &result.Messages[i]
+		}
+	}
+	if lastAI == nil || len(lastAI.ToolCalls) != 5 {
+		t.Fatalf("expected the final assistant message to carry 5 tool calls; got %+v", lastAI)
+	}
+
+	hintIdx := -1
+	lastToolIdx := -1
+	toolResultIDs := make(map[string]bool)
+	for i, msg := range result.Messages {
+		if msg.Role == models.RoleTool && msg.ToolResult != nil {
+			toolResultIDs[msg.ToolResult.CallID] = true
+			lastToolIdx = i
+		}
+		if msg.Role == models.RoleHuman && strings.Contains(strings.ToLower(msg.Content), "loop") {
+			hintIdx = i
+		}
+	}
+	for _, call := range lastAI.ToolCalls {
+		if !toolResultIDs[call.ID] {
+			t.Errorf("tool_use ID %q has no matching tool_result", call.ID)
+		}
+	}
+	if hintIdx == -1 {
+		t.Fatal("expected a non-fatal loop hint to be injected into messages")
+	}
+	if hintIdx < lastToolIdx {
+		t.Fatalf("hint message at index %d appeared before the batch's LAST tool result (including the "+
+			"synthesized one) at index %d; a hint must never land between an assistant tool_calls message "+
+			"and any of its tool results, even on the fatal path", hintIdx, lastToolIdx)
+	}
+}
+
+// parallelRepeatLoopProviderHintThenFatal emits 4 turns of a single failing
+// ParallelSafe call (bringing the repeat counters to 4), then a single turn
+// with a batch of 5 identical ParallelSafe calls — same count arithmetic as
+// serialRepeatLoopProviderHintThenFatal (hint at batch index 0, fatal at
+// batch index 3), but exercised on the parallel path's already-computed
+// tail-append loop instead of the serial path's synthesize loop.
+type parallelRepeatLoopProviderHintThenFatal struct {
+	callCount int
+}
+
+func (p *parallelRepeatLoopProviderHintThenFatal) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *parallelRepeatLoopProviderHintThenFatal) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	if p.callCount > 20 {
+		go func() {
+			defer close(ch)
+			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		}()
+		return ch, nil
+	}
+	turn := p.callCount
+	var calls []models.ToolCall
+	if turn <= 4 {
+		calls = []models.ToolCall{
+			{ID: fmt.Sprintf("phf-%d-0", turn), Name: "phf", Arguments: map[string]any{"x": "y"}},
+		}
+	} else {
+		calls = make([]models.ToolCall, 5)
+		for i := range calls {
+			calls[i] = models.ToolCall{ID: fmt.Sprintf("phf-%d-%d", turn, i), Name: "phf", Arguments: map[string]any{"x": "y"}}
+		}
+	}
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{ToolCalls: calls, Stop: "tool_calls", Done: true}
+	}()
+	return ch, nil
+}
+
+// TestParallelBreaker_HintFlushedAfterTailAppend is the parallel-path
+// analogue of TestSerialBreaker_HintFlushedAfterSynthesizedResults — the
+// same pendingHints-flushed-too-early bug pre-dates this task (M1) in the
+// parallel fatal tail-append loop.
+func TestParallelBreaker_HintFlushedAfterTailAppend(t *testing.T) {
+	reg := tools.NewRegistry()
+	if err := reg.Register(models.Tool{
+		Name:         "phf",
+		ParallelSafe: true,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"x": map[string]any{"type": "string"}},
+		},
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   c.ID,
+				ToolName: c.Name,
+				Status:   models.CallStatusFailed,
+				Error:    "boom",
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &parallelRepeatLoopProviderHintThenFatal{},
+		Tools:       reg,
+		MaxTurns:    50,
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run parallel"},
+	})
+	if err == nil {
+		t.Fatal("expected the agent to stop with a fatal repeat-loop error")
+	}
+	if result == nil {
+		t.Fatal("expected a non-nil RunResult even on fatal breaker error")
+	}
+
+	var lastAI *models.Message
+	for i := range result.Messages {
+		if result.Messages[i].Role == models.RoleAI && len(result.Messages[i].ToolCalls) > 0 {
+			lastAI = &result.Messages[i]
+		}
+	}
+	if lastAI == nil || len(lastAI.ToolCalls) != 5 {
+		t.Fatalf("expected the final assistant message to carry 5 tool calls; got %+v", lastAI)
+	}
+
+	hintIdx := -1
+	lastToolIdx := -1
+	toolResultIDs := make(map[string]bool)
+	for i, msg := range result.Messages {
+		if msg.Role == models.RoleTool && msg.ToolResult != nil {
+			toolResultIDs[msg.ToolResult.CallID] = true
+			lastToolIdx = i
+		}
+		if msg.Role == models.RoleHuman && strings.Contains(strings.ToLower(msg.Content), "loop") {
+			hintIdx = i
+		}
+	}
+	for _, call := range lastAI.ToolCalls {
+		if !toolResultIDs[call.ID] {
+			t.Errorf("tool_use ID %q has no matching tool_result", call.ID)
+		}
+	}
+	if hintIdx == -1 {
+		t.Fatal("expected a non-fatal loop hint to be injected into messages")
+	}
+	if hintIdx < lastToolIdx {
+		t.Fatalf("hint message at index %d appeared before the batch's LAST tool result (including the "+
+			"already-computed tail append) at index %d; a hint must never land between an assistant "+
+			"tool_calls message and any of its tool results, even on the fatal path", hintIdx, lastToolIdx)
 	}
 }
 

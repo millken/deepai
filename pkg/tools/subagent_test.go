@@ -297,6 +297,142 @@ func TestTaskTool_ContextFilesNonStringEntryFails(t *testing.T) {
 	}
 }
 
+// TestTaskTool_ParentRemainingBudgetCapsConfig is the RED test for the
+// M2.2-carry-forward parent-budget passthrough: when the ctx carries a
+// parent's remaining token budget (injected by react.go's Run at batch
+// dispatch time via tools.WithRemainingTokenBudget), the task tool must fold
+// it into SubagentConfig.TokenBudget as min(nonzero values) — the parent
+// remaining caps an explicit arg, and becomes the default when no explicit
+// arg is given. A parent with no budget in play (ctx never carries one) must
+// leave the explicit-arg-or-zero behavior completely unchanged.
+//
+// RED signature (today): the handler never calls
+// tools.RemainingTokenBudgetFromContext, so cfg.TokenBudget is always just
+// the explicit token_budget arg (or 0), regardless of what's in ctx.
+func TestTaskTool_ParentRemainingBudgetCapsConfig(t *testing.T) {
+	var gotBudget int
+	newTool := func() models.Tool {
+		return TaskTool(fakeTaskPool{
+			startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+				gotBudget = cfg.TokenBudget
+				return &subagent.Task{ID: "task-parent-budget"}, nil
+			},
+			wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+				return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+			},
+		}, nil)
+	}
+
+	call := func(ctx context.Context, args map[string]any) {
+		gotBudget = -1
+		tool := newTool()
+		if _, err := tool.Handler(ctx, models.ToolCall{
+			ID:        "call-parent-budget",
+			Name:      "task",
+			Arguments: args,
+		}); err != nil {
+			t.Fatalf("Handler() error = %v", err)
+		}
+	}
+
+	// No explicit arg, parent remaining=600 present → default to 600.
+	call(WithRemainingTokenBudget(context.Background(), 600), map[string]any{
+		"description": "run", "prompt": "do it",
+	})
+	if gotBudget != 600 {
+		t.Fatalf("no explicit arg, parent remaining=600: cfg.TokenBudget = %d, want 600", gotBudget)
+	}
+
+	// Explicit 900, parent remaining=600 → capped to min(600, 900)=600.
+	call(WithRemainingTokenBudget(context.Background(), 600), map[string]any{
+		"description": "run", "prompt": "do it", "token_budget": 900.0,
+	})
+	if gotBudget != 600 {
+		t.Fatalf("explicit=900, parent remaining=600: cfg.TokenBudget = %d, want 600", gotBudget)
+	}
+
+	// Explicit 300, parent remaining=600 → explicit stays (min(600,300)=300).
+	call(WithRemainingTokenBudget(context.Background(), 600), map[string]any{
+		"description": "run", "prompt": "do it", "token_budget": 300.0,
+	})
+	if gotBudget != 300 {
+		t.Fatalf("explicit=300, parent remaining=600: cfg.TokenBudget = %d, want 300", gotBudget)
+	}
+
+	// No parent budget in ctx at all → explicit arg passes through unchanged.
+	call(context.Background(), map[string]any{
+		"description": "run", "prompt": "do it", "token_budget": 900.0,
+	})
+	if gotBudget != 900 {
+		t.Fatalf("no parent budget, explicit=900: cfg.TokenBudget = %d, want 900 (unchanged)", gotBudget)
+	}
+
+	// No parent budget, no explicit arg → stays 0 (unlimited), unchanged.
+	call(context.Background(), map[string]any{
+		"description": "run", "prompt": "do it",
+	})
+	if gotBudget != 0 {
+		t.Fatalf("no parent budget, no explicit arg: cfg.TokenBudget = %d, want 0 (unchanged)", gotBudget)
+	}
+}
+
+// TestTaskTool_ParentRemainingBudgetZero_RefusesCall is the RED test for
+// review finding #2: when the parent's remaining budget is present in ctx
+// but already exhausted (remaining <= 0 — the parent spent its whole
+// MaxTokensBudget mid-turn, before this batch's dispatch), the task tool
+// must refuse to spawn a subagent at all rather than silently handing it an
+// unlimited budget (the old `remaining > 0` guard skipped the fold entirely
+// in this case, leaving tokenBudget at whatever the explicit arg — or its
+// absence — left it: unlimited by default).
+//
+// RED signature (today): StartTask is called anyway (with tokenBudget
+// unchanged, e.g. 0/unlimited), instead of the handler refusing up front.
+func TestTaskTool_ParentRemainingBudgetZero_RefusesCall(t *testing.T) {
+	startTaskCalled := false
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			startTaskCalled = true
+			return &subagent.Task{ID: "should-not-start"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+
+	result, err := tool.Handler(WithRemainingTokenBudget(context.Background(), 0), models.ToolCall{
+		ID:        "call-exhausted",
+		Name:      "task",
+		Arguments: map[string]any{"description": "run", "prompt": "do it"},
+	})
+	if err == nil {
+		t.Fatal("Handler() error = nil, want a refusal error when the parent's remaining budget is 0")
+	}
+	if startTaskCalled {
+		t.Fatal("StartTask was called — the handler must refuse BEFORE spawning a subagent when the parent budget is exhausted")
+	}
+	if result.Status != models.CallStatusFailed {
+		t.Fatalf("result.Status = %s, want %s", result.Status, models.CallStatusFailed)
+	}
+	if !strings.Contains(result.Error, "budget exhausted") || !strings.Contains(result.Error, "no budget available for subagents") {
+		t.Fatalf("result.Error = %q, want it to explain the parent token budget is exhausted", result.Error)
+	}
+
+	// Sanity: an ABSENT parent budget (ctx never carries one) must still
+	// pass through completely unchanged — only a PRESENT-but-zero remaining
+	// triggers the refusal, not "no parent budget configured at all".
+	startTaskCalled = false
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "call-no-parent-budget",
+		Name:      "task",
+		Arguments: map[string]any{"description": "run", "prompt": "do it"},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v, want nil (no parent budget in ctx must not trigger the refusal)", err)
+	}
+	if !startTaskCalled {
+		t.Fatal("StartTask was not called — an absent parent budget must not be treated as exhausted")
+	}
+}
+
 func TestTaskTool_AdvertisesAgents(t *testing.T) {
 	// No agents → description has no agent_type list.
 	bare := TaskTool(nil, nil)

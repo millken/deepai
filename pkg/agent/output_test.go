@@ -129,22 +129,6 @@ func TestParseOutputSchemaValidationFail(t *testing.T) {
 	}
 }
 
-// --- RunWithSchema tests ---
-
-type mockAgentRunner struct {
-	agents []*Agent
-}
-
-func (m *mockAgentRunner) Create() *Agent {
-	// Return a minimal agent — actual Run() won't work without LLM,
-	// so RunWithSchema tests focus on parse logic, not full agent execution.
-	return nil
-}
-
-// Note: RunWithSchema requires a working Agent, which needs LLM provider.
-// We test it indirectly through ParseOutput + the retry logic is tested
-// by verifying the wrapper's error handling path.
-
 // --- ValidateOutput tests ---
 //
 // ValidateOutput is the non-generic sibling of ParseOutput[T]: the subagent

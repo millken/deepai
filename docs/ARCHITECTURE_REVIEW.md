@@ -187,6 +187,8 @@ cmd/deepai
 
 ### M3 — 结构性重构与瘦身
 
+> **状态：部分完成（2026-08-03，同分支）**。已落地：死代码删除（-9323 行：`pkg/plugin`+`plugins/`、`gateway`+`checkpoint`、clarification Manager、git 空壳、`ListByGroup`；go.mod -9 依赖）；`react.go` 拆分（1806→~990，新增 breaker/toolexec/promptbuild/streaming/subagent_context，multiset 证明纯移动）；度量统一（单一 `bytesPerToken=3.3`、度量组装后提示词 + aged view、`compactOnOverflow` 陈旧锚点失效、停滞守卫 + 增长解除、no-tool-calls 溢出分支收窄并接入重试）。计划外追加：工具调用契约修复（串行孤儿 tool_use 合成、hint 顺序）、父预算下传（耗尽即拒绝）、流空闲看门狗。**未完成顺延**：(a) 工具批执行两回路仍内联于 `Run()`（各 ~90 行重复簿记）；(b) 单一 `contextManager` 未建立；(c) M3.3 REPL/Agent 生命周期对齐未开始；(d) M3.4 系统提示前缀稳定化（prompt cache）未开始。
+
 1. **拆 `react.go`**：`Run()` 按职责拆为 loop 骨架 / 熔断器 / 流式消费 / 工具批执行四块；上下文管理（压缩/aging/offload/估算）收拢进单一 `contextManager`，统一度量口径（一个 estimator、一套字节比、压缩与 aging 同一标尺，压缩应度量实际发送的视图）。
 2. **删除死代码**：`pkg/plugin` 整包（或写明保留意图的 README）、`pkg/gateway`+`pkg/checkpoint`（若近期无 HTTP 计划）、clarification Manager 分支、`GitTools` 空壳。预计 -6000 行。
 3. **REPL 与 Agent 生命周期对齐**：要么让 Agent 可复用（熔断计数、skill 状态、压缩锚点跨回合存活），要么把这些状态显式提升到 `ChatRepl` 层随回合传递。当前"每回合重建 + 部分状态手工回传（planMode）"是两头不靠的中间态，P0-1 和 P1-6 都是它的症状。

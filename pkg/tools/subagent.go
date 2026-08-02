@@ -76,6 +76,41 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 			model, _ := call.Arguments["model"].(string)
 			tokenBudget := intFromArg(call.Arguments["token_budget"])
 
+			// Parent-budget passthrough (plan §M2.2 carry-forward): a parent
+			// agent running under its own MaxTokensBudget injects its
+			// remaining budget into ctx once per tool-dispatch batch
+			// (react.go's Run, via tools.WithRemainingTokenBudget) so a
+			// subagent spawned here can't be handed an unlimited budget
+			// underneath a budget-constrained parent. The parent remaining
+			// caps an explicit token_budget arg, and becomes the default
+			// when no explicit arg was given — i.e. effective budget = min
+			// of whichever of {explicit, parent remaining} are nonzero. A
+			// parent with no remaining budget in play at all (ctx never
+			// carries one, e.g. the parent itself has no MaxTokensBudget)
+			// leaves tokenBudget completely unchanged.
+			//
+			// A PRESENT-but-zero remaining is different from "no budget in
+			// play": it means the parent's own budget is already exhausted
+			// (spent mid-turn, before this batch's dispatch), and folding
+			// that in as a "default" would leave tokenBudget at 0 —
+			// unlimited — exactly backwards. Refuse the call outright
+			// instead of ever calling pool.StartTask, so an exhausted parent
+			// can't fan out subagents with no cap at all.
+			if remaining, ok := RemainingTokenBudgetFromContext(ctx); ok {
+				if remaining <= 0 {
+					refuseErr := fmt.Errorf("parent token budget exhausted; no budget available for subagents")
+					return models.ToolResult{
+						CallID:   call.ID,
+						ToolName: call.Name,
+						Status:   models.CallStatusFailed,
+						Error:    refuseErr.Error(),
+					}, refuseErr
+				}
+				if tokenBudget <= 0 || remaining < tokenBudget {
+					tokenBudget = remaining
+				}
+			}
+
 			// Resolve agent type: agent_type > subagent_type > general-purpose
 			agentType, _ := call.Arguments["agent_type"].(string)
 			if agentType == "" {
