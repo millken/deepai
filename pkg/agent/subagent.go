@@ -105,9 +105,17 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		systemPrompt = profileCfg.SystemPrompt
 	}
 
+	// MaxTurns priority: caller-explicit (max_turns arg) > agent type profile
+	// (builtin/YAML/MD) > pool fallback (general-purpose default).
+	// Pool fallback is applied last so a profile that defines MaxTurns=10
+	// is not capped to the pool's general-purpose default of 6.
 	maxTurns := task.Config.MaxTurns
-	if maxTurns <= 0 && profileCfg.MaxTurns > 0 {
+	if maxTurns <= 0 {
 		maxTurns = profileCfg.MaxTurns
+	}
+	if maxTurns <= 0 {
+		// Last resort: pool's general-purpose safety floor.
+		maxTurns = 6
 	}
 
 	// Inject OutputSchema prompt into system prompt when available
@@ -190,7 +198,7 @@ func NewSubagentPool(executor *SubagentExecutor, maxConcurrent int, timeout time
 
 func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
 	if len(selectors) == 0 {
-		return append([]models.Tool(nil), all...)
+		return filterTaskTool(all)
 	}
 
 	allowNames := make(map[string]struct{}, len(selectors))
@@ -223,7 +231,20 @@ func selectSubagentTools(all []models.Tool, selectors []string) []models.Tool {
 	if len(selected) > 0 {
 		return selected
 	}
-	return append([]models.Tool(nil), all...)
+	// Fallback: no selectors matched. Return all tools EXCEPT task to prevent
+	// unbounded recursion (a sub-agent spawning its own sub-agents).
+	return filterTaskTool(all)
+}
+
+// filterTaskTool returns a copy of tools with the task tool removed.
+func filterTaskTool(tools []models.Tool) []models.Tool {
+	out := make([]models.Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name != "task" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func subagentMessageFromAgentEvent(evt AgentEvent) string {

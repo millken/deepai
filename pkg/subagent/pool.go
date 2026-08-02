@@ -239,6 +239,9 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 
 	base, ok := p.cfg.Defaults[agentType]
 	if !ok {
+		// Unknown agent type: no pool defaults. The executor resolves MaxTurns,
+		// Tools, etc. from the agent type profile (builtin/YAML/MD). If the
+		// profile also has nothing, the executor applies a safety floor.
 		base = SubagentConfig{AgentType: agentType}
 	}
 

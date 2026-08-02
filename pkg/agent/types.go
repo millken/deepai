@@ -71,10 +71,15 @@ type AgentConfig struct {
 	PlanMode bool
 	WorkDir  string // working directory for writing plan files
 
-	// NonInteractive disables plan mode entirely (no enter_plan_mode tool).
-	// Set for delegated subagents, which have no user to approve a plan and must
-	// implement directly rather than stall in read-only exploration.
+	// NonInteractive marks delegated sub-agents and other headless contexts.
+	// It disables plan mode (no user to approve) and suppresses team-delegation
+	// prompt injection (sub-agents don't orchestrate).
 	NonInteractive bool
+
+	// AgentCatalog lists the sub-agent types available via the task tool, used
+	// to render delegation guidance in the system prompt. Empty = no delegation
+	// prompt injected. Only meaningful for top-level (interactive) agents.
+	AgentCatalog []AgentInfo
 
 	// OffloadDir is where tool results exceeding the offload threshold are
 	// written to disk. Empty = auto-derive ~/.deepai/offload in New().

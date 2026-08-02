@@ -45,7 +45,8 @@ type ReplConfig struct {
 	InputHistoryFile    string                   // path for persisting input history (optional)
 	SandboxBaseDir      string                   // root for sandbox session dirs; must NOT be the user's workdir
 	MCPReport           string                   // one-line MCP load summary; printed after banner when non-empty
-	Commands            map[string]Command       // file-based slash commands; body injected as a user turn
+	AgentCatalog        []agent.AgentInfo
+	Commands            map[string]Command // file-based slash commands; body injected as a user turn
 }
 
 // memoryExtractInterval is the turn cadence for async memory extraction in CLI.
@@ -532,6 +533,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		MemoryExtractor: r.cfg.MemoryExtractor,
 		MemoryUserID:    r.cfg.WorkDir,
 		ImageDetail:     r.currentImageDetail(),
+		AgentCatalog:    r.cfg.AgentCatalog,
 	}
 
 	runAgent := agent.New(agentCfg)

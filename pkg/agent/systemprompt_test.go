@@ -77,6 +77,155 @@ func TestPlanMode_IncludesCodeMap(t *testing.T) {
 	}
 }
 
+// TestTeamDelegation_InjectedWithTaskToolAndCatalog: a top-level agent with the
+// task tool and a non-empty catalog gets the delegation prompt with the catalog
+// rendered dynamically.
+func TestTeamDelegation_InjectedWithTaskToolAndCatalog(t *testing.T) {
+	reg := tools.NewRegistry()
+	_ = reg.Register(models.Tool{
+		Name: "task",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	})
+	a := New(AgentConfig{
+		LLMProvider:  &captureProvider{},
+		Tools:        reg,
+		Model:        "m",
+		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
+	})
+
+	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	if !strings.Contains(sp, "Team Delegation") {
+		t.Errorf("delegation prompt missing:\n%s", sp)
+	}
+	if !strings.Contains(sp, "coder") {
+		t.Errorf("catalog entry 'coder' not rendered:\n%s", sp)
+	}
+}
+
+// TestTeamDelegation_OmittedForSubagent: NonInteractive agents (sub-agents) must
+// not get the delegation prompt — they can't spawn their own sub-agents.
+func TestTeamDelegation_OmittedForSubagent(t *testing.T) {
+	reg := tools.NewRegistry()
+	_ = reg.Register(models.Tool{
+		Name: "task",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	})
+	a := New(AgentConfig{
+		LLMProvider:    &captureProvider{},
+		Tools:          reg,
+		Model:          "m",
+		NonInteractive: true,
+		AgentCatalog:   []AgentInfo{{Type: "coder", Description: "writes code"}},
+	})
+
+	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	if strings.Contains(sp, "Team Delegation") {
+		t.Errorf("sub-agent should not get delegation prompt:\n%s", sp)
+	}
+}
+
+// TestTeamDelegation_OmittedWithoutTaskTool: no task tool → no delegation prompt,
+// even for interactive agents with a catalog.
+func TestTeamDelegation_OmittedWithoutTaskTool(t *testing.T) {
+	a := New(AgentConfig{
+		LLMProvider:  &captureProvider{},
+		Tools:        tools.NewRegistry(),
+		Model:        "m",
+		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
+	})
+
+	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	if strings.Contains(sp, "Team Delegation") {
+		t.Errorf("agent without task tool should not get delegation prompt:\n%s", sp)
+	}
+}
+
+// TestTeamDelegation_OmittedWithEmptyCatalog: task tool present but no agents to
+// delegate to → skip the prompt (saves tokens, avoids advertising nothing).
+func TestTeamDelegation_OmittedWithEmptyCatalog(t *testing.T) {
+	reg := tools.NewRegistry()
+	_ = reg.Register(models.Tool{
+		Name: "task",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	})
+	a := New(AgentConfig{
+		LLMProvider: &captureProvider{},
+		Tools:       reg,
+		Model:       "m",
+	})
+
+	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	if strings.Contains(sp, "Team Delegation") {
+		t.Errorf("agent with empty catalog should not get delegation prompt:\n%s", sp)
+	}
+}
+
+// TestTeamDelegation_OmittedInPlanMode: plan mode replaces a.tools with
+// planToolNames (no task), so the delegation prompt must not appear. This
+// prevents using sub-agents to bypass plan-mode file restrictions.
+func TestTeamDelegation_OmittedInPlanMode(t *testing.T) {
+	reg := tools.NewRegistry()
+	_ = reg.Register(models.Tool{
+		Name: "task",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	})
+	for _, n := range planToolNames {
+		_ = reg.Register(models.Tool{
+			Name: n,
+			Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+				return models.ToolResult{}, nil
+			},
+		})
+	}
+	a := New(AgentConfig{
+		LLMProvider:  &captureProvider{},
+		Tools:        reg,
+		Model:        "m",
+		PlanMode:     true,
+		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
+	})
+
+	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	if strings.Contains(sp, "Team Delegation") {
+		t.Errorf("plan mode must not show delegation prompt:\n%s", sp)
+	}
+}
+
+// TestSelectSubagentTools_FiltersTaskInFallback: the no-selectors and
+// no-match fallback paths must both exclude the task tool to prevent
+// unbounded sub-agent recursion.
+func TestSelectSubagentTools_FiltersTaskInFallback(t *testing.T) {
+	tools := []models.Tool{
+		{Name: "bash"},
+		{Name: "task"},
+		{Name: "read_file"},
+	}
+
+	// No selectors → fallback path.
+	got := selectSubagentTools(tools, nil)
+	for _, tt := range got {
+		if tt.Name == "task" {
+			t.Error("task tool should be filtered in no-selectors fallback")
+		}
+	}
+
+	// Non-matching selectors → fallback path.
+	got = selectSubagentTools(tools, []string{"nonexistent_tool"})
+	for _, tt := range got {
+		if tt.Name == "task" {
+			t.Error("task tool should be filtered in no-match fallback")
+		}
+	}
+}
+
 // builtinFileToolsForTest registers a minimal read_file so BuildSystemPrompt's
 // tool gate fires, without importing the builtin package (avoids an import cycle
 // risk in agent tests).

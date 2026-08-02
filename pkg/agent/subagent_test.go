@@ -40,3 +40,42 @@ func TestSubagentMessageFromAgentEvent(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveMaxTurns_Priority verifies the MaxTurns resolution chain:
+// caller-explicit > agent type profile > safety floor (6).
+func TestResolveMaxTurns_Priority(t *testing.T) {
+	// Simulate the executor's maxTurns resolution logic.
+	// In production this runs inside Execute(), but the logic is:
+	//   maxTurns = task.Config.MaxTurns    // caller-explicit (max_turns arg)
+	//   if maxTurns <= 0: maxTurns = profileCfg.MaxTurns  // builtin/YAML
+	//   if maxTurns <= 0: maxTurns = 6     // safety floor
+	resolve := func(callerMaxTurns, profileMaxTurns int) int {
+		maxTurns := callerMaxTurns
+		if maxTurns <= 0 {
+			maxTurns = profileMaxTurns
+		}
+		if maxTurns <= 0 {
+			maxTurns = 6
+		}
+		return maxTurns
+	}
+
+	tests := []struct {
+		name            string
+		callerMaxTurns  int
+		profileMaxTurns int
+		want            int
+	}{
+		{"caller overrides profile", 20, 10, 20},
+		{"profile used when caller is 0", 0, 10, 10},
+		{"safety floor when both 0", 0, 0, 6},
+		{"caller=0 profile=0 → floor", 0, 0, 6},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolve(tt.callerMaxTurns, tt.profileMaxTurns); got != tt.want {
+				t.Errorf("resolve(%d, %d) = %d, want %d", tt.callerMaxTurns, tt.profileMaxTurns, got, tt.want)
+			}
+		})
+	}
+}

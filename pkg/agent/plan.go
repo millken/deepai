@@ -14,6 +14,10 @@ import (
 
 // planToolNames are the tools available while in plan mode (read-only).
 // exit_plan_mode and write_plan are registered dynamically after Restrict.
+// Note: task is intentionally absent — this prevents an agent in plan mode
+// from spawning a sub-agent (e.g. coder) to bypass the read-only restriction.
+// BuildSystemPrompt also checks a.tools.Get("task"), so the team-delegation
+// prompt is naturally omitted in plan mode.
 var planToolNames = []string{
 	"read_file", "list_dir", "glob", "grep", "find", "code_map",
 	"ask_clarification", "present_file",

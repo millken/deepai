@@ -316,6 +316,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		SandboxBaseDir:      SandboxDir(),
 		MCPReport:           startupReport,
 		Commands:            commands,
+		AgentCatalog:        agentCatalog,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

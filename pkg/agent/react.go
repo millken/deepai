@@ -91,6 +91,12 @@ type Agent struct {
 	// attachments in ChatRequest.
 	imageDetail string
 
+	// nonInteractive marks sub-agents (no user to interact with).
+	nonInteractive bool
+
+	// agentCatalog lists available sub-agent types for delegation guidance.
+	agentCatalog []AgentInfo
+
 	// Diagnostic: warn at most once when the events channel overflows so the
 	// silent drop is visible in logs without flooding when the slow consumer
 	// stays slow for many events in a row.
@@ -155,6 +161,8 @@ func New(cfg AgentConfig) *Agent {
 		workDir:             cfg.WorkDir,
 		offloadDir:          offloadDir,
 		imageDetail:         cfg.ImageDetail,
+		nonInteractive:      cfg.NonInteractive,
+		agentCatalog:        cfg.AgentCatalog,
 	}
 
 	// Register plan mode tools (agent self-references via closures). Skipped for
@@ -885,6 +893,17 @@ func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMess
 		sections = append(sections, builtin.GetToolRecommendations())
 	}
 
+	// Team awareness: when the agent can spawn sub-agents (has the task tool),
+	// inject delegation guidance so it knows when to delegate vs do itself.
+	// Skipped for non-interactive agents (sub-agents) to avoid recursion, and
+	// when the catalog is empty (no agents to delegate to).
+	// Note: plan mode replaces a.tools (enterPlanMode), removing the task tool,
+	// so this block is naturally skipped — that prevents using sub-agents to
+	// bypass plan-mode file restrictions.
+	if !a.nonInteractive && a.tools.Get("task") != nil && len(a.agentCatalog) > 0 {
+		sections = append(sections, renderDelegationPrompt(a.agentCatalog))
+	}
+
 	sections = a.appendPlanModePrompt(sections)
 	return strings.Join(sections, "\n\n")
 }
@@ -956,6 +975,49 @@ func buildSystemPrompt(base string, date string) string {
 	b.WriteString(date)
 	b.WriteByte('.')
 	return b.String()
+}
+
+// delegationStrategy is the static policy text for team delegation. The agent
+// catalog (available types) is rendered separately from the live EnumerateAgents
+// result, so this text never lists specific agent names.
+const delegationStrategy = `# Team Delegation
+
+You lead a team of specialized sub-agents. Use the task tool to delegate when a sub-agent can do a better job than you.
+
+## When to delegate
+
+- Complex feature (new page, new module, multi-file change) → delegate implementation.
+- UI/design work, requirements analysis, technical design, deep code review → delegate to the matching specialist.
+- For multi-step projects, run sub-agents in dependency order. A sub-agent's result comes back as the task tool's return value; pass relevant context from prior steps in the next sub-agent's prompt.
+
+## When NOT to delegate
+
+- Simple edits, quick fixes, answering questions → do it yourself.
+- You already know the answer from context → just answer.
+
+## How to delegate
+
+- Give the sub-agent a self-contained prompt with all needed context (file paths, requirements, constraints).
+- Sub-agents cannot see your conversation history. They start fresh. Always include: what to do, what input/context it needs, and what its final answer should contain.
+- After a sub-agent completes, review its output before proceeding. If wrong, re-invoke with corrections.`
+
+// renderDelegationPrompt combines the static strategy text with a dynamically
+// rendered agent catalog, so the prompt always reflects the actual available
+// types (project > plugin > builtin) instead of a hardcoded list.
+func renderDelegationPrompt(catalog []AgentInfo) string {
+	var b strings.Builder
+	b.WriteString(delegationStrategy)
+	b.WriteString("\n\n## Available agents\n")
+	b.WriteString("Use these agent_type values with the task tool:\n\n")
+	for _, a := range catalog {
+		desc := strings.TrimSpace(a.Description)
+		desc = strings.ReplaceAll(desc, "\n", " ")
+		if len([]rune(desc)) > 100 {
+			desc = string([]rune(desc)[:99]) + "…"
+		}
+		fmt.Fprintf(&b, "- **%s** — %s\n", a.Type, desc)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func resolveModel(model string) string {
