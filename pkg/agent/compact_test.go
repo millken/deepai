@@ -273,31 +273,42 @@ func TestToolSchemaTokens_AccountsForToolPayload(t *testing.T) {
 // to the provider's own reported input-token count once it is known.
 func TestEstimateContextTokens_PrefersProviderCount(t *testing.T) {
 	a := &Agent{compactionKeepTail: 6}
-	msgs := []models.Message{
+	canonical := []models.Message{
 		{Role: models.RoleHuman, Content: "你好"},
 		{Role: models.RoleAI, Content: "世界"},
 	}
+	// M4-2: the anchor path assumes the real react.go invariant — the view
+	// passed in is canonical messages PLUS the trailing turn injection (see
+	// appendTurnInjection), while lastTokenCountMsgs anchors only the
+	// CANONICAL length. Modeling that here (rather than passing a bare
+	// canonical slice as the view) is what TestEstimateContextTokens_
+	// AnchorDoesNotDoubleCountInjection in injection_test.go guards directly;
+	// this test still needs the same shape or it exercises a view/anchor
+	// pairing that never occurs in production.
+	injection := models.Message{Role: models.RoleHuman, Content: "[System note: irrelevant]"}
+	view := appendTurnInjection(canonical, injection)
 
-	heuristic := a.estimateContextTokens(msgs, "") // no anchor yet → small heuristic
+	heuristic := a.estimateContextTokens(view, "") // no anchor yet → small heuristic
 
 	// Provider reports the real (much larger) count for these same messages.
 	a.lastInputTokens = 50000
-	a.lastTokenCountMsgs = len(msgs)
-	got := a.estimateContextTokens(msgs, "")
+	a.lastTokenCountMsgs = len(canonical)
+	got := a.estimateContextTokens(view, "")
 	if got < 50000 {
 		t.Fatalf("estimate = %d, want >= provider count 50000 (heuristic was %d)", got, heuristic)
 	}
 
 	// Growth since the anchor must be added on top of the provider count.
-	msgs = append(msgs, models.Message{Role: models.RoleTool, Content: strings.Repeat("x", 3000)})
-	if grown := a.estimateContextTokens(msgs, ""); grown <= got {
+	canonical = append(canonical, models.Message{Role: models.RoleTool, Content: strings.Repeat("x", 3000)})
+	view = appendTurnInjection(canonical, injection)
+	if grown := a.estimateContextTokens(view, ""); grown <= got {
 		t.Fatalf("estimate did not grow after appending a message: %d <= %d", grown, got)
 	}
 
 	// A stale anchor (more messages counted than now present, e.g. after a
 	// compaction) must fall back to the heuristic rather than over-report.
-	a.lastTokenCountMsgs = len(msgs) + 5
-	if fallback := a.estimateContextTokens(msgs, ""); fallback >= 50000 {
+	a.lastTokenCountMsgs = len(canonical) + 5
+	if fallback := a.estimateContextTokens(view, ""); fallback >= 50000 {
 		t.Fatalf("stale anchor not ignored: estimate=%d still reflects old provider count", fallback)
 	}
 }

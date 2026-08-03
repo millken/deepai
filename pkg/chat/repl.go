@@ -89,6 +89,41 @@ type ChatRepl struct {
 	currentModel      string // selected model alias (from ModelRegistry)
 	currentEffort     string // reasoning effort: "low", "medium", "high", "disabled", or "" (provider default)
 	imageDetail       string // vision detail: "low" (default), "high", or "" (use "low")
+
+	// carry holds cross-turn Agent state (circuit breaker, active skill,
+	// compaction anchors — see agent.SessionCarry's doc comment) that would
+	// otherwise silently reset every turn, since runTurn builds a fresh,
+	// single-use Agent per turn (M4-3, task-23-brief.md). Passed unchanged
+	// into every turn's AgentConfig.Session; reset to a fresh
+	// agent.NewSessionCarry() by clearSession (/clear), startNewSession
+	// (/new), and undoLastTurn (/undo), alongside the state each of those
+	// already invalidates. The REPL drives turns serially (one runTurn
+	// completes before the next begins) EXCEPT on the orphan path (see
+	// orphanWaitOrDefault) — do not share this pointer with anything that
+	// could run concurrently with a turn (e.g. a subagent).
+	carry *agent.SessionCarry
+
+	// orphanWait overrides the orphan-turn wait (see orphanWaitOrDefault)
+	// for tests. Zero (the field's default in every real ChatRepl, since
+	// NewRepl never sets it) means "use the production default" — this
+	// mirrors the Agent.streamIdleTimeout pattern (pkg/agent/react.go): a
+	// field only tests reach into directly, never exposed via ReplConfig.
+	orphanWait time.Duration
+}
+
+// defaultOrphanWait bounds how long runTurn waits for an orphaned Run
+// goroutine (one that hasn't returned by the time ctx is cancelled — e.g. a
+// tool ignoring ctx) before giving up and returning anyway, so a stuck tool
+// can never hang the whole REPL.
+const defaultOrphanWait = 10 * time.Second
+
+// orphanWaitOrDefault returns r.orphanWait if a test has set it, else
+// defaultOrphanWait.
+func (r *ChatRepl) orphanWaitOrDefault() time.Duration {
+	if r.orphanWait > 0 {
+		return r.orphanWait
+	}
+	return defaultOrphanWait
 }
 
 // NewRepl creates a new chat REPL instance.
@@ -113,6 +148,7 @@ func NewRepl(cfg ReplConfig) (*ChatRepl, error) {
 		sb:           sb,
 		prefSched:    memory.NewPreferenceScheduler(),
 		currentModel: cfg.ModelRegistry.DefaultName(),
+		carry:        agent.NewSessionCarry(),
 	}
 	return repl, nil
 }
@@ -534,6 +570,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		MemoryUserID:    r.cfg.WorkDir,
 		ImageDetail:     r.currentImageDetail(),
 		AgentCatalog:    r.cfg.AgentCatalog,
+		Session:         r.carry,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -636,9 +673,26 @@ EventLoop:
 						lastUsage = out.result.Usage
 					}
 				}
-			case <-time.After(10 * time.Second):
+			case <-time.After(r.orphanWaitOrDefault()):
 				// Defensive: a tool ignoring ctx could delay Run's return.
 				// Persist what we have rather than hanging the REPL.
+				//
+				// M4-3 (review r1 F3): the abandoned runAgent.Run goroutine
+				// above is still alive and will keep mutating whatever
+				// *agent.SessionCarry it was handed (breaker maps,
+				// activeSkill/skillPrompt, token anchors) for as long as it
+				// runs — SessionCarry has no locking (see its doc comment),
+				// and the very next turn is about to build a NEW Agent
+				// sharing r.carry, which would then race with the orphan on
+				// every one of those fields (and can panic on the map writes
+				// inside breaker.observe). Detach: give the next turn a fresh
+				// carry and leave the orphaned goroutine as the sole (if now
+				// pointless) owner of the old one. This preserves the "never
+				// hand one SessionCarry to two concurrently-running Agents"
+				// contract instead of violating it, at the cost of losing
+				// this orphaned turn's carried state — acceptable, since the
+				// turn itself was already abandoned.
+				r.carry = agent.NewSessionCarry()
 			}
 			break EventLoop
 		}
@@ -651,16 +705,31 @@ EventLoop:
 		_ = r.sessMgr.AppendMessage(r.sess.ID, msg)
 	}
 
+	// Sync plan mode both directions (M4-3): the agent may have exited plan
+	// mode this turn (e.g. user confirmed the plan via exit_plan_mode) or
+	// ENTERED it mid-turn (e.g. enter_plan_mode, deciding a complex request
+	// needs a plan first) — either way, the next turn's AgentConfig.PlanMode
+	// must reflect what actually happened, not just the exit direction.
+	// Unconditional assignment (not the old if-guarded clear-only form)
+	// keeps both directions symmetric with a single readback. Review r1
+	// F10/item 6: this now runs BEFORE the turnErr early-return below so an
+	// errored/interrupted turn still gets the readback (e.g. the agent
+	// called enter_plan_mode and was then Ctrl+C'd) — runAgent.IsPlanMode()
+	// is an atomic.Bool read, safe to call even if the Run goroutine that
+	// owns it hasn't fully returned yet (the orphan path above).
+	r.planMode = runAgent.IsPlanMode()
+	// M4 final-phase review F-M4-4: every other write to r.planMode pairs
+	// it with a SetStatus call (Run()'s startup, /plan, /run, model
+	// switch) so the TUI footer stays in sync — this symmetric readback
+	// must too, or a mid-turn enter_plan_mode leaves the footer showing
+	// full tool access while the agent has actually restricted itself to
+	// read-only tools. Safe to call here: runTurn executes on the REPL's
+	// own goroutine, same as every other SetStatus call site.
+	r.ui.SetStatus(r.currentModel, r.planMode)
+
 	if turnErr != nil {
 		r.saveSession()
 		return turnErr
-	}
-
-	// Sync plan mode: if the agent exited plan mode during this turn
-	// (e.g. user confirmed the plan via exit_plan_mode tool), clear the
-	// REPL flag so the next turn won't re-enter plan mode.
-	if r.planMode && !runAgent.IsPlanMode() {
-		r.planMode = false
 	}
 
 	// Auto-title generation after first turn. Run asynchronously so the user
@@ -1121,6 +1190,11 @@ func (r *ChatRepl) currentContextWindow() int {
 func (r *ChatRepl) clearSession() {
 	r.sess.Messages = nil
 	r.turn = 0
+	// M4-3: the message history is gone, so any carried cross-turn Agent
+	// state (breaker counters, active skill, compaction anchors) referring
+	// to it must go too — a fresh SessionCarry, not a reset of the old
+	// one's fields, matching NewSessionCarry's doc comment.
+	r.carry = agent.NewSessionCarry()
 	if r.sessMgr != nil {
 		if err := r.sessMgr.DeleteMessagesAfterSeq(r.sess.ID, 0); err != nil {
 			slog.Warn("clear persisted messages failed", "err", err)
@@ -1144,6 +1218,10 @@ func (r *ChatRepl) startNewSession() {
 	}
 	r.sess = sess
 	r.turn = 0
+	// M4-3 (review r1 F1): a new session must not inherit the previous
+	// conversation's carried Agent state — same reset as clearSession, for
+	// the same reason (see SessionCarry's doc comment).
+	r.carry = agent.NewSessionCarry()
 	r.persistModel()
 	r.ui.Info(fmt.Sprintf("  New session started: %s", sess.ID))
 }
@@ -1165,6 +1243,14 @@ func (r *ChatRepl) undoLastTurn() {
 		slog.Warn("undo: reload messages failed", "err", err)
 	}
 	r.sess.Messages = filterUnresolvedToolUses(msgs)
+
+	// M4-3 (review r1 F8): the removed messages invalidate the carried
+	// compaction anchor (lastInputTokens/lastTokenCountMsgs referred to a
+	// message count that no longer exists — estimateContextTokens's stale-
+	// anchor guard only catches the larger-shrink case) and any
+	// skill/breaker state built up during the undone turn. Reset the whole
+	// carry rather than only its anchors, matching /clear and /new.
+	r.carry = agent.NewSessionCarry()
 
 	r.ui.Info(fmt.Sprintf("  Undone %d messages.", removed))
 }

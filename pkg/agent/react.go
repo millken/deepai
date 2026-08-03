@@ -92,6 +92,23 @@ type Agent struct {
 	compactionStalled   bool
 	compactionStalledAt int
 
+	// turnInjection is the per-Run trailing message carrying the volatile
+	// content (date + memory injections) that used to be baked into the
+	// system prompt (M4-2). Computed once at the top of Run (see the call
+	// site there) and appended — never mutated in place — to every
+	// (re)built provider view via appendTurnInjection, so the request prefix
+	// (system prompt + tool schemas + canonical history) stays byte-stable
+	// across an entire Run for automatic prefix caching. Zero value before
+	// Run computes it is never observed by a request: buildTurnInjection
+	// always returns a non-empty date line, and it is set before the turn
+	// loop's first iteration. Exception: re-derived (still via
+	// buildTurnInjection, not mutated directly) when a "skill" tool call
+	// changes ActiveSkill() mid-Run, so the memory fence's activeSource
+	// tracks the actual active skill — see the skill-result handling below.
+	// "Once per Run" is therefore "once per activeSource segment": cheap,
+	// since a skill load is rare, not a per-request event.
+	turnInjection models.Message
+
 	// Memory integration
 	memoryService   *memory.Service
 	memoryExtractor memory.Extractor
@@ -99,6 +116,19 @@ type Agent struct {
 
 	// Skill tracking for memory source tagging
 	activeSkill atomic.Value // stores string
+
+	// appliedSkillPrompt is the exact skill-body string last appended to
+	// a.systemPrompt via AppendSystemPrompt (set alongside every such
+	// append — Run()'s start-of-Run reapply from a carried session, and
+	// the mid-Run skill-result handling below). Review M4-final F-M4-7:
+	// used for an EXACT-EQUALITY check (bodyAlreadyApplied) instead of
+	// re-deriving "is this body already applied?" via
+	// strings.Contains(a.systemPrompt, loadedSkillPrompt), which could
+	// false-positive on a short/degenerate body that happens to already be
+	// a substring of the base prompt, the file-op rule, or other assembled
+	// text — reporting "already applied" for a body that was never
+	// actually appended, and silently dropping a genuine reload.
+	appliedSkillPrompt string
 
 	// User interaction
 	userInteraction tools.UserInteraction
@@ -127,6 +157,13 @@ type Agent struct {
 	// silent drop is visible in logs without flooding when the slow consumer
 	// stays slow for many events in a row.
 	eventDropWarned atomic.Bool
+
+	// session carries state across successive single-use Agent Runs within
+	// one conversation (M4-3: breaker, active skill, compaction anchors —
+	// see SessionCarry's doc comment). nil unless AgentConfig.Session was
+	// set (the REPL's normal case); every other caller, including every
+	// subagent, leaves this nil and gets today's per-Run-only behavior.
+	session *SessionCarry
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -168,7 +205,7 @@ func New(cfg AgentConfig) *Agent {
 		agentType:           cfg.AgentType,
 		model:               resolveModel(cfg.Model),
 		reasoningEffort:     strings.TrimSpace(cfg.ReasoningEffort),
-		systemPrompt:        buildSystemPrompt(strings.TrimSpace(cfg.SystemPrompt), time.Now().Format("2006-01-02")),
+		systemPrompt:        strings.TrimSpace(cfg.SystemPrompt),
 		temperature:         cfg.Temperature,
 		maxTokens:           cfg.MaxTokens,
 		maxTurns:            maxTurns,
@@ -190,6 +227,23 @@ func New(cfg AgentConfig) *Agent {
 		imageDetail:         cfg.ImageDetail,
 		nonInteractive:      cfg.NonInteractive,
 		agentCatalog:        cfg.AgentCatalog,
+		session:             cfg.Session,
+	}
+
+	// M4-3: prime the compaction anchor/stall bookkeeping from the carried
+	// session, if any, so this fresh Run's first estimate isn't blind to the
+	// previous Run's real provider-reported count (see estimateContextTokens
+	// and maybeCompact's doc comments). The active-skill/breaker carriage
+	// happens in Run() instead (see the comments there) since a skill's
+	// system-prompt append must happen AFTER the caller's own post-New()
+	// AppendSystemPrompt calls (e.g. the REPL appends the skill catalog
+	// after New() returns) for removeSkillDescriptions to find anything to
+	// strip.
+	if cfg.Session != nil {
+		a.lastInputTokens = cfg.Session.lastInputTokens
+		a.lastTokenCountMsgs = cfg.Session.lastTokenCountMsgs
+		a.compactionStalled = cfg.Session.compactionStalled
+		a.compactionStalledAt = cfg.Session.compactionStalledAt
 	}
 
 	// Register plan mode tools (agent self-references via closures). Skipped for
@@ -244,8 +298,37 @@ func (a *Agent) AppendSystemPrompt(extra string) {
 func (a *Agent) removeSkillDescriptions() {
 	const marker = "Available skills (use the matching skill when the user request fits):"
 	idx := strings.Index(a.systemPrompt, marker)
-	if idx > 0 {
-		a.systemPrompt = strings.TrimSpace(a.systemPrompt[:idx])
+	if idx <= 0 {
+		return
+	}
+	before := strings.TrimSpace(a.systemPrompt[:idx])
+	// Review r1 F2: this used to truncate EVERYTHING after the marker
+	// (a.systemPrompt[:idx] and nothing else), which silently and
+	// permanently discarded whatever the caller appended AFTER the catalog
+	// — e.g. the REPL appends the skill catalog and THEN the CLI/DEEPAI.md
+	// system prompt (repl.go's runTurn, two AppendSystemPrompt calls right
+	// after New()). Since M4-3 carries a loaded skill across Runs (this
+	// function now runs at the top of every subsequent Run, not just once
+	// per turn), that loss became permanent for the rest of the
+	// conversation instead of lasting only the remainder of one turn.
+	// Excise ONLY the catalog block itself: AppendSystemPrompt always joins
+	// sections with exactly "\n\n", so the first such boundary after the
+	// marker is where the catalog ends and whatever was appended after it
+	// begins — preserve that tail. If no such boundary exists, the catalog
+	// was the last thing appended and there is nothing to preserve, which
+	// reduces to the original behavior for that case.
+	rest := a.systemPrompt[idx:]
+	after := ""
+	if sep := strings.Index(rest, "\n\n"); sep >= 0 {
+		after = strings.TrimSpace(rest[sep+2:])
+	}
+	switch {
+	case before == "":
+		a.systemPrompt = after
+	case after == "":
+		a.systemPrompt = before
+	default:
+		a.systemPrompt = before + "\n\n" + after
 	}
 }
 
@@ -280,8 +363,27 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	a.runMu.Unlock()
 	defer a.closeEvents()
 
-	// Reset skill tracking for this run.
-	a.activeSkill.Store("")
+	// M4-3: initialize skill tracking for this Run from the carried session
+	// instead of unconditionally resetting to "" — a skill loaded by a
+	// previous Run sharing this session (a different, single-use Agent
+	// instance) must stay active here too, or the "Available skills"
+	// catalog gets re-shown and M4-2's memory fence loses its cross-turn
+	// activeSource. Reapplying session.skillPrompt here (rather than in
+	// New()) is deliberate: it must run AFTER the caller's own post-New()
+	// AppendSystemPrompt calls (e.g. the REPL appends the skill catalog and
+	// its own system prompt after New() returns, before calling Run) so
+	// removeSkillDescriptions below actually finds the catalog marker to
+	// strip — calling this in New() would run before that marker exists.
+	initialSkill := ""
+	if a.session != nil {
+		initialSkill = a.session.activeSkill
+		if a.session.skillPrompt != "" {
+			a.removeSkillDescriptions()
+			a.AppendSystemPrompt(a.session.skillPrompt)
+			a.appliedSkillPrompt = a.session.skillPrompt
+		}
+	}
+	a.activeSkill.Store(initialSkill)
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -308,12 +410,38 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	}
 
 	runMessages := append([]models.Message(nil), messages...)
+
+	// M4-2: compute the per-Run turn injection (date + memory) exactly ONCE,
+	// from the runMessages present at Run start — see buildTurnInjection's
+	// doc comment for the full rationale (prefix stability + the async
+	// memory-extraction cadence making intra-run recomputation pointless).
+	// Every (re)build of the provider view below appends this via
+	// appendTurnInjection instead of BuildSystemPrompt baking volatile
+	// content into the request prefix.
+	a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
+
 	usage := &Usage{}
 	// breaker holds all circuit-breaker state (validation-failure loop and
 	// repeat-call loop). Both the serial and parallel tool-execution paths
 	// below feed every (call, result) pair through breaker.observe in batch
 	// order, so the two paths enforce identical limits from one implementation.
-	breaker := newToolCallBreaker()
+	//
+	// M4-3: when a session is carried, reuse (and lazily create, once) its
+	// breaker instead of a fresh one — the SAME *toolCallBreaker is then
+	// mutated in place by this Run and read again, unchanged, by the next
+	// Run sharing this session (see SessionCarry's doc comment for the
+	// single-goroutine access contract this relies on). A subagent's
+	// AgentConfig never sets Session (see subagent.go), so this is a no-op
+	// there: every subagent Run still gets its own fresh breaker.
+	var breaker *toolCallBreaker
+	if a.session != nil {
+		if a.session.breaker == nil {
+			a.session.breaker = newToolCallBreaker()
+		}
+		breaker = a.session.breaker
+	} else {
+		breaker = newToolCallBreaker()
+	}
 	// taskCallCount is the per-Run fan-out cap counter (M2-2 12c): persists
 	// across turns (NOT reset per turn), incremented only for "task" tool
 	// calls, and checked before execution in both the serial and parallel
@@ -346,22 +474,16 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 		// Assemble the system prompt ONCE per turn, before the compaction check,
 		// so the check measures the same prompt the request below actually
-		// sends (BuildSystemPrompt layers memory injections, the file-op rule,
-		// tool recommendations, the delegation prompt + catalog, and plan-mode
-		// text on top of the base a.systemPrompt — all of that was previously
-		// invisible to the compaction trigger). Built from PRE-compaction
-		// runMessages: BuildSystemPrompt's memory relevance context is a
-		// heuristic (a recency-based excerpt), so it doesn't need the
-		// post-compaction view to stay correct, and rebuilding it a second time
-		// after compaction would cost another memory-service round trip for a
-		// once-per-turn compaction check. Not recomputed even if compaction
-		// fires below — a behavior consequence worth noting: on a turn where
-		// compaction fires, the synchronous memory flush below runs (and
-		// writes its extracted facts to storage) AFTER this BuildSystemPrompt
-		// call, so the injected memory this turn still reflects PRE-flush
-		// state; facts the flush just extracted only become visible to
-		// InjectWithContext/InjectScopeWithContext starting next turn.
-		systemPrompt := a.BuildSystemPrompt(ctx, sessionID, runMessages)
+		// sends (BuildSystemPrompt layers the file-op rule, tool
+		// recommendations, the delegation prompt + catalog, and plan-mode text
+		// on top of the base a.systemPrompt — all of that was previously
+		// invisible to the compaction trigger). M4-2: BuildSystemPrompt no
+		// longer layers memory injections — those, plus the date, now live in
+		// a.turnInjection (computed once per Run, above) and are appended to
+		// the provider view below via appendTurnInjection instead of being
+		// baked into this prefix, so this prefix stays byte-stable across an
+		// entire Run (automatic prefix caching on OpenAI-compat providers).
+		systemPrompt := a.BuildSystemPrompt()
 
 		// T1/T4: derive a per-request compressed prompt view from the canonical
 		// runMessages. When aging is disabled this is a zero-copy pass-through.
@@ -369,109 +491,15 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// never modified — only the view sent to the provider is compressed.
 		// Computed before the compaction check (and recomputed after, if
 		// compaction fires) so the check measures what is actually sent, not
-		// canonical history that aging may have shrunk considerably.
+		// canonical history that aging may have shrunk considerably. Does NOT
+		// yet include a.turnInjection — maybeCompact appends it (via
+		// appendTurnInjection) to both its internal estimate and its returned
+		// view, exactly once, whether or not compaction actually fires.
 		promptView := buildPromptView(runMessages, a.aging, a.contextWindow)
 
-		// Clear a previous stall once new material has slid into the
-		// compactable region: enough messages have been appended since the
-		// stall point that the messages protected as the tail back then are
-		// no longer the tail now, so a fresh compaction attempt has new
-		// ground to work with instead of just re-deriving the same
-		// inconclusive result.
-		if a.compactionStalled && len(runMessages) >= a.compactionStalledAt+a.compactionKeepTail {
-			a.compactionStalled = false
-		}
-
-		// Context compaction: compress old messages when approaching context window.
-		// Skipped entirely while compactionStalled is set: a previous turn
-		// already discovered that compacting doesn't bring the ratio back
-		// under threshold, and re-evaluating and re-compacting every
-		// subsequent turn before enough new material has accumulated (see
-		// the unstall check above) would only thrash (repeated synchronous
-		// memory flushes and re-deriving the same inconclusive compaction)
-		// for no benefit.
-		if a.contextWindow > 0 && !a.compactionStalled {
-			// Measure the assembled prompt + aged view (what the request below
-			// actually sends), not canonical messages or the base system prompt —
-			// otherwise compaction can fire too late (assembled prompt bigger than
-			// base) or too early (aged view much smaller than canonical, so
-			// compacting on the canonical estimate destroys history the provider
-			// was never even going to see). Tool schemas are sent on every request
-			// too; estimateContextTokens adds them internally.
-			estimated := a.estimateContextTokens(promptView, systemPrompt)
-			ratio := float64(estimated) / float64(a.contextWindow)
-			if ratio >= a.compactionThreshold {
-				before := len(runMessages)
-				compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
-				if didCompact {
-					// Flush memory synchronously before compaction to guarantee no
-					// data loss. This blocks while the LLM extracts, but compaction
-					// is infrequent and losing information is worse than the
-					// latency cost. Moved inside didCompact (rather than gated only
-					// on ratio >= threshold) so a trigger turn where
-					// compactMessages finds nothing left to compact — already at
-					// the head/tail floor — doesn't still pay a 30s-timeout flush
-					// for a compaction that's not going to happen.
-					if a.memoryService != nil && a.memoryExtractor != nil {
-						// Cancel any queued update for this session so the
-						// stale async job won't overwrite our sync flush.
-						a.memoryService.CancelPendingUpdates(sessionID)
-						flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
-						if skillName := a.ActiveSkill(); skillName != "" {
-							_ = a.memoryService.UpdateWithFactSource(flushCtx, sessionID, runMessages, a.memoryExtractor, "skill:"+skillName)
-						} else {
-							_ = a.memoryService.UpdateWith(flushCtx, sessionID, runMessages, a.memoryExtractor)
-						}
-						flushCancel()
-					}
-
-					runMessages = compacted
-					a.lastInputTokens = 0
-					a.lastTokenCountMsgs = 0
-					// Canonical messages changed; the view sent to the provider
-					// must be re-derived from them.
-					promptView = buildPromptView(runMessages, a.aging, a.contextWindow)
-
-					afterEstimated := a.estimateContextTokens(promptView, systemPrompt)
-					if afterEstimated > a.contextWindow {
-						for tail := a.compactionKeepTail - 1; tail >= 2; tail-- {
-							c2, ok := compactMessages(runMessages, tail)
-							if ok {
-								runMessages = c2
-							}
-							promptView = buildPromptView(runMessages, a.aging, a.contextWindow)
-							afterEstimated = a.estimateContextTokens(promptView, systemPrompt)
-							if afterEstimated <= a.contextWindow {
-								break
-							}
-						}
-					}
-
-					afterRatio := float64(afterEstimated) / float64(a.contextWindow)
-					a.logger.Debug("context compaction", "turn", turn, "before_msgs", before, "after_msgs", len(runMessages), "before_tokens", estimated, "after_tokens", afterEstimated, "before_ratio", fmt.Sprintf("%.2f", ratio), "after_ratio", fmt.Sprintf("%.2f", afterRatio))
-					emit(AgentEvent{
-						Type: AgentEventCompact,
-						CompactStats: &CompactStats{
-							MessagesBefore: before,
-							MessagesAfter:  len(runMessages),
-							InputTokens:    estimated,
-							AfterTokens:    afterEstimated,
-							ContextWindow:  a.contextWindow,
-							Ratio:          ratio,
-							AfterRatio:     afterRatio,
-						},
-					})
-					if afterRatio >= a.compactionThreshold {
-						a.compactionStalled = true
-						a.compactionStalledAt = len(runMessages)
-						a.logger.Warn("context compaction did not drop the ratio under threshold; suppressing "+
-							"further compaction attempts until enough new messages accumulate to make the "+
-							"current tail compactable again", "turn", turn, "after_tokens", afterEstimated,
-							"context_window", a.contextWindow, "threshold", a.compactionThreshold)
-					}
-				}
-			}
-		}
+		// Unstall check + threshold-triggered compaction (memory flush,
+		// escalating retry, stall bookkeeping) — see maybeCompact.
+		runMessages, promptView = a.maybeCompact(ctx, sessionID, turn, runMessages, promptView, systemPrompt, emit)
 
 		// Phase 0 auxiliary metric: byte breakdown of the outgoing prompt.
 		// Captured before the request; combined with the provider's real token
@@ -549,10 +577,16 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			accumulateUsage(usage, streamUsage)
 			if streamUsage.InputTokens > 0 {
 				// The assistant message for this turn isn't appended yet, so
-				// len(runMessages) is exactly the message set the provider just
-				// counted. Anchor here so later estimates add only the growth.
-				a.lastInputTokens = streamUsage.InputTokens
-				a.lastTokenCountMsgs = len(runMessages)
+				// len(runMessages) is exactly the CANONICAL message set the
+				// provider just counted. lastInputTokens, however, is the
+				// provider's count for the VIEW actually sent — which (via
+				// maybeCompact) had a.turnInjection appended at its tail, one
+				// message beyond len(runMessages). estimateContextTokens's
+				// anchor path accounts for that offset explicitly (see its
+				// doc comment): it must not re-add the injection's bytes via
+				// the delta, since lastInputTokens already priced in that
+				// exact (Run-constant) content once.
+				a.setTokenAnchor(streamUsage.InputTokens, len(runMessages))
 			}
 		}
 
@@ -716,59 +750,15 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				}()
 			}
 			wg.Wait()
-			batchClean := true
-			// pendingHints accumulates breaker hint messages during the batch;
-			// they are appended to runMessages only after the batch's last
-			// tool result so a hint (RoleHuman) never lands between an
-			// assistant tool_calls message and any of its tool results (M1-7).
-			var pendingHints []models.Message
-			for i, call := range toolCalls {
-				result := results[i]
-				addSubagentUsage(usage, result)
-				offloaded := a.offloadIfNeeded(&result, a.offloadDir)
-				runMessages = appendToolResultMessage(runMessages, sessionID, result)
-				if a.metrics != nil {
-					// M1.2: Enhanced metrics collection
-					argsHash := computeArgsHash(call.Arguments)
-					filePath := extractPathFromArgs(result.ToolName, call.Arguments)
-					durationMs := result.Duration.Milliseconds()
 
-					a.metrics.RecordToolResult(ToolResultMetric{
-						Turn:        turn,
-						ToolName:    result.ToolName,
-						ResultBytes: len(result.Content),
-						ArgsHash:    argsHash,
-						Path:        filePath,
-						Offloaded:   offloaded,
-						DurationMs:  durationMs,
-					})
-				}
-				toolMessage := runMessages[len(runMessages)-1]
-				emit(AgentEvent{
-					Type:      AgentEventToolResult,
-					MessageID: toolMessage.ID,
-					Result:    &result,
-					ToolEvent: newToolEventFromResult(call, result),
-				})
-				completed := runningCalls[i]
-				completed.Status = result.Status
-				completed.CompletedAt = result.CompletedAt
-				emit(AgentEvent{
-					Type:      AgentEventToolCallEnd,
-					MessageID: toolMessage.ID,
-					ToolCall:  &completed,
-					Result:    &result,
-					ToolEvent: newToolEventFromResult(completed, result),
-				})
-				// Circuit-breaker bookkeeping — identical logic to the serial
-				// path below, run through the shared helper in batch order.
-				obs := breaker.observe(sessionID, call, result)
-				if len(obs.hintMessages) > 0 {
-					pendingHints = append(pendingHints, obs.hintMessages...)
-				}
-				if obs.validationFailure {
-					batchClean = false
-				}
+			// Per-result bookkeeping (usage rollup, offload, message
+			// append, metrics, events, breaker observation) is identical to
+			// the serial path below — run through the shared helper, in
+			// batch order, so both paths enforce identical limits and
+			// invariants from one implementation. See toolBatchState.
+			batch := newToolBatchState(a, sessionID, turn, breaker, usage, emit, runMessages)
+			for i, call := range toolCalls {
+				obs := batch.handleResult(call, results[i], runningCalls[i])
 				if obs.fatalErr != nil {
 					// Invariant that matters here: every tool_use ID on the
 					// assistant message that started this batch MUST have a
@@ -778,45 +768,21 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					// permanently poison the session. results[i+1:] were
 					// already computed by the goroutines above (the whole
 					// batch runs concurrently before this observation loop
-					// starts), so append them now even though the breaker
-					// already decided to stop; skip metrics/events for them
-					// to keep this simple, since only the tool_result
-					// pairing invariant is required for correctness. Usage
-					// roll-up (M1) is NOT skipped, though — these results
-					// still represent real subagent token consumption that
-					// already happened and must not be silently dropped from
-					// RunResult.Usage just because the breaker tripped on an
-					// earlier result in the same batch.
-					for j := i + 1; j < len(toolCalls); j++ {
-						addSubagentUsage(usage, results[j])
-						// Mirror the normal per-index loop above: a large
-						// trailing result must still be shrunk to its
-						// offload stub before being persisted, or it lands
-						// in runMessages at full size (M1 gap — the normal
-						// path applies offload before appending, this tail
-						// loop did not).
-						a.offloadIfNeeded(&results[j], a.offloadDir)
-						runMessages = appendToolResultMessage(runMessages, sessionID, results[j])
-					}
-					// Append any pending hints only AFTER every tool result of
-					// this batch (including the tail append above) — a hint
-					// (RoleHuman) must never land between the assistant
-					// tool_calls message that started this batch and any of
-					// its tool results (M1-7), and flushing it before the
-					// tail append violated that invariant on the fatal path.
-					if len(pendingHints) > 0 {
-						runMessages = append(runMessages, pendingHints...)
-					}
+					// starts), so append them now (usage + offload only,
+					// matching the original tail loop's scope) even though
+					// the breaker already decided to stop, then flush any
+					// pending hints only AFTER every tool result of this
+					// batch — a hint (RoleHuman) must never land between the
+					// assistant tool_calls message that started this batch
+					// and any of its tool results (M1-7).
+					batch.appendRemaining(results[i+1:])
+					batch.flushPendingHints()
 					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
-					return &RunResult{Messages: runMessages, Usage: usage}, obs.fatalErr
+					return &RunResult{Messages: batch.runMessages, Usage: usage}, obs.fatalErr
 				}
 			}
-			if len(pendingHints) > 0 {
-				runMessages = append(runMessages, pendingHints...)
-			}
-			if batchClean {
-				breaker.resetOnCleanBatch()
-			}
+			batch.finishBatch()
+			runMessages = batch.runMessages
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
@@ -825,12 +791,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			continue
 		}
 
-		batchClean := true
-		// pendingHints accumulates breaker hint messages during the batch;
-		// they are appended to runMessages only after the batch's last tool
-		// result so a hint (RoleHuman) never lands between an assistant
-		// tool_calls message and any of its tool results (M1-7).
-		var pendingHints []models.Message
+		// Per-result bookkeeping mirrors the parallel path above — see
+		// toolBatchState.
+		batch := newToolBatchState(a, sessionID, turn, breaker, usage, emit, runMessages)
 		for idx, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
@@ -860,67 +823,107 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// If a skill was loaded, inject its body into the system prompt
 			// so it doesn't need to be repeated in every turn's history.
 			if result.ToolName == "skill" {
-				if m, ok := result.Data["system_prompt"]; ok {
-					if sp, _ := m.(string); sp != "" {
-						a.removeSkillDescriptions()
-						a.AppendSystemPrompt(sp)
-					}
+				skillName, _ := result.Data["skill_name"].(string)
+				loadedSkillPrompt, _ := result.Data["system_prompt"].(string)
+
+				// Review r1 F7 (dedup) + review r2 F2-b (guard property
+				// fixed) + review M4-final F-M4-7 (exact-equality, not
+				// substring): if the model reloads a skill whose body is
+				// ALREADY present in the system prompt, reapplying would
+				// duplicate it verbatim — doubling its token cost for the
+				// rest of the turn. r1's guard keyed this off the skill
+				// NAME alone (skillName == a.ActiveSkill()), which diverges
+				// from the actual property ("this body is already in
+				// a.systemPrompt") in exactly the state the r2 F11 fix
+				// makes durable: activeSkill set but skillPrompt=="" (an
+				// empty-bodied load carried across a Run boundary) — the
+				// name matches on a later real-body reload of the SAME
+				// skill, but nothing was ever actually applied. r2 fixed
+				// that by additionally requiring strings.Contains(a.
+				// systemPrompt, loadedSkillPrompt) — but a substring check
+				// can itself false-positive: a short/degenerate body that
+				// happens to already appear as a substring of the base
+				// prompt (or the file-op rule, or anything else assembled
+				// into a.systemPrompt) would report "already applied" for a
+				// body that was never actually appended, silently dropping
+				// a genuine reload. Compare against a.appliedSkillPrompt
+				// (the EXACT string this Agent itself last appended, set
+				// alongside every AppendSystemPrompt call for a skill body)
+				// instead: same name AND byte-for-byte the same body that
+				// was actually applied, so a later reload with a
+				// DIFFERENT body — even one that happens to collide with
+				// unrelated prompt text — still gets applied exactly once.
+				bodyAlreadyApplied := loadedSkillPrompt != "" && skillName != "" && skillName == a.ActiveSkill() &&
+					loadedSkillPrompt == a.appliedSkillPrompt
+				if loadedSkillPrompt != "" && !bodyAlreadyApplied {
+					a.removeSkillDescriptions()
+					a.AppendSystemPrompt(loadedSkillPrompt)
+					a.appliedSkillPrompt = loadedSkillPrompt
 				}
 				// Track active skill for memory source tagging.
-				if skillName, ok := result.Data["skill_name"]; ok {
-					if name, _ := skillName.(string); name != "" {
-						a.activeSkill.Store(name)
+				if skillName != "" {
+					// Review r2 F7-a: capture whether this load actually
+					// changes activeSource (the turn injection's memory
+					// fence key, "skill:"+ActiveSkill()) BEFORE overwriting
+					// a.activeSkill below — a same-skill reload (whether its
+					// body is empty, a duplicate, or newly real per the F2-b
+					// fix above) leaves activeSource unchanged, so the
+					// recompute a few lines down would be pure wasted work
+					// (an extra memory-service round trip) with nothing to
+					// show for it.
+					activeSourceChanged := skillName != a.ActiveSkill()
+					a.activeSkill.Store(skillName)
+					// M4-3: write the loaded skill back onto the carried
+					// session (if any) so the NEXT Run sharing this
+					// session (a fresh, single-use Agent) starts with it
+					// already active instead of forgetting it — see
+					// react.go's Run() start, which reapplies
+					// session.skillPrompt/activeSkill the same way.
+					if a.session != nil {
+						a.session.activeSkill = skillName
+						// Review r1 F11: only overwrite the carried body
+						// when a NEW, non-empty one was actually returned.
+						// A skill result with skill_name set but an empty
+						// system_prompt (e.g. a skill whose rendered body is
+						// genuinely empty) must not wipe out a previously
+						// carried body while leaving activeSkill pointed at
+						// this name — that would leave the next Run
+						// reporting ActiveSkill()==name with no body and an
+						// un-stripped catalog.
+						if loadedSkillPrompt != "" {
+							a.session.skillPrompt = loadedSkillPrompt
+						}
+					}
+					// M4-2 fix: the once-per-Run turn injection (computed at
+					// Run start — see buildTurnInjection's doc comment) is
+					// built from a.ActiveSkill() as of that moment: "" on a
+					// session-less Run, or the carried skill from a previous
+					// Run when one is carried (M4-3). Recompute only when
+					// activeSourceChanged (this load switched ActiveSkill()
+					// to a genuinely different skill), so the injection's
+					// memory content is re-fenced to it. Review r2 F7-a:
+					// skipping the recompute on a same-skill reload (the
+					// common alternative to activeSourceChanged) fixes two
+					// things at once — it avoids the extra memory-service
+					// round trip when nothing about activeSource changed,
+					// and it retires the old comment's now-conditionally-
+					// false claim that "AppendSystemPrompt just above
+					// already grew the system prompt this turn" (true when
+					// the F2-b reapply fired, but the reapply is skipped
+					// entirely when the body was already present — this
+					// branch no longer runs in that case at all, so the
+					// claim never needs to hold here). "Once per Run" really
+					// means "once per activeSource segment" — a skill load
+					// changing to a genuinely different active skill is the
+					// only thing that changes activeSource mid-Run, and
+					// it's a rare event, not a per-request one.
+					if activeSourceChanged {
+						a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
 					}
 				}
 			}
 
-			addSubagentUsage(usage, result)
-			offloaded := a.offloadIfNeeded(&result, a.offloadDir)
-			runMessages = appendToolResultMessage(runMessages, sessionID, result)
-			if a.metrics != nil {
-				// M1.2: Enhanced metrics collection
-				argsHash := computeArgsHash(call.Arguments)
-				filePath := extractPathFromArgs(result.ToolName, call.Arguments)
-				durationMs := result.Duration.Milliseconds()
-
-				a.metrics.RecordToolResult(ToolResultMetric{
-					Turn:        turn,
-					ToolName:    result.ToolName,
-					ResultBytes: len(result.Content),
-					ArgsHash:    argsHash,
-					Path:        filePath,
-					Offloaded:   offloaded,
-					DurationMs:  durationMs,
-				})
-			}
-			toolMessage := runMessages[len(runMessages)-1]
-			emit(AgentEvent{
-				Type:      AgentEventToolResult,
-				MessageID: toolMessage.ID,
-				Result:    &result,
-				ToolEvent: newToolEventFromResult(call, result),
-			})
-			completedCall := runningCall
-			completedCall.Status = result.Status
-			completedCall.CompletedAt = result.CompletedAt
-			emit(AgentEvent{
-				Type:      AgentEventToolCallEnd,
-				MessageID: toolMessage.ID,
-				ToolCall:  &completedCall,
-				Result:    &result,
-				ToolEvent: newToolEventFromResult(completedCall, result),
-			})
-
-			// Circuit-breaker bookkeeping (repeat-call loop, then
-			// validation-failure loop) via the shared helper — see
-			// toolCallBreaker.observe for the combined logic.
-			obs := breaker.observe(sessionID, call, result)
-			if len(obs.hintMessages) > 0 {
-				pendingHints = append(pendingHints, obs.hintMessages...)
-			}
-			if obs.validationFailure {
-				batchClean = false
-			}
+			obs := batch.handleResult(call, result, runningCall)
 			if obs.fatalErr != nil {
 				// Invariant that matters here: every tool_use ID on the
 				// assistant message that started this batch MUST have a
@@ -928,44 +931,26 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// request is malformed. Unlike the parallel path, the serial
 				// loop never executed the remaining calls in this batch —
 				// there are no computed results to append, so synthesize a
-				// failed placeholder for each one instead.
-				for _, remaining := range toolCalls[idx+1:] {
-					synthetic := models.ToolResult{
-						CallID:      remaining.ID,
-						ToolName:    remaining.Name,
-						Status:      models.CallStatusFailed,
-						Error:       "not executed: batch aborted by circuit breaker",
-						CompletedAt: time.Now().UTC(),
-					}
-					runMessages = appendToolResultMessage(runMessages, sessionID, synthetic)
-				}
-				// Append any pending hints only AFTER the synthesized tail
-				// results above — a hint (RoleHuman) must never land between
-				// the assistant tool_calls message that started this batch
-				// and any of its tool results (M1-7); flushing it before the
-				// synthesize loop violated that invariant.
-				if len(pendingHints) > 0 {
-					runMessages = append(runMessages, pendingHints...)
-				}
+				// failed placeholder for each one instead, then flush any
+				// pending hints only AFTER those synthesized results — a
+				// hint (RoleHuman) must never land between the assistant
+				// tool_calls message that started this batch and any of its
+				// tool results (M1-7).
+				batch.appendSynthesizedFailures(toolCalls[idx+1:])
+				batch.flushPendingHints()
 				emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
-				return &RunResult{Messages: runMessages, Usage: usage}, obs.fatalErr
+				return &RunResult{Messages: batch.runMessages, Usage: usage}, obs.fatalErr
 			}
 
 			if err := ctx.Err(); err != nil {
-				if len(pendingHints) > 0 {
-					runMessages = append(runMessages, pendingHints...)
-				}
+				batch.flushPendingHints()
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
+				return &RunResult{Messages: batch.runMessages, Usage: usage}, err
 			}
 		}
-		if len(pendingHints) > 0 {
-			runMessages = append(runMessages, pendingHints...)
-		}
-		if batchClean {
-			breaker.resetOnCleanBatch()
-		}
+		batch.finishBatch()
+		runMessages = batch.runMessages
 	}
 }
 

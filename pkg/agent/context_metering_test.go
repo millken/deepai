@@ -417,7 +417,7 @@ func TestCompactionTrigger_UnstallsAsHistoryGrows(t *testing.T) {
 			"past its window", compactions, totalCalls, minCompactions)
 	}
 
-	finalSystemPrompt := a.BuildSystemPrompt(context.Background(), "sess-unstall", result.Messages)
+	finalSystemPrompt := a.BuildSystemPrompt()
 	finalView := buildPromptView(result.Messages, a.aging, a.contextWindow)
 	finalEstimate := a.estimateContextTokens(finalView, finalSystemPrompt)
 	if maxAllowed := a.contextWindow * 3; finalEstimate > maxAllowed {

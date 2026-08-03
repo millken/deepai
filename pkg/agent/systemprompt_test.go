@@ -27,7 +27,7 @@ func TestT5c_FileOpRuleAppendedWhenToolsPresent(t *testing.T) {
 	}
 	a := New(AgentConfig{LLMProvider: &captureProvider{}, Tools: reg, Model: "m"})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if got := strings.Count(sp, "File-operation rule:"); got != 1 {
 		t.Errorf("file-op rule count = %d, want exactly 1:\n%s", got, sp)
 	}
@@ -38,7 +38,7 @@ func TestT5c_FileOpRuleAppendedWhenToolsPresent(t *testing.T) {
 func TestT5c_FileOpRuleOmittedWithoutFileTools(t *testing.T) {
 	a := New(AgentConfig{LLMProvider: &captureProvider{}, Tools: tools.NewRegistry(), Model: "m"})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if strings.Contains(sp, "File-operation rule:") {
 		t.Errorf("agent without read_file should not carry the file-op rule:\n%s", sp)
 	}
@@ -57,7 +57,7 @@ func TestT5c_FileOpRulePresentWithAnyFileTool(t *testing.T) {
 	})
 	a := New(AgentConfig{LLMProvider: &captureProvider{}, Tools: reg, Model: "m"})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if !strings.Contains(sp, "File-operation rule:") {
 		t.Errorf("agent with edit_file (sans read_file) must still carry the file-op rule:\n%s", sp)
 	}
@@ -95,7 +95,7 @@ func TestTeamDelegation_InjectedWithTaskToolAndCatalog(t *testing.T) {
 		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
 	})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if !strings.Contains(sp, "Team Delegation") {
 		t.Errorf("delegation prompt missing:\n%s", sp)
 	}
@@ -134,7 +134,7 @@ func TestTeamDelegation_OmittedForSubagent(t *testing.T) {
 		AgentCatalog:   []AgentInfo{{Type: "coder", Description: "writes code"}},
 	})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if strings.Contains(sp, "Team Delegation") {
 		t.Errorf("sub-agent should not get delegation prompt:\n%s", sp)
 	}
@@ -150,7 +150,7 @@ func TestTeamDelegation_OmittedWithoutTaskTool(t *testing.T) {
 		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
 	})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if strings.Contains(sp, "Team Delegation") {
 		t.Errorf("agent without task tool should not get delegation prompt:\n%s", sp)
 	}
@@ -172,7 +172,7 @@ func TestTeamDelegation_OmittedWithEmptyCatalog(t *testing.T) {
 		Model:       "m",
 	})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if strings.Contains(sp, "Team Delegation") {
 		t.Errorf("agent with empty catalog should not get delegation prompt:\n%s", sp)
 	}
@@ -205,7 +205,7 @@ func TestTeamDelegation_OmittedInPlanMode(t *testing.T) {
 		AgentCatalog: []AgentInfo{{Type: "coder", Description: "writes code"}},
 	})
 
-	sp := a.BuildSystemPrompt(context.Background(), "s", nil)
+	sp := a.BuildSystemPrompt()
 	if strings.Contains(sp, "Team Delegation") {
 		t.Errorf("plan mode must not show delegation prompt:\n%s", sp)
 	}

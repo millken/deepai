@@ -282,33 +282,62 @@ func (a *Agent) toolSchemaBytes() int {
 // request will occupy. Callers MUST pass the same two things the request
 // actually sends: the message VIEW (the aged prompt view when aging is
 // enabled, not necessarily canonical runMessages) and the fully ASSEMBLED
-// system prompt (BuildSystemPrompt's output — base prompt plus memory
-// injections, the file-op rule, tool recommendations, the delegation prompt +
-// catalog, and plan-mode text — not the bare a.systemPrompt). Measuring
-// anything else (canonical messages, or the base prompt alone) either
-// compacts too late — the assembled prompt is bigger than the base one — or
-// compacts unnecessarily — canonical history can be far bigger than the aged
-// view that is actually sent, permanently destroying history the provider
-// never even saw.
+// system prompt (BuildSystemPrompt's output — base prompt, the file-op rule,
+// tool recommendations, the delegation prompt + catalog, and plan-mode text —
+// not the bare a.systemPrompt). BuildSystemPrompt does NOT layer memory
+// injections (M4-2 removed that — those, plus the date, now ride the
+// separate per-Run trailing turn injection appended via appendTurnInjection;
+// see buildTurnInjection's doc comment): every call site in this package
+// passes view WITH that injection already appended (never systemPrompt with
+// it baked in), which is how the injection's bytes get counted at all here.
+// Measuring anything else (canonical messages, or the base prompt alone, or
+// systemPrompt without also appending the injection to view) either compacts
+// too late — the assembled prompt is bigger than the base one — or compacts
+// unnecessarily — canonical history can be far bigger than the aged view
+// that is actually sent, permanently destroying history the provider never
+// even saw.
 //
 // It prefers the provider's own reported input-token count from the previous
 // response — accurate for the model's real tokenizer, which the byte
 // heuristic underestimates for CJK/multi-byte text — plus a byte estimate of
 // any messages appended since that count was taken. The anchor
 // (lastInputTokens/lastTokenCountMsgs) is reset to zero at every compaction
-// site, so whenever it is set the first lastTokenCountMsgs entries of view are
-// exactly what the provider counted (buildPromptView never changes message
-// count, only content, so indices into view and into the canonical slice it
-// was derived from always agree). Falls back to the pure byte heuristic (plus
-// tool schemas) before the first response or right after a compaction reset.
+// site via setTokenAnchor — the SINGLE write mechanism for both fields (see
+// its doc comment); every reset in this package, including
+// compactOnOverflow's, goes through it — so whenever the anchor is set, the
+// first lastTokenCountMsgs entries of view are exactly what SOME request
+// counted (buildPromptView never changes message count, only content, so
+// indices into view and into the canonical slice it was derived from always
+// agree). "Some request" rather than "this Agent's own previous request" is
+// deliberate: M4-3 (SessionCarry) lets New() PRIME a brand-new Agent's
+// anchor from a carried session — i.e. from a DIFFERENT Agent's prior Run —
+// so this invariant holds across the REPL's per-turn Agent churn, not only
+// within a single Run (setTokenAnchor mirrors onto the session on every
+// write, so the two can never disagree). Falls back to the pure byte
+// heuristic (plus tool schemas) before the first response, right after a
+// compaction reset, or when nothing was ever carried.
 func (a *Agent) estimateContextTokens(view []models.Message, systemPrompt string) int {
 	heuristic := estimateTokens(view, systemPrompt, 0) + a.toolSchemaTokens()
-	if a.lastInputTokens <= 0 || a.lastTokenCountMsgs <= 0 || a.lastTokenCountMsgs > len(view) {
+	if a.lastInputTokens <= 0 || a.lastTokenCountMsgs <= 0 || len(view) == 0 || a.lastTokenCountMsgs > len(view)-1 {
 		return heuristic
 	}
-	// lastInputTokens already covers the system prompt, tool schemas, and the
-	// first lastTokenCountMsgs messages; add only the growth since the anchor.
-	delta := estimateTokens(view[a.lastTokenCountMsgs:], "", 0)
+	// lastInputTokens already covers the system prompt, tool schemas, the
+	// first lastTokenCountMsgs CANONICAL messages, AND the trailing turn
+	// injection (M4-2) that was appended to THAT request's view — react.go
+	// sets lastTokenCountMsgs from len(runMessages) (canonical, never
+	// includes the injection), but the provider's real count it pairs with
+	// (lastInputTokens) was for a view that DID have a.turnInjection appended
+	// at the tail. Since a.turnInjection is constant per activeSource segment
+	// (recomputed only on a mid-Run skill load; that one turn's estimate is
+	// off by the injection size delta until the next response re-anchors), that
+	// already-counted copy stands in for "the current injection's cost" —
+	// the delta below must therefore span only view[lastTokenCountMsgs :
+	// len(view)-1], i.e. the genuinely new canonical growth since the
+	// anchor, EXCLUDING the freshly re-appended injection at view's tail
+	// (view[len(view)-1]). Including it would double-count the injection's
+	// bytes every single turn (once via lastInputTokens, once via delta),
+	// inflating the estimate and tripping compaction early.
+	delta := estimateTokens(view[a.lastTokenCountMsgs:len(view)-1], "", 0)
 	if provider := a.lastInputTokens + delta; provider > heuristic {
 		return provider
 	}
@@ -402,13 +431,24 @@ func isContextOverflowError(err error) bool {
 // common case for any provider that reports input_tokens (DeepSeek, Qwen,
 // GLM), not a rare edge case.
 func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt string, turn int, where string) ([]models.Message, bool) {
-	a.lastInputTokens = 0
-	a.lastTokenCountMsgs = 0
+	// M4 final-phase review F-M4-1: use setTokenAnchor (not a direct field
+	// assignment) so the reset also reaches the carried session, if any —
+	// otherwise the next REPL turn's New() would revive this stale
+	// pre-overflow anchor from the session even though this Agent's own
+	// copy was correctly invalidated.
+	a.setTokenAnchor(0, 0)
 
-	// Measure the same aged VIEW the main compaction trigger (and the request
-	// that just overflowed) actually sends, not raw canonical bytes —
-	// compactMessages below still mutates and returns canonical messages.
-	before := a.estimateContextTokens(buildPromptView(runMessages, a.aging, a.contextWindow), systemPrompt)
+	// Measure the same aged VIEW + turn injection the main compaction trigger
+	// (and the request that just overflowed — maybeCompact appends
+	// a.turnInjection to every view it hands to Run) actually sends, not raw
+	// canonical bytes — compactMessages below still mutates and returns
+	// canonical messages. Without the injection here, "before" would
+	// under-count relative to what actually overflowed; since it is the same
+	// constant-per-Run message on both sides of the comparison, omitting it
+	// wouldn't change which candidate tail wins, but including it keeps this
+	// reactive path's absolute numbers (logged below) consistent with the
+	// proactive trigger's.
+	before := a.estimateContextTokens(appendTurnInjection(buildPromptView(runMessages, a.aging, a.contextWindow), a.turnInjection), systemPrompt)
 	for _, tail := range []int{a.compactionKeepTail, 4, 2} {
 		if tail <= 0 {
 			continue
@@ -417,7 +457,7 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 		if !didCompact {
 			continue
 		}
-		after := a.estimateContextTokens(buildPromptView(compacted, a.aging, a.contextWindow), systemPrompt)
+		after := a.estimateContextTokens(appendTurnInjection(buildPromptView(compacted, a.aging, a.contextWindow), a.turnInjection), systemPrompt)
 		if after < before {
 			a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "tail", tail, "before_tokens", before, "after_tokens", after)
 			return compacted, true

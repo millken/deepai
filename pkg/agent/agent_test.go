@@ -100,15 +100,29 @@ func TestAgent_BuildSystemPrompt(t *testing.T) {
 	}
 
 	agent := New(cfg)
-	ctx := context.Background()
 
-	prompt := agent.BuildSystemPrompt(ctx, "test_session", nil)
+	prompt := agent.BuildSystemPrompt()
 
 	if prompt == "" {
 		t.Error("System prompt should not be empty")
 	}
-	if prompt == "custom system prompt" {
-		t.Error("BuildSystemPrompt should include runtime instructions in addition to the base prompt")
+	// M4-2 CONTRACT CHANGE: this used to assert prompt != the bare base,
+	// because construction always baked "Today's date is X" onto the
+	// base — the ONLY reason a tool-less, catalog-less agent
+	// (like this one) ever differed from its raw base string. The date has
+	// moved to the per-Run trailing turn injection (see buildTurnInjection /
+	// appendTurnInjection) precisely so the system prompt stays byte-stable
+	// across a session for automatic prefix caching — so for an agent with
+	// no file tools, no search tools, no delegation catalog, and no plan
+	// mode, BuildSystemPrompt legitimately now returns exactly the base,
+	// unchanged. The "runtime instructions get appended when applicable"
+	// behavior itself is still real and covered by the T5c/TeamDelegation
+	// tests in systemprompt_test.go (file-op rule, tool recommendations,
+	// delegation prompt) — this test now just pins the "no extras" floor for
+	// a minimal agent instead of asserting a difference that no longer has a
+	// source.
+	if prompt != "custom system prompt" {
+		t.Errorf("BuildSystemPrompt() for a tool-less, catalog-less agent = %q, want exactly the base (no runtime instructions apply)", prompt)
 	}
 }
 
@@ -275,7 +289,15 @@ func (timeoutProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan 
 // TestBuildSystemPrompt_InjectsProjectMemory guards the fix for the CLI bug
 // where the per-turn agent was built without a MemoryService, so stored facts
 // were never injected. With a MemoryService and a project (UserScope) memoryUserID
-// set, a relevant stored fact must appear in the built system prompt.
+// set, a relevant stored fact must appear... — but M4-2 CONTRACT CHANGE:
+// no longer in the built SYSTEM PROMPT. Baking per-request memory into the
+// system prompt (position 0 of every request) defeated automatic prefix
+// caching on every OpenAI-compat provider, since the injected content varies
+// with the retrieval relevance context on every turn. Project-scoped memory
+// injection itself still works exactly as before; it just now rides the
+// per-Run trailing turn injection (buildTurnInjection) instead of
+// BuildSystemPrompt. This test now pins BOTH halves of that contract: the
+// system prompt must NOT contain the fact, and buildTurnInjection must.
 func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 	ctx := context.Background()
 	store, err := memory.NewFileStore(t.TempDir())
@@ -309,15 +331,19 @@ func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 	})
 
 	msgs := []models.Message{{Role: models.RoleHuman, Content: "how do I deploy zephyr?"}}
-	prompt := a.BuildSystemPrompt(ctx, "session-xyz", msgs)
+	prompt := a.BuildSystemPrompt()
+	if strings.Contains(prompt, "deploy-zephyr script") {
+		t.Fatalf("project memory must NOT be injected into the system prompt (breaks prefix caching):\n%s", prompt)
+	}
 
-	if !strings.Contains(prompt, "deploy-zephyr script") {
-		t.Fatalf("project memory not injected into system prompt:\n%s", prompt)
+	injection := a.buildTurnInjection(ctx, "session-xyz", msgs)
+	if !strings.Contains(injection.Content, "deploy-zephyr script") {
+		t.Fatalf("project memory not injected into the turn injection:\n%s", injection.Content)
 	}
 
 	bare := New(AgentConfig{SystemPrompt: "base"})
-	if got := bare.BuildSystemPrompt(ctx, "session-xyz", msgs); strings.Contains(got, "deploy-zephyr script") {
-		t.Fatalf("bare agent should not inject memory, but did:\n%s", got)
+	if got := bare.buildTurnInjection(ctx, "session-xyz", msgs); strings.Contains(got.Content, "deploy-zephyr script") {
+		t.Fatalf("bare agent (no MemoryService) should not inject memory, but did:\n%s", got.Content)
 	}
 }
 

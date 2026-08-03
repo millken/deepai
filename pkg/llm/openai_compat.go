@@ -284,12 +284,14 @@ func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message, imageDetail
 	for _, m := range msgs {
 		switch m.Role {
 		case models.RoleHuman:
+			var next openai.ChatCompletionMessageParamUnion
 			if len(m.Images) > 0 {
-				result = append(result, mapHumanWithImages(m, imageDetail))
+				next = mapHumanWithImages(m, imageDetail)
 			} else {
 				content := ensureContent(m.Content, "user")
-				result = append(result, openai.UserMessage(content))
+				next = openai.UserMessage(content)
 			}
+			result = appendOrMergeOpenAIUser(result, next)
 		case models.RoleAI:
 			if len(m.ToolCalls) > 0 {
 				result = append(result, mapAssistantWithToolCalls(m))
@@ -305,6 +307,63 @@ func mapMessagesToOpenAI(systemPrompt string, msgs []models.Message, imageDetail
 		}
 	}
 	return result
+}
+
+// appendOrMergeOpenAIUser merges consecutive user-role messages into one,
+// mirroring anthropic.go's appendOrMergeUser. Unlike the Anthropic mapper —
+// where RoleTool ALSO becomes "user" role, so tool_result-then-hint merging
+// matters — RoleTool maps to its own distinct "tool" role here
+// (mapMessagesToOpenAI's RoleTool case, via openai.ToolMessage), so the only
+// adjacency this needs to fix is two RoleHuman messages in a row. That
+// happens on the FIRST request of every Run: canonical [humanMsg] plus
+// M4-2's trailing turn injection (also RoleHuman) both map to "user" role —
+// two adjacent same-role messages, which some OpenAI-compat providers
+// (deepseek-reasoner has historically 400'd on this) reject. It can also
+// happen anywhere a RoleHuman breaker-hint or plan-mode nudge lands right
+// after another RoleHuman message.
+//
+// Merges by content: if either side already uses the array-of-parts form
+// (an image message), both are normalized to that form and concatenated,
+// existing parts first then incoming (same order-preserving discipline as
+// the Anthropic mapper); otherwise plain string content is concatenated with
+// a blank-line separator.
+func appendOrMergeOpenAIUser(msgs []openai.ChatCompletionMessageParamUnion, next openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if len(msgs) == 0 || msgs[len(msgs)-1].OfUser == nil || next.OfUser == nil {
+		return append(msgs, next)
+	}
+	last := msgs[len(msgs)-1].OfUser
+	incoming := next.OfUser
+
+	if len(last.Content.OfArrayOfContentParts) == 0 && len(incoming.Content.OfArrayOfContentParts) == 0 {
+		merged := last.Content.OfString.Value
+		if incomingText := incoming.Content.OfString.Value; incomingText != "" {
+			if merged != "" {
+				merged += "\n\n"
+			}
+			merged += incomingText
+		}
+		last.Content = openai.ChatCompletionUserMessageParamContentUnion{OfString: param.NewOpt(merged)}
+		return msgs
+	}
+
+	// At least one side carries content parts (e.g. an image) — normalize
+	// both to the array-of-parts form and concatenate, preserving order.
+	parts := append(userContentParts(last), userContentParts(incoming)...)
+	last.Content = openai.ChatCompletionUserMessageParamContentUnion{OfArrayOfContentParts: parts}
+	return msgs
+}
+
+// userContentParts normalizes a user message's content into the
+// array-of-parts form, wrapping plain string content in a single text part
+// (nil/empty when there's nothing to wrap).
+func userContentParts(u *openai.ChatCompletionUserMessageParam) []openai.ChatCompletionContentPartUnionParam {
+	if len(u.Content.OfArrayOfContentParts) > 0 {
+		return u.Content.OfArrayOfContentParts
+	}
+	if text := u.Content.OfString.Value; text != "" {
+		return []openai.ChatCompletionContentPartUnionParam{openai.TextContentPart(text)}
+	}
+	return nil
 }
 
 // mapHumanWithImages constructs a multimodal user message with text + image

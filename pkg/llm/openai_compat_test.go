@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
@@ -75,6 +76,56 @@ func TestMapMessagesToOpenAI_ToolMessagesContiguousBeforeHumanHint(t *testing.T)
 	}
 	if result[3].OfUser == nil {
 		t.Errorf("msg[3]: expected user (the hint, after both tool messages), got %+v", result[3])
+	}
+}
+
+// TestMapMessagesToOpenAI_ConsecutiveHumanCoalesced is the RED test for the
+// M4-2 review fix: openai-compat providers map RoleTool to a distinct "tool"
+// role, but two RoleHuman messages in a row (e.g. the FIRST request of every
+// Run: canonical [humanMsg] + M4-2's trailing turn injection, both
+// RoleHuman) both map to "user" role — two adjacent same-role messages,
+// which deepseek-reasoner has historically rejected with a 400. The mapper
+// must coalesce them into one user message, mirroring anthropic.go's
+// appendOrMergeUser.
+func TestMapMessagesToOpenAI_ConsecutiveHumanCoalesced(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "first"},
+		{Role: models.RoleHuman, Content: "second"},
+	}
+	result := mapMessagesToOpenAI("", msgs, "low")
+	if len(result) != 1 {
+		t.Fatalf("expected 1 coalesced user message, got %d: %+v", len(result), result)
+	}
+	if result[0].OfUser == nil {
+		t.Fatalf("expected user message, got %+v", result[0])
+	}
+	content := result[0].OfUser.Content.OfString.Value
+	if !strings.Contains(content, "first") || !strings.Contains(content, "second") {
+		t.Errorf("merged content should contain both messages' text, got %q", content)
+	}
+	if strings.Index(content, "first") > strings.Index(content, "second") {
+		t.Errorf("merged content should preserve order (first before second), got %q", content)
+	}
+}
+
+// TestMapMessagesToOpenAI_ToolThenHumanNotCoalesced is the control for the
+// fix above: RoleTool maps to a distinct "tool" role param (not "user"), so
+// a RoleTool immediately followed by a RoleHuman must NOT be merged — they
+// are already different roles and the provider has no adjacency problem.
+func TestMapMessagesToOpenAI_ToolThenHumanNotCoalesced(t *testing.T) {
+	msgs := []models.Message{
+		{Role: models.RoleTool, Content: "result", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "t"}},
+		{Role: models.RoleHuman, Content: "hint"},
+	}
+	result := mapMessagesToOpenAI("", msgs, "low")
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages (tool, user) unchanged, got %d: %+v", len(result), result)
+	}
+	if result[0].OfTool == nil {
+		t.Errorf("msg[0]: expected tool, got %+v", result[0])
+	}
+	if result[1].OfUser == nil {
+		t.Errorf("msg[1]: expected user, got %+v", result[1])
 	}
 }
 

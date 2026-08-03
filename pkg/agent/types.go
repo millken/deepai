@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -89,6 +90,23 @@ type AgentConfig struct {
 	// ImageDetail controls the vision detail level for image attachments.
 	// "low" (default, ~170 tokens/image) or "high" (multi-tile, finer detail).
 	ImageDetail string
+
+	// Session carries Agent state across successive single-use Agent Runs
+	// within one conversation (M4-3, task-23-brief.md): the tool-call
+	// circuit breaker, the active skill (+ its system-prompt body), and the
+	// context-compaction anchors/stall state. nil (the default) preserves
+	// today's per-Run-only behavior — every field starts fresh, exactly as
+	// before this option existed. This is the right default for one-shot
+	// callers and, critically, for subagents: a delegated Agent must NEVER
+	// receive a Session shared with its parent or siblings (see
+	// subagent.go's buildAgentConfig, which never sets this field) since a
+	// subagent's Run can execute concurrently with others on a different
+	// goroutine, and SessionCarry has no internal locking (see its doc
+	// comment). The REPL is the intended caller: it holds one *SessionCarry
+	// for the life of a conversation and passes it, unchanged, into every
+	// turn's AgentConfig, resetting it (to a fresh NewSessionCarry()) only
+	// on a full history wipe (e.g. /clear).
+	Session *SessionCarry
 }
 
 type TimeoutError struct {
@@ -105,6 +123,41 @@ func (e *TimeoutError) Error() string {
 	}
 	return fmt.Sprintf("request timed out after %s", e.Duration)
 }
+
+// Unwrap exposes context.DeadlineExceeded as this error's cause for EVERY
+// *TimeoutError, from both of this package's two construction sites — but
+// that only reflects the literal cause at one of them:
+//
+//   - normalizeRunError (this file's caller) constructs one only after
+//     checking errors.Is(ctx.Err(), context.DeadlineExceeded) itself, so for
+//     that site Unwrap restates a real context deadline that already fired.
+//   - The stream-idle watchdog (streaming.go's consumeStream, the
+//     `case <-idleTimer.C` branch) constructs one from its OWN idleTimer
+//     firing and calls cancel() itself right there — the request's own ctx
+//     has NOT expired at that point, and canceling it this way makes
+//     reqCtx.Err() become context.Canceled, never context.DeadlineExceeded.
+//     Unwrap's answer for THIS site is a deliberate classification choice
+//     ("stream went idle" is treated as the same kind of failure as "ran out
+//     of time" for callers that check the cause), not a restatement of an
+//     observed deadline.
+//
+// The practical effect is that errors.Is(err, context.DeadlineExceeded) is
+// true for a stream-idle timeout too, which existing callers were not
+// written to expect but which is not a misclassification requiring a code
+// fix (both are still Retryable/CallStatusFailed at their respective
+// layers): newAgentError (streaming.go) now reports Code:"deadline_exceeded"
+// (previously "run_error") for a stream-idle timeout, and
+// pkg/subagent/pool.go's status switch now reports TaskStatusTimedOut
+// (previously TaskStatusFailed) for the same case. Both are arguably more
+// accurate descriptions of "the request took too long," which is exactly
+// what happened either way — recorded here as an intended consequence of
+// this Unwrap, not an oversight.
+//
+// Existing consumers use errors.As(err, *TimeoutError) (e.g. subagent.go's
+// mid-stream fall-soft guard) and keep working unchanged; this additionally
+// makes errors.Is(err, context.DeadlineExceeded) hold for a *TimeoutError,
+// which it did not before.
+func (e *TimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
 type AgentEventType string
 

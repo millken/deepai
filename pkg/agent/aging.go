@@ -16,10 +16,10 @@ const defaultMinContextPressure = 0.4
 // Based on §5.4 measured p90/p99 percentiles. The "default" key is the
 // catch-all for any tool not explicitly listed (global p90 = 3.1KB).
 //
-// Layering note: L0 source guards (offload at 24KB, bash 50KB truncate,
-// git_diff --stat default) run BEFORE aging in react.go. So by the time
-// aging sees a tool result, extreme tails are already removed. The budgets
-// below handle the remaining long-tail of "moderately large" results.
+// Layering note: L0 source guards (offload at 24KB, bash 50KB truncate) run
+// BEFORE aging in react.go. So by the time aging sees a tool result, extreme
+// tails are already removed. The budgets below handle the remaining
+// long-tail of "moderately large" results.
 var defaultToolBudgetsByTool = map[string]map[int]int{
 	"default":    {1: 4096, 2: 1024, 3: 300}, // §5.4 "其他/默认", global p90=3.1KB
 	"read_file":  {1: 8192, 2: 2048, 3: 300}, // high: preserve latest reads, prevent re-read
@@ -27,7 +27,6 @@ var defaultToolBudgetsByTool = map[string]map[int]int{
 	"edit_file":  {1: 300, 2: 300, 3: 300}, // confirmation messages, p99 < 105B
 	"write_file": {1: 300, 2: 300, 3: 300},
 	"grep":       {1: 4096, 2: 1024, 3: 300}, // grep p99=168KB tail is eaten by L0 offload (24KB) first
-	"git_diff":   {1: 2048, 2: 1024, 3: 300}, // L0 defaults to --stat; full diff tail eaten by offload
 	"web_fetch":  {1: 8192, 2: 2048, 3: 300},
 }
 
@@ -222,11 +221,11 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 
 // agedToolHint generates the suffix appended to a truncated tool result.
 // Tools whose output can look "complete" even when heavily truncated (grep,
-// git_diff, web_fetch) get a stronger warning that the visible content is
-// only a fragment and important matches/details may have been omitted.
+// web_fetch) get a stronger warning that the visible content is only a
+// fragment and important matches/details may have been omitted.
 func agedToolHint(toolName string, age int) string {
 	switch toolName {
-	case "grep", "git_diff", "web_fetch":
+	case "grep", "web_fetch":
 		return fmt.Sprintf("\n[...aged %d: this output was truncated to fit context — re-call %s for the complete result, important content may be missing]", age, toolName)
 	default:
 		return fmt.Sprintf("\n[...aged: re-call %s to see full output]", toolName)

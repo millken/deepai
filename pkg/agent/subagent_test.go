@@ -649,9 +649,12 @@ func (p *hangingRetryProvider) Stream(ctx context.Context, req llm.ChatRequest) 
 // errors.Is(retryErr, context.DeadlineExceeded), which catches the retry
 // dying at Agent.Run's own entry-time ctx check (before any Stream call) —
 // but a retry that starts and then hits the SAME shared deadline MID-STREAM
-// gets react.go's normalizeRunError-wrapped *TimeoutError instead, which does
-// NOT implement Unwrap, so errors.Is is false and the hard-error branch still
-// dropped the output for this (more common in practice) shape.
+// gets react.go's normalizeRunError-wrapped *TimeoutError instead, which at
+// the time did NOT implement Unwrap, so errors.Is was false and the
+// hard-error branch still dropped the output for this (more common in
+// practice) shape. (TimeoutError now implements Unwrap() ->
+// context.DeadlineExceeded, so both arms of the guard match; the errors.As
+// arm remains for clarity.)
 //
 // The provider's retry call (hangingRetryProvider, idx>=1) blocks on
 // ctx.Done() — modeling a request that has actually started streaming — and
@@ -1139,5 +1142,41 @@ func TestSubagentExecutor_ContextFiles_ThroughRealPool(t *testing.T) {
 	human := firstHumanMessage(provider.messagesForCall(0))
 	if human == nil || !strings.Contains(human.Content, "pool notes content") {
 		t.Fatalf("human message = %+v, want the context file's content injected through the real pool chain", human)
+	}
+}
+
+// TestSubagentExecutor_SessionIsolation_NoBreakerCarryAcrossExecutes is the
+// isolation guard for M4-3: AgentConfig.Session must stay nil for every
+// subagent Agent (buildAgentConfig, above, never sets it — confirmed by
+// `grep -n Session pkg/agent/subagent.go` returning nothing), so the
+// repeat-call circuit breaker must start FRESH on every Execute call rather
+// than carrying counters across them, unlike the REPL's carried session (see
+// session_carry_test.go's TestSessionCarry_BreakerTripsAcrossRuns, which
+// proves the OPPOSITE for an explicitly-shared *SessionCarry). Two Execute
+// calls on the SAME executor, each driving 5 identical failing tool calls
+// (5+5=10 >= maxRepeatFails=8), must BOTH complete without error: if breaker
+// state ever leaked across Execute calls (e.g. a future regression added a
+// persistent Session to SubagentExecutor), the second call's 5 failures
+// would combine with the first's and trip fatally instead.
+func TestSubagentExecutor_SessionIsolation_NoBreakerCarryAcrossExecutes(t *testing.T) {
+	reg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	toolReg := tools.NewRegistry()
+	registerSFailTool(t, toolReg)
+	exec := NewSubagentExecutor(reg, toolReg, nil)
+
+	for i := 0; i < 2; i++ {
+		provider := &repeatFailProvider{maxCalls: 5}
+		reg.InjectProvider("test", "", "", provider)
+		_, err := exec.Execute(context.Background(),
+			&subagent.Task{
+				ID:     fmt.Sprintf("t%d", i),
+				Prompt: "hi",
+				Config: subagent.SubagentConfig{AgentType: "general-purpose", MaxTurns: 10, Tools: []string{"sfail"}},
+			},
+			func(subagent.TaskEvent) {})
+		if err != nil {
+			t.Fatalf("Execute #%d: unexpected error (5 identical failures alone must not trip a fresh breaker — "+
+				"isolation broken if this only fails on the 2nd iteration): %v", i, err)
+		}
 	}
 }

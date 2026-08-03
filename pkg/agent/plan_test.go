@@ -164,7 +164,7 @@ func TestPlanMode_SystemPromptContainsInstructions(t *testing.T) {
 		WorkDir:  tmpDir,
 	})
 
-	prompt := a.BuildSystemPrompt(context.Background(), "test_session", nil)
+	prompt := a.BuildSystemPrompt()
 	if !strings.Contains(prompt, "plan mode") {
 		t.Fatal("system prompt should contain plan mode instructions")
 	}
@@ -177,7 +177,7 @@ func TestPlanMode_SystemPromptNoInstructionsWhenNotInPlanMode(t *testing.T) {
 	registry := newTestRegistry()
 	a := New(AgentConfig{Tools: registry})
 
-	prompt := a.BuildSystemPrompt(context.Background(), "test_session", nil)
+	prompt := a.BuildSystemPrompt()
 	if strings.Contains(prompt, "plan mode") {
 		t.Fatal("system prompt should NOT contain plan mode instructions when not in plan mode")
 	}

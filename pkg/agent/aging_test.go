@@ -256,7 +256,6 @@ func TestToolResultBudget_PerToolDifferentiation(t *testing.T) {
 		{"edit_file", 1, 300},  // low: confirmation messages
 		{"write_file", 1, 300},
 		{"grep", 1, 4096},
-		{"git_diff", 1, 2048},
 		{"web_fetch", 1, 8192},
 		// Age progression for bash
 		{"bash", 2, 1024},

@@ -87,6 +87,54 @@ func TestRegistry_Descriptions(t *testing.T) {
 	}
 }
 
+// TestDescriptionsFiltered_SanitizesBlankLinesInDescription is the RED test
+// for M4-3 review r2 F2-a: a SKILL.md YAML frontmatter description can be a
+// block scalar containing a blank line (e.g. a wrapped paragraph). Rendered
+// verbatim, that blank line becomes a literal "\n\n" inside the catalog
+// entry — indistinguishable, to pkg/agent's react.go removeSkillDescriptions
+// (which ends the catalog block at the FIRST "\n\n" after the marker, since
+// that is where AppendSystemPrompt's own section separator normally lives),
+// from the boundary between the catalog and whatever was appended after it.
+// A multi-line description therefore truncates the strip early, leaking the
+// rest of the catalog (and any content the model appended after it) into
+// the system prompt indefinitely once a skill is loaded and carried
+// (M4-3). Fix (this test targets it directly, at the source): sanitize each
+// description the same way pkg/agent's renderDelegationPrompt already
+// sanitizes agent descriptions — trim, then collapse newlines to spaces —
+// so the rendered catalog can never contain an embedded blank line.
+func TestDescriptionsFiltered_SanitizesBlankLinesInDescription(t *testing.T) {
+	reg := NewRegistry()
+	reg.skills = map[string]*Skill{
+		"one": {Meta: Frontmatter{
+			Name:        "one",
+			Description: "does one thing.\n\ncontinued description line",
+		}},
+		"two": {Meta: Frontmatter{
+			Name:        "two",
+			Description: "does two things",
+		}},
+	}
+
+	desc := reg.Descriptions()
+
+	if strings.Contains(desc, "\n\n") {
+		t.Fatalf("rendered catalog contains a blank line — react.go's removeSkillDescriptions would "+
+			"mistake it for the catalog's end boundary and leak the rest of the catalog into the system "+
+			"prompt (review r2 F2-a), got: %q", desc)
+	}
+	// ReplaceAll("\n", " ") (matching renderDelegationPrompt's exact
+	// approach) turns the description's blank line ("\n\n") into two
+	// spaces, not one — checking for the collapsed prefix/suffix (rather
+	// than asserting exact single-space spacing) avoids over-specifying
+	// that incidental detail.
+	if !strings.Contains(desc, "- /one: does one thing.") || !strings.Contains(desc, "continued description line") {
+		t.Fatalf("expected the multi-line description collapsed onto one line, got: %q", desc)
+	}
+	if !strings.Contains(desc, "- /two: does two things") {
+		t.Fatalf("expected the single-line description unaffected, got: %q", desc)
+	}
+}
+
 func TestRegistry_AvailableNames(t *testing.T) {
 	dir := t.TempDir()
 	createSkillDir(t, filepath.Join(dir, "aaa"), "aaa", "First")

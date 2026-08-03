@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
@@ -30,26 +31,24 @@ func recentConversationContext(messages []models.Message) string {
 	return joined
 }
 
-func (a *Agent) BuildSystemPrompt(ctx context.Context, sessionID string, runMessages []models.Message) string {
+// BuildSystemPrompt assembles the request's system prompt from the
+// session-stable pieces only: the base prompt, the file-op rule, tool
+// recommendations, the delegation prompt + catalog, and plan-mode text.
+//
+// M4-2: this used to ALSO layer in per-request memory injections (user-scope
+// + session-scope) and a "Today's date is X" line, making the returned
+// string vary every single turn with whatever the memory relevance
+// heuristic picked and with the calendar date — both sat at position 0 of
+// every request and defeated automatic prefix caching on every OpenAI-
+// compat provider (DeepSeek/Qwen/GLM: any byte change at position N
+// invalidates the cache from N on). That volatile content now lives in a
+// per-Run, once-computed TRAILING injection message instead — see
+// buildTurnInjection and appendTurnInjection. This is why the method takes
+// no parameters: nothing it assembles depends on the request's session,
+// message history, or ctx anymore — buildTurnInjection is the new home for
+// everything that did.
+func (a *Agent) BuildSystemPrompt() string {
 	sections := []string{strings.TrimSpace(a.systemPrompt)}
-
-	if a.memoryService != nil {
-		activeSource := ""
-		if skillName := a.ActiveSkill(); skillName != "" {
-			activeSource = "skill:" + skillName
-		}
-		relevanceContext := recentConversationContext(runMessages)
-		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
-			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
-				sections = append(sections, userMem)
-			}
-		}
-		if strings.TrimSpace(sessionID) != "" {
-			if injection := a.memoryService.InjectWithContext(ctx, sessionID, relevanceContext, activeSource); injection != "" {
-				sections = append(sections, injection)
-			}
-		}
-	}
 
 	// T5c: only carry the file-operation routing rule when the agent has ANY of
 	// the dedicated file tools it references — an agent with edit_file but not
@@ -107,16 +106,98 @@ func (a *Agent) hasSearchTools() bool {
 	return false
 }
 
-func buildSystemPrompt(base string, date string) string {
+// dateNoteFormat is shared by buildTurnInjection and its tests: the
+// system-note-style date line appended to every turn injection, mirroring
+// the "[System note: ...]" framing pkg/memory/prompt.go already uses for its
+// own memory-context wrapper (see buildInjectionWithIDs).
+const dateNoteFormat = "[System note: Today's date is %s.]"
+
+// buildTurnInjection assembles the per-Run volatile-content injection: the
+// current date plus (when a memory service is configured) the user- and
+// session-scope memory injections, each already self-wrapped by
+// pkg/memory/prompt.go (buildInjectionWithIDs wraps them in
+// "<memory-context>...[System note: recalled memory, not new user
+// input.]...</memory-context>"). Returns a single RoleHuman message with a
+// STABLE SHAPE across every call: the date line is always present, so the
+// message always exists — only its total byte length varies with whether
+// memory is configured and what it contains.
+//
+// M4-2 design (see task-22-brief.md): computed ONCE per Run, at Run start,
+// from the runMessages present at that moment (see Run's call site in
+// react.go) — memory extraction runs on an async 5-turn cadence elsewhere,
+// so recomputing this per REQUEST inside the turn loop would buy nothing
+// while costing prefix stability (every request before this trailing message
+// would otherwise still be re-scored against a shifting relevance context).
+// Subagents (no MemoryService) fall through the nil check below and get a
+// date-only injection — same mechanism, no special-casing.
+//
+// The memory fence (activeSource = "skill:"+name, for cross-skill fact
+// penalization) is evaluated here from a.ActiveSkill() at the moment this is
+// called. At Run start that is "" for a session-less Run (nothing carried),
+// but M4-3 (task-23-brief.md) can seed it non-empty from a carried
+// SessionCarry — a skill loaded in a PREVIOUS Run sharing that session is
+// already active when THIS Run's very first buildTurnInjection call happens,
+// so the fence applies from request one, not just from a mid-Run load
+// onward. Either way, "once per Run" is really "once per activeSource
+// segment", not a hard one-shot: react.go's skill-result handling calls this
+// AGAIN
+// immediately after a.activeSkill.Store(name) whenever a "skill" tool call
+// changes it mid-Run, so the injection IS re-fenced starting with the very
+// next request after a skill loads — see the call site there for why that
+// recompute is prefix-cache-free (AppendSystemPrompt already invalidated the
+// prefix that same turn). Only genuinely per-request recomputation (once per
+// REQUEST rather than once per activeSource change) is what this function
+// avoids.
+func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMessages []models.Message) models.Message {
 	var b strings.Builder
-	if base != "" {
-		b.WriteString(base)
-		b.WriteString("\n\n")
+	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))
+
+	if a.memoryService != nil {
+		activeSource := ""
+		if skillName := a.ActiveSkill(); skillName != "" {
+			activeSource = "skill:" + skillName
+		}
+		relevanceContext := recentConversationContext(runMessages)
+		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
+			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
+				b.WriteString("\n\n")
+				b.WriteString(userMem)
+			}
+		}
+		if strings.TrimSpace(sessionID) != "" {
+			if sessionMem := a.memoryService.InjectWithContext(ctx, sessionID, relevanceContext, activeSource); sessionMem != "" {
+				b.WriteString("\n\n")
+				b.WriteString(sessionMem)
+			}
+		}
 	}
-	b.WriteString("# Current date\nToday's date is ")
-	b.WriteString(date)
-	b.WriteByte('.')
-	return b.String()
+
+	return models.Message{Role: models.RoleHuman, Content: b.String()}
+}
+
+// appendTurnInjection returns a NEW slice — view is never mutated — with
+// injection (see buildTurnInjection) appended as the final message. Every
+// site in this package that (re)builds the message view actually sent to
+// the provider calls this exactly once, so the M3 metering invariant holds:
+// the estimate that decides whether to compact is computed over the same
+// bytes the request actually sends, and the request sends what was measured.
+//
+// Position rationale (M4-2 design): appending at the END, rather than
+// prepending or folding into the system prompt, keeps everything BEFORE it —
+// the stable system prompt, tool schemas, and the entire canonical message
+// history — a stable, monotonically growing prefix. That maximizes
+// automatic prefix-cache reuse on providers that cache by byte-identical
+// prefix (DeepSeek/Qwen/GLM). On a tool-call turn, the view ends [..,
+// tool_result, injection]; the Anthropic mapper's appendOrMergeUser (see
+// pkg/llm/anthropic.go) merges this trailing RoleHuman text into the same
+// open user turn as the preceding tool_result blocks (tool_result blocks
+// first, text after — contract-valid), exactly like the pre-existing
+// RoleHuman "hint" messages it already handles (M1-7).
+func appendTurnInjection(view []models.Message, injection models.Message) []models.Message {
+	out := make([]models.Message, len(view)+1)
+	copy(out, view)
+	out[len(view)] = injection
+	return out
 }
 
 // delegationStrategy is the static policy text for team delegation. The agent

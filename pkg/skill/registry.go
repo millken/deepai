@@ -326,7 +326,21 @@ func (r *Registry) DescriptionsFiltered(filePath string) string {
 
 	total := 0
 	for _, s := range skills {
-		line := fmt.Sprintf("- /%s: %s\n", s.Meta.Name, s.Meta.Description)
+		// M4-3 review r2 F2-a: Description comes verbatim from SKILL.md YAML
+		// frontmatter, which can be a block scalar containing blank lines
+		// (e.g. a wrapped paragraph). Rendered as-is, an embedded blank line
+		// becomes a literal "\n\n" inside this catalog entry —
+		// indistinguishable from the boundary pkg/agent's
+		// removeSkillDescriptions uses to find where the catalog block ends
+		// (the first "\n\n" after the marker, matching AppendSystemPrompt's
+		// own section separator), which would truncate the strip early and
+		// leak the rest of the catalog into the system prompt once a skill
+		// loads. Sanitize the same way renderDelegationPrompt already
+		// sanitizes agent descriptions (pkg/agent/promptbuild.go): trim,
+		// then collapse newlines to spaces, so a catalog entry can never
+		// contain a blank line.
+		desc := strings.ReplaceAll(strings.TrimSpace(s.Meta.Description), "\n", " ")
+		line := fmt.Sprintf("- /%s: %s\n", s.Meta.Name, desc)
 		if total+len(line) > descriptionKB {
 			break
 		}

@@ -325,11 +325,13 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 					// (errors.Is catches this). If instead the deadline fires
 					// mid-request/mid-stream, react.go's normalizeRunError
 					// converts it into a *TimeoutError before returning
-					// (errors.As catches this) — TimeoutError deliberately
-					// does NOT implement Unwrap (shared error semantics
-					// across the codebase are out of scope here; deferred to
-					// M3), so errors.Is alone would miss this second, more
-					// common shape and still drop the output.
+					// (errors.As catches this). TimeoutError now also
+					// implements Unwrap() -> context.DeadlineExceeded, so
+					// errors.Is alone would catch this second shape too — the
+					// errors.As arm below is kept anyway (harmless
+					// redundancy, not a correctness dependency) rather than
+					// narrowed, since removing it buys nothing and this is
+					// not the place to relitigate that.
 					var timeoutErr *TimeoutError
 					if (errors.Is(retryErr, context.DeadlineExceeded) || errors.As(retryErr, &timeoutErr)) && strings.TrimSpace(result.FinalOutput) != "" {
 						break
