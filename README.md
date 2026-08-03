@@ -161,6 +161,30 @@ DEEPSEEK_API_KEY=sk-...
 | `DEEPAI_TOKEN_METRICS` | `1`/`true` 写入 `$TMPDIR/deepai-token-metrics.jsonl`；其他非空值作为输出路径；空=关闭 |
 | `DEEPAI_TOKEN_AGING` | `1`/`true` 启用 T1 工具结果老化 |
 
+### 网络代理与超时
+
+所有出网请求都遵循标准代理环境变量，无需额外配置项：
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export NO_PROXY=localhost,127.0.0.1,.internal   # 例外列表
+```
+
+覆盖范围：模型 API 请求（`pkg/llm`）、`web_search` / `image_search`、`web_fetch` /
+`web_fetch_batch`、以及 `deepai proxy` 转发到上游的请求。`ALL_PROXY` 与小写形式同样生效。
+
+网络慢或走代理时链路更长，默认超时可能不够：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `DEEPAI_WEB_TIMEOUT` | `20s` | web 工具单次请求总超时。接受 `45s`、`2m`，或纯数字（秒） |
+| `DEEPAI_WEB_DIAL_TIMEOUT` | `10s` | web 工具 TCP 连接超时，同样格式 |
+
+> **安全说明**：web 工具默认拒绝访问私网/回环/云元数据地址。配了代理之后，目标域名改由代理解析，
+> 因此这层防护对「只能通过域名解析到私网」的目标不再生效——URL 里直接写私网 IP 仍然会被拒绝，
+> 域名类目标则交由代理自身策略把关。不希望放宽的话，用 `NO_PROXY` 把内网域名排除在代理之外。
+
 ### 项目级指令 `DEEPAI.md`
 
 在项目根目录放置 `DEEPAI.md`，内容会注入为系统提示，用于给 agent 项目特定的指令：

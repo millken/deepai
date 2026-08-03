@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/millken/deepai/pkg/netutil"
 )
 
 // newHTTPClient creates an *http.Client with HTTP/2, connection pooling, and sane timeouts.
@@ -16,6 +18,13 @@ func newHTTPClient() *http.Client {
 		// Run lifetime is bounded by the caller context (agent RequestTimeout / Ctrl+C).
 		Timeout: 0,
 		Transport: &http.Transport{
+			// Honor HTTP_PROXY / HTTPS_PROXY / NO_PROXY. A hand-built Transport
+			// gets no proxy support unless this is set — only http.DefaultTransport
+			// comes with it — so without this line every model API call ignores the
+			// user's proxy. netutil.EnvProxyFunc rather than
+			// http.ProxyFromEnvironment because the stdlib version snapshots the
+			// environment process-wide on first use.
+			Proxy:             netutil.EnvProxyFunc,
 			ForceAttemptHTTP2: true,
 			DialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,

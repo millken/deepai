@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 
 	readability "codeberg.org/readeck/go-readability/v2"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/netutil"
 )
 
 const (
@@ -30,28 +33,34 @@ const (
 )
 
 var (
+	// webRequestTimeout / webDialTimeout bound every outbound web-tool request.
+	// Overridable because the defaults are too tight for a slow link or a proxied
+	// round trip, which surfaces as web_search/web_fetch "timeout" errors.
+	// Accepts a duration string ("45s", "2m") or a bare number of seconds.
+	webRequestTimeout = envDuration("DEEPAI_WEB_TIMEOUT", 20*time.Second)
+	webDialTimeout    = envDuration("DEEPAI_WEB_DIAL_TIMEOUT", 10*time.Second)
+
 	// safeDialer resolves DNS at dial time and rejects private/loopback IPs,
 	// preventing both DNS rebinding and direct private-host fetches.
 	safeDialer = &net.Dialer{
-		Timeout:   10 * time.Second,
+		Timeout:   webDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
 	safeTransport = &http.Transport{
+		// Honor the standard proxy environment variables. netutil.EnvProxyFunc
+		// rather than http.ProxyFromEnvironment: the stdlib version snapshots the
+		// environment process-wide on first use.
+		Proxy: netutil.EnvProxyFunc,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, fmt.Errorf("host %q is not allowed: %w", host, err)
-			}
-			for _, ip := range ips {
-				if ip.IP.IsLoopback() || ip.IP.IsLinkLocalUnicast() || ip.IP.IsLinkLocalMulticast() || ip.IP.IsPrivate() {
-					return nil, fmt.Errorf("host %q resolved to private address %s", host, ip.IP)
-				}
-				if ip.IP.To4() != nil && ip.IP.Equal(net.IPv4(169, 254, 169, 254)) {
-					return nil, fmt.Errorf("host %q resolved to metadata address", host)
+			// When a proxy is in play, addr is the PROXY's address — commonly
+			// 127.0.0.1 — not the target's. Screening it here would reject the
+			// user's own proxy and make every fetch fail. The target is screened
+			// instead by validateTargetHostname before the request is issued
+			// (see fetchWebPage), which is what keeps a configured proxy from
+			// becoming an SSRF bypass.
+			if !netutil.IsEnvProxyAddr(addr) {
+				if err := rejectPrivateAddr(ctx, addr); err != nil {
+					return nil, err
 				}
 			}
 			// Dial with the original addr (hostname) to preserve TLS SNI.
@@ -61,37 +70,49 @@ var (
 	// webFetchClient rejects private hosts at the transport level (DialContext)
 	// and blocks redirects to private hosts (CheckRedirect).
 	webFetchClient = &http.Client{
-		Timeout:   20 * time.Second,
+		Timeout:   webRequestTimeout,
 		Transport: safeTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return fmt.Errorf("too many redirects")
 			}
-			host := req.URL.Host
-			h, _, err := net.SplitHostPort(host)
-			if err != nil {
-				h = host
+			// Name- and literal-IP screening always applies.
+			if err := validateTargetHostname(req.URL.Hostname()); err != nil {
+				return fmt.Errorf("redirect to %q is not allowed: %w", req.URL.Host, err)
 			}
-			if h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback" {
-				return fmt.Errorf("redirect to private host %q is not allowed", host)
+			// Resolving the redirect target is only meaningful for a direct
+			// connection: behind a proxy the name is resolved by the proxy, and
+			// insisting on local resolution here would reject hosts that only the
+			// proxy's resolver knows — a common reason to run a proxy at all.
+			proxyURL, err := netutil.EnvProxyFunc(req)
+			if err == nil && proxyURL != nil {
+				return nil
 			}
-			ips, err := net.LookupIP(h)
+			ips, err := net.LookupIP(req.URL.Hostname())
 			if err != nil {
-				return fmt.Errorf("redirect host %q is not allowed", host)
+				return fmt.Errorf("redirect host %q is not allowed", req.URL.Host)
 			}
 			for _, ip := range ips {
-				if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() {
-					return fmt.Errorf("redirect to private host %q is not allowed", host)
-				}
-				if ip.To4() != nil && ip.Equal(net.IPv4(169, 254, 169, 254)) {
-					return fmt.Errorf("redirect to metadata address %q is not allowed", host)
+				if err := rejectPrivateIP(ip); err != nil {
+					return fmt.Errorf("redirect to %q is not allowed: %w", req.URL.Host, err)
 				}
 			}
 			return nil
 		},
 	}
 
-	webClient               = &http.Client{Timeout: 20 * time.Second}
+	// webTransport backs the search-side clients. It carries no SSRF dial guard
+	// because those clients only ever talk to the fixed DuckDuckGo endpoints
+	// below, but it still needs explicit proxy support: a hand-built Transport
+	// ignores the proxy environment unless Proxy is set.
+	webTransport = &http.Transport{
+		Proxy: netutil.EnvProxyFunc,
+		DialContext: (&net.Dialer{
+			Timeout:   webDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	webClient               = &http.Client{Timeout: webRequestTimeout, Transport: webTransport}
 	duckDuckGoSearchBaseURL = "https://html.duckduckgo.com/html/"
 	duckDuckGoPageBaseURL   = "https://duckduckgo.com/"
 	duckDuckGoImageAPIURL   = "https://duckduckgo.com/i.js"
@@ -517,6 +538,33 @@ func parseDuckDuckGoResults(body string, maxResults int) []webSearchResult {
 	return results
 }
 
+// envDuration reads a duration override from the environment. It accepts a Go
+// duration string ("45s", "2m") or a bare number of seconds ("60"). An unset,
+// unparseable, or non-positive value falls back to def, with a warning for
+// anything that looked like an attempt to set it.
+func envDuration(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		if d > 0 {
+			return d
+		}
+		slog.Warn("ignoring non-positive duration override", "env", name, "value", raw, "using", def)
+		return def
+	}
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		slog.Warn("ignoring non-positive duration override", "env", name, "value", raw, "using", def)
+		return def
+	}
+	slog.Warn("ignoring unparseable duration override", "env", name, "value", raw, "using", def)
+	return def
+}
+
 // isPrivateHost checks if a hostname is a well-known private name
 // without performing DNS resolution. Used for early rejection; the full
 // IP-level check is done by safeTransport.DialContext at connection time.
@@ -528,6 +576,71 @@ func isPrivateHost(host string) bool {
 	return h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback"
 }
 
+// rejectPrivateIP reports why ip is not a permitted fetch destination, or nil
+// when it is. Shared by the dial-time guard, the redirect guard, and the
+// pre-request screening so all three agree on what "private" means.
+func rejectPrivateIP(ip net.IP) error {
+	switch {
+	case ip.IsUnspecified():
+		return fmt.Errorf("unspecified address %s", ip)
+	case ip.IsLoopback():
+		return fmt.Errorf("loopback address %s", ip)
+	case ip.To4() != nil && ip.Equal(net.IPv4(169, 254, 169, 254)):
+		return fmt.Errorf("cloud metadata address %s", ip)
+	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		return fmt.Errorf("link-local address %s", ip)
+	case ip.IsPrivate():
+		return fmt.Errorf("private address %s", ip)
+	}
+	return nil
+}
+
+// rejectPrivateAddr resolves the host part of a "host:port" dial address and
+// rejects it if any answer is a private destination. This is the anti-DNS-
+// rebinding layer: it runs at dial time, on the addresses actually connected to.
+func rejectPrivateAddr(ctx context.Context, addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("host %q is not allowed: %w", host, err)
+	}
+	for _, ip := range ips {
+		if err := rejectPrivateIP(ip.IP); err != nil {
+			return fmt.Errorf("host %q resolved to %w", host, err)
+		}
+	}
+	return nil
+}
+
+// validateTargetHostname screens a target hostname WITHOUT resolving it: the
+// well-known private names, plus any host written as a literal IP.
+//
+// This is the screening that survives proxying. Once a proxy is configured the
+// transport only ever dials the proxy, so safeTransport's dial-time guard never
+// sees the target and a request for http://169.254.169.254/ would otherwise be
+// forwarded verbatim. DNS-based screening is deliberately NOT done here: behind
+// a proxy the target is resolved by the proxy, and requiring the name to resolve
+// locally would reject hosts only the proxy's resolver knows — which is a common
+// reason to run a proxy. The consequence, stated plainly: with a proxy
+// configured, a private host reachable only via a DNS name is screened by the
+// proxy's own policy, not by this guard.
+func validateTargetHostname(hostname string) error {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return fmt.Errorf("empty host")
+	}
+	if isPrivateHost(hostname) {
+		return fmt.Errorf("private host %q", hostname)
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return rejectPrivateIP(ip)
+	}
+	return nil
+}
+
 func fetchWebPage(ctx context.Context, rawURL string, maxChars int, extractContent bool) (string, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -536,8 +649,8 @@ func fetchWebPage(ctx context.Context, rawURL string, maxChars int, extractConte
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", fmt.Errorf("url scheme must be http or https")
 	}
-	if parsed.Host == "" || isPrivateHost(parsed.Host) {
-		return "", fmt.Errorf("url host is not allowed")
+	if err := validateTargetHostname(parsed.Hostname()); err != nil {
+		return "", fmt.Errorf("url host is not allowed: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)

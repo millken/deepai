@@ -886,3 +886,37 @@ func TestFileEventStoreGetTimelineFromDisk(t *testing.T) {
 		t.Fatalf("GetTimeline nonexistent = %v, want ErrNotFound", err)
 	}
 }
+
+// TestProxyUpstreamClientHonorsEnvProxy: the recording proxy forwards to
+// api.openai.com / api.anthropic.com through its own http.Transport, which — like
+// every hand-built Transport — ignores HTTP_PROXY/HTTPS_PROXY unless Proxy is set.
+// Without it, `deepai proxy` cannot reach the upstreams from behind a firewall
+// even though direct model calls can.
+func TestProxyUpstreamClientHonorsEnvProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	p, err := NewProxy(slog.Default(), Config{Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("NewProxy() error = %v", err)
+	}
+	transport, ok := p.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("upstream Transport is %T, want *http.Transport", p.httpClient.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("upstream Transport.Proxy is nil; the recording proxy ignores the proxy environment")
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL, err := transport.Proxy(req)
+	if err != nil {
+		t.Fatalf("Transport.Proxy() error = %v", err)
+	}
+	if proxyURL == nil || proxyURL.Host != "127.0.0.1:7890" {
+		t.Fatalf("Transport.Proxy() = %v, want 127.0.0.1:7890", proxyURL)
+	}
+}

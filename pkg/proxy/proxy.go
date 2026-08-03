@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/millken/deepai/pkg/netutil"
 )
 
 const (
@@ -75,6 +77,11 @@ func NewProxy(logger *slog.Logger, cfg Config) (*Proxy, error) {
 		store:  NewMemoryEventStore(),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
+				// Reach the upstream APIs through the user's proxy when one is
+				// configured; a hand-built Transport has no proxy support unless
+				// Proxy is set. See pkg/netutil for why not
+				// http.ProxyFromEnvironment.
+				Proxy:                 netutil.EnvProxyFunc,
 				ResponseHeaderTimeout: 30 * time.Second,
 				MaxIdleConns:          100,
 				MaxIdleConnsPerHost:   10,
