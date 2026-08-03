@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -81,11 +82,21 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}
 
 	// Resolve agent type config: project YAML/MD > plugin MD > builtin > general
-	agentType := AgentType(task.Config.EffectiveAgentType())
+	agentType := normalizeAgentType(AgentType(task.Config.EffectiveAgentType()))
 	if agentType == "" {
 		agentType = AgentTypeGeneral
 	}
-	profileCfg := resolveAgentTypeConfigWithPlugins(agentType, e.workDir, e.pluginAgentDirs)
+	profileCfg, profileProblems, typeResolved := resolveAgentTypeConfigResolved(agentType, e.workDir, e.pluginAgentDirs)
+	if !typeResolved {
+		// Nothing on disk and no builtin defines this type. Refusing is the
+		// same policy selectSubagentTools applies to an unmatched tools
+		// selector: a typo must not silently widen privileges. The lenient
+		// general-purpose fallback that used to happen here was strictly worse
+		// than an explicit general-purpose — it left DefaultTools empty, which
+		// selectSubagentTools reads as "no restriction", so a hallucinated
+		// agent_type ran with EVERY registered tool.
+		return subagent.ExecutionResult{}, e.unknownAgentTypeError(agentType, profileProblems)
+	}
 
 	// Determine tools: explicit Tools > AgentType DefaultTools > all
 	var toolSelectors []string
@@ -111,15 +122,17 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}
 
 	// MaxTurns priority: caller-explicit (max_turns arg) > agent type profile
-	// (builtin/YAML/MD) > pool fallback (general-purpose default).
-	// Pool fallback is applied last so a profile that defines MaxTurns=10
-	// is not capped to the pool's general-purpose default of 6.
+	// (builtin/YAML/MD) > safety floor. The pool contributes nothing here — it
+	// deliberately injects no per-type defaults (see Pool.resolveConfig), so a
+	// profile's MaxTurns can no longer be shadowed for the two types the pool
+	// used to special-case.
 	maxTurns := task.Config.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = profileCfg.MaxTurns
 	}
 	if maxTurns <= 0 {
-		// Last resort: pool's general-purpose safety floor.
+		// Last resort safety floor: a profile with no MaxTurns (e.g. builtin
+		// general-purpose) must still be bounded.
 		maxTurns = 6
 	}
 
@@ -138,6 +151,19 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		return subagent.ExecutionResult{}, fmt.Errorf("resolve subagent model: %w", err)
 	}
 
+	// profileTemperature must be handed to the agent EXPLICITLY: New() runs
+	// ApplyAgentType(&cfg, cfg.AgentType), and the config below deliberately
+	// leaves AgentType unset (setting it would make ApplyAgentType re-resolve
+	// the profile WITHOUT e.workDir and then Restrict the already-selected
+	// registry against that wrong tool list — a project YAML that adds a tool
+	// the builtin profile lacks would lose it). With AgentType empty,
+	// ApplyAgentType filled in general-purpose's temperature for every
+	// subagent, so the per-type Temperature (coder 0.1, bash 0.0, ...) reached
+	// the provider for no type at all. Passing it explicitly wins because
+	// ApplyAgentType only defaults a nil Temperature. Read from the RESOLVED
+	// profile, so a project YAML's `temperature:` applies too.
+	profileTemperature := profileCfg.Temperature
+
 	// buildAgentConfig is factored out so a schema-validation retry (below)
 	// constructs its fresh agent (agents are single-use, react.go's
 	// a.started guard) from the EXACT same config as the original run —
@@ -145,6 +171,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// two drifting apart over time. tokenBudget is a parameter (not always
 	// task.Config.TokenBudget) so a retry can be given the REMAINING budget
 	// instead of the full budget again (see the retry loop below).
+
 	buildAgentConfig := func(tokenBudget int) AgentConfig {
 		return AgentConfig{
 			LLMProvider: provider,
@@ -152,6 +179,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 			MaxTurns:    maxTurns,
 			Model:       modelName,
 			MaxTokens:   e.maxTokens,
+			Temperature: &profileTemperature,
 			Sandbox:     e.sandbox,
 			// runCtx (built by Pool.runTask via context.WithTimeout) always carries
 			// a deadline, so react.go's requestTimeout-from-bare-ctx branch never
@@ -380,6 +408,26 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		Messages: result.Messages,
 		Usage:    convertSubagentUsage(totalUsage),
 	}, nil
+}
+
+// unknownAgentTypeError builds the rejection for an agent_type nothing defines.
+// It lists the types that DO resolve so the model can correct itself on the next
+// call instead of retrying the same bad name — the same self-correction the
+// unmatched-tools-selector error offers. Enumeration touches disk, which is fine
+// on this error-only path. Any load problems collected while resolving the type
+// are appended: a type whose ONLY definition is a broken file lands here too,
+// and "unknown" alone would be actively misleading in that case.
+func (e *SubagentExecutor) unknownAgentTypeError(t AgentType, problems []string) error {
+	var names []string
+	for _, info := range EnumerateAgents(e.workDir, e.pluginAgentDirs) {
+		names = append(names, string(info.Type))
+	}
+	sort.Strings(names)
+	err := fmt.Errorf("unknown agent_type %q; available agent types: %s", t, strings.Join(names, ", "))
+	if len(problems) > 0 {
+		err = fmt.Errorf("%w (agent config load problems: %s)", err, strings.Join(problems, "; "))
+	}
+	return err
 }
 
 // outputSchemaWarningPrefix marks a fail-soft ExecutionResult.Result: the

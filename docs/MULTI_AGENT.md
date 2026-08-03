@@ -1,6 +1,6 @@
 # Multi-Agent 协同设计
 
-> **⚠️ 2026-08 勘误**："Environment 发布/订阅消息总线"从未实现，代码中不存在 Publish/Subscribe/MessageBus；agent 表中的温度等参数与代码不符（以 `pkg/agent/types_config.go` 为准，如 general-purpose 实为 0.2、coder 实为 0.1）。现状评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
+> **⚠️ 2026-08 勘误**："Environment 发布/订阅消息总线"从未实现，代码中不存在 Publish/Subscribe/MessageBus。下表温度已与 `pkg/agent/types_config.go` 对齐（在此之前子 agent 的温度实际全部退化为 0.2）；「工具」列仍是概述，精确列表以 `BuiltinAgentTypes` 的 `DefaultTools` 为准。现状评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
 
 ## 概述
 
@@ -13,10 +13,10 @@ deepai 多 agent 系统通过以下机制实现 agent 协同：
 
 | Agent Type | 角色 | 工具 | 温度 | 用途 |
 |---|---|---|---|---|
-| `general-purpose` | 通用助手 | 全部 | 0.7 | 日常对话 |
-| `researcher` | 研究员 | 全部 | 0.3 | 信息收集与综合 |
-| `coder` | 编码 | bash, file_ops, git | 0.7 | 代码实现、调试 |
-| `analyst` | 分析师 | 全部 | 0.3 | 数据分析 |
+| `general-purpose` | 通用助手 | file_ops, bash, web_search, web_fetch, skill, present_file, ask_clarification | 0.2 | 日常对话 |
+| `researcher` | 研究员 | 全部 | 0.1 | 信息收集与综合 |
+| `coder` | 编码 | bash, file_ops, git | 0.1 | 代码实现、调试 |
+| `analyst` | 分析师 | 全部 | 0.15 | 数据分析 |
 | `security-reviewer` | 安全审查 | read_file, grep, glob, list_dir, find | 0.2 | 漏洞、注入、权限 |
 | `arch-reviewer` | 架构审查 | read_file, grep, glob, list_dir, find | 0.2 | 设计模式、耦合度 |
 | `perf-reviewer` | 性能审查 | read_file, grep, glob, list_dir, find, bash | 0.2 | 算法复杂度、内存 |
@@ -77,7 +77,22 @@ tools:
   - grep
 ```
 
-加载优先级：`.deepai/agents/{type}.yaml` > 内置配置 > `general-purpose` 兜底。
+加载优先级：`.deepai/agents/{type}.yaml` > `.deepai/agents/{type}.md` > 插件 `agents/{type}.md` > 内置配置。
+
+以上都没有定义该类型时，**子 agent 会直接报错**（错误信息里列出所有可用类型），不会静默回落到
+`general-purpose`——回落会让拼错的 `agent_type` 拿到一个没有工具白名单的 profile，也就是全部工具，
+与 `tools` 写错时的硬失败策略正好相反。`agent_type` 留空才使用 `general-purpose`。
+
+`max_turns` / `tools` / `temperature` / `model` 一律由上面解析出的 profile 决定（`task` 工具的
+`max_turns`、`model` 等参数可显式覆盖），subagent pool 不再注入任何按类型的默认值。
+
+`general-purpose` 的工具是**显式白名单**（不是"全部"）：不含 `git_auto_commit`，也不含任何 MCP 工具
+——白名单无法枚举 MCP 工具名，所以 MCP 需要按 agent 类型显式开启。需要放宽就在
+`.deepai/agents/general-purpose.yaml` 里写 `tools:`。
+
+注意主 agent（REPL）建 agent 时**不声明** `AgentType`：它仍以 `general-purpose` 的 prompt/温度为基线，
+但工具注册表不受白名单裁剪（否则 task / skill / MCP 工具会被剪掉）。只有显式声明了类型的 agent 才按
+白名单收窄——见 `ApplyAgentType`。
 
 ## 文件结构
 

@@ -191,6 +191,23 @@ func resolveAgentTypeConfigWithPlugins(t AgentType, workDir string, pluginAgentD
 // order, ending at builtin/general — execution-path behavior is identical to
 // resolveAgentTypeConfigWithPlugins, only the reporting differs.
 func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, pluginAgentDirs []string) (AgentTypeConfig, []string) {
+	cfg, problems, _ := resolveAgentTypeConfigResolved(t, workDir, pluginAgentDirs)
+	return cfg, problems
+}
+
+// resolveAgentTypeConfigResolved is resolveAgentTypeConfigWithPluginsReported
+// plus a third value reporting whether t was actually BACKED by a source: a
+// project YAML/MD, a plugin MD, or a builtin profile. false means the returned
+// config is the general-purpose fallback for a type nothing defines — a
+// hallucinated or typo'd agent_type, or a name rejected by validateSafeName.
+//
+// The distinction exists because the two consumers want opposite behavior:
+// enumeration and the main agent's ApplyAgentType want the lenient fallback,
+// while the subagent executor must REJECT an unbacked type. Silently running it
+// as general-purpose used to hand the subagent an unrestricted tool set (more
+// privilege than an explicit general-purpose), the exact widening
+// selectSubagentTools refuses for an unmatched tools selector.
+func resolveAgentTypeConfigResolved(t AgentType, workDir string, pluginAgentDirs []string) (AgentTypeConfig, []string, bool) {
 	var problems []string
 	// Explicit builtin-ness check, passed to every mergeConfig call below —
 	// mergeConfig must never infer this from base's field emptiness.
@@ -221,14 +238,14 @@ func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, plug
 			}
 			problems = append(problems, msg)
 		} else if cfg != nil {
-			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
+			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems, true
 		}
 
 		mdPath := filepath.Join(workDir, ".deepai", "agents", string(t)+".md")
 		if cfg, err := loadAgentMDFileReported(mdPath); err != nil {
 			problems = append(problems, err.Error())
 		} else if cfg != nil {
-			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
+			return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems, true
 		}
 
 		for _, dir := range pluginAgentDirs {
@@ -236,14 +253,14 @@ func resolveAgentTypeConfigWithPluginsReported(t AgentType, workDir string, plug
 			if cfg, err := loadAgentMDFileReported(pluginPath); err != nil {
 				problems = append(problems, err.Error())
 			} else if cfg != nil {
-				return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems
+				return mergeConfig(BuiltinAgentTypes[t], cfg, isBuiltin), problems, true
 			}
 		}
 	}
 	if cfg, ok := BuiltinAgentTypes[t]; ok {
-		return cfg, problems
+		return cfg, problems, true
 	}
-	return BuiltinAgentTypes[AgentTypeGeneral], problems
+	return BuiltinAgentTypes[AgentTypeGeneral], problems, false
 }
 
 // loadAgentMDFile parses an agent .md if it exists; returns nil for missing or

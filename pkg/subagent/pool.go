@@ -33,22 +33,6 @@ func NewPool(executor Executor, cfg PoolConfig) *Pool {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.Defaults == nil {
-		cfg.Defaults = map[string]SubagentConfig{
-			"general-purpose": {
-				AgentType: "general-purpose",
-				MaxTurns:  6,
-				Timeout:   cfg.Timeout,
-				Tools:     []string{"file_ops"},
-			},
-			"bash": {
-				AgentType: "bash",
-				MaxTurns:  4,
-				Timeout:   cfg.Timeout,
-				Tools:     []string{"bash"},
-			},
-		}
-	}
 	return &Pool{
 		executor: executor,
 		cfg:      cfg,
@@ -262,51 +246,49 @@ func (p *Pool) emit(ctx context.Context, evt TaskEvent) {
 	EmitEvent(ctx, evt)
 }
 
+// resolveConfig normalizes a caller-supplied SubagentConfig: it fills in the
+// agent type and the pool-wide Timeout, sanitizes the values, and copies the
+// caller's slices so a task can never alias them. It deliberately injects NO
+// per-agent-type configuration of its own — MaxTurns, Tools, SystemPrompt and
+// Model come from the agent-type profile (builtin > project YAML > project MD >
+// plugin MD), resolved by the executor.
+//
+// The pool used to seed hardcoded per-type defaults here (general-purpose:
+// MaxTurns 6 + Tools [file_ops]; bash: MaxTurns 4 + Tools [bash]). Because
+// SubagentExecutor.Execute prefers task.Config over the resolved profile, those
+// defaults silently shadowed a project .deepai/agents/<type>.yaml|md for
+// exactly those two types, and pinned general-purpose to file_ops even though
+// its builtin profile means "unrestricted". The profile is now the single
+// source of truth, with the executor's MaxTurns safety floor as last resort.
 func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
-	agentType := cfg.EffectiveAgentType()
-	if agentType == "" {
-		agentType = "general-purpose"
+	resolved := cfg
+	resolved.AgentType = cfg.EffectiveAgentType()
+	if resolved.AgentType == "" {
+		resolved.AgentType = "general-purpose"
 	}
-
-	base, ok := p.cfg.Defaults[agentType]
-	if !ok {
-		// Unknown agent type: no pool defaults. The executor resolves MaxTurns,
-		// Tools, etc. from the agent type profile (builtin/YAML/MD). If the
-		// profile also has nothing, the executor applies a safety floor.
-		base = SubagentConfig{AgentType: agentType}
-	}
-
-	if cfg.AgentType != "" {
-		base.AgentType = cfg.AgentType
-	}
-	if base.AgentType == "" {
-		base.AgentType = agentType
-	}
-	if cfg.MaxTurns > 0 {
-		base.MaxTurns = cfg.MaxTurns
-	}
-	if cfg.Timeout > 0 {
-		base.Timeout = cfg.Timeout
-	}
-	if strings.TrimSpace(cfg.SystemPrompt) != "" {
-		base.SystemPrompt = strings.TrimSpace(cfg.SystemPrompt)
-	}
+	resolved.SystemPrompt = strings.TrimSpace(cfg.SystemPrompt)
+	resolved.Model = strings.TrimSpace(cfg.Model)
 	if len(cfg.Tools) > 0 {
-		base.Tools = append([]string(nil), cfg.Tools...)
+		resolved.Tools = append([]string(nil), cfg.Tools...)
 	}
 	if len(cfg.ContextFiles) > 0 {
-		base.ContextFiles = append([]string(nil), cfg.ContextFiles...)
+		resolved.ContextFiles = append([]string(nil), cfg.ContextFiles...)
 	}
-	if strings.TrimSpace(cfg.Model) != "" {
-		base.Model = strings.TrimSpace(cfg.Model)
+	// Negative values are meaningless and would read as "explicitly set"
+	// downstream (a negative MaxTokensBudget, for instance, is not the same as
+	// unlimited); normalize them to the unset zero so the profile and the
+	// executor's own floors apply. A model can produce one via the task tool's
+	// max_turns / token_budget arguments.
+	if resolved.MaxTurns < 0 {
+		resolved.MaxTurns = 0
 	}
-	if cfg.TokenBudget > 0 {
-		base.TokenBudget = cfg.TokenBudget
+	if resolved.TokenBudget < 0 {
+		resolved.TokenBudget = 0
 	}
-	if base.Timeout <= 0 {
-		base.Timeout = p.cfg.Timeout
+	if resolved.Timeout <= 0 {
+		resolved.Timeout = p.cfg.Timeout
 	}
-	return base
+	return resolved
 }
 
 func newTaskID() string {

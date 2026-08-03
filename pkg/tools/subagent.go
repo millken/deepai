@@ -111,10 +111,16 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				}
 			}
 
-			// Resolve agent type: agent_type > subagent_type > general-purpose
-			agentType, _ := call.Arguments["agent_type"].(string)
+			// Resolve agent type: agent_type > subagent_type > (empty, which the
+			// executor defaults to general-purpose). Both arguments pass through
+			// VERBATIM: deciding which types exist needs the project/plugin/
+			// builtin agent catalog, which lives in pkg/agent, and the executor
+			// rejects an unknown type there. Coercing an unrecognized value to
+			// general-purpose here would silently downgrade a typo into a run
+			// with the wrong — and less restricted — profile.
+			agentType := strings.TrimSpace(stringArg(call.Arguments["agent_type"]))
 			if agentType == "" {
-				agentType = string(parseSubagentType(call.Arguments["subagent_type"]))
+				agentType = strings.TrimSpace(stringArg(call.Arguments["subagent_type"]))
 			}
 
 			contextFiles, err := stringsFromArg(call.Arguments["context_files"])
@@ -194,14 +200,13 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 	}
 }
 
-func parseSubagentType(raw any) subagent.SubagentType {
+// stringArg returns a string argument, or "" when it is absent or of another
+// type. A non-string agent type is treated as absent rather than rejected: the
+// executor's default (general-purpose) is the documented behavior for an omitted
+// type, and there is nothing a caller could mean by a numeric agent type.
+func stringArg(raw any) string {
 	value, _ := raw.(string)
-	switch strings.TrimSpace(value) {
-	case string(subagent.SubagentBash):
-		return subagent.SubagentBash
-	default:
-		return subagent.SubagentGeneralPurpose
-	}
+	return value
 }
 
 // stringsFromArg converts a JSON array argument (decoded as []any) into a

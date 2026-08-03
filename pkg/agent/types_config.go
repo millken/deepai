@@ -80,9 +80,30 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "General Purpose",
 		Description:  "Balanced assistant profile for general tasks.",
 		SystemPrompt: generalPurposeSystemPrompt,
-		DefaultTools: nil,
-		MaxTurns:     0,
-		Temperature:  0.2,
+		// An EXPLICIT allowlist, not nil. nil means "no restriction" to both
+		// consumers of DefaultTools, which for a delegated general-purpose
+		// subagent meant every registered tool — mutating git tools and every
+		// connected MCP server included. This list is the generalist's baseline:
+		// files, search, shell, read-only web, skills, clarification.
+		// Deliberately absent: git_auto_commit (mutates history, and concurrent
+		// git operations across parallel subagents race on the shared index —
+		// see the ParallelSafe note on the task tool), MCP tools (no allowlist
+		// can name them, so they are opt-in per agent type), and the narrower
+		// web variants (web_fetch_batch, image_search). A project
+		// .deepai/agents/general-purpose.yaml can widen or narrow this.
+		//
+		// NOTE: ApplyAgentType only restricts the registry for an agent that
+		// DECLARED a type. The main agent (REPL) declares none and normalizes to
+		// this profile for its prompt/temperature baseline; this list must not
+		// narrow it, since it can never name the task tool, the skill tool or
+		// MCP tools.
+		DefaultTools: []string{
+			"bash", "read_file", "write_file", "edit_file", "list_dir", "glob",
+			"grep", "find", "code_map", "present_file", "ask_clarification",
+			"skill", "web_search", "web_fetch",
+		},
+		MaxTurns:    0,
+		Temperature: 0.2,
 	},
 	AgentTypeResearch: {
 		Type:         AgentTypeResearch,
@@ -212,12 +233,23 @@ func GetAgentTypeConfig(t AgentType) AgentTypeConfig {
 	return BuiltinAgentTypes[AgentTypeGeneral]
 }
 
+// ApplyAgentType fills the unset parts of cfg from an agent type profile.
+//
+// An empty t means the caller DECLARED NO TYPE (the REPL's shape — see
+// pkg/chat/repl.go). Such an agent still normalizes to general-purpose for its
+// baseline prompt and temperature, but its tool registry is left untouched: the
+// tools it was handed are the tools it should have. Only a DECLARED type narrows
+// the registry to that profile's allowlist. Without this distinction, giving
+// general-purpose an explicit DefaultTools list would silently strip the main
+// agent's task tool, skill tool and every MCP tool — none of which any agent-type
+// allowlist can name.
 func ApplyAgentType(cfg *AgentConfig, t AgentType) error {
 	if cfg == nil {
 		return fmt.Errorf("agent config is nil")
 	}
 
 	t = normalizeAgentType(t)
+	declared := t != ""
 	if t == "" {
 		t = AgentTypeGeneral
 	}
@@ -231,7 +263,7 @@ func ApplyAgentType(cfg *AgentConfig, t AgentType) error {
 		temp := profile.Temperature
 		cfg.Temperature = &temp
 	}
-	if cfg.Tools != nil && len(profile.DefaultTools) > 0 {
+	if declared && cfg.Tools != nil && len(profile.DefaultTools) > 0 {
 		cfg.Tools = cfg.Tools.Restrict(profile.DefaultTools)
 	}
 	return nil

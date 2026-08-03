@@ -62,11 +62,15 @@ func (c SubagentConfig) EffectiveAgentType() string {
 }
 
 // PoolConfig holds the configuration for a subagent pool.
+// PoolConfig configures pool-wide limits only. There is deliberately no
+// per-agent-type default map: agent-type configuration (system prompt, tools,
+// max turns, model, temperature) belongs to the agent-type profile the executor
+// resolves — see Pool.resolveConfig for why a pool-level default map is
+// actively harmful.
 type PoolConfig struct {
 	MaxConcurrent int
 	Timeout       time.Duration
 	Logger        *slog.Logger
-	Defaults      map[string]SubagentConfig // key is agent type string
 }
 
 // Task represents a subagent task.

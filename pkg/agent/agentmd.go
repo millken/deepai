@@ -57,17 +57,20 @@ func ParseAgentMarkdown(path string) (*AgentTypeConfig, error) {
 		slog.Warn("agent md missing \"name\"; using filename stem", "path", path, "fallback", name)
 	}
 
-	cfg := &AgentTypeConfig{
+	// Model is a model ALIAS resolved against the model registry by the
+	// subagent executor (pkg/agent/subagent.go), exactly like an agent YAML's
+	// `model:` key. An alias the registry does not know makes the executor fail
+	// with a resolve error, which is the intended signal — an MD-defined agent
+	// (every Claude-plugin agent is one) must not silently run on the default
+	// model when it explicitly asked for another.
+	return &AgentTypeConfig{
 		Type:         AgentType(name),
 		Name:         name,
 		Description:  strings.TrimSpace(af.Description),
 		SystemPrompt: strings.TrimSpace(body),
 		DefaultTools: mapClaudeTools(af.Tools),
-	}
-	if strings.TrimSpace(af.Model) != "" {
-		slog.Debug("agent md model field ignored", "path", path, "model", af.Model)
-	}
-	return cfg, nil
+		Model:        strings.TrimSpace(af.Model),
+	}, nil
 }
 
 func mapClaudeTools(csv string) []string {
