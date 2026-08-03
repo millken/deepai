@@ -56,6 +56,55 @@ func TestTaskToolCompleted(t *testing.T) {
 	}
 }
 
+// TestTaskTool_SubagentTypeArgPassesThroughVerbatim is the RED test for the
+// deprecated argument's silent coercion: parseSubagentType collapsed every value
+// except "bash" to "general-purpose", so a typo'd or hallucinated type arriving
+// via subagent_type ran as general-purpose instead of being rejected. The
+// executor is the single place that knows which types resolve (builtin, project
+// YAML/MD, plugin MD) and now hard-fails on an unknown one — this layer must
+// hand it the value verbatim rather than pre-coercing it, otherwise the
+// deprecated argument quietly reopens the fallback that agent_type just closed.
+func TestTaskTool_SubagentTypeArgPassesThroughVerbatim(t *testing.T) {
+	cases := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{"bash still works", map[string]any{"subagent_type": "bash"}, "bash"},
+		{"general-purpose still works", map[string]any{"subagent_type": "general-purpose"}, "general-purpose"},
+		{"unknown type is not coerced", map[string]any{"subagent_type": "code-reviewer"}, "code-reviewer"},
+		{"whitespace is trimmed", map[string]any{"subagent_type": "  coder  "}, "coder"},
+		{"absent arg stays empty (executor defaults it)", map[string]any{}, ""},
+		{"non-string arg stays empty", map[string]any{"subagent_type": 42.0}, ""},
+		{"agent_type still wins", map[string]any{"subagent_type": "bash", "agent_type": "coder"}, "coder"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			tool := TaskTool(fakeTaskPool{
+				startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+					got = cfg.AgentType
+					return &subagent.Task{ID: "task-1"}, nil
+				},
+				wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+					return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+				},
+			}, nil)
+
+			args := map[string]any{"description": "d", "prompt": "p"}
+			for k, v := range tc.args {
+				args[k] = v
+			}
+			if _, err := tool.Handler(context.Background(), models.ToolCall{ID: "c", Name: "task", Arguments: args}); err != nil {
+				t.Fatalf("Handler() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("cfg.AgentType = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTaskToolFailed(t *testing.T) {
 	tool := TaskTool(fakeTaskPool{
 		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {

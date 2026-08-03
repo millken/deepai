@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -334,11 +335,14 @@ func TestLoadAgentYAML_ExplicitZeroOverrides(t *testing.T) {
 	})
 }
 
-// TestResolveAgentTypeConfig_GeneralPurposeYAMLNoToolsStaysUnrestricted: a
-// project general-purpose.yaml that only sets system_prompt (no tools: key)
-// must not strip the builtin's nil (unrestricted) DefaultTools down to the
-// read-only five — nil means unrestricted everywhere else in the codebase.
-func TestResolveAgentTypeConfig_GeneralPurposeYAMLNoToolsStaysUnrestricted(t *testing.T) {
+// TestResolveAgentTypeConfig_GeneralPurposeYAMLNoToolsInheritsBuiltinAllowlist:
+// a project general-purpose.yaml that only sets system_prompt (no tools: key)
+// must inherit the BUILTIN general-purpose allowlist, not be narrowed to the
+// conservative read-only five that a custom (non-builtin) type falls back to.
+// general-purpose used to carry nil DefaultTools ("unrestricted"), which handed
+// a delegated general-purpose subagent every registered tool; it now carries an
+// explicit allowlist, and a tools-less YAML override must leave it intact.
+func TestResolveAgentTypeConfig_GeneralPurposeYAMLNoToolsInheritsBuiltinAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	agentsDir := filepath.Join(dir, ".deepai", "agents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
@@ -350,8 +354,15 @@ func TestResolveAgentTypeConfig_GeneralPurposeYAMLNoToolsStaysUnrestricted(t *te
 	}
 
 	cfg := resolveAgentTypeConfig(AgentTypeGeneral, dir)
-	if cfg.DefaultTools != nil {
-		t.Errorf("DefaultTools = %v, want nil (unrestricted)", cfg.DefaultTools)
+	want := BuiltinAgentTypes[AgentTypeGeneral].DefaultTools
+	if len(want) == 0 {
+		t.Fatal("builtin general-purpose has no DefaultTools, which means \"unrestricted\"")
+	}
+	if strings.Join(cfg.DefaultTools, ",") != strings.Join(want, ",") {
+		t.Errorf("DefaultTools = %v, want the builtin allowlist %v", cfg.DefaultTools, want)
+	}
+	if cfg.SystemPrompt != "Custom general-purpose prompt." {
+		t.Errorf("SystemPrompt = %q, want the YAML override", cfg.SystemPrompt)
 	}
 }
 

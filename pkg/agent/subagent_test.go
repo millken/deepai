@@ -137,6 +137,18 @@ func noopTool() models.Tool {
 	}
 }
 
+// registryWithNoopTool holds just the noop tool. Tests that pair it with an
+// explicit SubagentConfig.Tools of []string{"noop"} stay independent of whichever
+// tools an agent-type profile allowlists.
+func registryWithNoopTool(t *testing.T) *tools.Registry {
+	t.Helper()
+	reg := tools.NewRegistry()
+	if err := reg.Register(noopTool()); err != nil {
+		t.Fatalf("register noop tool: %v", err)
+	}
+	return reg
+}
+
 // TestSubagentExecutor_PassesTokenBudgetToAgentConfig is the RED test for
 // M2-2 (12d): task.Config.TokenBudget must reach the subagent's
 // AgentConfig.MaxTokensBudget, which react.go's turn-loop budget check then
@@ -160,7 +172,7 @@ func TestSubagentExecutor_PassesTokenBudgetToAgentConfig(t *testing.T) {
 
 	exec := NewSubagentExecutor(reg, toolReg, nil)
 	execResult, err := exec.Execute(context.Background(),
-		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", TokenBudget: 10}},
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", TokenBudget: 10, Tools: []string{"noop"}}},
 		func(subagent.TaskEvent) {})
 	if err == nil {
 		t.Fatal("Execute() error = nil, want a token-budget-exceeded error (TokenBudget=10 with 20 tokens/turn)")
@@ -192,7 +204,7 @@ func TestSubagentExecutor_PassesTokenBudgetToAgentConfig(t *testing.T) {
 	}
 	exec2 := NewSubagentExecutor(reg2, toolReg2, nil)
 	_, err = exec2.Execute(context.Background(),
-		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose"}},
+		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Tools: []string{"noop"}}},
 		func(subagent.TaskEvent) {})
 	if err != nil {
 		t.Fatalf("Execute() (no budget) error = %v, want nil", err)

@@ -394,25 +394,47 @@ func TestPoolStartTask_ContextFilesReachExecutor(t *testing.T) {
 	}
 }
 
-func TestResolveConfig_TypedAgentDoesNotInheritGeneralDefaults(t *testing.T) {
+// TestResolveConfig_NoPerTypeDefaults pins the pool's role: it resolves only
+// what the CALLER passed (plus the pool-wide Timeout fallback) and injects no
+// per-agent-type configuration of its own. The pool used to seed hardcoded
+// defaults for "general-purpose" (MaxTurns 6, Tools [file_ops]) and "bash"
+// (MaxTurns 4, Tools [bash]); because SubagentExecutor.Execute prefers
+// task.Config over the resolved agent-type profile, those defaults silently
+// shadowed a project .deepai/agents/<type>.yaml|md for exactly those two types.
+// The agent-type profile (builtin > YAML > MD) is now the single source of
+// truth, with the executor's own safety floor as the last resort.
+func TestResolveConfig_NoPerTypeDefaults(t *testing.T) {
 	p := NewPool(nil, PoolConfig{})
 
-	// "coder" has no pool default → must NOT borrow general-purpose's MaxTurns(6)
-	// or Tools([file_ops]); leave them unset so the executor's profile applies.
-	coder := p.resolveConfig(SubagentConfig{AgentType: "coder"})
-	if coder.AgentType != "coder" {
-		t.Fatalf("AgentType = %q, want coder", coder.AgentType)
-	}
-	if coder.MaxTurns != 0 {
-		t.Fatalf("coder MaxTurns = %d, want 0 (profile decides), not the general-purpose cap", coder.MaxTurns)
-	}
-	if len(coder.Tools) != 0 {
-		t.Fatalf("coder Tools = %v, want empty (profile decides), not general-purpose's file_ops", coder.Tools)
+	for _, agentType := range []string{"general-purpose", "bash", "coder"} {
+		got := p.resolveConfig(SubagentConfig{AgentType: agentType})
+		if got.AgentType != agentType {
+			t.Fatalf("AgentType = %q, want %q", got.AgentType, agentType)
+		}
+		if got.MaxTurns != 0 {
+			t.Fatalf("%s MaxTurns = %d, want 0 so the agent-type profile decides", agentType, got.MaxTurns)
+		}
+		if len(got.Tools) != 0 {
+			t.Fatalf("%s Tools = %v, want empty so the agent-type profile decides", agentType, got.Tools)
+		}
+		if got.SystemPrompt != "" {
+			t.Fatalf("%s SystemPrompt = %q, want empty so the agent-type profile decides", agentType, got.SystemPrompt)
+		}
 	}
 
-	// general-purpose still gets its pool default.
-	gp := p.resolveConfig(SubagentConfig{AgentType: "general-purpose"})
-	if gp.MaxTurns != 6 {
-		t.Fatalf("general-purpose MaxTurns = %d, want 6 (pool default preserved)", gp.MaxTurns)
+	// An empty agent type still normalizes to general-purpose, and the
+	// pool-wide Timeout still applies as the per-task deadline.
+	empty := p.resolveConfig(SubagentConfig{})
+	if empty.AgentType != "general-purpose" {
+		t.Fatalf("empty AgentType resolved to %q, want general-purpose", empty.AgentType)
+	}
+	if empty.Timeout != p.cfg.Timeout {
+		t.Fatalf("Timeout = %v, want the pool-wide %v", empty.Timeout, p.cfg.Timeout)
+	}
+
+	// Caller-supplied values still win.
+	explicit := p.resolveConfig(SubagentConfig{AgentType: "coder", MaxTurns: 12, Tools: []string{"bash"}})
+	if explicit.MaxTurns != 12 || len(explicit.Tools) != 1 || explicit.Tools[0] != "bash" {
+		t.Fatalf("caller values dropped: %+v", explicit)
 	}
 }

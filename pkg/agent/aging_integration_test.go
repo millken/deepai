@@ -16,6 +16,10 @@ import (
 type captureProvider struct {
 	mu       sync.Mutex
 	captured []models.Message
+	// firstReq is the first Stream request in full, so tests can assert
+	// request-level knobs (temperature, tool set, system prompt) and not just
+	// the message view. Zero value means Stream was never called.
+	firstReq llm.ChatRequest
 }
 
 func (p *captureProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
@@ -28,6 +32,7 @@ func (p *captureProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-ch
 		// Deep-copy Content so a later canonical read can't mask a shared-buffer bug.
 		p.captured = make([]models.Message, len(req.Messages))
 		copy(p.captured, req.Messages)
+		p.firstReq = req
 	}
 	p.mu.Unlock()
 	ch := make(chan llm.StreamChunk, 1)
@@ -36,6 +41,12 @@ func (p *captureProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-ch
 		ch <- llm.StreamChunk{Message: &models.Message{Role: models.RoleAI, Content: "done"}, Done: true}
 	}()
 	return ch, nil
+}
+
+func (p *captureProvider) firstRequest() llm.ChatRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.firstReq
 }
 
 func (p *captureProvider) seen() []models.Message {

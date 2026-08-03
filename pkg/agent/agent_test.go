@@ -270,6 +270,72 @@ func TestApplyAgentType(t *testing.T) {
 	}
 }
 
+// TestApplyAgentType_NoDeclaredTypeKeepsFullToolset is the RED test for the
+// blast radius of giving general-purpose an explicit DefaultTools allowlist: the
+// REPL builds its AgentConfig WITHOUT an AgentType (pkg/chat/repl.go), so
+// ApplyAgentType normalizes the empty type to general-purpose. It must keep
+// using that profile as the baseline prompt/temperature — the REPL relies on
+// both — while leaving the tool registry ALONE. Restricting it would silently
+// strip the main agent's task tool, skill tool and every MCP tool, none of which
+// any agent-type allowlist can name.
+func TestApplyAgentType_NoDeclaredTypeKeepsFullToolset(t *testing.T) {
+	registry := tools.NewRegistry()
+	// task/skill/some_mcp_tool are exactly the tools no profile allowlist names.
+	for _, name := range []string{"read_file", "bash", "task", "skill", "some_mcp_tool", "git_auto_commit"} {
+		if err := registry.Register(models.Tool{Name: name, Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		}}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	cfg := AgentConfig{Tools: registry} // no AgentType — the REPL's shape
+	if err := ApplyAgentType(&cfg, cfg.AgentType); err != nil {
+		t.Fatalf("ApplyAgentType() error = %v", err)
+	}
+
+	if cfg.AgentType != AgentTypeGeneral {
+		t.Fatalf("AgentType = %q, want the general-purpose baseline", cfg.AgentType)
+	}
+	if cfg.SystemPrompt == "" {
+		t.Fatal("ApplyAgentType() did not set the baseline system prompt")
+	}
+	if cfg.Temperature == nil {
+		t.Fatal("ApplyAgentType() did not set the baseline temperature")
+	}
+	for _, name := range []string{"read_file", "bash", "task", "skill", "some_mcp_tool", "git_auto_commit"} {
+		if cfg.Tools.Get(name) == nil {
+			t.Fatalf("ApplyAgentType() removed %q from an agent that declared no type", name)
+		}
+	}
+}
+
+// TestApplyAgentType_DeclaredTypeStillRestricts is the companion guard: an
+// EXPLICIT agent type must still narrow the registry to its allowlist.
+func TestApplyAgentType_DeclaredTypeStillRestricts(t *testing.T) {
+	registry := tools.NewRegistry()
+	for _, name := range []string{"bash", "read_file", "some_mcp_tool"} {
+		if err := registry.Register(models.Tool{Name: name, Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		}}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	cfg := AgentConfig{Tools: registry, AgentType: AgentTypeBash}
+	if err := ApplyAgentType(&cfg, cfg.AgentType); err != nil {
+		t.Fatalf("ApplyAgentType() error = %v", err)
+	}
+	if cfg.Tools.Get("bash") == nil {
+		t.Fatal("ApplyAgentType() removed the bash profile's own tool")
+	}
+	for _, name := range []string{"read_file", "some_mcp_tool"} {
+		if cfg.Tools.Get(name) != nil {
+			t.Fatalf("ApplyAgentType() kept %q, which the bash allowlist does not name", name)
+		}
+	}
+}
+
 type timeoutProvider struct{}
 
 func (timeoutProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
@@ -1870,9 +1936,12 @@ func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
 	reg := llm.NewSingleModelRegistry("test", "configured-model", "")
 	reg.InjectProvider("test", "", "", p)
 
-	exec := NewSubagentExecutor(reg, tools.NewRegistry(), nil)
+	// Explicit Tools keeps this test about MODEL resolution: it must not depend
+	// on which tools the general-purpose profile happens to allowlist, and
+	// selectSubagentTools rejects a selector list that matches nothing.
+	exec := NewSubagentExecutor(reg, registryWithNoopTool(t), nil)
 	_, err := exec.Execute(context.Background(),
-		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose"}},
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Tools: []string{"noop"}}},
 		func(subagent.TaskEvent) {})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -1892,9 +1961,9 @@ func TestSubagentExecutor_UsesConfiguredModel(t *testing.T) {
 	}
 	regOverride.InjectProvider("test", "", "", p2)
 
-	exec2 := NewSubagentExecutor(regOverride, tools.NewRegistry(), nil)
+	exec2 := NewSubagentExecutor(regOverride, registryWithNoopTool(t), nil)
 	_, err = exec2.Execute(context.Background(),
-		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Model: "review"}},
+		&subagent.Task{ID: "t2", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "general-purpose", Model: "review", Tools: []string{"noop"}}},
 		func(subagent.TaskEvent) {})
 	if err != nil {
 		t.Fatalf("Execute (override): %v", err)

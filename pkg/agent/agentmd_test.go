@@ -40,6 +40,14 @@ Focus on quality and security.`)
 	if cfg.SystemPrompt != "You are a senior code reviewer.\nFocus on quality and security." {
 		t.Fatalf("system prompt: %q", cfg.SystemPrompt)
 	}
+	// The model alias is honored, same as an agent YAML's `model:` key — the
+	// subagent executor resolves AgentTypeConfig.Model against the model
+	// registry (pkg/agent/subagent.go), so dropping it here would leave
+	// MD-defined agents (all Claude-plugin agents included) unable to pin a
+	// model while YAML-defined ones can.
+	if cfg.Model != "sonnet" {
+		t.Fatalf("model = %q, want sonnet", cfg.Model)
+	}
 	// Claude tool names mapped to deepai names.
 	want := []string{"read_file", "grep", "bash"}
 	if len(cfg.DefaultTools) != len(want) {
