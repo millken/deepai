@@ -107,12 +107,13 @@ func TestCompactMessages_AssistantToolCallsPreserved(t *testing.T) {
 		}
 	}
 
-	// Arguments should be stripped from compacted tool calls to save space.
+	// Small Arguments should be preserved (some providers reject nil);
+	// large Arguments should be replaced with a placeholder.
 	for _, m := range out {
 		if m.Role == models.RoleAI && strings.HasPrefix(m.Content, "[Called") {
 			for _, tc := range m.ToolCalls {
-				if tc.Arguments != nil {
-					t.Errorf("compacted tool call %s retained arguments (should be stripped)", tc.ID)
+				if tc.Arguments == nil {
+					t.Errorf("compacted tool call %s has nil Arguments (providers may reject)", tc.ID)
 				}
 			}
 		}
@@ -170,6 +171,54 @@ func TestCompactMessages_TailPreserved(t *testing.T) {
 	tail := out[len(out)-keepTail:]
 	if tail[0].Content != "more" || tail[1].Content != "tail result" || tail[2].Content != "final" {
 		t.Errorf("tail not preserved: %+v", tail)
+	}
+}
+
+// TestCompactMessages_ToolCallArgumentsPreserved verifies that compacted
+// assistant messages preserve Arguments (not nil) so provider tool_call ↔
+// tool_result pairing stays valid. Large Arguments are replaced with a
+// placeholder; small Arguments are kept verbatim.
+func TestCompactMessages_ToolCallArgumentsPreserved(t *testing.T) {
+	smallArgs := map[string]any{"path": "/tmp/file.go"}
+	largeArgs := map[string]any{"content": strings.Repeat("x", 600)}
+
+	msgs := []models.Message{
+		{ID: "1", Role: models.RoleHuman, Content: "go"},
+		{ID: "2", Role: models.RoleAI, ToolCalls: []models.ToolCall{
+			{ID: "c1", Name: "read_file", Arguments: smallArgs},
+			{ID: "c2", Name: "write_file", Arguments: largeArgs},
+		}, Content: ""},
+		{ID: "3", Role: models.RoleTool, Content: "r1", ToolResult: &models.ToolResult{CallID: "c1", ToolName: "read_file"}},
+		{ID: "4", Role: models.RoleTool, Content: "r2", ToolResult: &models.ToolResult{CallID: "c2", ToolName: "write_file"}},
+		{ID: "5", Role: models.RoleAI, Content: "tail1"},
+		{ID: "6", Role: models.RoleAI, Content: "tail2"},
+	}
+
+	out, did := compactMessages(msgs, 2)
+	if !did {
+		t.Fatal("expected compaction")
+	}
+
+	for _, m := range out {
+		if m.Role != models.RoleAI || len(m.ToolCalls) == 0 {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Arguments == nil {
+				t.Errorf("compacted tool call %s has nil Arguments", tc.ID)
+				continue
+			}
+			if tc.ID == "c1" {
+				if got := tc.Arguments["path"]; got != "/tmp/file.go" {
+					t.Errorf("small args not preserved: got %v", got)
+				}
+			}
+			if tc.ID == "c2" {
+				if _, ok := tc.Arguments["_compacted"]; !ok {
+					t.Errorf("large args not replaced with placeholder: got %v", tc.Arguments)
+				}
+			}
+		}
 	}
 }
 

@@ -100,19 +100,17 @@ type toolCallBreaker struct {
 	validationFailures            map[string]int
 	consecutiveValidationFailures int
 
-	// repeatCalls/repeatFails/prevRepeatKey track consecutive identical tool
-	// invocations (same name + args hash). prevRepeatKey gives "consecutive"
-	// semantics — switching to a different call resets both counters.
-	repeatCalls   map[string]int
-	repeatFails   map[string]int
+	// repeatCount/repeatFail track consecutive identical tool invocations
+	// (same name + args hash). prevRepeatKey gives "consecutive" semantics
+	// — switching to a different call resets both counters.
+	repeatCount   int
+	repeatFail    int
 	prevRepeatKey string
 }
 
 func newToolCallBreaker() *toolCallBreaker {
 	return &toolCallBreaker{
 		validationFailures: make(map[string]int),
-		repeatCalls:        make(map[string]int),
-		repeatFails:        make(map[string]int),
 	}
 }
 
@@ -146,22 +144,21 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 	// command dozens of times.
 	rKey := repeatKey(call.Name, call.Arguments)
 	if rKey != b.prevRepeatKey {
-		// Model switched to a different call → not a loop; reset.
-		b.repeatCalls = make(map[string]int)
-		b.repeatFails = make(map[string]int)
+		b.repeatCount = 0
+		b.repeatFail = 0
 		b.prevRepeatKey = rKey
 	}
-	b.repeatCalls[rKey]++
+	b.repeatCount++
 	if isResultFailed(result) {
-		b.repeatFails[rKey]++
+		b.repeatFail++
 	} else {
-		b.repeatFails[rKey] = 0
+		b.repeatFail = 0
 	}
 
 	// Fatal: repeated identical failures mean retrying won't help.
-	if b.repeatFails[rKey] >= maxRepeatFails {
+	if b.repeatFail >= maxRepeatFails {
 		err := fmt.Errorf("repeated identical failed tool call (%q x%d): %s",
-			call.Name, b.repeatFails[rKey], result.Error)
+			call.Name, b.repeatFail, result.Error)
 		out.fatalErr = err
 		out.fatalAgentErr = &AgentError{
 			Code:    "tool_repeat_loop",
@@ -172,7 +169,7 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 		return out
 	}
 	// Non-fatal hint: nudge the model to change approach (inject once).
-	if b.repeatCalls[rKey] == maxRepeatCalls {
+	if b.repeatCount == maxRepeatCalls {
 		out.hintMessages = append(out.hintMessages, models.Message{
 			ID:        newMessageID("human"),
 			SessionID: sessionID,
@@ -181,7 +178,7 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 				"You have run %q %d times with identical arguments. "+
 					"If the result isn't changing, you are in a loop. "+
 					"Try a different command, inspect the output more carefully, or move on.",
-				call.Name, b.repeatCalls[rKey]),
+				call.Name, b.repeatCount),
 			CreatedAt: time.Now().UTC(),
 		})
 	}
@@ -263,16 +260,17 @@ func isResultFailed(result models.ToolResult) bool {
 
 // computeArgsHash generates a hash of tool arguments for deduplication
 // detection. It returns a fixed-width hex FNV-1a 64 digest rather than the
-// raw "k=v&" argument text: the metrics sink writes this value verbatim to
-// the JSONL metrics file, and raw argument VALUES (bash commands, secrets,
-// etc.) must not land there unhashed. This narrows only ArgsHash's exposure —
-// ToolResultMetric.Path still carries the raw file path by design (a
-// separate field, populated from extractPathFromArgs, not from this hash) so
-// file-based tools remain traceable in the metrics JSONL. Equality is all
-// callers need (the metrics ArgsHash field and the repeat-call breaker's
-// rKey), so hashing is behavior-preserving.
+// raw argument text: the metrics sink writes this value verbatim to the
+// JSONL metrics file, and raw argument VALUES (bash commands, secrets, etc.)
+// must not land there unhashed. Equality is all callers need (the metrics
+// ArgsHash field and the repeat-call breaker's rKey), so hashing is
+// behavior-preserving.
+//
+// Values are serialized via json.Marshal (not fmt.Sprintf("%v")) so nested
+// maps get sorted-key output — Go's %v formats map keys in random order,
+// which would make identical nested args hash differently and break the
+// repeat-call breaker's loop detection.
 func computeArgsHash(args map[string]any) string {
-	// Sort keys for consistent hashing regardless of map iteration order.
 	keys := make([]string, 0, len(args))
 	for k := range args {
 		keys = append(keys, k)
@@ -283,8 +281,11 @@ func computeArgsHash(args map[string]any) string {
 	for _, k := range keys {
 		hashContent.WriteString(k)
 		hashContent.WriteString("=")
-		// Simple string representation for hashing
-		hashContent.WriteString(fmt.Sprintf("%v", args[k]))
+		valBytes, err := json.Marshal(args[k])
+		if err != nil {
+			valBytes = []byte(fmt.Sprintf("%v", args[k]))
+		}
+		hashContent.Write(valBytes)
 		hashContent.WriteString("&")
 	}
 

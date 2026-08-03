@@ -239,10 +239,10 @@ func (p *twoTaskCallBudgetProvider) Stream(ctx context.Context, req llm.ChatRequ
 // TestParentBudgetPassthrough_ParallelBatchBothConfigsCarryBudget is the
 // regression test for review finding #3: the parallel tool-execution path
 // (task is ParallelSafe, so a batch of 2+ task calls in one turn runs
-// concurrently — see TestTaskTool_ParallelBatch_OverlapsSubagents) was never
-// exercised for the parent-budget passthrough. dispatchCtx is computed ONCE
-// per batch, before any goroutine is spawned (react.go), so both concurrent
-// task calls in the same batch must see the SAME folded remaining budget.
+// concurrently) splits the parent's remaining budget evenly across task
+// calls so N parallel subagents can't jointly draw N×remaining.
+// parent budget=1000, usage=400 at dispatch → remaining=600, split across
+// 2 task calls → 300 each.
 func TestParentBudgetPassthrough_ParallelBatchBothConfigsCarryBudget(t *testing.T) {
 	pool := &multiBudgetCapturingTaskPool{}
 
@@ -273,8 +273,8 @@ func TestParentBudgetPassthrough_ParallelBatchBothConfigsCarryBudget(t *testing.
 		t.Fatalf("StartTask was called %d times, want 2", len(configs))
 	}
 	for i, cfg := range configs {
-		if cfg.TokenBudget != 600 {
-			t.Fatalf("configs[%d].TokenBudget = %d, want 600 (parent budget=1000, usage=400 at dispatch → remaining=600, same for both concurrent calls in the batch)", i, cfg.TokenBudget)
+		if cfg.TokenBudget != 300 {
+			t.Fatalf("configs[%d].TokenBudget = %d, want 300 (parent budget=1000, usage=400 → remaining=600, split across 2 task calls → 300 each)", i, cfg.TokenBudget)
 		}
 	}
 }

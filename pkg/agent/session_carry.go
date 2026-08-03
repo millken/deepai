@@ -1,46 +1,24 @@
 package agent
 
 // SessionCarry holds Agent state that must survive across the REPL's
-// per-turn Agent churn (Agent is single-use — see Run's a.started guard) so
-// a fresh per-turn Run doesn't silently forget what a previous Run in the
-// same conversation already established (task-23-brief.md, M4-3):
+// per-turn Agent churn (Agent is single-use — see Run's a.started guard):
 //
-//   - the tool-call circuit breaker (repeat-call + validation-failure loop
-//     detection) — without this, a loop spanning two turns is never caught,
-//     since each turn's breaker starts counting from zero;
+//   - the tool-call circuit breaker — without this, a loop spanning two
+//     turns is never caught;
 //   - the active skill + its system-prompt body — without this, a skill
-//     loaded in turn N is forgotten in turn N+1 (its body lived only in the
-//     dead turn-N Agent's systemPrompt), the "Available skills" catalog
-//     gets re-injected, and M4-2's memory fence (which keys off
-//     ActiveSkill()) stops working across turns;
-//   - the context-compaction anchors (lastInputTokens/lastTokenCountMsgs)
-//     and stall state — without this, every turn's first token estimate
-//     falls back to the byte heuristic instead of the previous turn's real
-//     provider-reported count.
+//     loaded in turn N is forgotten in turn N+1;
+//   - the context-compaction anchors and stall state — without this, every
+//     turn's first token estimate falls back to the byte heuristic.
 //
 // Single-goroutine access contract: SessionCarry has NO internal locking.
 // A carry must NEVER be handed to a second Agent while a Run that already
-// holds it may still be live — that is the whole safety argument, and it is
-// stronger than just "the REPL calls Run serially": the REPL's normal turn
-// loop does exactly that (one Run() returns before the next turn's Agent is
-// built), but its 10-second orphan path (ctx cancelled, the Run goroutine
-// doesn't return in time) does NOT wait for the abandoned Run to actually
-// finish — so the REPL DETACHES on that path instead: it replaces its held
-// pointer with a fresh NewSessionCarry() rather than reusing the old one,
-// leaving the orphaned Run as the old instance's sole (if now pointless)
-// owner. See pkg/chat/repl.go's runTurn, the `case <-time.After(10 *
-// time.Second)` branch. Never share one SessionCarry across concurrently-
-// running Agents by any other path either, and never hand one to a
-// subagent: a subagent's Run can execute concurrently with siblings (a
-// parallel task fan-out) on other goroutines and must not observe or mutate
-// a parent conversation's breaker/skill/anchor state. AgentConfig.Session
-// defaults to nil (today's per-Run-only behavior) for exactly this reason —
-// see subagent.go's buildAgentConfig, which never sets it.
+// holds it may still be live. The REPL's normal turn loop is serial (one
+// Run() returns before the next turn's Agent is built), but its 10-second
+// orphan path does NOT wait — so the REPL DETACHES there, replacing its
+// pointer with a fresh NewSessionCarry(). Never hand one to a subagent:
+// subagent Runs execute concurrently with siblings and must not observe or
+// mutate a parent conversation's state. AgentConfig.Session defaults to nil.
 type SessionCarry struct {
-	// breaker is the tool-call circuit breaker. Stored as a pointer so Run()
-	// can use it in place across Runs with no explicit write-back: the same
-	// *toolCallBreaker instance mutated by Run N is exactly what Run N+1
-	// reads (see react.go's breaker setup at the top of Run).
 	breaker *toolCallBreaker
 
 	// activeSkill/skillPrompt carry a loaded skill across Runs. activeSkill

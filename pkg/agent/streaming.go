@@ -321,22 +321,21 @@ func (a *Agent) estimateContextTokens(view []models.Message, systemPrompt string
 	if a.lastInputTokens <= 0 || a.lastTokenCountMsgs <= 0 || len(view) == 0 || a.lastTokenCountMsgs > len(view)-1 {
 		return heuristic
 	}
-	// lastInputTokens already covers the system prompt, tool schemas, the
-	// first lastTokenCountMsgs CANONICAL messages, AND the trailing turn
-	// injection (M4-2) that was appended to THAT request's view — react.go
-	// sets lastTokenCountMsgs from len(runMessages) (canonical, never
-	// includes the injection), but the provider's real count it pairs with
-	// (lastInputTokens) was for a view that DID have a.turnInjection appended
-	// at the tail. Since a.turnInjection is constant per activeSource segment
-	// (recomputed only on a mid-Run skill load; that one turn's estimate is
-	// off by the injection size delta until the next response re-anchors), that
-	// already-counted copy stands in for "the current injection's cost" —
-	// the delta below must therefore span only view[lastTokenCountMsgs :
-	// len(view)-1], i.e. the genuinely new canonical growth since the
-	// anchor, EXCLUDING the freshly re-appended injection at view's tail
-	// (view[len(view)-1]). Including it would double-count the injection's
-	// bytes every single turn (once via lastInputTokens, once via delta),
-	// inflating the estimate and tripping compaction early.
+	// Anchor path: lastInputTokens covers the system prompt, tool schemas,
+	// the first lastTokenCountMsgs canonical messages, AND the trailing turn
+	// injection. The delta spans only view[lastTokenCountMsgs:len(view)-1]
+	// (new canonical growth, excluding the injection at the tail to avoid
+	// double-counting).
+	//
+	// Reliability boundary: after a compaction the anchor is cleared
+	// (setTokenAnchor(0,0)), then rebuilt on the next successful request.
+	// The rebuilt anchor corresponds to the compacted+aged view at that
+	// point. Subsequent delta estimates are reliable as long as the aged
+	// content of messages below lastTokenCountMsgs doesn't change — which
+	// holds because compacted messages are already minimal summaries that
+	// aging won't compress further. The one residual uncertainty is aging
+	// drift on the newly-added messages between the anchor and the current
+	// turn, which is inherent to the heuristic and not compaction-specific.
 	delta := estimateTokens(view[a.lastTokenCountMsgs:len(view)-1], "", 0)
 	if provider := a.lastInputTokens + delta; provider > heuristic {
 		return provider

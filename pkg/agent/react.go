@@ -735,6 +735,26 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			for i, call := range toolCalls {
 				overCap[i] = taskCallOverCap(&taskCallCount, call)
 			}
+
+			// When the parent runs under a token budget, split the remaining
+			// budget evenly across the task calls in this batch so N parallel
+			// subagents can't jointly draw N×remaining. Non-task calls and
+			// budget-less parents keep the shared dispatchCtx.
+			taskCount := 0
+			for i, call := range toolCalls {
+				if !overCap[i] && call.Name == "task" {
+					taskCount++
+				}
+			}
+			perTaskCtx := dispatchCtx
+			if taskCount > 1 && a.maxTokensBudget > 0 {
+				remaining := a.maxTokensBudget - usage.TotalTokens
+				if remaining < 0 {
+					remaining = 0
+				}
+				perTaskCtx = tools.WithRemainingTokenBudget(ctx, remaining/taskCount)
+			}
+
 			results := make([]models.ToolResult, len(toolCalls))
 			var wg sync.WaitGroup
 			for i, call := range toolCalls {
@@ -743,10 +763,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					results[i] = synthesizeTaskCapResult(call)
 					continue
 				}
+				execCtx := dispatchCtx
+				if call.Name == "task" && taskCount > 1 {
+					execCtx = perTaskCtx
+				}
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					results[i] = a.runOneTool(dispatchCtx, sessionID, call)
+					results[i] = a.runOneTool(execCtx, sessionID, call)
 				}()
 			}
 			wg.Wait()
@@ -826,33 +850,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				skillName, _ := result.Data["skill_name"].(string)
 				loadedSkillPrompt, _ := result.Data["system_prompt"].(string)
 
-				// Review r1 F7 (dedup) + review r2 F2-b (guard property
-				// fixed) + review M4-final F-M4-7 (exact-equality, not
-				// substring): if the model reloads a skill whose body is
-				// ALREADY present in the system prompt, reapplying would
-				// duplicate it verbatim — doubling its token cost for the
-				// rest of the turn. r1's guard keyed this off the skill
-				// NAME alone (skillName == a.ActiveSkill()), which diverges
-				// from the actual property ("this body is already in
-				// a.systemPrompt") in exactly the state the r2 F11 fix
-				// makes durable: activeSkill set but skillPrompt=="" (an
-				// empty-bodied load carried across a Run boundary) — the
-				// name matches on a later real-body reload of the SAME
-				// skill, but nothing was ever actually applied. r2 fixed
-				// that by additionally requiring strings.Contains(a.
-				// systemPrompt, loadedSkillPrompt) — but a substring check
-				// can itself false-positive: a short/degenerate body that
-				// happens to already appear as a substring of the base
-				// prompt (or the file-op rule, or anything else assembled
-				// into a.systemPrompt) would report "already applied" for a
-				// body that was never actually appended, silently dropping
-				// a genuine reload. Compare against a.appliedSkillPrompt
-				// (the EXACT string this Agent itself last appended, set
-				// alongside every AppendSystemPrompt call for a skill body)
-				// instead: same name AND byte-for-byte the same body that
-				// was actually applied, so a later reload with a
-				// DIFFERENT body — even one that happens to collide with
-				// unrelated prompt text — still gets applied exactly once.
+				// Dedup: skip re-applying the exact same skill body that's
+				// already in the system prompt (compared by exact equality
+				// against appliedSkillPrompt, not substring — a substring check
+				// can false-positive on short bodies that happen to appear in
+				// other assembled prompt sections).
 				bodyAlreadyApplied := loadedSkillPrompt != "" && skillName != "" && skillName == a.ActiveSkill() &&
 					loadedSkillPrompt == a.appliedSkillPrompt
 				if loadedSkillPrompt != "" && !bodyAlreadyApplied {
@@ -860,63 +862,19 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					a.AppendSystemPrompt(loadedSkillPrompt)
 					a.appliedSkillPrompt = loadedSkillPrompt
 				}
-				// Track active skill for memory source tagging.
 				if skillName != "" {
-					// Review r2 F7-a: capture whether this load actually
-					// changes activeSource (the turn injection's memory
-					// fence key, "skill:"+ActiveSkill()) BEFORE overwriting
-					// a.activeSkill below — a same-skill reload (whether its
-					// body is empty, a duplicate, or newly real per the F2-b
-					// fix above) leaves activeSource unchanged, so the
-					// recompute a few lines down would be pure wasted work
-					// (an extra memory-service round trip) with nothing to
-					// show for it.
+					// Only recompute the turn injection when the active skill
+					// actually changes (not on a same-skill reload).
 					activeSourceChanged := skillName != a.ActiveSkill()
 					a.activeSkill.Store(skillName)
-					// M4-3: write the loaded skill back onto the carried
-					// session (if any) so the NEXT Run sharing this
-					// session (a fresh, single-use Agent) starts with it
-					// already active instead of forgetting it — see
-					// react.go's Run() start, which reapplies
-					// session.skillPrompt/activeSkill the same way.
+					// Carry the loaded skill onto the session so the next
+					// Run's fresh Agent starts with it active.
 					if a.session != nil {
 						a.session.activeSkill = skillName
-						// Review r1 F11: only overwrite the carried body
-						// when a NEW, non-empty one was actually returned.
-						// A skill result with skill_name set but an empty
-						// system_prompt (e.g. a skill whose rendered body is
-						// genuinely empty) must not wipe out a previously
-						// carried body while leaving activeSkill pointed at
-						// this name — that would leave the next Run
-						// reporting ActiveSkill()==name with no body and an
-						// un-stripped catalog.
 						if loadedSkillPrompt != "" {
 							a.session.skillPrompt = loadedSkillPrompt
 						}
 					}
-					// M4-2 fix: the once-per-Run turn injection (computed at
-					// Run start — see buildTurnInjection's doc comment) is
-					// built from a.ActiveSkill() as of that moment: "" on a
-					// session-less Run, or the carried skill from a previous
-					// Run when one is carried (M4-3). Recompute only when
-					// activeSourceChanged (this load switched ActiveSkill()
-					// to a genuinely different skill), so the injection's
-					// memory content is re-fenced to it. Review r2 F7-a:
-					// skipping the recompute on a same-skill reload (the
-					// common alternative to activeSourceChanged) fixes two
-					// things at once — it avoids the extra memory-service
-					// round trip when nothing about activeSource changed,
-					// and it retires the old comment's now-conditionally-
-					// false claim that "AppendSystemPrompt just above
-					// already grew the system prompt this turn" (true when
-					// the F2-b reapply fired, but the reapply is skipped
-					// entirely when the body was already present — this
-					// branch no longer runs in that case at all, so the
-					// claim never needs to hold here). "Once per Run" really
-					// means "once per activeSource segment" — a skill load
-					// changing to a genuinely different active skill is the
-					// only thing that changes activeSource mid-Run, and
-					// it's a rare event, not a per-request one.
 					if activeSourceChanged {
 						a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
 					}

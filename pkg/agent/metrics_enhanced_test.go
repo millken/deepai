@@ -95,6 +95,28 @@ func TestComputeArgsHashDiffers(t *testing.T) {
 	}
 }
 
+// TestComputeArgsHashNestedMapStable verifies that nested map values are
+// serialized deterministically (sorted keys via json.Marshal), not via
+// fmt.Sprintf("%v") which uses random map iteration order. Without this,
+// the repeat-call breaker would fail to detect loops involving tools whose
+// arguments contain nested maps (e.g. context_files, complex schemas).
+func TestComputeArgsHashNestedMapStable(t *testing.T) {
+	// Build the same nested structure with different insertion orders.
+	a := map[string]any{
+		"options": map[string]any{"z": 1, "a": 2, "m": 3},
+		"path":    "/tmp",
+	}
+	b := map[string]any{
+		"path":    "/tmp",
+		"options": map[string]any{"a": 2, "m": 3, "z": 1},
+	}
+	h1 := computeArgsHash(a)
+	h2 := computeArgsHash(b)
+	if h1 != h2 {
+		t.Errorf("computeArgsHash() not stable for nested maps with different insertion order: %q != %q", h1, h2)
+	}
+}
+
 // TestExtractPathFromArgs tests path extraction from tool arguments
 func TestExtractPathFromArgs(t *testing.T) {
 	tests := []struct {

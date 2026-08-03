@@ -13,8 +13,13 @@ import (
 const (
 	defaultCompactionThreshold = 0.75
 	defaultCompactionKeepTail  = 6
-	compactToolResultKeep      = 300
-	compactAssistantTextKeep   = 200
+	compactToolResultKeep    = 300
+	compactAssistantTextKeep = 200
+	// compactToolCallArgsKeep is the max JSON byte size for a compacted
+	// tool call's Arguments. Arguments larger than this are replaced with a
+	// placeholder so compaction actually saves space, while small Arguments
+	// are preserved verbatim (some providers reject nil Arguments).
+	compactToolCallArgsKeep = 512
 	// maxToolContentBytes is a hard cap applied when storing tool results in
 	// runMessages. Prevents individual bash/web-fetch outputs from inflating
 	// the context beyond any provider's practical limit.
@@ -283,8 +288,9 @@ func compactToolMessage(msg models.Message) models.Message {
 }
 
 // compactAssistantMessage creates a compressed copy of an assistant message.
-// For messages with tool_calls: keeps ToolCalls with ID+Name (strips large Arguments),
-// and adds a summary text. This preserves the tool_calls→tool_result chain.
+// For messages with tool_calls: keeps ToolCalls with ID+Name+Status and
+// preserves Arguments (some providers reject tool_calls with nil Arguments),
+// truncating large Arguments to a placeholder to save space.
 // For text-only messages: truncates content.
 func compactAssistantMessage(msg models.Message) models.Message {
 	out := models.Message{
@@ -294,13 +300,18 @@ func compactAssistantMessage(msg models.Message) models.Message {
 	}
 
 	if len(msg.ToolCalls) > 0 {
-		// Preserve tool calls with ID+Name, strip Arguments to save space.
 		out.ToolCalls = make([]models.ToolCall, len(msg.ToolCalls))
 		for i, tc := range msg.ToolCalls {
 			out.ToolCalls[i] = models.ToolCall{
 				ID:     tc.ID,
 				Name:   tc.Name,
 				Status: tc.Status,
+			}
+			argsJSON, err := json.Marshal(tc.Arguments)
+			if err != nil || len(argsJSON) > compactToolCallArgsKeep {
+				out.ToolCalls[i].Arguments = map[string]any{"_compacted": true}
+			} else {
+				out.ToolCalls[i].Arguments = cloneArguments(tc.Arguments)
 			}
 		}
 		if strings.TrimSpace(msg.Content) == "" {
