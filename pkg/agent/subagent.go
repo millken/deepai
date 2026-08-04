@@ -132,8 +132,11 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}
 	if maxTurns <= 0 {
 		// Last resort safety floor: a profile with no MaxTurns (e.g. builtin
-		// general-purpose) must still be bounded.
-		maxTurns = 6
+		// general-purpose) must still be bounded. 15 lets a delegated subagent
+		// do meaningful multi-file work (explore + edit + verify) without
+		// hitting the wall mid-task, which at the old 6 turned most delegations
+		// into wasted tokens — the parent had to redo everything from scratch.
+		maxTurns = 15
 	}
 
 	// Inject OutputSchema prompt into system prompt when available
