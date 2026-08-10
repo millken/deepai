@@ -7,3 +7,4 @@ deepai
 deepai-debug.log
 .deepai/plans/
 .superpowers/
+.DS_Store
