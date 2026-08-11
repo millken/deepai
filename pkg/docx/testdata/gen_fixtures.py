@@ -18,6 +18,7 @@ from docx.shared import Inches
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "structure.docx")
+OUTLINE_OUT = os.path.join(HERE, "outline.docx")
 
 # A 1x1 transparent PNG, so the fixture has a word/media/ entry.
 PNG_1X1 = bytes.fromhex(
@@ -86,6 +87,39 @@ REPLACEMENTS = {
 }
 
 
+# FIXED_DATE_TIME pins every zip entry's timestamp so the fixtures are
+# byte-reproducible.
+#
+# Without it, python-docx stamps each entry with the current time (DOS zip
+# timestamps have 2-second granularity), so regenerating produced a file whose
+# entry CONTENT was byte-identical but whose zip shell differed -- enough to
+# dirty a committed binary fixture in git and to make the generator
+# unauditable. Note the cause is the zip metadata, not the XML: docProps and
+# settings.xml come out identical.
+FIXED_DATE_TIME = (2026, 1, 1, 0, 0, 0)
+
+
+def normalize_zip(path):
+    """Rewrites path's zip with fixed entry timestamps, preserving entry order
+    and decompressed content exactly. Makes the fixture reproducible so anyone
+    can regenerate it and get the committed bytes back."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        parts = {n: zf.read(n) for n in names}
+    _write_zip(path, names, parts)
+
+
+def _write_zip(path, names, parts):
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        for n in names:  # preserve original entry order
+            info = zipfile.ZipInfo(n, date_time=FIXED_DATE_TIME)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            zf.writestr(info, parts[n])
+    shutil.move(tmp, path)
+
+
 def inject_raw_xml(path):
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
@@ -99,15 +133,59 @@ def inject_raw_xml(path):
         if n != 1:
             raise SystemExit(f"failed to inject {marker}")
     parts["word/document.xml"] = xml.encode("utf-8")
+    _write_zip(path, names, parts)
 
-    tmp = path + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        for n in names:  # preserve original entry order
-            zf.writestr(n, parts[n])
-    shutil.move(tmp, path)
+
+def build_outline_fixture(path):
+    """Generates outline.docx: a heading/body-only fixture for P1b's outline
+    and chunking tests. Deliberately has no tables, images, headers, or
+    footers — structure.docx already covers those, and mixing concerns here
+    would make it unclear which fixture a given test failure implicates.
+    """
+    doc = Document()
+
+    def body(section_label, n):
+        for i in range(1, n + 1):
+            doc.add_paragraph(f"Body paragraph {i} of section {section_label}.")
+
+    doc.add_heading("Chapter One", level=1)
+    body("Chapter One", 2)
+
+    doc.add_heading("Section 1.1", level=2)
+    # The one multi-run paragraph in this fixture. It must sit immediately
+    # after this heading: Task 4's tests locate it dynamically and assert
+    # both whole-paragraph multi-run behavior and cross-run find rejection.
+    # Every other paragraph here is single-run, so those two assertions
+    # would pass vacuously without this one.
+    p = doc.add_paragraph()
+    p.add_run("Plain ")
+    p.add_run("bold").bold = True
+    p.add_run(" tail")
+    body("Section 1.1", 3)
+
+    doc.add_heading("Chapter Two", level=1)
+    body("Chapter Two", 2)
+
+    doc.add_heading("Section 2.1", level=2)
+    body("Section 2.1", 1)
+
+    # Filler paragraphs, purely to push the paragraph count past what the
+    # chunking tests need.
+    for i in range(1, 61):
+        doc.add_paragraph(f"Filler paragraph {i}.")
+
+    doc.save(path)
+    normalize_zip(path)
 
 
 if __name__ == "__main__":
+    # Both fixtures are committed and every test binds to them, so generation
+    # must be reproducible: re-running this script on an unchanged checkout
+    # must leave `git status` clean. normalize_zip pins the entry timestamps
+    # that would otherwise make each run differ.
     build_base(OUT)
     inject_raw_xml(OUT)
     print("wrote", OUT)
+
+    build_outline_fixture(OUTLINE_OUT)
+    print("wrote", OUTLINE_OUT)

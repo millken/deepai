@@ -163,7 +163,7 @@ InputSchema: {
     "find":    string?,       // 段内子串精确匹配；命中区间即补丁边界（与 run 二选一）
     "text":    string,        // 新文本
     "op":      "replace"|"insert_before"|"insert_after"|"delete",  // 默认 replace
-    "style":   string?,       // 可选：覆盖段落样式（如 "Heading2"）
+    // 注意：早期设计此处还有 "style"（覆盖段落样式），**已推迟到 P2**，见下。
   }],
   "protect": [string]?,       // 保护清单：术语/正则（§1.1 边界层），语义见下
 }
@@ -182,6 +182,8 @@ InputSchema: {
 | `replace` | 是 | 有 `run`/`find` → run 内子串；否则整段 | 否 |
 | `insert_before` / `insert_after` | **否** | **恒为段落级**：新建一个 `<w:p>` 插在目标段前/后 | **是** |
 | `delete` | 是 | 有 `run`/`find` → 只删该 run / 子串；否则删整个 `<w:p>` | 仅整段删除时是 |
+
+> **`style` 参数已推迟到 P2（2026-08-11 决定）。** 实现它需要 `<w:pStyle>` 元素的字节区间，而扫描层只记录 `Para.Style` 字符串、不记录位置 —— 补上意味着又一轮扫描层改动与审查。更重要的是职责划分：改段落样式属于 §4.3 `docx_format` 的范围，而 §7 的润色系统规则本就要求不改版式。**`docx_edit` 管文本，`docx_format` 管样式**，这条边界更干净。P1c 的工具 schema 不暴露该字段，收到时应显式报错而非静默忽略。
 
 `insert_*` 不接受 `run`/`find`，是刻意的：如果允许"在段内某处插入文本"，它与 `replace` 就完全重叠了（`find` 命中处替换成"原文+新文本"即可），徒增歧义。需要段内插入就用 `replace`。
 
