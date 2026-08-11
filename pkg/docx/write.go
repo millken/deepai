@@ -1235,6 +1235,23 @@ func buildDocRelsXML(rels []hyperlinkRel) string {
 // TestWrite_HeadingStylesAreDefinedInStylesXML does.
 const stylesPartXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
 	`<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+	// docDefaults must be <w:styles>'s first child, and rPrDefault must
+	// precede pPrDefault within it -- Word treats an out-of-schema-order
+	// styles part as corrupt with no diagnostic. Without this chain at all,
+	// docx_format has nowhere to land a document-wide body font/size/line
+	// spacing/alignment change (see Document.Format's BodyFont/BodySizePt/
+	// LineSpacing/Align doc comments): a document this package writes
+	// itself must be as formattable as one Word or python-docx produced,
+	// both of which always emit this chain. The values mirror
+	// testdata/structure.docx's own docDefaults (a real Word-authored
+	// file's defaults), not an arbitrary choice.
+	`<w:docDefaults><w:rPrDefault><w:rPr>` +
+	`<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/>` +
+	`<w:sz w:val="22"/><w:szCs w:val="22"/>` +
+	`<w:lang w:val="en-US" w:eastAsia="en-US" w:bidi="ar-SA"/>` +
+	`</w:rPr></w:rPrDefault>` +
+	`<w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>` +
+	`</w:docDefaults>` +
 	`<w:style w:type="paragraph" w:default="1" w:styleId="Normal">` +
 	`<w:name w:val="Normal"/><w:qFormat/></w:style>` +
 	`<w:style w:type="paragraph" w:styleId="Heading1">` +

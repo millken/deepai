@@ -527,21 +527,135 @@ func applyLeafOps(doc []byte, containerCloseStart int, ops []leafOp) []Patch {
 	return patches
 }
 
+// renderActiveLeaves concatenates ops' active leaves, in the schema order
+// they were given in, as brand-new self-closing tags. It is
+// synthesizeDocDefaultsPatches's counterpart to applyLeafOps: there is no
+// existing container byte range to splice into when a container is being
+// created from scratch, so there is nothing to merge against and no
+// "found" span to preserve — every active leaf is simply rendered in
+// order, and an inactive leaf contributes nothing (there is no pre-existing
+// copy of it to keep, unlike applyLeafOps' found-but-inactive case).
+func renderActiveLeaves(ops []leafOp) string {
+	var b strings.Builder
+	for _, op := range ops {
+		if op.active {
+			b.WriteString(buildTag(op.local, op.attrs, true))
+		}
+	}
+	return b.String()
+}
+
+// synthesizeDocDefaultsPatches creates whichever part of styles.xml's
+// <w:docDefaults> chain planStylesPatches determined is missing —
+// <w:docDefaults> itself, <w:rPrDefault>/<w:pPrDefault>, or the <w:rPr>/
+// <w:pPr> directly inside an already-present rPrDefault/pPrDefault — with
+// rprInner/pprInner (built by renderActiveLeaves) as the new element's
+// content. needRPr/needPPr say which of the two sub-chains this call
+// actually needs; a false one is left completely alone, including when
+// docDefaults itself has to be created (its body only ever contains the
+// sub-chain(s) actually requested, never an empty rPrDefault/pPrDefault
+// nobody asked for).
+//
+// Every insertion respects CT_DocDefaults' schema order — rPrDefault
+// precedes pPrDefault — and, critically, never emits two patches sharing
+// the same start offset (Apply rejects that as an overlap): when
+// docDefaults doesn't exist yet, both needed sub-chains are combined into
+// ONE patch inserted right after <w:styles>'s own start tag; when
+// docDefaults already exists but BOTH rPrDefault and pPrDefault are
+// missing, both are likewise combined into one patch inserted right after
+// docDefaults' own start tag — the two insertion points would otherwise
+// coincide whenever docDefaults is currently empty.
+func synthesizeDocDefaultsPatches(styles []byte, rootEnd int, dd, rpd, ppd elemInfo, needRPr bool, rprInner string, needPPr bool, pprInner string) []Patch {
+	rprWrapperXML := "<w:rPrDefault><w:rPr>" + rprInner + "</w:rPr></w:rPrDefault>"
+	pprWrapperXML := "<w:pPrDefault><w:pPr>" + pprInner + "</w:pPr></w:pPrDefault>"
+
+	// dd.found&&!dd.selfClosing means docDefaults exists with a real body
+	// to insert into. A self-closing <w:docDefaults/> (or its outright
+	// absence) has nowhere for a child to live, so both are handled by
+	// building the whole element fresh — the only difference is whether an
+	// existing self-closing tag is expanded in place or a new one is
+	// inserted at rootEnd.
+	if !dd.found || dd.selfClosing {
+		var body strings.Builder
+		if needRPr {
+			body.WriteString(rprWrapperXML)
+		}
+		if needPPr {
+			body.WriteString(pprWrapperXML)
+		}
+		full := "<w:docDefaults>" + body.String() + "</w:docDefaults>"
+		if dd.found {
+			return []Patch{PatchRawSpan(styles, dd.tagSpan, full)}
+		}
+		return []Patch{PatchRawSpan(styles, Span{rootEnd, rootEnd}, full)}
+	}
+
+	var patches []Patch
+
+	rpdOpen := rpd.found && !rpd.selfClosing
+	ppdOpen := ppd.found && !ppd.selfClosing
+	needRPrWrapper := needRPr && !rpdOpen
+	needPPrWrapper := needPPr && !ppdOpen
+
+	switch {
+	case needRPrWrapper && needPPrWrapper && !rpd.found && !ppd.found:
+		// Neither wrapper exists at all, and docDefaults' body is
+		// otherwise empty of them: combine into one insert right after
+		// docDefaults' own start tag so the two insertion points, which
+		// coincide when docDefaults has no other content, never collide.
+		patches = append(patches, PatchRawSpan(styles, Span{dd.tagSpan.End, dd.tagSpan.End}, rprWrapperXML+pprWrapperXML))
+	default:
+		if needRPrWrapper {
+			if rpd.found {
+				// Self-closing <w:rPrDefault/>: expand it in place.
+				patches = append(patches, PatchRawSpan(styles, rpd.tagSpan, rprWrapperXML))
+			} else {
+				patches = append(patches, PatchRawSpan(styles, Span{dd.tagSpan.End, dd.tagSpan.End}, rprWrapperXML))
+			}
+		}
+		if needPPrWrapper {
+			if ppd.found {
+				patches = append(patches, PatchRawSpan(styles, ppd.tagSpan, pprWrapperXML))
+			} else {
+				patches = append(patches, PatchRawSpan(styles, Span{dd.closeStart, dd.closeStart}, pprWrapperXML))
+			}
+		}
+	}
+
+	// rPrDefault/pPrDefault themselves already exist with a real body here
+	// (rpdOpen/ppdOpen) — only rPr/pPr is missing from inside them.
+	if needRPr && rpdOpen {
+		patches = append(patches, PatchRawSpan(styles, Span{rpd.closeStart, rpd.closeStart}, "<w:rPr>"+rprInner+"</w:rPr>"))
+	}
+	if needPPr && ppdOpen {
+		patches = append(patches, PatchRawSpan(styles, Span{ppd.closeStart, ppd.closeStart}, "<w:pPr>"+pprInner+"</w:pPr>"))
+	}
+
+	return patches
+}
+
 // scanDocDefaults locates styles.xml's <w:docDefaults> chain in one pass:
 // the rPr triple (rFonts/sz/szCs, under rPrDefault) and the pPr pair
 // (spacing/jc, under pPrDefault). Each returned elemInfo's found field says
 // whether that element exists at all; rpr/ppr additionally carry
 // closeStart, the insertion point to use when every one of their tracked
-// children is missing.
+// children is missing. dd/rpd/ppd also carry closeStart now (populated the
+// same way, on their own end tag) so planStylesPatches can synthesize
+// whichever part of the chain a minimal generator's styles.xml omitted —
+// see synthesizeDocDefaultsPatches — rather than only ever editing an
+// already-complete chain. rootEnd is the offset right after the root
+// <w:styles ...> element's own start tag: the insertion point for a brand
+// new <w:docDefaults>, which must land as <w:styles>'s FIRST child.
 //
 // Only docDefaults and its direct rPrDefault/pPrDefault/rPr/pPr descendants
 // are tracked structurally (booleans gate matches the same way scan.go's
 // paraDepth/pPrDepth do) — this is deliberately narrower than a general
 // path engine, scoped to exactly the chain §4.3's measured facts describe.
-func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc elemInfo, err error) {
+func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc elemInfo, rootEnd int, err error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
-	var inRPD, inRPR, inPPD, inPPR bool
+	var inDD, inRPD, inRPR, inPPD, inPPR bool
+	var sawRoot bool
 
 	for {
 		tok, terr := dec.Token()
@@ -549,7 +663,7 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc,
+			return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd,
 				fmt.Errorf("scan styles.xml docDefaults: %w", terr)
 		}
 		offset := int(dec.InputOffset())
@@ -558,9 +672,16 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 		case xml.StartElement:
 			span := Span{prevOffset, offset}
 			sc := isSelfClosingSpan(styles, span)
+			if !sawRoot {
+				sawRoot = true
+				rootEnd = offset
+			}
 			switch {
 			case isWordElement(t.Name, "docDefaults") && !dd.found:
 				dd = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
+				if !sc {
+					inDD = true
+				}
 			case isWordElement(t.Name, "rPrDefault") && dd.found && !rpd.found:
 				rpd = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
 				if !sc {
@@ -599,12 +720,17 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 				rpr.closeStart = prevOffset
 				inRPR = false
 			case isWordElement(t.Name, "rPrDefault") && inRPD:
+				rpd.closeStart = prevOffset
 				inRPD = false
 			case isWordElement(t.Name, "pPr") && inPPR:
 				ppr.closeStart = prevOffset
 				inPPR = false
 			case isWordElement(t.Name, "pPrDefault") && inPPD:
+				ppd.closeStart = prevOffset
 				inPPD = false
+			case isWordElement(t.Name, "docDefaults") && inDD:
+				dd.closeStart = prevOffset
+				inDD = false
 			}
 		}
 		prevOffset = offset
@@ -616,16 +742,25 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 	if ppr.found && ppr.selfClosing {
 		ppr.closeStart = ppr.tagSpan.End
 	}
-	return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, nil
+	return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd, nil
 }
 
 // planStylesPatches builds every styles.xml patch resolved requests
 // (docDefaults body font/size/line-spacing/alignment, plus every
 // Heading1..9's font) and a human-readable Applied entry per change made.
 //
-// It refuses outright, rather than guessing, when the docDefaults chain a
-// requested field needs to land in does not exist — see Document.Format's
-// self-review note on a docDefaults-less styles.xml.
+// A requested field's docDefaults chain (rPrDefault/rPr for BodyFont/
+// BodySizePt, pPrDefault/pPr for LineSpacing/Align) is edited in place when
+// it already fully exists — the ordinary case for a document Word or
+// python-docx produced — and synthesized (via synthesizeDocDefaultsPatches)
+// at whichever point it is missing otherwise: docx_write's own styles.xml
+// now always carries the full chain (see stylesPartXML), but docx_format
+// must not be brittle against every OTHER minimal generator that omits it,
+// or a caller hits this same failure again with a document this package
+// did not write. Creating <w:docDefaults><w:rPrDefault><w:rPr> is not a
+// guess: it is the standard OOXML structure a document default lives in,
+// so building it is exactly what "set the document default" means when it
+// is not there yet.
 func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, error) {
 	var patches []Patch
 	var applied []string
@@ -634,16 +769,16 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 	wantPPrChain := opts.LineSpacing != 0 || opts.Align != ""
 
 	if wantRPrChain || wantPPrChain {
-		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, err := scanDocDefaults(styles)
+		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd, err := scanDocDefaults(styles)
 		if err != nil {
 			return nil, nil, err
 		}
 
+		var rprInner, pprInner string
+		needRPrSynthesis := false
+		needPPrSynthesis := false
+
 		if wantRPrChain {
-			if !dd.found || !rpd.found || !rpr.found {
-				return nil, nil, fmt.Errorf(
-					"docx: styles.xml has no <w:docDefaults><w:rPrDefault><w:rPr> chain; cannot set body font/size")
-			}
 			ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 			if opts.BodyFont != "" {
 				ops[0].active = true
@@ -658,14 +793,20 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 				ops[2].attrs = setAttr(szcs.attrs, "val", half)
 				applied = append(applied, fmt.Sprintf("body size -> %gpt", opts.BodySizePt))
 			}
-			patches = append(patches, applyLeafOps(styles, rpr.closeStart, ops)...)
+			if dd.found && rpd.found && rpr.found {
+				// The chain fully exists already: edit its leaves in place,
+				// the exact same patches this package has always produced —
+				// byte-identical output for a document that already has
+				// the chain is a hard guarantee, so this branch must stay
+				// untouched by the synthesis path below.
+				patches = append(patches, applyLeafOps(styles, rpr.closeStart, ops)...)
+			} else {
+				needRPrSynthesis = true
+				rprInner = renderActiveLeaves(ops)
+			}
 		}
 
 		if wantPPrChain {
-			if !dd.found || !ppd.found || !ppr.found {
-				return nil, nil, fmt.Errorf(
-					"docx: styles.xml has no <w:docDefaults><w:pPrDefault><w:pPr> chain; cannot set line spacing/alignment")
-			}
 			ops := []leafOp{{info: spacing, local: "spacing"}, {info: jc, local: "jc"}}
 			if opts.LineSpacing != 0 {
 				ops[0].active = true
@@ -678,7 +819,17 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 				ops[1].attrs = setAttr(jc.attrs, "val", opts.Align)
 				applied = append(applied, fmt.Sprintf("alignment -> %s", opts.Align))
 			}
-			patches = append(patches, applyLeafOps(styles, ppr.closeStart, ops)...)
+			if dd.found && ppd.found && ppr.found {
+				patches = append(patches, applyLeafOps(styles, ppr.closeStart, ops)...)
+			} else {
+				needPPrSynthesis = true
+				pprInner = renderActiveLeaves(ops)
+			}
+		}
+
+		if needRPrSynthesis || needPPrSynthesis {
+			patches = append(patches, synthesizeDocDefaultsPatches(
+				styles, rootEnd, dd, rpd, ppd, needRPrSynthesis, rprInner, needPPrSynthesis, pprInner)...)
 		}
 	}
 
