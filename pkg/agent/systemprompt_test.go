@@ -285,6 +285,38 @@ func TestSelectSubagentTools_TaskOnlySelectorClarifiesUnavailability(t *testing.
 	}
 }
 
+// TestSelectSubagentTools_DocumentSelectorYieldsDocxToolsOnly guards the
+// document-editor profile's tool-selection path (design
+// docs/DOCX_TOOLS_DESIGN.md §6): the "document" selector is a Groups entry
+// (pkg/tools/builtin/docx.go carries Groups: {"builtin", "document"} on both
+// docx_read and docx_edit), not a tool name, so it must select exactly those
+// two tools and nothing else — in particular not every "builtin"-grouped
+// tool, which would defeat the whole point of a restricted profile.
+func TestSelectSubagentTools_DocumentSelectorYieldsDocxToolsOnly(t *testing.T) {
+	tools := []models.Tool{
+		{Name: "docx_read", Groups: []string{"builtin", "document"}},
+		{Name: "docx_edit", Groups: []string{"builtin", "document"}},
+		{Name: "bash", Groups: []string{"builtin"}},
+		{Name: "read_file", Groups: []string{"builtin", "file_ops"}},
+		{Name: "task"},
+	}
+
+	got, err := selectSubagentTools(tools, []string{"document"})
+	if err != nil {
+		t.Fatalf("selectSubagentTools(document) error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("selectSubagentTools(document) = %v, want exactly [docx_read, docx_edit]", got)
+	}
+	names := map[string]bool{}
+	for _, tt := range got {
+		names[tt.Name] = true
+	}
+	if !names["docx_read"] || !names["docx_edit"] {
+		t.Fatalf("selectSubagentTools(document) = %v, want exactly [docx_read, docx_edit]", got)
+	}
+}
+
 // builtinFileToolsForTest registers a minimal read_file so BuildSystemPrompt's
 // tool gate fires, without importing the builtin package (avoids an import cycle
 // risk in agent tests).

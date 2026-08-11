@@ -295,6 +295,33 @@ func TestSubagentExecutor_AgentMDModelResolves(t *testing.T) {
 	}
 }
 
+// TestBuiltinAgentTypes_DocumentEditorProfile guards the document-editor
+// profile's two load-bearing knobs (design docs/DOCX_TOOLS_DESIGN.md §6/§5.8):
+// MaxTurns must be an explicit 30 (a zero value gets floored to 15 by
+// subagent.go's safety net, which only covers four or five 2-3-turn polishing
+// chunks), and DefaultTools must include both docx tools or the profile can
+// never touch a document at all.
+func TestBuiltinAgentTypes_DocumentEditorProfile(t *testing.T) {
+	cfg, ok := BuiltinAgentTypes[AgentTypeDocEditor]
+	if !ok {
+		t.Fatal("BuiltinAgentTypes[document-editor] is not registered")
+	}
+	if cfg.MaxTurns != 30 {
+		t.Fatalf("document-editor MaxTurns = %d, want 30 (0 would be floored to 15 by the subagent safety net)", cfg.MaxTurns)
+	}
+	want := map[string]bool{"docx_read": false, "docx_edit": false}
+	for _, name := range cfg.DefaultTools {
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("document-editor DefaultTools = %v, missing %q", cfg.DefaultTools, name)
+		}
+	}
+}
+
 func writeAgentYAML(t *testing.T, dir, name, body string) {
 	t.Helper()
 	writeAgentFile(t, dir, name+".yaml", body)

@@ -21,6 +21,7 @@ const (
 	AgentTypeFrontend         AgentType = "frontend"
 	AgentTypeUIDesigner       AgentType = "ui-designer"
 	AgentTypeNews             AgentType = "news"
+	AgentTypeDocEditor        AgentType = "document-editor"
 )
 
 type AgentTypeConfig struct {
@@ -72,6 +73,31 @@ const (
 	uiDesignerSystemPrompt = "You are a UI/UX designer. Focus on user interface design, user experience optimization, design systems, color theory, typography, layout composition, and interaction patterns. Produce detailed design specifications, wireframe descriptions, component specifications, and style guides. Consider accessibility, responsive design, and platform conventions. Ask for clarification with ask_clarification when design requirements are unclear."
 	// newsSystemPrompt focuses on news gathering and summarization.
 	newsSystemPrompt = "You are a news research assistant. Focus on searching, gathering, and summarizing news from the web. Prioritize accuracy, recency, and source credibility. Present news in a structured format with headlines, summaries, sources, and timestamps. Cover multiple perspectives on controversial topics. Ask for clarification with ask_clarification when the news topic or scope is unclear."
+	// docEditorSystemPrompt scopes this profile to .docx polishing and
+	// summarization via docx_read/docx_edit. Design docs/DOCX_TOOLS_DESIGN.md
+	// §5.4 and §7: paragraph indices only stay valid across an entire chunked
+	// run if paragraphs are never inserted or deleted, so that rule is stated
+	// as a hard prohibition, not a preference — an LLM follows an explicit
+	// "never do X" far more reliably than "avoid X when possible".
+	docEditorSystemPrompt = "You are a document editor for .docx files, working through docx_read and docx_edit. " +
+		"Preserve the author's voice, tone, and terminology — this is polishing, not rewriting; do not rephrase " +
+		"sentences that are already clear just to sound different.\n\n" +
+		"NEVER use docx_edit's insert_before, insert_after, or a whole-paragraph delete. Only replace text within " +
+		"existing paragraphs. Inserting or deleting a paragraph shifts every later paragraph's index, which breaks " +
+		"the paragraph indices you already collected from docx_read for the rest of the document — this is an " +
+		"absolute rule, not a style preference, because there is no way to recover from it mid-run.\n\n" +
+		"When changing text within a paragraph, prefer a narrow `find` substring replacement over replacing the " +
+		"whole paragraph. A whole-paragraph replace collapses every run in that paragraph to the formatting of the " +
+		"first run, silently destroying bold/italic/hyperlink formatting elsewhere in the paragraph; a `find` or " +
+		"`run`-scoped replacement leaves the rest of the paragraph's formatting untouched.\n\n" +
+		"When working through a large document, process it as: read a section or range with docx_read, edit it " +
+		"with docx_edit, and (if writing a separate output) write it — keep these calls adjacent, with no unrelated " +
+		"tool calls interleaved between the read and the edit for the same chunk. Ask for clarification with " +
+		"ask_clarification when the polishing scope or protected terms are unclear.\n\n" +
+		"Whenever you have a protect list (numbers, acronyms, names, or house-style terms that must survive " +
+		"unchanged), pass it as docx_edit's protect argument on every edit call, not just the first — it is " +
+		"validated mechanically per call, so omitting it on a later call silently removes that protection for " +
+		"that call's edits. Do not rely on self-policing a protect list you are not also passing to the tool."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
@@ -212,6 +238,20 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		DefaultTools: []string{"web_search", "web_fetch", "web_fetch_batch", "read_file", "present_file", "ask_clarification"},
 		MaxTurns:     0,
 		Temperature:  0.1,
+	},
+	AgentTypeDocEditor: {
+		Type:         AgentTypeDocEditor,
+		Name:         "Document Editor",
+		Description:  "Profile for .docx polishing and summarization: structured read, format-preserving edit, and protected-term validation.",
+		SystemPrompt: docEditorSystemPrompt,
+		DefaultTools: []string{"docx_read", "docx_edit", "read_file", "write_file", "ask_clarification"},
+		// MaxTurns must be explicit and non-zero: subagent.go's safety floor
+		// treats <= 0 as "unset" and coerces it to 15, which only covers
+		// four or five 2-3-turn polishing chunks (design §5.8). 30 covers
+		// roughly 10-12 chunks before a caller needs to fall back to
+		// multiple serial subagent batches for larger documents.
+		MaxTurns:    30,
+		Temperature: 0.2,
 	},
 }
 

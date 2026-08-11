@@ -352,6 +352,9 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	for _, tool := range builtin.WebTools() {
 		mustRegisterTool(registry, tool)
 	}
+	for _, tool := range builtin.DocxTools() {
+		mustRegisterTool(registry, tool)
+	}
 }
 
 // resolveRequestTimeout converts a config value (in minutes) to a duration.

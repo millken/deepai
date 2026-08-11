@@ -28,6 +28,7 @@ var defaultToolBudgetsByTool = map[string]map[int]int{
 	"write_file": {1: 300, 2: 300, 3: 300},
 	"grep":       {1: 4096, 2: 1024, 3: 300}, // grep p99=168KB tail is eaten by L0 offload (24KB) first
 	"web_fetch":  {1: 8192, 2: 2048, 3: 300},
+	"docx_read":  {1: 8192, 2: 2048, 3: 300}, // same as read_file: re-reading a chunk is expensive
 }
 
 // Default per-age byte budgets. See docs/spec/token-efficiency.md §T1.

@@ -1,0 +1,811 @@
+package builtin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/millken/deepai/pkg/docx"
+	"github.com/millken/deepai/pkg/models"
+)
+
+// maxDocxResultBytes is the cap fitDocxReadResult and
+// marshalDocxOutlineResult enforce on the marshalled JSON payload docx_read
+// returns. Design §5.1 has deepai silently offload any tool result over 24
+// KB (pkg/agent's offloadThresholdBytes, 24576 bytes), replacing it with
+// "first 50 lines + last 50 lines" and no error — an oversized read does
+// not fail loudly, it quietly drops the middle of the document while
+// looking fine.
+//
+// This tool stays 4 KB under that 24576-byte line rather than riding right
+// up against it. That margin is NOT because anything wraps this payload
+// before the offload check: offloadIfNeeded (pkg/agent/toolexec.go)
+// compares len(result.Content) against the threshold verbatim, with no
+// added framing, so the bytes produced here are exactly the bytes that
+// check sees. The margin exists anyway as plain safety slack — e.g. so a
+// future change to offloadThresholdBytes or to this package's own JSON
+// shape doesn't require immediately re-tuning this constant too. 20 KB is
+// that margin.
+const maxDocxResultBytes = 20 << 10
+
+// maxDocxFitAttempts bounds fitDocxReadResult's shrink loop: the initial
+// attempt at the caller's budget, plus at most 4 halvings.
+const maxDocxFitAttempts = 5
+
+// docxReadArgs is docx_read's parsed arguments.
+type docxReadArgs struct {
+	Path      string
+	StartPara int
+	EndPara   int
+	Heading   string
+	Full      bool
+	Runs      bool
+	MaxChars  int
+}
+
+// docxReadOutput is the JSON shape docx_read returns to the model.
+type docxReadOutput struct {
+	Markdown      string          `json:"markdown"`
+	Paras         []docxParaIndex `json:"paragraphs,omitempty"`
+	Outline       *docxOutline    `json:"outline,omitempty"`
+	NextStartPara int             `json:"next_start_para"`
+	RangeStart    int             `json:"range_start,omitempty"`
+	RangeEnd      int             `json:"range_end,omitempty"`
+	TotalParas    int             `json:"total_paras"`
+	Notes         []string        `json:"notes,omitempty"`
+}
+
+// docxParaIndex is one paragraph's index and metadata, deliberately without
+// its text: Markdown already carries every paragraph's (marker-neutralized)
+// text under its "[para N]" marker, so repeating it here would both double
+// the payload and reintroduce the marker-spoofing hazard that
+// neutralization exists to prevent. Runs is populated only when the caller
+// asked for runs=true, since only run-level edits need run text.
+type docxParaIndex struct {
+	Index int            `json:"index"`
+	Style string         `json:"style,omitempty"`
+	Cell  *docx.CellRef  `json:"cell,omitempty"`
+	Runs  []docxRunIndex `json:"runs,omitempty"`
+}
+
+// docxRunIndex is one run's index and exact text, included only when the
+// caller passed runs=true.
+type docxRunIndex struct {
+	Index int    `json:"index"`
+	Text  string `json:"text"`
+}
+
+// docxOutline is the serialized form of docx.Outline.
+type docxOutline struct {
+	TotalParas int                  `json:"total_paras"`
+	Words      int                  `json:"words"`
+	Sections   []docxOutlineSection `json:"sections"`
+}
+
+// docxOutlineSection is the serialized form of docx.Section.
+type docxOutlineSection struct {
+	Heading   string `json:"heading,omitempty"`
+	Level     int    `json:"level"`
+	StartPara int    `json:"start_para"`
+	EndPara   int    `json:"end_para"`
+	Paras     int    `json:"paras"`
+	Words     int    `json:"words"`
+}
+
+// DocxReadTool describes docx_read to the model.
+func DocxReadTool() models.Tool {
+	return models.Tool{
+		Name:         "docx_read",
+		Groups:       []string{"builtin", "document"},
+		ParallelSafe: true,
+		Description: "Read a .docx as structured content. Returns a heading outline by default for " +
+			"large documents; pass heading or start_para/end_para for a section or range, or full=true " +
+			"for the whole body. Large ranges are chunked: next_start_para is the cursor for the next " +
+			"call, and 0 means the range is exhausted. Headers, footers, footnotes and text boxes are " +
+			"not included and are declared in notes.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":       map[string]any{"type": "string", "description": "Path to the .docx file"},
+				"heading":    map[string]any{"type": "string", "description": "Restrict to the section under this heading; mutually exclusive with start_para/end_para"},
+				"start_para": map[string]any{"type": "number", "description": "1-based inclusive first paragraph"},
+				"end_para":   map[string]any{"type": "number", "description": "1-based inclusive last paragraph"},
+				"full":       map[string]any{"type": "boolean", "description": "Return the whole body; errors instead of chunking when it exceeds the budget"},
+				"runs":       map[string]any{"type": "boolean", "description": "Include each paragraph's runs, needed to edit by run index"},
+				"max_chars":  map[string]any{"type": "number", "description": "Body character budget for this chunk"},
+			},
+			"required": []any{"path"},
+		},
+		Handler: DocxReadHandler,
+	}
+}
+
+// DocxReadHandler parses docx_read's arguments, delegates all document
+// semantics (heading resolution, chunking, marker neutralization) to
+// pkg/docx, and enforces the serialized-result size cap that pkg/docx has
+// no visibility into.
+func DocxReadHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	result := models.ToolResult{CallID: call.ID, ToolName: call.Name}
+
+	args, err := parseDocxReadArgs(call.Arguments)
+	if err != nil {
+		return result, err
+	}
+
+	resolved := resolveReadablePath(ctx, args.Path)
+	doc, err := docx.OpenDocument(resolved)
+	if err != nil {
+		return result, fmt.Errorf("docx_read: %w", err)
+	}
+
+	total := doc.TotalParas()
+	if shouldReturnOutline(total, args) {
+		payload, err := marshalDocxOutlineResult(doc.Outline(), total)
+		if err != nil {
+			return result, fmt.Errorf("docx_read: %w", err)
+		}
+		result.Status = models.CallStatusCompleted
+		result.Content = string(payload)
+		return result, nil
+	}
+
+	initialBudget := args.MaxChars
+	if initialBudget <= 0 {
+		initialBudget = docx.DefaultReadBudget
+	}
+
+	read := func(budget int) (docxReadOutput, error) {
+		rr, err := doc.Read(docx.ReadOptions{
+			StartPara: args.StartPara,
+			EndPara:   args.EndPara,
+			Heading:   args.Heading,
+			Runs:      args.Runs,
+			MaxChars:  budget,
+			Full:      args.Full,
+		})
+		if err != nil {
+			return docxReadOutput{}, err
+		}
+		return docxReadOutputFromResult(rr), nil
+	}
+
+	payload, err := fitDocxReadResult(read, initialBudget, args.Runs)
+	if err != nil {
+		return result, fmt.Errorf("docx_read: %w", err)
+	}
+	result.Status = models.CallStatusCompleted
+	result.Content = string(payload)
+	return result, nil
+}
+
+// parseDocxReadArgs extracts docxReadArgs from the raw JSON arguments map.
+// It only converts types (JSON numbers decode as float64) and checks that
+// path is present; every other default and mutual-exclusion rule is
+// pkg/docx's to enforce.
+func parseDocxReadArgs(raw map[string]any) (docxReadArgs, error) {
+	path, _ := raw["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return docxReadArgs{}, fmt.Errorf("docx_read: path is required")
+	}
+
+	var args docxReadArgs
+	args.Path = path
+	// heading/full/runs are type-checked the same way find already is
+	// (finding 4 of the P1c review): a bare `raw["x"].(T)` type assertion
+	// with the ", ok" form silently discards a wrong-typed value as the
+	// zero value instead of erroring, so e.g. runs sent as the string
+	// "true" reads as false with no diagnostic, and the model gets a
+	// chunked read it believes was full=true.
+	if v, present := raw["heading"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docxReadArgs{}, fmt.Errorf("docx_read: heading must be a string")
+		}
+		args.Heading = s
+	}
+	if v, present := raw["full"]; present && v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return docxReadArgs{}, fmt.Errorf("docx_read: full must be a boolean")
+		}
+		args.Full = b
+	}
+	if v, present := raw["runs"]; present && v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return docxReadArgs{}, fmt.Errorf("docx_read: runs must be a boolean")
+		}
+		args.Runs = b
+	}
+
+	var err error
+	if args.StartPara, err = docxIntArg(raw, "start_para"); err != nil {
+		return docxReadArgs{}, err
+	}
+	if args.EndPara, err = docxIntArg(raw, "end_para"); err != nil {
+		return docxReadArgs{}, err
+	}
+	if args.MaxChars, err = docxIntArg(raw, "max_chars"); err != nil {
+		return docxReadArgs{}, err
+	}
+	return args, nil
+}
+
+// docxIntArg reads key from raw as an int. JSON numbers decode as float64
+// through encoding/json's default map[string]any handling, so that is the
+// only numeric type accepted from a real tool call; a plain int is also
+// accepted so callers constructing arguments in Go (as the tests do) work
+// too. A missing or nil key is not an error: it reports 0, which every
+// caller here treats as "not given".
+func docxIntArg(raw map[string]any, key string) (int, error) {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return 0, nil
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), nil
+	case int:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("docx_read: %s must be a number", key)
+	}
+}
+
+// shouldReturnOutline implements §4.1's outline-by-default rule: with no
+// heading, no explicit range, and no full=true, a document bigger than
+// docx.DocxOutlineParaThreshold gets an outline instead of a wall of
+// markdown the caller never asked to chunk through.
+func shouldReturnOutline(total int, args docxReadArgs) bool {
+	if args.Heading != "" || args.StartPara != 0 || args.EndPara != 0 || args.Full {
+		return false
+	}
+	return total > docx.DocxOutlineParaThreshold
+}
+
+// buildDocxOutline converts a docx.Outline into its compact serialized
+// form.
+func buildDocxOutline(o docx.Outline) *docxOutline {
+	sections := make([]docxOutlineSection, len(o.Sections))
+	for i, s := range o.Sections {
+		sections[i] = docxOutlineSection{
+			Heading:   s.Heading,
+			Level:     s.Level,
+			StartPara: s.StartPara,
+			EndPara:   s.EndPara,
+			Paras:     s.Paras,
+			Words:     s.Words,
+		}
+	}
+	return &docxOutline{
+		TotalParas: o.TotalParas,
+		Words:      o.Words,
+		Sections:   sections,
+	}
+}
+
+// marshalDocxOutlineResult serializes an outline read result and enforces
+// the same maxDocxResultBytes cap fitDocxReadResult applies to ranged reads
+// (finding 1 of the P1c review: the outline branch used to marshal and
+// return directly, with no cap check at all — exactly the path every large
+// document takes, since shouldReturnOutline only fires above 200
+// paragraphs).
+//
+// Unlike a ranged/chunked read, an outline cannot be shrunk by lowering a
+// character budget: every section is one fixed-size JSON object, and there
+// is no smaller unit to chunk by without losing sections outright. Rather
+// than silently emit a level-truncated (and therefore lossy) outline, this
+// returns an actionable error naming the actual size and pointing at the
+// tool's other read modes — consistent with fitDocxReadResult's own choice
+// to error rather than truncate when a ranged read can't be shrunk to fit
+// either (see its doc comment).
+func marshalDocxOutlineResult(outline docx.Outline, total int) ([]byte, error) {
+	out := docxReadOutput{
+		Outline:    buildDocxOutline(outline),
+		TotalParas: total,
+		Notes:      outline.Notes,
+	}
+	payload, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("marshal outline: %w", err)
+	}
+	if len(payload) > maxDocxResultBytes {
+		return nil, fmt.Errorf(
+			// Deliberately does NOT suggest the heading parameter: the caller
+			// only learns a document's heading names FROM the outline, so at
+			// the moment this error fires that lever is unavailable. Paging
+			// with start_para/end_para always works, and the headings become
+			// visible in the returned markdown as the caller pages through.
+			"the outline is %d bytes, over the %d-byte cap; page through the document with start_para/end_para instead (headings appear in the returned markdown)",
+			len(payload), maxDocxResultBytes)
+	}
+	return payload, nil
+}
+
+// docxReadOutputFromResult converts a docx.ReadResult into the JSON shape
+// docx_read returns, dropping ParaView.Text (see docxParaIndex) and
+// including run text only when pkg/docx populated it (i.e. only when the
+// caller asked for runs=true).
+func docxReadOutputFromResult(rr docx.ReadResult) docxReadOutput {
+	paras := make([]docxParaIndex, len(rr.Paras))
+	for i, pv := range rr.Paras {
+		paras[i] = docxParaIndexFromView(pv)
+	}
+	return docxReadOutput{
+		Markdown:      rr.Markdown,
+		Paras:         paras,
+		NextStartPara: rr.NextStartPara,
+		RangeStart:    rr.RangeStart,
+		RangeEnd:      rr.RangeEnd,
+		TotalParas:    rr.TotalParas,
+		Notes:         rr.Notes,
+	}
+}
+
+// docxParaIndexFromView converts one docx.ParaView, carrying its runs only
+// when there are any to carry — which pkg/docx.Read only populates when
+// ReadOptions.Runs was true.
+func docxParaIndexFromView(pv docx.ParaView) docxParaIndex {
+	out := docxParaIndex{
+		Index: pv.Index,
+		Style: pv.Style,
+		Cell:  pv.Cell,
+	}
+	if len(pv.Runs) > 0 {
+		out.Runs = make([]docxRunIndex, len(pv.Runs))
+		for i, r := range pv.Runs {
+			out.Runs[i] = docxRunIndex{Index: r.Index, Text: r.Text}
+		}
+	}
+	return out
+}
+
+// fitDocxReadResult calls read at budget, marshals the result, and — if the
+// marshalled payload exceeds maxDocxResultBytes — halves the budget and
+// retries, up to maxDocxFitAttempts total attempts. It never truncates a
+// result to make it fit: a body that is still over the cap at the smallest
+// attempted budget is reported as an error instead, since silently
+// dropping content is exactly the failure design §5.1 exists to prevent.
+// Every attempt after the first appends a note to the result explaining
+// that it was shrunk, so the caller is told it received less than it
+// asked for.
+//
+// runs is args.Runs from the original call: the terminal error (finding 3
+// of the P1c review) can only fire when a single paragraph's rendered block
+// alone exceeds every attempted budget, in which case pkg/docx returns that
+// paragraph whole every time regardless of budget — halving budget again
+// changes nothing, so "retry with a smaller max_chars" is not just
+// unhelpful there, it is actively wrong advice that a compliant caller
+// would loop forever on. Dropping runs=true is the one lever that actually
+// shrinks that paragraph's rendered size (each run's own JSON overhead), so
+// the error says that instead whenever runs was set.
+func fitDocxReadResult(read func(budget int) (docxReadOutput, error), budget int, runs bool) ([]byte, error) {
+	if budget <= 0 {
+		budget = docx.DefaultReadBudget
+	}
+
+	var lastNotes []string
+	for attempt := 0; attempt < maxDocxFitAttempts; attempt++ {
+		out, err := read(budget)
+		if err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			out.Notes = append(out.Notes, fmt.Sprintf(
+				"the result exceeded the %d-byte tool result cap and was shrunk to a %d-character body budget; "+
+					"pass a smaller max_chars or narrow the range to get the rest",
+				maxDocxResultBytes, budget))
+		}
+		lastNotes = out.Notes
+
+		payload, err := json.Marshal(out)
+		if err != nil {
+			return nil, fmt.Errorf("marshal docx_read result: %w", err)
+		}
+		if len(payload) <= maxDocxResultBytes {
+			return payload, nil
+		}
+		if attempt == maxDocxFitAttempts-1 {
+			advice := "retry with a smaller max_chars, or narrow the range with heading or start_para/end_para"
+			if runs {
+				advice = "retry without runs=true — that is the one lever that actually shrinks this payload; a smaller max_chars or a narrower range will not, since pkg/docx returns an over-budget paragraph whole regardless of budget"
+			}
+			diag := ""
+			if len(lastNotes) > 0 {
+				diag = fmt.Sprintf(" (pkg/docx reported: %s)", strings.Join(lastNotes, "; "))
+			}
+			return nil, fmt.Errorf(
+				"docx_read: result is %d bytes even at a %d-character body budget, over the %d-byte cap%s; %s",
+				len(payload), budget, maxDocxResultBytes, diag, advice)
+		}
+		budget /= 2
+		if budget < 1 {
+			budget = 1
+		}
+	}
+	// Unreachable: the loop above always returns on its last iteration.
+	return nil, fmt.Errorf("docx_read: shrink loop exhausted without resolving")
+}
+
+// docxIndexAdvice is appended to docxEditOutput.IndexAdvice whenever a batch
+// changed the document's paragraph count (design §5.4): insert_before,
+// insert_after, and a whole-paragraph delete all shift every later
+// paragraph's index, so a caller holding indices from an earlier docx_read
+// needs to be told they are stale before it issues another edit against
+// them. It is deliberately omitted (see DocxEditHandler) when the count did
+// not change, since an ordinary replace-only polish batch never shifts
+// anything and telling the model to re-read anyway would waste a docx_read
+// round trip on every such batch.
+const docxIndexAdvice = "the paragraph count changed; paragraph indices from any earlier read are now stale — re-read the outline or range before issuing further edits"
+
+// docxEditArgs is docx_edit's parsed arguments.
+type docxEditArgs struct {
+	Path                string
+	Edits               []docx.Edit
+	Protect             []string
+	ReviewedThroughPara int
+}
+
+// docxEditOutput is the JSON shape docx_edit returns to the model.
+type docxEditOutput struct {
+	Applied          int               `json:"applied"`
+	Outcomes         []docxEditOutcome `json:"outcomes"`
+	TotalParas       int               `json:"total_paras"`
+	ParaCountChanged bool              `json:"para_count_changed"`
+	IndexAdvice      string            `json:"index_advice,omitempty"`
+	BackupPath       string            `json:"backup_path,omitempty"`
+	// BackupCreated distinguishes a backup this call just created from one
+	// that already existed from an earlier call (finding 8 of the P1c
+	// review): BackupPath alone can't tell those apart, so a second session
+	// would be told an identical backup_path both times, and the skill's
+	// reporting step would call it "the rollback path" when the user would
+	// actually roll back past an earlier accepted run, not just this one.
+	// Deliberately not omitempty: false is a meaningful, distinct answer
+	// (pre-existing backup) from omitting the field entirely (no backup was
+	// involved because nothing was modified, in which case BackupPath is
+	// also empty).
+	BackupCreated       bool `json:"backup_created"`
+	ReviewedThroughPara int  `json:"reviewed_through_para,omitempty"`
+}
+
+// docxEditOutcome is the serialized form of one docx.EditOutcome, reporting
+// what happened to a single requested edit within the batch.
+type docxEditOutcome struct {
+	Para    int    `json:"para"`
+	Applied bool   `json:"applied"`
+	Before  string `json:"before,omitempty"`
+	After   string `json:"after,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Warning string `json:"warning,omitempty"`
+}
+
+// DocxEditTool describes docx_edit to the model. style is deliberately not
+// declared here: design §4.2 defers paragraph styling to docx_format (P2),
+// and DocxEditHandler returns an explicit error naming docx_format if any
+// edit object carries it, rather than silently dropping it.
+func DocxEditTool() models.Tool {
+	return models.Tool{
+		Name:         "docx_edit",
+		Groups:       []string{"builtin", "document"},
+		ParallelSafe: false,
+		Description: "Edit a .docx in place with byte-faithful, format-preserving patches. Each edit targets a " +
+			"paragraph, optionally narrowed to a run index or a literal find substring, and applies replace " +
+			"(default), insert_before, insert_after, or delete. A refused edit does not block the rest of the " +
+			"batch. Refuses documents that already contain revision marks. Backs up the original file once, " +
+			"before the first overwrite, to <path>.bak. Paragraph styling is out of scope here; use docx_format.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Path to the .docx file"},
+				"edits": map[string]any{
+					"type":        "array",
+					"description": "Edits to apply in one batch; a refused edit does not block the rest",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"para": map[string]any{"type": "number", "description": "1-based paragraph index"},
+							"run":  map[string]any{"type": "number", "description": "1-based run index within the paragraph; mutually exclusive with find"},
+							"find": map[string]any{"type": "string", "description": "Literal substring to locate within the paragraph's text; mutually exclusive with run"},
+							"text": map[string]any{"type": "string", "description": "Replacement or inserted text; ignored by delete"},
+							"op":   map[string]any{"type": "string", "description": "replace (default), insert_before, insert_after, or delete"},
+						},
+						"required": []any{"para"},
+					},
+				},
+				"protect": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Regex or literal patterns that must survive every edit touching them",
+				},
+				"reviewed_through_para": map[string]any{
+					"type":        "number",
+					"description": "Echoed back verbatim. Set this to the end_para of the chunk you just wrote back, so a resumed session (e.g. a fresh subagent picking up after this one ran out of turns) can tell how far this batch reviewed",
+				},
+			},
+			"required": []any{"path", "edits"},
+		},
+		Handler: DocxEditHandler,
+	}
+}
+
+// DocxTools returns every docx tool.
+func DocxTools() []models.Tool {
+	return []models.Tool{DocxReadTool(), DocxEditTool()}
+}
+
+// DocxEditHandler parses docx_edit's arguments, delegates all editing
+// semantics (locating by run/find, protect validation, collision detection,
+// the revision gate) to pkg/docx, and owns only the four responsibilities
+// pkg/docx deliberately leaves to the tool layer: rejecting style outright,
+// backing up the file once before the first overwrite, echoing
+// reviewed_through_para, and translating ParaCountChanged into actionable
+// advice.
+func DocxEditHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	result := models.ToolResult{CallID: call.ID, ToolName: call.Name}
+
+	args, err := parseDocxEditArgs(call.Arguments)
+	if err != nil {
+		return result, err
+	}
+
+	resolved := resolveWritablePath(ctx, args.Path)
+	doc, err := docx.OpenDocument(resolved)
+	if err != nil {
+		return result, fmt.Errorf("docx_edit: %w", err)
+	}
+
+	editResult, err := doc.Edit(args.Edits, docx.EditOptions{Protect: args.Protect})
+	if err != nil {
+		return result, fmt.Errorf("docx_edit: %w", err)
+	}
+
+	// Only a batch that actually changed something reaches disk: a batch
+	// where every edit was refused leaves doc.Modified() false, and this
+	// call must return cleanly without writing the file or touching the
+	// backup. The backup itself is written BEFORE Save, not after: if Save
+	// then fails (e.g. a disk error), the pristine original is already
+	// safely copied aside, which is the ordering that actually protects the
+	// user — backing up after a successful Save would be too late to help if
+	// Save itself is what failed partway.
+	var backupPath string
+	var backupCreated bool
+	if doc.Modified() {
+		backupPath, backupCreated, err = backupDocxOnce(resolved)
+		if err != nil {
+			return result, fmt.Errorf("docx_edit: back up %s before saving: %w", resolved, err)
+		}
+		if err := doc.Save(); err != nil {
+			return result, fmt.Errorf("docx_edit: save %s: %w", resolved, err)
+		}
+	}
+
+	out := docxEditOutput{
+		Applied:             editResult.Applied,
+		Outcomes:            docxEditOutcomesFromResult(editResult.Outcomes),
+		TotalParas:          editResult.TotalParas,
+		ParaCountChanged:    editResult.ParaCountChanged,
+		BackupPath:          backupPath,
+		BackupCreated:       backupCreated,
+		ReviewedThroughPara: args.ReviewedThroughPara,
+	}
+	if editResult.ParaCountChanged {
+		out.IndexAdvice = docxIndexAdvice
+	}
+
+	payload, err := json.Marshal(out)
+	if err != nil {
+		return result, fmt.Errorf("docx_edit: marshal result: %w", err)
+	}
+	result.Status = models.CallStatusCompleted
+	result.Content = string(payload)
+	return result, nil
+}
+
+// docxEditOutcomesFromResult converts pkg/docx's EditOutcome slice into the
+// JSON shape docx_edit returns, echoing each outcome's target paragraph from
+// the edit it corresponds to.
+func docxEditOutcomesFromResult(outcomes []docx.EditOutcome) []docxEditOutcome {
+	out := make([]docxEditOutcome, len(outcomes))
+	for i, o := range outcomes {
+		out[i] = docxEditOutcome{
+			Para:    o.Edit.Para,
+			Applied: o.Applied,
+			Before:  o.Before,
+			After:   o.After,
+			Reason:  o.Reason,
+			Warning: o.Warning,
+		}
+	}
+	return out
+}
+
+// backupDocxOnce copies path to path+".bak" the first time it is called for
+// that path, and does nothing on every later call. It keys that decision on
+// the backup file's existence on disk, not on any in-process record: that
+// makes it stateless (no global map, nothing to reset between calls or
+// processes) and correct across restarts, and it is naturally idempotent —
+// design §8/§5.7 require the backup to hold the ORIGINAL, pre-edit content
+// for the entire lifetime of a multi-call polish run, so a second call must
+// never refresh it once it exists.
+//
+// It uses Lstat, not Stat, to decide "does a backup already exist" (finding
+// 7 of the P1c review): Stat follows symlinks, so a directory left at
+// <path>.bak would make Stat succeed and this function would report a
+// backup "exists" when Save() is about to overwrite the original with none
+// at all, and a DANGLING <path>.bak symlink would make Stat fail with
+// os.IsNotExist (since the symlink's target is missing), which would fall
+// through to the os.WriteFile below and write the document's bytes to
+// wherever the symlink points — an attacker-controlled path, if the symlink
+// was planted there. Lstat reports on the symlink/directory entry itself in
+// both cases, so requiring Mode().IsRegular() catches both without ever
+// following the link.
+//
+// The returned bool reports whether THIS call created the backup (true) or
+// found a pre-existing one and left it untouched (false) — see
+// docxEditOutput.BackupCreated's doc comment for why that distinction
+// matters to a caller.
+func backupDocxOnce(path string) (backupPath string, created bool, err error) {
+	backupPath = path + ".bak"
+	info, statErr := os.Lstat(backupPath)
+	switch {
+	case statErr == nil:
+		if !info.Mode().IsRegular() {
+			return "", false, fmt.Errorf(
+				"%s exists but is not a regular file (mode %s); refusing to treat it as a valid backup",
+				backupPath, info.Mode())
+		}
+		return backupPath, false, nil
+	case !os.IsNotExist(statErr):
+		return "", false, statErr
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	if err := os.WriteFile(backupPath, data, filePerm(path, 0o644)); err != nil {
+		return "", false, err
+	}
+	return backupPath, true, nil
+}
+
+// parseDocxEditArgs extracts docxEditArgs from the raw JSON arguments map.
+// Like parseDocxReadArgs, it only converts types and checks presence; every
+// editing rule (mutual exclusion of run/find, op legality, paragraph/run
+// range, the revision gate, protect matching) is pkg/docx's to enforce. The
+// one rule enforced here that pkg/docx has no opinion on at all is style:
+// design §4.2 defers it to docx_format, and the schema never declares it, so
+// any edit object that carries the key at all is refused outright rather
+// than silently ignored.
+func parseDocxEditArgs(raw map[string]any) (docxEditArgs, error) {
+	path, _ := raw["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return docxEditArgs{}, fmt.Errorf("docx_edit: path is required")
+	}
+
+	rawEdits, ok := raw["edits"].([]any)
+	if !ok || len(rawEdits) == 0 {
+		return docxEditArgs{}, fmt.Errorf("docx_edit: edits is required and must be a non-empty array")
+	}
+
+	edits := make([]docx.Edit, len(rawEdits))
+	for i, re := range rawEdits {
+		em, ok := re.(map[string]any)
+		if !ok {
+			return docxEditArgs{}, fmt.Errorf("docx_edit: edits[%d] must be an object", i)
+		}
+		// Checked before anything else, and independently for EVERY edit in
+		// the batch (not just the first): silently dropping style anywhere
+		// in the batch would let the model believe that edit restyled its
+		// paragraph, when nothing about styling happened at all.
+		if _, hasStyle := em["style"]; hasStyle {
+			return docxEditArgs{}, fmt.Errorf(
+				"docx_edit: edits[%d] sets style, which is deferred to P2 and not supported here; use docx_format for paragraph styling", i)
+		}
+		edit, err := parseDocxEditItem(em)
+		if err != nil {
+			return docxEditArgs{}, fmt.Errorf("docx_edit: edits[%d]: %w", i, err)
+		}
+		edits[i] = edit
+	}
+
+	var protect []string
+	if rawProtect, ok := raw["protect"].([]any); ok {
+		for _, p := range rawProtect {
+			if s, ok := p.(string); ok {
+				protect = append(protect, s)
+			}
+		}
+	}
+
+	reviewedThroughPara, err := docxEditNumberArg(raw, "reviewed_through_para")
+	if err != nil {
+		return docxEditArgs{}, err
+	}
+
+	return docxEditArgs{
+		Path:                path,
+		Edits:               edits,
+		Protect:             protect,
+		ReviewedThroughPara: reviewedThroughPara,
+	}, nil
+}
+
+// parseDocxEditItem converts one raw edit object into a docx.Edit. find's
+// nil-vs-pointer-to-empty-string distinction (see docx.Edit.Find's doc
+// comment) is preserved here: an absent "find" key leaves Find nil, and a
+// present key decodes to a non-nil pointer even when its value is "" — that
+// second case is deliberately handed to pkg/docx to refuse, not resolved
+// here, since planEdit's refusal message is the one that should reach the
+// caller.
+func parseDocxEditItem(em map[string]any) (docx.Edit, error) {
+	para, err := docxEditNumberArg(em, "para")
+	if err != nil {
+		return docx.Edit{}, err
+	}
+	if para == 0 {
+		return docx.Edit{}, fmt.Errorf("para is required")
+	}
+	run, err := docxEditNumberArg(em, "run")
+	if err != nil {
+		return docx.Edit{}, err
+	}
+
+	var find *string
+	if v, present := em["find"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.Edit{}, fmt.Errorf("find must be a string")
+		}
+		find = &s
+	}
+
+	// text/op are type-checked the same way find already is (finding 4 of
+	// the P1c review): the previous ", _ :=" form silently coerced a
+	// wrong-typed value to "" instead of erroring, so an edit sent as
+	// {"para":5,"find":"2025","text":2026} (a bare number where a model
+	// meant a string) applied as a replace with Text="", deleting the
+	// matched text and reporting applied:true with no diagnostic at all.
+	var text string
+	if v, present := em["text"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.Edit{}, fmt.Errorf("text must be a string")
+		}
+		text = s
+	}
+	var op string
+	if v, present := em["op"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.Edit{}, fmt.Errorf("op must be a string")
+		}
+		op = s
+	}
+
+	return docx.Edit{Para: para, Run: run, Find: find, Text: text, Op: op}, nil
+}
+
+// docxEditNumberArg reads key from raw as an int, exactly like docxIntArg's
+// float64/int handling, but with an error message scoped to docx_edit
+// (docxIntArg's own message is hardcoded to docx_read, so it is not reused
+// here). A missing or nil key reports 0, which every caller here treats as
+// "not given".
+func docxEditNumberArg(raw map[string]any, key string) (int, error) {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return 0, nil
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), nil
+	case int:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("docx_edit: %s must be a number", key)
+	}
+}
