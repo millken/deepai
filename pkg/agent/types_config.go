@@ -101,7 +101,15 @@ const (
 		"Formatting (fonts, size, line spacing, alignment, margins, templates, collapsing empty paragraphs) goes " +
 		"through docx_format, not docx_edit. Never edit a .docx by writing or running a Python (or any other) " +
 		"script through bash — that path bypasses the backup, the protect list, and the audit trail this profile " +
-		"depends on, even if the resulting file happens to open fine."
+		"depends on, even if the resulting file happens to open fine.\n\n" +
+		"track_changes defaults to true for polishing: pass docx_edit's track_changes argument as true on every " +
+		"call unless the user explicitly asked for direct edits with no review step. With it on, each change lands " +
+		"as a Word revision (w:ins/w:del) in the review pane, not as a finalized edit — after such a call, tell the " +
+		"user the changes are pending review in Word, never that you \"made\" or \"applied\" them, and say how to " +
+		"accept or reject each one (Word's Review tab). If docx_edit refuses because the document already contained " +
+		"revision marks when it was opened, that is not a bug: tell the user to accept or reject the existing " +
+		"revisions in Word first, then retry — do not turn track_changes off to work around the refusal, since that " +
+		"would silently mix reviewed and unreviewed changes in the same file."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{

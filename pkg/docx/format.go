@@ -53,6 +53,24 @@ type FormatOptions struct {
 	// promise that formatting never touches body text otherwise. It does
 	// NOT normalize punctuation spacing; see FormatResult.Notes.
 	Normalize bool
+	// StartPara, if > 0, switches BodyFont/BodySizePt/LineSpacing/Align
+	// from the whole-document path above to DIRECT FORMATTING scoped to
+	// paragraphs [StartPara, EndPara] (1-based, inclusive) of
+	// word/document.xml: font/size land on each targeted run's own
+	// <w:rPr>, and line spacing/alignment land on each targeted
+	// paragraph's own <w:pPr> — direct formatting, which outranks
+	// whatever word/styles.xml says, exactly what a user gets by
+	// selecting text in Word and setting a size. 0 (the zero value) means
+	// "whole document", the original, unchanged behavior — see
+	// formatDirectRange for the range path and its own doc comment for
+	// which fields it rejects outright (Template, HeadingFont, MarginsMM,
+	// Normalize all only make sense document-wide).
+	StartPara int
+	// EndPara, if StartPara > 0 and EndPara == 0, defaults to StartPara
+	// (formatting exactly that one paragraph). Setting EndPara while
+	// StartPara is 0 is an error — there is no range to end. 1-based,
+	// inclusive.
+	EndPara int
 }
 
 // FormatResult reports what Document.Format actually changed.
@@ -138,6 +156,18 @@ func (d *Document) SetPart(name string, data []byte) error {
 // every other field only ever touches formatting properties, never a
 // <w:t>'s content.
 func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
+	// A range switches to direct formatting entirely (formatDirectRange),
+	// never falling through to the whole-document path below — see that
+	// function's doc comment for the landing-point table and why several
+	// FormatOptions fields are refused outright when combined with a
+	// range.
+	if opts.StartPara > 0 {
+		return d.formatDirectRange(opts)
+	}
+	if opts.EndPara != 0 {
+		return FormatResult{}, fmt.Errorf("docx: end_para %d was given without start_para; there is no range to end", opts.EndPara)
+	}
+
 	resolved, err := resolveFormatOptions(opts)
 	if err != nil {
 		return FormatResult{}, err

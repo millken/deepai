@@ -851,3 +851,555 @@ func TestIntegration_ReadThenEditByReportedIndex(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P2b Task 2: TrackChanges wiring.
+// ---------------------------------------------------------------------------
+
+// docXMLOf returns d's current word/document.xml bytes, for tests that need
+// to inspect the raw markup a tracked-change edit produced rather than just
+// the Scan-derived visible text.
+func docXMLOf(t *testing.T, d *Document) string {
+	t.Helper()
+	data, ok := d.pkg.Part(DocumentPart)
+	if !ok {
+		t.Fatal("document has no document.xml part")
+	}
+	return string(data)
+}
+
+// TestEdit_TrackChangesOffIsByteIdenticalToBeforeThisFeature is the single
+// most important regression guard for this task: EditOptions gained three
+// new fields (TrackChanges, Author, Now), and every planner gained a branch
+// point on rc == nil vs rc != nil. This proves that branch point is a true
+// no-op when TrackChanges is false — even when Author/Now are populated
+// anyway, which must be silently ignored — by running the SAME batch (one
+// of each op) against two fresh copies of the same fixture and diffing
+// document.xml byte for byte.
+func TestEdit_TrackChangesOffIsByteIdenticalToBeforeThisFeature(t *testing.T) {
+	batch := []Edit{
+		{Para: 2, Find: strp("Body"), Text: "BODY"},
+		{Para: 2, Op: "insert_after", Text: "inserted"},
+		{Para: 4, Op: "delete"},
+	}
+
+	dOld := editableDoc(t)
+	resOld, err := dOld.Edit(batch, EditOptions{})
+	if err != nil {
+		t.Fatalf("Edit (implicit-off): %v", err)
+	}
+
+	dNew := editableDoc(t)
+	resNew, err := dNew.Edit(batch, EditOptions{TrackChanges: false, Author: "someone", Now: testNow})
+	if err != nil {
+		t.Fatalf("Edit (explicit-off with Author/Now set): %v", err)
+	}
+
+	if resOld.Applied == 0 || resNew.Applied == 0 {
+		t.Fatalf("test setup: batch did not apply (old Applied=%d, new Applied=%d)", resOld.Applied, resNew.Applied)
+	}
+	if resOld.Applied != resNew.Applied {
+		t.Fatalf("Applied differs: old=%d new=%d", resOld.Applied, resNew.Applied)
+	}
+
+	oldXML := docXMLOf(t, dOld)
+	newXML := docXMLOf(t, dNew)
+	if oldXML != newXML {
+		t.Errorf("document.xml differs with TrackChanges left at its zero value vs explicitly false with Author/Now set:\nold: %s\nnew: %s", oldXML, newXML)
+	}
+}
+
+// TestEdit_TrackChanges_ReplaceRun_ProducesDelInsAndPreservesFormatting
+// covers the run-target replace row of the plan's table, and doubles as the
+// "preserve original formatting" pin (brief's must-have test 5): both the
+// <w:del> and <w:ins> sides of a bold run's replace must still carry <w:b/>.
+func TestEdit_TrackChanges_ReplaceRun_ProducesDelInsAndPreservesFormatting(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>old text</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Run: 1, Text: "new text"}},
+		EditOptions{TrackChanges: true, Author: "tester", Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked run replace was refused: %s", res.Outcomes[0].Reason)
+	}
+	if res.Outcomes[0].Before != "old text" || res.Outcomes[0].After != "new text" {
+		t.Errorf("Before/After = %q/%q, want %q/%q", res.Outcomes[0].Before, res.Outcomes[0].After, "old text", "new text")
+	}
+
+	xml := docXMLOf(t, d)
+	if !strings.Contains(xml, "<w:del ") || !strings.Contains(xml, "<w:ins ") {
+		t.Fatalf("document.xml does not contain both <w:del> and <w:ins>: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:delText>old text</w:delText>") {
+		t.Errorf("old text was not converted to delText: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:t>new text</w:t>") {
+		t.Errorf("new text was not written as plain w:t inside w:ins: %s", xml)
+	}
+	if strings.Count(xml, "<w:b/>") != 2 {
+		t.Errorf("want <w:b/> preserved on BOTH the del and ins clones, got %d occurrences: %s", strings.Count(xml, "<w:b/>"), xml)
+	}
+
+	// Independent self-consistency check, per the task's instructions: reuse
+	// the scanner's own visible-text rules (delText excluded, ins included)
+	// rather than trusting the XML assertions above alone.
+	if got := paraTextAt(t, d, 1); got != "new text" {
+		t.Errorf("Scan-derived visible text = %q, want %q", got, "new text")
+	}
+}
+
+// TestEdit_TrackChanges_DeleteRun_ProducesDelOnly is the delete-side
+// counterpart: no <w:ins> should appear at all.
+func TestEdit_TrackChanges_DeleteRun_ProducesDelOnly(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>gone</w:t></w:r><w:r><w:t> stays</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Run: 1, Op: "delete"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked run delete was refused: %s", res.Outcomes[0].Reason)
+	}
+	xml := docXMLOf(t, d)
+	if strings.Contains(xml, "<w:ins ") {
+		t.Errorf("a plain delete must not produce any <w:ins>: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:delText>gone</w:delText>") {
+		t.Errorf("deleted text was not converted to delText: %s", xml)
+	}
+	if got := paraTextAt(t, d, 1); got != " stays" {
+		t.Errorf("Scan-derived visible text = %q, want %q (delText excluded)", got, " stays")
+	}
+}
+
+// TestEdit_TrackChanges_ReplaceFind_SplitsPrefixDelInsSuffix pins the find
+// op's four-piece shape, including the "no empty run for an empty
+// prefix/suffix" rule: the match sits at the very end of the run's text, so
+// there must be no third clone (an empty suffix run) in the output.
+func TestEdit_TrackChanges_ReplaceFind_SplitsPrefixDelInsSuffix(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>hello world</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Find: strp("world"), Text: "there"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked find replace was refused: %s", res.Outcomes[0].Reason)
+	}
+	xml := docXMLOf(t, d)
+	// "hello " has a trailing space, so cloneRunWithText adds
+	// xml:space="preserve" (needsPreserve) — this is not the original run's
+	// tag (which had none), it is added because the SPLIT-OUT prefix text
+	// itself now ends in whitespace that Word would otherwise collapse.
+	if !strings.Contains(xml, `<w:t xml:space="preserve">hello </w:t>`) {
+		t.Errorf("prefix run \"hello \" not found intact (with xml:space=\"preserve\" for its trailing space): %s", xml)
+	}
+	if !strings.Contains(xml, "<w:delText>world</w:delText>") {
+		t.Errorf("matched text not converted to delText: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:t>there</w:t>") {
+		t.Errorf("replacement text not found as plain w:t: %s", xml)
+	}
+	// No empty suffix run: exactly one <w:t...> holds "hello " and one holds
+	// "there" — a third, empty <w:t></w:t> would mean an unwanted empty
+	// suffix run was emitted.
+	if strings.Contains(xml, "<w:t></w:t>") || strings.Contains(xml, `<w:t xml:space="preserve"></w:t>`) {
+		t.Errorf("an empty run was emitted for the empty suffix: %s", xml)
+	}
+	if got := paraTextAt(t, d, 1); got != "hello there" {
+		t.Errorf("Scan-derived visible text = %q, want %q", got, "hello there")
+	}
+}
+
+// TestEdit_TrackChanges_DeleteFind_NoInsertionProduced is the find-delete
+// counterpart, and also exercises a match with a non-empty SUFFIX (unlike
+// the replace test above, which put the match at the end).
+func TestEdit_TrackChanges_DeleteFind_NoInsertionProduced(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>hello world today</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Find: strp("world "), Op: "delete"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked find delete was refused: %s", res.Outcomes[0].Reason)
+	}
+	xml := docXMLOf(t, d)
+	if strings.Contains(xml, "<w:ins ") {
+		t.Errorf("a plain delete must not produce any <w:ins>: %s", xml)
+	}
+	// "world " (the match) and "hello " (the prefix) both have a trailing
+	// space, so both clones pick up xml:space="preserve" — see the analogous
+	// comment in TestEdit_TrackChanges_ReplaceFind_SplitsPrefixDelInsSuffix.
+	if !strings.Contains(xml, `<w:delText xml:space="preserve">world </w:delText>`) {
+		t.Errorf("matched text not converted to delText: %s", xml)
+	}
+	if !strings.Contains(xml, `<w:t xml:space="preserve">hello </w:t>`) {
+		t.Errorf("prefix run not found intact: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:t>today</w:t>") {
+		t.Errorf("suffix run not found intact: %s", xml)
+	}
+	if got := paraTextAt(t, d, 1); got != "hello today" {
+		t.Errorf("Scan-derived visible text = %q, want %q", got, "hello today")
+	}
+}
+
+// TestEdit_TrackChanges_ParagraphDelete_DoesNotRemoveParagraph is the
+// brief's must-have test 3: paragraph count must not change, and
+// ParaCountChanged must be false, because the paragraph is marked deleted
+// rather than removed.
+func TestEdit_TrackChanges_ParagraphDelete_DoesNotRemoveParagraph(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>first</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p>`)
+	before := d.TotalParas()
+
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Op: "delete"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked paragraph delete was refused: %s", res.Outcomes[0].Reason)
+	}
+	if res.Outcomes[0].Before != "first" || res.Outcomes[0].After != "" {
+		t.Errorf("Before/After = %q/%q, want %q/%q", res.Outcomes[0].Before, res.Outcomes[0].After, "first", "")
+	}
+	if res.ParaCountChanged {
+		t.Error("ParaCountChanged = true, want false for a tracked paragraph delete")
+	}
+	if res.TotalParas != before {
+		t.Errorf("TotalParas = %d, want unchanged %d", res.TotalParas, before)
+	}
+	if d.TotalParas() != before {
+		t.Errorf("Document.TotalParas() = %d, want unchanged %d", d.TotalParas(), before)
+	}
+
+	xml := docXMLOf(t, d)
+	if !strings.Contains(xml, "<w:delText>first</w:delText>") {
+		t.Errorf("paragraph's run text was not converted to delText: %s", xml)
+	}
+	// The paragraph MARK itself must also be flagged deleted (plan's OOXML
+	// shape note 5), or Word would merge this paragraph into its neighbour
+	// once the revision is accepted.
+	if !strings.Contains(xml, "<w:pPr><w:rPr><w:del ") {
+		t.Errorf("paragraph mark was not flagged deleted via <w:pPr><w:rPr><w:del/>: %s", xml)
+	}
+	// Scan-derived visible text: the deleted paragraph's run text must be
+	// gone (delText excluded), while the second paragraph is untouched.
+	if got := paraTextAt(t, d, 1); got != "" {
+		t.Errorf("paragraph 1 visible text = %q, want empty (delText excluded)", got)
+	}
+	if got := paraTextAt(t, d, 2); got != "second" {
+		t.Errorf("paragraph 2 = %q, want untouched %q", got, "second")
+	}
+}
+
+// TestEdit_TrackChanges_ParagraphReplace_CollapsesFormattingLikeUntrackedMode
+// pins the whole-paragraph replace row: the first run's <w:r> gets
+// del(oldText)+ins(newText), every other run's <w:r> gets del(oldText) only,
+// and the same "collapsed formatting" Warning fires as in untracked mode.
+func TestEdit_TrackChanges_ParagraphReplace_CollapsesFormattingLikeUntrackedMode(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>one</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>two</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Text: "flat"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked paragraph replace was refused: %s", res.Outcomes[0].Reason)
+	}
+	if res.Outcomes[0].Warning == "" {
+		t.Error("multi-run tracked whole-paragraph replace produced no collapsed-formatting warning")
+	}
+	xml := docXMLOf(t, d)
+	if !strings.Contains(xml, "<w:delText>one</w:delText>") || !strings.Contains(xml, "<w:delText>two</w:delText>") {
+		t.Errorf("both runs' old text must be converted to delText: %s", xml)
+	}
+	if strings.Count(xml, "<w:ins ") != 1 {
+		t.Errorf("want exactly one <w:ins> (on the first run only), got %d: %s", strings.Count(xml, "<w:ins "), xml)
+	}
+	if !strings.Contains(xml, "<w:i/>") {
+		t.Errorf("second run's <w:i/> formatting was lost: %s", xml)
+	}
+	if got := paraTextAt(t, d, 1); got != "flat" {
+		t.Errorf("Scan-derived visible text = %q, want %q", got, "flat")
+	}
+}
+
+// TestEdit_TrackChanges_InsertAfter_MarksNewParagraphAndRunAsInserted covers
+// the insert_before/insert_after row: the new paragraph is a real <w:p>
+// (paragraph count DOES change — nothing here mirrors the paragraph-delete
+// carve-out, since nothing pre-existing is being hidden), but both the
+// paragraph mark and its run must carry <w:ins/>.
+func TestEdit_TrackChanges_InsertAfter_MarksNewParagraphAndRunAsInserted(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>only</w:t></w:r></w:p>`)
+	before := d.TotalParas()
+
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Op: "insert_after", Text: "brand new"}},
+		EditOptions{TrackChanges: true, Author: "tester", Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked insert_after was refused: %s", res.Outcomes[0].Reason)
+	}
+	if !res.ParaCountChanged || res.TotalParas != before+1 {
+		t.Errorf("ParaCountChanged=%v TotalParas=%d, want true/%d (a real new paragraph was added)", res.ParaCountChanged, res.TotalParas, before+1)
+	}
+
+	xml := docXMLOf(t, d)
+	if !strings.Contains(xml, "<w:pPr><w:rPr><w:ins ") {
+		t.Errorf("new paragraph's mark was not flagged inserted: %s", xml)
+	}
+	if !strings.Contains(xml, "<w:ins ") || !strings.Contains(xml, "<w:t>brand new</w:t>") {
+		t.Errorf("new paragraph's run was not wrapped in <w:ins> holding the inserted text: %s", xml)
+	}
+	if got := paraTextAt(t, d, 2); got != "brand new" {
+		t.Errorf("paragraph 2 visible text = %q, want %q", got, "brand new")
+	}
+}
+
+// TestEdit_TrackChanges_TwoConsecutiveChunkedEditsBothSucceed is the reason
+// this phase exists (brief's must-have test 4): the FIRST tracked edit
+// writes real w:ins/w:del into the document and rescans, which flips
+// HasRevisions() to true — proving the gate genuinely uses
+// hadRevisionsAtOpen (captured once, at OpenDocument) rather than
+// HasRevisions() (which would now block every subsequent call). A SECOND
+// tracked edit in the same session, after the first has already landed,
+// must still succeed.
+func TestEdit_TrackChanges_TwoConsecutiveChunkedEditsBothSucceed(t *testing.T) {
+	d := editableDoc(t)
+
+	res1, err := d.Edit(
+		[]Edit{{Para: 2, Find: strp("Body"), Text: "BODY"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("first tracked Edit: %v", err)
+	}
+	if !res1.Outcomes[0].Applied {
+		t.Fatalf("first tracked edit was refused: %s", res1.Outcomes[0].Reason)
+	}
+	if !d.HasRevisions() {
+		t.Fatal("test setup: HasRevisions() = false after a tracked edit landed; the rest of this test would be vacuous")
+	}
+
+	res2, err := d.Edit(
+		[]Edit{{Para: 3, Find: strp("Body"), Text: "BODY2"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("second tracked Edit returned an error — the gate is blocking on the first edit's own revisions: %v", err)
+	}
+	if !res2.Outcomes[0].Applied {
+		t.Fatalf("second tracked edit was refused: %s", res2.Outcomes[0].Reason)
+	}
+
+	if got := paraTextAt(t, d, 2); !strings.Contains(got, "BODY") {
+		t.Errorf("paragraph 2 = %q, want it to contain BODY (first edit's ins)", got)
+	}
+	if got := paraTextAt(t, d, 3); !strings.Contains(got, "BODY2") {
+		t.Errorf("paragraph 3 = %q, want it to contain BODY2 (second edit's ins)", got)
+	}
+
+	// Both revisions must have distinct w:id values: newRevisionCtx is
+	// rebuilt from the CURRENT document.xml on every Edit call, so the
+	// second batch's ids must start above whatever the first batch wrote,
+	// never colliding.
+	xml := docXMLOf(t, d)
+	firstID := strings.Index(xml, `w:id="1"`)
+	if firstID == -1 {
+		t.Fatalf("expected the first tracked edit's ids to start at 1: %s", xml)
+	}
+	if strings.Count(xml, `w:id="1"`) != 1 {
+		t.Errorf("w:id=\"1\" must be unique across the whole document, found %d occurrences: %s", strings.Count(xml, `w:id="1"`), xml)
+	}
+
+	// The document must still be a genuinely valid, reopenable package —
+	// the real end-to-end proof that neither batch corrupted anything.
+	if err := d.Save(); err != nil {
+		t.Fatalf("Save after two chunked tracked edits: %v", err)
+	}
+	if _, err := OpenDocument(d.path); err != nil {
+		t.Errorf("saved document is not reopenable: %v", err)
+	}
+}
+
+// TestEdit_TrackChanges_ThreeConsecutiveEditsAllSucceed extends the above to
+// three rounds, since two could theoretically pass by coincidence if the
+// gate merely tolerated exactly one prior tracked edit rather than genuinely
+// decoupling from HasRevisions().
+func TestEdit_TrackChanges_ThreeConsecutiveEditsAllSucceed(t *testing.T) {
+	d := editableDoc(t)
+	targets := []struct {
+		para int
+		find string
+		text string
+	}{
+		{2, "Body", "BODY-1"},
+		{3, "Body", "BODY-2"},
+		{6, "Body", "BODY-3"},
+	}
+	for i, tc := range targets {
+		res, err := d.Edit(
+			[]Edit{{Para: tc.para, Find: strp(tc.find), Text: tc.text}},
+			EditOptions{TrackChanges: true, Now: testNow},
+		)
+		if err != nil {
+			t.Fatalf("round %d: Edit returned an error: %v", i+1, err)
+		}
+		if !res.Outcomes[0].Applied {
+			t.Fatalf("round %d: tracked edit was refused: %s", i+1, res.Outcomes[0].Reason)
+		}
+	}
+	for _, tc := range targets {
+		if got := paraTextAt(t, d, tc.para); !strings.Contains(got, tc.text) {
+			t.Errorf("paragraph %d = %q, want it to contain %q", tc.para, got, tc.text)
+		}
+	}
+}
+
+// TestEdit_TrackChanges_RunWithSeveralTextNodesIsRefusedPerEditNotBatch is
+// the self-review's most important check: cloneRunWithText refuses a run
+// holding more than one <w:t> (see its doc comment — this is exactly the
+// shape that caused a silent text-loss defect earlier in this package), and
+// that refusal must surface as ONE edit's Reason, never as a whole-batch
+// error that also blocks an unrelated edit in the same call.
+func TestEdit_TrackChanges_RunWithSeveralTextNodesIsRefusedPerEditNotBatch(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>a</w:t><w:t>b</w:t></w:r><w:r><w:t>other</w:t></w:r></w:p>`)
+	para := d.Paras()[0]
+	if len(para.Runs) != 3 {
+		t.Fatalf("test setup: got %d runs, want 3 (two sharing one <w:r>, plus one more)", len(para.Runs))
+	}
+	if para.Runs[0].Elem != para.Runs[1].Elem {
+		t.Fatal("test setup: runs 1 and 2 do not share an Elem; this test would be vacuous")
+	}
+
+	res, err := d.Edit(
+		[]Edit{
+			{Para: 1, Run: 1, Text: "x"}, // shared-Elem run: must be refused
+			{Para: 1, Run: 3, Text: "y"}, // unrelated run: must still succeed
+		},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit returned a whole-batch error instead of a per-edit Reason: %v", err)
+	}
+	if res.Outcomes[0].Applied {
+		t.Error("a tracked edit on a run with several <w:t> children was applied instead of refused")
+	}
+	if res.Outcomes[0].Reason == "" {
+		t.Error("no Reason given for the shared-Elem refusal")
+	}
+	if !strings.Contains(res.Outcomes[0].Reason, "text-holding") && !strings.Contains(res.Outcomes[0].Reason, "tracked change") {
+		t.Errorf("Reason = %q, want it to explain the tracked-change construction failure", res.Outcomes[0].Reason)
+	}
+	if !res.Outcomes[1].Applied {
+		t.Errorf("the unrelated edit was blocked too: %s", res.Outcomes[1].Reason)
+	}
+	if got := paraTextAt(t, d, 1); !strings.Contains(got, "y") {
+		t.Errorf("paragraph 1 = %q, want the unrelated edit's %q to have landed", got, "y")
+	}
+}
+
+// TestEdit_TrackChanges_ParagraphDeleteOnSharedElemIsRefused extends the
+// same shared-Elem refusal to the whole-paragraph delete path
+// (wrapParagraphRunsInDel), a separate code path from the run-target one
+// above.
+func TestEdit_TrackChanges_ParagraphDeleteOnSharedElemIsRefused(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>a</w:t><w:t>b</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Op: "delete"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("Edit returned a whole-batch error instead of a per-edit Reason: %v", err)
+	}
+	if res.Outcomes[0].Applied {
+		t.Error("a tracked whole-paragraph delete on a shared-Elem run was applied instead of refused")
+	}
+	if res.Outcomes[0].Reason == "" {
+		t.Error("no Reason given for the refusal")
+	}
+}
+
+// TestEdit_TrackChanges_CollisionDetectionStillWorksWithLargerPatches is the
+// self-review's collision-detector check: a tracked patch's NewText is much
+// larger than the span it replaces (it now contains <w:del>/<w:ins> markup
+// plus cloned <w:rPr>), but Patch.Content — the span collision detection
+// actually compares — is still the ORIGINAL run.Elem, unchanged in size by
+// TrackChanges. Two finds landing in the SAME run must still collide (only
+// the first lands), and two finds in DIFFERENT runs of the same paragraph
+// must both land, exactly as in untracked mode (see
+// TestEdit_TwoFindsInTheSameRunRefuseOnlyTheLater).
+func TestEdit_TrackChanges_CollisionDetectionStillWorksWithLargerPatches(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>hello world</w:t></w:r><w:r><w:t> second run</w:t></w:r></w:p>`)
+
+	// Same run: must collide, refusing only the later edit.
+	res, err := d.Edit([]Edit{
+		{Para: 1, Find: strp("hello"), Text: "hi"},
+		{Para: 1, Find: strp("world"), Text: "there"},
+	}, EditOptions{TrackChanges: true, Now: testNow})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Errorf("first tracked edit was refused: %s", res.Outcomes[0].Reason)
+	}
+	if res.Outcomes[1].Applied {
+		t.Error("second tracked edit colliding with the first (same run) was applied")
+	}
+	if !strings.Contains(res.Outcomes[1].Reason, "edit 1") {
+		t.Errorf("Reason = %q, want it to name edit 1 as the collision", res.Outcomes[1].Reason)
+	}
+
+	d2 := bodyDoc(t, `<w:p><w:r><w:t>hello world</w:t></w:r><w:r><w:t> second run</w:t></w:r></w:p>`)
+	res2, err := d2.Edit([]Edit{
+		{Para: 1, Find: strp("hello"), Text: "hi"},
+		{Para: 1, Find: strp("second"), Text: "SECOND"},
+	}, EditOptions{TrackChanges: true, Now: testNow})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res2.Outcomes[0].Applied || !res2.Outcomes[1].Applied {
+		t.Errorf("two tracked edits on DIFFERENT runs falsely collided: %+v", res2.Outcomes)
+	}
+	if got := paraTextAt(t, d2, 1); got != "hi world SECOND run" {
+		t.Errorf("paragraph 1 = %q, want %q", got, "hi world SECOND run")
+	}
+}
+
+// TestEdit_TrackChanges_DefaultAuthorIsDeepai pins EditOptions.Author's ""
+// -> "deepai" default reaching all the way through to the written XML.
+func TestEdit_TrackChanges_DefaultAuthorIsDeepai(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>hi</w:t></w:r></w:p>`)
+	res, err := d.Edit(
+		[]Edit{{Para: 1, Text: "bye"}},
+		EditOptions{TrackChanges: true, Now: testNow}, // Author left ""
+	)
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("tracked edit was refused: %s", res.Outcomes[0].Reason)
+	}
+	xml := docXMLOf(t, d)
+	if !strings.Contains(xml, `w:author="deepai"`) {
+		t.Errorf(`document.xml = %s, want w:author="deepai" as the default`, xml)
+	}
+}

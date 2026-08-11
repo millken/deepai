@@ -448,6 +448,8 @@ type docxEditArgs struct {
 	Edits               []docx.Edit
 	Protect             []string
 	ReviewedThroughPara int
+	TrackChanges        bool
+	Author              string
 }
 
 // docxEditOutput is the JSON shape docx_edit returns to the model.
@@ -470,6 +472,23 @@ type docxEditOutput struct {
 	// also empty).
 	BackupCreated       bool `json:"backup_created"`
 	ReviewedThroughPara int  `json:"reviewed_through_para,omitempty"`
+	// TrackChanges echoes whether this batch was written as Word tracked
+	// changes (w:ins/w:del) rather than applied directly. It is always
+	// present, never omitempty: false is exactly as meaningful an answer as
+	// true — a model must be able to read this field and truthfully tell
+	// the user either "the changes are pending your review in Word" or "the
+	// changes were applied directly", never guess from the field's absence.
+	//
+	// This mirrors the request verbatim rather than something pkg/docx
+	// computed post hoc, because "requested" and "took effect" cannot
+	// diverge in the current design: pkg/docx.Document.Edit applies
+	// TrackChanges uniformly to every patch in the batch (see EditOptions.
+	// TrackChanges's doc comment) or refuses the ENTIRE call before
+	// producing any result at all (the hadRevisionsAtOpen gate) — there is
+	// no partial-tracking outcome for this field to distinguish. If
+	// pkg/docx ever grows one (e.g. per-edit tracking), this field must
+	// change to report the actual outcome, not the request.
+	TrackChanges bool `json:"track_changes"`
 }
 
 // docxEditOutcome is the serialized form of one docx.EditOutcome, reporting
@@ -495,8 +514,12 @@ func DocxEditTool() models.Tool {
 		Description: "Edit a .docx in place with byte-faithful, format-preserving patches. Each edit targets a " +
 			"paragraph, optionally narrowed to a run index or a literal find substring, and applies replace " +
 			"(default), insert_before, insert_after, or delete. A refused edit does not block the rest of the " +
-			"batch. Refuses documents that already contain revision marks. Backs up the original file once, " +
-			"before the first overwrite, to <path>.bak. Paragraph styling is out of scope here; use docx_format.",
+			"batch. Pass track_changes to write every edit in the batch as a Word tracked-change revision instead " +
+			"of rewriting text directly. Refuses a document that already contained revision marks when it was " +
+			"opened — accept or reject those in Word first, then reopen. Backs up the original file once, " +
+			"before the first overwrite, to <path>.bak. This tool does not touch fonts, size, spacing, or " +
+			"alignment — for that, including changing just one paragraph's font size, call docx_format with " +
+			"start_para/end_para set to the paragraph range to change.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -524,6 +547,17 @@ func DocxEditTool() models.Tool {
 				"reviewed_through_para": map[string]any{
 					"type":        "number",
 					"description": "Echoed back verbatim. Set this to the end_para of the chunk you just wrote back, so a resumed session (e.g. a fresh subagent picking up after this one ran out of turns) can tell how far this batch reviewed",
+				},
+				"track_changes": map[string]any{
+					"type": "boolean",
+					"description": "When true, every edit in this batch lands as a Word revision (w:ins/w:del) instead of being written " +
+						"directly — the user opens the document in Word and accepts or rejects each change in the review pane; " +
+						"nothing is silently finalized. Defaults to false (direct edit). Refuses, before applying anything, a " +
+						"document that already contained revision marks when it was opened — accept or reject those in Word first.",
+				},
+				"author": map[string]any{
+					"type":        "string",
+					"description": "The reviewer name stamped as w:author on every revision this batch produces. Defaults to \"deepai\" when omitted, empty, or whitespace-only. Ignored when track_changes is false.",
 				},
 			},
 			"required": []any{"path", "edits"},
@@ -553,29 +587,55 @@ type docxFormatOutput struct {
 // that silently did nothing by mistake.
 const docxFormatNoChangeNote = "no formatting changes were applied: either no rules were given, or none of the given rules changed anything in this document"
 
-// DocxFormatTool describes docx_format to the model. It applies
-// document-wide formatting (fonts, size, line spacing, alignment, margins,
-// a named template, and collapsing empty paragraphs) without touching body
-// text otherwise — see pkg/docx.Document.Format's doc comment for the
-// byte-range promise that backs that claim. page_numbers and rebuild_toc
-// are named in the schema but always refused: see DocxFormatHandler's doc
-// comment for why they cannot be silently dropped.
+// DocxFormatTool describes docx_format to the model. Without start_para/
+// end_para it applies document-wide formatting (fonts, size, line spacing,
+// alignment, margins, a named template, and collapsing empty paragraphs) by
+// changing word/styles.xml's defaults; with a range it applies DIRECT
+// formatting (font, size, line spacing, alignment) to only those
+// paragraphs' own <w:rPr>/<w:pPr> in word/document.xml, which is how one
+// paragraph's font size gets changed without touching the rest of the
+// document — see pkg/docx.Document.Format's doc comment for the byte-range
+// promise that backs both paths, and formatDirectRange's for which fields
+// only make sense document-wide and are refused when combined with a range.
+// page_numbers and rebuild_toc are named in the schema but always refused
+// regardless of range: see DocxFormatHandler's doc comment for why they
+// cannot be silently dropped.
 func DocxFormatTool() models.Tool {
 	return models.Tool{
 		Name:         "docx_format",
 		Groups:       []string{"builtin", "document"},
 		ParallelSafe: false,
-		Description: "Apply document-wide formatting to a .docx: a named template (corporate, academic, minimal), " +
-			"heading/body font, body size, line spacing, alignment, margins, and collapsing runs of consecutive " +
-			"empty paragraphs. Never changes body text otherwise. Reports which rules actually changed something " +
-			"in applied, and an empty or no-op rules object says so explicitly rather than looking identical to a " +
-			"real change. page_numbers and rebuild_toc are not supported yet and return an explicit error rather " +
-			"than being silently ignored. Backs up the original file once, before the first overwrite, to " +
-			"<path>.bak.",
+		Description: "Apply formatting to a .docx. Two modes, chosen by whether start_para/end_para is given: " +
+			"(1) WITHOUT a range (the default): changes the document's DEFAULT styles — a named template " +
+			"(corporate, academic, minimal), heading/body font, body size, line spacing, alignment, margins, and " +
+			"collapsing runs of consecutive empty paragraphs. This is document-wide: every paragraph that does " +
+			"not already carry its own direct formatting picks up the new default. (2) WITH start_para/end_para " +
+			"(1-based, inclusive): applies DIRECT formatting — font, size, line spacing, alignment — to only the " +
+			"paragraphs in that range, which overrides the document's default styles for exactly those " +
+			"paragraphs. This is the way to change one paragraph's (or a few paragraphs') font size, font, line " +
+			"spacing, or alignment without reformatting the rest of the document — use this instead of editing " +
+			"the file with a script. template, heading_font, margins_mm, and normalize are document-level " +
+			"concepts and are refused with an explicit error if combined with a range. Never changes body text " +
+			"either way. Reports which rules actually changed something in applied — including how many " +
+			"paragraphs were affected when a range was used — and an empty or no-op rules object says so " +
+			"explicitly rather than looking identical to a real change. page_numbers and rebuild_toc are not " +
+			"supported yet and return an explicit error rather than being silently ignored, with or without a " +
+			"range. Backs up the original file once, before the first overwrite, to <path>.bak.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{"type": "string", "description": "Path to the .docx file"},
+				"start_para": map[string]any{
+					"type": "number",
+					"description": "1-based inclusive first paragraph to apply DIRECT formatting to instead of " +
+						"changing the document's defaults. Get paragraph indices from docx_read. Omit both " +
+						"start_para and end_para to format the whole document instead.",
+				},
+				"end_para": map[string]any{
+					"type": "number",
+					"description": "1-based inclusive last paragraph of the range; defaults to start_para (a " +
+						"single paragraph) when omitted. Requires start_para to also be set.",
+				},
 				"rules": map[string]any{
 					"type":        "object",
 					"description": "Formatting rules to apply. Every field is optional; an empty or omitted object is a no-op.",
@@ -706,7 +766,45 @@ func parseDocxFormatArgs(raw map[string]any) (docxFormatArgs, error) {
 	if err != nil {
 		return docxFormatArgs{}, err
 	}
+
+	// start_para/end_para are top-level, siblings of rules (mirroring
+	// docx_read's own start_para/end_para), because they name a SCOPE for
+	// the rules to land in, not a rule themselves. Type-checked the same
+	// never-coerce way as every other numeric docx_format field (brief's
+	// explicit requirement): a string "2" must be refused outright, not
+	// silently read as 0 — which would turn a one-paragraph request into a
+	// document-wide rewrite with no error at all.
+	startPara, err := docxFormatIntArg(raw, "start_para")
+	if err != nil {
+		return docxFormatArgs{}, err
+	}
+	endPara, err := docxFormatIntArg(raw, "end_para")
+	if err != nil {
+		return docxFormatArgs{}, err
+	}
+	opts.StartPara = startPara
+	opts.EndPara = endPara
+
 	return docxFormatArgs{Path: path, Opts: opts}, nil
+}
+
+// docxFormatIntArg reads key from raw as an int, exactly like
+// docxEditNumberArg's float64/int handling, but with an error message
+// scoped to docx_format. A missing or nil key reports 0, which
+// docx.FormatOptions treats as "not given" for both StartPara and EndPara.
+func docxFormatIntArg(raw map[string]any, key string) (int, error) {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return 0, nil
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), nil
+	case int:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("docx_format: %s must be a number", key)
+	}
 }
 
 // parseDocxFormatRules converts one raw rules object into a
@@ -917,7 +1015,11 @@ func DocxEditHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return result, fmt.Errorf("docx_edit: %w", err)
 	}
 
-	editResult, err := doc.Edit(args.Edits, docx.EditOptions{Protect: args.Protect})
+	editResult, err := doc.Edit(args.Edits, docx.EditOptions{
+		Protect:      args.Protect,
+		TrackChanges: args.TrackChanges,
+		Author:       args.Author,
+	})
 	if err != nil {
 		return result, fmt.Errorf("docx_edit: %w", err)
 	}
@@ -950,6 +1052,7 @@ func DocxEditHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		BackupPath:          backupPath,
 		BackupCreated:       backupCreated,
 		ReviewedThroughPara: args.ReviewedThroughPara,
+		TrackChanges:        args.TrackChanges,
 	}
 	if editResult.ParaCountChanged {
 		out.IndexAdvice = docxIndexAdvice
@@ -1087,11 +1190,46 @@ func parseDocxEditArgs(raw map[string]any) (docxEditArgs, error) {
 		return docxEditArgs{}, err
 	}
 
+	// track_changes/author are type-checked the same never-coerce way as
+	// every other docx_edit argument (finding 4 of the P1c review): a bare
+	// ", ok" assertion would let e.g. track_changes: "true" (a string, not a
+	// bool) silently read as false and apply the edit directly while still
+	// reporting success — exactly the kind of mismatch between what was
+	// requested and what the model tells the user that this feature exists
+	// to prevent.
+	var trackChanges bool
+	if v, present := raw["track_changes"]; present && v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return docxEditArgs{}, fmt.Errorf("docx_edit: track_changes must be a boolean")
+		}
+		trackChanges = b
+	}
+
+	var author string
+	if v, present := raw["author"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docxEditArgs{}, fmt.Errorf("docx_edit: author must be a string")
+		}
+		// Trimmed here, not left for pkg/docx: revisionCtx.attrs only
+		// substitutes its "deepai" default for an EXACT empty string, so a
+		// whitespace-only author ("   ") sent from the tool layer would
+		// otherwise reach Word as a literal blank reviewer name in the
+		// review pane rather than the same "deepai" default an omitted or
+		// ""-valued author gets. Trimming here makes those three inputs
+		// (omitted, "", whitespace-only) converge on one behavior before
+		// EditOptions.Author is ever set.
+		author = strings.TrimSpace(s)
+	}
+
 	return docxEditArgs{
 		Path:                path,
 		Edits:               edits,
 		Protect:             protect,
 		ReviewedThroughPara: reviewedThroughPara,
+		TrackChanges:        trackChanges,
+		Author:              author,
 	}, nil
 }
 

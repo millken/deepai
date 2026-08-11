@@ -189,7 +189,11 @@ InputSchema: {
 | `insert_before` / `insert_after` | **否** | **恒为段落级**：新建一个 `<w:p>` 插在目标段前/后 | **是** |
 | `delete` | 是 | 有 `run`/`find` → 只删该 run / 子串；否则删整个 `<w:p>` | 仅整段删除时是 |
 
-> **`style` 参数已推迟到 P2（2026-08-11 决定）。** 实现它需要 `<w:pStyle>` 元素的字节区间，而扫描层只记录 `Para.Style` 字符串、不记录位置 —— 补上意味着又一轮扫描层改动与审查。更重要的是职责划分：改段落样式属于 §4.3 `docx_format` 的范围，而 §7 的润色系统规则本就要求不改版式。**`docx_edit` 管文本，`docx_format` 管样式**，这条边界更干净。P1c 的工具 schema 不暴露该字段，收到时应显式报错而非静默忽略。
+> **`style` 参数已推迟到 P2（2026-08-11 决定）。** 实现它需要 `<w:pStyle>` 元素的字节区间，而扫描层只记录 `Para.Style` 字符串、不记录位置 —— 补上意味着又一轮扫描层改动与审查。当时给的第二个理由是"改段落样式属于 §4.3 `docx_format` 的范围，`docx_edit` 管文本、`docx_format` 管样式，这条边界更干净"——**这个理由不完整，2026-08-11 用户实测直接撞上了它的漏洞**：那时的 `docx_format` 从设计之初就只做**整篇**（改 `styles.xml` 的默认值），从未有段落范围。于是"改某一段的字体/字号"这个能力**掉在两个工具之间**：`docx_edit` 说不管、`docx_format` 只做整篇——都不对。agent 的推理链每一步都正确，结论却是退回 bash + python-docx。
+>
+> **P2a.5（同日修正）**：`docx_format` 加了 `start_para`/`end_para`（见 §4.3），有范围时改为对目标段落做**直接格式化**（run 的 `<w:rPr>`、段落的 `<w:pPr>`，落在 `document.xml`），不再是"只能整篇"。这补上了"改某一段字体/字号"这条能力，`docx_edit` 的工具描述也不再把模型指向它做不到的地方。
+>
+> 但这**不等于** `style` 参数的能力已经补齐。`style`（按样式名整段套用，如把某段设成 `Heading2`）和"直接格式化某段的字体/字号"是两件不同的事：前者是把段落指向 `styles.xml` 里的一条样式定义（写 `<w:pStyle w:val="Heading2"/>`），后者是在段落/run 自己身上直接写属性（不改它引用哪个样式）。`style` 仍未实现，仍然需要 `<w:pStyle>` 元素的字节区间（扫描层目前只记录 `Para.Style` 字符串，不记录位置），留待后续阶段。P1c/P2a.5 的工具 schema 都不暴露该字段，`docx_edit` 收到 `style` 时仍应显式报错而非静默忽略或误导向 `docx_format`。
 
 `insert_*` 不接受 `run`/`find`，是刻意的：如果允许"在段内某处插入文本"，它与 `replace` 就完全重叠了（`find` 命中处替换成"原文+新文本"即可），徒增歧义。需要段内插入就用 `replace`。
 
@@ -223,26 +227,42 @@ InputSchema: {
 
 ### 4.3 `docx_format` —— 排版 / 套样
 
-这是"排版"的核心。对整篇应用一组排版规则，**不改正文文字**：
+这是"排版"的核心。对文档应用一组排版规则，**不改正文文字**。**P2a.5（2026-08-11）起**分两种模式，由是否给 `start_para` 决定：
 
 ```go
 InputSchema: {
-  "path": string,
+  "path":       string,
+  "start_para": number?,  // 1-based inclusive；给出即切到段落范围的直接格式化
+  "end_para":   number?,  // 1-based inclusive；省略时默认等于 start_para（只改那一段）；给了 end_para 却没给 start_para 报错
   "rules": {
-    "template":     "corporate"|"academic"|"minimal"?,  // 预设模板
-    "heading_font": string?, "body_font": string?,
+    "template":     "corporate"|"academic"|"minimal"?,  // 预设模板；只能整篇，见下
+    "heading_font": string?,                            // 只能整篇，见下
+    "body_font": string?,
     "body_size_pt": number?,  "line_spacing": number?,
-    "align":        "left"|"justify"?,  "margins_mm": [number;4]?,
-    "normalize":    boolean?,  // 合并连续空段、统一标点间距
-    "page_numbers": boolean?,  // Tier 3 / P3，见下
-    "rebuild_toc":  boolean?,  // Tier 3 only，见下
+    "align":        "left"|"justify"?,
+    "margins_mm": [number;4]?,                           // 只能整篇，见下
+    "normalize":    boolean?,  // 合并连续空段、统一标点间距；只能整篇，见下
+    "page_numbers": boolean?,  // Tier 3 / P3，见下——无论是否有范围都直接报错
+    "rebuild_toc":  boolean?,  // Tier 3 only，见下——无论是否有范围都直接报错
   },
 }
 ```
 
-分层落点要分清楚：
+**两种模式的落点差异**（"整篇 vs 段落范围"，`FormatOptions.StartPara`/`EndPara` 的 `docx.Document.Format` 分派）：
 
-- **字体 / 字号 / 行距 / 对齐 / 页边距**：改 `word/styles.xml` 与 `word/document.xml` 的 `<w:sectPr>`，Tier 1 纯 Go 可做。
+| | 不给 `start_para`（整篇，原有行为） | 给了 `start_para`（P2a.5 新增） |
+|---|---|---|
+| 落在 | `word/styles.xml` 的 `docDefaults` | `word/document.xml`：目标段落自己的 `<w:rPr>`/`<w:pPr>` |
+| 字体 / 字号 | 改**文档默认值**（`rPrDefault/rPr` 的 `<w:rFonts>`/`<w:sz>`+`<w:szCs>`） | 每个目标段落**每个 run** 自己的 `<w:rPr><w:rFonts>`/`<w:sz>`+`<w:szCs>`，与已有的粗体/颜色等属性合并而非覆盖 |
+| 行距 / 对齐 | 改**文档默认值**（`pPrDefault/pPr` 的 `<w:spacing>`/`<w:jc>`） | 每个目标段落自己的 `<w:pPr><w:spacing>`/`<w:jc>` |
+| 机制 | 改样式表默认值——只影响没有自己直接格式化的段落 | **直接格式化**，优先级高于样式表——与用户在 Word 里选中文字改字号是同一种效果 |
+| `template`/`heading_font`/`margins_mm`/`normalize` | 支持 | **拒绝**，报错说明原因（模板/页边距是文档级概念；`heading_font` 改的是标题**样式定义**而非某一段） |
+
+给了范围但没给 `end_para` 时默认 `end_para = start_para`（只改这一段）；给了 `end_para` 却没给 `start_para` 是错误（没有范围可言）。`page_numbers`/`rebuild_toc` 无论是否带范围都直接报错——它们本来就不是 `FormatOptions` 的字段，工具层在两种模式下都统一拒绝，不需要额外分支。
+
+其余分层落点仍按原样：
+
+- **字体 / 字号 / 行距 / 对齐 / 页边距（整篇路径）**：改 `word/styles.xml` 与 `word/document.xml` 的 `<w:sectPr>`，Tier 1 纯 Go 可做。
 - **`normalize`**：合并连续空段、统一标点间距是**正文操作**，改的是 `document.xml` 而不是 `styles.xml`。Tier 1 可做（仍走 byte-splice）；有 `soffice` 时可选走 Tier 3 做更彻底的整篇归一。
 - **`page_numbers`**：**Tier 3 / P3**。加页码不是"改一个属性"，而是四处联动：新增 `word/footer1.xml` 条目 + `w:sectPr/w:footerReference` + `[Content_Types].xml` 声明 + `document.xml.rels` 关系项。这既超出 §3.1 的单文件 byte-splice 模型，也要求 zipio 支持**新增条目**（读取侧无冲突——§8 已明确全部条目原样读入保留；但写入侧需要额外设计）。P2 的 `docx_format` 不提供此参数。
 - **`rebuild_toc`**：**Tier 3 only**。TOC 是域（field）+ 缓存的结果文本，重建需要重新分页，纯 Go 做不到；即便有 `soffice` 也要靠宏触发字段更新。无 `soffice` 时该参数直接报错说明不可用，不静默忽略。

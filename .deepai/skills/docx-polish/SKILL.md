@@ -39,6 +39,40 @@ is worse than none.
 Everything below this point describes what happens **inside** the
 `document-editor` subagent (or is what you put in the delegation prompt).
 
+## Step 0a — track_changes is on by default
+
+Every `docx_edit` call this workflow makes should pass `track_changes: true`
+unless the user explicitly asked for direct edits with no review step (e.g.
+"just fix it, don't bother with track changes"). This is the default for
+polishing specifically because polishing is a judgment call, not a
+mechanical correction — the user should see and approve each change in
+Word's review pane rather than discover it after the fact. Pass `author`
+too when you know who the user wants credited for the revisions (it
+defaults to `"deepai"` if you don't).
+
+**The consequence for how you report results**: with `track_changes: true`,
+nothing in the document is actually finalized. Every change is sitting in
+the file as a Word revision (`w:ins`/`w:del`) waiting for the user to accept
+or reject it. Do not tell the user "I've made the changes" or "the document
+has been updated" — say the changes are **pending review** in Word, and
+tell them how to act on them (Review tab → Accept/Reject, one at a time or
+all at once). Saying "applied" when the edits are unaccepted revisions
+misleads the user into thinking there's nothing left to check.
+
+**The gate you may hit, and what it does NOT mean**: `docx_edit` refuses
+outright (before touching anything) if the document already contained
+revision marks *when it was opened* — including your own tracked changes
+from an earlier session that the user hasn't accepted or rejected yet. This
+is not a bug and not this skill malfunctioning. The way forward is to tell
+the user to open the file in Word, accept or reject the existing revisions,
+save, and then retry — not to work around it. **Never respond to this
+refusal by turning `track_changes` off and editing directly**: that would
+silently mix a batch of reviewed-and-decided changes with a new batch the
+user has never seen, in the same file, with no way to tell them apart
+afterward. If the user has good reason to want direct edits at that point,
+that's a decision for them to make explicitly, not one this skill makes for
+them by falling back silently.
+
 ## Step 1 — The three prompt layers
 
 Every polishing pass is governed by three layers, in this order of
@@ -81,15 +115,17 @@ this loop:
    a. `docx_read(path, start_para=..., end_para=..., runs=true)` to get the
       chunk's paragraphs with their run breakdown.
    b. Polish the chunk text according to the three layers above.
-   c. `docx_edit(path, edits=[...], protect=[...], reviewed_through_para=...)`
+   c. `docx_edit(path, edits=[...], protect=[...], track_changes=true, reviewed_through_para=...)`
       **immediately** — write the chunk back before moving on. Pass the
       protect list from Step 1 as `docx_edit`'s `protect` argument on
       *every* call, not just the first — the tool validates it mechanically
       on each batch, and omitting it on a later call silently drops that
-      protection for that chunk. Set `reviewed_through_para` to this
-      chunk's `end_para` so a resumed session (a fresh subagent picking up
-      a batch that ran out of turns) can tell how far the previous batch
-      got.
+      protection for that chunk. Pass `track_changes: true` on every call
+      too, for the same reason (see Step 0a) — it is not a one-time setting
+      that persists across calls, each batch decides for itself. Set
+      `reviewed_through_para` to this chunk's `end_para` so a resumed
+      session (a fresh subagent picking up a batch that ran out of turns)
+      can tell how far the previous batch got.
    d. Continue from the `next_start_para` the read call returned.
 
 **Do not interleave any other tool call between a chunk's read and its
@@ -159,6 +195,16 @@ When the subagent (or delegation chain) finishes, report back to the user:
 - Which paragraphs changed, each with a one-line before/after summary.
 - Any paragraph you deliberately skipped and why (e.g. protect-list
   conflict you couldn't resolve).
+- Whether the changes are pending review or already applied — read this
+  off `docx_edit`'s own `track_changes` field in each response, don't
+  assume from what you intended to pass. If `track_changes` came back
+  `true` (the default per Step 0a), say explicitly that the changes are
+  **pending review in Word**, not applied yet, and how to act on them:
+  open the file, go to the Review tab, and accept or reject each change
+  (or Accept All / Reject All). If it came back `false` — the user asked
+  for direct edits — say the changes were applied directly, with no review
+  step, so the language matches what actually happened rather than what
+  was intended.
 - The backup file path `docx_edit` returned. Check `backup_created` on
   that same response: if `true`, this run just made it and it holds the
   document exactly as it was before this run started — the actual rollback

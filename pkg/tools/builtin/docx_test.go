@@ -1,10 +1,12 @@
 package builtin
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,38 @@ import (
 	"github.com/millken/deepai/pkg/docx"
 	"github.com/millken/deepai/pkg/models"
 )
+
+// readDocumentXML unzips a .docx and returns word/document.xml verbatim, for
+// tests that need to see the raw revision markup (w:ins/w:del/w:author)
+// track_changes produces. decodeRead's JSON view can never show this: pkg/docx's
+// Read deliberately excludes w:delText and folds w:ins content into plain
+// text, since that is what a reader should see, not what a reviewer needs to
+// audit.
+func readDocumentXML(t *testing.T, path string) string {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open %s as zip: %v", path, err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.Name != docx.DocumentPart {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open %s entry: %v", docx.DocumentPart, err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("read %s entry: %v", docx.DocumentPart, err)
+		}
+		return string(data)
+	}
+	t.Fatalf("%s has no %s entry", path, docx.DocumentPart)
+	return ""
+}
 
 // docxFixture copies the pkg/docx outline fixture into a temp dir so tests
 // can edit it freely. The path is relative because pkg/tools/builtin sits
@@ -768,6 +802,182 @@ func TestDocxEdit_PerEditRefusalDoesNotFailTheCall(t *testing.T) {
 	}
 }
 
+// TestDocxEdit_RejectsWrongTypedTrackChangesAndAuthor pins the same
+// never-coerce rule the P1c review established for every other docx_edit
+// argument (finding 4, see TestDocxEdit_RejectsWrongTypedTextAndOp): a
+// wrong-typed track_changes or author must error, not silently discard the
+// value as false/"" while the call still applies edits and reports success.
+func TestDocxEdit_RejectsWrongTypedTrackChangesAndAuthor(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{"track_changes not a bool", map[string]any{
+			"track_changes": "true",
+		}},
+		{"author not a string", map[string]any{
+			"author": float64(1),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			original, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := map[string]any{
+				"path":  p,
+				"edits": []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY"}},
+			}
+			for k, v := range tt.args {
+				args[k] = v
+			}
+			if _, err := callDocxEdit(t, args); err == nil {
+				t.Fatal("a wrong-typed argument returned nil error")
+			}
+			after, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) {
+				t.Error("the rejected call still modified the file on disk")
+			}
+		})
+	}
+}
+
+// TestDocxEdit_TrackChangesDefaultsToFalseAndIsEchoed pins that an ordinary
+// docx_edit call (no track_changes given) behaves as untracked AND reports
+// that truthfully in the result: a model must be able to tell "applied
+// directly" from "pending review" by reading the response, not by assuming
+// from field absence.
+func TestDocxEdit_TrackChangesDefaultsToFalseAndIsEchoed(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxEdit(t, map[string]any{
+		"path":  p,
+		"edits": []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decodeRead(t, res)
+	if v, ok := out["track_changes"]; !ok || v != false {
+		t.Errorf("track_changes = %v (present=%v), want false", v, ok)
+	}
+	xml := readDocumentXML(t, p)
+	if strings.Contains(xml, "<w:ins") || strings.Contains(xml, "<w:del") {
+		t.Error("track_changes defaulted false but the document still contains revision marks")
+	}
+}
+
+// TestDocxEdit_TrackChangesTrueProducesRevisionsAndIsEchoed is this task's
+// core positive case: track_changes: true must both (a) land in the written
+// document as real w:ins/w:del markup stamped with the given author, and (b)
+// come back in the result so the model can truthfully tell the user the
+// change is pending review in Word, not already applied. It also pins §4.2's
+// contract that TrackChanges changes only the produced bytes, never the
+// semantic Before/After fields an untracked edit would report.
+func TestDocxEdit_TrackChangesTrueProducesRevisionsAndIsEchoed(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxEdit(t, map[string]any{
+		"path":          p,
+		"track_changes": true,
+		"author":        "Alice",
+		"edits":         []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decodeRead(t, res)
+	if v, ok := out["track_changes"]; !ok || v != true {
+		t.Errorf("track_changes = %v (present=%v), want true", v, ok)
+	}
+	xml := readDocumentXML(t, p)
+	if !strings.Contains(xml, "<w:ins") || !strings.Contains(xml, "<w:del") {
+		t.Errorf("track_changes:true did not produce w:ins/w:del markup: %s", xml)
+	}
+	if !strings.Contains(xml, `w:author="Alice"`) {
+		t.Errorf("author was not stamped on the revision: %s", xml)
+	}
+	outcomes, ok := out["outcomes"].([]any)
+	if !ok || len(outcomes) == 0 {
+		t.Fatalf("outcomes missing or empty: %v", out["outcomes"])
+	}
+	first := outcomes[0].(map[string]any)
+	if first["before"] != "Body" || first["after"] != "BODY" {
+		t.Errorf("before/after = %v/%v, want Body/BODY unchanged by track_changes", first["before"], first["after"])
+	}
+}
+
+// TestDocxEdit_AuthorEmptyOrWhitespaceDefaultsToDeepai pins the self-review
+// question the brief raises explicitly: an author that is omitted, "", or
+// whitespace-only must all land as the identical "deepai" default in the
+// actual w:author attribute — not as literal whitespace Word would show in
+// its review pane, and not as three different outcomes.
+func TestDocxEdit_AuthorEmptyOrWhitespaceDefaultsToDeepai(t *testing.T) {
+	cases := []struct {
+		name    string
+		author  any
+		present bool
+	}{
+		{"omitted", nil, false},
+		{"empty string", "", true},
+		{"whitespace only", "   ", true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			args := map[string]any{
+				"path":          p,
+				"track_changes": true,
+				"edits":         []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY"}},
+			}
+			if tt.present {
+				args["author"] = tt.author
+			}
+			if _, err := callDocxEdit(t, args); err != nil {
+				t.Fatal(err)
+			}
+			xml := readDocumentXML(t, p)
+			if !strings.Contains(xml, `w:author="deepai"`) {
+				t.Errorf("author %q did not default to deepai: %s", tt.author, xml)
+			}
+		})
+	}
+}
+
+// TestDocxEdit_TrackChangesFalseIsByteIdenticalToOmitted guards the tool
+// layer's own wiring, mirroring pkg/docx's
+// TestEdit_TrackChangesOffIsByteIdenticalToBeforeThisFeature one level up:
+// an explicit track_changes: false must produce byte-identical output to
+// omitting the field entirely, so adding this argument cannot have changed
+// what an existing, unaware caller gets.
+func TestDocxEdit_TrackChangesFalseIsByteIdenticalToOmitted(t *testing.T) {
+	p1 := docxFixture(t, "outline.docx")
+	p2 := docxFixture(t, "outline.docx")
+	edits := []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY"}}
+
+	if _, err := callDocxEdit(t, map[string]any{"path": p1, "edits": edits}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callDocxEdit(t, map[string]any{"path": p2, "track_changes": false, "edits": edits}); err != nil {
+		t.Fatal(err)
+	}
+
+	x1, err := os.ReadFile(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x2, err := os.ReadFile(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(x1, x2) {
+		t.Error("track_changes: false produced different bytes than omitting track_changes entirely")
+	}
+}
+
 // callDocxFormat is docx_format's test-only entry point, mirroring
 // callDocxRead/callDocxEdit.
 func callDocxFormat(t *testing.T, args map[string]any) (models.ToolResult, error) {
@@ -1176,5 +1386,369 @@ func TestDocxFormat_IsInDocumentGroupAndNotParallelSafe(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("docx_format.Groups = %v, want it to contain %q", tool.Groups, "document")
+	}
+}
+
+// zipEntry reads name's raw bytes out of the .docx at path, generalizing
+// readDocumentXML to any zip entry. Range-formatting tests use it to prove
+// word/styles.xml is left byte-identical when a range is given: the P2a.5
+// gap this task closes only makes sense if the range path really lands in
+// word/document.xml (direct formatting) and never touches the stylesheet at
+// all.
+func zipEntry(t *testing.T, path, name string) []byte {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open %s as zip: %v", path, err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.Name != name {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open %s entry: %v", name, err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("read %s entry: %v", name, err)
+		}
+		return data
+	}
+	t.Fatalf("%s has no %s entry", path, name)
+	return nil
+}
+
+// TestDocxFormat_RangeAppliesDirectRunFormattingToOnlyThatParagraph is the
+// tool-layer half of P2a.5: start_para/end_para must reach
+// docx.FormatOptions and take the direct-formatting path (word/document.xml,
+// per-run <w:rPr>), never the whole-document styles.xml path. This is the
+// exact capability the user was blocked on: changing one paragraph's font
+// size without falling back to a script.
+func TestDocxFormat_RangeAppliesDirectRunFormattingToOnlyThatParagraph(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	stylesBefore := zipEntry(t, p, "word/styles.xml")
+
+	res, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(2),
+		"end_para":   float64(2),
+		"rules":      map[string]any{"body_size_pt": float64(14)},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatalf("applied is empty; want an entry reporting the range change (content=%s)", res.Content)
+	}
+	found := false
+	for _, a := range applied {
+		s, _ := a.(string)
+		if strings.Contains(s, "2-2") && strings.Contains(s, "(1 paragraph(s))") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("applied = %v, want an entry naming the range (2-2) and the affected paragraph count (1 paragraph(s))", applied)
+	}
+
+	docXML := readDocumentXML(t, p)
+	if !strings.Contains(docXML, `<w:sz w:val="28"/>`) || !strings.Contains(docXML, `<w:szCs w:val="28"/>`) {
+		t.Errorf("word/document.xml does not contain the direct-formatted size: %s", docXML)
+	}
+
+	stylesAfter := zipEntry(t, p, "word/styles.xml")
+	if !bytes.Equal(stylesBefore, stylesAfter) {
+		t.Error("word/styles.xml changed; a ranged call must land purely in word/document.xml, never the stylesheet")
+	}
+}
+
+// TestDocxFormat_RangeAppliedReportsCountEvenForLargerRanges pins the
+// self-review requirement directly: "applied" must say how many paragraphs
+// were affected, so a caller can tell a one-paragraph change from a
+// document-wide one.
+func TestDocxFormat_RangeAppliedReportsCountEvenForLargerRanges(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(5),
+		"end_para":   float64(8),
+		"rules":      map[string]any{"align": "left"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	found := false
+	for _, a := range applied {
+		s, _ := a.(string)
+		if strings.Contains(s, "5-8") && strings.Contains(s, "(4 paragraph(s))") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("applied = %v, want an entry naming the range (5-8) and 4 paragraph(s)", applied)
+	}
+}
+
+// TestDocxFormat_RangeOmittingEndParaDefaultsToStartPara pins that a
+// caller wanting exactly one paragraph only has to say so once.
+func TestDocxFormat_RangeOmittingEndParaDefaultsToStartPara(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(3),
+		"rules":      map[string]any{"body_font": "Georgia"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	found := false
+	for _, a := range applied {
+		s, _ := a.(string)
+		if strings.Contains(s, "3-3") && strings.Contains(s, "Georgia") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("applied = %v, want an entry naming the single-paragraph range (3-3)", applied)
+	}
+}
+
+// TestDocxFormat_RangeOutOfBoundsIsActionable pins that an out-of-range
+// start_para produces an error naming both the requested value and the
+// document's actual paragraph count, not a generic failure.
+func TestDocxFormat_RangeOutOfBoundsIsActionable(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(9999),
+		"rules":      map[string]any{"body_font": "Georgia"},
+	})
+	if err == nil {
+		t.Fatal("start_para beyond the document's paragraph count was accepted")
+	}
+	if !strings.Contains(err.Error(), "9999") || !strings.Contains(err.Error(), "73") {
+		t.Errorf("error = %q, want it to name both the requested start_para (9999) and the document's actual paragraph count (73)", err)
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("an out-of-range start_para still modified the file on disk")
+	}
+}
+
+// TestDocxFormat_RangeInvertedIsActionable pins that end_para before
+// start_para produces an actionable error rather than silently doing
+// nothing or misinterpreting the range.
+func TestDocxFormat_RangeInvertedIsActionable(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	_, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(5),
+		"end_para":   float64(2),
+		"rules":      map[string]any{"body_font": "Georgia"},
+	})
+	if err == nil {
+		t.Fatal("end_para before start_para was accepted")
+	}
+	if !strings.Contains(err.Error(), "5") || !strings.Contains(err.Error(), "2") {
+		t.Errorf("error = %q, want it to name both start_para (5) and end_para (2)", err)
+	}
+}
+
+// TestDocxFormat_RangeRejectsWrongTypedValues pins the brief's
+// never-coerce requirement for start_para/end_para specifically: a string
+// "2" must be refused outright, never silently read as 0 — which would
+// turn a one-paragraph request into a document-wide rewrite instead of an
+// error, exactly the failure mode the brief calls out by name.
+func TestDocxFormat_RangeRejectsWrongTypedValues(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{"start_para as string", map[string]any{"start_para": "2"}},
+		{"end_para as string", map[string]any{"start_para": float64(2), "end_para": "3"}},
+		{"start_para as bool", map[string]any{"start_para": true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			original, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := map[string]any{"path": p, "rules": map[string]any{"body_font": "Georgia"}}
+			for k, v := range tt.args {
+				args[k] = v
+			}
+			if _, err := callDocxFormat(t, args); err == nil {
+				t.Fatalf("wrong-typed range field %v was accepted", tt.args)
+			}
+			after, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) {
+				t.Error("a rejected wrong-typed range field still modified the file on disk")
+			}
+		})
+	}
+}
+
+// TestDocxFormat_RangeRejectsDocumentWideOnlyRules pins point 4 of the
+// brief: template/heading_font/margins_mm/normalize only make sense
+// document-wide, and pkg/docx already refuses them when combined with a
+// paragraph range (Document.formatDirectRange). This test proves the tool
+// layer surfaces that refusal cleanly rather than swallowing it or
+// duplicating the check with different wording.
+func TestDocxFormat_RangeRejectsDocumentWideOnlyRules(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules map[string]any
+	}{
+		{"template", map[string]any{"template": "academic"}},
+		{"heading_font", map[string]any{"heading_font": "Georgia"}},
+		{"margins_mm", map[string]any{"margins_mm": []any{float64(20), float64(20), float64(20), float64(20)}}},
+		{"normalize", map[string]any{"normalize": true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			original, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = callDocxFormat(t, map[string]any{
+				"path":       p,
+				"start_para": float64(2),
+				"end_para":   float64(2),
+				"rules":      tt.rules,
+			})
+			if err == nil {
+				t.Fatalf("%s combined with a paragraph range was accepted", tt.name)
+			}
+			if !strings.Contains(err.Error(), "range") {
+				t.Errorf("error = %q, want it to explain the rule cannot combine with a paragraph range", err)
+			}
+			after, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) {
+				t.Errorf("%s rejected with a range still modified the file on disk", tt.name)
+			}
+		})
+	}
+}
+
+// TestDocxFormat_RangeRejectsPageNumbersAndRebuildToc pins that the
+// always-unsupported flags stay rejected the same way whether or not a
+// paragraph range is also given — no special-casing needed since pkg/docx
+// never even sees them (FormatOptions has no field for either).
+func TestDocxFormat_RangeRejectsPageNumbersAndRebuildToc(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(2),
+		"end_para":   float64(2),
+		"rules":      map[string]any{"page_numbers": true},
+	}); err == nil {
+		t.Fatal("page_numbers=true combined with a range was accepted")
+	}
+}
+
+// TestDocxFormat_RangeEndParaWithoutStartParaErrors pins pkg/docx's own
+// rule (Document.Format) is surfaced through the tool layer: end_para
+// without start_para has no range to end.
+func TestDocxFormat_RangeEndParaWithoutStartParaErrors(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":     p,
+		"end_para": float64(3),
+		"rules":    map[string]any{"body_font": "Georgia"},
+	}); err == nil {
+		t.Fatal("end_para without start_para was accepted")
+	}
+}
+
+// TestDocxFormat_WithoutRangeRemainsDocumentWide is the regression pin the
+// plan requires: omitting start_para/end_para entirely must still take the
+// whole-document styles.xml path, byte-identical to pre-P2a.5 behavior.
+// This guards against a schema change that accidentally defaults StartPara
+// to a nonzero value.
+func TestDocxFormat_WithoutRangeRemainsDocumentWide(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	docBefore := zipEntry(t, p, docx.DocumentPart)
+
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatal("applied is empty for a document-wide body_font change")
+	}
+
+	docAfter := zipEntry(t, p, docx.DocumentPart)
+	if !bytes.Equal(docBefore, docAfter) {
+		t.Error("a rules-only (no range) call changed word/document.xml; body_font without a range must land only in word/styles.xml")
+	}
+}
+
+// TestDocxEditTool_DescriptionPointsToDocxFormatRange pins Task 2's core
+// fix: docx_edit's description must no longer send a model to a tool that
+// (before P2a.5) could not do the job. It must name docx_format together
+// with start_para/end_para, not the old bare "use docx_format" dead end.
+func TestDocxEditTool_DescriptionPointsToDocxFormatRange(t *testing.T) {
+	d := DocxEditTool().Description
+	if strings.Contains(d, "Paragraph styling is out of scope here; use docx_format.") {
+		t.Fatal("docx_edit still carries the pre-P2a.5 dead-end sentence")
+	}
+	if !strings.Contains(d, "docx_format") {
+		t.Errorf("docx_edit description no longer mentions docx_format at all: %q", d)
+	}
+	if !strings.Contains(d, "start_para") || !strings.Contains(d, "end_para") {
+		t.Errorf("docx_edit description must name start_para/end_para so the pointer to docx_format lands somewhere real: %q", d)
+	}
+}
+
+// TestDocxFormatTool_DescriptionDistinguishesTheTwoModes pins that a model
+// choosing between docx_edit and docx_format to change one paragraph's
+// formatting can tell, from the description alone, that a range exists and
+// what it does differently from the no-range path.
+func TestDocxFormatTool_DescriptionDistinguishesTheTwoModes(t *testing.T) {
+	d := DocxFormatTool().Description
+	if !strings.Contains(d, "start_para") || !strings.Contains(d, "end_para") {
+		t.Errorf("docx_format description does not mention start_para/end_para: %q", d)
+	}
+	if strings.Contains(strings.ToLower(d), "document-wide formatting") && !strings.Contains(d, "start_para") {
+		t.Errorf("docx_format description still reads as document-wide only: %q", d)
+	}
+	// The description must make the without-range/with-range distinction
+	// legible, not just mention the parameter names in passing.
+	lower := strings.ToLower(d)
+	if !strings.Contains(lower, "default") && !strings.Contains(lower, "style") {
+		t.Errorf("docx_format description does not explain that the no-range path changes the document's default styles: %q", d)
+	}
+	if !strings.Contains(lower, "direct formatting") && !strings.Contains(lower, "those paragraphs") && !strings.Contains(lower, "paragraphs only") {
+		t.Errorf("docx_format description does not explain that the range path applies direct, paragraph-scoped formatting: %q", d)
 	}
 }

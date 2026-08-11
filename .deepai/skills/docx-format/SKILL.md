@@ -7,13 +7,13 @@ agent: document-editor
 
 # docx-format
 
-Applies document-wide formatting rules to an existing `.docx` file: a named
-template (`corporate`, `academic`, `minimal`), heading/body font, body size,
-line spacing, alignment, margins, and collapsing runs of consecutive empty
-paragraphs. This workflow never rewrites or rephrases the body text — the
-`docx_format` tool it drives is built so that only its `normalize` rule is
-even allowed to touch paragraph count, and nothing it does ever touches a
-`<w:t>`'s content.
+Applies formatting rules to an existing `.docx` file, either document-wide
+or scoped to a range of paragraphs: a named template (`corporate`,
+`academic`, `minimal`), heading/body font, body size, line spacing,
+alignment, margins, and collapsing runs of consecutive empty paragraphs.
+This workflow never rewrites or rephrases the body text — the `docx_format`
+tool it drives is built so that only its `normalize` rule is even allowed to
+touch paragraph count, and nothing it does ever touches a `<w:t>`'s content.
 
 ## Step 0 — Delegate, don't format directly
 
@@ -47,6 +47,36 @@ headings, whether it already has a heavy custom style, how many blank lines
 it has — before proposing a template or a set of overrides. Formatting a
 document you haven't looked at is how a "corporate template" request ends
 up silently fighting an already-deliberate layout.
+
+## Step 1a — Formatting only certain paragraphs
+
+When the request names a specific paragraph, heading, or short range
+("change paragraph 3's font size", "make this one heading bigger") rather
+than the whole document, do **not** reach for the document-wide path and do
+**not** fall back to bash/Python — `docx_format` supports exactly this:
+
+1. Call `docx_read(path)` (or with `heading`/`start_para`/`end_para`) to get
+   the `para_index` values for the paragraph(s) the user means. You need the
+   real index — guessing from the user's description alone is how the wrong
+   paragraph gets reformatted.
+2. Call `docx_format(path, start_para=<index>, end_para=<index>, rules={...})`.
+   Omitting `end_para` formats exactly the one paragraph named by
+   `start_para`. This applies **direct formatting** to just those
+   paragraphs (font, size, line spacing, alignment) — it overrides the
+   document's default styles for that range only, which is exactly the
+   effect of selecting the text in Word and changing its font size by hand.
+   Everything outside the range is untouched.
+3. `template`, `heading_font`, `margins_mm`, and `normalize` are
+   document-level concepts and cannot be combined with a range —
+   `docx_format` returns an explicit error if you try. Drop the range for
+   those, or drop those rules from a ranged call.
+
+**This is the case the fallback used to happen for, and it is exactly what
+this capability exists to close off.** If you find yourself reasoning "I
+need to change one paragraph's font size, but `docx_format` is
+document-wide" — that reasoning is now out of date. Use `start_para`/
+`end_para`; never write a bash/Python script to patch the XML directly for
+this, no matter how small the change looks.
 
 ## Step 2 — Confirm before a sweeping change
 
@@ -91,7 +121,12 @@ back to the user:
 - The `applied` list from the response, verbatim or lightly rephrased — it
   is the authoritative record of what actually changed. If `applied` came
   back empty, say so plainly (the rules matched nothing to change, or none
-  were given) rather than implying the document was formatted.
+  were given) rather than implying the document was formatted. When you
+  used `start_para`/`end_para`, `applied` names the range and how many
+  paragraphs it actually touched (e.g. "paragraph 3-3 size -> 14pt (1
+  paragraph(s))") — read that count back to the user so they can tell a
+  one-paragraph change from a document-wide one, rather than saying
+  "formatting applied" with no scope.
 - Any `notes` the response carries (e.g. `normalize` being skipped because
   the document already contains revision marks).
 - The `backup_path`, and whether `backup_created` was `true` (this call

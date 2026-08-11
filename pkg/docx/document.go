@@ -20,6 +20,24 @@ type Document struct {
 	// document was opened or since the last successful Save/SaveAs. See
 	// Modified.
 	modified bool
+	// hadRevisionsAtOpen records whether HasRevisions() was already true
+	// the moment OpenDocument finished its FIRST scan, before any Edit call
+	// in this session. rescan() (invoked again after every edit) never
+	// updates this field.
+	//
+	// This exists because HasRevisions() reads the CURRENT paragraph cache,
+	// which a tracked-changes edit itself flips to true via rescan: without
+	// a separate "as of open" bit, a gate built on HasRevisions() would
+	// block the SECOND chunk of a chunked polish from ever landing,
+	// immediately after the first chunk wrote its own w:ins/w:del marks —
+	// even though chunked polishing is the main reason tracked changes
+	// exist. hadRevisionsAtOpen answers the question such a gate actually
+	// needs to ask ("did revisions already exist before this session
+	// touched the document"), which by construction cannot change after
+	// open. HasRevisions() itself keeps its existing meaning (the current
+	// state) unchanged, since read.go and format.go both use it for other
+	// decisions.
+	hadRevisionsAtOpen bool
 }
 
 // OpenDocument opens path as a .docx package, scans its main document part
@@ -35,6 +53,10 @@ func OpenDocument(path string) (*Document, error) {
 	if err := d.rescan(); err != nil {
 		return nil, fmt.Errorf("scan %s: %w", path, err)
 	}
+	// Captured right after the one and only scan OpenDocument itself runs,
+	// before any Edit call in this session has had a chance to add
+	// revisions of its own — see hadRevisionsAtOpen's doc comment.
+	d.hadRevisionsAtOpen = d.HasRevisions()
 	return d, nil
 }
 

@@ -1,6 +1,8 @@
 package docx
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,4 +214,42 @@ func TestFormat_NoOptionsIsANoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEntriesEqual(t, fixture, p, nil)
+}
+
+// TestFormat_NoRangeOutputIsUnchangedByDirectFormatting pins P2a.5's core
+// promise about the EXISTING (whole-document) path: adding paragraph-scoped
+// direct formatting must not change a single byte of what a StartPara==0
+// call produces. The hashes below were captured from this exact Format call
+// against this exact fixture BEFORE format_direct.go existed (see the
+// P2a.5 Task 1 report for how), so a match here is not just "looks the
+// same" — it is the literal pre-task output.
+func TestFormat_NoRangeOutputIsUnchangedByDirectFormatting(t *testing.T) {
+	const (
+		wantStylesSHA256 = "1b218dcd8bd724029e6db98287049cb65fe6e046ade88fd9147567552e0772ce"
+		wantDocSHA256    = "d84400b6456f8f3be5a02edee299c543f191a9aff867d6dbe9598d795b44e5e9"
+		wantStylesLen    = 349141
+		wantDocLen       = 3709
+	)
+	d, _ := formatDoc(t)
+	if _, err := d.Format(FormatOptions{
+		BodyFont: "Georgia", BodySizePt: 13, LineSpacing: 1.5, Align: "justify",
+		HeadingFont: "Georgia", MarginsMM: []float64{25.4, 25.4, 25.4, 25.4}, Normalize: true,
+	}); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	styles := stylesXML(t, d)
+	doc, _ := d.Part(DocumentPart)
+
+	if len(styles) != wantStylesLen {
+		t.Errorf("styles.xml length = %d, want %d (output changed)", len(styles), wantStylesLen)
+	}
+	if len(doc) != wantDocLen {
+		t.Errorf("document.xml length = %d, want %d (output changed)", len(doc), wantDocLen)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(styles))); got != wantStylesSHA256 {
+		t.Errorf("styles.xml sha256 = %s, want %s (no-range output changed byte for byte)", got, wantStylesSHA256)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(doc)); got != wantDocSHA256 {
+		t.Errorf("document.xml sha256 = %s, want %s (no-range output changed byte for byte)", got, wantDocSHA256)
+	}
 }

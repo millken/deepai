@@ -343,6 +343,33 @@ func TestDocEditorSystemPrompt_RoutesFormattingAndForbidsScriptedEditing(t *test
 	}
 }
 
+// TestDocEditorSystemPrompt_DefaultsToTrackChangesAndReportsPendingReview
+// pins P2b Task 3's system-prompt requirement (design §4.2's "润色首选" —
+// track_changes defaults on for polishing once it exists): the profile must
+// tell the model to pass track_changes on docx_edit calls by default, and —
+// just as importantly — to report the result as changes PENDING REVIEW in
+// Word rather than already applied. A model that says "I've made the
+// changes" when they are sitting unaccepted in a review pane has misled the
+// user, so the prompt must forbid that phrasing pattern, not just describe
+// the argument.
+func TestDocEditorSystemPrompt_DefaultsToTrackChangesAndReportsPendingReview(t *testing.T) {
+	cfg, ok := BuiltinAgentTypes[AgentTypeDocEditor]
+	if !ok {
+		t.Fatal("BuiltinAgentTypes[document-editor] is not registered")
+	}
+	prompt := cfg.SystemPrompt
+	lower := strings.ToLower(prompt)
+	if !strings.Contains(lower, "track_changes") {
+		t.Error("document-editor system prompt never mentions track_changes")
+	}
+	if !strings.Contains(lower, "default") {
+		t.Errorf("document-editor system prompt does not say track_changes is the default for polishing: %q", prompt)
+	}
+	if !strings.Contains(lower, "pending review") && !strings.Contains(lower, "review pane") {
+		t.Errorf("document-editor system prompt does not tell the model to report tracked changes as pending review, not applied: %q", prompt)
+	}
+}
+
 func writeAgentYAML(t *testing.T, dir, name, body string) {
 	t.Helper()
 	writeAgentFile(t, dir, name+".yaml", body)

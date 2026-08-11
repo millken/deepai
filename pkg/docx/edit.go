@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -53,6 +54,24 @@ type EditOptions struct {
 	// entries that fail to compile (e.g. "(beta", an unbalanced group)
 	// are matched literally instead — see compileProtect.
 	Protect []string
+	// TrackChanges, when true, makes every planner in this batch emit Word
+	// native tracked-change markup (<w:ins>/<w:del>, plus a paragraph-mark
+	// <w:ins/>/<w:del/> for paragraph-level ops) instead of rewriting
+	// content in place. Turning this on changes ONLY the bytes each
+	// patch contains — Before/After/Warning/Reason/target reported on
+	// EditOutcome are identical to what the same edit would report with
+	// TrackChanges false. See revision.go and the plan's "各 op 的修订形态"
+	// table for the exact shape per op.
+	TrackChanges bool
+	// Author is the w:author value stamped on every revision this batch
+	// produces. "" defaults to "deepai" (applied by revisionCtx.attrs,
+	// not here). Ignored when TrackChanges is false.
+	Author string
+	// Now returns the instant stamped into every w:date attribute this
+	// batch produces. nil defaults to time.Now (applied by newRevisionCtx,
+	// not here). Ignored when TrackChanges is false; tests inject a fixed
+	// clock so tracked-change output bytes are assertable.
+	Now func() time.Time
 }
 
 // EditOutcome reports what happened to one Edit within a batch.
@@ -134,9 +153,16 @@ const (
 // collision pass has run.
 //
 // Edit refuses the entire batch up front, with an error rather than a
-// per-edit Reason, when the document already contains revision marks
-// (HasRevisions): patching text inside or alongside a <w:ins>/<w:del> is
-// P2 scope (design §4.2's P1 revision gate).
+// per-edit Reason, when the document ALREADY contained revision marks
+// (w:ins/w:del) the moment it was opened (d.hadRevisionsAtOpen) — reopening
+// a document that carries its own earlier tracked changes and editing it
+// again is not supported in this phase; see hadRevisionsAtOpen's doc
+// comment. This deliberately does NOT use HasRevisions(): that method
+// reads the CURRENT paragraph cache, which a TrackChanges edit itself
+// flips to true via rescan, and gating on it would block the second chunk
+// of a chunked, tracked-changes polish from ever landing — the main use
+// case TrackChanges exists for. HasRevisions() keeps its existing meaning
+// unchanged for read.go/format.go's own, unrelated uses of it.
 //
 // On success, Edit re-scans the document (rescan) so that Paras() and
 // TotalParas() reflect the new state immediately. If the combined patch
@@ -147,11 +173,26 @@ const (
 // bytes one Save/SaveAs call away from overwriting the user's file on
 // disk.
 func (d *Document) Edit(edits []Edit, opts EditOptions) (EditResult, error) {
-	if d.HasRevisions() {
-		return EditResult{}, fmt.Errorf("docx: refusing to edit a document that already contains revision marks (w:ins/w:del); resolve them first")
+	if d.hadRevisionsAtOpen {
+		return EditResult{}, fmt.Errorf(
+			"docx: this document already contained revision marks (w:ins/w:del) when it was opened; " +
+				"reopening a document that carries your own earlier tracked changes and editing it again " +
+				"is not supported yet in this phase — open the file in Word, accept or reject the existing " +
+				"revisions, save, then reopen it here to continue editing")
 	}
 
 	matchers := compileProtect(opts.Protect)
+	// rc is nil (and stays nil) unless TrackChanges is on; every planner
+	// below treats a nil rc as "plain patch" and a non-nil rc as "build the
+	// tracked-changes shape instead". Building exactly one revisionCtx per
+	// batch — rather than one per edit — is what keeps w:id unique across
+	// every revision this call produces: revisionCtx.nextID only ever
+	// increases (see revision.go), so two edits in the same batch, or two
+	// edits on the same run, never collide.
+	var rc *revisionCtx
+	if opts.TrackChanges {
+		rc = newRevisionCtx(d.doc, opts.Author, opts.Now)
+	}
 	// paras/doc are read directly from the Document's cache rather than via
 	// the deep-copying Paras() accessor: this whole method only reads Run/
 	// Para fields (byte spans, text) to plan patches, never mutates them, so
@@ -175,7 +216,7 @@ func (d *Document) Edit(edits []Edit, opts EditOptions) (EditResult, error) {
 	var candidates []candidate
 
 	for i, e := range edits {
-		plan, before, after, warning, reason, target, ok := planEdit(doc, e, paras, matchers)
+		plan, before, after, warning, reason, target, ok := planEdit(doc, e, paras, matchers, rc)
 		outcomes[i] = EditOutcome{
 			Edit:    e,
 			Applied: ok,
@@ -300,7 +341,7 @@ func normalizeOp(op string) (string, error) {
 // its own precondition holds; it is fixed here purely so refusal messages
 // are deterministic when an edit happens to be invalid in more than one way
 // at once.
-func planEdit(doc []byte, e Edit, paras []Para, matchers []protectMatcher) (patches []Patch, before, after, warning, reason, target string, ok bool) {
+func planEdit(doc []byte, e Edit, paras []Para, matchers []protectMatcher, rc *revisionCtx) (patches []Patch, before, after, warning, reason, target string, ok bool) {
 	op, err := normalizeOp(e.Op)
 	if err != nil {
 		return nil, "", "", "", err.Error(), "", false
@@ -364,16 +405,26 @@ func planEdit(doc []byte, e Edit, paras []Para, matchers []protectMatcher) (patc
 	para := paras[e.Para-1]
 
 	if op == opInsertBefore || op == opInsertAfter {
-		return planInsert(doc, e, op, para, paras, matchers)
+		return planInsert(doc, e, op, para, paras, matchers, rc)
 	}
 	switch {
 	case e.Run != 0:
-		return planRunTarget(doc, e, op, para, matchers)
+		return planRunTarget(doc, e, op, para, matchers, rc)
 	case e.Find != nil:
-		return planFindTarget(doc, e, op, para, matchers)
+		return planFindTarget(doc, e, op, para, matchers, rc)
 	default:
-		return planParagraphTarget(doc, e, op, para, paras, matchers)
+		return planParagraphTarget(doc, e, op, para, paras, matchers, rc)
 	}
+}
+
+// trackChangesReason formats a per-edit refusal reason for a tracked-change
+// construction failure (revision.go's cloneRunWithText/wrapDel/wrapIns/
+// markParagraph), most commonly cloneRunWithText's refusal of a run holding
+// more than one text-holding element — see its doc comment. This turns that
+// error into exactly the kind of per-edit Reason every other refusal in this
+// file produces, rather than letting it escape as a whole-batch error.
+func trackChangesReason(err error) string {
+	return fmt.Sprintf("cannot represent this edit as a tracked change: %v", err)
 }
 
 // planInsert builds the paragraph-level insert_before/insert_after patch.
@@ -398,7 +449,7 @@ func planEdit(doc []byte, e Edit, paras []Para, matchers []protectMatcher) (patc
 // content does not break well-formedness (the check Apply runs whenever any
 // patch is Raw), so a broken document would sail through validation and
 // only fail later, inside Word.
-func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers []protectMatcher) ([]Patch, string, string, string, string, string, bool) {
+func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
 	before := ""
 	after := e.Text
 	target := fmt.Sprintf("an insert %s paragraph %d", strings.TrimPrefix(op, "insert_"), para.Index)
@@ -407,11 +458,20 @@ func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers
 		return nil, before, after, "", protectReason(broken), "", false
 	}
 
-	escaped, err := escapeXMLText(e.Text)
-	if err != nil {
-		return nil, before, after, "", fmt.Sprintf("escape insert text: %v", err), "", false
+	var rawXML string
+	if rc != nil {
+		paraXML, err := trackedInsertParagraph(rc, e.Text)
+		if err != nil {
+			return nil, before, after, "", trackChangesReason(err), "", false
+		}
+		rawXML = paraXML
+	} else {
+		escaped, err := escapeXMLText(e.Text)
+		if err != nil {
+			return nil, before, after, "", fmt.Sprintf("escape insert text: %v", err), "", false
+		}
+		rawXML = `<w:p><w:r><w:t xml:space="preserve">` + string(escaped) + `</w:t></w:r></w:p>`
 	}
-	rawXML := `<w:p><w:r><w:t xml:space="preserve">` + string(escaped) + `</w:t></w:r></w:p>`
 
 	var span Span
 	if op == opInsertBefore {
@@ -423,8 +483,72 @@ func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers
 	return []Patch{patch}, before, after, "", "", target, true
 }
 
+// trackedInsertParagraph builds the tracked-changes shape of a new
+// insert_before/insert_after paragraph: a <w:r> holding text (built with an
+// empty placeholder <w:t> so cloneRunWithText has a text node to replace) is
+// wrapped in <w:ins>, and the paragraph mark itself is flagged inserted via
+// markParagraph — per the plan's OOXML shape notes item 5, without the
+// paragraph-mark flag Word would merge this paragraph into its neighbour
+// once the insertion is accepted.
+func trackedInsertParagraph(rc *revisionCtx, text string) (string, error) {
+	insRun, err := rc.wrapIns([]byte(`<w:r><w:t></w:t></w:r>`), text)
+	if err != nil {
+		return "", err
+	}
+	marked, err := rc.markParagraph([]byte("<w:p>"+string(insRun)+"</w:p>"), true)
+	if err != nil {
+		return "", err
+	}
+	return string(marked), nil
+}
+
+// trackedRunPatch builds the tracked-changes shape for a run/find-scoped
+// replace or delete, splitting run's <w:r> element into up to four pieces —
+// all cloned from the original run so <w:rPr> formatting survives — per the
+// plan's "find 的情形要拆成四段" note: a prefix run holding run.Text[:localStart],
+// a <w:del> holding run.Text[localStart:localEnd] (the "before" text) as
+// delText, optionally (withIns) a <w:ins> holding after, and a suffix run
+// holding run.Text[localEnd:]. No run is emitted for an empty prefix/suffix,
+// and a plain run-level (not find-scoped) call simply passes
+// localStart=0, localEnd=len(run.Text), which makes prefix and suffix both
+// "" and so contributes only the del(+ins).
+func trackedRunPatch(rc *revisionCtx, doc []byte, run Run, localStart, localEnd int, before, after string, withIns bool) (Patch, error) {
+	elemBytes := doc[run.Elem.Start:run.Elem.End]
+	prefix := run.Text[:localStart]
+	suffix := run.Text[localEnd:]
+
+	var out []byte
+	if prefix != "" {
+		p, err := cloneRunWithText(elemBytes, prefix, false)
+		if err != nil {
+			return Patch{}, err
+		}
+		out = append(out, p...)
+	}
+	del, err := rc.wrapDel(elemBytes, before)
+	if err != nil {
+		return Patch{}, err
+	}
+	out = append(out, del...)
+	if withIns {
+		ins, err := rc.wrapIns(elemBytes, after)
+		if err != nil {
+			return Patch{}, err
+		}
+		out = append(out, ins...)
+	}
+	if suffix != "" {
+		s, err := cloneRunWithText(elemBytes, suffix, false)
+		if err != nil {
+			return Patch{}, err
+		}
+		out = append(out, s...)
+	}
+	return PatchRawSpan(doc, run.Elem, string(out)), nil
+}
+
 // planRunTarget handles replace/delete when the edit names a specific Run.
-func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectMatcher) ([]Patch, string, string, string, string, string, bool) {
+func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
 	if e.Run < 1 || e.Run > len(para.Runs) {
 		return nil, "", "", "", fmt.Sprintf(
 			"run %d is out of range: paragraph %d has %d runs", e.Run, para.Index, len(para.Runs)), "", false
@@ -441,7 +565,22 @@ func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectM
 		after := ""
 		warning := deleteWarning(before, matchers)
 		var patch Patch
-		if runElemSharedWithSibling(para.Runs, e.Run-1) {
+		switch {
+		case rc != nil:
+			// Tracked mode always targets the whole <w:r> (run.Elem), via
+			// trackedRunPatch's localStart=0/localEnd=len(before) call
+			// shape: if this run's <w:r> is shared with a sibling Run (see
+			// the non-tracked branch below), that Elem holds more than one
+			// text-holding element, and cloneRunWithText refuses it — see
+			// trackChangesReason — rather than guessing which text node to
+			// wrap, so this can't repeat the C2 silent-text-loss defect
+			// under a different name.
+			p, err := trackedRunPatch(rc, doc, run, 0, len(before), before, "", false)
+			if err != nil {
+				return nil, before, after, "", trackChangesReason(err), "", false
+			}
+			patch = p
+		case runElemSharedWithSibling(para.Runs, e.Run-1):
 			// This run's <w:r> also produced at least one sibling Run
 			// (scan.go: "If a single <w:r> contains multiple <w:t>
 			// children, every run it produces shares the same Elem span"
@@ -453,7 +592,7 @@ func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectM
 			// this run's own <w:t> instead removes only what Before said
 			// it would.
 			patch = PatchRun(doc, run, "")
-		} else {
+		default:
 			patch = PatchRawSpan(doc, run.Elem, "")
 		}
 		return []Patch{patch}, before, after, warning, "", target, true
@@ -463,7 +602,16 @@ func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectM
 	if broken := brokenProtectedItems(before, after, matchers); len(broken) > 0 {
 		return nil, before, after, "", protectReason(broken), "", false
 	}
-	patch := PatchRun(doc, run, e.Text)
+	var patch Patch
+	if rc != nil {
+		p, err := trackedRunPatch(rc, doc, run, 0, len(before), before, after, true)
+		if err != nil {
+			return nil, before, after, "", trackChangesReason(err), "", false
+		}
+		patch = p
+	} else {
+		patch = PatchRun(doc, run, e.Text)
+	}
 	return []Patch{patch}, before, after, "", "", target, true
 }
 
@@ -478,7 +626,7 @@ func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectM
 // is coordinated multi-patch editing left to P2. Saying so explicitly here,
 // rather than silently editing only the first run's portion of the match,
 // is the whole point of "never guess" in §4.2.
-func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protectMatcher) ([]Patch, string, string, string, string, string, bool) {
+func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
 	find := *e.Find // planEdit already refused a nil or explicitly-empty Find before dispatching here.
 	text := outlineParaText(para)
 	count := strings.Count(text, find)
@@ -527,8 +675,17 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 	if op == opDelete {
 		after := ""
 		warning := deleteWarning(before, matchers)
-		newText := run.Text[:localStart] + run.Text[localEnd:]
-		patch := PatchRun(doc, run, newText)
+		var patch Patch
+		if rc != nil {
+			p, err := trackedRunPatch(rc, doc, run, localStart, localEnd, before, "", false)
+			if err != nil {
+				return nil, before, after, "", trackChangesReason(err), "", false
+			}
+			patch = p
+		} else {
+			newText := run.Text[:localStart] + run.Text[localEnd:]
+			patch = PatchRun(doc, run, newText)
+		}
 		return []Patch{patch}, before, after, warning, "", target, true
 	}
 
@@ -536,8 +693,17 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 	if broken := brokenProtectedItems(before, after, matchers); len(broken) > 0 {
 		return nil, before, after, "", protectReason(broken), "", false
 	}
-	newText := run.Text[:localStart] + e.Text + run.Text[localEnd:]
-	patch := PatchRun(doc, run, newText)
+	var patch Patch
+	if rc != nil {
+		p, err := trackedRunPatch(rc, doc, run, localStart, localEnd, before, after, true)
+		if err != nil {
+			return nil, before, after, "", trackChangesReason(err), "", false
+		}
+		patch = p
+	} else {
+		newText := run.Text[:localStart] + e.Text + run.Text[localEnd:]
+		patch = PatchRun(doc, run, newText)
+	}
 	return []Patch{patch}, before, after, "", "", target, true
 }
 
@@ -546,13 +712,30 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 // pre-edit paragraph snapshot the batch was planned against; delete needs it
 // to tell whether para is the only paragraph in its table cell (see the
 // Cell branch below).
-func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para, matchers []protectMatcher) ([]Patch, string, string, string, string, string, bool) {
+func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
 	before := outlineParaText(para)
 	target := fmt.Sprintf("paragraph %d", para.Index)
 
 	if op == opDelete {
 		after := ""
 		warning := deleteWarning(before, matchers)
+		if rc != nil {
+			// Per the plan's "delete（整段）" row, tracked mode never removes
+			// the paragraph itself — its runs are wrapped in <w:del> (text
+			// converted to delText) and the paragraph MARK is flagged
+			// deleted via markParagraph, but the <w:p> stays. That is also
+			// why the table-cell "only paragraph in its cell" carve-out
+			// below (which exists solely because REMOVING the paragraph
+			// could leave an empty, schema-invalid <w:tc>) does not apply
+			// here: nothing is removed, so ParaCountChanged stays false
+			// regardless of table placement.
+			newParaXML, err := trackedParagraphDelete(rc, doc, para)
+			if err != nil {
+				return nil, before, after, "", trackChangesReason(err), "", false
+			}
+			patch := PatchRawSpan(doc, para.Span, newParaXML)
+			return []Patch{patch}, before, after, warning, "", target, true
+		}
 		if para.Cell != nil && isOnlyParaInCell(paras, para) {
 			// A <w:tc> with no <w:p> at all is schema-invalid — Word
 			// treats it as needing repair — even though it is well-formed
@@ -586,6 +769,19 @@ func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para,
 	if first.SelfClosing {
 		return nil, before, after, "", fmt.Sprintf(
 			"paragraph %d's first run is a self-closing <w:t/>; whole-paragraph replace needs a run with a text content model", para.Index), "", false
+	}
+
+	if rc != nil {
+		patches, err := trackedParagraphReplace(rc, doc, para, e.Text)
+		if err != nil {
+			return nil, before, after, "", trackChangesReason(err), "", false
+		}
+		warning := ""
+		if len(para.Runs) > 1 {
+			warning = fmt.Sprintf(
+				"paragraph %d has %d runs; whole-paragraph replace collapsed formatting to the first run's", para.Index, len(para.Runs))
+		}
+		return patches, before, after, warning, "", target, true
 	}
 
 	// Rewrite the first run's content in place (PatchRun), which keeps its
@@ -639,6 +835,106 @@ func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para,
 			"paragraph %d has %d runs; whole-paragraph replace collapsed formatting to the first run's", para.Index, len(para.Runs))
 	}
 	return patches, before, after, warning, "", target, true
+}
+
+// trackedParagraphDelete returns the whole paragraph's replacement XML for a
+// tracked-changes whole-paragraph delete: every run's own <w:r> is wrapped
+// in <w:del> (text converted to delText via wrapParagraphRunsInDel), and the
+// paragraph mark itself is flagged deleted via markParagraph. Per the plan's
+// "delete（整段）" row, the paragraph is never actually removed — accepting
+// every one of these revisions in Word is what removes it — so callers must
+// splice this over the WHOLE para.Span (not drop it), which is exactly why
+// ParaCountChanged stays false for a tracked paragraph delete.
+func trackedParagraphDelete(rc *revisionCtx, doc []byte, para Para) (string, error) {
+	wrapped, err := wrapParagraphRunsInDel(rc, doc, para)
+	if err != nil {
+		return "", err
+	}
+	marked, err := rc.markParagraph(wrapped, false)
+	if err != nil {
+		return "", err
+	}
+	return string(marked), nil
+}
+
+// wrapParagraphRunsInDel returns a copy of para's whole <w:p>...</w:p> bytes
+// with every distinct <w:r> element replaced by a <w:del> wrapping a clone
+// of that run with its text converted to delText. Runs sharing one <w:r>
+// (see scan.go's Elem doc comment) are deduplicated by comparing each run's
+// Elem against only the PREVIOUS run's Elem: Scan always appends runs from
+// the same <w:r> consecutively, so shared-Elem runs are always adjacent in
+// para.Runs (the same assumption anyRunsShareElem relies on), making this a
+// single ascending forward-copy pass — mirroring Apply's own splice loop,
+// but scoped to just this one paragraph's bytes.
+//
+// Any run whose <w:r> holds more than one text-holding element makes
+// wrapDel (via cloneRunWithText) return an error here — this is the same
+// "never guess which text node to keep" refusal every other tracked-change
+// path in this file relies on, surfaced by the caller as a per-edit Reason
+// rather than a whole-batch failure.
+func wrapParagraphRunsInDel(rc *revisionCtx, doc []byte, para Para) ([]byte, error) {
+	out := make([]byte, 0, para.Span.End-para.Span.Start+64)
+	cursor := para.Span.Start
+	seenAny := false
+	var lastElem Span
+	for _, r := range para.Runs {
+		if seenAny && r.Elem == lastElem {
+			continue // already handled as part of the same <w:r>
+		}
+		seenAny = true
+		lastElem = r.Elem
+
+		out = append(out, doc[cursor:r.Elem.Start]...)
+		del, err := rc.wrapDel(doc[r.Elem.Start:r.Elem.End], r.Text)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, del...)
+		cursor = r.Elem.End
+	}
+	out = append(out, doc[cursor:para.Span.End]...)
+	return out, nil
+}
+
+// trackedParagraphReplace returns one raw Patch per distinct <w:r> element in
+// para (deduplicated the same way wrapParagraphRunsInDel is), realizing a
+// tracked whole-paragraph replace: the FIRST run's <w:r> is replaced by
+// <w:del>(its old text)</w:del><w:ins>(newText)</w:ins>, and every other
+// run's <w:r> is replaced by just <w:del>(its old text)</w:del> — mirroring
+// the untracked path's "rewrite the first run in place, clear every other
+// run" collapse (see planParagraphTarget above), so accepting every
+// revision this produces in Word reproduces exactly what the untracked
+// replace would have written directly. Callers must check len(para.Runs) >
+// 0 first (planParagraphTarget already refuses that case before reaching
+// here).
+func trackedParagraphReplace(rc *revisionCtx, doc []byte, para Para, newText string) ([]Patch, error) {
+	firstElem := para.Runs[0].Elem
+	var patches []Patch
+	seenAny := false
+	var lastElem Span
+	for _, r := range para.Runs {
+		if seenAny && r.Elem == lastElem {
+			continue
+		}
+		seenAny = true
+		lastElem = r.Elem
+
+		elemBytes := doc[r.Elem.Start:r.Elem.End]
+		del, err := rc.wrapDel(elemBytes, r.Text)
+		if err != nil {
+			return nil, err
+		}
+		combined := append([]byte{}, del...)
+		if r.Elem == firstElem {
+			ins, err := rc.wrapIns(elemBytes, newText)
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, ins...)
+		}
+		patches = append(patches, PatchRawSpan(doc, r.Elem, string(combined)))
+	}
+	return patches, nil
 }
 
 // runElemSharedWithSibling reports whether para.Runs[idx].Elem equals some
