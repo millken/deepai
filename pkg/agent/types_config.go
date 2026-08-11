@@ -97,7 +97,11 @@ const (
 		"Whenever you have a protect list (numbers, acronyms, names, or house-style terms that must survive " +
 		"unchanged), pass it as docx_edit's protect argument on every edit call, not just the first — it is " +
 		"validated mechanically per call, so omitting it on a later call silently removes that protection for " +
-		"that call's edits. Do not rely on self-policing a protect list you are not also passing to the tool."
+		"that call's edits. Do not rely on self-policing a protect list you are not also passing to the tool.\n\n" +
+		"Formatting (fonts, size, line spacing, alignment, margins, templates, collapsing empty paragraphs) goes " +
+		"through docx_format, not docx_edit. Never edit a .docx by writing or running a Python (or any other) " +
+		"script through bash — that path bypasses the backup, the protect list, and the audit trail this profile " +
+		"depends on, even if the resulting file happens to open fine."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
@@ -244,7 +248,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Name:         "Document Editor",
 		Description:  "Profile for .docx polishing and summarization: structured read, format-preserving edit, and protected-term validation.",
 		SystemPrompt: docEditorSystemPrompt,
-		DefaultTools: []string{"docx_read", "docx_edit", "read_file", "write_file", "ask_clarification"},
+		DefaultTools: []string{"docx_read", "docx_edit", "docx_format", "read_file", "write_file", "ask_clarification"},
 		// MaxTurns must be explicit and non-zero: subagent.go's safety floor
 		// treats <= 0 as "unset" and coerces it to 15, which only covers
 		// four or five 2-3-turn polishing chunks (design §5.8). 30 covers

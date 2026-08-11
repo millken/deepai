@@ -309,7 +309,7 @@ func TestBuiltinAgentTypes_DocumentEditorProfile(t *testing.T) {
 	if cfg.MaxTurns != 30 {
 		t.Fatalf("document-editor MaxTurns = %d, want 30 (0 would be floored to 15 by the subagent safety net)", cfg.MaxTurns)
 	}
-	want := map[string]bool{"docx_read": false, "docx_edit": false}
+	want := map[string]bool{"docx_read": false, "docx_edit": false, "docx_format": false}
 	for _, name := range cfg.DefaultTools {
 		if _, ok := want[name]; ok {
 			want[name] = true
@@ -319,6 +319,27 @@ func TestBuiltinAgentTypes_DocumentEditorProfile(t *testing.T) {
 		if !found {
 			t.Errorf("document-editor DefaultTools = %v, missing %q", cfg.DefaultTools, name)
 		}
+	}
+}
+
+// TestDocEditorSystemPrompt_RoutesFormattingAndForbidsScriptedEditing pins
+// the P2a Task 2 brief's system-prompt requirement directly: the model must
+// be told formatting goes through docx_format, and must be told never to
+// edit a .docx via a Python (or other) script run through bash — that path
+// skips the backup, the protect list, and the audit trail this profile
+// exists to guarantee.
+func TestDocEditorSystemPrompt_RoutesFormattingAndForbidsScriptedEditing(t *testing.T) {
+	cfg, ok := BuiltinAgentTypes[AgentTypeDocEditor]
+	if !ok {
+		t.Fatal("BuiltinAgentTypes[document-editor] is not registered")
+	}
+	prompt := cfg.SystemPrompt
+	if !strings.Contains(prompt, "docx_format") {
+		t.Error("document-editor system prompt never mentions docx_format")
+	}
+	lower := strings.ToLower(prompt)
+	if !strings.Contains(lower, "python") || !strings.Contains(lower, "bash") {
+		t.Errorf("document-editor system prompt does not warn against editing .docx via a script through bash: %q", prompt)
 	}
 }
 

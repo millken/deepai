@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -531,9 +532,368 @@ func DocxEditTool() models.Tool {
 	}
 }
 
+// docxFormatOutput is the JSON shape docx_format returns to the model.
+type docxFormatOutput struct {
+	// Applied is always present, even when empty, so an empty rules object
+	// (or one whose fields matched nothing to change) is reported the same
+	// explicit way a real change is: as data the model can read, not as a
+	// response shape it has to infer "nothing happened" from.
+	Applied []string `json:"applied"`
+	Notes   []string `json:"notes,omitempty"`
+	// BackupPath/BackupCreated mirror docxEditOutput's fields exactly (see
+	// its doc comment): BackupPath alone can't distinguish a backup this
+	// call just created from one an earlier call already made.
+	BackupPath    string `json:"backup_path,omitempty"`
+	BackupCreated bool   `json:"backup_created"`
+}
+
+// docxFormatNoChangeNote is appended to docxFormatOutput.Notes whenever
+// Applied comes back empty, so an empty rules object (or one whose fields
+// all matched nothing to change) is never indistinguishable from a call
+// that silently did nothing by mistake.
+const docxFormatNoChangeNote = "no formatting changes were applied: either no rules were given, or none of the given rules changed anything in this document"
+
+// DocxFormatTool describes docx_format to the model. It applies
+// document-wide formatting (fonts, size, line spacing, alignment, margins,
+// a named template, and collapsing empty paragraphs) without touching body
+// text otherwise — see pkg/docx.Document.Format's doc comment for the
+// byte-range promise that backs that claim. page_numbers and rebuild_toc
+// are named in the schema but always refused: see DocxFormatHandler's doc
+// comment for why they cannot be silently dropped.
+func DocxFormatTool() models.Tool {
+	return models.Tool{
+		Name:         "docx_format",
+		Groups:       []string{"builtin", "document"},
+		ParallelSafe: false,
+		Description: "Apply document-wide formatting to a .docx: a named template (corporate, academic, minimal), " +
+			"heading/body font, body size, line spacing, alignment, margins, and collapsing runs of consecutive " +
+			"empty paragraphs. Never changes body text otherwise. Reports which rules actually changed something " +
+			"in applied, and an empty or no-op rules object says so explicitly rather than looking identical to a " +
+			"real change. page_numbers and rebuild_toc are not supported yet and return an explicit error rather " +
+			"than being silently ignored. Backs up the original file once, before the first overwrite, to " +
+			"<path>.bak.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Path to the .docx file"},
+				"rules": map[string]any{
+					"type":        "object",
+					"description": "Formatting rules to apply. Every field is optional; an empty or omitted object is a no-op.",
+					"properties": map[string]any{
+						"template":     map[string]any{"type": "string", "description": "Named preset: corporate, academic, or minimal. Explicit fields below override the preset's values."},
+						"heading_font": map[string]any{"type": "string", "description": "Replaces Heading1-9's font"},
+						"body_font":    map[string]any{"type": "string", "description": "Replaces the document's default font"},
+						"body_size_pt": map[string]any{"type": "number", "description": "Replaces the document's default font size, in points"},
+						"line_spacing": map[string]any{"type": "number", "description": "Line spacing as a multiple of a single line (1.0, 1.15, 2.0, ...)"},
+						"align":        map[string]any{"type": "string", "description": "left or justify"},
+						"margins_mm": map[string]any{
+							"type":        "array",
+							"items":       map[string]any{"type": "number"},
+							"description": "Exactly 4 positive values in millimeters: top, right, bottom, left",
+						},
+						"normalize":    map[string]any{"type": "boolean", "description": "Collapse runs of two or more consecutive empty paragraphs down to one"},
+						"page_numbers": map[string]any{"type": "boolean", "description": "Not supported yet; setting this true returns an error instead of being ignored"},
+						"rebuild_toc":  map[string]any{"type": "boolean", "description": "Not supported yet; setting this true returns an error instead of being ignored"},
+					},
+				},
+			},
+			"required": []any{"path"},
+		},
+		Handler: DocxFormatHandler,
+	}
+}
+
+// DocxFormatHandler parses docx_format's arguments, delegates all
+// formatting semantics to pkg/docx.Document.Format, and owns the three
+// responsibilities pkg/docx deliberately leaves to the tool layer: backing
+// up the file once before the first overwrite (reusing backupDocxOnce),
+// refusing page_numbers/rebuild_toc outright rather than dropping them
+// (design §4.3: both need a multi-part write pkg/docx does not support
+// yet — page numbers need a new word/footerN.xml entry plus
+// sectPr/footerReference plus a [Content_Types].xml declaration plus a
+// rels entry, and TOC rebuilding needs LibreOffice-driven repagination),
+// and surfacing FormatResult.Applied/Notes so a caller can tell an empty or
+// no-op rules object apart from one that actually changed the document.
+func DocxFormatHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	result := models.ToolResult{CallID: call.ID, ToolName: call.Name}
+
+	args, err := parseDocxFormatArgs(call.Arguments)
+	if err != nil {
+		return result, err
+	}
+
+	resolved := resolveWritablePath(ctx, args.Path)
+	doc, err := docx.OpenDocument(resolved)
+	if err != nil {
+		return result, fmt.Errorf("docx_format: %w", err)
+	}
+
+	formatResult, err := doc.Format(args.Opts)
+	if err != nil {
+		return result, fmt.Errorf("docx_format: %w", err)
+	}
+
+	// Only a call that actually changed something reaches disk, the same
+	// gate docx_edit uses: an empty (or fully no-op) rules object leaves
+	// doc.Modified() false, so nothing is written and no backup is made.
+	// The backup is written BEFORE Save for the same reason docx_edit's is:
+	// if Save then fails partway, the pristine original is already safely
+	// copied aside.
+	var backupPath string
+	var backupCreated bool
+	if doc.Modified() {
+		backupPath, backupCreated, err = backupDocxOnce(resolved)
+		if err != nil {
+			return result, fmt.Errorf("docx_format: back up %s before saving: %w", resolved, err)
+		}
+		if err := doc.Save(); err != nil {
+			return result, fmt.Errorf("docx_format: save %s: %w", resolved, err)
+		}
+	}
+
+	out := docxFormatOutput{
+		Applied:       formatResult.Applied,
+		Notes:         formatResult.Notes,
+		BackupPath:    backupPath,
+		BackupCreated: backupCreated,
+	}
+	if out.Applied == nil {
+		out.Applied = []string{}
+	}
+	if len(out.Applied) == 0 {
+		out.Notes = append(out.Notes, docxFormatNoChangeNote)
+	}
+
+	payload, err := json.Marshal(out)
+	if err != nil {
+		return result, fmt.Errorf("docx_format: marshal result: %w", err)
+	}
+	result.Status = models.CallStatusCompleted
+	result.Content = string(payload)
+	return result, nil
+}
+
+// docxFormatArgs is docx_format's parsed arguments.
+type docxFormatArgs struct {
+	Path string
+	Opts docx.FormatOptions
+}
+
+// parseDocxFormatArgs extracts docxFormatArgs from the raw JSON arguments
+// map. Like parseDocxEditArgs, it only converts and type-checks: every
+// domain rule pkg/docx has an opinion on (unknown template name, alignment
+// value) is left for Document.Format to enforce. The one rule enforced
+// here that pkg/docx has no visibility into at all is page_numbers/
+// rebuild_toc, since FormatOptions has no fields for them at all — see
+// DocxFormatHandler's doc comment.
+func parseDocxFormatArgs(raw map[string]any) (docxFormatArgs, error) {
+	path, _ := raw["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return docxFormatArgs{}, fmt.Errorf("docx_format: path is required")
+	}
+
+	var rules map[string]any
+	if v, present := raw["rules"]; present && v != nil {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return docxFormatArgs{}, fmt.Errorf("docx_format: rules must be an object")
+		}
+		rules = m
+	}
+
+	opts, err := parseDocxFormatRules(rules)
+	if err != nil {
+		return docxFormatArgs{}, err
+	}
+	return docxFormatArgs{Path: path, Opts: opts}, nil
+}
+
+// parseDocxFormatRules converts one raw rules object into a
+// docx.FormatOptions, type-checking every field the same way
+// parseDocxEditItem already does for docx_edit (finding 4 of the P1c
+// review: a bare type assertion silently coerces a wrong-typed value to
+// its zero value instead of erroring, which for a formatting call would
+// mean e.g. body_size_pt sent as "big" silently becoming 0 — "leave the
+// size alone" — while the call still reports success).
+//
+// page_numbers and rebuild_toc are checked and refused here, before
+// anything is applied: design §4.3 requires an explicit error, not a
+// silently dropped parameter, and refusing before Format is called means a
+// batch that also asked for legitimate changes (e.g. body_font) never
+// applies any of them either — the caller gets one unambiguous outcome
+// (an error identical to what would happen alone) rather than a partial
+// apply it would have to reconcile against what it asked for.
+func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
+	var opts docx.FormatOptions
+	if raw == nil {
+		return opts, nil
+	}
+
+	if v, present := raw["template"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.template must be a string")
+		}
+		opts.Template = s
+	}
+	if v, present := raw["heading_font"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.heading_font must be a string")
+		}
+		opts.HeadingFont = s
+	}
+	if v, present := raw["body_font"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.body_font must be a string")
+		}
+		opts.BodyFont = s
+	}
+	if v, present := raw["align"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.align must be a string")
+		}
+		opts.Align = s
+	}
+	if v, present := raw["normalize"]; present && v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.normalize must be a boolean")
+		}
+		opts.Normalize = b
+	}
+
+	bodySize, err := docxFormatNumberArg(raw, "body_size_pt")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.BodySizePt = bodySize
+
+	lineSpacing, err := docxFormatNumberArg(raw, "line_spacing")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.LineSpacing = lineSpacing
+
+	if err := requireNotRequested(raw, "page_numbers",
+		"docx_format: page_numbers is not supported yet — adding page numbers requires a new word/footerN.xml "+
+			"part plus a <w:sectPr><w:footerReference>, a [Content_Types].xml declaration, and a document.xml.rels "+
+			"entry, none of which this tool can create; that needs LibreOffice-backed support planned for a later "+
+			"phase. Tell the user page numbers were not added rather than working around this."); err != nil {
+		return docx.FormatOptions{}, err
+	}
+	if err := requireNotRequested(raw, "rebuild_toc",
+		"docx_format: rebuild_toc is not supported yet — a table of contents is a field with a cached result "+
+			"that can only be refreshed by repaginating the document, which needs LibreOffice; that is planned for "+
+			"a later phase. Tell the user the TOC was not rebuilt rather than working around this."); err != nil {
+		return docx.FormatOptions{}, err
+	}
+
+	if v, present := raw["margins_mm"]; present && v != nil {
+		mm, err := parseDocxFormatMarginsMM(v)
+		if err != nil {
+			return docx.FormatOptions{}, err
+		}
+		opts.MarginsMM = mm
+	}
+
+	return opts, nil
+}
+
+// requireNotRequested checks a boolean rules field that has no
+// corresponding docx.FormatOptions field at all (page_numbers, rebuild_toc):
+// it type-checks the raw value the same as every other field, then errors
+// with msg if and only if the caller actually asked for it (true). A field
+// that is absent, nil, or explicitly false is not a request for the
+// feature — refusing those too would make a caller that always sends the
+// full rules shape (with unwanted features set to false) unable to use
+// docx_format at all.
+func requireNotRequested(raw map[string]any, key, msg string) error {
+	v, present := raw[key]
+	if !present || v == nil {
+		return nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return fmt.Errorf("docx_format: rules.%s must be a boolean", key)
+	}
+	if b {
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// parseDocxFormatMarginsMM converts a raw JSON value into the []float64
+// pkg/docx.FormatOptions.MarginsMM wants. Per-element type-checking is this
+// layer's load-bearing job: pkg/docx never sees the raw JSON array, only a
+// Go []float64, so a smuggled non-numeric element (e.g. a string in the
+// array) has to be caught here or it never gets caught at all. The length
+// and positivity checks below are deliberately redundant with pkg/docx's
+// own validateMargins (Document.Format calls it before touching any part,
+// so a bad length/sign would be refused there too, just wrapped as
+// "docx_format: docx: ..."): keeping them here as well fails fast, before
+// even opening the document, with a cleaner single-source error message.
+
+func parseDocxFormatMarginsMM(v any) ([]float64, error) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("docx_format: rules.margins_mm must be an array")
+	}
+	if len(arr) != 4 {
+		return nil, fmt.Errorf(
+			"docx_format: rules.margins_mm must have exactly 4 values (top, right, bottom, left); got %d", len(arr))
+	}
+	mm := make([]float64, 4)
+	for i, e := range arr {
+		f, ok := docxAsFloat(e)
+		if !ok {
+			return nil, fmt.Errorf("docx_format: rules.margins_mm[%d] must be a number", i)
+		}
+		if f <= 0 {
+			return nil, fmt.Errorf("docx_format: rules.margins_mm[%d] = %g must be positive", i, f)
+		}
+		mm[i] = f
+	}
+	return mm, nil
+}
+
+// docxAsFloat converts a decoded JSON number (float64) or a Go-literal int
+// (as tests construct arguments with) to float64. Any other type is
+// reported as not-a-number rather than defaulting to 0, the same
+// never-coerce rule docxIntArg/docxEditNumberArg already follow for
+// integer fields.
+func docxAsFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
+// docxFormatNumberArg reads key from raw as a float64 via docxAsFloat. A
+// missing or nil key reports 0, which docx.FormatOptions treats as "not
+// given" for every numeric field it has.
+func docxFormatNumberArg(raw map[string]any, key string) (float64, error) {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return 0, nil
+	}
+	f, ok := docxAsFloat(v)
+	if !ok {
+		return 0, fmt.Errorf("docx_format: rules.%s must be a number", key)
+	}
+	return f, nil
+}
+
 // DocxTools returns every docx tool.
 func DocxTools() []models.Tool {
-	return []models.Tool{DocxReadTool(), DocxEditTool()}
+	return []models.Tool{DocxReadTool(), DocxEditTool(), DocxFormatTool()}
 }
 
 // DocxEditHandler parses docx_edit's arguments, delegates all editing

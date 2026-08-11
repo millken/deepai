@@ -767,3 +767,414 @@ func TestDocxEdit_PerEditRefusalDoesNotFailTheCall(t *testing.T) {
 		t.Errorf("applied = %v, want 1", out["applied"])
 	}
 }
+
+// callDocxFormat is docx_format's test-only entry point, mirroring
+// callDocxRead/callDocxEdit.
+func callDocxFormat(t *testing.T, args map[string]any) (models.ToolResult, error) {
+	t.Helper()
+	return DocxFormatHandler(context.Background(), models.ToolCall{
+		ID: "f1", Name: "docx_format", Arguments: args,
+	})
+}
+
+func TestDocxFormat_RequiresPath(t *testing.T) {
+	if _, err := callDocxFormat(t, map[string]any{}); err == nil {
+		t.Fatal("missing path returned nil error")
+	}
+}
+
+// TestDocxFormat_EmptyRulesIsANoOpWithClearNote pins the task brief's
+// self-review question directly: an empty rules object must be
+// distinguishable from a call that actually changed something, not a
+// silent no-op that looks identical to success. It must also not write the
+// file or create a backup, since pkg/docx's Document.Modified() stays false
+// when nothing was requested.
+func TestDocxFormat_EmptyRulesIsANoOpWithClearNote(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := callDocxFormat(t, map[string]any{"path": p, "rules": map[string]any{}})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+
+	applied, ok := out["applied"].([]any)
+	if !ok {
+		t.Fatalf("applied is not an array: %v (content=%s)", out["applied"], res.Content)
+	}
+	if len(applied) != 0 {
+		t.Errorf("applied = %v, want empty for an empty rules object", applied)
+	}
+	notes, _ := out["notes"].([]any)
+	if len(notes) == 0 {
+		t.Error("notes is empty; the caller cannot tell an empty rules object did nothing versus a real no-op bug")
+	}
+	if out["backup_path"] != nil && out["backup_path"] != "" {
+		t.Errorf("backup_path = %v, want empty; nothing was modified so no backup should be made", out["backup_path"])
+	}
+	if out["backup_created"] != false {
+		t.Errorf("backup_created = %v, want false", out["backup_created"])
+	}
+
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("an empty rules object modified the file on disk")
+	}
+	if _, err := os.Stat(p + ".bak"); !os.IsNotExist(err) {
+		t.Error("an empty rules object created a backup file")
+	}
+}
+
+// TestDocxFormat_RulesKeyIsOptional pins that omitting "rules" entirely
+// behaves exactly like passing rules={} — both mean "nothing requested",
+// not an error.
+func TestDocxFormat_RulesKeyIsOptional(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{"path": p})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler with no rules key: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) != 0 {
+		t.Errorf("applied = %v, want empty when rules is omitted entirely", applied)
+	}
+}
+
+// TestDocxFormat_AppliesBodyFontAndReportsApplied pins the "report what
+// changed" responsibility: the tool must surface pkg/docx's Applied list,
+// not just report success.
+func TestDocxFormat_AppliesBodyFontAndReportsApplied(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatalf("applied is empty; want it to report the body font change (content=%s)", res.Content)
+	}
+	found := false
+	for _, a := range applied {
+		if s, ok := a.(string); ok && strings.Contains(s, "Georgia") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("applied = %v, want an entry mentioning Georgia", applied)
+	}
+	if out["backup_created"] != true {
+		t.Errorf("backup_created = %v, want true on the first modifying call", out["backup_created"])
+	}
+	if out["backup_path"] == nil || out["backup_path"] == "" {
+		t.Error("backup_path is empty after a modifying call")
+	}
+}
+
+// TestDocxFormat_TemplateAppliesPreset exercises the "template" rule
+// end to end through the tool layer, not just pkg/docx directly.
+func TestDocxFormat_TemplateAppliesPreset(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"template": "academic"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatal("applied is empty for the academic template")
+	}
+}
+
+// TestDocxFormat_UnknownTemplateErrors pins that an unknown template name
+// is reported, not silently ignored, and does not touch the file.
+func TestDocxFormat_UnknownTemplateErrors(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"template": "fancy"},
+	}); err == nil {
+		t.Fatal("an unknown template name was accepted")
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("a rejected template still modified the file on disk")
+	}
+}
+
+// TestDocxFormat_BacksUpOnceBeforeTheFirstOverwrite mirrors
+// TestDocxEdit_BacksUpOnceBeforeTheFirstOverwrite: the backup must hold the
+// pristine original for the lifetime of a multi-call formatting run, not
+// get refreshed by a later call.
+func TestDocxFormat_BacksUpOnceBeforeTheFirstOverwrite(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	format := func(font string) {
+		t.Helper()
+		if _, err := callDocxFormat(t, map[string]any{
+			"path":  p,
+			"rules": map[string]any{"body_font": font},
+		}); err != nil {
+			t.Fatalf("format %q: %v", font, err)
+		}
+	}
+	format("Georgia")
+	backup := p + ".bak"
+	first, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("no backup after the first format call: %v", err)
+	}
+	if !bytes.Equal(first, original) {
+		t.Error("the backup is not the pristine original")
+	}
+
+	format("Verdana")
+	second, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(second, original) {
+		t.Error("the second format call refreshed the backup; it must be written once")
+	}
+}
+
+// TestDocxFormat_ReportsBackupCreated mirrors TestDocxEdit_ReportsBackupCreated.
+func TestDocxFormat_ReportsBackupCreated(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	format := func(font string) map[string]any {
+		t.Helper()
+		res, err := callDocxFormat(t, map[string]any{
+			"path":  p,
+			"rules": map[string]any{"body_font": font},
+		})
+		if err != nil {
+			t.Fatalf("format %q: %v", font, err)
+		}
+		return decodeRead(t, res)
+	}
+
+	first := format("Georgia")
+	if first["backup_created"] != true {
+		t.Errorf("backup_created = %v on the first backup-creating call, want true", first["backup_created"])
+	}
+	second := format("Verdana")
+	if second["backup_created"] != false {
+		t.Errorf("backup_created = %v on the second call, want false (the backup already existed)", second["backup_created"])
+	}
+	if second["backup_path"] != first["backup_path"] {
+		t.Errorf("backup_path changed between calls: %v vs %v", first["backup_path"], second["backup_path"])
+	}
+}
+
+// TestDocxFormat_PageNumbersErrorsExplicitly pins design §4.3's requirement
+// directly: page_numbers is Tier 3/P3 (needs a new footer part, a
+// sectPr/footerReference, a Content_Types entry, and a rels entry — none of
+// which this tool can create), and requesting it must return an explicit
+// error, never be silently dropped while the rest of the rules apply.
+func TestDocxFormat_PageNumbersErrorsExplicitly(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia", "page_numbers": true},
+	})
+	if err == nil {
+		t.Fatal("page_numbers=true was accepted; want an explicit error")
+	}
+	if !strings.Contains(err.Error(), "page_numbers") {
+		t.Errorf("error = %q, want it to name page_numbers", err)
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("a call that errors on page_numbers must not apply any of the other rules in the same batch either")
+	}
+}
+
+// TestDocxFormat_RebuildTocErrorsExplicitly is rebuild_toc's half of the
+// same requirement.
+func TestDocxFormat_RebuildTocErrorsExplicitly(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	original, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"rebuild_toc": true},
+	})
+	if err == nil {
+		t.Fatal("rebuild_toc=true was accepted; want an explicit error")
+	}
+	if !strings.Contains(err.Error(), "rebuild_toc") {
+		t.Errorf("error = %q, want it to name rebuild_toc", err)
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("a rejected rebuild_toc request still modified the file on disk")
+	}
+}
+
+// TestDocxFormat_PageNumbersFalseIsNotAnError pins the other side: a
+// caller that explicitly sends page_numbers=false (meaning "not requested")
+// must not be refused just for naming the field.
+func TestDocxFormat_PageNumbersFalseIsNotAnError(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia", "page_numbers": false, "rebuild_toc": false},
+	}); err != nil {
+		t.Fatalf("page_numbers/rebuild_toc explicitly false must not error: %v", err)
+	}
+}
+
+// TestDocxFormat_RejectsWrongTypedFields pins the brief's "type-checked,
+// never coerced" requirement for every field in rules, following the same
+// pattern as TestDocxEdit_RejectsWrongTypedTextAndOp: a wrong-typed value
+// must be refused with an error, never silently coerced to a zero value
+// that then reports success.
+func TestDocxFormat_RejectsWrongTypedFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules map[string]any
+	}{
+		{"template not a string", map[string]any{"template": float64(1)}},
+		{"heading_font not a string", map[string]any{"heading_font": float64(1)}},
+		{"body_font not a string", map[string]any{"body_font": float64(1)}},
+		{"body_size_pt not a number", map[string]any{"body_size_pt": "big"}},
+		{"line_spacing not a number", map[string]any{"line_spacing": "double"}},
+		{"align not a string", map[string]any{"align": true}},
+		{"normalize not a boolean", map[string]any{"normalize": "yes"}},
+		{"page_numbers not a boolean", map[string]any{"page_numbers": "yes"}},
+		{"rebuild_toc not a boolean", map[string]any{"rebuild_toc": "yes"}},
+		{"margins_mm not an array", map[string]any{"margins_mm": "big margins"}},
+		{"margins_mm element not a number", map[string]any{"margins_mm": []any{float64(10), "x", float64(10), float64(10)}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			original, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := callDocxFormat(t, map[string]any{"path": p, "rules": tt.rules}); err == nil {
+				t.Fatal("a wrong-typed rules field returned nil error")
+			}
+			after, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) {
+				t.Error("a rejected wrong-typed field still modified the file on disk")
+			}
+		})
+	}
+}
+
+// TestDocxFormat_RejectsBadMarginsMM pins length and sign validation at the
+// tool layer, before the request ever reaches pkg/docx.
+func TestDocxFormat_RejectsBadMarginsMM(t *testing.T) {
+	tests := []struct {
+		name string
+		mm   []any
+	}{
+		{"too few", []any{float64(10), float64(10)}},
+		{"too many", []any{float64(10), float64(10), float64(10), float64(10), float64(10)}},
+		{"zero value", []any{float64(0), float64(10), float64(10), float64(10)}},
+		{"negative value", []any{float64(10), float64(-5), float64(10), float64(10)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			if _, err := callDocxFormat(t, map[string]any{
+				"path":  p,
+				"rules": map[string]any{"margins_mm": tt.mm},
+			}); err == nil {
+				t.Fatalf("margins_mm=%v was accepted", tt.mm)
+			}
+		})
+	}
+}
+
+// TestDocxFormat_MarginsMMAccepted is the positive counterpart to
+// TestDocxFormat_RejectsBadMarginsMM: a valid 4-element array must be
+// accepted and reported in applied.
+func TestDocxFormat_MarginsMMAccepted(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"margins_mm": []any{float64(20), float64(20), float64(20), float64(20)}},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatal("applied is empty for a valid margins_mm change")
+	}
+}
+
+// TestDocxFormat_RulesMustBeAnObject pins that a non-object rules value
+// (e.g. a bare string) is rejected rather than silently treated as empty.
+func TestDocxFormat_RulesMustBeAnObject(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": "corporate",
+	}); err == nil {
+		t.Fatal("a non-object rules value was accepted")
+	}
+}
+
+// TestDocxFormat_IsInDocumentGroupAndNotParallelSafe pins the brief's
+// requirement directly: docx_format writes, so it must never run in
+// parallel with another tool call, and it must be selectable by the
+// document-editor subagent profile's group-based tool selection.
+func TestDocxFormat_IsInDocumentGroupAndNotParallelSafe(t *testing.T) {
+	tool := DocxFormatTool()
+	if tool.ParallelSafe {
+		t.Error("docx_format.ParallelSafe = true, want false; it writes to disk")
+	}
+	found := false
+	for _, g := range tool.Groups {
+		if g == "document" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("docx_format.Groups = %v, want it to contain %q", tool.Groups, "document")
+	}
+}
