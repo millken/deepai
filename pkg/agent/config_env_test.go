@@ -41,6 +41,7 @@ func TestEnvEnabled(t *testing.T) {
 func TestMain(m *testing.M) {
 	os.Unsetenv(envTokenMetrics)
 	os.Unsetenv(envTokenAging)
+	os.Unsetenv(EnvMaxOutputTokens)
 	os.Exit(m.Run())
 }
 
@@ -119,6 +120,60 @@ func TestTokenEfficiency_AgingEnvEnables(t *testing.T) {
 	// T1 tool-result budgets: unknown tools fall back to §5.4 "default" row.
 	if budget := a.aging.toolResultBudget(1, "unknown_tool"); budget != 4096 {
 		t.Errorf("age-1 unknown tool budget = %d, want 4096 (§5.4 default)", budget)
+	}
+}
+
+// TestResolveMaxOutputTokens_Unset pins the fallback: with no override
+// configured, both the main agent and every subagent land on
+// DefaultMaxOutputTokens (see mainAgentMaxTokens / subagentMaxTokens, which
+// both call this function rather than reading the constant directly).
+func TestResolveMaxOutputTokens_Unset(t *testing.T) {
+	t.Setenv(EnvMaxOutputTokens, "")
+	os.Unsetenv(EnvMaxOutputTokens)
+	if got := ResolveMaxOutputTokens(); got != DefaultMaxOutputTokens {
+		t.Errorf("ResolveMaxOutputTokens() = %d, want DefaultMaxOutputTokens (%d)", got, DefaultMaxOutputTokens)
+	}
+}
+
+// TestResolveMaxOutputTokens_ValidValueWins pins that an explicit, valid
+// setting is used verbatim instead of DefaultMaxOutputTokens.
+func TestResolveMaxOutputTokens_ValidValueWins(t *testing.T) {
+	t.Setenv(EnvMaxOutputTokens, "32000")
+	const want = 32000
+	if got := ResolveMaxOutputTokens(); got != want {
+		t.Errorf("ResolveMaxOutputTokens() = %d, want explicit value %d", got, want)
+	}
+	if want == DefaultMaxOutputTokens {
+		t.Fatal("test setup bug: chosen value must differ from the default to prove it was actually read")
+	}
+}
+
+// TestResolveMaxOutputTokens_InvalidFallsBackToDefault is the rule that
+// matters most: MaxTokens must never reach the provider as 0, because a
+// provider that receives 0 applies its OWN default (8192 for Anthropic),
+// silently reintroducing the truncation bug DefaultMaxOutputTokens was added
+// to fix. Every rejected form must land on DefaultMaxOutputTokens exactly —
+// not merely "some non-input value" — which is why each case asserts equality
+// with the constant AND explicitly asserts the result is not 0.
+func TestResolveMaxOutputTokens_InvalidFallsBackToDefault(t *testing.T) {
+	cases := map[string]string{
+		"non-numeric":    "not-a-number",
+		"empty-string":   "",
+		"zero":           "0",
+		"negative":       "-100",
+		"absurdly-large": "100000000000",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(EnvMaxOutputTokens, raw)
+			got := ResolveMaxOutputTokens()
+			if got != DefaultMaxOutputTokens {
+				t.Errorf("ResolveMaxOutputTokens() with %s (%q) = %d, want DefaultMaxOutputTokens (%d)", name, raw, got, DefaultMaxOutputTokens)
+			}
+			if got == 0 {
+				t.Errorf("ResolveMaxOutputTokens() with %s (%q) = 0; must never coerce to 0 (provider would apply its own default)", name, raw)
+			}
+		})
 	}
 }
 

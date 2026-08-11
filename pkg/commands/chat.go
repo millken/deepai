@@ -336,11 +336,10 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
 	// advertised agents resolve to the same source at execution time.
-	subMaxTokens := 16384 // larger than provider default (8192) to avoid truncating big tool args
 	subExecutor := agent.NewSubagentExecutor(modelRegistry, registry, nil).
 		WithWorkDir(workDir).
 		WithContextWindow(contextWindow).
-		WithMaxTokens(&subMaxTokens).
+		WithMaxTokens(subagentMaxTokens()).
 		WithPluginAgentDirs(pluginAgentDirs)
 	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
@@ -355,6 +354,18 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	for _, tool := range builtin.DocxTools() {
 		mustRegisterTool(registry, tool)
 	}
+}
+
+// subagentMaxTokens returns a fresh pointer to agent.ResolveMaxOutputTokens()
+// for SubagentExecutor.WithMaxTokens, which takes *int. It exists only so
+// this value is read from the one shared resolver rather than a local
+// literal — see pkg/chat/repl.go's mainAgentMaxTokens, which the main agent
+// must keep in step with. ResolveMaxOutputTokens honors an explicit
+// DEEPAI_MAX_OUTPUT_TOKENS setting and otherwise falls back to
+// agent.DefaultMaxOutputTokens; it never returns 0.
+func subagentMaxTokens() *int {
+	n := agent.ResolveMaxOutputTokens()
+	return &n
 }
 
 // resolveRequestTimeout converts a config value (in minutes) to a duration.

@@ -863,3 +863,56 @@ func TestHandleModelCommand_PickerCancel(t *testing.T) {
 		t.Fatalf("currentModel should not change on cancel")
 	}
 }
+
+// TestMainAgentMaxTokens_UsesSharedConstant pins that the main (interactive
+// REPL) agent's MaxTokens comes from agent.ResolveMaxOutputTokens, the same
+// resolver pkg/commands/chat.go's subagentMaxTokens uses. Before this fix
+// the main agent never set MaxTokens at all and silently ran at the
+// provider default (8192 for Anthropic) — the exact truncation exposure the
+// subagent limit was raised to avoid, left in place for the agent the user
+// actually talks to. This test, together with
+// TestSubagentMaxTokens_UsesSharedConstant in pkg/commands, would fail if
+// either wiring point were changed to a literal instead of the shared
+// resolver, catching the two silently drifting apart.
+func TestMainAgentMaxTokens_UsesSharedConstant(t *testing.T) {
+	t.Setenv(agent.EnvMaxOutputTokens, "")
+	got := mainAgentMaxTokens()
+	if got == nil {
+		t.Fatal("mainAgentMaxTokens() = nil, want a pointer to agent.DefaultMaxOutputTokens")
+	}
+	if *got != agent.DefaultMaxOutputTokens {
+		t.Errorf("mainAgentMaxTokens() = %d, want agent.DefaultMaxOutputTokens (%d)", *got, agent.DefaultMaxOutputTokens)
+	}
+}
+
+// TestMainAgentMaxTokens_ExplicitSettingWins pins that a valid
+// DEEPAI_MAX_OUTPUT_TOKENS setting reaches the main agent's MaxTokens,
+// not just the default.
+func TestMainAgentMaxTokens_ExplicitSettingWins(t *testing.T) {
+	t.Setenv(agent.EnvMaxOutputTokens, "40000")
+	got := mainAgentMaxTokens()
+	if got == nil {
+		t.Fatal("mainAgentMaxTokens() = nil, want a pointer to 40000")
+	}
+	if *got != 40000 {
+		t.Errorf("mainAgentMaxTokens() = %d, want 40000 (explicit setting)", *got)
+	}
+}
+
+// TestMainAgentMaxTokens_MatchesResolver pins mainAgentMaxTokens to
+// agent.ResolveMaxOutputTokens under both a valid override and an invalid
+// one, so the main-agent wiring can never be changed to bypass the resolver
+// (e.g. reading agent.DefaultMaxOutputTokens directly again) without this
+// test catching the divergence.
+func TestMainAgentMaxTokens_MatchesResolver(t *testing.T) {
+	for _, raw := range []string{"", "50000", "not-a-number", "-5"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv(agent.EnvMaxOutputTokens, raw)
+			want := agent.ResolveMaxOutputTokens()
+			got := mainAgentMaxTokens()
+			if got == nil || *got != want {
+				t.Errorf("mainAgentMaxTokens() = %v, want pointer to agent.ResolveMaxOutputTokens() = %d", got, want)
+			}
+		})
+	}
+}

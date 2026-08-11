@@ -160,6 +160,7 @@ DEEPSEEK_API_KEY=sk-...
 |------|------|
 | `DEEPAI_TOKEN_METRICS` | `1`/`true` 写入 `$TMPDIR/deepai-token-metrics.jsonl`；其他非空值作为输出路径；空=关闭 |
 | `DEEPAI_TOKEN_AGING` | `1`/`true` 启用 T1 工具结果老化 |
+| `DEEPAI_MAX_OUTPUT_TOKENS` | 覆盖主 agent 与所有 subagent 的单次回复最大输出 token 数（默认 16384）。非法值（非数字、空、0、负数，或远超合理范围）会被忽略并回退到默认值，绝不会把 0 传给 provider（0 会被 provider 当作"用它自己的默认值"，如 Anthropic 的 8192，从而重新出现截断问题） |
 
 ### 网络代理与超时
 

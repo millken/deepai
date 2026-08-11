@@ -1,17 +1,16 @@
 ---
 name: docx-summarize
 description: "Use when the user asks to summarize, extract key points from, or produce a digest of a .docx Word document, especially a long one that won't fit in context. Triggers on requests like 'summarize this docx', 'give me the key points of this Word document', 'write a summary of file.docx'."
-allowed-tools: [docx_read, write_file, task, ask_clarification]
+allowed-tools: [docx_read, docx_write, write_file, task, ask_clarification]
 agent: document-editor
 ---
 
 # docx-summarize
 
-Produces a Markdown summary of an existing `.docx` file via map-reduce over
-chunks. This workflow is **read-only**: it never calls `docx_edit` and never
-modifies the source document. It also never generates a new `.docx` — P1
-only writes a Markdown summary via `write_file`; producing a summary as a
-`.docx` is `docx_write`, a P2 capability.
+Produces a summary of an existing `.docx` file via map-reduce over chunks.
+Reading the source is **read-only**: this skill never calls `docx_edit` and
+never modifies the source document. The output, however, can be either
+Markdown (`write_file`) or a brand-new `.docx` (`docx_write`) — see Step 4.
 
 ## Step 0 — Delegate, don't read directly from the main agent
 
@@ -85,11 +84,33 @@ chunk N-1's summary. That's what makes parallel `task` delegation valid here
 
 ## Step 4 — Write the result
 
-Write the final summary as Markdown via `write_file`. Do not attempt to
-produce a `.docx` output file — that capability (`docx_write`) does not
-exist yet in this version; if the user specifically asks for a `.docx`
-summary, tell them it's not yet supported rather than silently substituting
-Markdown without saying so.
+Produce the summary as Markdown first, exactly as before — that is the one
+form every downstream step (Step 3's reduce, the report in Step 5) already
+works with. What happens to that Markdown next depends on what the user
+asked for:
+
+- **Markdown output (default, or when the user didn't ask for a file
+  format)**: write it via `write_file`.
+- **`.docx` output** (the user asked for "a Word doc", "a .docx summary", a
+  file they can open in Word, etc.): call `docx_write(path, markdown, title)`
+  with the Markdown you just produced. `docx_write` renders real Word
+  structure — headings, bulleted/numbered lists, GFM tables with a bold
+  header row, code blocks, links — so a summary with a bulleted key-points
+  list or a small comparison table comes out as an actual list or table in
+  Word, not flattened prose. **There is no reason to reach for a script
+  (e.g. python-docx) here**: that reflex predates `docx_write` and this
+  skill existing, and every construct a summary is likely to contain (a
+  heading per section, a bulleted list of key points, an occasional table)
+  is exactly what `docx_write` renders structurally. The one thing it
+  cannot do is embed images, which is irrelevant to a text summary anyway.
+  `docx_write` refuses to overwrite an existing file, so pick a path that
+  does not already exist (or ask the user which file to replace and delete
+  it first, deliberately).
+- Read `docx_write`'s `notes` field in the result and relay anything in it
+  to the user — an empty `notes` means the summary rendered exactly as
+  written; a non-empty one names specifically what did not (currently only
+  an embedded image, which a plain-text summary should never contain in the
+  first place).
 
 ## Step 5 — Report at the end
 
@@ -104,8 +125,10 @@ Report back to the user:
 
 ## Reminders
 
-- This skill is read-only end to end: no `docx_edit`, no in-place
-  modification, no new `.docx` file.
+- Reading the source is read-only end to end: no `docx_edit`, no in-place
+  modification of the file the user handed you. `docx_write` (Step 4) only
+  ever creates a brand-new file at a different path; it never touches the
+  source document.
 - Do not paraphrase numbers, dates, or names into different values —
   summarizing is compression, not rewriting; a summary that alters a figure
   from the source is a factual error, not a stylistic choice.

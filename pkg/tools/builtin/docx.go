@@ -989,9 +989,232 @@ func docxFormatNumberArg(raw map[string]any, key string) (float64, error) {
 	return f, nil
 }
 
+// docxWriteArgs is docx_write's parsed arguments.
+type docxWriteArgs struct {
+	Path         string
+	Markdown     string
+	MarkdownPath string
+	Title        string
+}
+
+// docxWriteOutput is the JSON shape docx_write returns to the model.
+// Paras is always present (never omitempty), since the count is exactly
+// what lets a caller sanity-check the output size — a body that came out
+// far shorter than expected is the caller's only signal that something
+// went wrong, and a field that vanishes on a legitimate empty document
+// (paras: 0 would never actually happen, but paras: 1 for a near-empty one
+// must still show up) would defeat that. Notes carries every markdown
+// construct pkg/docx.WriteDocx did not render structurally (currently only
+// images), verbatim and unfiltered: this tool has no domain opinion of its
+// own about what is or is not supported, and swallowing a note here would
+// leave the model believing something rendered that did not.
+type docxWriteOutput struct {
+	Paras int      `json:"paras"`
+	Notes []string `json:"notes,omitempty"`
+}
+
+// DocxWriteTool describes docx_write to the model. The description is
+// deliberately explicit about every structural construct WriteDocx renders
+// (headings, lists, tables, code, links, emphasis, quotes, rules) rather
+// than a vague "converts markdown": design's brief for this task records
+// that a model reading a vaguer description has twice fallen back to a bash
+// + python script rather than trust a docx tool to handle a document with
+// real structure. A description that reads as "probably just paragraphs"
+// would reproduce that failure here.
+//
+// It is equally deliberate about markdown_path, and puts that guidance
+// FIRST, ahead of the markdown-subset explanation: a model that just had a
+// docx_write call fail with "invalid arguments JSON: unexpected end of JSON
+// input" (its own streamed tool-call JSON truncated mid-string by a large
+// inline markdown argument) needs to learn the file-based escape route from
+// this description alone, on its very next attempt, without any human in
+// the loop pointing it there. Burying that below the syntax reference would
+// risk exactly that model skimming past it and inlining the same oversized
+// document again.
+func DocxWriteTool() models.Tool {
+	return models.Tool{
+		Name:         "docx_write",
+		Groups:       []string{"builtin", "document"},
+		ParallelSafe: false,
+		Description: "Create a new .docx from markdown, given either inline via markdown or from a file via " +
+			"markdown_path — pass exactly one of the two, never both and never neither. For anything longer " +
+			"than a few pages (a design document, a report, anything with real length), do NOT inline the " +
+			"whole document as the markdown argument: a large inline argument can exceed this model's own " +
+			"output budget while it is being streamed, cutting the tool call's JSON off mid-string and failing " +
+			"the whole call with no document written. Instead, build the markdown in a file first — write_file " +
+			"for the first chunk, then write_file with append: true for every chunk after, so the file can grow " +
+			"past any single response's output budget — and call docx_write once with markdown_path set to that " +
+			"file's path. That makes document length effectively unbounded, and converting the whole thing in " +
+			"one pass keeps list numbering, style ids, and hyperlink relationship ids consistent throughout; " +
+			"writing several smaller .docx files and merging them instead would collide those three id spaces. " +
+			"This renders real Word structure, not a plain-text dump: # .. ###### become Heading1-6 styles; " +
+			"**bold**/*italic*/`inline code` become formatted runs; - / * and 1. lists (including nested ones) " +
+			"become properly indented bulleted or numbered lists; GFM pipe tables (| a | b |, with an alignment " +
+			"row) become bordered Word tables with a bold header row and per-column left/center/right alignment; " +
+			"fenced ``` code blocks become monospace, shaded paragraphs with indentation preserved; [text](url) " +
+			"becomes a clickable hyperlink; > quotes and a standalone --- become a bordered block quote and a " +
+			"horizontal rule. A document with tables, nested lists, and code blocks is exactly what this tool " +
+			"is for — there is no need to write a script instead. The one thing it cannot do is embed images: " +
+			"![alt](url) is written as plain text and declared in notes, never silently dropped. Every other " +
+			"unsupported edge case (e.g. a ragged table row) is declared in notes the same way, so an empty " +
+			"notes field means the input rendered exactly as written. Refuses to create the file if path " +
+			"already exists — creating never overwrites; delete the existing file or choose another path " +
+			"first. Returns paras, the number of paragraphs written, so the caller can sanity-check the output " +
+			"size.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "Path for the new .docx file. Must not already exist; this tool never overwrites.",
+				},
+				"markdown": map[string]any{
+					"type": "string",
+					"description": "Inline source markdown. Mutually exclusive with markdown_path — give exactly " +
+						"one. Fine for short documents; for anything longer than a few pages, write the markdown " +
+						"to a file with write_file (append: true for each chunk after the first) and pass " +
+						"markdown_path instead, to avoid the inline argument being truncated. See the tool " +
+						"description for the exact supported subset.",
+				},
+				"markdown_path": map[string]any{
+					"type": "string",
+					"description": "Path to a file holding the source markdown, read in full and converted in " +
+						"one pass. Mutually exclusive with markdown — give exactly one. This is the route for " +
+						"long documents: build the file incrementally with write_file (append: true for each " +
+						"chunk after the first), then pass the finished file's path here.",
+				},
+				"title": map[string]any{
+					"type":        "string",
+					"description": "Optional title, rendered as the document's very first paragraph, styled as Heading1, ahead of anything parsed from markdown.",
+				},
+			},
+			"required": []any{"path"},
+		},
+		Handler: DocxWriteHandler,
+	}
+}
+
+// DocxWriteHandler parses docx_write's arguments, resolves whichever of
+// markdown/markdown_path was given into an in-memory markdown string, and
+// delegates all rendering and OOXML skeleton construction to
+// pkg/docx.WriteDocx unchanged — WriteDocx already takes markdown as a
+// plain string, so markdown_path is purely a tool-layer convenience for
+// getting that string without an inline argument. Unlike docx_edit/
+// docx_format there is no backup to make (WriteDocx never overwrites, so
+// there is nothing pre-existing to protect), and pkg/docx.WriteDocx's own
+// refusal error (when path already exists) is already the clear, actionable
+// message the brief asks for, so it is surfaced verbatim rather than
+// reworded.
+func DocxWriteHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	result := models.ToolResult{CallID: call.ID, ToolName: call.Name}
+
+	args, err := parseDocxWriteArgs(call.Arguments)
+	if err != nil {
+		return result, err
+	}
+
+	markdown := args.Markdown
+	if args.MarkdownPath != "" {
+		resolvedMarkdownPath := resolveReadablePath(ctx, args.MarkdownPath)
+		data, err := os.ReadFile(resolvedMarkdownPath)
+		if err != nil {
+			return result, fmt.Errorf("docx_write: read markdown_path %s: %w", resolvedMarkdownPath, err)
+		}
+		markdown = string(data)
+	}
+
+	resolved := resolveWritablePath(ctx, args.Path)
+	writeResult, err := docx.WriteDocx(resolved, docx.WriteOptions{
+		Markdown: markdown,
+		Title:    args.Title,
+	})
+	if err != nil {
+		return result, fmt.Errorf("docx_write: %w", err)
+	}
+
+	out := docxWriteOutput{Paras: writeResult.Paras, Notes: writeResult.Notes}
+	payload, err := json.Marshal(out)
+	if err != nil {
+		return result, fmt.Errorf("docx_write: marshal result: %w", err)
+	}
+	result.Status = models.CallStatusCompleted
+	result.Content = string(payload)
+	return result, nil
+}
+
+// parseDocxWriteArgs extracts docxWriteArgs from the raw JSON arguments map,
+// type-checking every field and never coercing (the brief's explicit
+// warning: a bare `raw["x"].(string)` with the ", ok" form silently
+// discards a wrong-typed value as "" instead of erroring, which for
+// markdown would mean a caller's mistaken non-string value producing an
+// empty document while still reporting success).
+//
+// Exactly one of markdown/markdown_path must be present as a key: markdown
+// alone is checked against presence rather than non-empty (distinct from an
+// empty string, which pkg/docx.WriteDocx already defines sensible behavior
+// for — see TestWrite_EmptyMarkdownProducesAValidEmptyDocument in pkg/docx
+// and its tool-layer mirror here) because an entirely absent key is far more
+// likely a caller mistake than a deliberate request for a near-empty
+// document. markdown_path is checked the ordinary trimmed-non-empty way,
+// like path, since a file path has no equivalent "deliberately near-empty"
+// reading for a blank string.
+func parseDocxWriteArgs(raw map[string]any) (docxWriteArgs, error) {
+	path, _ := raw["path"].(string)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return docxWriteArgs{}, fmt.Errorf("docx_write: path is required")
+	}
+
+	rawMarkdown, hasMarkdown := raw["markdown"]
+	hasMarkdown = hasMarkdown && rawMarkdown != nil
+
+	rawMarkdownPath, hasMarkdownPath := raw["markdown_path"]
+	hasMarkdownPath = hasMarkdownPath && rawMarkdownPath != nil
+
+	switch {
+	case hasMarkdown && hasMarkdownPath:
+		return docxWriteArgs{}, fmt.Errorf(
+			"docx_write: give exactly one of markdown or markdown_path, not both")
+	case !hasMarkdown && !hasMarkdownPath:
+		return docxWriteArgs{}, fmt.Errorf(
+			"docx_write: give exactly one of markdown (inline) or markdown_path (a file to read); " +
+				"for anything longer than a few pages, write the markdown to a file with write_file " +
+				"(append: true for each chunk after the first) and pass markdown_path instead of inlining it")
+	}
+
+	var markdown, markdownPath string
+	if hasMarkdown {
+		s, ok := rawMarkdown.(string)
+		if !ok {
+			return docxWriteArgs{}, fmt.Errorf("docx_write: markdown must be a string")
+		}
+		markdown = s
+	} else {
+		s, ok := rawMarkdownPath.(string)
+		if !ok {
+			return docxWriteArgs{}, fmt.Errorf("docx_write: markdown_path must be a string")
+		}
+		markdownPath = strings.TrimSpace(s)
+		if markdownPath == "" {
+			return docxWriteArgs{}, fmt.Errorf("docx_write: markdown_path must not be blank")
+		}
+	}
+
+	var title string
+	if v, present := raw["title"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docxWriteArgs{}, fmt.Errorf("docx_write: title must be a string")
+		}
+		title = s
+	}
+
+	return docxWriteArgs{Path: path, Markdown: markdown, MarkdownPath: markdownPath, Title: title}, nil
+}
+
 // DocxTools returns every docx tool.
 func DocxTools() []models.Tool {
-	return []models.Tool{DocxReadTool(), DocxEditTool(), DocxFormatTool()}
+	return []models.Tool{DocxReadTool(), DocxEditTool(), DocxFormatTool(), DocxWriteTool()}
 }
 
 // DocxEditHandler parses docx_edit's arguments, delegates all editing

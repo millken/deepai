@@ -209,7 +209,7 @@ func (p *OpenAICompatProvider) consumeStream(
 			slog.Debug("tool call arguments JSON invalid, will retry", "tool", badTool, "err", assembleErr)
 			return true, false
 		}
-		ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", badTool, assembleErr), Done: true}
+		ch <- StreamChunk{Err: newToolArgsJSONError(badTool, assembleErr), Done: true}
 		return false, false
 	}
 	toolCalls = append(toolCalls, assembled...)

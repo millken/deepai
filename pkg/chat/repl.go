@@ -514,6 +514,18 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 	return &turnError{err: err, cancelled: interrupted}
 }
 
+// mainAgentMaxTokens returns a fresh pointer to agent.ResolveMaxOutputTokens()
+// for AgentConfig.MaxTokens, which takes *int. It exists only so this value
+// is read from the one shared resolver rather than a local literal — see
+// pkg/commands/chat.go's subagentMaxTokens, which the subagent wiring must
+// keep in step with. ResolveMaxOutputTokens honors an explicit
+// DEEPAI_MAX_OUTPUT_TOKENS setting and otherwise falls back to
+// agent.DefaultMaxOutputTokens; it never returns 0.
+func mainAgentMaxTokens() *int {
+	n := agent.ResolveMaxOutputTokens()
+	return &n
+}
+
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []models.MessageImage, continuation bool) error {
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
 		r.ui.RenderSubagentEvent(evt)
@@ -561,6 +573,13 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		ContextWindow:   r.currentContextWindow(),
 		ReasoningEffort: r.currentReasoningEffort(),
 		MaxTurns:        r.cfg.MaxTurns,
+		// MaxTokens: without this the provider default applies (8192 for
+		// Anthropic), the same limit pkg/commands/chat.go raises for
+		// subagents to avoid truncating a large tool-call argument
+		// mid-stream — this is the agent the user actually talks to, so it
+		// needs the same headroom. See agent.ResolveMaxOutputTokens and
+		// mainAgentMaxTokens below.
+		MaxTokens:       mainAgentMaxTokens(),
 		RequestTimeout:  r.cfg.RequestTimeout,
 		UserInteraction: r.ui,
 		PlanMode:        r.planMode,

@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
@@ -175,5 +177,68 @@ func TestChatResponse(t *testing.T) {
 	}
 	if resp.Stop != "stop" {
 		t.Errorf("Stop = %s, want 'stop'", resp.Stop)
+	}
+}
+
+// TestNewToolArgsJSONError_ExplainsTruncationAndWhatToDo pins the P2c5
+// brief's Fix 3 directly: the bare "invalid arguments JSON: unexpected end
+// of JSON input" that reached the user gave no hint that a truncated
+// stream was the likely cause, even though anthropic.go's own comment next
+// to that line already names it ("e.g. stream was truncated"). The
+// constructed message must say what most likely happened (the response hit
+// its output limit while emitting a large tool argument) and what to do
+// about it (shrink the argument, or use the tool's file-based parameter if
+// it has one).
+func TestNewToolArgsJSONError_ExplainsTruncationAndWhatToDo(t *testing.T) {
+	cause := &json.SyntaxError{Offset: 42}
+	err := newToolArgsJSONError("docx_write", cause)
+	msg := err.Error()
+
+	if !strings.Contains(msg, `"docx_write"`) {
+		t.Errorf("error = %q, want it to name the tool", msg)
+	}
+	lower := strings.ToLower(msg)
+	for _, phrase := range []string{"output token limit", "smaller", "file-based parameter"} {
+		if !strings.Contains(lower, phrase) {
+			t.Errorf("error = %q, want it to contain %q", msg, phrase)
+		}
+	}
+}
+
+// TestNewToolArgsJSONError_WrapsTheOriginalCause pins that the underlying
+// json.Unmarshal error (e.g. "unexpected end of JSON input") is still
+// reachable via errors.Is/Unwrap, not replaced outright: a caller or log
+// line that inspects the cause (e.g. isRetryableAnthropicStreamErr-style
+// classification, or just a human comparing against the raw stdlib error)
+// must still find it.
+func TestNewToolArgsJSONError_WrapsTheOriginalCause(t *testing.T) {
+	var cause error
+	unmarshalErr := json.Unmarshal([]byte(`{"a":`), &struct{}{})
+	cause = unmarshalErr
+	if cause == nil {
+		t.Fatal("test setup: expected json.Unmarshal to fail on truncated input")
+	}
+	err := newToolArgsJSONError("bash", cause)
+	if !errors.Is(err, cause) {
+		t.Errorf("newToolArgsJSONError does not wrap the original cause: %v", err)
+	}
+}
+
+// TestNewToolArgsJSONError_IsProviderAgnostic pins the brief's explicit
+// constraint that pkg/llm must not know about docx: the message is built
+// and used identically for every tool, so it must never name a specific
+// tool's own remedy (e.g. "use markdown_path") — only the generic "this
+// tool's file-based parameter" framing, which stays correct regardless of
+// which tool triggered it.
+func TestNewToolArgsJSONError_IsProviderAgnostic(t *testing.T) {
+	// A neutral tool name: the message template itself must never add
+	// docx-specific wording on top of whatever tool name the caller passed
+	// in — pkg/llm has no import of, or knowledge about, pkg/docx.
+	err := newToolArgsJSONError("bash", errors.New("unexpected end of JSON input"))
+	lower := strings.ToLower(err.Error())
+	for _, term := range []string{"docx", "markdown_path", "write_file"} {
+		if strings.Contains(lower, term) {
+			t.Errorf("error = %q, must stay provider/tool-agnostic and not mention %q", err.Error(), term)
+		}
 	}
 }

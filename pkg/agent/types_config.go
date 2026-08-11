@@ -254,9 +254,9 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 	AgentTypeDocEditor: {
 		Type:         AgentTypeDocEditor,
 		Name:         "Document Editor",
-		Description:  "Profile for .docx polishing and summarization: structured read, format-preserving edit, and protected-term validation.",
+		Description:  "Profile for .docx polishing, summarization, and generation: structured read, format-preserving edit, and protected-term validation.",
 		SystemPrompt: docEditorSystemPrompt,
-		DefaultTools: []string{"docx_read", "docx_edit", "docx_format", "read_file", "write_file", "ask_clarification"},
+		DefaultTools: []string{"docx_read", "docx_edit", "docx_format", "docx_write", "read_file", "write_file", "ask_clarification"},
 		// MaxTurns must be explicit and non-zero: subagent.go's safety floor
 		// treats <= 0 as "unset" and coerces it to 15, which only covers
 		// four or five 2-3-turn polishing chunks (design §5.8). 30 covers

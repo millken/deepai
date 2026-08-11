@@ -1752,3 +1752,412 @@ func TestDocxFormatTool_DescriptionDistinguishesTheTwoModes(t *testing.T) {
 		t.Errorf("docx_format description does not explain that the range path applies direct, paragraph-scoped formatting: %q", d)
 	}
 }
+
+// callDocxWrite invokes DocxWriteHandler the same way callDocxRead/
+// callDocxEdit/callDocxFormat do for their tools.
+func callDocxWrite(t *testing.T, args map[string]any) (models.ToolResult, error) {
+	t.Helper()
+	return DocxWriteHandler(context.Background(), models.ToolCall{
+		ID: "c1", Name: "docx_write", Arguments: args,
+	})
+}
+
+// TestDocxWrite_RequiresPath pins the brief's "path (required)": a missing
+// or blank path must be refused before pkg/docx is ever touched, the same
+// way every other docx tool refuses.
+func TestDocxWrite_RequiresPath(t *testing.T) {
+	if _, err := callDocxWrite(t, map[string]any{"markdown": "# H\n"}); err == nil {
+		t.Fatal("missing path returned nil error")
+	}
+	if _, err := callDocxWrite(t, map[string]any{"path": "   ", "markdown": "# H\n"}); err == nil {
+		t.Fatal("whitespace-only path returned nil error")
+	}
+}
+
+// TestDocxWrite_RequiresMarkdown pins the brief's "markdown (required)":
+// the key must actually be present, distinct from an empty string (which is
+// a valid, if degenerate, request — see
+// TestDocxWrite_EmptyMarkdownProducesAValidDocument).
+func TestDocxWrite_RequiresMarkdown(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	if _, err := callDocxWrite(t, map[string]any{"path": p}); err == nil {
+		t.Fatal("missing markdown returned nil error")
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Error("a rejected call must not have created the file")
+	}
+}
+
+// TestDocxWrite_RejectsWrongTypedArgs pins the brief's "type-check every
+// argument; never coerce" requirement, quoting its own example almost
+// verbatim: a bare number arriving where a string is expected must be
+// refused with an explicit error, never silently read as the zero value
+// ("") while still reporting success.
+func TestDocxWrite_RejectsWrongTypedArgs(t *testing.T) {
+	base := func() (string, map[string]any) {
+		p := filepath.Join(t.TempDir(), "out.docx")
+		return p, map[string]any{"path": p, "markdown": "# H\n"}
+	}
+
+	if p, args := base(); true {
+		args["markdown"] = 12345.0
+		if _, err := callDocxWrite(t, args); err == nil {
+			t.Error("markdown as a number returned nil error")
+		}
+		if _, statErr := os.Stat(p); statErr == nil {
+			t.Error("a rejected call must not have created the file")
+		}
+	}
+	if p, args := base(); true {
+		args["title"] = 42.0
+		if _, err := callDocxWrite(t, args); err == nil {
+			t.Error("title as a number returned nil error")
+		}
+		if _, statErr := os.Stat(p); statErr == nil {
+			t.Error("a rejected call must not have created the file")
+		}
+	}
+	if _, args := base(); true {
+		args["path"] = 7.0
+		if _, err := callDocxWrite(t, args); err == nil {
+			t.Error("path as a number returned nil error")
+		}
+	}
+}
+
+// TestDocxWrite_CreatesDocxAndReportsParaCount is the core happy path: the
+// handler must produce a file pkg/docx's own reader can open, and the
+// reported paras count must match what Scan finds, so a caller can sanity
+// check the output size without reopening the file itself.
+func TestDocxWrite_CreatesDocxAndReportsParaCount(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	md := "# Chapter\n\nbody text\n\n- item one\n- item two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+	res, err := callDocxWrite(t, map[string]any{"path": p, "markdown": md})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	paras, ok := out["paras"].(float64)
+	if !ok {
+		t.Fatalf("result has no numeric paras field: %v", out)
+	}
+
+	doc, err := docx.OpenDocument(p)
+	if err != nil {
+		t.Fatalf("the written file cannot be reopened: %v", err)
+	}
+	if got := len(doc.Paras()); got != int(paras) {
+		t.Errorf("reported paras = %d, but the file actually has %d paragraphs", int(paras), got)
+	}
+	if doc.Paras()[0].Style != "Heading1" {
+		t.Errorf("paras[0].Style = %q, want Heading1", doc.Paras()[0].Style)
+	}
+}
+
+// TestDocxWrite_TitleBecomesLeadingHeading pins that the optional title
+// argument reaches docx.WriteOptions.Title (rendered as a leading Heading1
+// paragraph — see pkg/docx.WriteOptions's doc comment).
+func TestDocxWrite_TitleBecomesLeadingHeading(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{"path": p, "markdown": "body\n", "title": "My Title"})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	doc, err := docx.OpenDocument(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	paras := doc.Paras()
+	if len(paras) == 0 || paras[0].Style != "Heading1" {
+		t.Fatalf("paras[0] = %+v, want a leading Heading1", paras)
+	}
+	var text strings.Builder
+	for _, r := range paras[0].Runs {
+		text.WriteString(r.Text)
+	}
+	if text.String() != "My Title" {
+		t.Errorf("leading heading text = %q, want %q", text.String(), "My Title")
+	}
+}
+
+// TestDocxWrite_EmptyMarkdownProducesAValidDocument pins the self-review
+// question "does an empty markdown argument behave sensibly?": rather than
+// erroring or producing an unopenable file, it must produce the same
+// single-empty-paragraph document pkg/docx.WriteDocx itself defines for
+// empty input.
+func TestDocxWrite_EmptyMarkdownProducesAValidDocument(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	res, err := callDocxWrite(t, map[string]any{"path": p, "markdown": ""})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler with empty markdown: %v", err)
+	}
+	out := decodeRead(t, res)
+	paras, _ := out["paras"].(float64)
+	if paras != 1 {
+		t.Errorf("paras = %v, want 1 for empty input", out["paras"])
+	}
+	if _, err := docx.OpenDocument(p); err != nil {
+		t.Fatalf("the written file cannot be reopened: %v", err)
+	}
+}
+
+// TestDocxWrite_RefusesToOverwriteAnExistingFile pins the brief's "no
+// backup — creating never overwrites" requirement: the underlying refusal
+// from pkg/docx.WriteDocx must surface as a clear, actionable error, and the
+// pre-existing file's content must survive untouched.
+func TestDocxWrite_RefusesToOverwriteAnExistingFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	if err := os.WriteFile(p, []byte("existing content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := callDocxWrite(t, map[string]any{"path": p, "markdown": "# H\n"})
+	if err == nil {
+		t.Fatal("docx_write overwrote an existing file; creating must not destroy")
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "overwrite") && !strings.Contains(lower, "exist") {
+		t.Errorf("error does not clearly explain the refusal: %v", err)
+	}
+	got, readErr := os.ReadFile(p)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "existing content" {
+		t.Error("the existing file's content was modified despite the refusal")
+	}
+}
+
+// TestDocxWrite_NotesSurfaceUnsupportedSyntax pins the brief's "notes is how
+// the model learns that, say, an image was not rendered — it can only relay
+// what the result says": the tool layer must pass pkg/docx's Notes through
+// verbatim, not swallow them.
+func TestDocxWrite_NotesSurfaceUnsupportedSyntax(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	res, err := callDocxWrite(t, map[string]any{
+		"path":     p,
+		"markdown": "before ![alt](pic.png) after\n",
+	})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	notes, _ := out["notes"].([]any)
+	joined := fmt.Sprintf("%v", notes)
+	if !strings.Contains(joined, "image") {
+		t.Errorf("notes do not mention the unsupported image: %v", notes)
+	}
+}
+
+// TestDocxWrite_SupportedOnlyInputHasNoNotes pins that fully-supported
+// markdown produces no notes field at all in the JSON (omitempty), so a
+// model does not have to parse an empty array to conclude "nothing was
+// dropped".
+func TestDocxWrite_SupportedOnlyInputHasNoNotes(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	res, err := callDocxWrite(t, map[string]any{"path": p, "markdown": "# H\n\nbody **bold**\n"})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	if _, present := out["notes"]; present {
+		t.Errorf("notes present for fully-supported input: %v", out["notes"])
+	}
+}
+
+// TestDocxWrite_IsInDocumentGroupAndNotParallelSafe mirrors
+// TestDocxFormat_IsInDocumentGroupAndNotParallelSafe: docx_write writes a
+// new file, so it must never run in parallel with another tool call, and it
+// must be selectable by the document-editor subagent profile's group-based
+// tool selection.
+func TestDocxWrite_IsInDocumentGroupAndNotParallelSafe(t *testing.T) {
+	tool := DocxWriteTool()
+	if tool.ParallelSafe {
+		t.Error("docx_write.ParallelSafe = true, want false; it writes to disk")
+	}
+	found := false
+	for _, g := range tool.Groups {
+		if g == "document" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("docx_write.Groups = %v, want it to contain %q", tool.Groups, "document")
+	}
+}
+
+// TestDocxTools_IncludesWrite pins that DocxWriteTool is actually wired into
+// DocxTools(), not just defined and forgotten — the same failure mode design
+// §4's "汇总注册" section warns about for every docx tool added after P1.
+func TestDocxTools_IncludesWrite(t *testing.T) {
+	found := false
+	for _, tool := range DocxTools() {
+		if tool.Name == "docx_write" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("DocxTools() does not include docx_write")
+	}
+}
+
+// TestDocxWriteTool_DescriptionConveysTheMarkdownSubset is the self-review
+// question turned into a pinned test: a model deciding whether to write a
+// design document with this tool, or fall back to a script, reads only this
+// description. It must name the specific constructs supported (headings,
+// lists, tables, code, links) rather than reading as "probably just plain
+// paragraphs" — the exact ambiguity the brief says has already caused a
+// fallback to a script twice in this project.
+func TestDocxWriteTool_DescriptionConveysTheMarkdownSubset(t *testing.T) {
+	d := DocxWriteTool().Description
+	lower := strings.ToLower(d)
+	for _, term := range []string{"heading", "list", "table", "code", "link"} {
+		if !strings.Contains(lower, term) {
+			t.Errorf("docx_write description does not mention %q: %q", term, d)
+		}
+	}
+	if !strings.Contains(lower, "image") {
+		t.Errorf("docx_write description does not say images are unsupported: %q", d)
+	}
+	if !strings.Contains(lower, "overwrite") && !strings.Contains(lower, "exist") {
+		t.Errorf("docx_write description does not mention the refuse-to-overwrite behavior: %q", d)
+	}
+}
+
+// TestDocxWriteTool_DescriptionTeachesTheFileRoute is the self-review
+// question turned into a pinned test, for P2c's own motivating bug: a
+// design document's markdown exceeded the model's output budget, truncating
+// the streamed docx_write tool call and failing it with "invalid arguments
+// JSON: unexpected end of JSON input". The model that just hit that error
+// has only this description to learn from before its very next attempt, so
+// it must name markdown_path, name write_file as how to build the file, and
+// name append (the mechanism that lets the file grow past one response's
+// output budget) — not just declare the parameter exists in the schema.
+func TestDocxWriteTool_DescriptionTeachesTheFileRoute(t *testing.T) {
+	d := DocxWriteTool().Description
+	lower := strings.ToLower(d)
+	for _, term := range []string{"markdown_path", "write_file", "append"} {
+		if !strings.Contains(lower, term) {
+			t.Errorf("docx_write description does not mention %q; a model that was just truncated cannot discover the file route: %q", term, d)
+		}
+	}
+}
+
+// TestDocxWrite_MarkdownPathMatchesInlineMarkdownByteForByte pins the core
+// correctness claim of markdown_path: WriteDocx is deterministic (per the
+// brief), so reading the same markdown from a file must produce byte-
+// identical output to passing it inline. This is the test that would catch
+// a markdown_path implementation that, say, re-encoded line endings on read
+// or passed the file's path instead of its contents into WriteOptions.
+func TestDocxWrite_MarkdownPathMatchesInlineMarkdownByteForByte(t *testing.T) {
+	md := "# Chapter\n\nbody text with **bold** and `code`\n\n- item one\n- item two\n\n" +
+		"| a | b |\n|---|---|\n| 1 | 2 |\n\n> a quote\n\n---\n"
+
+	inlinePath := filepath.Join(t.TempDir(), "inline.docx")
+	if _, err := callDocxWrite(t, map[string]any{"path": inlinePath, "markdown": md}); err != nil {
+		t.Fatalf("inline markdown call: %v", err)
+	}
+
+	mdFile := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(mdFile, []byte(md), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	viaPathOut := filepath.Join(t.TempDir(), "via_path.docx")
+	if _, err := callDocxWrite(t, map[string]any{"path": viaPathOut, "markdown_path": mdFile}); err != nil {
+		t.Fatalf("markdown_path call: %v", err)
+	}
+
+	inlineBytes, err := os.ReadFile(inlinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaPathBytes, err := os.ReadFile(viaPathOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(inlineBytes, viaPathBytes) {
+		t.Error("markdown_path produced a different .docx than the equivalent inline markdown")
+	}
+}
+
+// TestDocxWrite_RefusesBothMarkdownAndMarkdownPath pins the brief's "giving
+// both... is an error naming what to do": a caller sending both must be
+// refused before any file is touched, with a message telling it to pick one.
+func TestDocxWrite_RefusesBothMarkdownAndMarkdownPath(t *testing.T) {
+	mdFile := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(mdFile, []byte("# H\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{
+		"path": p, "markdown": "# H\n", "markdown_path": mdFile,
+	})
+	if err == nil {
+		t.Fatal("giving both markdown and markdown_path returned nil error")
+	}
+	if !strings.Contains(err.Error(), "markdown") || !strings.Contains(err.Error(), "markdown_path") {
+		t.Errorf("error = %q, want it to name both markdown and markdown_path", err)
+	}
+	if _, statErr := os.Stat(p); statErr == nil {
+		t.Error("a rejected call must not have created the file")
+	}
+}
+
+// TestDocxWrite_RefusesNeitherMarkdownNorMarkdownPath is the other half:
+// omitting both must also be refused with a message naming the fix, not
+// just "markdown is required" as if markdown_path did not exist.
+func TestDocxWrite_RefusesNeitherMarkdownNorMarkdownPath(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{"path": p})
+	if err == nil {
+		t.Fatal("giving neither markdown nor markdown_path returned nil error")
+	}
+	if !strings.Contains(err.Error(), "markdown") || !strings.Contains(err.Error(), "markdown_path") {
+		t.Errorf("error = %q, want it to name both markdown and markdown_path", err)
+	}
+	if _, statErr := os.Stat(p); statErr == nil {
+		t.Error("a rejected call must not have created the file")
+	}
+}
+
+// TestDocxWrite_MarkdownPathMissingFileGivesClearError pins the brief's "A
+// missing markdown_path file gives a clear error": the underlying os.Open
+// failure must be surfaced, not swallowed into a generic docx_write error,
+// and the missing path itself must appear so the caller can act on it.
+func TestDocxWrite_MarkdownPathMissingFileGivesClearError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does_not_exist.md")
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{"path": p, "markdown_path": missing})
+	if err == nil {
+		t.Fatal("a missing markdown_path file returned nil error")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error = %q, want it to name the missing path %q", err, missing)
+	}
+	if _, statErr := os.Stat(p); statErr == nil {
+		t.Error("a rejected call must not have created the file")
+	}
+}
+
+// TestDocxWrite_MarkdownPathBlankIsRefused pins that a whitespace-only
+// markdown_path is treated as "not given" for the type-check but still
+// refused outright — a blank file path can never be a deliberate request the
+// way empty inline markdown is (see TestDocxWrite_EmptyMarkdownProducesAValidDocument).
+func TestDocxWrite_MarkdownPathBlankIsRefused(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	if _, err := callDocxWrite(t, map[string]any{"path": p, "markdown_path": "   "}); err == nil {
+		t.Fatal("a whitespace-only markdown_path returned nil error")
+	}
+}
+
+// TestDocxWrite_MarkdownPathWrongTypeIsRejected mirrors
+// TestDocxWrite_RejectsWrongTypedArgs for the new argument: a non-string
+// markdown_path must error, never silently coerce to "".
+func TestDocxWrite_MarkdownPathWrongTypeIsRejected(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	if _, err := callDocxWrite(t, map[string]any{"path": p, "markdown_path": 12345.0}); err == nil {
+		t.Fatal("markdown_path as a number returned nil error")
+	}
+	if _, statErr := os.Stat(p); statErr == nil {
+		t.Error("a rejected call must not have created the file")
+	}
+}

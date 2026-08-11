@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
@@ -66,4 +67,32 @@ func (r ChatRequest) Validate() error {
 		return errors.New("messages are required")
 	}
 	return nil
+}
+
+// newToolArgsJSONError wraps a tool-call arguments JSON parse failure
+// (anthropic.go's content_block_stop handling and openai_compat.go's
+// assembleToolCalls both hit this) with an explanation of the most likely
+// cause and what to do about it, instead of surfacing the bare
+// json.Unmarshal error ("unexpected end of JSON input") on its own.
+//
+// The non-retryable path is the only place this fires with a message a
+// human or the calling agent ever sees: the retryable path (see both call
+// sites) already retries silently on the same condition and never
+// constructs this error at all. By far the most common cause reaching this
+// non-retryable path is the response hitting its output token limit while
+// still emitting one large tool-call argument, which truncates the
+// streamed JSON mid-string; a malformed-but-complete JSON argument from the
+// model is possible but far rarer; it is not worth naming as a
+// second explanation. This package is provider-agnostic and has no
+// knowledge of individual tools (it must not name a specific tool such as
+// docx_write here), so the advice stays generic: shrink the argument, or —
+// if the tool that was called offers one — use its file-based parameter
+// instead of inlining a large value.
+func newToolArgsJSONError(toolName string, cause error) error {
+	return fmt.Errorf(
+		"tool %q: invalid arguments JSON: %w — this usually means the response hit its output token limit "+
+			"while emitting a large tool-call argument, cutting the argument off mid-stream before it could "+
+			"be parsed; retry with a smaller argument, or, if this tool has a file-based parameter, use that "+
+			"instead of inlining a large value",
+		toolName, cause)
 }

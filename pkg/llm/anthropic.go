@@ -165,7 +165,7 @@ func (p *AnthropicProvider) consumeStream(
 							slog.Debug("tool call arguments JSON invalid, will retry", "tool", b.name, "err", err)
 							return true
 						}
-						ch <- StreamChunk{Err: fmt.Errorf("tool %q: invalid arguments JSON: %w", b.name, err), Done: true}
+						ch <- StreamChunk{Err: newToolArgsJSONError(b.name, err), Done: true}
 						return false
 					}
 					tc.Arguments = args

@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -22,6 +24,59 @@ const (
 
 	defaultTokenMetricsFile = "deepai-token-metrics.jsonl"
 )
+
+// EnvMaxOutputTokens overrides DefaultMaxOutputTokens (see types.go) for both
+// the main REPL agent (pkg/chat/repl.go's mainAgentMaxTokens) and every
+// subagent (pkg/commands/chat.go's subagentMaxTokens) — the two call sites
+// that set AgentConfig.MaxTokens explicitly rather than leaving it nil, so
+// they must both resolve through ResolveMaxOutputTokens rather than reading
+// the env var (or the constant) themselves. Exported so those packages' tests
+// can set it without duplicating the string literal.
+//
+//	DEEPAI_MAX_OUTPUT_TOKENS=32000   use 32000 instead of DefaultMaxOutputTokens
+const EnvMaxOutputTokens = "DEEPAI_MAX_OUTPUT_TOKENS"
+
+// maxPlausibleOutputTokens rejects settings far outside any real model's
+// output limit — the largest advertised by any of this project's providers
+// today is on the order of 128k-200k tokens — so a typo like an extra digit
+// doesn't get forwarded to the provider as-is.
+const maxPlausibleOutputTokens = 1_000_000
+
+// ResolveMaxOutputTokens returns the effective max-output-tokens setting:
+// EnvMaxOutputTokens if it parses as a positive integer within a plausible
+// range, otherwise DefaultMaxOutputTokens. This is the single resolution
+// point; every caller that used to read DefaultMaxOutputTokens directly must
+// call this instead so an explicit setting takes effect everywhere at once.
+//
+// Rejection never falls through to 0: a provider that receives MaxTokens: 0
+// applies its OWN default (8192 for Anthropic — see anthropic.go's
+// buildMessageParams), which is the exact truncation bug DefaultMaxOutputTokens
+// was introduced to fix. So every invalid form (non-numeric, empty, zero,
+// negative, or absurdly large) is logged at debug level and mapped to
+// DefaultMaxOutputTokens, never to the parsed (or zero) value.
+func ResolveMaxOutputTokens() int {
+	raw := strings.TrimSpace(os.Getenv(EnvMaxOutputTokens))
+	if raw == "" {
+		return DefaultMaxOutputTokens
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		slog.Debug("ignoring invalid max output tokens setting: not an integer",
+			"env", EnvMaxOutputTokens, "value", raw, "using", DefaultMaxOutputTokens)
+		return DefaultMaxOutputTokens
+	}
+	if n <= 0 {
+		slog.Debug("ignoring invalid max output tokens setting: not positive",
+			"env", EnvMaxOutputTokens, "value", raw, "using", DefaultMaxOutputTokens)
+		return DefaultMaxOutputTokens
+	}
+	if n > maxPlausibleOutputTokens {
+		slog.Debug("ignoring invalid max output tokens setting: exceeds plausible range",
+			"env", EnvMaxOutputTokens, "value", raw, "using", DefaultMaxOutputTokens)
+		return DefaultMaxOutputTokens
+	}
+	return n
+}
 
 // tokenMetricsPath resolves DEEPAI_TOKEN_METRICS to a JSONL output path:
 // empty when unset, the default temp-dir file for a truthy flag, or the value

@@ -26,6 +26,23 @@ type RunResult struct {
 	Usage       *Usage           `json:"usage,omitempty"`
 }
 
+// DefaultMaxOutputTokens is the fallback max output tokens applied to both
+// the main (interactive REPL) agent and every subagent's LLM calls, in place
+// of each provider's own default (8192 for Anthropic — see anthropic.go's
+// buildMessageParams). That default is easy to exceed while streaming a
+// single large tool-call argument (e.g. a design document's markdown passed
+// inline to docx_write): the provider cuts the response off mid-string once
+// it hits the limit, and the truncated JSON then fails to parse.
+//
+// This is only the fallback: an explicit DEEPAI_MAX_OUTPUT_TOKENS setting
+// wins over it (see ResolveMaxOutputTokens in config_env.go). Both
+// pkg/commands/chat.go's subagent wiring and pkg/chat/repl.go's main-agent
+// wiring must set MaxTokens by calling ResolveMaxOutputTokens, never a
+// separate literal or a direct read of this constant, or the two can
+// silently drift apart the way they did before this was introduced (the
+// main agent had no override at all).
+const DefaultMaxOutputTokens = 16384
+
 // AgentConfig holds the dependencies required to construct an agent.
 type AgentConfig struct {
 	LLMProvider     llm.LLMProvider
