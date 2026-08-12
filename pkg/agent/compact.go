@@ -370,12 +370,20 @@ func compactAssistantText(content string) string {
 // re-compacting the same tail every turn forever.
 func summarizeOldToolResult(msg models.Message) string {
 	if isSummarizedToolResult(msg.Content) {
+		// Sessions compacted by the buggy version carry nested placeholders
+		// whose payload is already gone — 300 bytes of "[tool result:
+		// read_file, [tool result: read_file, …" per message, ~110k tokens of
+		// pure noise across the session that started this investigation. They
+		// cannot be repaired, but they can stop costing context: collapse them
+		// to one honest line. A single-level summary is left exactly as is,
+		// which is what keeps this function idempotent.
+		if strings.Count(msg.Content, summarizedToolResultPrefix) > 1 {
+			return fmt.Sprintf("%s%s, content lost to an earlier compaction bug]",
+				summarizedToolResultPrefix, toolNameOf(msg))
+		}
 		return msg.Content
 	}
-	toolName := "unknown"
-	if msg.ToolResult != nil {
-		toolName = msg.ToolResult.ToolName
-	}
+	toolName := toolNameOf(msg)
 	// truncateRuneSafe, not a raw byte slice: cutting mid-rune emits invalid
 	// UTF-8, which strict providers reject outright (same reason aging.go uses
 	// it — CJK tool output makes this the common case, not the edge case).
@@ -383,12 +391,23 @@ func summarizeOldToolResult(msg models.Message) string {
 	return fmt.Sprintf("%s%s, %s...]", summarizedToolResultPrefix, toolName, content)
 }
 
+// toolNameOf names the tool a result came from, for summaries and markers.
+func toolNameOf(msg models.Message) string {
+	if msg.ToolResult != nil && msg.ToolResult.ToolName != "" {
+		return msg.ToolResult.ToolName
+	}
+	return "unknown"
+}
+
 // isSummarizedToolResult reports whether content is already the output of
-// summarizeOldToolResult. Matching both ends keeps a genuine tool result that
-// merely happens to start with the prefix from being mistaken for a summary.
+// summarizeOldToolResult — either a truncated summary or the collapsed marker
+// for a legacy nested one. Requiring the closing bracket as well as the prefix
+// keeps a genuine tool result that merely happens to start with those bytes
+// from being mistaken for a summary; if one ever does slip through, the only
+// consequence is that it is left verbatim instead of being truncated.
 func isSummarizedToolResult(content string) bool {
 	return strings.HasPrefix(content, summarizedToolResultPrefix) &&
-		strings.HasSuffix(content, "...]")
+		strings.HasSuffix(content, "]")
 }
 
 func resolveCompactionThreshold(v float64) float64 {
