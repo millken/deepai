@@ -211,3 +211,81 @@ func TestWriteThenFormat_SecondIdenticalCallReportsNothingChanged(t *testing.T) 
 		t.Errorf("second identical call's Applied = %v, want empty: docDefaults and every shadowing style already carry the requested value", second.Applied)
 	}
 }
+
+// TestWriteThenFormat_FiveNewFieldsSecondIdenticalCallIsIdempotent pins task
+// 8 review's item 8 requirement: running the FIVE new whole-document fields
+// (BodyEastAsiaFont, FirstLineIndentChars, SpaceBeforePt, SpaceAfterPt,
+// LineSpacingExactPt) together a second time with identical FormatOptions
+// must report an empty Applied AND leave word/styles.xml byte-for-byte
+// identical to what the first call produced — not just "Applied is empty"
+// (which F1's per-attribute fix could satisfy while still silently
+// rewriting bytes that already matched), but the actual on-disk bytes
+// staying put, the same "second call is a true no-op" guarantee
+// TestWriteThenFormat_SecondIdenticalCallReportsNothingChanged already
+// pins for the FIRST four fields (BodyFont/BodySizePt/LineSpacing/Align).
+func TestWriteThenFormat_FiveNewFieldsSecondIdenticalCallIsIdempotent(t *testing.T) {
+	md := "# Title\n\nSome body text here.\n\n## Section\n\nMore body text.\n"
+	d, _, _ := writeAndReopen(t, md)
+	opts := FormatOptions{
+		BodyEastAsiaFont:     "SimSun",
+		FirstLineIndentChars: 2,
+		SpaceBeforePt:        6,
+		SpaceAfterPt:         12,
+		LineSpacingExactPt:   24,
+	}
+
+	first, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("first Format: %v", err)
+	}
+	if len(first.Applied) == 0 {
+		t.Fatal("first call's Applied is empty; none of the five new fields ever took effect")
+	}
+	stylesAfterFirst := stylesXML(t, d)
+	docAfterFirst, _ := d.Part(DocumentPart)
+	docAfterFirstStr := string(docAfterFirst)
+
+	second, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("second Format: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("second identical call's Applied = %v, want empty", second.Applied)
+	}
+	stylesAfterSecond := stylesXML(t, d)
+	if stylesAfterFirst != stylesAfterSecond {
+		t.Errorf("word/styles.xml changed on the second identical call:\nfirst:  %s\nsecond: %s", stylesAfterFirst, stylesAfterSecond)
+	}
+	docAfterSecond, _ := d.Part(DocumentPart)
+	if docAfterFirstStr != string(docAfterSecond) {
+		t.Error("word/document.xml changed on the second identical call (these fields never touch it, but pin it anyway)")
+	}
+}
+
+// TestWriteThenFormat_TemplateWithLineSpacingExactPtDoesNotFalselyConflict
+// is review F5's red test: corporate (which sets LineSpacing: 1.15) plus an
+// explicit LineSpacingExactPt used to merge into BOTH fields non-zero
+// (mergeFormatOptions filled LineSpacing in from the template because the
+// caller's own LineSpacing was still at its zero value), tripping
+// validateAlignAndLineSpacingMutex's mutual-exclusion check even though the
+// caller only ever explicitly asked for ONE of the two. LineSpacing/
+// LineSpacingExactPt are now merged as a pair: explicit wins for the whole
+// pair, not per-field.
+func TestWriteThenFormat_TemplateWithLineSpacingExactPtDoesNotFalselyConflict(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "Some body text.\n")
+	res, err := d.Format(FormatOptions{Template: "corporate", LineSpacingExactPt: 20})
+	if err != nil {
+		t.Fatalf("Format(template=corporate, line_spacing_exact_pt=20): %v", err)
+	}
+	if len(res.Applied) == 0 {
+		t.Fatal("Applied is empty; the exact line spacing never took effect")
+	}
+	dd := stylesXML(t, d)
+	dd = dd[strings.Index(dd, "<w:docDefaults>"):strings.Index(dd, "</w:docDefaults>")]
+	if !strings.Contains(dd, `w:line="400"`) || !strings.Contains(dd, `w:lineRule="exact"`) {
+		t.Errorf("docDefaults lacks w:line=400/w:lineRule=exact (20pt exact, not corporate's own 1.15 multiple): %s", dd)
+	}
+	if strings.Contains(dd, `w:lineRule="auto"`) {
+		t.Errorf("docDefaults still carries corporate's own auto line spacing; explicit line_spacing_exact_pt must win outright: %s", dd)
+	}
+}

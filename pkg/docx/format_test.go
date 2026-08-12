@@ -55,7 +55,7 @@ func TestFormat_BodySizeLandsInDocDefaultsAndSyncsSzCs(t *testing.T) {
 // and a literal w:ascii added beside it is ignored by Word — the theme wins.
 // It also pins task 8's follow-on fix: HeadingFont on its own no longer
 // touches eastAsia/eastAsiaTheme/cs/cstheme at all (that pair is
-// EastAsiaFont's own job — see TestFormat_HeadingFontWithEastAsiaFont
+// BodyEastAsiaFont's own job — see TestFormat_HeadingFontWithBodyEastAsiaFont
 // below), so those two *Theme attributes are expected to SURVIVE here.
 func TestFormat_HeadingFontRemovesThemeAttributes(t *testing.T) {
 	d, _ := formatDoc(t)
@@ -76,12 +76,12 @@ func TestFormat_HeadingFontRemovesThemeAttributes(t *testing.T) {
 	}
 }
 
-// TestFormat_HeadingFontWithEastAsiaFont covers HeadingFont+EastAsiaFont
+// TestFormat_HeadingFontWithBodyEastAsiaFont covers HeadingFont+BodyEastAsiaFont
 // given together in the SAME call: only then does the heading's own
 // eastAsia font/theme get replaced too (task 8 brief; task 7 复审遗留).
-func TestFormat_HeadingFontWithEastAsiaFont(t *testing.T) {
+func TestFormat_HeadingFontWithBodyEastAsiaFont(t *testing.T) {
 	d, _ := formatDoc(t)
-	if _, err := d.Format(FormatOptions{HeadingFont: "Georgia", EastAsiaFont: "SimSun"}); err != nil {
+	if _, err := d.Format(FormatOptions{HeadingFont: "Georgia", BodyEastAsiaFont: "SimSun"}); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	s := stylesXML(t, d)
@@ -282,7 +282,7 @@ func TestFormat_NoOptionsIsANoOp(t *testing.T) {
 // against the pristine fixture.
 //
 // styles.xml's hash/length were re-captured a THIRD time for task 8:
-// HeadingFont alone (given here, with no EastAsiaFont) no longer touches
+// HeadingFont alone (given here, with no BodyEastAsiaFont) no longer touches
 // eastAsia/cs at all (see planHeadingFontPatches' own doc comment) — this
 // fixture's nine Heading1-9 styles each keep their original
 // eastAsiaTheme="majorEastAsia"/cstheme="majorBidi" instead of having them

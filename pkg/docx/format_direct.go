@@ -43,6 +43,9 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 	if err := validateAlignAndLineSpacingMutex(opts.Align, opts.LineSpacing, opts.LineSpacingExactPt); err != nil {
 		return FormatResult{}, err
 	}
+	if err := validateNonNegativeMeasurements(opts); err != nil {
+		return FormatResult{}, err
+	}
 
 	total := d.TotalParas()
 	from := opts.StartPara
@@ -70,7 +73,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 
 	var result FormatResult
 
-	wantsRunFormat := opts.BodyFont != "" || opts.BodySizePt != 0 || opts.EastAsiaFont != ""
+	wantsRunFormat := opts.BodyFont != "" || opts.BodySizePt != 0 || opts.BodyEastAsiaFont != ""
 	if wantsRunFormat {
 		emptyCount := 0
 		for _, p := range paras {
@@ -79,7 +82,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			}
 		}
 
-		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.EastAsiaFont, opts.BodySizePt)
+		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.BodyEastAsiaFont, opts.BodySizePt)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct run formatting: %w", err)
 		}
@@ -95,9 +98,9 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, n))
 		}
-		if opts.EastAsiaFont != "" {
+		if opts.BodyEastAsiaFont != "" {
 			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.EastAsiaFont, n))
+				"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.BodyEastAsiaFont, n))
 		}
 		if opts.BodySizePt != 0 {
 			result.Applied = append(result.Applied, fmt.Sprintf(
@@ -321,7 +324,7 @@ func buildRunRPr(rprAttrs []xml.Attr, font, eastAsiaFont string, sizePt float64)
 	var b strings.Builder
 	b.WriteString(buildTag("rPr", rprAttrs, false))
 	if font != "" || eastAsiaFont != "" {
-		b.WriteString(buildTag("rFonts", rFontsDirectRangeAttrs(nil, font, eastAsiaFont), true))
+		b.WriteString(buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(nil, font, eastAsiaFont), true))
 	}
 	if sizePt != 0 {
 		half := ptToHalfPoints(sizePt)
@@ -330,32 +333,6 @@ func buildRunRPr(rprAttrs []xml.Attr, font, eastAsiaFont string, sizePt float64)
 	}
 	b.WriteString("</w:rPr>")
 	return b.String()
-}
-
-// rFontsDirectRangeAttrs is the paragraph-range direct-formatting path's
-// font-attrs builder. When eastAsiaFont is "" it reduces EXACTLY to
-// rFontsLiteralAttrs(existing, latinFont) — this path's pre-existing,
-// tested behavior (literal ascii/hAnsi/eastAsia/cs all set to the same
-// font) is left completely unchanged, since EastAsiaFont's whole point
-// (task 8 brief) is to be new, additive, opt-in behavior, never a silent
-// change to what body_font alone already did on a range before
-// EastAsiaFont existed. When eastAsiaFont is non-"", it is applied AFTER,
-// overriding just w:eastAsia (and dropping eastAsiaTheme) — so
-// latinFont != "" && eastAsiaFont != "" together yields ascii/hAnsi/cs =
-// latinFont, eastAsia = eastAsiaFont (the orthogonal-but-combinable
-// outcome BodyFont/EastAsiaFont's own doc comments describe), and
-// eastAsiaFont alone (latinFont == "") leaves ascii/hAnsi/cs completely
-// untouched, only setting eastAsia.
-func rFontsDirectRangeAttrs(existing []xml.Attr, latinFont, eastAsiaFont string) []xml.Attr {
-	attrs := existing
-	if latinFont != "" {
-		attrs = rFontsLiteralAttrs(attrs, latinFont)
-	}
-	if eastAsiaFont != "" {
-		attrs = dropAttrs(attrs, "eastAsiaTheme", "eastAsia")
-		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "eastAsia"}, Value: eastAsiaFont})
-	}
-	return attrs
 }
 
 // planRunRPrPatches builds the patches for one run's direct font/size
@@ -385,7 +362,7 @@ func planRunRPrPatches(doc []byte, openEnd int, rpr elemInfo, children map[strin
 	if rpr.selfClosing {
 		return []Patch{PatchRawSpan(doc, rpr.tagSpan, buildRunRPr(rpr.attrs, font, eastAsiaFont, sizePt))}
 	}
-	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, children, font, eastAsiaFont, sizePt, rFontsDirectRangeAttrs)
+	return planRPrFontSizePatches(doc, rpr.closeStart, children, font, eastAsiaFont, sizePt, rFontsLatinAndEastAsiaAttrs)
 }
 
 // planParaPPrPatches is planRunRPrPatches's paragraph-level twin: the same

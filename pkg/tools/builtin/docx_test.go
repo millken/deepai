@@ -1419,7 +1419,7 @@ func TestDocxFormat_RejectsWrongTypedFields(t *testing.T) {
 		{"body_size_pt not a number", map[string]any{"body_size_pt": "big"}},
 		{"line_spacing not a number", map[string]any{"line_spacing": "double"}},
 		{"line_spacing_exact_pt not a number", map[string]any{"line_spacing_exact_pt": "double"}},
-		{"east_asia_font not a string", map[string]any{"east_asia_font": float64(1)}},
+		{"body_east_asia_font not a string", map[string]any{"body_east_asia_font": float64(1)}},
 		{"first_line_indent_chars not a number", map[string]any{"first_line_indent_chars": "two"}},
 		{"space_before_pt not a number", map[string]any{"space_before_pt": "six"}},
 		{"space_after_pt not a number", map[string]any{"space_after_pt": "six"}},
@@ -1471,6 +1471,45 @@ func TestDocxFormat_RejectsBadMarginsMM(t *testing.T) {
 				"rules": map[string]any{"margins_mm": tt.mm},
 			}); err == nil {
 				t.Fatalf("margins_mm=%v was accepted", tt.mm)
+			}
+		})
+	}
+}
+
+// TestDocxFormat_RejectsNonPositiveNewMeasurementFields is review F6's red
+// test: first_line_indent_chars/space_before_pt/space_after_pt/
+// line_spacing_exact_pt must reject an EXPLICITLY-sent zero or negative
+// value, with the field's own name in the error — this layer, unlike
+// pkg/docx's own FormatOptions (where 0 is indistinguishable from "not
+// requested"), can tell the caller actually sent the key, so it holds
+// these four to a stricter rule than a bare "must not be negative".
+func TestDocxFormat_RejectsNonPositiveNewMeasurementFields(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		val  float64
+	}{
+		{"first_line_indent_chars zero", "first_line_indent_chars", 0},
+		{"first_line_indent_chars negative", "first_line_indent_chars", -2},
+		{"space_before_pt zero", "space_before_pt", 0},
+		{"space_before_pt negative", "space_before_pt", -6},
+		{"space_after_pt zero", "space_after_pt", 0},
+		{"space_after_pt negative", "space_after_pt", -12},
+		{"line_spacing_exact_pt zero", "line_spacing_exact_pt", 0},
+		{"line_spacing_exact_pt negative", "line_spacing_exact_pt", -24},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			_, err := callDocxFormat(t, map[string]any{
+				"path":  p,
+				"rules": map[string]any{tt.key: tt.val},
+			})
+			if err == nil {
+				t.Fatalf("rules.%s = %g was accepted; want an error", tt.key, tt.val)
+			}
+			if !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("error %q does not name the field %q", err.Error(), tt.key)
 			}
 		})
 	}
@@ -1851,7 +1890,7 @@ func TestDocxFormat_WithoutRangeRemainsDocumentWide(t *testing.T) {
 	}
 }
 
-// --- Task 8: align center/right, east_asia_font, first_line_indent_chars,
+// --- Task 8: align center/right, body_east_asia_font, first_line_indent_chars,
 // space_before_pt/space_after_pt, line_spacing_exact_pt, end to end through
 // the tool layer ---
 
@@ -1883,16 +1922,16 @@ func TestDocxFormat_AlignCenterAndRightAppliedDocumentWide(t *testing.T) {
 	}
 }
 
-// TestDocxFormat_EastAsiaFontOrthogonalToBodyFont pins EastAsiaFont's own
+// TestDocxFormat_BodyEastAsiaFontOrthogonalToBodyFont pins BodyEastAsiaFont's own
 // contract at the tool layer: body_font alone must leave docDefaults'
-// eastAsia font untouched, and east_asia_font alone must leave ascii/hAnsi
+// eastAsia font untouched, and body_east_asia_font alone must leave ascii/hAnsi
 // untouched — the fix for "中文宋体+西文 Times 表达不了" (format capability
 // review, Important 8).
-func TestDocxFormat_EastAsiaFontOrthogonalToBodyFont(t *testing.T) {
+func TestDocxFormat_BodyEastAsiaFontOrthogonalToBodyFont(t *testing.T) {
 	p := docxFixture(t, "outline.docx")
 	res, err := callDocxFormat(t, map[string]any{
 		"path":  p,
-		"rules": map[string]any{"body_font": "Georgia", "east_asia_font": "SimSun"},
+		"rules": map[string]any{"body_font": "Georgia", "body_east_asia_font": "SimSun"},
 	})
 	if err != nil {
 		t.Fatalf("DocxFormatHandler: %v", err)
@@ -2027,7 +2066,7 @@ func TestDocxFormat_RangeAppliesNewTask8FieldsDirectly(t *testing.T) {
 		"start_para": float64(2),
 		"end_para":   float64(2),
 		"rules": map[string]any{
-			"east_asia_font":          "SimSun",
+			"body_east_asia_font":     "SimSun",
 			"first_line_indent_chars": float64(2),
 			"space_before_pt":         float64(6),
 			"space_after_pt":          float64(12),

@@ -653,9 +653,9 @@ func DocxFormatTool() models.Tool {
 					"description": "Formatting rules to apply. Every field is optional; an empty or omitted object is a no-op.",
 					"properties": map[string]any{
 						"template":     map[string]any{"type": "string", "description": "Named preset: corporate, academic, or minimal. Explicit fields below override the preset's values."},
-						"heading_font": map[string]any{"type": "string", "description": "Replaces Heading1-9's font (ascii/hAnsi only; combine with east_asia_font in the same call to also set the heading's CJK font)"},
-						"body_font":    map[string]any{"type": "string", "description": "Replaces the document's default LATIN font (ascii/hAnsi only). Orthogonal to east_asia_font — an existing CJK font survives untouched unless east_asia_font is also given."},
-						"east_asia_font": map[string]any{
+						"heading_font": map[string]any{"type": "string", "description": "Replaces Heading1-9's font (ascii/hAnsi only; combine with body_east_asia_font in the same call to also set the heading's CJK font)"},
+						"body_font":    map[string]any{"type": "string", "description": "Replaces the document's default LATIN font (ascii/hAnsi only). Orthogonal to body_east_asia_font — an existing CJK font survives untouched unless body_east_asia_font is also given."},
+						"body_east_asia_font": map[string]any{
 							"type":        "string",
 							"description": "Replaces the document's default EAST ASIAN font only (w:eastAsia). Independent of body_font/heading_font — set it alongside either to change both the Latin and CJK font pair in one call, or alone to change only the CJK font.",
 						},
@@ -878,12 +878,12 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 		}
 		opts.BodyFont = s
 	}
-	if v, present := raw["east_asia_font"]; present && v != nil {
+	if v, present := raw["body_east_asia_font"]; present && v != nil {
 		s, ok := v.(string)
 		if !ok {
-			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.east_asia_font must be a string")
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.body_east_asia_font must be a string")
 		}
-		opts.EastAsiaFont = s
+		opts.BodyEastAsiaFont = s
 	}
 	if v, present := raw["align"]; present && v != nil {
 		s, ok := v.(string)
@@ -917,26 +917,30 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 	// mutual-exclusion RULE (both non-zero is an error) is enforced by
 	// pkg/docx (validateAlignAndLineSpacingMutex), the same domain-rule
 	// split this file's own doc comment already documents for align/
-	// template (task 8 brief's "参数校验层拒绝" requirement).
-	lineSpacingExactPt, err := docxFormatNumberArg(raw, "line_spacing_exact_pt")
+	// template (task 8 brief's "参数校验层拒绝" requirement). Unlike
+	// line_spacing (whose own positivity was never in scope here),
+	// line_spacing_exact_pt and the three fields below use
+	// docxFormatPositiveNumberArg — task 8 review F6's non-negative
+	// validation, with an error message naming the field.
+	lineSpacingExactPt, err := docxFormatPositiveNumberArg(raw, "line_spacing_exact_pt")
 	if err != nil {
 		return docx.FormatOptions{}, err
 	}
 	opts.LineSpacingExactPt = lineSpacingExactPt
 
-	firstLineIndentChars, err := docxFormatNumberArg(raw, "first_line_indent_chars")
+	firstLineIndentChars, err := docxFormatPositiveNumberArg(raw, "first_line_indent_chars")
 	if err != nil {
 		return docx.FormatOptions{}, err
 	}
 	opts.FirstLineIndentChars = firstLineIndentChars
 
-	spaceBeforePt, err := docxFormatNumberArg(raw, "space_before_pt")
+	spaceBeforePt, err := docxFormatPositiveNumberArg(raw, "space_before_pt")
 	if err != nil {
 		return docx.FormatOptions{}, err
 	}
 	opts.SpaceBeforePt = spaceBeforePt
 
-	spaceAfterPt, err := docxFormatNumberArg(raw, "space_after_pt")
+	spaceAfterPt, err := docxFormatPositiveNumberArg(raw, "space_after_pt")
 	if err != nil {
 		return docx.FormatOptions{}, err
 	}
@@ -1051,6 +1055,35 @@ func docxFormatNumberArg(raw map[string]any, key string) (float64, error) {
 	f, ok := docxAsFloat(v)
 	if !ok {
 		return 0, fmt.Errorf("docx_format: rules.%s must be a number", key)
+	}
+	return f, nil
+}
+
+// docxFormatPositiveNumberArg is docxFormatNumberArg's stricter sibling for
+// task 8's four new measurement fields (first_line_indent_chars/
+// space_before_pt/space_after_pt/line_spacing_exact_pt): none of them has a
+// sensible zero-or-negative meaning as an EXPLICIT request. docx.
+// FormatOptions' own convention treats 0 as "not requested" for every
+// numeric field (the same as BodySizePt/LineSpacing always have), but this
+// layer — unlike pkg/docx's own validateNonNegativeMeasurements — CAN tell
+// "the caller actually sent key:0" apart from "the caller omitted key
+// entirely" (raw[key]'s presence), so it holds these four fields to a
+// stricter rule: an explicitly-sent value that is zero or negative is
+// rejected outright (review F6), rather than silently becoming the same
+// no-op omitting the key would have been. A key that is absent or nil is
+// untouched (0, nil error) — exactly docxFormatNumberArg's own "not
+// requested" case.
+func docxFormatPositiveNumberArg(raw map[string]any, key string) (float64, error) {
+	v, present := raw[key]
+	if !present || v == nil {
+		return 0, nil
+	}
+	f, ok := docxAsFloat(v)
+	if !ok {
+		return 0, fmt.Errorf("docx_format: rules.%s must be a number", key)
+	}
+	if f <= 0 {
+		return 0, fmt.Errorf("docx_format: rules.%s = %g must be positive", key, f)
 	}
 	return f, nil
 }
