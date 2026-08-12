@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -642,8 +643,9 @@ func TestWrite_ListItemRunsInlineEmphasis(t *testing.T) {
 
 // --- Task 3: code blocks, inline code, links, block quotes, horizontal rules ---
 
-// A fenced code block becomes one paragraph per line, monospace, with the
-// light shading Item 1 specifies. The fence delimiters themselves are
+// A fenced code block becomes one paragraph per line, referencing the
+// SourceCode style (monospace font + light shading -- see styles.go), not
+// carrying either property inline. The fence delimiters themselves are
 // consumed, never becoming a paragraph of their own.
 func TestWrite_FencedCodeBlockUsesMonospaceAndShading(t *testing.T) {
 	d, _, _ := writeAndReopen(t, "```\nfunc main() {}\n```\n")
@@ -660,11 +662,16 @@ func TestWrite_FencedCodeBlockUsesMonospaceAndShading(t *testing.T) {
 	}
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
-	if !strings.Contains(s, `w:fill="F5F5F5"`) {
-		t.Error("code paragraph has no light shading")
+	if !strings.Contains(s, `<w:pStyle w:val="SourceCode"/>`) {
+		t.Error("code paragraph does not reference the SourceCode style")
 	}
-	if !strings.Contains(s, `w:ascii="Consolas"`) {
-		t.Error("code run is not in a monospace font")
+	styles, _ := d.Part("word/styles.xml")
+	sc := styleBlock(t, styles, "SourceCode")
+	if !strings.Contains(sc, `w:fill="F5F5F5"`) {
+		t.Error("SourceCode style has no light shading")
+	}
+	if !strings.Contains(sc, `w:ascii="Consolas"`) {
+		t.Error("SourceCode style is not in a monospace font")
 	}
 }
 
@@ -766,8 +773,9 @@ func TestWrite_UnterminatedFenceRunsToEndOfDocument(t *testing.T) {
 	}
 }
 
-// Inline code (backticks) becomes a monospace run, not a whole-paragraph
-// treatment -- it must sit inline among ordinary text.
+// Inline code (backticks) becomes a monospace run via the VerbatimChar
+// character style, not a whole-paragraph treatment and not a direct
+// <w:rFonts> -- it must sit inline among ordinary text.
 func TestWrite_InlineCodeBecomesMonospaceRun(t *testing.T) {
 	d, _, _ := writeAndReopen(t, "before `code` after\n")
 	paras := d.Paras()
@@ -782,8 +790,13 @@ func TestWrite_InlineCodeBecomesMonospaceRun(t *testing.T) {
 		t.Errorf("visible text = %q, want backticks stripped", text.String())
 	}
 	doc, _ := d.Part(DocumentPart)
-	if !strings.Contains(string(doc), `w:ascii="Consolas"`) {
-		t.Error("inline code did not produce a monospace run")
+	if !strings.Contains(string(doc), `<w:rStyle w:val="VerbatimChar"/>`) {
+		t.Error("inline code run does not reference the VerbatimChar character style")
+	}
+	styles, _ := d.Part("word/styles.xml")
+	vc := styleBlock(t, styles, "VerbatimChar")
+	if !strings.Contains(vc, `w:ascii="Consolas"`) {
+		t.Error("VerbatimChar style is not in a monospace font")
 	}
 }
 
@@ -983,7 +996,9 @@ func TestWrite_LinkRelationshipIdsDoNotCollideWithStylesOrNumbering(t *testing.T
 	}
 }
 
-// A "> " line becomes a paragraph with a left indent and a left border.
+// A "> " line becomes a paragraph referencing the Quote style, which
+// supplies the left indent and left border (styles.go) -- neither is
+// written inline on the paragraph itself.
 func TestWrite_BlockQuoteGetsLeftBorderAndIndent(t *testing.T) {
 	d, _, _ := writeAndReopen(t, "> quoted text\n")
 	paras := d.Paras()
@@ -999,11 +1014,16 @@ func TestWrite_BlockQuoteGetsLeftBorderAndIndent(t *testing.T) {
 	}
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
-	if !strings.Contains(s, "<w:pBdr><w:left") {
-		t.Error("block quote paragraph has no left border")
+	if !strings.Contains(s, `<w:pStyle w:val="Quote"/>`) {
+		t.Error("block quote paragraph does not reference the Quote style")
 	}
-	if !strings.Contains(s, "<w:ind ") {
-		t.Error("block quote paragraph has no left indent")
+	styles, _ := d.Part("word/styles.xml")
+	q := styleBlock(t, styles, "Quote")
+	if !strings.Contains(q, "<w:pBdr><w:left") {
+		t.Error("Quote style has no left border")
+	}
+	if !strings.Contains(q, "<w:ind ") {
+		t.Error("Quote style has no left indent")
 	}
 }
 
@@ -1164,8 +1184,15 @@ func TestWrite_RealisticDesignDocumentSurvivesRoundTrip(t *testing.T) {
 	if !strings.Contains(docStr, "<w:b/>") {
 		t.Error("no bold run found anywhere (expected from **Project Zephyr**)")
 	}
-	if !strings.Contains(docStr, `w:ascii="Consolas"`) {
-		t.Error("no monospace run found anywhere (expected from `zephyr-cli` and the fenced code block)")
+	if !strings.Contains(docStr, `<w:rStyle w:val="VerbatimChar"/>`) {
+		t.Error("no inline-code run referencing VerbatimChar found (expected from `zephyr-cli`)")
+	}
+	if !strings.Contains(docStr, `<w:pStyle w:val="SourceCode"/>`) {
+		t.Error("no code-block paragraph referencing SourceCode found (expected from the fenced code block)")
+	}
+	styles, _ := d.Part("word/styles.xml")
+	if !strings.Contains(string(styles), `w:ascii="Consolas"`) {
+		t.Error("no monospace font declared anywhere in styles.xml (expected on VerbatimChar/SourceCode)")
 	}
 
 	// Nested list: two distinct texts at ilvl 1, matching the two
@@ -1274,7 +1301,158 @@ func TestWrite_RealisticDesignDocumentSurvivesRoundTrip(t *testing.T) {
 	if !foundQuote {
 		t.Error("could not find the block quote paragraph")
 	}
-	if !strings.Contains(docStr, "<w:pBdr><w:left") {
-		t.Error("no block quote left border found")
+	if !strings.Contains(docStr, `<w:pStyle w:val="Quote"/>`) {
+		t.Error("block quote paragraph does not reference the Quote style")
+	}
+	if !strings.Contains(string(styles), "<w:pBdr><w:left") {
+		t.Error("no block quote left border found in the Quote style")
+	}
+}
+
+// --- Task 2 of the docx-style-architecture plan: document.xml references
+// named styles instead of carrying visual properties inline. ---
+
+// generateAndReadDocumentXML writes md through WriteDocx and returns
+// word/document.xml as a string, the one part the core invariant below
+// inspects.
+func generateAndReadDocumentXML(t *testing.T, md string) string {
+	t.Helper()
+	d, _, _ := writeAndReopen(t, md)
+	doc, ok := d.Part(DocumentPart)
+	if !ok {
+		t.Fatal("word/document.xml missing")
+	}
+	return string(doc)
+}
+
+// TestWrite_NoInlineVisualPropertiesInDocumentXML is the core, deliberately
+// exhaustive invariant this task exists to establish: document.xml must
+// never carry a paragraph-level visual property (<w:spacing>, <w:ind>, or
+// <w:shd>) inline. Those three belong in styles.xml, referenced by name
+// (<w:pStyle>/<w:rStyle>/<w:tblStyle>), so a future change that reaches for
+// "just inline it, it's simpler" regresses this test immediately instead
+// of silently reintroducing the striped-code-block/tall-table-row/
+// gapped-list defects this architecture fixes.
+//
+// The markdown below exercises every construct that used to write one of
+// the three banned properties: a heading (pStyle only, never carried
+// spacing/ind/shd inline even before this task), an ordinary paragraph, a
+// nested list (ind used to be implicit via numbering only, but
+// ListParagraph's own <w:ind> must not leak into the paragraph itself), a
+// block quote (pBdr+ind moved to Quote), a fenced code block (shd+spacing+
+// ind moved to SourceCode), and a table (cell paragraphs must not carry
+// spacing either, and TableGrid's own pPr must not leak into document.xml).
+func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
+	md := "# H\n\nBody.\n\n- a\n    - b\n\n> quote\n\n```\ncode\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n"
+	x := generateAndReadDocumentXML(t, md)
+	for _, banned := range []string{"<w:spacing", "<w:ind ", "<w:shd"} {
+		if strings.Contains(x, banned) {
+			t.Errorf("%s appears inline in document.xml; paragraph-level visual "+
+				"properties belong in styles.xml", banned)
+		}
+	}
+}
+
+// TestWrite_InvariantAllowsThreeNamedExceptions pins the three allowances
+// the plan calls out BY NAME as structural or per-document data, not
+// styling, and therefore deliberately exempt from the ban above --
+// checking they are present (not merely that the banned strings are
+// absent) so this test cannot pass vacuously by, say, a change that
+// happens to stop emitting numPr/tblW/jc altogether:
+//
+//   - <w:numPr>: attaches a list item to a numbering definition --
+//     structure, not styling.
+//   - <w:tblW>/<w:gridCol>: column widths depend on each table's column
+//     count and the page geometry, so they cannot live in a shared style.
+//   - <w:jc> on a table cell: GFM's per-column alignment is data the
+//     author wrote, not a style decision.
+func TestWrite_InvariantAllowsThreeNamedExceptions(t *testing.T) {
+	md := "- a\n\n| x | y |\n|---|:---:|\n| 1 | 2 |\n"
+	x := generateAndReadDocumentXML(t, md)
+	if !strings.Contains(x, "<w:numPr>") {
+		t.Error("no <w:numPr> found; the list-item allowance is untested")
+	}
+	if !strings.Contains(x, "<w:tblW ") {
+		t.Error("no <w:tblW> found; the table-width allowance is untested")
+	}
+	if !strings.Contains(x, "<w:gridCol ") {
+		t.Error("no <w:gridCol> found; the column-width allowance is untested")
+	}
+	if !strings.Contains(x, `<w:jc w:val="center"/>`) {
+		t.Error("no <w:jc> found; the table-cell-alignment allowance is untested")
+	}
+}
+
+// TestWrite_EveryConstructReferencesItsStyle is Step 3's "观感回归测试": a
+// realistic document exercising headings, an ordinary paragraph, a nested
+// list, a block quote, a fenced code block, a table, and a link, checked
+// against the brief's mapping table -- every code-line paragraph
+// references SourceCode, every list item references ListParagraph AND
+// still carries numPr, the table references TableGrid with column widths
+// still summing exactly to the content width, inline code references
+// VerbatimChar, and a link's text references Hyperlink. The document must
+// also still reopen through this package's own reader and survive every
+// docx_format rule (the compose guarantee), proving the style-reference
+// switch did not just satisfy a string check while breaking something an
+// independent reader or downstream tool would notice.
+func TestWrite_EveryConstructReferencesItsStyle(t *testing.T) {
+	md := "# Design Doc\n\n" +
+		"Body text with `inline code` and a [link](https://example.com/x).\n\n" +
+		"- top item\n" +
+		"  - nested item\n\n" +
+		"> a quoted line\n\n" +
+		"```\nline one\nline two\n```\n\n" +
+		"| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n"
+
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+
+	if got, want := strings.Count(s, `<w:pStyle w:val="SourceCode"/>`), 2; got != want {
+		t.Errorf("SourceCode pStyle count = %d, want %d (one per code line)", got, want)
+	}
+	if got, want := strings.Count(s, `<w:pStyle w:val="ListParagraph"/>`), 2; got != want {
+		t.Errorf("ListParagraph pStyle count = %d, want %d (one per list item)", got, want)
+	}
+	if got, want := strings.Count(s, "<w:numPr>"), 2; got != want {
+		t.Errorf("numPr count = %d, want %d (list items must keep numPr alongside the style)", got, want)
+	}
+	if !strings.Contains(s, `<w:pStyle w:val="Quote"/>`) {
+		t.Error("block quote paragraph does not reference Quote")
+	}
+	if !strings.Contains(s, `<w:tblStyle w:val="TableGrid"/>`) {
+		t.Error("table does not reference TableGrid")
+	}
+	if !strings.Contains(s, `<w:rStyle w:val="VerbatimChar"/>`) {
+		t.Error("inline code run does not reference VerbatimChar")
+	}
+	if !strings.Contains(s, `<w:rStyle w:val="Hyperlink"/>`) {
+		t.Error("link run does not reference Hyperlink")
+	}
+
+	want := contentWidthFromSectPr(t, s)
+	gridStart := strings.Index(s, "<w:tblGrid>")
+	gridEnd := strings.Index(s, "</w:tblGrid>")
+	if gridStart < 0 || gridEnd < 0 {
+		t.Fatal("no <w:tblGrid> found")
+	}
+	cols := gridRE.FindAllStringSubmatch(s[gridStart:gridEnd], -1)
+	if len(cols) != 3 {
+		t.Fatalf("got %d gridCol entries, want 3", len(cols))
+	}
+	sum := 0
+	for _, c := range cols {
+		n, _ := strconv.Atoi(c[1])
+		sum += n
+	}
+	if sum != want {
+		t.Errorf("table gridCol widths sum to %d, want the content width %d", sum, want)
+	}
+
+	// The compose guarantee: every docx_format rule must still work on this
+	// document, not just on the narrower fixtures write_format_compose_test.go
+	// already covers.
+	if _, err := d.Format(FormatOptions{BodyFont: "Calibri", BodySizePt: 13, LineSpacing: 1.5, Align: "justify"}); err != nil {
+		t.Errorf("Format failed on a document exercising every construct: %v", err)
 	}
 }

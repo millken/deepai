@@ -126,7 +126,7 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 		{name: "_rels/.rels", data: []byte(buildRootRelsXML(hasTitle))},
 		{name: DocumentPart, data: []byte(body.String())},
 		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels))},
-		{name: "word/styles.xml", data: []byte(stylesPartXML)},
+		{name: "word/styles.xml", data: buildStylesXML()},
 		{name: "word/numbering.xml", data: []byte(numberingXML)},
 	}
 	if hasTitle {
@@ -783,7 +783,7 @@ func cellAlign(s string) string {
 func renderTable(tb *tableBlock, ctx *renderCtx) (string, int, error) {
 	var out strings.Builder
 	out.WriteString("<w:tbl>")
-	out.WriteString(tableBordersXML)
+	out.WriteString(tableTblPrXML)
 	out.WriteString("<w:tblGrid>")
 	for _, w := range tableColumnWidthsTwips(tb.cols) {
 		fmt.Fprintf(&out, `<w:gridCol w:w="%d"/>`, w)
@@ -838,25 +838,30 @@ func tableColumnWidthsTwips(cols int) []int {
 	return widths
 }
 
-// tableBordersXML is the <w:tblPr> every generated table shares: a single
-// thin border on every edge and between every cell, sized to the full
-// content width (w:type="pct" with w:w="5000", OOXML's fiftieths-of-a-
-// percent unit for exactly 100%) rather than the "0"/"auto" this package
-// used to write. "auto" told Word the width was nonbinding and it was free
-// to shrink columns below even their already-too-narrow <w:tblGrid>
-// values to fit cell content — the direct cause of the user's cells
-// wrapping after two or three characters. <w:tblLayout w:type="fixed"/>
-// goes further and turns off Word's content-based autofit algorithm
-// entirely, so the widths tableColumnWidthsTwips computed are the ones
-// Word actually draws, not merely a hint it may override.
-const tableBordersXML = `<w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblLayout w:type="fixed"/><w:tblBorders>` +
-	`<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
-	`</w:tblBorders></w:tblPr>`
+// tableTblPrXML is the <w:tblPr> every generated table shares. Its border
+// declaration used to be written here too (a literal <w:tblBorders>
+// repeated on every table this package ever generates) until Task 2 of the
+// docx-style-architecture plan: TableGrid (styles.go) is now a w:type="table"
+// style carrying that exact same tblBorders in its own <w:tblPr>, and
+// <w:tblStyle w:val="TableGrid"/> below pulls it in by reference. Writing
+// tblBorders again here on top of that would be the identical duplication
+// this task exists to remove — one visual property (the border), two
+// sources of truth. Referencing TableGrid also pulls in its <w:pPr>
+// (spacing after="0"), which zeroes every cell paragraph's spacing and is
+// the actual fix for the tall table rows the user saw: a table style's own
+// pPr cascades to the paragraphs inside its cells without those paragraphs
+// needing any pStyle of their own.
+//
+// <w:tblW> (full content width, pct 5000 = 100%) and <w:tblLayout
+// w:type="fixed"/> (turns off Word's content-based column autofit) stay
+// here rather than moving into TableGrid: unlike a border or a spacing
+// rule, they are not shared, table-independent visual choices -- <w:tblW>
+// is set to a percentage that is the same for every table regardless of
+// column count, but page geometry (contentWidthTwips) is still something
+// only this per-table render call knows about, same reasoning as
+// <w:tblGrid>'s own <w:gridCol> widths below.
+const tableTblPrXML = `<w:tblPr><w:tblStyle w:val="` + StyleTableGrid + `"/>` +
+	`<w:tblW w:w="5000" w:type="pct"/><w:tblLayout w:type="fixed"/></w:tblPr>`
 
 // ---------------------------------------------------------------------------
 // Inline emphasis (bold/italic)
@@ -1060,18 +1065,30 @@ func (c *renderCtx) addLink(url string) string {
 	return id
 }
 
-// renderParagraph renders one paraBlock as a <w:p> element. Its <w:pPr>
-// (when non-empty) carries, in CT_PPr's fixed schema order, the heading's
-// <w:pStyle>, a list item's <w:numPr>, a block-quote or horizontal-rule's
-// <w:pBdr>, a code paragraph's <w:shd>, and finally a table cell's <w:jc>.
-// This package never combines more than one or two of these on a single
-// paragraph in practice, but emitting them in schema order keeps the
-// output valid even if it did.
+// renderParagraph renders one paraBlock as a <w:p> element. Per the
+// docx-style-architecture plan's Task 2, its <w:pPr> (when non-empty) no
+// longer carries any paragraph-level visual property directly (no
+// <w:spacing>, <w:ind>, or <w:shd> — see
+// TestWrite_NoInlineVisualPropertiesInDocumentXML): every construct that
+// used to write one now references a named style in styles.go instead,
+// which carries the same property. In CT_PPr's fixed schema order, that is
+// a heading/list/quote/code paragraph's single mutually-exclusive
+// <w:pStyle>, a list item's <w:numPr>, a horizontal-rule's <w:pBdr>, and
+// finally a table cell's <w:jc>. This package never combines more than one
+// or two of these on a single paragraph in practice, but emitting them in
+// schema order keeps the output valid even if it did.
+//
+// <w:pBdr> survives inline only for isHR: a horizontal rule is a one-off
+// empty paragraph, never repeated as a shared visual identity the way
+// SourceCode/Quote/ListParagraph/TableGrid are, so there is no shared style
+// for it to move into, and the plan's invariant does not ban <w:pBdr>
+// (only <w:spacing>/<w:ind>/<w:shd>).
 //
 // forceBold ORs bold onto every inline segment (used for a table header
 // row) regardless of the markdown markers parseInline already resolved.
 // isCode paragraphs skip parseInline entirely — the whole line becomes one
-// literal, monospace segment — which is how Item 1's "markdown is not
+// literal segment, monospace via pStyle="SourceCode" rather than a direct
+// <w:rFonts> on the run — which is how Item 1's "markdown is not
 // interpreted inside a fenced code block" is enforced structurally rather
 // than by convention. isHR paragraphs carry no runs at all: text is never
 // even looked at when isHR is set, since a horizontal rule is exactly one
@@ -1093,14 +1110,35 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		}
 	}
 
-	runsXML, err := renderRuns(segs, ctx)
+	// b.isCode tells renderRuns/renderRun not to also add a run-level
+	// <w:rStyle w:val="VerbatimChar"/> to this paragraph's own segment: the
+	// monospace font already comes from pStyle="SourceCode" below, cascading
+	// from the style's own <w:rPr> to every run in a paragraph of that
+	// style. VerbatimChar is reserved for genuine INLINE code -- a `code`
+	// span sitting inside an otherwise ordinary paragraph -- per the plan's
+	// mapping ("行内代码 → VerbatimChar"); applying it here too would be
+	// harmless (same font) but a second, redundant source of the same
+	// formatting, which is exactly the duplication this task removes.
+	runsXML, err := renderRuns(segs, ctx, b.isCode)
 	if err != nil {
 		return "", err
 	}
 
 	var pPr strings.Builder
-	if b.heading > 0 {
+	// pStyle is the one paragraph-level style reference every non-plain
+	// paragraph carries; buildBlocks never sets more than one of
+	// heading/isList/isQuote/isCode on the same paraBlock (see the
+	// paraBlock doc comment), so this is a genuine mutual exclusion, not
+	// merely an order-of-precedence choice.
+	switch {
+	case b.heading > 0:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="Heading%d"/>`, b.heading)
+	case b.isList:
+		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleListParagraph)
+	case b.isQuote:
+		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleQuote)
+	case b.isCode:
+		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleSourceCode)
 	}
 	if b.isList {
 		numID := bulletNumID
@@ -1109,25 +1147,8 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		}
 		fmt.Fprintf(&pPr, `<w:numPr><w:ilvl w:val="%d"/><w:numId w:val="%d"/></w:numPr>`, b.listLevel, numID)
 	}
-	switch {
-	case b.isQuote:
-		pPr.WriteString(blockquoteBorderXML)
-	case b.isHR:
+	if b.isHR {
 		pPr.WriteString(hrBorderXML)
-	}
-	if b.isCode {
-		// Shading before spacing before ind matches CT_PPr's fixed schema
-		// order (pBdr, shd, spacing, ind, jc) -- the same "even though this
-		// package rarely combines them" discipline as everywhere else in
-		// this function.
-		pPr.WriteString(codeShadingXML)
-		pPr.WriteString(codeSpacingXML)
-	}
-	switch {
-	case b.isQuote:
-		pPr.WriteString(blockquoteIndentXML)
-	case b.isCode:
-		pPr.WriteString(codeIndentXML)
 	}
 	switch b.jc {
 	case "left", "center", "right":
@@ -1154,13 +1175,17 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 // one each. ctx.addLink is called exactly once per such run, which is what
 // keeps relationship ids allocated once per link occurrence rather than
 // once per segment within it.
-func renderRuns(segs []segment, ctx *renderCtx) (string, error) {
+//
+// codeBlockLine is threaded straight through to renderRun for every
+// segment: see renderParagraph's call site for why a fenced-code-block
+// paragraph's own segment must NOT also pick up VerbatimChar.
+func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, error) {
 	var out strings.Builder
 	i := 0
 	for i < len(segs) {
 		seg := segs[i]
 		if seg.link == "" {
-			r, err := renderRun(seg)
+			r, err := renderRun(seg, codeBlockLine)
 			if err != nil {
 				return "", err
 			}
@@ -1172,7 +1197,7 @@ func renderRuns(segs []segment, ctx *renderCtx) (string, error) {
 		j := i
 		var inner strings.Builder
 		for j < len(segs) && segs[j].link == url {
-			r, err := renderRun(segs[j])
+			r, err := renderRun(segs[j], codeBlockLine)
 			if err != nil {
 				return "", err
 			}
@@ -1274,10 +1299,20 @@ func decodeHTMLEntities(s string) string {
 // survives.
 //
 // <w:rPr> children are emitted in CT_RPr's schema order: rStyle (a link's
-// Hyperlink character style) before rFonts (a code segment's monospace
-// font) before b/i, matching the same "schema order even though this
-// package rarely combines them" reasoning as renderParagraph's <w:pPr>.
-func renderRun(seg segment) (string, error) {
+// Hyperlink character style, or an inline code span's VerbatimChar
+// character style) before rFonts (the one narrow case that still needs a
+// direct font — see below) before b/i, matching the same "schema order
+// even though this package rarely combines them" reasoning as
+// renderParagraph's <w:pPr>.
+//
+// codeBlockLine is true only when this run is one line of a fenced code
+// block (renderParagraph passes b.isCode straight through) — never for a
+// `code` span inline inside an ordinary paragraph. It suppresses the
+// VerbatimChar rStyle below, because a code-block paragraph already gets
+// its monospace font from pStyle="SourceCode" (styles.go's rPr cascades to
+// every run in a paragraph of that style); adding VerbatimChar there too
+// would be a second, redundant source of the identical formatting.
+func renderRun(seg segment, codeBlockLine bool) (string, error) {
 	if seg.text == "" {
 		return "", nil
 	}
@@ -1291,11 +1326,24 @@ func renderRun(seg segment) (string, error) {
 	}
 
 	var rPr strings.Builder
-	if seg.link != "" {
+	switch {
+	case seg.link != "":
 		rPr.WriteString(`<w:rStyle w:val="Hyperlink"/>`)
-	}
-	if seg.code {
-		rPr.WriteString(codeFontXML)
+		if seg.code {
+			// A run's <w:rPr> may carry at most one <w:rStyle> (CT_RPr
+			// permits 0..1), so a segment that is BOTH a link and inline
+			// code -- the unusual "[`code`](url)" -- cannot reference both
+			// Hyperlink and VerbatimChar at once. Word draws the Hyperlink
+			// color/underline either way; codeFontXML falls back to a
+			// direct <w:rFonts> here purely to keep the monospace look for
+			// this one combination, matching this package's pre-Task-2
+			// behavior for it. This is run-level font formatting, not one
+			// of the three paragraph-level properties
+			// (spacing/ind/shd) the styles-architecture invariant bans.
+			rPr.WriteString(codeFontXML)
+		}
+	case seg.code && !codeBlockLine:
+		rPr.WriteString(`<w:rStyle w:val="VerbatimChar"/>`)
 	}
 	if seg.bold {
 		rPr.WriteString("<w:b/>")
@@ -1477,119 +1525,18 @@ func buildDocRelsXML(rels []hyperlinkRel) string {
 	return b.String()
 }
 
-// stylesPartXML defines Normal and Heading1..Heading6. This is the part most
-// likely to look like it worked when it did not: writing
-// <w:pStyle w:val="Heading1"/> onto a paragraph is not enough on its own —
-// if "Heading1" is not actually DEFINED here, Word treats it as an unknown
-// style and renders the paragraph as ordinary body text. The file still
-// opens fine either way, so the only way to notice the bug is to check, as
-// TestWrite_HeadingStylesAreDefinedInStylesXML does.
-const stylesPartXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-	`<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
-	// docDefaults must be <w:styles>'s first child, and rPrDefault must
-	// precede pPrDefault within it -- Word treats an out-of-schema-order
-	// styles part as corrupt with no diagnostic. Without this chain at all,
-	// docx_format has nowhere to land a document-wide body font/size/line
-	// spacing/alignment change (see Document.Format's BodyFont/BodySizePt/
-	// LineSpacing/Align doc comments): a document this package writes
-	// itself must be as formattable as one Word or python-docx produced,
-	// both of which always emit this chain. The values mirror
-	// testdata/structure.docx's own docDefaults (a real Word-authored
-	// file's defaults), not an arbitrary choice.
-	`<w:docDefaults><w:rPrDefault><w:rPr>` +
-	`<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/>` +
-	`<w:sz w:val="22"/><w:szCs w:val="22"/>` +
-	`<w:lang w:val="en-US" w:eastAsia="en-US" w:bidi="ar-SA"/>` +
-	`</w:rPr></w:rPrDefault>` +
-	`<w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>` +
-	`</w:docDefaults>` +
-	`<w:style w:type="paragraph" w:default="1" w:styleId="Normal">` +
-	`<w:name w:val="Normal"/><w:qFormat/></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading1">` +
-	`<w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="240" w:after="120"/><w:outlineLvl w:val="0"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading2">` +
-	`<w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="200" w:after="100"/><w:outlineLvl w:val="1"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="28"/></w:rPr></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading3">` +
-	`<w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="160" w:after="80"/><w:outlineLvl w:val="2"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="26"/></w:rPr></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading4">` +
-	`<w:name w:val="heading 4"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="120" w:after="60"/><w:outlineLvl w:val="3"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading5">` +
-	`<w:name w:val="heading 5"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="120" w:after="60"/><w:outlineLvl w:val="4"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="22"/></w:rPr></w:style>` +
-	`<w:style w:type="paragraph" w:styleId="Heading6">` +
-	`<w:name w:val="heading 6"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:keepNext/><w:spacing w:before="120" w:after="60"/><w:outlineLvl w:val="5"/></w:pPr>` +
-	`<w:rPr><w:b/><w:sz w:val="20"/></w:rPr></w:style>` +
-	// Hyperlink is a CHARACTER style (w:type="character"), not a paragraph
-	// style like Normal/HeadingN above — a run picks it up via
-	// <w:rStyle w:val="Hyperlink"/> inside its own <w:rPr> (see renderRun),
-	// not via <w:pStyle> on the paragraph. Item 2 requires this style
-	// actually be DEFINED here, exactly the same "looks like it worked but
-	// didn't" trap the package doc already calls out for Heading1..6: an
-	// <w:rStyle> referencing an undefined style renders as ordinary text,
-	// so a link would be structurally a hyperlink (clickable, right r:id)
-	// but visually indistinguishable from plain text.
-	`<w:style w:type="character" w:styleId="Hyperlink">` +
-	`<w:name w:val="Hyperlink"/>` +
-	`<w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>` +
-	`</w:styles>`
-
-// codeFontXML is the <w:rFonts> every code segment's <w:rPr> carries —
-// inline code (Item 1) and every line of a fenced code block alike — so
-// both render in the same monospace typeface. Consolas is Word's own
-// default for code-styled text; declaring all three of ascii/hAnsi/cs
-// keeps non-Latin and complex-script runs from silently falling back to
-// the surrounding paragraph's proportional font.
+// codeFontXML is a direct <w:rFonts> fallback for exactly one edge case:
+// a segment that is both inline code AND a link's text (the unusual
+// "[`code`](url)"), which cannot reference both the Hyperlink and
+// VerbatimChar character styles at once (CT_RPr allows only one
+// <w:rStyle>) — see renderRun. Every OTHER code segment gets its monospace
+// font from a style instead: a fenced-code-block line inherits it from
+// pStyle="SourceCode" (styles.go), and an ordinary inline `code` span gets
+// it from rStyle="VerbatimChar". Before Task 2 of the docx-style-
+// architecture plan this constant was applied unconditionally to every
+// code segment; it survives now only for the one combination a shared
+// style cannot express.
 const codeFontXML = `<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/>`
-
-// codeShadingXML is the light background every fenced-code-block paragraph
-// carries, per Item 1's brief ("light shading <w:shd w:fill="F5F5F5"/>").
-// w:val="clear" (no pattern, just the fill color) is what a real Word
-// paragraph shading def normally carries alongside w:fill; omitting it
-// still renders correctly in this package's own reader, but including it
-// matches what Word itself writes and avoids relying on an implicit
-// default for a value the schema does not treat as truly optional.
-const codeShadingXML = `<w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>`
-
-// codeSpacingXML is Defect 3's fix for the striped-bands look: every
-// generated paragraph inherits stylesPartXML's docDefaults pPrDefault
-// spacing (w:after="200" w:line="276" w:lineRule="auto") unless it
-// overrides it, and a fenced code block never did, so Word drew a visible
-// gap after every single code LINE (each line is its own paragraph — see
-// paraBlock.isCode) and a stack of separate shaded bars resulted instead
-// of one contiguous shaded band. Setting before/after to 0 and single
-// (240/"auto") line spacing on every code paragraph makes consecutive code
-// lines sit flush against each other, so codeShadingXML's fill reads as
-// one block.
-const codeSpacingXML = `<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>`
-
-// codeIndentXML gives a fenced code block a small, consistent left indent —
-// enough to visually separate it from the page margin the way a code block
-// should read as its own block, but modest next to blockquoteIndentXML's
-// 360 twips (a quarter of that) so it stays close to body text's own left
-// edge rather than reading as its own deeply-nested level, which is what
-// the user's document showed with no indent management at all.
-const codeIndentXML = `<w:ind w:left="120"/>`
-
-// blockquoteBorderXML/blockquoteIndentXML are Item 3's block-quote
-// treatment: a left border (the same "quoted text" visual convention
-// nearly every reader recognizes) plus a matching left indent so the
-// border doesn't sit flush against the quoted text with no breathing room.
-// Both are separate <w:pPr> children (<w:pBdr> and <w:ind>) rather than
-// one combined element — CT_PPr has no such combined element — and
-// renderParagraph emits them in that relative order, matching CT_PPr's own
-// schema sequence (pBdr precedes ind).
-const blockquoteBorderXML = `<w:pBdr><w:left w:val="single" w:sz="12" w:space="4" w:color="auto"/></w:pBdr>`
-const blockquoteIndentXML = `<w:ind w:left="360"/>`
 
 // hrBorderXML is Item 3's horizontal rule: a bottom border on an otherwise
 // completely empty paragraph (renderParagraph never generates any runs for

@@ -246,11 +246,25 @@ func TestWrite_TableWidthIsFullPercentNotAuto(t *testing.T) {
 }
 
 // --- Defect 3: code blocks must not render as striped bands ---------------
+//
+// As of the docx-style-architecture plan's Task 2, the zero-spacing, the
+// shading, and the left indent that fix this defect no longer live inline
+// in document.xml at all (see TestWrite_NoInlineVisualPropertiesInDocumentXML
+// -- <w:spacing>/<w:shd>/<w:ind> are banned there outright) -- they live
+// once, in styles.go's SourceCode style, and every code-block paragraph
+// picks all three up by referencing it via <w:pStyle w:val="SourceCode"/>.
+// The three tests below now check that indirection end to end: the
+// paragraph references the style, AND the style (in styles.xml) actually
+// carries the property, so a dangling or incomplete style reference would
+// still be caught -- checking only one half would let either "paragraph
+// forgot to reference the style" or "style forgot the property" regress
+// unnoticed.
 
-// Every fenced-code-block paragraph must suppress the document's default
-// paragraph spacing (before/after 0, single line spacing), or Word draws a
-// gap between every code line and the shared shading reads as separate
-// bars instead of one contiguous block.
+// Every fenced-code-block paragraph must reference the SourceCode style,
+// which suppresses the document's default paragraph spacing (before/after
+// 0, single line spacing) -- or Word draws a gap between every code line
+// and the shared shading reads as separate bars instead of one contiguous
+// block.
 func TestWrite_CodeBlockParagraphsSuppressSpacing(t *testing.T) {
 	md := "```\nline one\nline two\nline three\n```\n"
 	d, _, _ := writeAndReopen(t, md)
@@ -260,43 +274,60 @@ func TestWrite_CodeBlockParagraphsSuppressSpacing(t *testing.T) {
 	}
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
-	n := strings.Count(s, `<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>`)
+	n := strings.Count(s, `<w:pStyle w:val="SourceCode"/>`)
 	if n != 3 {
-		t.Errorf("found the zero-spacing declaration %d times, want 3 (one per code line)", n)
+		t.Errorf("found <w:pStyle w:val=\"SourceCode\"/> %d times, want 3 (one per code line)", n)
+	}
+
+	styles, _ := d.Part("word/styles.xml")
+	sc := styleBlock(t, styles, "SourceCode")
+	if !strings.Contains(sc, `<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>`) {
+		t.Errorf("SourceCode style does not zero paragraph spacing: %s", sc)
 	}
 }
 
-// The shading must be a <w:pPr> child (a paragraph-level <w:shd>), which is
-// what makes shaded code lines read as one contiguous band rather than
-// separate per-run highlights.
+// The shading must be a <w:pPr> child of the SourceCode style itself (a
+// paragraph-level <w:shd>, not a per-run highlight), which is what makes
+// shaded code lines read as one contiguous band rather than separate runs.
 func TestWrite_CodeBlockShadingIsOnTheParagraph(t *testing.T) {
 	md := "```\ncode\n```\n"
 	d, _, _ := writeAndReopen(t, md)
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
-	pPrStart := strings.Index(s, "<w:pPr>")
-	pPrEnd := strings.Index(s, "</w:pPr>")
+	if !strings.Contains(s, `<w:pStyle w:val="SourceCode"/>`) {
+		t.Fatal("code paragraph does not reference the SourceCode style")
+	}
+
+	styles, _ := d.Part("word/styles.xml")
+	sc := styleBlock(t, styles, "SourceCode")
+	pPrStart := strings.Index(sc, "<w:pPr>")
+	pPrEnd := strings.Index(sc, "</w:pPr>")
 	if pPrStart < 0 || pPrEnd < 0 {
-		t.Fatal("no <w:pPr> found")
+		t.Fatal("SourceCode style has no <w:pPr>")
 	}
-	if !strings.Contains(s[pPrStart:pPrEnd], `w:fill="F5F5F5"`) {
-		t.Errorf("shading is not inside <w:pPr>: %s", s[pPrStart:pPrEnd])
+	if !strings.Contains(sc[pPrStart:pPrEnd], `w:fill="F5F5F5"`) {
+		t.Errorf("shading is not inside SourceCode's <w:pPr>: %s", sc[pPrStart:pPrEnd])
 	}
-	_ = d
 }
 
 // A code block must carry a modest, non-zero left indent -- not flush at
 // the page margin, which is what made the user's code sit far off to the
-// left of everything else around it.
+// left of everything else around it. The indent now lives on the
+// SourceCode style rather than inline on the paragraph.
 func TestWrite_CodeBlockHasAModestLeftIndent(t *testing.T) {
 	md := "```\ncode\n```\n"
 	d, _, _ := writeAndReopen(t, md)
 	doc, _ := d.Part(DocumentPart)
-	s := string(doc)
+	if !strings.Contains(string(doc), `<w:pStyle w:val="SourceCode"/>`) {
+		t.Fatal("code paragraph does not reference the SourceCode style")
+	}
+
+	styles, _ := d.Part("word/styles.xml")
+	sc := styleBlock(t, styles, "SourceCode")
 	indRE := regexp.MustCompile(`<w:ind w:left="(\d+)"/>`)
-	m := indRE.FindStringSubmatch(s)
+	m := indRE.FindStringSubmatch(sc)
 	if m == nil {
-		t.Fatal("code paragraph has no <w:ind w:left=...>")
+		t.Fatal("SourceCode style has no <w:ind w:left=...>")
 	}
 	n, _ := strconv.Atoi(m[1])
 	if n <= 0 {
@@ -556,14 +587,18 @@ func TestWrite_DesignDocumentAllFourDefectsHoldTogether(t *testing.T) {
 		t.Error("the long table cell text did not survive intact")
 	}
 
-	// Defect 3: every code-block paragraph suppresses spacing and shares
-	// contiguous shading.
-	spacingCount := strings.Count(docStr, `<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>`)
-	if spacingCount != 3 {
-		t.Errorf("zero-spacing declaration found %d times, want 3 (one per code line: func Run/return nil/})", spacingCount)
+	// Defect 3: every code-block paragraph references SourceCode, which
+	// (per TestWrite_CodeBlockParagraphsSuppressSpacing /
+	// TestWrite_CodeBlockShadingIsOnTheParagraph) is the style now
+	// carrying the zero-spacing and shading that keep code lines
+	// contiguous -- document.xml itself carries neither inline anymore.
+	styleRefCount := strings.Count(docStr, `<w:pStyle w:val="SourceCode"/>`)
+	if styleRefCount != 3 {
+		t.Errorf("<w:pStyle w:val=\"SourceCode\"/> found %d times, want 3 (one per code line: func Run/return nil/})", styleRefCount)
 	}
-	if !strings.Contains(docStr, `w:fill="F5F5F5"`) {
-		t.Error("no code shading found")
+	styles, _ := d.Part("word/styles.xml")
+	if !strings.Contains(string(styles), `w:fill="F5F5F5"`) {
+		t.Error("no code shading found in the SourceCode style")
 	}
 	foundCodeLine := false
 	for _, p := range paras {
