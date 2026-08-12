@@ -284,3 +284,126 @@ func TestDirectFormatMaskingNotes_ListsExactParagraphNumbersNotARange(t *testing
 		t.Errorf("note = %q, want it to list paragraphs 1 and 3 explicitly", notes[0])
 	}
 }
+
+// TestPlanHeadingFontPatches_SecondIdenticalCallProducesNoPatches is the red
+// test for round 2's F1: planHeadingFontPatches always rewrote a found
+// <w:rFonts> regardless of whether it already matched the requested font, so
+// len(headingPatches) > 0 was trivially always true for any document with at
+// least one Heading1..9 style — a second heading_font call with the SAME
+// font kept producing a patch (and, one level up, a real SetPart + Save +
+// .bak) even though styles.xml would end up byte-identical.
+func TestPlanHeadingFontPatches_SecondIdenticalCallProducesNoPatches(t *testing.T) {
+	styles := []byte(`<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		styleChainTestNormal +
+		`<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>` +
+		`<w:rPr><w:rFonts w:ascii="Cambria"/></w:rPr></w:style>` +
+		`</w:styles>`)
+
+	first, touched, err := planHeadingFontPatches(styles, "Georgia")
+	if err != nil {
+		t.Fatalf("first planHeadingFontPatches: %v", err)
+	}
+	if len(first) == 0 {
+		t.Fatal("first call produced no patches; the font never took effect to begin with")
+	}
+	if !touched["Heading1"] {
+		t.Fatalf("touched = %v, want Heading1", touched)
+	}
+	out, err := Apply(styles, first)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	second, _, err := planHeadingFontPatches(out, "Georgia")
+	if err != nil {
+		t.Fatalf("second planHeadingFontPatches: %v", err)
+	}
+	if len(second) != 0 {
+		t.Errorf("second identical call produced %d patches, want 0: Heading1's rFonts already renders as Georgia", len(second))
+	}
+}
+
+// TestWriteThenFormat_SecondIdenticalHeadingFontCallDoesNotWriteAgain is the
+// compose-level companion: a second Document.Format call with the exact
+// same HeadingFont must report an empty Applied and must NOT mark the
+// document modified again (which is what would trigger a redundant
+// Save/backup one level up, in the docx_format tool handler, for a
+// styles.xml that ends up byte-identical).
+func TestWriteThenFormat_SecondIdenticalHeadingFontCallDoesNotWriteAgain(t *testing.T) {
+	md := "# Title\n\nSome body text here.\n"
+	d, _, _ := writeAndReopen(t, md)
+	opts := FormatOptions{HeadingFont: "Georgia"}
+
+	first, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("first Format: %v", err)
+	}
+	if len(first.Applied) == 0 {
+		t.Fatal("first call's Applied is empty; the rule never took effect to begin with")
+	}
+	if !d.Modified() {
+		t.Fatal("first call did not mark the document modified")
+	}
+	if err := d.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	second, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("second Format: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("second identical call's Applied = %v, want empty", second.Applied)
+	}
+	if d.Modified() {
+		t.Error("second identical call marked the document modified again; styles.xml should be byte-identical")
+	}
+}
+
+// TestPlanStyleChainShadowPatches_ProbeQ_WordBuiltinMonospaceStylesExcludedButNoted
+// is the red test for round 2's second nit: Word's own built-in Plain Text/
+// HTML Code/HTML Preformatted/Block Text styles use a monospace font
+// (Consolas/Courier-class) the same way this package's own SourceCode does,
+// but the exact-match sets F2 introduced only covered THIS package's own
+// styleIds — a real Word document's own "Plain Text" style was treated as
+// an ordinary body-type style and silently rewritten to a proportional
+// body_font. All four must be excluded from the rewrite AND (unlike
+// SourceCode, which stays silent) named in notes when used.
+func TestPlanStyleChainShadowPatches_ProbeQ_WordBuiltinMonospaceStylesExcludedButNoted(t *testing.T) {
+	styles := []byte(`<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		styleChainTestNormal +
+		`<w:style w:type="paragraph" w:styleId="PlainText"><w:name w:val="Plain Text"/><w:basedOn w:val="Normal"/>` +
+		`<w:rPr><w:rFonts w:ascii="Consolas"/></w:rPr></w:style>` +
+		`<w:style w:type="paragraph" w:styleId="HTMLCode"><w:name w:val="HTML Code"/><w:basedOn w:val="Normal"/>` +
+		`<w:rPr><w:rFonts w:ascii="Courier New"/></w:rPr></w:style>` +
+		`<w:style w:type="paragraph" w:styleId="HTMLPreformatted"><w:name w:val="HTML Preformatted"/><w:basedOn w:val="Normal"/>` +
+		`<w:rPr><w:rFonts w:ascii="Courier New"/></w:rPr></w:style>` +
+		`<w:style w:type="paragraph" w:styleId="BlockText"><w:name w:val="Block Text"/><w:basedOn w:val="Normal"/>` +
+		`<w:rPr><w:rFonts w:ascii="Consolas"/></w:rPr></w:style>` +
+		`</w:styles>`)
+	opts := FormatOptions{BodyFont: "Georgia"}
+	used := map[string]bool{"PlainText": true, "HTMLCode": true, "HTMLPreformatted": true, "BlockText": true}
+
+	patches, changed, notes, err := planStyleChainShadowPatches(styles, opts, used, nil)
+	if err != nil {
+		t.Fatalf("planStyleChainShadowPatches: %v", err)
+	}
+	if len(patches) != 0 || changed["body font"] {
+		t.Errorf("Plain Text/HTML Code/HTML Preformatted/Block Text must never be rewritten by body_font; got %d patches, changed=%v", len(patches), changed)
+	}
+	joined := strings.Join(notes, " | ")
+	for _, want := range []string{"Plain Text", "HTML Code", "HTML Preformatted", "Block Text"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("notes = %v, want it to name %q (PROBE-Q)", notes, want)
+		}
+	}
+
+	// Unused -> no noise (F5 still applies to this family).
+	_, _, notes, err = planStyleChainShadowPatches(styles, opts, map[string]bool{}, nil)
+	if err != nil {
+		t.Fatalf("planStyleChainShadowPatches (unused): %v", err)
+	}
+	if len(notes) != 0 {
+		t.Errorf("notes = %v, want none: nothing in the document references any of these styles", notes)
+	}
+}

@@ -1372,8 +1372,19 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]boo
 				trackingRPr = false
 				children := scanDirectChildren(styles[rprTagSpan.End:prevOffset], rprTagSpan.End, []string{"rFonts"})
 				if rf, ok := children["rFonts"]; ok {
+					// tagUnchanged: a heading whose rFonts already renders
+					// byte-for-byte identically to font has nothing left to
+					// rewrite — skipping the patch here (rather than always
+					// emitting one) is what makes a second heading_font call
+					// with the same font produce zero patches, so
+					// planStylesPatches' len(headingPatches)>0 gate correctly
+					// reports nothing changed instead of unconditionally
+					// re-writing (and re-saving/backing-up) a byte-identical
+					// styles.xml (task 7 follow-up review round 2, F1).
 					newTag := buildTag("rFonts", rFontsLiteralAttrs(rf.attrs, font), true)
-					patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+					if !tagUnchanged(styles, rf, newTag) {
+						patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+					}
 				} else {
 					// No rFonts among this rPr's own direct children:
 					// insert one as its FIRST child, at rprTagSpan.End —
@@ -1629,6 +1640,30 @@ var (
 		"footer":  true,
 		"caption": true,
 	}
+	// monospaceBuiltinKeys names WORD'S OWN built-in fixed-width-font
+	// styles that are not this package's own SourceCode/VerbatimChar but
+	// serve the same "keep this content in a monospace face" role: "Plain
+	// Text" (Outlook/mail-quote import), "HTML Code"/"HTML Preformatted"
+	// (pasted-from-web import), and "Block Text" (an older built-in,
+	// sometimes surfaced as "Block Quote" in Word's UI, also monospaced in
+	// Word's own default template). A follow-up review's PROBE-Q caught
+	// these falling through the SAME gap F2 fixed for Quote/SourceCode —
+	// this package's exact-match sets covered only ITS OWN monospace
+	// styles, so a real Word document's own built-in ones were treated as
+	// ordinary body-type styles and silently rewritten from Consolas/
+	// Courier-class fonts to whatever proportional body_font was requested.
+	// Unlike SourceCode/VerbatimChar (this package's own, silently excluded
+	// per the task's original invariant), these ARE reported via masking
+	// notes when they shadow a requested field and are actually used
+	// (isNotedExclusionStyle) — a caller is less likely to already assume
+	// "Plain Text" is off-limits for body_font the unambiguous way
+	// "SourceCode" reads, so the honesty is worth the extra note.
+	monospaceBuiltinKeys = map[string]bool{
+		"plaintext":        true, // Word's built-in "Plain Text"
+		"htmlcode":         true, // Word's built-in "HTML Code"
+		"htmlpreformatted": true, // Word's built-in "HTML Preformatted"
+		"blocktext":        true, // Word's built-in "Block Text" ("Block Quote" in some UIs)
+	}
 )
 
 // isHeadingLikeStyle reports whether s is a heading-or-heading-adjacent
@@ -1674,6 +1709,14 @@ func isPeripheralStyle(s styleElem) bool {
 	return peripheralFamilyKeys[normalizeStyleKey(s.id)] || peripheralFamilyKeys[normalizeStyleKey(s.name)]
 }
 
+// isMonospaceBuiltinStyle classifies Word's own Plain Text/HTML Code/HTML
+// Preformatted/Block Text family — see monospaceBuiltinKeys' own doc
+// comment for why these are excluded from the rewrite but, unlike this
+// package's own SourceCode/VerbatimChar, DO surface via masking notes.
+func isMonospaceBuiltinStyle(s styleElem) bool {
+	return monospaceBuiltinKeys[normalizeStyleKey(s.id)] || monospaceBuiltinKeys[normalizeStyleKey(s.name)]
+}
+
 // isSilentExclusionStyle families are excluded from BOTH the rewrite AND
 // masking notes: their shadowing is expected and not a caller-facing
 // caveat.
@@ -1686,7 +1729,7 @@ func isSilentExclusionStyle(s styleElem) bool {
 // actually referenced by a paragraph (planStyleChainShadowPatches' usedIDs
 // parameter, task 7 follow-up review F5).
 func isNotedExclusionStyle(s styleElem) bool {
-	return isHeadingLikeStyle(s) || isPeripheralStyle(s)
+	return isHeadingLikeStyle(s) || isPeripheralStyle(s) || isMonospaceBuiltinStyle(s)
 }
 
 func isExcludedFamilyStyle(s styleElem) bool {
