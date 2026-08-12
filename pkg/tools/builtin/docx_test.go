@@ -1184,6 +1184,47 @@ func TestDocxFormat_AppliesBodyFontAndReportsApplied(t *testing.T) {
 	}
 }
 
+// TestDocxFormat_SecondIdenticalCallReportsNoChangeNote is the tool-layer
+// half of pkg/docx's F1 fix (task 7 follow-up review): calling docx_format
+// twice with the exact same body_font rule must report an empty "applied"
+// and the same "no formatting changes were applied" note an entirely empty
+// rules object gets (docxFormatNoChangeNote), on the second call — the
+// first call already made docDefaults (and every shadowing style) carry the
+// requested font, so there is nothing left for the second call to change.
+func TestDocxFormat_SecondIdenticalCallReportsNoChangeNote(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	args := map[string]any{"path": p, "rules": map[string]any{"body_font": "Georgia"}}
+
+	first, err := callDocxFormat(t, args)
+	if err != nil {
+		t.Fatalf("first DocxFormatHandler: %v", err)
+	}
+	firstOut := decodeRead(t, first)
+	if applied, _ := firstOut["applied"].([]any); len(applied) == 0 {
+		t.Fatalf("first call's applied is empty; the rule never took effect (content=%s)", first.Content)
+	}
+
+	second, err := callDocxFormat(t, args)
+	if err != nil {
+		t.Fatalf("second DocxFormatHandler: %v", err)
+	}
+	secondOut := decodeRead(t, second)
+	applied, _ := secondOut["applied"].([]any)
+	if len(applied) != 0 {
+		t.Errorf("second identical call's applied = %v, want empty (content=%s)", applied, second.Content)
+	}
+	notes, _ := secondOut["notes"].([]any)
+	found := false
+	for _, n := range notes {
+		if s, ok := n.(string); ok && strings.Contains(s, "no formatting changes were applied") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the no-change note on a second identical call", notes)
+	}
+}
+
 // TestDocxFormat_TemplateAppliesPreset exercises the "template" rule
 // end to end through the tool layer, not just pkg/docx directly.
 func TestDocxFormat_TemplateAppliesPreset(t *testing.T) {

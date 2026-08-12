@@ -222,21 +222,38 @@ func TestFormat_NoOptionsIsANoOp(t *testing.T) {
 // call produces. document.xml's hash/length are untouched from the original
 // P2a.5 Task 1 capture (this call sets Normalize/MarginsMM too, both of
 // which land in document.xml, and neither is touched by task 7 below).
-// styles.xml's hash/length WERE re-captured for task 7 (format capability
-// review, Critical 4 / write review I4-I5): the whole-document path now
-// also rewrites whichever real style in this fixture (Heading1-9's own
-// font via the pre-existing HeadingFont path, plus Header/Footer/
-// BodyText2/BodyText3/Caption's own explicit spacing/size, via the new
-// effective-chain rewrite) already shadowed docDefaults — see
-// planStyleChainShadowPatches — so styles.xml legitimately looks different
-// now; Title/Subtitle/IntenseQuote/ListContinue*/NoSpacing/MacroText do NOT
-// change (verified directly against this fixture while re-capturing these
-// constants: the first three are excluded families or lack a based-on-
-// Normal chain, and ListContinue's own <w:spacing> never sets w:line, so it
-// was never shadowing line spacing to begin with).
+//
+// styles.xml's hash/length were re-captured TWICE for task 7:
+//
+//  1. format capability review, Critical 4 / write review I4-I5 (first
+//     pass): the whole-document path started also rewriting whichever real
+//     style in this fixture already shadowed docDefaults — Heading1-9's own
+//     font via the pre-existing HeadingFont path, plus Header/Footer/
+//     BodyText2/BodyText3/Caption's own explicit spacing/size via the new
+//     effective-chain rewrite.
+//  2. task 7 FOLLOW-UP review's "激进副作用纠正" (second pass, this capture):
+//     Header/Footer/Caption were pulled back OUT of the effective-chain
+//     rewrite — a page header/footer/figure caption is not "body text" in
+//     the sense body_font/body_size_pt/line_spacing/align mean it, and
+//     rewriting them was an unintended side effect of the first pass, not a
+//     deliberate design choice. They are now isPeripheralStyle-excluded
+//     from the rewrite the same way Quote/SourceCode always were, but
+//     (unlike Quote/SourceCode) still surface via FormatResult.Notes when
+//     they shadow a requested field and the document actually uses them —
+//     see planStyleChainShadowPatches. Heading1-9 (via HeadingFont) and
+//     BodyText2/BodyText3 (ordinary basedOn-Normal body styles, not
+//     peripheral) still change, unaffected by this second pass.
+//
+// Verified directly against this fixture while re-capturing these
+// constants: Title/Subtitle/IntenseQuote/ListContinue*/NoSpacing/MacroText
+// still do NOT change (the first three are excluded families or lack a
+// based-on-Normal chain; ListContinue's own <w:spacing> never sets w:line,
+// so it was never shadowing line spacing to begin with), and Header/Footer/
+// Caption now revert to their ORIGINAL (pre-task-7) bytes, confirmed by diff
+// against the pristine fixture.
 func TestFormat_NoRangeOutputIsUnchangedByDirectFormatting(t *testing.T) {
 	const (
-		wantStylesSHA256 = "61a71bf3a45065b0deeaa9e0ba8e9bd5d7414c54f66baf81c16f0fd8edde7f5d"
+		wantStylesSHA256 = "652d1588e33e791b9166b956e0bcadf48ee84ffdd2113a019142635cabd99428"
 		wantDocSHA256    = "d84400b6456f8f3be5a02edee299c543f191a9aff867d6dbe9598d795b44e5e9"
 		wantStylesLen    = 349159
 		wantDocLen       = 3709

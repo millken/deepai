@@ -180,3 +180,34 @@ func TestWriteThenFormat_BodyFontNeverTouchesSourceCodeOrHeadingFonts(t *testing
 		t.Errorf("Heading1 picked up the new body font, which must never happen without heading_font:\n%s", h1)
 	}
 }
+
+// TestWriteThenFormat_SecondIdenticalCallReportsNothingChanged is the red
+// test for the task 7 follow-up review's F1: Applied must reflect a real,
+// byte-different write, not merely "a rule was requested." Before this fix,
+// planStylesPatches unconditionally appended an Applied entry for every
+// requested field regardless of whether anything on disk actually differed
+// — running the exact same FormatOptions twice against the same document
+// would report success both times even though the second call's docDefaults
+// and every shadowing style already carried the requested value and nothing
+// was left to change.
+func TestWriteThenFormat_SecondIdenticalCallReportsNothingChanged(t *testing.T) {
+	md := "# Title\n\nSome body text here.\n\n## Section\n\nMore body text.\n"
+	d, _, _ := writeAndReopen(t, md)
+	opts := FormatOptions{BodyFont: "Georgia", BodySizePt: 13, LineSpacing: 1.5, Align: "justify"}
+
+	first, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("first Format: %v", err)
+	}
+	if len(first.Applied) == 0 {
+		t.Fatal("first call's Applied is empty; the rule never took effect to begin with")
+	}
+
+	second, err := d.Format(opts)
+	if err != nil {
+		t.Fatalf("second Format: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("second identical call's Applied = %v, want empty: docDefaults and every shadowing style already carry the requested value", second.Applied)
+	}
+}

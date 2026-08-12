@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -30,14 +31,17 @@ type FormatOptions struct {
 	// lands on styles.xml's <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts>
 	// AND, wherever it would otherwise be silently shadowed, on the SAME
 	// rFonts of Normal and any style basedOn it (transitively) other than
-	// the Heading1..9/Title/Subtitle, Quote, and SourceCode families — see
-	// planStyleChainShadowPatches. Only ascii/hAnsi are ever touched; an
-	// existing eastAsia (and cs) font is left completely alone, so a CJK
-	// document's Chinese/Japanese/Korean font survives a Latin body-font
-	// change untouched (format capability review, Important 8; write
-	// review, I5). FormatResult.Notes names whichever heading-like style
-	// still shadows this rule and any paragraph/run still carrying direct
-	// formatting that does the same.
+	// the Heading1..9/Title/Subtitle, Header/Footer/Caption, Quote, and
+	// SourceCode families — see planStyleChainShadowPatches. Only ascii/
+	// hAnsi are ever touched; an existing eastAsia (and cs) font is left
+	// completely alone, so a CJK document's Chinese/Japanese/Korean font
+	// survives a Latin body-font change untouched (format capability
+	// review, Important 8; write review, I5). FormatResult.Notes names
+	// whichever excluded style still shadows this rule AND is actually
+	// referenced by a paragraph (a heading no caller uses is not worth a
+	// caveat about) and any paragraph/run still carrying direct formatting
+	// that does the same; Quote/SourceCode's own shadowing is never
+	// mentioned — see isSilentExclusionStyle.
 	BodyFont string
 	// BodySizePt, if non-zero, replaces the document's default font size in
 	// points: it lands on docDefaults's <w:sz> AND <w:szCs> (kept in sync so
@@ -197,7 +201,7 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no word/styles.xml part")
 		}
-		patches, applied, notes, err := planStylesPatches(styles, resolved)
+		patches, applied, notes, err := planStylesPatches(styles, resolved, usedStyleIDs(d.Paras()))
 		if err != nil {
 			return FormatResult{}, err
 		}
@@ -1046,8 +1050,9 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 }
 
 // planStylesPatches builds every styles.xml patch resolved requests
-// (docDefaults body font/size/line-spacing/alignment, plus every
-// Heading1..9's font) and a human-readable Applied entry per change made.
+// (docDefaults body font/size/line-spacing/alignment plus the effective-
+// chain rewrite that keeps a shadowing style in sync, and every Heading1..9's
+// font) and a human-readable Applied entry per change ACTUALLY made.
 //
 // A requested field's docDefaults chain (rPrDefault/rPr for BodyFont/
 // BodySizePt, pPrDefault/pPr for LineSpacing/Align) is edited in place when
@@ -1061,10 +1066,28 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 // guess: it is the standard OOXML structure a document default lives in,
 // so building it is exactly what "set the document default" means when it
 // is not there yet.
-func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []string, error) {
+//
+// usedIDs (Format's usedStyleIDs(d.Paras()), or nil from a caller that only
+// cares about the docDefaults/rewrite behavior, e.g. this package's own
+// low-level docDefaults tests) is threaded straight through to
+// planStyleChainShadowPatches' own usedIDs parameter — see that function's
+// doc comment for why a style must actually be referenced by a paragraph
+// before its shadowing is worth a note (task 7 follow-up review, F5).
+//
+// fontChanged/sizeChanged/spacingChanged/alignChanged track, independently
+// of whether a patch OBJECT was produced, whether a docDefaults or
+// style-chain leaf was actually rewritten to a DIFFERENT value than it
+// already had (via tagUnchanged) — an Applied entry for a field is only
+// ever appended when its own flag is true, mirroring the pre-existing
+// HeadingFont branch's "len(headingPatches) > 0" gate below, so a second
+// Format call with identical options reports an honestly empty Applied
+// instead of re-claiming success for a no-op rewrite (task 7 follow-up
+// review, F1).
+func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]bool) ([]Patch, []string, []string, error) {
 	var patches []Patch
 	var applied []string
 	var notes []string
+	var fontChanged, sizeChanged, spacingChanged, alignChanged bool
 
 	wantRPrChain := opts.BodyFont != "" || opts.BodySizePt != 0
 	wantPPrChain := opts.LineSpacing != 0 || opts.Align != ""
@@ -1080,12 +1103,6 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 		needPPrSynthesis := false
 
 		if wantRPrChain {
-			if opts.BodyFont != "" {
-				applied = append(applied, fmt.Sprintf("body font -> %s", opts.BodyFont))
-			}
-			if opts.BodySizePt != 0 {
-				applied = append(applied, fmt.Sprintf("body size -> %gpt", opts.BodySizePt))
-			}
 			if dd.found && rpd.found && rpr.found {
 				// The chain fully exists already: edit its leaves in place —
 				// byte-identical output for a document that already has a
@@ -1097,14 +1114,44 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 				// rFontsBodyLatinAttrs (not rFontsLiteralAttrs) is BodyFont's
 				// own font-attrs builder: it leaves docDefaults' eastAsia
 				// font alone (format capability review, Important 8).
+				//
+				// effFont/effSize are opts.BodyFont/opts.BodySizePt
+				// SUPPRESSED to ""/0 when the leaf(s) already render
+				// byte-identically to what's requested (tagUnchanged) —
+				// planRPrFontSizePatches already treats ""/0 as "not
+				// requested" for exactly this leaf, the same code path a
+				// caller who only ever asked for ONE of the two fields
+				// already exercises, so no new merge/anchoring logic is
+				// needed to get idempotency for free.
+				effFont := opts.BodyFont
+				if effFont != "" {
+					newTag := buildTag("rFonts", rFontsBodyLatinAttrs(rfonts.attrs, effFont), true)
+					if tagUnchanged(styles, rfonts, newTag) {
+						effFont = ""
+					} else {
+						fontChanged = true
+					}
+				}
+				effSize := opts.BodySizePt
+				if effSize != 0 {
+					half := ptToHalfPoints(effSize)
+					szTag := buildTag("sz", setAttr(sz.attrs, "val", half), true)
+					szcsTag := buildTag("szCs", setAttr(szcs.attrs, "val", half), true)
+					if tagUnchanged(styles, sz, szTag) && tagUnchanged(styles, szcs, szcsTag) {
+						effSize = 0
+					} else {
+						sizeChanged = true
+					}
+				}
 				patches = append(patches, planRPrFontSizePatches(
-					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, opts.BodyFont, opts.BodySizePt, rFontsBodyLatinAttrs)...)
+					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, effFont, effSize, rFontsBodyLatinAttrs)...)
 			} else {
 				needRPrSynthesis = true
 				ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 				if opts.BodyFont != "" {
 					ops[0].active = true
 					ops[0].attrs = rFontsBodyLatinAttrs(rfonts.attrs, opts.BodyFont)
+					fontChanged = true // synthesis always creates something new
 				}
 				if opts.BodySizePt != 0 {
 					half := ptToHalfPoints(opts.BodySizePt)
@@ -1112,27 +1159,55 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 					ops[1].attrs = setAttr(sz.attrs, "val", half)
 					ops[2].active = true
 					ops[2].attrs = setAttr(szcs.attrs, "val", half)
+					sizeChanged = true
 				}
 				rprInner = renderActiveLeaves(ops)
 			}
 		}
 
 		if wantPPrChain {
-			if opts.LineSpacing != 0 {
-				applied = append(applied, fmt.Sprintf("line spacing -> %g", opts.LineSpacing))
-			}
-			if opts.Align != "" {
-				applied = append(applied, fmt.Sprintf("alignment -> %s", opts.Align))
-			}
 			if dd.found && ppd.found && ppr.found {
 				// buildPPrOps (not a bare 2-element ops list) anchors the
 				// insertion against pPrDefault's pPr's FULL set of tracked
 				// children, so a newly inserted spacing/jc lands in
 				// CT_PPr's schema order even when that pPr also carries a
 				// paragraph-mark <w:rPr> or other properties (Critical 1).
-				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, opts.LineSpacing, opts.Align))...)
+				// effLineSpacing/effAlign mirror effFont/effSize above.
+				effLineSpacing := opts.LineSpacing
+				if effLineSpacing != 0 {
+					if sp, ok := pprChildren["spacing"]; ok {
+						newTag := buildTag("spacing", setAttr(setAttr(sp.attrs, "line", lineSpacingTo240ths(effLineSpacing)), "lineRule", "auto"), true)
+						if tagUnchanged(styles, sp, newTag) {
+							effLineSpacing = 0
+						} else {
+							spacingChanged = true
+						}
+					} else {
+						spacingChanged = true // not found -> definitely a new insert
+					}
+				}
+				effAlign := opts.Align
+				if effAlign != "" {
+					if jc, ok := pprChildren["jc"]; ok {
+						newTag := buildTag("jc", setAttr(jc.attrs, "val", effAlign), true)
+						if tagUnchanged(styles, jc, newTag) {
+							effAlign = ""
+						} else {
+							alignChanged = true
+						}
+					} else {
+						alignChanged = true
+					}
+				}
+				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, effLineSpacing, effAlign))...)
 			} else {
 				needPPrSynthesis = true
+				if opts.LineSpacing != 0 {
+					spacingChanged = true
+				}
+				if opts.Align != "" {
+					alignChanged = true
+				}
 				pprInner = renderActiveLeaves(buildPPrOps(nil, opts.LineSpacing, opts.Align))
 			}
 		}
@@ -1143,6 +1218,24 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 		}
 	}
 
+	// HeadingFont is computed BEFORE the style-chain call below so
+	// touchedHeadingIDs is ready for planStyleChainShadowPatches' same-call
+	// exemption (task 7 follow-up review, F3/F4) — patch ORDER in the
+	// returned slice does not matter (Apply sorts by offset), only this
+	// data dependency does.
+	var touchedHeadingIDs map[string]bool
+	if opts.HeadingFont != "" {
+		headingPatches, touched, err := planHeadingFontPatches(styles, opts.HeadingFont)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		touchedHeadingIDs = touched
+		if len(headingPatches) > 0 {
+			patches = append(patches, headingPatches...)
+			applied = append(applied, fmt.Sprintf("heading font -> %s", opts.HeadingFont))
+		}
+	}
+
 	// docDefaults is the cascade's WEAKEST layer: Normal and any style
 	// basedOn it (BodyText, and every real Word/WPS document's own named
 	// styles) can carry the very same rFonts/sz/spacing/jc explicitly,
@@ -1150,25 +1243,31 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 	// point of this task (format capability review, Critical 4; write
 	// review, I4/I5). planStyleChainShadowPatches finds and rewrites every
 	// such shadowing leaf that is safe to touch, and reports (via notes,
-	// not applied) whichever heading-like style it deliberately left alone.
+	// not applied) whichever style it deliberately left alone.
 	if wantRPrChain || wantPPrChain {
-		chainPatches, chainNotes, err := planStyleChainShadowPatches(styles, opts)
+		chainPatches, chainChanged, chainNotes, err := planStyleChainShadowPatches(styles, opts, usedIDs, touchedHeadingIDs)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		patches = append(patches, chainPatches...)
 		notes = append(notes, chainNotes...)
+		fontChanged = fontChanged || chainChanged["body font"]
+		sizeChanged = sizeChanged || chainChanged["body size"]
+		spacingChanged = spacingChanged || chainChanged["line spacing"]
+		alignChanged = alignChanged || chainChanged["alignment"]
 	}
 
-	if opts.HeadingFont != "" {
-		headingPatches, err := planHeadingFontPatches(styles, opts.HeadingFont)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		if len(headingPatches) > 0 {
-			patches = append(patches, headingPatches...)
-			applied = append(applied, fmt.Sprintf("heading font -> %s", opts.HeadingFont))
-		}
+	if opts.BodyFont != "" && fontChanged {
+		applied = append(applied, fmt.Sprintf("body font -> %s", opts.BodyFont))
+	}
+	if opts.BodySizePt != 0 && sizeChanged {
+		applied = append(applied, fmt.Sprintf("body size -> %gpt", opts.BodySizePt))
+	}
+	if opts.LineSpacing != 0 && spacingChanged {
+		applied = append(applied, fmt.Sprintf("line spacing -> %g", opts.LineSpacing))
+	}
+	if opts.Align != "" && alignChanged {
+		applied = append(applied, fmt.Sprintf("alignment -> %s", opts.Align))
 	}
 
 	return patches, applied, notes, nil
@@ -1192,10 +1291,21 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []
 // current one (format capability review follow-up, same root cause as
 // Critical 2 — this function had it twice: once for the close/rFonts-search
 // itself, fixed here, and once for the insertion position, fixed earlier).
-func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
+//
+// touched reports every styleId this function structurally matched
+// (headingStyleIDRe on the styleId, exactly the condition below), REGARDLESS
+// of whether a byte-different patch actually resulted — planStylesPatches
+// uses it to exempt exactly these Heading1..9 styles from
+// planStyleChainShadowPatches' "body font" masking note when HeadingFont was
+// also requested in this same call (task 7 follow-up review, F3/F4): a
+// heading that legitimately got its own new font this call is not masking
+// body_font in any sense worth a caveat about, even on a second identical
+// call where the heading's font already matched and no patch was needed.
+func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]bool, error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
 	var patches []Patch
+	touched := map[string]bool{}
 
 	var inHeading bool
 	var pPrDepth int
@@ -1210,7 +1320,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return nil, fmt.Errorf("scan styles.xml for heading fonts: %w", terr)
+			return nil, nil, fmt.Errorf("scan styles.xml for heading fonts: %w", terr)
 		}
 		offset := int(dec.InputOffset())
 
@@ -1221,6 +1331,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 			case isWordElement(t.Name, "style") && !inHeading:
 				if id, ok := wordAttrVal(t, "styleId"); ok && headingStyleIDRe.MatchString(id) {
 					inHeading = true
+					touched[id] = true
 					pPrDepth = 0
 					rprSeen = false
 					trackingRPr = false
@@ -1281,7 +1392,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 		}
 		prevOffset = offset
 	}
-	return patches, nil
+	return patches, touched, nil
 }
 
 // styleElem is one <w:style> block's classification-relevant facts, plus,
@@ -1475,21 +1586,49 @@ func styleLeafClose(styles []byte, elem elemInfo, tagName string) (int, error) {
 // headingStyleIDRe on the styleId alone.
 var headingLikeNameRe = regexp.MustCompile(`(?i)^heading\s*[1-9]$`)
 
-// quoteFamilyRe/codeFamilyRe are deliberately loose (any style whose name OR
-// styleId contains the word, case-insensitively) rather than an exact-match
-// list: this package's own Quote/SourceCode styleIds match trivially, and a
-// real Word document's built-in "Intense Quote" also needs to match. The
-// cost of this looseness is a false positive on some hypothetical custom
-// style whose name merely contains "quote"/"code" as a substring of an
-// unrelated word — accepted because the failure mode on that side (a style
-// that should have been rewritten is instead left alone and reported in
-// notes for line_spacing/align, silently for font/size per this task's own
-// invariant) is far less harmful than the alternative (silently rewriting a
-// document's actual code or quotation styling because "SourceCode" happened
-// to be the exact match required).
+// normalizeStyleKey folds a style's own w:styleId or w:name into a
+// comparison key — lowercased, with spaces removed — so "Source Code",
+// "SourceCode", and "sourcecode" all compare equal without every caller
+// having to enumerate every spacing/casing variant separately.
+func normalizeStyleKey(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, " ", ""))
+}
+
+// quoteFamilyKeys/codeFamilyKeys/peripheralFamilyKeys are EXACT (post-
+// normalizeStyleKey) name/styleId matches, deliberately NOT substring
+// matches. An earlier version of this file matched any style whose name or
+// styleId merely CONTAINED "quote"/"code" case-insensitively, which silently
+// exempted a perfectly ordinary body-type style — "Unquoted", "Barcode",
+// "Encoded" — from body_font/body_size_pt/line_spacing/align entirely, with
+// no note either (task 7 follow-up review, F2). Each set below lists both
+// this package's own styleIds (styles.go) and Word's own built-in style
+// names for the same concept, normalized the same way their styleId/name
+// pair would be.
 var (
-	quoteFamilyRe = regexp.MustCompile(`(?i)quote`)
-	codeFamilyRe  = regexp.MustCompile(`(?i)code`)
+	quoteFamilyKeys = map[string]bool{
+		"quote":        true, // this package's own Quote; Word's built-in "Quote"
+		"intensequote": true, // Word's built-in "Intense Quote" / "IntenseQuote"
+	}
+	codeFamilyKeys = map[string]bool{
+		"sourcecode":   true, // this package's own SourceCode / "Source Code"
+		"verbatimchar": true, // this package's own VerbatimChar / "Verbatim Char"
+	}
+	// peripheralFamilyKeys names styles whose content is not "body text" in
+	// the sense body_font/body_size_pt/line_spacing/align mean it, even
+	// though nothing about their OWN basedOn chain would otherwise exclude
+	// them: Header/Footer repeat on every page independently of the
+	// document's running text, and Caption labels a figure/table rather
+	// than being a paragraph of prose. A follow-up review caught the
+	// original implementation silently rewriting these alongside Normal/
+	// BodyText — asking for a new body_size should not also resize page
+	// headers/footers/captions (task 7 follow-up review, "激进副作用纠正").
+	// Unlike Quote/SourceCode, this family is still reported via masking
+	// notes when it shadows a requested field (isNotedExclusionStyle).
+	peripheralFamilyKeys = map[string]bool{
+		"header":  true,
+		"footer":  true,
+		"caption": true,
+	}
 )
 
 // isHeadingLikeStyle reports whether s is a heading-or-heading-adjacent
@@ -1507,21 +1646,51 @@ func isHeadingLikeStyle(s styleElem) bool {
 		strings.EqualFold(s.id, "Subtitle") || strings.EqualFold(s.name, "Subtitle")
 }
 
-// isQuoteLikeStyle/isCodeLikeStyle classify the two other families
-// FormatOptions.BodyFont/BodySizePt/LineSpacing/Align must never touch —
+// isCodeLikeName/isQuoteLikeName test a bare styleId or w:name string (not a
+// full styleElem) against the exact-match sets above — used both by
+// isCodeLikeStyle/isQuoteLikeStyle below (which check a style's OWN id/name)
+// and by directFormatMaskingNotes (which only ever has a paragraph's pStyle
+// STRING, via Para.Style, not a resolved styleElem).
+func isCodeLikeName(name string) bool  { return codeFamilyKeys[normalizeStyleKey(name)] }
+func isQuoteLikeName(name string) bool { return quoteFamilyKeys[normalizeStyleKey(name)] }
+
+// isQuoteLikeStyle/isCodeLikeStyle classify the two families whose shadowing
+// is NEVER mentioned, not even in notes (isSilentExclusionStyle) —
 // SourceCode's monospace font and Quote's distinct look are deliberate, not
-// an oversight, so (unlike headings) a masking style in either family is
-// left out of notes too: see planStyleChainShadowPatches' own doc comment.
+// an oversight, so nobody is surprised body_font left their code blocks and
+// blockquotes alone.
 func isQuoteLikeStyle(s styleElem) bool {
-	return quoteFamilyRe.MatchString(s.name) || quoteFamilyRe.MatchString(s.id)
+	return isQuoteLikeName(s.id) || isQuoteLikeName(s.name)
 }
 
 func isCodeLikeStyle(s styleElem) bool {
-	return codeFamilyRe.MatchString(s.name) || codeFamilyRe.MatchString(s.id)
+	return isCodeLikeName(s.id) || isCodeLikeName(s.name)
+}
+
+// isPeripheralStyle classifies the Header/Footer/Caption family: excluded
+// from the rewrite (like Quote/SourceCode) but, unlike them, still reported
+// via masking notes (like headings) — see isNotedExclusionStyle.
+func isPeripheralStyle(s styleElem) bool {
+	return peripheralFamilyKeys[normalizeStyleKey(s.id)] || peripheralFamilyKeys[normalizeStyleKey(s.name)]
+}
+
+// isSilentExclusionStyle families are excluded from BOTH the rewrite AND
+// masking notes: their shadowing is expected and not a caller-facing
+// caveat.
+func isSilentExclusionStyle(s styleElem) bool {
+	return isQuoteLikeStyle(s) || isCodeLikeStyle(s)
+}
+
+// isNotedExclusionStyle families are excluded from the rewrite but DO get
+// reported via masking notes when they shadow a requested field and are
+// actually referenced by a paragraph (planStyleChainShadowPatches' usedIDs
+// parameter, task 7 follow-up review F5).
+func isNotedExclusionStyle(s styleElem) bool {
+	return isHeadingLikeStyle(s) || isPeripheralStyle(s)
 }
 
 func isExcludedFamilyStyle(s styleElem) bool {
-	return isHeadingLikeStyle(s) || isQuoteLikeStyle(s) || isCodeLikeStyle(s)
+	return isSilentExclusionStyle(s) || isNotedExclusionStyle(s)
 }
 
 // reachesNormalCleanly walks the basedOn chain starting at id, returning
@@ -1598,39 +1767,85 @@ func hasAttr(attrs []xml.Attr, local string) bool {
 	return ok
 }
 
-// planStyleChainShadowPatches walks styles' full style graph and, for every
-// paragraph style that is Normal itself or basedOn it (directly or
-// transitively) EXCLUDING the Heading/Title/Subtitle, Quote, and SourceCode
-// families (eligibleForBodyChainRewrite), rewrites whichever of its own
-// EXPLICIT rFonts/sz/szCs/spacing/jc already shadows the docDefaults value
-// planStylesPatches's docDefaults section just wrote — Word's cascade puts a
-// named style above docDefaults, so a style that already declares its own
-// font/size/spacing/alignment keeps winning over a docDefaults-only edit no
-// matter what docDefaults itself now says (format capability review,
-// Critical 4; write review, I4/I5).
+// tagUnchanged reports whether elem — a found, self-closing leaf like
+// <w:rFonts>/<w:sz>/<w:spacing>/<w:jc> — already renders byte-for-byte
+// identically to newTagXML, the tag planStyleChainShadowPatches/
+// planStylesPatches is about to write. It is the idempotency check behind
+// "applied only reports a real, byte-different write": without it, a second
+// Format call with the exact same options would still rewrite every leaf to
+// the value it already has and unconditionally report success (task 7
+// follow-up review, F1). A not-found elem is never "unchanged" — there is
+// nothing on disk to compare against, so the caller's insert-vs-rewrite
+// branch decides what happens, not this function.
+func tagUnchanged(doc []byte, elem elemInfo, newTagXML string) bool {
+	if !elem.found {
+		return false
+	}
+	return string(doc[elem.tagSpan.Start:elem.tagSpan.End]) == newTagXML
+}
+
+// usedStyleIDs collects every <w:pStyle w:val="..."/> value at least one
+// paragraph in paras directly references. planStyleChainShadowPatches uses
+// it to keep a masking note from firing on a style nothing in the document
+// actually uses — a document with no headings should not be told "Heading1
+// still has its own font" just because styles.xml happens to define one,
+// unused, the way every Word template does (task 7 follow-up review, F5).
+// Only DIRECT references count, not a transitive basedOn chain: that is
+// enough to silence the "no headings at all" noise this review flagged,
+// without needing a second graph walk over the style chain itself.
+func usedStyleIDs(paras []Para) map[string]bool {
+	used := make(map[string]bool)
+	for _, p := range paras {
+		if p.Style != "" {
+			used[p.Style] = true
+		}
+	}
+	return used
+}
+
+// planStyleChainShadowPatches walks styles' full style graph and handles
+// every paragraph-type style other than the silently-excluded Quote/
+// SourceCode families (isSilentExclusionStyle) one of two ways:
 //
-// This never inserts a new element into another style: a style with no
-// explicit property of its own has nothing shadowing docDefaults to fix — it
-// already inherits the freshly-rewritten default correctly — so only an
-// EXISTING leaf (found in that style's own rprChildren/pprChildren) is ever
-// rewritten in place, via a plain PatchRawSpan on that leaf's own tagSpan,
-// with no anchoring/ordering concerns at all (nothing is being inserted, so
-// CT_PPr/EG_RPrBase's child order can never be violated here).
+//   - eligibleForBodyChainRewrite (Normal itself, or basedOn it without
+//     passing through a heading/peripheral/quote/code style): REWRITE
+//     whichever of its own EXPLICIT rFonts/sz/szCs/spacing[line]/jc already
+//     shadows the docDefaults value planStylesPatches's docDefaults section
+//     just wrote, skipping any leaf that would already render byte-for-byte
+//     identically (tagUnchanged) so a repeat call is a true no-op. This
+//     never inserts a new element into another style — nothing to fix when
+//     no explicit property exists — so only an EXISTING leaf is ever
+//     rewritten in place, with no anchoring/ordering concerns (nothing is
+//     being inserted, so CT_PPr/EG_RPrBase's child order can never be
+//     violated here).
+//   - everything else (Heading1..9/Title/Subtitle, Header/Footer/Caption,
+//     AND any style whose basedOn chain does not cleanly reach Normal at
+//     all — a root-level custom style, or one like Word's own NoSpacing/
+//     MacroText): never rewritten. If it carries the shadowing property
+//     explicitly AND is referenced by at least one real paragraph
+//     (usedIDs, F5) AND was not already handled some other way this same
+//     call (touchedHeadingIDs — see below), it is named in notes instead —
+//     task 7 follow-up review F3/F4's unified rule: "shadows AND wasn't
+//     rewritten this call" is the one test for whether to name a style,
+//     replacing the previous version's inconsistent "only heading-like
+//     styles reachable from Normal" carve-out, which silently said nothing
+//     at all about a root-level style or an unreachable built-in like
+//     NoSpacing/MacroText even when both cases are exactly the same
+//     "docDefaults doesn't actually win here" situation a caller needs to
+//     know about.
 //
-// notes reports, for whichever REQUESTED field, the heading-like styles
-// (Heading1..9, Title, Subtitle) that DID shadow it but were deliberately
-// left alone — Quote/SourceCode's own families shadow deliberately too, but
-// are not reported: "SourceCode 的等宽字体、HeadingN 的字体绝不被 body_font 触碰"
-// (brief §1) is this task's invariant for BOTH families equally, but only
-// the heading-like family is also treated as a caller-facing caveat worth a
-// note (brief §2's own Title/Subtitle example) — nobody is surprised that
-// asking for a document-wide body font left their code blocks and
-// blockquotes alone, but a user who set body_font expecting Title/Subtitle
-// to follow along deserves to be told they did not.
-func planStyleChainShadowPatches(styles []byte, opts FormatOptions) ([]Patch, []string, error) {
+// touchedHeadingIDs (populated by planHeadingFontPatches when opts.
+// HeadingFont is also set in this SAME call) exempts exactly those
+// Heading1..9 styles from the "body font" note only: a heading that
+// heading_font just gave its own deliberate font is not "masking" body_font
+// in any sense the caller needs a caveat about — the previous version
+// contradicted itself by rewriting a heading's font via HeadingFont and
+// then, in the same result, complaining that the very same style still
+// "shadows" body_font.
+func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, touchedHeadingIDs map[string]bool) ([]Patch, map[string]bool, []string, error) {
 	elems, err := scanAllStyles(styles)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	byID := make(map[string]styleElem, len(elems))
 	for _, s := range elems {
@@ -1643,73 +1858,99 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions) ([]Patch, []
 		// docDefaults alone (planStylesPatches' existing, unconditional
 		// behavior) still applies; guessing at a different root here would
 		// risk rewriting the wrong styles entirely.
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	var patches []Patch
-	masked := map[string][]string{} // field label -> heading-like style names
+	changed := map[string]bool{}    // field label -> a real (byte-different) rewrite happened
+	masked := map[string][]string{} // field label -> style names that still shadow it
 
 	for _, s := range elems {
 		if s.typ != "paragraph" || s.id == "" {
 			continue
 		}
-		elig := eligibleForBodyChainRewrite(s, byID)
-		headingMask := !elig && s.id != "Normal" && isHeadingLikeStyle(s) && reachesNormalCleanly(s.basedOn, byID)
-		if !elig && !headingMask {
+		if isSilentExclusionStyle(s) {
+			continue
+		}
+
+		if eligibleForBodyChainRewrite(s, byID) {
+			if opts.BodyFont != "" {
+				if rf, ok := s.rprChildren["rFonts"]; ok {
+					newTag := buildTag("rFonts", rFontsBodyLatinAttrs(rf.attrs, opts.BodyFont), true)
+					if !tagUnchanged(styles, rf, newTag) {
+						patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+						changed["body font"] = true
+					}
+				}
+			}
+			if opts.BodySizePt != 0 {
+				half := ptToHalfPoints(opts.BodySizePt)
+				if sz, ok := s.rprChildren["sz"]; ok {
+					newTag := buildTag("sz", setAttr(sz.attrs, "val", half), true)
+					if !tagUnchanged(styles, sz, newTag) {
+						patches = append(patches, PatchRawSpan(styles, sz.tagSpan, newTag))
+						changed["body size"] = true
+					}
+				}
+				if szcs, ok := s.rprChildren["szCs"]; ok {
+					newTag := buildTag("szCs", setAttr(szcs.attrs, "val", half), true)
+					if !tagUnchanged(styles, szcs, newTag) {
+						patches = append(patches, PatchRawSpan(styles, szcs.tagSpan, newTag))
+						changed["body size"] = true
+					}
+				}
+			}
+			if opts.LineSpacing != 0 {
+				if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "line") {
+					line := lineSpacingTo240ths(opts.LineSpacing)
+					newTag := buildTag("spacing", setAttr(setAttr(sp.attrs, "line", line), "lineRule", "auto"), true)
+					if !tagUnchanged(styles, sp, newTag) {
+						patches = append(patches, PatchRawSpan(styles, sp.tagSpan, newTag))
+						changed["line spacing"] = true
+					}
+				}
+			}
+			if opts.Align != "" {
+				if jc, ok := s.pprChildren["jc"]; ok {
+					newTag := buildTag("jc", setAttr(jc.attrs, "val", opts.Align), true)
+					if !tagUnchanged(styles, jc, newTag) {
+						patches = append(patches, PatchRawSpan(styles, jc.tagSpan, newTag))
+						changed["alignment"] = true
+					}
+				}
+			}
+			continue
+		}
+
+		// Not eligible for rewrite: report it, by name, only when it
+		// actually shadows a requested field AND a real paragraph uses it
+		// (F5) — the exact-match family/PROBE fixtures this rule was
+		// written against are format_style_chain_test.go's own tests.
+		if !usedIDs[s.id] {
 			continue
 		}
 		label := styleLabel(s)
-
-		if opts.BodyFont != "" {
-			if rf, ok := s.rprChildren["rFonts"]; ok {
-				if elig {
-					patches = append(patches, PatchRawSpan(styles, rf.tagSpan,
-						buildTag("rFonts", rFontsBodyLatinAttrs(rf.attrs, opts.BodyFont), true)))
-				} else {
-					masked["body font"] = append(masked["body font"], label)
-				}
+		exemptFont := isHeadingLikeStyle(s) && opts.HeadingFont != "" && touchedHeadingIDs[s.id]
+		if opts.BodyFont != "" && !exemptFont {
+			if _, ok := s.rprChildren["rFonts"]; ok {
+				masked["body font"] = append(masked["body font"], label)
 			}
 		}
-
 		if opts.BodySizePt != 0 {
-			half := ptToHalfPoints(opts.BodySizePt)
-			sawSize := false
-			if sz, ok := s.rprChildren["sz"]; ok {
-				sawSize = true
-				if elig {
-					patches = append(patches, PatchRawSpan(styles, sz.tagSpan, buildTag("sz", setAttr(sz.attrs, "val", half), true)))
-				}
-			}
-			if szcs, ok := s.rprChildren["szCs"]; ok {
-				sawSize = true
-				if elig {
-					patches = append(patches, PatchRawSpan(styles, szcs.tagSpan, buildTag("szCs", setAttr(szcs.attrs, "val", half), true)))
-				}
-			}
-			if sawSize && !elig {
+			_, hasSz := s.rprChildren["sz"]
+			_, hasSzCs := s.rprChildren["szCs"]
+			if hasSz || hasSzCs {
 				masked["body size"] = append(masked["body size"], label)
 			}
 		}
-
 		if opts.LineSpacing != 0 {
 			if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "line") {
-				if elig {
-					line := lineSpacingTo240ths(opts.LineSpacing)
-					patches = append(patches, PatchRawSpan(styles, sp.tagSpan,
-						buildTag("spacing", setAttr(setAttr(sp.attrs, "line", line), "lineRule", "auto"), true)))
-				} else {
-					masked["line spacing"] = append(masked["line spacing"], label)
-				}
+				masked["line spacing"] = append(masked["line spacing"], label)
 			}
 		}
-
 		if opts.Align != "" {
-			if jc, ok := s.pprChildren["jc"]; ok {
-				if elig {
-					patches = append(patches, PatchRawSpan(styles, jc.tagSpan, buildTag("jc", setAttr(jc.attrs, "val", opts.Align), true)))
-				} else {
-					masked["alignment"] = append(masked["alignment"], label)
-				}
+			if _, ok := s.pprChildren["jc"]; ok {
+				masked["alignment"] = append(masked["alignment"], label)
 			}
 		}
 	}
@@ -1725,10 +1966,10 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions) ([]Patch, []
 			quoted[i] = fmt.Sprintf("%q", n)
 		}
 		notes = append(notes, fmt.Sprintf(
-			"style(s) %s carry their own %s that overrides this rule; they were left unchanged (heading/title styles are never rewritten by this rule)",
+			"style(s) %s carry their own %s that overrides this rule and were left unchanged",
 			strings.Join(quoted, ", "), field))
 	}
-	return patches, notes, nil
+	return patches, changed, notes, nil
 }
 
 // directFormatMaskingNotes scans doc's paragraphs for DIRECT formatting (a
@@ -1736,12 +1977,29 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions) ([]Patch, []
 // outranking whatever the docDefaults/style-chain rewrite above just wrote —
 // Word's cascade puts direct formatting above every style, including a
 // freshly-rewritten Normal/BodyText. It reports one honest note per
-// requested field that is actually shadowed this way, naming how many
-// paragraphs are affected and the start_para/end_para range
-// formatDirectRange needs to fix them, rather than letting the
-// whole-document path's Applied read as "every paragraph now looks like
-// this" the way it used to (format capability review, Critical 4 / this
-// task's §2).
+// requested field that is actually shadowed this way, naming the exact
+// paragraphs affected, rather than letting the whole-document path's
+// Applied read as "every paragraph now looks like this" the way it used to
+// (format capability review, Critical 4 / this task's §2).
+//
+// A paragraph styled SourceCode is skipped entirely (isCodeLikeName(p.
+// Style)), not merely excluded from whatever range gets suggested: a code
+// block's own run carries a DIRECT <w:rFonts>/<w:sz> copy of SourceCode's
+// monospace font on purpose (styles.go's codeRunFontsXML — this package's
+// own GenOffice-compatibility mechanism, copied onto the run so a renderer
+// that ignores paragraph styles still shows the right font), which is not a
+// caller mistake to "fix" by restyling it toward the new body font — quite
+// the opposite, that direct copy is exactly what keeps the code block
+// looking like code (task 7 follow-up review, F6).
+//
+// Exact paragraph numbers are listed (not a start_para/end_para range) for
+// the same reason: a min/max range spanning two flagged paragraphs can
+// silently sweep in an untouched one sitting between them — e.g. a
+// SourceCode paragraph the check above deliberately skipped — and
+// formatDirectRange's start_para/end_para only ever accepts one contiguous
+// range, so a caller acting on a range-shaped suggestion would restyle that
+// untouched paragraph too. An exact list has no such gap (task 7 follow-up
+// review, F6).
 func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]string, error) {
 	wantFont := opts.BodyFont != ""
 	wantSize := opts.BodySizePt != 0
@@ -1751,22 +2009,12 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 		return nil, nil
 	}
 
-	type hit struct {
-		count      int
-		minP, maxP int
-	}
-	var fontHit, sizeHit, spacingHit, alignHit hit
-	record := func(h *hit, idx int) {
-		if h.count == 0 || idx < h.minP {
-			h.minP = idx
-		}
-		if idx > h.maxP {
-			h.maxP = idx
-		}
-		h.count++
-	}
+	var fontHits, sizeHits, spacingHits, alignHits []int
 
 	for _, p := range paras {
+		if isCodeLikeName(p.Style) {
+			continue
+		}
 		if wantSpacing || wantAlign {
 			_, ppr, children, err := scanParaProps(doc, p.Span)
 			if err != nil {
@@ -1775,12 +2023,12 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 			if ppr.found && !ppr.selfClosing {
 				if wantSpacing {
 					if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "line") {
-						record(&spacingHit, p.Index)
+						spacingHits = append(spacingHits, p.Index)
 					}
 				}
 				if wantAlign {
 					if _, ok := children["jc"]; ok {
-						record(&alignHit, p.Index)
+						alignHits = append(alignHits, p.Index)
 					}
 				}
 			}
@@ -1803,27 +2051,31 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 				}
 			}
 			if paraFont {
-				record(&fontHit, p.Index)
+				fontHits = append(fontHits, p.Index)
 			}
 			if paraSize {
-				record(&sizeHit, p.Index)
+				sizeHits = append(sizeHits, p.Index)
 			}
 		}
 	}
 
 	var notes []string
-	add := func(h hit, label string) {
-		if h.count == 0 {
+	add := func(hits []int, label string) {
+		if len(hits) == 0 {
 			return
 		}
+		nums := make([]string, len(hits))
+		for i, n := range hits {
+			nums[i] = strconv.Itoa(n)
+		}
 		notes = append(notes, fmt.Sprintf(
-			"%d paragraph(s) carry direct %s formatting that overrides this rule; use start_para=%d/end_para=%d to restyle them",
-			h.count, label, h.minP, h.maxP))
+			"%d paragraph(s) carry direct %s formatting that overrides this rule: paragraph(s) %s; use start_para/end_para on them to restyle",
+			len(hits), label, strings.Join(nums, ", ")))
 	}
-	add(fontHit, "font")
-	add(sizeHit, "size")
-	add(spacingHit, "line spacing")
-	add(alignHit, "alignment")
+	add(fontHits, "font")
+	add(sizeHits, "size")
+	add(spacingHits, "line spacing")
+	add(alignHits, "alignment")
 	return notes, nil
 }
 
