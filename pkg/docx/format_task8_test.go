@@ -107,7 +107,7 @@ func TestDirect_RunFormat_SzLandsBeforeRPrChangeNotAfter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestDirect_ParagraphFormat_FirstLineIndentChars(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestDirect_ParagraphFormat_FirstLineIndentCharsMergesWithExistingInd(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestDirect_ParagraphFormat_SpaceBeforeAfterCombineWithLineSpacing(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{
 		LineSpacing: 1.5, SpaceBeforePt: 6, SpaceAfterPt: 12,
 	})
 	if err != nil {
@@ -275,7 +275,7 @@ func TestDirect_ParagraphFormat_SpaceBeforeMergesIntoExistingSpacing(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{SpaceBeforePt: 6})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{SpaceBeforePt: 6})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestDirect_ParagraphFormat_LineSpacingExactPt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacingExactPt: 24})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacingExactPt: 24})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestDirect_RunFormat_BodyEastAsiaFontAloneLeavesLatinFontsUntouched(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "SimSun", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "", "SimSun", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestDirect_RunFormat_BodyFontAndBodyEastAsiaFontTogether(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "SimSun", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "SimSun", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func TestDirect_RunFormat_BodyFontAloneLeavesEastAsiaAndCsUntouched(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,7 +587,7 @@ func TestDirect_ParagraphFormat_FirstLineIndentCharsDropsHanging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{FirstLineIndentChars: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +644,7 @@ func TestDirect_ParagraphFormat_SpaceBeforeDropsBeforeAutospacing(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{SpaceBeforePt: 6, SpaceAfterPt: 12})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{SpaceBeforePt: 6, SpaceAfterPt: 12})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +673,7 @@ func TestDirect_RunFormat_RFontsLandsAfterRStyle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1914,24 +1914,6 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 	return patches, applied, notes, nil
 }
 
-// styleChildOrder is CT_Style's full child sequence (ECMA-376 §17.7.4.17):
-// the anchor set planHeadingFontPatches needs so a brand-new <w:rPr>
-// inserted for a heading style that has none at all (task 9 brief, item 2 —
-// format capability review, Important 6) lands in the schema-correct
-// position — immediately after <w:pPr> when the style has one, or wherever
-// CT_Style says rPr goes otherwise — and strictly before tblPr/trPr/tcPr/
-// tblStylePr, never unconditionally at the style's own end. Table-type
-// styles (the only ones that ever carry tblPr/trPr/tcPr/tblStylePr) are out
-// of scope for HeadingFont, which only ever matches paragraph-type Heading1
-// ..9 styles, so this list is only ever consulted up through rPr in
-// practice; the trailing names are kept for documentation completeness.
-var styleChildOrder = []string{
-	"name", "aliases", "basedOn", "next", "link", "autoRedefine", "hidden",
-	"uiPriority", "semiHidden", "unhideWhenUsed", "qFormat", "locked",
-	"personal", "personalCompose", "personalReply", "rsid",
-	"pPr", "rPr", "tblPr", "trPr", "tcPr", "tblStylePr",
-}
-
 // planHeadingFontPatches rewrites every heading style's <w:rPr><w:rFonts>
 // ascii/hAnsi to font (stripping their *Theme counterparts), and eastAsia to
 // eastAsiaFont too — but ONLY when eastAsiaFont is non-"" (i.e.
@@ -1966,9 +1948,13 @@ var styleChildOrder = []string{
 // in place to hold the new rFonts; and if the style has NO <w:rPr> AT ALL —
 // a heading whose font is entirely inherited via basedOn, format capability
 // review Important 6 — one is synthesized and inserted at the
-// schema-correct position via styleChildOrder (right after </w:pPr> when
-// the style has a pPr, otherwise right before </w:style>), rather than left
-// as a silent no-op (task 9 brief, item 2). A fully self-closing
+// schema-correct position (right after </w:pPr> when the style has a pPr —
+// CT_Style requires rPr immediately follow pPr — otherwise right before
+// </w:style>, computed inline via pPrFound/pPrCloseEnd below rather than a
+// generic anchor-set scan: HeadingFont never needs to anchor against any
+// OTHER CT_Style child, since none of name/aliases/basedOn/.../rsid ever
+// gets a patch here), rather than left as a silent no-op (task 9 brief,
+// item 2). A fully self-closing
 // <w:style .../> (no children of any kind) is likewise expanded in place.
 //
 // A heading's rPr can wrap a <w:rPrChange><w:rPr>...</w:rPr></w:rPrChange>

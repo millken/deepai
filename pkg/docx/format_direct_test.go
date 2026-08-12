@@ -20,7 +20,7 @@ func TestDirect_OnlyTheRangeIsTouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 2, 2, "Georgia", "", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 2, 2, "Georgia", "", 0)
 	if err != nil {
 		t.Fatalf("applyDirectRunFormat: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestDirect_OnlyTheRangeIsTouched(t *testing.T) {
 func TestDirect_MergesIntoExistingRunProperties(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestDirect_MergesIntoExistingRunProperties(t *testing.T) {
 func TestDirect_InsertsRunPropertiesWhenAbsent(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestDirect_InsertsRunPropertiesWhenAbsent(t *testing.T) {
 func TestDirect_UpdatesAnExistingSizeInsteadOfDuplicating(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestDirect_UpdatesAnExistingSizeInsteadOfDuplicating(t *testing.T) {
 func TestDirect_IsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	once, n1, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
+	once, n1, _, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestDirect_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectRunFormat(once, paras2, 1, 2, "Georgia", "", 14)
+	twice, n2, _, err := applyDirectRunFormat(once, paras2, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 		t.Fatalf("paragraph 1 fixture must have zero runs")
 	}
 
-	runOut, runN, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
+	runOut, runN, _, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 		t.Errorf("empty paragraph 1 was touched by run-level formatting: %s", p1)
 	}
 
-	paraOut, paraN, _, err := applyDirectParaFormat(doc, paras, 1, 2, pParaRequest{LineSpacing: 1.5, Align: ""})
+	paraOut, paraN, _, _, err := applyDirectParaFormat(doc, paras, 1, 2, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 func TestDirect_LeavesTextUntouched(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:t>hello world</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
+	got, _, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestDirect_RunInsideHyperlinkIsFormatted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("no pPr at all", func(t *testing.T) {
 		doc := []byte(`<w:p><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -291,7 +291,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("pPr present but lacking the target property", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +313,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("target property already present", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:spacing w:line="240" w:lineRule="auto"/><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -346,7 +346,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+	got, n, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, _, err := applyDirectParaFormat(got, gotParas, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+	twice, n2, _, _, err := applyDirectParaFormat(got, gotParas, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	once, n1, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
+	once, n1, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, _, err := applyDirectParaFormat(once, paras2, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
+	twice, n2, _, _, err := applyDirectParaFormat(once, paras2, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestDirect_NoFieldsIsANoOp(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
 
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 0)
+	got, n, _, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestDirect_NoFieldsIsANoOp(t *testing.T) {
 		t.Errorf("output changed for an empty run-format request: %s", got)
 	}
 
-	got2, n2, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: ""})
+	got2, n2, _, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,6 +511,68 @@ func TestFormat_RangeNotesSkippedEmptyParagraphsForRunFormat(t *testing.T) {
 	doc, _ := d.Part(DocumentPart)
 	if !strings.Contains(string(doc), `<w:sz w:val="28"/>`) {
 		t.Errorf("the non-empty paragraph in range was not formatted: %s", doc)
+	}
+}
+
+// TestFormatDirectRange_MixedParaFieldsReportOnlyTheOneThatChanged is the
+// review's named probe for the paragraph-level path ("para 级 align+
+// line_spacing 混合"): a paragraph whose <w:jc> ALREADY matches the
+// requested alignment gets a call that ALSO requests a line_spacing change
+// it does not yet have. Before the fix, both fields shared one aggregate
+// "n" (>0 because line_spacing did change), so align — genuinely
+// unchanged — was reported as "applied" too. Each field must now be judged
+// on its own byte-level change: line_spacing -> Applied, alignment ->
+// Notes' "already ..." (task 10 review, Major finding).
+func TestFormatDirectRange_MixedParaFieldsReportOnlyTheOneThatChanged(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
+	res, err := d.Format(FormatOptions{StartPara: 1, EndPara: 1, Align: "center", LineSpacing: 1.5})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	appliedJoined := strings.Join(res.Applied, "|")
+	notesJoined := strings.Join(res.Notes, "|")
+	if !strings.Contains(appliedJoined, "line spacing") {
+		t.Errorf("Applied = %v, want a line spacing entry (it genuinely changed)", res.Applied)
+	}
+	if strings.Contains(appliedJoined, "alignment") {
+		t.Errorf("Applied = %v, want NO alignment entry (it already matched)", res.Applied)
+	}
+	if !strings.Contains(notesJoined, "alignment already center; no change") {
+		t.Errorf("Notes = %v, want an \"alignment already center; no change\" note", res.Notes)
+	}
+	doc, _ := d.Part(DocumentPart)
+	if !strings.Contains(string(doc), `w:line="360"`) {
+		t.Errorf("line spacing was not actually written: %s", doc)
+	}
+}
+
+// TestFormatDirectRange_MixedRunFieldsReportOnlyTheOneThatChanged is the
+// review's named probe for the run-level path ("run 级 body_font+
+// body_size_pt 混合"): a run whose <w:rFonts> ALREADY matches the requested
+// font gets a call that ALSO requests a size change it does not yet have.
+// Before the fix, both fields shared one aggregate "n", so font — genuinely
+// unchanged — was reported as "applied" too, exactly the risk task 10's
+// first pass left open (task 10 review, Major finding).
+func TestFormatDirectRange_MixedRunFieldsReportOnlyTheOneThatChanged(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/></w:rPr><w:t>x</w:t></w:r></w:p>`)
+	res, err := d.Format(FormatOptions{StartPara: 1, EndPara: 1, BodyFont: "Georgia", BodySizePt: 14})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	appliedJoined := strings.Join(res.Applied, "|")
+	notesJoined := strings.Join(res.Notes, "|")
+	if !strings.Contains(appliedJoined, "size") {
+		t.Errorf("Applied = %v, want a size entry (it genuinely changed)", res.Applied)
+	}
+	if strings.Contains(appliedJoined, "font ->") {
+		t.Errorf("Applied = %v, want NO font entry (it already matched)", res.Applied)
+	}
+	if !strings.Contains(notesJoined, "font already Georgia; no change") {
+		t.Errorf("Notes = %v, want a \"font already Georgia; no change\" note", res.Notes)
+	}
+	doc, _ := d.Part(DocumentPart)
+	if !strings.Contains(string(doc), `<w:sz w:val="28"/>`) {
+		t.Errorf("size was not actually written: %s", doc)
 	}
 }
 

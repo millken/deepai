@@ -98,7 +98,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			emptyCount++
 		}
 
-		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.BodyEastAsiaFont, opts.BodySizePt)
+		out, n, counts, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.BodyEastAsiaFont, opts.BodySizePt)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct run formatting: %w", err)
 		}
@@ -110,34 +110,37 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 				return FormatResult{}, fmt.Errorf("docx: rescan after direct run formatting: %w", err)
 			}
 		}
-		// n counts only paragraphs a byte actually changed for (task 10
-		// brief item 3): a repeat call whose runs already carry exactly the
-		// requested font/size reports n==0, so the field is reported as an
-		// "already ..." note instead of a (false) Applied entry, mirroring
-		// the whole-document path's own already-empty-Applied convention
-		// (docxFormatNoChangeNote at the tool layer).
+		// counts.Font/EastAsia/Size are computed per FIELD, not from the
+		// shared n above (code review after task 10's first pass): <w:rFonts>
+		// carries BOTH BodyFont (ascii/hAnsi) and BodyEastAsiaFont (eastAsia)
+		// independently, so a mixed call where body_font already matches but
+		// body_east_asia_font does not (or vice versa) must gate each field
+		// on its OWN byte-level change, not on whether ANY field in the call
+		// changed something. Using the shared n here would have reported the
+		// unchanged field as "applied" too, just because a sibling field on
+		// the same call happened to change (task 10 review, Major finding).
 		if opts.BodyFont != "" {
-			if n > 0 {
+			if counts.Font > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, n))
+					"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, counts.Font))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d font already %s; no change", from, to, opts.BodyFont))
 			}
 		}
 		if opts.BodyEastAsiaFont != "" {
-			if n > 0 {
+			if counts.EastAsia > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.BodyEastAsiaFont, n))
+					"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.BodyEastAsiaFont, counts.EastAsia))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d east asia font already %s; no change", from, to, opts.BodyEastAsiaFont))
 			}
 		}
 		if opts.BodySizePt != 0 {
-			if n > 0 {
+			if counts.Size > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d size -> %gpt (%d paragraph(s))", from, to, opts.BodySizePt, n))
+					"paragraph %d-%d size -> %gpt (%d paragraph(s))", from, to, opts.BodySizePt, counts.Size))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d size already %gpt; no change", from, to, opts.BodySizePt))
@@ -165,7 +168,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			Align:                opts.Align,
 			FirstLineIndentChars: opts.FirstLineIndentChars,
 		}
-		out, n, dropNotes, err := applyDirectParaFormat(working, paras, from, to, req)
+		out, n, counts, dropNotes, err := applyDirectParaFormat(working, paras, from, to, req)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
 		}
@@ -174,58 +177,62 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			changed = true
 		}
 		result.Notes = append(result.Notes, dropNotes...)
-		// n counts only paragraphs a byte actually changed for (task 10
-		// brief item 3) -- see the run-format block's identical comment
-		// above.
+		// counts.* are computed per FIELD, not from the shared n above (see
+		// the run-format block's identical comment above): <w:spacing>
+		// carries line-spacing/before/after independently, so a mixed call
+		// where e.g. align already matches but line_spacing does not must
+		// gate each field on its own byte-level change (task 10 review,
+		// Major finding — the review's own named probe: "para 级 align+
+		// line_spacing 混合").
 		if opts.LineSpacing != 0 {
-			if n > 0 {
+			if counts.LineSpacing > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, n))
+					"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, counts.LineSpacing))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d line spacing already %g; no change", from, to, opts.LineSpacing))
 			}
 		}
 		if opts.LineSpacingExactPt != 0 {
-			if n > 0 {
+			if counts.LineSpacing > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d line spacing -> exact %gpt (%d paragraph(s))", from, to, opts.LineSpacingExactPt, n))
+					"paragraph %d-%d line spacing -> exact %gpt (%d paragraph(s))", from, to, opts.LineSpacingExactPt, counts.LineSpacing))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d line spacing already exact %gpt; no change", from, to, opts.LineSpacingExactPt))
 			}
 		}
 		if opts.SpaceBeforePt != 0 {
-			if n > 0 {
+			if counts.SpaceBefore > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d space before -> %gpt (%d paragraph(s))", from, to, opts.SpaceBeforePt, n))
+					"paragraph %d-%d space before -> %gpt (%d paragraph(s))", from, to, opts.SpaceBeforePt, counts.SpaceBefore))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d space before already %gpt; no change", from, to, opts.SpaceBeforePt))
 			}
 		}
 		if opts.SpaceAfterPt != 0 {
-			if n > 0 {
+			if counts.SpaceAfter > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d space after -> %gpt (%d paragraph(s))", from, to, opts.SpaceAfterPt, n))
+					"paragraph %d-%d space after -> %gpt (%d paragraph(s))", from, to, opts.SpaceAfterPt, counts.SpaceAfter))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d space after already %gpt; no change", from, to, opts.SpaceAfterPt))
 			}
 		}
 		if opts.Align != "" {
-			if n > 0 {
+			if counts.Align > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d alignment -> %s (%d paragraph(s))", from, to, opts.Align, n))
+					"paragraph %d-%d alignment -> %s (%d paragraph(s))", from, to, opts.Align, counts.Align))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d alignment already %s; no change", from, to, opts.Align))
 			}
 		}
 		if opts.FirstLineIndentChars != 0 {
-			if n > 0 {
+			if counts.FirstLineIndent > 0 {
 				result.Applied = append(result.Applied, fmt.Sprintf(
-					"paragraph %d-%d first line indent -> %g chars (%d paragraph(s))", from, to, opts.FirstLineIndentChars, n))
+					"paragraph %d-%d first line indent -> %g chars (%d paragraph(s))", from, to, opts.FirstLineIndentChars, counts.FirstLineIndent))
 			} else {
 				result.Notes = append(result.Notes, fmt.Sprintf(
 					"paragraph %d-%d first line indent already %g chars; no change", from, to, opts.FirstLineIndentChars))
@@ -247,16 +254,78 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 	return result, nil
 }
 
+// directRunFieldCounts reports, per requested run-level field, how many
+// paragraphs in the range actually had a byte-level change for that
+// SPECIFIC field — finer-grained than applyDirectRunFormat's aggregate "n"
+// (which only says whether ANY of the requested fields changed something in
+// a paragraph). The distinction matters because a single run's <w:rFonts>
+// carries BOTH BodyFont (ascii/hAnsi) and BodyEastAsiaFont (eastAsia)
+// independently: a run whose font already matches but whose east-asia font
+// does not (or vice versa) must count toward exactly one of Font/EastAsia,
+// never both — using the shared aggregate for both would report the
+// unchanged field as "applied" too, merely because its sibling field in the
+// same call happened to change (task 10 review, Major finding; the review's
+// own named probe: "run 级 body_font+body_size_pt 混合").
+type directRunFieldCounts struct {
+	Font     int
+	EastAsia int
+	Size     int
+}
+
+// runFieldsAlreadyMatch reports, for one run's already-scanned rPr/children
+// (scanRunProps' output), whether each REQUESTED field (font/eastAsiaFont/
+// sizePt — a ""/0 field's own return value is meaningless and never
+// consulted by callers) already carries exactly the value being requested.
+// This is the value-level analogue of filterChangedPatches' byte-level
+// check, resolved per FIELD rather than per rendered tag, using the same
+// attribute-level predicates (rFontsLatinUnchanged/rFontsEastAsiaUnchanged/
+// attrEquals) format.go's whole-document path already relies on for exactly
+// this "more than one independently-requested field lands on the SAME
+// element" situation — see attrEquals' own doc comment. A missing or
+// self-closing rPr never "already matches" anything: there is no rFonts/sz/
+// szCs there yet to compare against, so every requested field on it counts
+// as needing a change (consistent with planRunRPrPatches' own missing/
+// self-closing branches, which always emit a real insert/expand there).
+func runFieldsAlreadyMatch(rpr elemInfo, children map[string]elemInfo, font, eastAsiaFont string, sizePt float64) (fontOK, eastAsiaOK, sizeOK bool) {
+	if !rpr.found || rpr.selfClosing {
+		return false, false, false
+	}
+	if font != "" {
+		if rf, ok := children["rFonts"]; ok {
+			fontOK = rFontsLatinUnchanged(rf.attrs, font)
+		}
+	}
+	if eastAsiaFont != "" {
+		if rf, ok := children["rFonts"]; ok {
+			eastAsiaOK = rFontsEastAsiaUnchanged(rf.attrs, eastAsiaFont)
+		}
+	}
+	if sizePt != 0 {
+		half := ptToHalfPoints(sizePt)
+		sz, okSz := children["sz"]
+		szCs, okSzCs := children["szCs"]
+		sizeOK = okSz && okSzCs && attrEquals(sz.attrs, "val", half) && attrEquals(szCs.attrs, "val", half)
+	}
+	return
+}
+
 // applyDirectRunFormat rewrites every run's own <w:rPr> for every paragraph
 // in [from,to] (1-based, inclusive) that has at least one run, setting font
 // (via <w:rFonts> ascii/hAnsi/eastAsia/cs, skipped when "") and/or
 // eastAsiaFont (via the SAME <w:rFonts>'s eastAsia ONLY, skipped when "")
 // and/or sizePt (via <w:sz>+<w:szCs> kept in sync, skipped when 0). A
 // paragraph with zero runs is left completely untouched — there is no
-// <w:r> to attach a <w:rPr> to — and does not count toward the returned
-// paragraph count; callers that need to report this (Format's Notes) must
-// compute it themselves from paras, the same slice this function was
-// given.
+// <w:r> to attach a <w:rPr> to — and does not count toward either the
+// returned paragraph count or directRunFieldCounts; callers that need to
+// report this (Format's Notes) must compute it themselves from paras, the
+// same slice this function was given.
+//
+// The returned int is the aggregate "did ANY requested field change in this
+// paragraph" count, used by callers only to decide whether the returned
+// bytes differ from documentXML at all (e.g. whether to rescan/persist).
+// directRunFieldCounts is the per-field breakdown callers must use for
+// Applied/Notes reporting instead (see its own doc comment for why the
+// aggregate is not precise enough for that).
 //
 // A single <w:r> is only ever patched once even if it produced more than
 // one Run (scan.go's Run.Elem doc comment: a <w:r> with multiple <w:t>
@@ -265,16 +334,17 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 // paras must be Scan's output for documentXML (or an equivalent rescan) —
 // stale offsets from an earlier version of the bytes would corrupt the
 // splice.
-func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, eastAsiaFont string, sizePt float64) ([]byte, int, error) {
+func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, eastAsiaFont string, sizePt float64) ([]byte, int, directRunFieldCounts, error) {
 	if font == "" && eastAsiaFont == "" && sizePt == 0 {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, 0, nil
+		return out, 0, directRunFieldCounts{}, nil
 	}
 
 	var patches []Patch
 	seenElems := make(map[Span]bool)
 	changed := 0
+	var counts directRunFieldCounts
 
 	for _, p := range paras {
 		if p.Index < from || p.Index > to {
@@ -284,6 +354,11 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 			continue
 		}
 		touchedThisPara := false
+		// *ChangedHere are reset once per paragraph (not per run), so a
+		// paragraph with several runs counts toward a field's total at most
+		// once even when more than one of its runs needed that field's
+		// change.
+		fontChangedHere, eastAsiaChangedHere, sizeChangedHere := false, false, false
 		for _, r := range p.Runs {
 			if seenElems[r.Elem] {
 				continue
@@ -292,7 +367,17 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 
 			openEnd, rpr, children, err := scanRunProps(documentXML, r.Elem)
 			if err != nil {
-				return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
+				return nil, 0, directRunFieldCounts{}, fmt.Errorf("paragraph %d: %w", p.Index, err)
+			}
+			fontOK, eastAsiaOK, sizeOK := runFieldsAlreadyMatch(rpr, children, font, eastAsiaFont, sizePt)
+			if font != "" && !fontOK {
+				fontChangedHere = true
+			}
+			if eastAsiaFont != "" && !eastAsiaOK {
+				eastAsiaChangedHere = true
+			}
+			if sizePt != 0 && !sizeOK {
+				sizeChangedHere = true
 			}
 			// filterChangedPatches drops any leaf rewrite that would leave
 			// its span byte-identical to what it already is -- the
@@ -310,18 +395,80 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 		if touchedThisPara {
 			changed++
 		}
+		if fontChangedHere {
+			counts.Font++
+		}
+		if eastAsiaChangedHere {
+			counts.EastAsia++
+		}
+		if sizeChangedHere {
+			counts.Size++
+		}
 	}
 
 	if len(patches) == 0 {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, changed, nil
+		return out, changed, counts, nil
 	}
 	out, err := Apply(documentXML, patches)
 	if err != nil {
-		return nil, 0, fmt.Errorf("docx: apply direct run formatting: %w", err)
+		return nil, 0, directRunFieldCounts{}, fmt.Errorf("docx: apply direct run formatting: %w", err)
 	}
-	return out, changed, nil
+	return out, changed, counts, nil
+}
+
+// directParaFieldCounts is directRunFieldCounts' paragraph-level twin: one
+// counter per pParaRequest field, needed for the same reason -- <w:spacing>
+// carries LineSpacing (or LineSpacingExactPt; the two are mutually
+// exclusive, so exactly one of them is ever non-zero in a given call) AND
+// SpaceBeforePt AND SpaceAfterPt independently, on the very same element.
+// LineSpacing covers both LineSpacing and LineSpacingExactPt.
+type directParaFieldCounts struct {
+	LineSpacing     int
+	SpaceBefore     int
+	SpaceAfter      int
+	Align           int
+	FirstLineIndent int
+}
+
+// paraFieldsAlreadyMatch is runFieldsAlreadyMatch's paragraph-level twin:
+// reports, for one paragraph's already-scanned pPr/children (scanParaProps'
+// output), whether each requested pParaRequest field already carries
+// exactly the value being requested. As with rFonts above, <w:spacing>'s
+// line/lineRule vs. before vs. after are checked independently via
+// attrEquals, so a paragraph whose alignment already matches but whose line
+// spacing does not (or vice versa) resolves each field on its own (task 10
+// review, Major finding; the review's own named probe: "para 级 align+
+// line_spacing 混合"). A missing or self-closing pPr never "already
+// matches" anything, mirroring runFieldsAlreadyMatch and
+// planParaPPrPatches' own missing/self-closing branches.
+func paraFieldsAlreadyMatch(ppr elemInfo, children map[string]elemInfo, req pParaRequest) (lineSpacingOK, beforeOK, afterOK, alignOK, indentOK bool) {
+	if !ppr.found || ppr.selfClosing {
+		return false, false, false, false, false
+	}
+	if sp, ok := children["spacing"]; ok {
+		switch {
+		case req.LineSpacing != 0:
+			lineSpacingOK = attrEquals(sp.attrs, "line", lineSpacingTo240ths(req.LineSpacing)) && attrEquals(sp.attrs, "lineRule", "auto")
+		case req.LineSpacingExactPt != 0:
+			lineSpacingOK = attrEquals(sp.attrs, "line", ptToTwips(req.LineSpacingExactPt)) && attrEquals(sp.attrs, "lineRule", "exact")
+		}
+		if req.SpaceBeforePt != 0 {
+			beforeOK = attrEquals(sp.attrs, "before", ptToTwips(req.SpaceBeforePt)) && !hasAttr(sp.attrs, "beforeAutospacing")
+		}
+		if req.SpaceAfterPt != 0 {
+			afterOK = attrEquals(sp.attrs, "after", ptToTwips(req.SpaceAfterPt)) && !hasAttr(sp.attrs, "afterAutospacing")
+		}
+	}
+	if jc, ok := children["jc"]; ok && req.Align != "" {
+		alignOK = attrEquals(jc.attrs, "val", req.Align)
+	}
+	if ind, ok := children["ind"]; ok && req.FirstLineIndentChars != 0 {
+		indentOK = attrEquals(ind.attrs, "firstLineChars", firstLineCharsHundredths(req.FirstLineIndentChars)) &&
+			!hasAttr(ind.attrs, "hanging") && !hasAttr(ind.attrs, "hangingChars")
+	}
+	return
 }
 
 // applyDirectParaFormat rewrites every paragraph's own <w:pPr> for every
@@ -334,21 +481,27 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 // place into <w:p><w:pPr>...</w:pPr></w:p> — there is no content model to
 // insert into otherwise).
 //
+// The returned int is the aggregate "did ANY requested field change in this
+// paragraph" count (see applyDirectRunFormat's identical doc comment for
+// why callers must use the returned directParaFieldCounts, not this
+// aggregate, for Applied/Notes reporting).
+//
 // notes reports, aggregated across the whole range rather than once per
 // paragraph, the same silent-drop caveats pPrDropNotes covers for the
 // whole-document path (task 9 brief, item 7b): a pre-existing w:hanging/
 // w:hangingChars removed by a real FirstLineIndentChars, or a pre-existing
 // w:beforeAutospacing/w:afterAutospacing removed by a real SpaceBeforePt/
 // SpaceAfterPt.
-func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req pParaRequest) ([]byte, int, []string, error) {
+func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req pParaRequest) ([]byte, int, directParaFieldCounts, []string, error) {
 	if req.isZero() {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, 0, nil, nil
+		return out, 0, directParaFieldCounts{}, nil, nil
 	}
 
 	var patches []Patch
 	changed := 0
+	var counts directParaFieldCounts
 	var hangingDropped, beforeAutoDropped, afterAutoDropped int
 
 	for _, p := range paras {
@@ -357,15 +510,33 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req p
 		}
 
 		if isSelfClosingSpan(documentXML, p.Span) {
+			// A brand new pPr is being synthesized from nothing: every
+			// requested field is necessarily a real change (there is
+			// nothing there yet to already match).
 			newXML := expandSelfClosingParagraph(documentXML, p.Span, req)
 			patches = append(patches, PatchRawSpan(documentXML, p.Span, newXML))
 			changed++
+			if req.LineSpacing != 0 || req.LineSpacingExactPt != 0 {
+				counts.LineSpacing++
+			}
+			if req.SpaceBeforePt != 0 {
+				counts.SpaceBefore++
+			}
+			if req.SpaceAfterPt != 0 {
+				counts.SpaceAfter++
+			}
+			if req.Align != "" {
+				counts.Align++
+			}
+			if req.FirstLineIndentChars != 0 {
+				counts.FirstLineIndent++
+			}
 			continue
 		}
 
 		openEnd, ppr, children, err := scanParaProps(documentXML, p.Span)
 		if err != nil {
-			return nil, 0, nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
+			return nil, 0, directParaFieldCounts{}, nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
 		}
 		if req.FirstLineIndentChars != 0 {
 			if ind, ok := children["ind"]; ok && (hasAttr(ind.attrs, "hanging") || hasAttr(ind.attrs, "hangingChars")) {
@@ -382,6 +553,24 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req p
 				afterAutoDropped++
 			}
 		}
+
+		lineSpacingOK, beforeOK, afterOK, alignOK, indentOK := paraFieldsAlreadyMatch(ppr, children, req)
+		if (req.LineSpacing != 0 || req.LineSpacingExactPt != 0) && !lineSpacingOK {
+			counts.LineSpacing++
+		}
+		if req.SpaceBeforePt != 0 && !beforeOK {
+			counts.SpaceBefore++
+		}
+		if req.SpaceAfterPt != 0 && !afterOK {
+			counts.SpaceAfter++
+		}
+		if req.Align != "" && !alignOK {
+			counts.Align++
+		}
+		if req.FirstLineIndentChars != 0 && !indentOK {
+			counts.FirstLineIndent++
+		}
+
 		// filterChangedPatches: see applyDirectRunFormat's identical comment
 		// above -- a paragraph whose pPr already carries exactly the
 		// requested spacing/align/indent must not be counted as "changed"
@@ -416,13 +605,13 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req p
 	if len(patches) == 0 {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, changed, notes, nil
+		return out, changed, counts, notes, nil
 	}
 	out, err := Apply(documentXML, patches)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
+		return nil, 0, directParaFieldCounts{}, nil, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
 	}
-	return out, changed, notes, nil
+	return out, changed, counts, notes, nil
 }
 
 // expandSelfClosingParagraph rewrites a self-closing <w:p .../> into
