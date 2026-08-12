@@ -1058,7 +1058,8 @@ func DocxWriteTool() models.Tool {
 			"**bold**/*italic*/`inline code` become formatted runs; - / * and 1. lists (including nested ones) " +
 			"become properly indented bulleted or numbered lists; GFM pipe tables (| a | b |, with an alignment " +
 			"row) become bordered Word tables with a bold header row and per-column left/center/right alignment; " +
-			"fenced ``` code blocks become monospace, shaded paragraphs with indentation preserved; [text](url) " +
+			"fenced ``` code blocks (and 4-space/tab-indented ones) become a single monospace, shaded, " +
+			"bordered paragraph per block with indentation preserved and lines separated by line breaks; [text](url) " +
 			"becomes a clickable hyperlink; > quotes and a standalone --- become a bordered block quote and a " +
 			"horizontal rule. A document with tables, nested lists, and code blocks is exactly what this tool " +
 			"is for — there is no need to write a script instead. The one thing it cannot do is embed images: " +

@@ -760,26 +760,24 @@ func TestWrite_FenceInfoStringIsIgnoredNotError(t *testing.T) {
 func TestWrite_UnterminatedFenceRunsToEndOfDocument(t *testing.T) {
 	// The trailing "\n" splits into one extra, empty final line -- still
 	// inside the never-closed fence, so it becomes its own (empty) code
-	// paragraph too, per the same "every line inside a fence, blank ones
-	// included, is its own paragraph" rule this file's inFence branch
-	// documents.
+	// LINE too, per the same "every line inside a fence, blank ones
+	// included, is part of the block" rule this file's inFence branch
+	// documents. As of the code-single-paragraph task (write.go's
+	// mergeCodeBlocks/renderCodeBlockRuns) all four lines collapse into
+	// ONE SourceCode paragraph, recovered here via paraTextWithBreaks
+	// rather than as four separate paragraphs.
 	d, _, _ := writeAndReopen(t, "```\nfoo\n# Heading\nbar\n")
 	paras := d.Paras()
-	if len(paras) != 4 {
-		t.Fatalf("got %d paragraphs, want 4 (foo / # Heading / bar / trailing blank, all as code)", len(paras))
+	if len(paras) != 1 {
+		t.Fatalf("got %d paragraphs, want 1 (the whole unterminated fence is one code block/paragraph)", len(paras))
 	}
-	wantTexts := []string{"foo", "# Heading", "bar", ""}
-	for i, want := range wantTexts {
-		var text strings.Builder
-		for _, r := range paras[i].Runs {
-			text.WriteString(r.Text)
-		}
-		if text.String() != want {
-			t.Errorf("paras[%d] text = %q, want %q", i, text.String(), want)
-		}
-		if paras[i].Style == "Heading1" {
-			t.Errorf("paras[%d] became a Heading1 -- the unterminated fence did not swallow it as code", i)
-		}
+	if paras[0].Style != StyleSourceCode {
+		t.Fatalf("paras[0].Style = %q, want %q", paras[0].Style, StyleSourceCode)
+	}
+	got := strings.Split(paraTextWithBreaks(paras[0]), "\n")
+	want := []string{"foo", "# Heading", "bar", ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("code block lines = %q, want %q", got, want)
 	}
 }
 
@@ -1267,17 +1265,26 @@ func TestWrite_RealisticDesignDocumentSurvivesRoundTrip(t *testing.T) {
 		t.Error("no right-aligned table cell found (expected from the ---: Notes column)")
 	}
 
-	// Fenced code block: three literal lines, markdown not interpreted,
-	// no fence marker or info string leaked into the text.
-	wantCode := []string{"func Run() error {", "    return nil", "}"}
-	gotCode := map[string]bool{}
+	// Fenced code block: three literal lines, markdown not interpreted, no
+	// fence marker or info string leaked into the text. As of the
+	// code-single-paragraph task the whole block is one SourceCode
+	// paragraph (write.go's mergeCodeBlocks/renderCodeBlockRuns), its
+	// three lines joined by <w:br/> rather than split across three
+	// paragraphs -- recovered here via paraTextWithBreaks.
+	var codeBlockText string
+	var foundCodeBlock bool
 	for _, p := range paras {
-		gotCode[textOf(p)] = true
-	}
-	for _, want := range wantCode {
-		if !gotCode[want] {
-			t.Errorf("code line %q not found in the round-tripped document", want)
+		if p.Style == StyleSourceCode {
+			codeBlockText = paraTextWithBreaks(p)
+			foundCodeBlock = true
+			break
 		}
+	}
+	if !foundCodeBlock {
+		t.Fatal("no SourceCode paragraph found in the round-tripped document")
+	}
+	if want := "func Run() error {\n    return nil\n}"; codeBlockText != want {
+		t.Errorf("code block text = %q, want %q", codeBlockText, want)
 	}
 	if strings.Contains(docStr, "```") {
 		t.Error("a fence delimiter leaked into the rendered document")
@@ -1467,8 +1474,10 @@ func TestWrite_InvariantAllowsThreeNamedExceptions(t *testing.T) {
 // TestWrite_EveryConstructReferencesItsStyle is Step 3's "观感回归测试": a
 // realistic document exercising headings, an ordinary paragraph, a nested
 // list, a block quote, a fenced code block, a table, and a link, checked
-// against the brief's mapping table -- every code-line paragraph
-// references SourceCode, every list item references ListParagraph AND
+// against the brief's mapping table -- the code BLOCK's one paragraph
+// references SourceCode (see the code-single-paragraph task: a whole block
+// is now one paragraph, not one per line -- TestWrite_CodeBlockParagraphsSuppressSpacing's
+// own doc comment has the full reasoning), every list item references ListParagraph AND
 // still carries numPr, the table references TableGrid with column widths
 // still summing exactly to the content width, inline code references
 // VerbatimChar, and a link's text references Hyperlink. The document must
@@ -1489,8 +1498,8 @@ func TestWrite_EveryConstructReferencesItsStyle(t *testing.T) {
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
 
-	if got, want := strings.Count(s, `<w:pStyle w:val="SourceCode"/>`), 2; got != want {
-		t.Errorf("SourceCode pStyle count = %d, want %d (one per code line)", got, want)
+	if got, want := strings.Count(s, `<w:pStyle w:val="SourceCode"/>`), 1; got != want {
+		t.Errorf("SourceCode pStyle count = %d, want %d (one per code BLOCK, not one per line)", got, want)
 	}
 	if got, want := strings.Count(s, `<w:pStyle w:val="ListParagraph"/>`), 2; got != want {
 		t.Errorf("ListParagraph pStyle count = %d, want %d (one per list item)", got, want)

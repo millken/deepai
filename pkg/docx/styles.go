@@ -432,15 +432,22 @@ func codeRunFontsXML(f fontOptions) string {
 		`" w:hAnsi="` + f.codeLatin + `" w:cs="` + f.codeLatin + `"/>`
 }
 
-// sourceCodeStyleXML is the fix for the striped-code-block defect. A
-// fenced code block renders one paragraph per line (see write.go's
-// paraBlock.isCode); without both zeroed spacing AND
-// <w:contextualSpacing/>, each line inherits docDefaultsXML's 200-twip
-// after-spacing, and the shading on each paragraph reads as a stack of
-// separate bars rather than one contiguous block. contextualSpacing is
-// what collapses the gap between adjacent paragraphs of the SAME style —
-// zeroing spacing alone is not sufficient once a document's default line
-// spacing is non-zero, so this style carries both per the brief.
+// sourceCodeStyleXML is the fix for the striped-code-block defect.
+// contextualSpacing/zeroed spacing predate the code-single-paragraph task
+// (below): a fenced code block used to render one paragraph per line (see
+// write.go's old paraBlock.isCode doc comment), and without both, each
+// line inherited docDefaultsXML's 200-twip after-spacing, so the shading
+// read as a stack of separate bars rather than one contiguous block.
+// contextualSpacing collapsed the gap between adjacent paragraphs of the
+// SAME style; zeroing spacing alone was not sufficient once a document's
+// default line spacing is non-zero. A code block is now always exactly one
+// paragraph (write.go's mergeCodeBlocks/renderCodeBlockRuns), so neither
+// property has adjacent same-style paragraphs left to act on for an
+// ordinary document -- they stay only because they are still harmless
+// (nothing to collapse against) and because two textually distinct fenced
+// blocks with nothing at all between them still merge into one paraBlock
+// (see mergeCodeBlocks' doc comment on that specific edge case) and so
+// still benefit from both.
 //
 // <w:ind w:left="120"/> is Task 2's addition on top of Task 1's original
 // definition: write.go's pre-Task-2 codeIndentXML gave every fenced-code
@@ -452,38 +459,58 @@ func codeRunFontsXML(f fontOptions) string {
 // it, moving code blocks over to pStyle="SourceCode" would have silently
 // dropped the indent rather than merely relocating it.
 //
-// <w:keepNext/><w:keepLines/> and <w:pBdr> are this task's own addition
-// (the code-block-report's "Defect 2": a code block was a run of shaded
-// paragraphs with no visible container -- Word draws paragraph shading
-// edge to edge with no padding, so the code sat flush against the
-// surrounding text). Two containers were considered: a single-cell table
-// (the technique real Word documents commonly use, since a cell supplies a
-// border, background AND internal margins for free), and a paragraph
-// border. The table was rejected specifically for THIS codebase: wrapping
-// every code line in a <w:tc> would make docx_read's scanner report each
-// one as a table cell (Para.Cell != nil), which read.go's renderReadPara
-// cannot be taught to treat differently (it is on this task's forbidden-
-// to-modify list, same as scan.go) -- every code block would start
-// rendering as "(table N row 1 col 1) ..." in Read's markdown output and
-// trip its table-structure note, for a document that has no real table at
-// all. A table would also shift every REAL data table after it to a
-// higher table index, a second, independent behavior change with its own
-// blast radius. A paragraph border pays for none of that: Word merges the
-// borders of contiguous paragraphs that share byte-identical <w:pBdr> XML
-// into a single box around the whole run (the same mechanism "Borders and
-// Shading" applied to a multi-paragraph selection produces), so this one
-// style-level property still yields ONE bordered box around a multi-line
-// code block, not a border around every individual line. w:space on each
-// side is what turns the border into real padding rather than a second
-// line flush against the text: 4pt top/bottom (the gap above the first
-// line and below the last, since Word merges the interior lines' borders
-// away) and 8pt left/right (applied to every line, since a vertical border
-// spans the whole box). keepNext/keepLines is the paragraph-only answer to
-// "keeps together sensibly across pages": the same chaining mechanism
-// heading styles above already use for the identical reason (a heading
-// stranding at the bottom of a page while its body flows to the next) --
-// consecutive keepNext paragraphs pull each other onto the same page
-// wherever Word can manage it.
+// <w:pBdr> is a still-earlier task's own addition (the code-block-report's
+// "Defect 2": a code block was a run of shaded paragraphs with no visible
+// container -- Word draws paragraph shading edge to edge with no padding,
+// so the code sat flush against the surrounding text). Two containers were
+// considered: a single-cell table (the technique real Word documents
+// commonly use, since a cell supplies a border, background AND internal
+// margins for free), and a paragraph border. The table was rejected
+// specifically for THIS codebase: wrapping code in a <w:tc> would make
+// docx_read's scanner report it as a table cell (Para.Cell != nil), which
+// read.go's renderReadPara cannot be taught to treat differently (it is on
+// this task's forbidden-to-modify list, same as scan.go) -- every code
+// block would start rendering as "(table N row 1 col 1) ..." in Read's
+// markdown output and trip its table-structure note, for a document that
+// has no real table at all. A table would also shift every REAL data
+// table after it to a higher table index, a second, independent behavior
+// change with its own blast radius. A paragraph border pays for none of
+// that, and now that a code block is one paragraph, it needs no
+// cross-paragraph border-merging assumption either (see this task's own
+// report): ONE <w:pBdr>/<w:shd> on the one paragraph is the whole box, in
+// every renderer. w:space on each side is what turns the border into real
+// padding rather than a line flush against the text: 4pt top/bottom, 8pt
+// left/right.
+//
+// keepNext -- kept, unlike keepLines (removed; see below) -- avoids
+// stranding the code block at the bottom of a page separated from
+// whatever ordinary paragraph immediately follows it, the same reasoning
+// the heading styles above use for their own keepNext. Its blast radius is
+// bounded: at most it pulls ONE following paragraph back to fit the code
+// block, not a whole chain.
+//
+// keepLines is deliberately NOT carried here, even though it looks like
+// the obvious pagination-safety pairing with keepNext. Before the
+// code-single-paragraph task, isCode was one paragraph PER LINE, so
+// keepLines ("keep every line of THIS paragraph on the same page") was a
+// near no-op -- it only mattered for a single source line long enough to
+// visually word-wrap, and the real "keep the whole block together" effect
+// instead came from keepNext chaining each line-paragraph to the next
+// (paragraph1 keepNext paragraph2 keepNext paragraph3 ...), transitively
+// pulling however many lines existed onto one page. Collapsing the block
+// to one paragraph turns keepLines from that near no-op into the literal
+// meaning "keep the ENTIRE block on one page" -- and for a block longer
+// than a full page that request is unsatisfiable, so Word's fallback is to
+// push the whole thing to the top of the next page first and try there,
+// which is exactly the large-blank-area failure mode this package's own
+// heading keepNext fix (see TestStyles_HeadingsKeepWithNext) exists to
+// avoid, just relocated onto code blocks instead of headings. Leaving
+// keepLines off lets a long code block break across a page boundary like
+// ordinary body text instead: the border/shading still read as one
+// contiguous box (Word does not redraw pBdr's top/bottom at the split --
+// it is still one paragraph, so the border wraps the whole thing, not each
+// page's portion), and no page is left with an avoidable gap. See
+// TestWrite_LongCodeBlockDoesNotForceKeepLines.
 //
 // f.codeLatin/f.codeEastAsia (resolved from WriteOptions.CodeLatinFont/
 // CodeEastAsiaFont, defaulting to Consolas/微软雅黑 — see
@@ -492,7 +519,7 @@ func codeRunFontsXML(f fontOptions) string {
 func sourceCodeStyleXML(f fontOptions) string {
 	return `<w:style w:type="paragraph" w:styleId="SourceCode">` +
 		`<w:name w:val="Source Code"/><w:basedOn w:val="Normal"/><w:qFormat/>` +
-		`<w:pPr><w:keepNext/><w:keepLines/>` +
+		`<w:pPr><w:keepNext/>` +
 		codeBorderXML +
 		codeShadingXML +
 		`<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>` +

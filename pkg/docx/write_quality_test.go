@@ -264,23 +264,40 @@ func TestWrite_TableWidthIsFullPercentNotAuto(t *testing.T) {
 // forgot to reference the style" or "style forgot the property" regress
 // unnoticed.
 
-// Every fenced-code-block paragraph must reference the SourceCode style,
+// The fenced-code-block paragraph must reference the SourceCode style,
 // which suppresses the document's default paragraph spacing (before/after
-// 0, single line spacing) -- or Word draws a gap between every code line
-// and the shared shading reads as separate bars instead of one contiguous
+// 0, single line spacing) -- or Word draws a gap at the top/bottom of the
+// block and the shading reads as separate bars instead of one contiguous
 // block.
+//
+// As of the code-single-paragraph task, the whole block is ONE paragraph
+// (write.go's mergeCodeBlocks/renderCodeBlockRuns), not one per line --
+// see write_codeblock_test.go's own doc comment on that task for why (a
+// renderer that does not merge adjacent identical-<w:pBdr> paragraphs the
+// way Word does would otherwise draw a separate box per line). This test
+// used to want 3 paragraphs/3 pStyle references, one per source line;
+// pinning 1 of each here, plus the three lines still recoverable via
+// paraTextWithBreaks, is the deliberate update for that new shape, not a
+// weakened accommodation of it.
 func TestWrite_CodeBlockParagraphsSuppressSpacing(t *testing.T) {
 	md := "```\nline one\nline two\nline three\n```\n"
 	d, _, _ := writeAndReopen(t, md)
 	paras := d.Paras()
-	if len(paras) != 3 {
-		t.Fatalf("got %d paragraphs, want 3", len(paras))
+	if len(paras) != 1 {
+		t.Fatalf("got %d paragraphs, want 1 (one per code BLOCK, not one per line)", len(paras))
 	}
+	if paras[0].Style != StyleSourceCode {
+		t.Fatalf("paras[0].Style = %q, want %q", paras[0].Style, StyleSourceCode)
+	}
+	if got, want := paraTextWithBreaks(paras[0]), "line one\nline two\nline three"; got != want {
+		t.Errorf("code paragraph text = %q, want %q (three lines joined by <w:br/>)", got, want)
+	}
+
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
 	n := strings.Count(s, `<w:pStyle w:val="SourceCode"/>`)
-	if n != 3 {
-		t.Errorf("found <w:pStyle w:val=\"SourceCode\"/> %d times, want 3 (one per code line)", n)
+	if n != 1 {
+		t.Errorf("found <w:pStyle w:val=\"SourceCode\"/> %d times, want 1", n)
 	}
 
 	styles, _ := d.Part("word/styles.xml")
@@ -591,27 +608,38 @@ func TestWrite_DesignDocumentAllFourDefectsHoldTogether(t *testing.T) {
 		t.Error("the long table cell text did not survive intact")
 	}
 
-	// Defect 3: every code-block paragraph references SourceCode, which
+	// Defect 3: the code block's paragraph references SourceCode, which
 	// (per TestWrite_CodeBlockParagraphsSuppressSpacing /
 	// TestWrite_CodeBlockShadingIsOnTheParagraph) is the style now
 	// carrying the zero-spacing and shading that keep code lines
 	// contiguous -- document.xml itself carries neither inline anymore.
+	//
+	// The whole "func Run() error {" / "    return nil" / "}" block is one
+	// SourceCode paragraph now (write.go's mergeCodeBlocks/
+	// renderCodeBlockRuns), not three -- see
+	// TestWrite_CodeBlockParagraphsSuppressSpacing's own doc comment on
+	// that task. styleRefCount pins that new count directly (1, not 3),
+	// and the three lines are checked via paraTextWithBreaks instead of as
+	// three separate paragraphs.
 	styleRefCount := strings.Count(docStr, `<w:pStyle w:val="SourceCode"/>`)
-	if styleRefCount != 3 {
-		t.Errorf("<w:pStyle w:val=\"SourceCode\"/> found %d times, want 3 (one per code line: func Run/return nil/})", styleRefCount)
+	if styleRefCount != 1 {
+		t.Errorf("<w:pStyle w:val=\"SourceCode\"/> found %d times, want 1 (one per code BLOCK, not one per line)", styleRefCount)
 	}
 	styles, _ := d.Part("word/styles.xml")
 	if !strings.Contains(string(styles), `w:fill="F5F5F5"`) {
 		t.Error("no code shading found in the SourceCode style")
 	}
-	foundCodeLine := false
+	foundCodeBlock := false
 	for _, p := range paras {
-		if textOf(p) == "    return nil" {
-			foundCodeLine = true
+		if p.Style != StyleSourceCode {
+			continue
+		}
+		if got, want := paraTextWithBreaks(p), "func Run() error {\n    return nil\n}"; got == want {
+			foundCodeBlock = true
 		}
 	}
-	if !foundCodeLine {
-		t.Error("code block line missing or markdown was interpreted inside it")
+	if !foundCodeBlock {
+		t.Error("code block missing or markdown was interpreted inside it")
 	}
 
 	// Link still renders as a real hyperlink.

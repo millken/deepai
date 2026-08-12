@@ -276,11 +276,17 @@ type block struct {
 //
 // isCode, isQuote and isHR are Task 3's three additional paragraph kinds,
 // mutually exclusive with each other and with isList/heading in practice
-// (buildBlocks never sets more than one). isCode marks one line of a
-// fenced code block: text is rendered completely literally — renderParagraph
-// skips parseInline for it entirely, so "**bold**" inside a code block
-// never becomes a run — in a monospace font on a lightly shaded paragraph.
-// isQuote marks a block-quote paragraph (left border + indent); isHR marks
+// (buildBlocks never sets more than one). isCode marks a WHOLE fenced or
+// indented code block, not one line of it: buildBlocks still builds one
+// paraBlock per source line internally, exactly as before, but
+// mergeCodeBlocks (its own last step) joins every consecutive run of them
+// into a single paraBlock whose text is those lines joined with "\n" --
+// see mergeCodeBlocks' and renderCodeBlockRuns' doc comments for why (one
+// <w:p>, one border, in every renderer, not just Word). Text is rendered
+// completely literally — renderParagraph never runs it through parseInline,
+// so "**bold**" inside a code block never becomes a run — in a monospace
+// font on a lightly shaded paragraph. isQuote marks a block-quote paragraph
+// (left border + indent); isHR marks
 // a horizontal-rule paragraph, which carries no text at all (text is
 // ignored when isHR is set — see renderParagraph).
 //
@@ -442,8 +448,13 @@ func markdownStartsWithH1(markdown string) bool {
 // buildBlocks walks Markdown line by line and produces one block per
 // heading, per ordinary paragraph, per list item, per table (which
 // consumes multiple lines at once via parseTable), per block-quote run,
-// per horizontal rule, and per line of a fenced OR indented code block.
-// Ordinary paragraph lines and block-quote lines are each merged with a
+// per horizontal rule, and -- internally, one per line -- per line of a
+// fenced OR indented code block; its own final step, mergeCodeBlocks,
+// then collapses each maximal run of those line-blocks into one block per
+// code BLOCK rather than one per line (see its doc comment for why). So a
+// caller of buildBlocks never sees a raw per-line code block, only the
+// merged result. Ordinary paragraph lines and block-quote lines are each
+// merged with a
 // single space within their own run (Markdown's soft-line-break model —
 // see flush/flushQuote below); everything else is emitted immediately as
 // its own block rather than merged with neighbors, since merging e.g. two
@@ -673,7 +684,46 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	}
 	flush()
 	flushQuote()
-	return blocks, tableNotes
+	return mergeCodeBlocks(blocks), tableNotes
+}
+
+// mergeCodeBlocks collapses every maximal run of consecutive isCode
+// paraBlocks the loop above still emits one per source line, exactly as it
+// always has -- into a single paraBlock whose text is those lines' text
+// joined with "\n". This is the code-block-single-paragraph fix: a code
+// BLOCK is one logical unit, and this is the one place that fact is turned
+// into one <w:p> instead of N (renderCodeBlockRuns, further down this
+// file, is what turns each joined line back into its own run separated by
+// a <w:br/>). Doing the merge here, as a pass over the already-built
+// blocks slice, rather than threading an accumulator through every one of
+// buildBlocks' four isCode-append call sites (fenced, indented-continue,
+// indented-open, indented-blank-catchup) keeps this fix a single, easily
+// re-checked function instead of a change smeared across the whole state
+// machine above.
+//
+// It is agnostic to WHY a run of isCode blocks is adjacent -- a fenced
+// block's lines, an indented block's lines including its buffered blank
+// ones, or (the one edge case worth naming) two textually separate fenced
+// blocks with nothing at all between them ("```\na\n```\n```\nb\n```\n")
+// also merge into one paragraph/one box. That last case is not a
+// regression: Word's own border-merging behavior already drew those two
+// blocks as one visual box before this task, for the identical reason
+// (byte-identical adjacent <w:pBdr>/<w:shd>); this change keeps that
+// combined appearance but makes it explicit and universal (every
+// renderer, not just Word) instead of relying on the border-merge
+// assumption the rest of this task removes everywhere else.
+func mergeCodeBlocks(blocks []block) []block {
+	merged := make([]block, 0, len(blocks))
+	for _, b := range blocks {
+		if b.para != nil && b.para.isCode && len(merged) > 0 {
+			if prev := merged[len(merged)-1].para; prev != nil && prev.isCode {
+				prev.text += "\n" + b.para.text
+				continue
+			}
+		}
+		merged = append(merged, b)
+	}
+	return merged
 }
 
 // stripIndentedCodePrefix reports whether line opens or continues a
@@ -1357,40 +1407,41 @@ func (c *renderCtx) codeFontXML() string {
 //
 // forceBold ORs bold onto every inline segment (used for a table header
 // row) regardless of the markdown markers parseInline already resolved.
-// isCode paragraphs skip parseInline entirely — the whole line becomes one
-// literal segment, monospace via pStyle="SourceCode" rather than a direct
-// <w:rFonts> on the run — which is how Item 1's "markdown is not
-// interpreted inside a fenced code block" is enforced structurally rather
-// than by convention. isHR paragraphs carry no runs at all: text is never
-// even looked at when isHR is set, since a horizontal rule is exactly one
-// empty paragraph with a bottom border.
+// isCode paragraphs skip parseInline entirely: b.text (after
+// mergeCodeBlocks, above) is the whole block's lines joined with "\n", and
+// renderCodeBlockRuns turns each line back into its own literal run --
+// monospace via pStyle="SourceCode" rather than a direct <w:rFonts> on the
+// run -- separated by a <w:br/>, never interpreting markdown inside any of
+// them. That is how Item 1's "markdown is not interpreted inside a fenced
+// code block" is enforced structurally rather than by convention. isHR
+// paragraphs carry no runs at all: text is never even looked at when isHR
+// is set, since a horizontal rule is exactly one empty paragraph with a
+// bottom border.
 func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
-	var segs []segment
+	var runsXML string
+	var err error
 	switch {
 	case b.isHR:
 		// No runs: a horizontal rule is an empty paragraph carrying only
 		// the bottom-border <w:pBdr> assembled below.
 	case b.isCode:
-		segs = []segment{{text: b.text, code: true}}
+		// One <w:p>, one border, one shading -- see renderCodeBlockRuns'
+		// own doc comment for why this no longer goes through
+		// renderRuns/parseInline the way every other paragraph kind does.
+		runsXML, err = renderCodeBlockRuns(b.text, ctx)
 	default:
-		segs = parseInline(b.text)
+		segs := parseInline(b.text)
 		if b.forceBold {
 			for i := range segs {
 				segs[i].bold = true
 			}
 		}
+		// codeBlockLine is always false here: a code-block paragraph is
+		// handled entirely above, so renderRuns/renderRun's codeBlockLine
+		// branch is now reached only via renderCodeBlockRuns's own direct
+		// renderRun calls, never through this path.
+		runsXML, err = renderRuns(segs, ctx)
 	}
-
-	// b.isCode tells renderRuns/renderRun not to also add a run-level
-	// <w:rStyle w:val="VerbatimChar"/> to this paragraph's own segment: the
-	// monospace font already comes from pStyle="SourceCode" below, cascading
-	// from the style's own <w:rPr> to every run in a paragraph of that
-	// style. VerbatimChar is reserved for genuine INLINE code -- a `code`
-	// span sitting inside an otherwise ordinary paragraph -- per the plan's
-	// mapping ("行内代码 → VerbatimChar"); applying it here too would be
-	// harmless (same font) but a second, redundant source of the same
-	// formatting, which is exactly the duplication this task removes.
-	runsXML, err := renderRuns(segs, ctx, b.isCode)
 	if err != nil {
 		return "", err
 	}
@@ -1474,16 +1525,18 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 // keeps relationship ids allocated once per link occurrence rather than
 // once per segment within it.
 //
-// codeBlockLine is threaded straight through to renderRun for every
-// segment: see renderParagraph's call site for why a fenced-code-block
-// paragraph's own segment must NOT also pick up VerbatimChar.
-func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, error) {
+// renderRuns is renderParagraph's default (non-code, non-HR) path, so it
+// always calls renderRun with codeBlockLine false: a code-block paragraph
+// is handled entirely by renderCodeBlockRuns instead, which calls
+// renderRun directly (codeBlockLine true) for each of its own lines. See
+// renderRun's own doc comment for what that flag changes.
+func renderRuns(segs []segment, ctx *renderCtx) (string, error) {
 	var out strings.Builder
 	i := 0
 	for i < len(segs) {
 		seg := segs[i]
 		if seg.link == "" {
-			r, err := renderRun(seg, ctx, codeBlockLine)
+			r, err := renderRun(seg, ctx, false)
 			if err != nil {
 				return "", err
 			}
@@ -1495,7 +1548,7 @@ func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, err
 		j := i
 		var inner strings.Builder
 		for j < len(segs) && segs[j].link == url {
-			r, err := renderRun(segs[j], ctx, codeBlockLine)
+			r, err := renderRun(segs[j], ctx, false)
 			if err != nil {
 				return "", err
 			}
@@ -1505,6 +1558,59 @@ func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, err
 		id := ctx.addLink(url)
 		fmt.Fprintf(&out, `<w:hyperlink r:id="%s">%s</w:hyperlink>`, id, inner.String())
 		i = j
+	}
+	return out.String(), nil
+}
+
+// renderCodeBlockRuns renders one code-block paragraph's full text -- b.text
+// after mergeCodeBlocks (buildBlocks, above) has joined every line of the
+// block with "\n" -- as the runs of a SINGLE <w:p>: one <w:r> per line,
+// blank lines included, each carrying seg.code's literal-text/
+// xml:space="preserve" handling exactly as renderRun always has, with a
+// separate, textless "<w:r><w:br/></w:r>" between every pair of adjacent
+// lines standing in for the line break a paragraph boundary used to carry.
+//
+// This is the fix for the box-per-line defect a renderer that does not
+// merge adjacent identical-<w:pBdr> paragraphs (unlike Word) draws: one
+// <w:p> means exactly one <w:pPr><w:pBdr>/<w:shd> for the whole block, in
+// every renderer, with no merging assumption required at all. Splitting on
+// "\n" and rejoining with an explicit run-level <w:br/> (rather than one
+// run holding embedded "\n" characters inside its own <w:t>) is what keeps
+// this readable back out: scan.go's Para.Breaks -- already built, before
+// this task, for exactly this shape (see its own doc comment and
+// TestScan_BreaksRecordRunPositions) -- records a break as "after Run.Index
+// N", and read.go's paraTextWithBreaks turns that back into "\n" in the
+// markdown Read renders, recovering the same per-line view an LLM had
+// before when each line was its own paragraph, just under one shared
+// "[para N]" marker instead of N of them.
+//
+// EVERY line gets its own run, even a blank one — renderRun's codeBlockLine
+// argument (true here) is what lets an empty-text segment through instead
+// of being skipped the way it would be anywhere else. This looks
+// redundant (why write "<w:t></w:t>" for nothing?) until two adjacent
+// blank lines, or a blank line right after the fence, are considered: see
+// renderRun's own doc comment for exactly why a blank line MUST anchor its
+// own run rather than contribute nothing between two <w:br/>s, and
+// TestWrite_FencedCodeBlockBlankLineSurvives/
+// TestWrite_IndentedCodeBlockContinuesThroughBlankLines/
+// TestWrite_FencedCodeBlockLeadingBlankLineSurvives for the read-back
+// regressions this closes. For N lines there are always exactly N-1
+// separators, one per adjacent PAIR, regardless of which individual lines
+// are empty: "a\n\nb" (a blank line in the middle) becomes
+// run(a) + break + run("") + break + run(b), two breaks for three lines,
+// exactly as CommonMark's own count would predict.
+func renderCodeBlockRuns(text string, ctx *renderCtx) (string, error) {
+	lines := strings.Split(text, "\n")
+	var out strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			out.WriteString("<w:r><w:br/></w:r>")
+		}
+		r, err := renderRun(segment{text: line, code: true}, ctx, true)
+		if err != nil {
+			return "", err
+		}
+		out.WriteString(r)
 	}
 	return out.String(), nil
 }
@@ -1603,15 +1709,44 @@ func decodeHTMLEntities(s string) string {
 // even though this package rarely combines them" reasoning as
 // renderParagraph's <w:pPr>.
 //
-// codeBlockLine is true only when this run is one line of a fenced code
-// block (renderParagraph passes b.isCode straight through) — never for a
-// `code` span inline inside an ordinary paragraph. It suppresses the
-// VerbatimChar rStyle below, because a code-block paragraph already gets
-// its monospace font from pStyle="SourceCode" (styles.go's rPr cascades to
-// every run in a paragraph of that style); adding VerbatimChar there too
-// would be a second, redundant source of the identical formatting.
+// codeBlockLine is true only when this run is one line of a code-block
+// paragraph (renderCodeBlockRuns calls this directly, once per line, with
+// it set) — never for a `code` span inline inside an ordinary paragraph.
+// It suppresses the VerbatimChar rStyle below, because a code-block
+// paragraph already gets its monospace font from pStyle="SourceCode"
+// (styles.go's rPr cascades to every run in a paragraph of that style);
+// adding VerbatimChar there too would be a second, redundant source of the
+// identical formatting.
+//
+// codeBlockLine ALSO disables the empty-text early return immediately
+// below: for every other caller, a segment with no text genuinely has
+// nothing to write, but renderCodeBlockRuns needs a real (if textless)
+// <w:r><w:t></w:t></w:r> for a blank code line, not nothing at all.
+// scan.go always appends a Run on </w:t> regardless of its content
+// (Run.Text == "" is a valid run, not a skipped one), so this still shows
+// up as a genuine run with its own Run.Index — which is exactly the point:
+// it gives the <w:br/> immediately before and/or after a blank line
+// somewhere to anchor to. Without it, two (or more) consecutive
+// "<w:r><w:br/></w:r>" elements with no run between them would all be
+// recorded by scan.go's paraBreaks as "after the same run index" (it
+// counts runs seen so far, and none were seen between them), and
+// read.go's paraTextWithBreaks — a map[int]bool keyed by that index, not a
+// counter — collapses any number of same-indexed entries down to one "\n",
+// silently swallowing every blank line but the first. A break before the
+// very first run in the paragraph (a blank line opening a fenced block)
+// has the same root cause one level further: paraTextWithBreaks only ever
+// emits "\n" AFTER a run's own text in its loop over p.Runs, so a break
+// with NO preceding run at all is dropped entirely, not merely merged.
+// Giving every line — blank ones included — its own run, first line
+// included, means a leading blank line is never that "break before any
+// run" case either: see
+// TestWrite_FencedCodeBlockBlankLineSurvives/TestWrite_IndentedCodeBlockContinuesThroughBlankLines
+// for the regression this closes and
+// TestWrite_FencedCodeBlockLeadingBlankLineSurvives for the leading case
+// specifically. Neither scan.go nor read.go is on this task's list of
+// files it may modify, so the fix has to live entirely on the write side.
 func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) {
-	if seg.text == "" {
+	if seg.text == "" && !codeBlockLine {
 		return "", nil
 	}
 	text := seg.text
