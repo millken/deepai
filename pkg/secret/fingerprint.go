@@ -1,6 +1,11 @@
 package secret
 
-import "strings"
+import (
+	"sort"
+	"strings"
+
+	"github.com/jaypipes/ghw"
+)
 
 // Mode identifies which tier of binding material a sealed value was created
 // with. It is stored as one byte in the blob header and drives diagnostics
@@ -69,7 +74,7 @@ var discoverAll = defaultDiscoverAll
 
 func defaultDiscoverAll() [][]source {
 	return [][]source{
-		nil, // ModeHardware — filled in by disk serial discovery
+		diskSources(),
 		nil, // ModeInstall — filled in by OS machine ID lookup
 		{{mode: ModeObfuscate, value: obfuscationConstant}},
 	}
@@ -145,4 +150,68 @@ func isZeroish(s string) bool {
 		}
 	}
 	return true
+}
+
+// diskInfo is the subset of a block device that matters for binding.
+type diskInfo struct {
+	Serial    string
+	Removable bool
+}
+
+// listDisks enumerates block devices. Replaced in tests so the fingerprint
+// logic can be exercised without real hardware.
+var listDisks = ghwListDisks
+
+// ghwListDisks reads block devices through ghw, which handles the platform
+// differences itself: sysfs/udev on Linux, ioreg on macOS, WMI on Windows.
+// None of those paths need root or admin. Only Block() is called, so ghw's
+// ethtool shellout (a network-subsystem path) never runs.
+func ghwListDisks() []diskInfo {
+	info, err := ghw.Block()
+	if err != nil {
+		return nil
+	}
+	out := make([]diskInfo, 0, len(info.Disks))
+	for _, d := range info.Disks {
+		if d == nil {
+			continue
+		}
+		out = append(out, diskInfo{Serial: d.SerialNumber, Removable: d.IsRemovable})
+	}
+	return out
+}
+
+// diskSources returns one binding source per fixed disk with a usable
+// serial number, sorted so wrap order is stable across runs.
+//
+// Only SerialNumber is used, never WWN: cheap NVMe firmware reports
+// meaningless near-zero WWNs (eui.0000000000000002 on one of the
+// development machine's drives) while the serial is fine. Removable
+// devices are skipped so a USB stick present at seal time does not become
+// an extra decryption path.
+//
+// Motherboard and chassis serials are not used at all: on modern Linux
+// kernels /sys/class/dmi/id/product_uuid, product_serial, and board_serial
+// are 0400 root-only, precisely to prevent fingerprinting.
+func diskSources() []source {
+	seen := make(map[string]bool)
+	var serials []string
+	for _, d := range listDisks() {
+		if d.Removable {
+			continue
+		}
+		s := usableID(d.Serial)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		serials = append(serials, s)
+	}
+	sort.Strings(serials)
+
+	out := make([]source, 0, len(serials))
+	for _, s := range serials {
+		out = append(out, source{mode: ModeHardware, value: s})
+	}
+	return out
 }
