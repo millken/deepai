@@ -192,19 +192,35 @@ func TestStyles_PPrChildrenAreInSchemaOrder(t *testing.T) {
 }
 
 // CT_Style's own child sequence: name, basedOn, next, qFormat, pPr, rPr,
-// tblPr. Same rationale as the pPr check above, applied to the enclosing
-// <w:style> element.
+// tblPr, tblStylePr (0 or more, always last -- CT_Style's own sequence puts
+// trPr/tcPr between tblPr and tblStylePr, but this package's styles never
+// use those two, so they are simply absent from the canonical list rather
+// than tracked with nothing to check). Same rationale as the pPr check
+// above, applied to the enclosing <w:style> element.
+//
+// tblStylePr's own children (CT_TblStylePr: pPr?, rPr?, tblPr?, trPr?,
+// tcPr?) are a SEPARATE nested schema scope from the enclosing <w:style>'s
+// -- TableGrid's own <w:tblStylePr><w:rPr>...</w:rPr><w:tcPr>...</w:tcPr>
+// carries an "rPr" tag that would otherwise look, to this test's flat
+// tag-name scan, like a second top-level <w:rPr> appearing suspiciously
+// late (after <w:tblPr>) in the outer <w:style> — a false positive, not a
+// real ordering defect. Each <w:tblStylePr>...</w:tblStylePr> span is
+// collapsed to a bare self-closing placeholder before the scan below, so
+// only the outer style's own direct-descendant-shaped tags are checked
+// against CT_Style's order, exactly as intended.
 func TestStyles_StyleChildrenAreInSchemaOrder(t *testing.T) {
-	canonical := []string{"name", "basedOn", "next", "qFormat", "pPr", "rPr", "tblPr"}
+	canonical := []string{"name", "basedOn", "next", "qFormat", "pPr", "rPr", "tblPr", "tblStylePr"}
 	rank := make(map[string]int, len(canonical))
 	for i, n := range canonical {
 		rank[n] = i
 	}
+	collapseTblStylePr := regexp.MustCompile(`<w:tblStylePr[^>]*>.*?</w:tblStylePr>`)
 	s := string(buildStylesXML())
 	for _, block := range regexp.MustCompile(`<w:style [^>]*>(.*?)</w:style>`).FindAllStringSubmatch(s, -1) {
+		content := collapseTblStylePr.ReplaceAllString(block[1], `<w:tblStylePr/>`)
 		last := -1
 		lastName := ""
-		for _, m := range regexp.MustCompile(`<w:(\w+)`).FindAllStringSubmatch(block[1], -1) {
+		for _, m := range regexp.MustCompile(`<w:(\w+)`).FindAllStringSubmatch(content, -1) {
 			name := m[1]
 			r, ok := rank[name]
 			if !ok {
@@ -212,7 +228,7 @@ func TestStyles_StyleChildrenAreInSchemaOrder(t *testing.T) {
 			}
 			if r < last {
 				t.Errorf("in style block %q: %s (rank %d) appears after %s (rank %d), violating CT_Style's schema order",
-					block[1], name, r, lastName, last)
+					content, name, r, lastName, last)
 			}
 			last, lastName = r, name
 		}

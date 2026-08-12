@@ -111,7 +111,11 @@ func TestWrite_EntitiesInsideFencedCodeBlockAreNotDecoded(t *testing.T) {
 // --- Defect 2: tables must use the real content width --------------------
 
 var (
-	pgSzRE  = regexp.MustCompile(`<w:pgSz w:w="(\d+)" w:h="(\d+)"/>`)
+	// pgSzRE deliberately tolerates trailing attributes (e.g. w:orient)
+	// after w:h so it keeps matching regardless of what else <w:pgSz>
+	// carries -- this helper computes content width from whatever page
+	// geometry WriteDocx actually wrote, not from one fixed attribute shape.
+	pgSzRE  = regexp.MustCompile(`<w:pgSz w:w="(\d+)" w:h="(\d+)"[^>]*/>`)
 	pgMarRE = regexp.MustCompile(`<w:pgMar w:top="(\d+)" w:right="(\d+)" w:bottom="(\d+)" w:left="(\d+)"`)
 	gridRE  = regexp.MustCompile(`<w:gridCol w:w="(\d+)"/>`)
 )

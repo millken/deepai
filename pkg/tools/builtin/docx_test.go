@@ -1964,6 +1964,72 @@ func TestDocxWrite_SupportedOnlyInputHasNoNotes(t *testing.T) {
 	}
 }
 
+// TestDocxWrite_CustomFontsReachStylesXML pins the docx-chinese-typography
+// plan's Part A at the tool layer: docx_write's four font arguments
+// (body_latin_font, body_east_asia_font, code_latin_font,
+// code_east_asia_font) must actually reach pkg/docx.WriteOptions and land in
+// the generated file's styles.xml -- not just be accepted and silently
+// dropped by the schema/handler plumbing.
+func TestDocxWrite_CustomFontsReachStylesXML(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{
+		"path":                p,
+		"markdown":            "body\n\n```\ncode\n```\n",
+		"body_latin_font":     "Georgia",
+		"body_east_asia_font": "宋体",
+		"code_latin_font":     "Cascadia Code",
+		"code_east_asia_font": "NSimSun",
+	})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	d, err := docx.OpenDocument(p)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	styles, ok := d.Part("word/styles.xml")
+	if !ok {
+		t.Fatal("styles.xml missing")
+	}
+	s := string(styles)
+	if !strings.Contains(s, `<w:rFonts w:ascii="Georgia" w:eastAsia="宋体"/>`) {
+		t.Errorf("styles.xml docDefaults does not carry the custom body fonts: %s", s)
+	}
+	if !strings.Contains(s, `w:ascii="Cascadia Code" w:eastAsia="NSimSun"`) {
+		t.Errorf("styles.xml's SourceCode/VerbatimChar does not carry the custom code fonts: %s", s)
+	}
+}
+
+// TestDocxWrite_FontArgsAreOptional pins the other half of "each falls back
+// to the current default when empty" at the tool layer: omitting all four
+// font arguments must still produce a valid, openable document using this
+// package's own defaults, not an error.
+func TestDocxWrite_FontArgsAreOptional(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.docx")
+	_, err := callDocxWrite(t, map[string]any{"path": p, "markdown": "# H\n"})
+	if err != nil {
+		t.Fatalf("DocxWriteHandler without any font argument: %v", err)
+	}
+	if _, err := docx.OpenDocument(p); err != nil {
+		t.Fatalf("the written file cannot be reopened: %v", err)
+	}
+}
+
+// TestDocxWriteTool_SchemaExposesFontParameters pins that the four font
+// knobs are actually discoverable by a model reading the tool's schema, not
+// only usable by a caller who already knows their names from source code.
+func TestDocxWriteTool_SchemaExposesFontParameters(t *testing.T) {
+	props, ok := DocxWriteTool().InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("docx_write InputSchema has no properties map")
+	}
+	for _, key := range []string{"body_latin_font", "body_east_asia_font", "code_latin_font", "code_east_asia_font"} {
+		if _, present := props[key]; !present {
+			t.Errorf("docx_write InputSchema.properties is missing %q", key)
+		}
+	}
+}
+
 // TestDocxWrite_IsInDocumentGroupAndNotParallelSafe mirrors
 // TestDocxFormat_IsInDocumentGroupAndNotParallelSafe: docx_write writes a
 // new file, so it must never run in parallel with another tool call, and it

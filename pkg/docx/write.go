@@ -55,6 +55,35 @@ type WriteOptions struct {
 	// root .rels registrations) is added only when Title is non-empty, so a
 	// title-less document's package shape is unchanged.
 	Title string
+
+	// BodyLatinFont/BodyEastAsiaFont replace styles.xml's docDefaults font
+	// pair (which every style inherits unless it declares its own
+	// <w:rFonts> — today only SourceCode/VerbatimChar do), i.e. the
+	// document's ordinary body and heading font. Each falls back to this
+	// package's own default (Calibri / 微软雅黑, copied from the
+	// docx-chinese-typography plan's reference document) when left empty —
+	// see resolveFontOptions.
+	BodyLatinFont    string
+	BodyEastAsiaFont string
+
+	// CodeLatinFont/CodeEastAsiaFont replace the font pair a fenced code
+	// block and an inline `code` span render in (SourceCode/VerbatimChar in
+	// styles.xml, plus write.go's own codeFontXML fallback for the one case
+	// -- inline code that is also a link's text -- that cannot reference
+	// either style). CodeLatinFont falls back to Consolas when empty.
+	//
+	// CodeEastAsiaFont falls back to 微软雅黑 (Microsoft YaHei) when empty.
+	// Read that default's own doc comment (defaultCodeEastAsiaFont in
+	// styles.go) before assuming it aligns ASCII box-drawing characters
+	// against Chinese text — it does NOT, by itself: exact alignment needs
+	// a font where a Latin glyph's advance is exactly half a CJK glyph's
+	// (NSimSun, MS Gothic, Sarasa Gothic, Noto Sans Mono CJK), none of
+	// which ship on macOS. This field exists so a caller targeting Windows
+	// readers, or with one of those fonts installed, can ask for one of
+	// them explicitly and get exact alignment; the default cannot provide
+	// that on its own.
+	CodeLatinFont    string
+	CodeEastAsiaFont string
 }
 
 // WriteResult reports what WriteDocx produced.
@@ -95,8 +124,9 @@ var docxEpoch = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
 // must remove it (or choose another path) first.
 func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	blocks, notes := parseMarkdown(opts)
+	fonts := resolveFontOptions(opts)
 
-	ctx := newRenderCtx()
+	ctx := newRenderCtx(fonts)
 	var body strings.Builder
 	body.WriteString(documentXMLHeader)
 	paraCount := 0
@@ -118,16 +148,24 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 			paraCount += n
 		}
 	}
-	body.WriteString(documentXMLFooter)
+	// footerRelID is allocated from the SAME counter addLink draws from
+	// (ctx.nextRelID), after every hyperlink in the body has already
+	// claimed its own id: the two id spaces are one space, not two, so
+	// there is no way for this to collide with a hyperlink's id no matter
+	// how many links the document has -- see addFooterRelID's doc comment
+	// and TestType_HyperlinkAndFooterRelIDsDoNotCollide.
+	footerRelID := ctx.addFooterRelID()
+	body.WriteString(documentXMLFooterXML(footerRelID))
 
 	hasTitle := opts.Title != ""
 	entries := []zipEntry{
 		{name: contentTypesPart, data: []byte(buildContentTypesXML(hasTitle))},
 		{name: "_rels/.rels", data: []byte(buildRootRelsXML(hasTitle))},
 		{name: DocumentPart, data: []byte(body.String())},
-		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels))},
-		{name: "word/styles.xml", data: buildStylesXML()},
+		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels, footerRelID))},
+		{name: "word/styles.xml", data: buildStylesXMLWithFonts(fonts)},
 		{name: "word/numbering.xml", data: []byte(numberingXML)},
+		{name: footer1Part, data: []byte(footer1XML)},
 	}
 	if hasTitle {
 		coreXML, err := docPropsCoreXML(opts.Title)
@@ -239,6 +277,17 @@ type block struct {
 // isQuote marks a block-quote paragraph (left border + indent); isHR marks
 // a horizontal-rule paragraph, which carries no text at all (text is
 // ignored when isHR is set — see renderParagraph).
+//
+// isCell is the docx-chinese-typography plan's Task 2 addition: it marks a
+// table cell's own paragraph (set only by renderTable), and exists solely
+// so renderParagraph can tell that case apart from an ordinary top-level
+// paragraph — both otherwise look identical (heading==0, no
+// isList/isQuote/isCode/isHR). Without it, an ordinary paragraph's new
+// pStyle="BodyText" (the first-line indent) would apply to table cells too,
+// which is exactly the leak the plan's Task 2 warns against by name. A cell
+// paragraph with isCell set gets NO pStyle at all — it stays on Normal, and
+// TableGrid's own <w:pPr> (styles.go) supplies its compact spacing via the
+// table-style cascade instead — see tableTblPrXML's doc comment.
 type paraBlock struct {
 	heading     int
 	text        string
@@ -250,6 +299,7 @@ type paraBlock struct {
 	isCode      bool
 	isQuote     bool
 	isHR        bool
+	isCell      bool
 }
 
 // tableCell is one <w:tc>'s content: raw markdown text (inline emphasis is
@@ -793,8 +843,17 @@ func renderTable(tb *tableBlock, ctx *renderCtx) (string, int, error) {
 	paraCount := 0
 	for _, row := range tb.rows {
 		out.WriteString("<w:tr>")
+		if row.header {
+			// <w:trPr><w:tblHeader/></w:trPr> is Part B of the docx-chinese-
+			// typography plan: it makes Word repeat this row at the top of
+			// every page a long table spans, instead of the header
+			// scrolling off after the first page. trPr is CT_Row's first
+			// child, so it must come immediately after <w:tr>, before any
+			// <w:tc> -- see TestType_HeaderRowRepeatsAcrossPages.
+			out.WriteString("<w:trPr><w:tblHeader/></w:trPr>")
+		}
 		for _, cell := range row.cells {
-			p, err := renderParagraph(paraBlock{text: cell.text, jc: cell.align, forceBold: row.header}, ctx)
+			p, err := renderParagraph(paraBlock{text: cell.text, jc: cell.align, forceBold: row.header, isCell: true}, ctx)
 			if err != nil {
 				return "", 0, err
 			}
@@ -860,8 +919,21 @@ func tableColumnWidthsTwips(cols int) []int {
 // column count, but page geometry (contentWidthTwips) is still something
 // only this per-table render call knows about, same reasoning as
 // <w:tblGrid>'s own <w:gridCol> widths below.
+//
+// <w:tblLook w:firstRow="1" .../> is Part B of the docx-chinese-typography
+// plan: it is what actually ACTIVATES TableGrid's <w:tblStylePr
+// w:type="firstRow"> conditional formatting (the header shading/bold) for
+// THIS table. A table style can carry tblStylePr and still render with no
+// shading at all if the table referencing it has no tblLook (or one with
+// firstRow="0") — Word treats tblLook as an opt-in per table, not an
+// automatic consequence of the style existing. The other five booleans
+// (lastRow/firstColumn/lastColumn/noHBand off, noVBand on) match Word's own
+// default for a plain "banded first row only" look, since this package
+// never generates banded columns or a distinguished last row/column.
 const tableTblPrXML = `<w:tblPr><w:tblStyle w:val="` + StyleTableGrid + `"/>` +
-	`<w:tblW w:w="5000" w:type="pct"/><w:tblLayout w:type="fixed"/></w:tblPr>`
+	`<w:tblW w:w="5000" w:type="pct"/><w:tblLayout w:type="fixed"/>` +
+	`<w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/>` +
+	`</w:tblPr>`
 
 // ---------------------------------------------------------------------------
 // Inline emphasis (bold/italic)
@@ -1024,16 +1096,28 @@ func matchLinkAt(s string, i int) (text, url string, end int, ok bool) {
 
 // renderCtx accumulates state shared across the whole document render pass
 // that a single paraBlock cannot decide on its own: the hyperlink
-// relationships a link segment needs. It is created once per WriteDocx call
-// and threaded through every renderParagraph/renderTable call so a link
-// inside a list item, a table cell, or an ordinary paragraph all draw from
-// the same counter — see addLink.
+// relationships a link segment needs, and (as of the docx-chinese-
+// typography plan's Part C) the one footer relationship every document
+// needs. It is created once per WriteDocx call and threaded through every
+// renderParagraph/renderTable/renderRun call so a link inside a list item,
+// a table cell, or an ordinary paragraph -- and the footer -- all draw
+// their relationship ids from the same counter. See addLink/addFooterRelID.
+//
+// fonts carries the resolved (never-empty) font choices this WriteDocx call
+// is using; renderRun reads it through codeFontXML for the one code+link
+// combination that cannot get its font from a shared style (see that
+// method's doc comment).
 type renderCtx struct {
-	rels []hyperlinkRel
+	rels  []hyperlinkRel
+	fonts fontOptions
 	// nextRelID starts at 3: rId1 and rId2 are permanently reserved for
 	// styles.xml and numbering.xml (see docRelsXML's Task 1/2 history), so
 	// the first link-relationship id this document ever allocates must not
-	// collide with either.
+	// collide with either. Every relationship this package ever allocates
+	// beyond those two fixed ones -- every hyperlink AND the one footer
+	// relationship -- draws from this SAME counter, which is what makes
+	// them mutually collision-free by construction rather than by
+	// coincidence: see addFooterRelID's doc comment.
 	nextRelID int
 }
 
@@ -1045,8 +1129,8 @@ type hyperlinkRel struct {
 	url string
 }
 
-func newRenderCtx() *renderCtx {
-	return &renderCtx{nextRelID: 3}
+func newRenderCtx(fonts fontOptions) *renderCtx {
+	return &renderCtx{nextRelID: 3, fonts: fonts}
 }
 
 // addLink allocates a fresh, always-unique relationship id for one link
@@ -1063,6 +1147,43 @@ func (c *renderCtx) addLink(url string) string {
 	c.nextRelID++
 	c.rels = append(c.rels, hyperlinkRel{id: id, url: url})
 	return id
+}
+
+// addFooterRelID allocates the relationship id for word/footer1.xml,
+// drawing from the exact same counter addLink uses. This is the load-
+// bearing fix for the hazard the docx-chinese-typography plan calls out by
+// name: if the footer's relationship were numbered by a second, independent
+// counter, a document with (say) three hyperlinks already using rId3-rId5
+// could easily also hand the footer rId3 or rId4 -- Word does not detect
+// that as an error at open time, it just resolves the footer's
+// <w:footerReference r:id="rId3"> against WHATEVER Target rId3 happens to
+// have in word/_rels/document.xml.rels, which after a collision is a
+// hyperlink's URL, not footer1.xml. That surfaces to a user as either "Word
+// found a problem with this file" (a repair prompt) or a footer that does
+// not show a page number at all, with no indication of why. Drawing from
+// the one shared counter makes the id space, structurally, never able to
+// double-assign a number no matter how many links the document has -- see
+// TestType_HyperlinkAndFooterRelIDsDoNotCollide.
+func (c *renderCtx) addFooterRelID() string {
+	id := fmt.Sprintf("rId%d", c.nextRelID)
+	c.nextRelID++
+	return id
+}
+
+// codeFontXML renders c.fonts' code Latin/East-Asian pair as a direct
+// <w:rFonts> — the one narrow edge case (inline code that is ALSO a
+// hyperlink's text, "[`code`](url)") that cannot reference either
+// SourceCode or VerbatimChar, because a run's <w:rPr> permits at most one
+// <w:rStyle> and this combination already needs Hyperlink's — see
+// renderRun's call site. Every OTHER code segment gets its monospace font
+// from a style instead, so this is the one place in the whole render pass
+// where a font choice is written directly into document.xml rather than
+// referenced by name; it is run-level FONT formatting, not one of the three
+// paragraph-level properties (spacing/ind/shd) the styles-architecture
+// invariant bans.
+func (c *renderCtx) codeFontXML() string {
+	return `<w:rFonts w:ascii="` + c.fonts.codeLatin + `" w:eastAsia="` + c.fonts.codeEastAsia +
+		`" w:hAnsi="` + c.fonts.codeLatin + `" w:cs="` + c.fonts.codeLatin + `"/>`
 }
 
 // renderParagraph renders one paraBlock as a <w:p> element. Per the
@@ -1130,6 +1251,17 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 	// heading/isList/isQuote/isCode on the same paraBlock (see the
 	// paraBlock doc comment), so this is a genuine mutual exclusion, not
 	// merely an order-of-precedence choice.
+	//
+	// The default branch (an ordinary paragraph, heading==0 and none of
+	// isList/isQuote/isCode/isHR/isCell) is Task 2 of the docx-chinese-
+	// typography plan: it references BodyText (styles.go) for the
+	// reference document's first-line indent + 1.5x line spacing. isHR and
+	// isCell are excluded from that default on purpose, not merely left
+	// unhandled: an isHR paragraph carries no text to indent at all, and an
+	// isCell (table-cell) paragraph must NOT pick up BodyText's first-line
+	// indent — see paraBlock.isCell's doc comment and
+	// TestType_FirstLineIndentDoesNotLeakIntoOtherBlocks, which pins this
+	// directly rather than trusting the switch's shape by eyeball.
 	switch {
 	case b.heading > 0:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="Heading%d"/>`, b.heading)
@@ -1139,6 +1271,12 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleQuote)
 	case b.isCode:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleSourceCode)
+	case b.isHR, b.isCell:
+		// No pStyle: isHR has no text to indent, and isCell must stay on
+		// Normal so TableGrid's own pPr cascade (styles.go) governs its
+		// spacing instead of BodyText's.
+	default:
+		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleBodyText)
 	}
 	if b.isList {
 		numID := bulletNumID
@@ -1185,7 +1323,7 @@ func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, err
 	for i < len(segs) {
 		seg := segs[i]
 		if seg.link == "" {
-			r, err := renderRun(seg, codeBlockLine)
+			r, err := renderRun(seg, ctx, codeBlockLine)
 			if err != nil {
 				return "", err
 			}
@@ -1197,7 +1335,7 @@ func renderRuns(segs []segment, ctx *renderCtx, codeBlockLine bool) (string, err
 		j := i
 		var inner strings.Builder
 		for j < len(segs) && segs[j].link == url {
-			r, err := renderRun(segs[j], codeBlockLine)
+			r, err := renderRun(segs[j], ctx, codeBlockLine)
 			if err != nil {
 				return "", err
 			}
@@ -1312,7 +1450,7 @@ func decodeHTMLEntities(s string) string {
 // its monospace font from pStyle="SourceCode" (styles.go's rPr cascades to
 // every run in a paragraph of that style); adding VerbatimChar there too
 // would be a second, redundant source of the identical formatting.
-func renderRun(seg segment, codeBlockLine bool) (string, error) {
+func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) {
 	if seg.text == "" {
 		return "", nil
 	}
@@ -1334,13 +1472,13 @@ func renderRun(seg segment, codeBlockLine bool) (string, error) {
 			// permits 0..1), so a segment that is BOTH a link and inline
 			// code -- the unusual "[`code`](url)" -- cannot reference both
 			// Hyperlink and VerbatimChar at once. Word draws the Hyperlink
-			// color/underline either way; codeFontXML falls back to a
+			// color/underline either way; ctx.codeFontXML falls back to a
 			// direct <w:rFonts> here purely to keep the monospace look for
 			// this one combination, matching this package's pre-Task-2
 			// behavior for it. This is run-level font formatting, not one
 			// of the three paragraph-level properties
 			// (spacing/ind/shd) the styles-architecture invariant bans.
-			rPr.WriteString(codeFontXML)
+			rPr.WriteString(ctx.codeFontXML())
 		}
 	case seg.code && !codeBlockLine:
 		rPr.WriteString(`<w:rStyle w:val="VerbatimChar"/>`)
@@ -1393,40 +1531,74 @@ const documentXMLHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes"
 // for contentWidthTwips (below), which every generated table's
 // <w:tblGrid> divides -- Defect 2's fix. Before this fix a table hardcoded
 // 2000-twip columns with no relationship at all to the page these
-// constants describe: three columns used 6000 of the page's 9360 usable
-// twips (64%), and <w:tblW w:type="auto"> let Word shrink them even
-// further to fit cell content, wrapping every cell into a tower of
-// characters two or three wide.
+// constants describe.
+//
+// The values themselves are copied verbatim from the docx-chinese-
+// typography plan's reference document (a real, professional Chinese
+// business document; see .superpowers/sdd/reference-values.md) rather than
+// chosen: A4 (11906x16838 twips, portrait) replaces this package's previous
+// US Letter (12240x15840) -- a Chinese document on US Letter is simply the
+// wrong paper, independent of anything else this task fixes. Side margins
+// stay 1440 twips (1 inch, the reference's own value, unchanged from this
+// package's prior US Letter default), but header/footer shrink to 708
+// twips (the reference's value; this package's prior 720 was never copied
+// from anything).
 const (
-	pageWidthTwips        = 12240
-	pageHeightTwips       = 15840
+	pageWidthTwips        = 11906
+	pageHeightTwips       = 16838
 	pageMarginTopTwips    = 1440
 	pageMarginRightTwips  = 1440
 	pageMarginBottomTwips = 1440
 	pageMarginLeftTwips   = 1440
-	pageHeaderTwips       = 720
-	pageFooterTwips       = 720
+	pageHeaderTwips       = 708
+	pageFooterTwips       = 708
+	// docGridLinePitchTwips is <w:docGrid>'s w:linePitch: the East Asian
+	// line-pitch grid Word lays CJK text onto, present in the reference
+	// (.superpowers/sdd/reference-values.md) and absent from this
+	// package's output before this task.
+	docGridLinePitchTwips = 360
 )
 
 // contentWidthTwips is the horizontal space available for body content --
 // page width minus the left and right margins -- and is what every
 // generated table's columns must sum to exactly (see
 // tableColumnWidthsTwips). On the constants above this comes out to
-// 12240 - 1440 - 1440 = 9360, but nothing in this package hardcodes that
+// 11906 - 1440 - 1440 = 9026, but nothing in this package hardcodes that
 // number: it is always recomputed from pageWidthTwips/pageMarginLeftTwips/
-// pageMarginRightTwips, the same three constants documentXMLFooter writes
+// pageMarginRightTwips, the same three constants documentXMLFooterXML writes
 // into <w:pgSz>/<w:pgMar>, so the two can never drift out of sync with
-// each other even if the page geometry above ever changes.
+// each other even if the page geometry above ever changes -- see
+// TestType_TableWidthsFollowA4Geometry, which ties a rendered table's
+// column widths back to this constant rather than to a literal number.
 const contentWidthTwips = pageWidthTwips - pageMarginLeftTwips - pageMarginRightTwips
 
-var documentXMLFooter = fmt.Sprintf(
-	`<w:sectPr><w:pgSz w:w="%d" w:h="%d"/>`+
-		`<w:pgMar w:top="%d" w:right="%d" w:bottom="%d" w:left="%d" w:header="%d" w:footer="%d" w:gutter="0"/>`+
-		`</w:sectPr></w:body></w:document>`,
-	pageWidthTwips, pageHeightTwips,
-	pageMarginTopTwips, pageMarginRightTwips, pageMarginBottomTwips, pageMarginLeftTwips,
-	pageHeaderTwips, pageFooterTwips,
-)
+// documentXMLFooterXML closes the document body: the section's
+// <w:footerReference> (Part C of the docx-chinese-typography plan --
+// footerRelID is WriteDocx's own footer relationship id, allocated by
+// ctx.addFooterRelID from the same counter hyperlinks use), then <w:pgSz>/
+// <w:pgMar>/<w:docGrid> exactly as before Part C. footerReference MUST
+// precede pgSz: CT_SectPr's schema lists headerReference/footerReference
+// ahead of pgSz, and Word treats an out-of-order sectPr as corrupt with no
+// diagnostic, the same trap docDefaultsXML's own ordering comment warns
+// about.
+//
+// This was a package-level var (computed once, unconditionally) before
+// Part C; it has to be a function now because footerRelID varies with how
+// many hyperlinks a given document's body already allocated ids to.
+func documentXMLFooterXML(footerRelID string) string {
+	return fmt.Sprintf(
+		`<w:sectPr><w:footerReference w:type="default" r:id="%s"/>`+
+			`<w:pgSz w:w="%d" w:h="%d" w:orient="portrait"/>`+
+			`<w:pgMar w:top="%d" w:right="%d" w:bottom="%d" w:left="%d" w:header="%d" w:footer="%d" w:gutter="0"/>`+
+			`<w:docGrid w:linePitch="%d"/>`+
+			`</w:sectPr></w:body></w:document>`,
+		footerRelID,
+		pageWidthTwips, pageHeightTwips,
+		pageMarginTopTwips, pageMarginRightTwips, pageMarginBottomTwips, pageMarginLeftTwips,
+		pageHeaderTwips, pageFooterTwips,
+		docGridLinePitchTwips,
+	)
+}
 
 // docPropsCorePart is the OPC-standard location for core document
 // properties (title, author, etc.) -- Word's File > Info panel, and its
@@ -1437,7 +1609,10 @@ var documentXMLFooter = fmt.Sprintf(
 // it has always had.
 const docPropsCorePart = "docProps/core.xml"
 
-// buildContentTypesXML builds [Content_Types].xml. The docProps/core.xml
+// buildContentTypesXML builds [Content_Types].xml. word/footer1.xml's
+// Override is unconditional -- Part C of the docx-chinese-typography plan
+// adds a footer to every document WriteDocx produces, not an opt-in one, so
+// there is no hasTitle-style flag guarding it. The docProps/core.xml
 // Override is included only when hasTitle is true, matching WriteDocx only
 // adding that entry in the same condition -- an Override for a part that
 // does not exist would itself make the package invalid.
@@ -1450,6 +1625,7 @@ func buildContentTypesXML(hasTitle bool) string {
 	b.WriteString(`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>`)
 	b.WriteString(`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`)
 	b.WriteString(`<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>`)
+	b.WriteString(`<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>`)
 	if hasTitle {
 		b.WriteString(`<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>`)
 	}
@@ -1496,26 +1672,31 @@ func docPropsCoreXML(title string) (string, error) {
 // permanently-fixed relationships from word/document.xml (styles.xml at
 // rId1 from Task 1, numbering.xml at rId2 from Task 2 — missing either
 // registration makes Word declare the whole file corrupt, not just fail to
-// render lists; see TestWrite_NumberingXMLIsDeclaredInContentTypes), plus
-// one hyperlink relationship per link the document's render pass
-// collected (rId3 upward, see renderCtx.addLink). This can no longer be a
-// constant, unlike Task 1/2's docRelsXML: the set of hyperlink
-// relationships depends on the document's content. rels is built by
-// walking blocks in a fixed, deterministic order (WriteDocx's render
-// loop), so the SAME markdown always allocates the SAME ids in the SAME
-// order — the determinism guarantee (TestWrite_IsDeterministic) extends to
-// this part too, not just to document.xml.
+// render lists; see TestWrite_NumberingXMLIsDeclaredInContentTypes), the one
+// footer relationship every document gets (footerRelID, Part C of the
+// docx-chinese-typography plan — see renderCtx.addFooterRelID), plus one
+// hyperlink relationship per link the document's render pass collected
+// (rId3 upward, see renderCtx.addLink). This can no longer be a constant,
+// unlike Task 1/2's docRelsXML: the set of hyperlink relationships depends
+// on the document's content, and footerRelID varies with how many of those
+// there are. rels is built by walking blocks in a fixed, deterministic
+// order (WriteDocx's render loop), and footerRelID is allocated exactly
+// once right after that loop finishes, so the SAME markdown always
+// allocates the SAME ids in the SAME order — the determinism guarantee
+// (TestWrite_IsDeterministic) extends to this part too, not just to
+// document.xml.
 //
 // A link's URL is XML-escaped before going into the Target attribute: a
 // URL containing "&" (an ordinary query-string separator) would otherwise
 // produce the same "unreadable content" failure escapeXMLText already
 // guards against for run text.
-func buildDocRelsXML(rels []hyperlinkRel) string {
+func buildDocRelsXML(rels []hyperlinkRel, footerRelID string) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	b.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
 	b.WriteString(`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`)
 	b.WriteString(`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>`)
+	fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`, footerRelID)
 	for _, r := range rels {
 		escapedURL, _ := escapeXMLText(r.url)
 		fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="%s" TargetMode="External"/>`,
@@ -1524,19 +1705,6 @@ func buildDocRelsXML(rels []hyperlinkRel) string {
 	b.WriteString(`</Relationships>`)
 	return b.String()
 }
-
-// codeFontXML is a direct <w:rFonts> fallback for exactly one edge case:
-// a segment that is both inline code AND a link's text (the unusual
-// "[`code`](url)"), which cannot reference both the Hyperlink and
-// VerbatimChar character styles at once (CT_RPr allows only one
-// <w:rStyle>) — see renderRun. Every OTHER code segment gets its monospace
-// font from a style instead: a fenced-code-block line inherits it from
-// pStyle="SourceCode" (styles.go), and an ordinary inline `code` span gets
-// it from rStyle="VerbatimChar". Before Task 2 of the docx-style-
-// architecture plan this constant was applied unconditionally to every
-// code segment; it survives now only for the one combination a shared
-// style cannot express.
-const codeFontXML = `<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/>`
 
 // hrBorderXML is Item 3's horizontal rule: a bottom border on an otherwise
 // completely empty paragraph (renderParagraph never generates any runs for

@@ -43,8 +43,13 @@ func TestWrite_HeadingsCarryHeadingStyles(t *testing.T) {
 	if paras[2].Style != "Heading2" {
 		t.Errorf("paras[2].Style = %q, want Heading2", paras[2].Style)
 	}
-	if paras[1].Style != "" && paras[1].Style != "Normal" {
-		t.Errorf("body paragraph has style %q", paras[1].Style)
+	// An ordinary body paragraph references BodyText (docx-chinese-
+	// typography plan, Task 2: the reference document's first-line indent
+	// + 1.5x line spacing) -- not "" and not "Normal" as it did before
+	// that task, but also not a heading style, which is what this test
+	// actually guards against.
+	if paras[1].Style != StyleBodyText {
+		t.Errorf("body paragraph has style %q, want %q", paras[1].Style, StyleBodyText)
 	}
 }
 
@@ -182,8 +187,13 @@ func TestWrite_SevenHashesIsNotAHeading(t *testing.T) {
 	if len(paras) != 1 {
 		t.Fatalf("got %d paragraphs, want 1", len(paras))
 	}
-	if paras[0].Style != "" && paras[0].Style != "Normal" {
-		t.Errorf("seven-hash line got style %q, want plain paragraph", paras[0].Style)
+	// See TestWrite_HeadingsCarryHeadingStyles' comment: an ordinary
+	// paragraph (which is what seven hashes falls back to) references
+	// BodyText, not "" or "Normal", since the docx-chinese-typography
+	// plan's Task 2. This test's actual point -- that seven hashes is NOT
+	// treated as a heading -- is unaffected.
+	if paras[0].Style != StyleBodyText {
+		t.Errorf("seven-hash line got style %q, want plain paragraph style %q", paras[0].Style, StyleBodyText)
 	}
 	var text strings.Builder
 	for _, r := range paras[0].Runs {

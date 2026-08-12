@@ -995,6 +995,13 @@ type docxWriteArgs struct {
 	Markdown     string
 	MarkdownPath string
 	Title        string
+	// The four font fields mirror docx.WriteOptions' own — see that type's
+	// doc comment (pkg/docx/write.go) for what each controls and what each
+	// falls back to when left empty ("" here, same as an omitted argument).
+	BodyLatinFont    string
+	BodyEastAsiaFont string
+	CodeLatinFont    string
+	CodeEastAsiaFont string
 }
 
 // docxWriteOutput is the JSON shape docx_write returns to the model.
@@ -1087,6 +1094,26 @@ func DocxWriteTool() models.Tool {
 					"type":        "string",
 					"description": "Optional title, rendered as the document's very first paragraph, styled as Heading1, ahead of anything parsed from markdown.",
 				},
+				"body_latin_font": map[string]any{
+					"type":        "string",
+					"description": "Latin font for ordinary body text and headings. Defaults to Calibri when omitted.",
+				},
+				"body_east_asia_font": map[string]any{
+					"type":        "string",
+					"description": "East Asian (e.g. Chinese) font for ordinary body text and headings. Defaults to 微软雅黑 (Microsoft YaHei) when omitted.",
+				},
+				"code_latin_font": map[string]any{
+					"type":        "string",
+					"description": "Latin font for fenced code blocks and inline code. Defaults to Consolas when omitted.",
+				},
+				"code_east_asia_font": map[string]any{
+					"type": "string",
+					"description": "East Asian font for fenced code blocks and inline code. Defaults to 微软雅黑 when omitted, which does " +
+						"NOT give exact alignment between ASCII box-drawing characters and Chinese text (it is a proportional " +
+						"font, not a 2:1 CJK/Latin monospace one) — pass a font with a true 2:1 width ratio (e.g. NSimSun or MS " +
+						"Gothic, neither preinstalled on macOS) for exact alignment, typically when targeting Windows readers " +
+						"or when such a font is installed locally.",
+				},
 			},
 			"required": []any{"path"},
 		},
@@ -1125,8 +1152,12 @@ func DocxWriteHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 
 	resolved := resolveWritablePath(ctx, args.Path)
 	writeResult, err := docx.WriteDocx(resolved, docx.WriteOptions{
-		Markdown: markdown,
-		Title:    args.Title,
+		Markdown:         markdown,
+		Title:            args.Title,
+		BodyLatinFont:    args.BodyLatinFont,
+		BodyEastAsiaFont: args.BodyEastAsiaFont,
+		CodeLatinFont:    args.CodeLatinFont,
+		CodeEastAsiaFont: args.CodeEastAsiaFont,
 	})
 	if err != nil {
 		return result, fmt.Errorf("docx_write: %w", err)
@@ -1209,7 +1240,27 @@ func parseDocxWriteArgs(raw map[string]any) (docxWriteArgs, error) {
 		title = s
 	}
 
-	return docxWriteArgs{Path: path, Markdown: markdown, MarkdownPath: markdownPath, Title: title}, nil
+	fonts := make(map[string]string, 4)
+	for _, key := range []string{"body_latin_font", "body_east_asia_font", "code_latin_font", "code_east_asia_font"} {
+		if v, present := raw[key]; present && v != nil {
+			s, ok := v.(string)
+			if !ok {
+				return docxWriteArgs{}, fmt.Errorf("docx_write: %s must be a string", key)
+			}
+			fonts[key] = s
+		}
+	}
+
+	return docxWriteArgs{
+		Path:             path,
+		Markdown:         markdown,
+		MarkdownPath:     markdownPath,
+		Title:            title,
+		BodyLatinFont:    fonts["body_latin_font"],
+		BodyEastAsiaFont: fonts["body_east_asia_font"],
+		CodeLatinFont:    fonts["code_latin_font"],
+		CodeEastAsiaFont: fonts["code_east_asia_font"],
+	}, nil
 }
 
 // DocxTools returns every docx tool.
