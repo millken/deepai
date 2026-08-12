@@ -1337,28 +1337,99 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 
 // TestWrite_NoInlineVisualPropertiesInDocumentXML is the core, deliberately
 // exhaustive invariant this task exists to establish: document.xml must
-// never carry a paragraph-level visual property (<w:spacing>, <w:ind>, or
-// <w:shd>) inline. Those three belong in styles.xml, referenced by name
+// never carry a paragraph-level visual property (<w:spacing>, <w:ind>,
+// <w:shd>, or <w:pBdr>) inline outside two narrow, deliberate exceptions.
+// Those properties belong in styles.xml, referenced by name
 // (<w:pStyle>/<w:rStyle>/<w:tblStyle>), so a future change that reaches for
 // "just inline it, it's simpler" regresses this test immediately instead
 // of silently reintroducing the striped-code-block/tall-table-row/
 // gapped-list defects this architecture fixes.
 //
-// The markdown below exercises every construct that used to write one of
-// the three banned properties: a heading (pStyle only, never carried
-// spacing/ind/shd inline even before this task), an ordinary paragraph, a
-// nested list (ind used to be implicit via numbering only, but
-// ListParagraph's own <w:ind> must not leak into the paragraph itself), a
-// block quote (pBdr+ind moved to Quote), a fenced code block (shd+spacing+
-// ind moved to SourceCode), and a table (cell paragraphs must not carry
-// spacing either, and TableGrid's own pPr must not leak into document.xml).
+// <w:spacing> and <w:ind> remain banned inline with NO exception, full
+// stop: every construct that needs either still gets it exclusively from a
+// style.
+//
+// <w:shd> and <w:pBdr> get two named, narrow exceptions, both added by the
+// renderer-compatibility task that also added this comment (see
+// styles.go's codeBorderXML/codeShadingXML/tableHeaderShadingXML doc
+// comments for the full reasoning) -- this is a deliberate compatibility
+// measure, not an erosion of the invariant, because the renderer that
+// motivates it (GenOffice, the user's own local previewer; Google Docs for
+// the table case) does not resolve those two style properties AT ALL, so a
+// style-only version is invisible there no matter how correct the style
+// itself is:
+//
+//  1. A fenced-code-block paragraph (<w:pStyle w:val="SourceCode"/>) may
+//     carry BOTH <w:pBdr> and <w:shd> inline, byte-identical to
+//     SourceCode's own copy -- GenOffice does not apply a paragraph
+//     style's border or shading.
+//  2. A table HEADER cell's own <w:tcPr> (not the paragraph inside it) may
+//     carry <w:shd> (never <w:pBdr> -- TableGrid has none to copy), also
+//     byte-identical to TableGrid's <w:tblStylePr> copy -- neither Google
+//     Docs nor GenOffice applies a table style's conditional formatting.
+//
+// A horizontal rule's own <w:pBdr> (hrBorderXML) is a THIRD, pre-existing
+// exception that predates this task entirely: an isHR paragraph was never
+// routed through a shared style to begin with (see renderParagraph's own
+// doc comment), so there is nothing for it to have "moved out of" -- it is
+// listed here so the loop below does not misreport it as a new violation,
+// not because it is part of this task's compatibility work.
+//
+// Every OTHER paragraph, and every DATA-row table cell, must still carry
+// neither <w:shd> nor <w:pBdr> -- the two exceptions are scoped to exactly
+// the constructs named above, not "anywhere convenient."
+//
+// The markdown below exercises every construct that used to (or still
+// does) write one of these properties: a heading, an ordinary paragraph, a
+// nested list, a block quote, a horizontal rule, a fenced code block, and
+// a table with a header and a data row.
 func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
-	md := "# H\n\nBody.\n\n- a\n    - b\n\n> quote\n\n```\ncode\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n"
+	md := "# H\n\nBody.\n\n- a\n    - b\n\n> quote\n\n---\n\n```\ncode\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n"
 	x := generateAndReadDocumentXML(t, md)
-	for _, banned := range []string{"<w:spacing", "<w:ind ", "<w:shd"} {
+
+	// <w:spacing>/<w:ind> stay banned inline everywhere, no exceptions.
+	for _, banned := range []string{"<w:spacing", "<w:ind "} {
 		if strings.Contains(x, banned) {
 			t.Errorf("%s appears inline in document.xml; paragraph-level visual "+
 				"properties belong in styles.xml", banned)
+		}
+	}
+
+	// <w:shd>/<w:pBdr> are banned on every <w:p> except a SourceCode
+	// paragraph (both) or an isHR paragraph (pBdr only, via hrBorderXML).
+	paraRE := regexp.MustCompile(`<w:p>.*?</w:p>`)
+	paras := paraRE.FindAllString(x, -1)
+	if len(paras) == 0 {
+		t.Fatal("no <w:p> found; test would be vacuous")
+	}
+	for _, p := range paras {
+		isCodePara := strings.Contains(p, `<w:pStyle w:val="SourceCode"/>`)
+		isHRPara := strings.Contains(p, hrBorderXML)
+		if strings.Contains(p, "<w:shd") && !isCodePara {
+			t.Errorf("<w:shd appears inline on a non-code paragraph: %s", p)
+		}
+		if strings.Contains(p, "<w:pBdr") && !isCodePara && !isHRPara {
+			t.Errorf("<w:pBdr appears inline on a paragraph that is neither code nor an hr: %s", p)
+		}
+	}
+
+	// <w:shd>/<w:pBdr> are banned on every table cell except a HEADER
+	// cell's own <w:tcPr>, which may carry <w:shd> (never <w:pBdr>).
+	rowRE := regexp.MustCompile(`<w:tr>.*?</w:tr>`)
+	rows := rowRE.FindAllString(x, -1)
+	if len(rows) == 0 {
+		t.Fatal("no <w:tr> found; test would be vacuous")
+	}
+	tcRE := regexp.MustCompile(`<w:tc>.*?</w:tc>`)
+	for _, row := range rows {
+		isHeader := strings.Contains(row, "<w:tblHeader/>")
+		for _, tc := range tcRE.FindAllString(row, -1) {
+			if strings.Contains(tc, "<w:pBdr") {
+				t.Errorf("table cell carries inline <w:pBdr>, which has no exception: %s", tc)
+			}
+			if strings.Contains(tc, "<w:shd") && !isHeader {
+				t.Errorf("non-header table cell carries inline <w:shd>: %s", tc)
+			}
 		}
 	}
 }

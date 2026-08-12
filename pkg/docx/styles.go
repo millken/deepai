@@ -384,6 +384,54 @@ const heading6StyleXML = `<w:style w:type="paragraph" w:styleId="Heading6">` +
 	`<w:pPr><w:keepNext/>` + headingSpacingXML + `<w:outlineLvl w:val="5"/></w:pPr>` +
 	`<w:rPr><w:b/><w:color w:val="1F4D78"/></w:rPr></w:style>`
 
+// codeBorderXML and codeShadingXML are the code block's border and shading
+// <w:pPr> children, and codeRunFontsXML is its <w:rFonts> run property --
+// the three visual properties a code block needs that GenOffice (the
+// user's actual previewer, not Word) does not resolve from a paragraph
+// style at all: it renders headings' color/size and a table's TableGrid
+// borders/header shading (those DO come from a style reference), but drops
+// a paragraph style's own <w:shd>, <w:pBdr>, and <w:rFonts> outright. A
+// code block styled ONLY via SourceCode/VerbatimChar therefore shows no
+// box and no shading in that viewer, even though the document is correct
+// and Word/Google Docs render it fine.
+//
+// These three are this package's single source for that XML: sourceCodeStyleXML/
+// verbatimCharStyleXML below use them to build SourceCode/VerbatimChar (the
+// semantic anchor every code paragraph/run still references via
+// pStyle/rStyle), and write.go's renderParagraph/renderRun call the SAME
+// three to write a byte-identical copy directly onto each code paragraph
+// and run, purely so GenOffice has something to render even though it
+// ignores the style. Word and Google Docs see identical direct formatting
+// layered over an identical style and render exactly as before; only
+// GenOffice's rendering changes.
+//
+// Do not hand-copy these strings a second time anywhere -- import the
+// constants/function instead. TestWrite_InlineCodeVisualsMatchStyle
+// extracts both copies independently (one from styles.xml, one from
+// document.xml) after a real WriteDocx call and fails if they ever differ,
+// so a future edit to one side without the other is caught immediately
+// rather than silently drifting.
+const codeBorderXML = `<w:pBdr>` +
+	`<w:top w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
+	`<w:left w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
+	`<w:bottom w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
+	`<w:right w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
+	`</w:pBdr>`
+
+const codeShadingXML = `<w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>`
+
+// codeRunFontsXML renders f's code Latin/East-Asian pair as a <w:rFonts>
+// run property. f is always SourceCode/VerbatimChar's own fontOptions (see
+// those styles' doc comments), so this is the ONE place that pair's XML
+// shape is written; sourceCodeStyleXML, verbatimCharStyleXML, and write.go's
+// renderCtx.codeFontXML (the direct-<w:rFonts> fallback for a code run that
+// cannot reference either style, plus the code-block-line compatibility
+// copy this task adds) all call it rather than each writing their own copy.
+func codeRunFontsXML(f fontOptions) string {
+	return `<w:rFonts w:ascii="` + f.codeLatin + `" w:eastAsia="` + f.codeEastAsia +
+		`" w:hAnsi="` + f.codeLatin + `" w:cs="` + f.codeLatin + `"/>`
+}
+
 // sourceCodeStyleXML is the fix for the striped-code-block defect. A
 // fenced code block renders one paragraph per line (see write.go's
 // paraBlock.isCode); without both zeroed spacing AND
@@ -445,17 +493,12 @@ func sourceCodeStyleXML(f fontOptions) string {
 	return `<w:style w:type="paragraph" w:styleId="SourceCode">` +
 		`<w:name w:val="Source Code"/><w:basedOn w:val="Normal"/><w:qFormat/>` +
 		`<w:pPr><w:keepNext/><w:keepLines/>` +
-		`<w:pBdr>` +
-		`<w:top w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
-		`<w:left w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
-		`<w:bottom w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
-		`<w:right w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
-		`</w:pBdr>` +
-		`<w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>` +
+		codeBorderXML +
+		codeShadingXML +
 		`<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>` +
 		`<w:ind w:left="120"/>` +
 		`<w:contextualSpacing/></w:pPr>` +
-		`<w:rPr><w:rFonts w:ascii="` + f.codeLatin + `" w:eastAsia="` + f.codeEastAsia + `" w:hAnsi="` + f.codeLatin + `" w:cs="` + f.codeLatin + `"/></w:rPr>` +
+		`<w:rPr>` + codeRunFontsXML(f) + `</w:rPr>` +
 		`</w:style>`
 }
 
@@ -469,7 +512,7 @@ func sourceCodeStyleXML(f fontOptions) string {
 func verbatimCharStyleXML(f fontOptions) string {
 	return `<w:style w:type="character" w:styleId="VerbatimChar">` +
 		`<w:name w:val="Verbatim Char"/>` +
-		`<w:rPr><w:rFonts w:ascii="` + f.codeLatin + `" w:eastAsia="` + f.codeEastAsia + `" w:hAnsi="` + f.codeLatin + `" w:cs="` + f.codeLatin + `"/></w:rPr>` +
+		`<w:rPr>` + codeRunFontsXML(f) + `</w:rPr>` +
 		`</w:style>`
 }
 
@@ -519,20 +562,52 @@ const listParagraphStyleXML = `<w:style w:type="paragraph" w:styleId="ListParagr
 // the border, which is the "文字贴着框线" defect the plan calls out.
 //
 // <w:tblStylePr w:type="firstRow"> is Task 3's header-row shading (DDE5F0)
-// and bold — deliberately NOT a per-cell inline <w:shd> on the header row's
-// <w:tc> elements in document.xml. This project's core invariant (see
-// TestWrite_NoInlineVisualPropertiesInDocumentXML) bans inline
-// <w:spacing>/<w:ind>/<w:shd> in document.xml; an inline header shd would
-// violate it the same way an inline paragraph shd would. A table style's
-// conditional formatting is how Word's OWN built-in table styles shade a
-// header row — see CT_TblStylePr — so referencing it keeps the shading (and
-// the bold) entirely inside styles.xml, one styleId lookup away from being
-// changed for every table in the document at once. This only takes effect
+// and bold, via tableHeaderShadingXML (shared with write.go's inline copy —
+// see that constant's doc comment for why an inline copy exists at all now).
+// A table style's conditional formatting is how Word's OWN built-in table
+// styles shade a header row — see CT_TblStylePr — and it only takes effect
 // when the TABLE ITSELF also sets <w:tblLook w:firstRow="1" .../> (see
 // write.go's tableTblPrXML) — a table style carrying tblStylePr with no
 // tblLook enabling it is silently inert, which is why
 // TestType_TableLookActivatesFirstRowShading checks both sides together
 // rather than the style alone.
+//
+// An earlier version of this comment argued the inline copy below would
+// violate this project's core invariant (TestWrite_NoInlineVisualProperties
+// InDocumentXML) the same way an inline paragraph shd would, and so kept the
+// header shading style-only. That reasoning was sound about Word (which
+// does resolve tblStylePr) and wrong about the renderers this document
+// actually gets read in: Google Docs and GenOffice do not apply a table
+// style's conditional formatting at all, so a header row styled ONLY this
+// way shows no background in either of them. The general lesson is the one
+// this whole task is about: a visual property that exists only in a style
+// is invisible in any renderer that does not resolve styles, and renderers
+// vary in exactly which parts they resolve (this one drops conditional
+// table formatting but, per the code-block case above, still separately
+// drops paragraph shd/pBdr/rFonts) — direct formatting is what travels
+// regardless of which parts of the style model a given renderer implements.
+// The invariant is narrowed, not dropped, to admit this one exception; see
+// TestWrite_NoInlineVisualPropertiesInDocumentXML's own doc comment.
+// tableHeaderShadingXML is the header row's background shading, DDE5F0 --
+// this package's single source for that fragment, shared between
+// tableGridStyleXML's <w:tblStylePr> below (the semantic anchor: Word's own
+// conditional-formatting mechanism for "shade a table style's first row")
+// and write.go's renderTable, which writes a byte-identical copy directly
+// onto each header cell's own <w:tcPr>. The direct copy exists because
+// Google Docs and GenOffice do not apply a table style's tblStylePr at all
+// (only Word does), so a header row styled only through TableGrid shows no
+// background in either of them -- see the corrected reasoning in
+// tableGridStyleXML's own doc comment above. The header row's bold needs no
+// equivalent inline copy: it has been written directly via
+// paraBlock.forceBold since before this task, so it already renders in
+// every renderer regardless of style resolution.
+//
+// Do not hand-copy this string a second time -- import the constant.
+// TestWrite_InlineHeaderShadingMatchesStyle extracts both copies
+// independently (one from styles.xml, one from document.xml) after a real
+// WriteDocx call and fails if they ever diverge.
+const tableHeaderShadingXML = `<w:shd w:val="clear" w:fill="DDE5F0"/>`
+
 const tableGridStyleXML = `<w:style w:type="table" w:styleId="TableGrid">` +
 	`<w:name w:val="Table Grid"/>` +
 	`<w:pPr><w:spacing w:after="0" w:line="260"/></w:pPr>` +
@@ -551,7 +626,7 @@ const tableGridStyleXML = `<w:style w:type="table" w:styleId="TableGrid">` +
 	`</w:tblPr>` +
 	`<w:tblStylePr w:type="firstRow">` +
 	`<w:rPr><w:b/></w:rPr>` +
-	`<w:tcPr><w:shd w:val="clear" w:fill="DDE5F0"/></w:tcPr>` +
+	`<w:tcPr>` + tableHeaderShadingXML + `</w:tcPr>` +
 	`</w:tblStylePr>` +
 	`</w:style>`
 

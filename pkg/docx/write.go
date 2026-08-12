@@ -976,6 +976,16 @@ func renderTable(tb *tableBlock, ctx *renderCtx) (string, int, error) {
 			}
 			paraCount++
 			out.WriteString("<w:tc>")
+			if row.header {
+				// GenOffice-compatibility copy of TableGrid's own header
+				// shading (see styles.go's tableHeaderShadingXML): TableGrid's
+				// <w:tblStylePr w:type="firstRow"> already carries this by
+				// reference, but Google Docs and GenOffice do not apply a
+				// table style's conditional formatting at all, so a header
+				// cell also gets it written directly. <w:tcPr> is CT_Tc's
+				// first child, so it must come before the cell's <w:p>.
+				out.WriteString("<w:tcPr>" + tableHeaderShadingXML + "</w:tcPr>")
+			}
 			out.WriteString(p)
 			out.WriteString("</w:tc>")
 		}
@@ -1302,19 +1312,22 @@ func (c *renderCtx) addFontTableRelID() string {
 }
 
 // codeFontXML renders c.fonts' code Latin/East-Asian pair as a direct
-// <w:rFonts> — the one narrow edge case (inline code that is ALSO a
-// hyperlink's text, "[`code`](url)") that cannot reference either
-// SourceCode or VerbatimChar, because a run's <w:rPr> permits at most one
-// <w:rStyle> and this combination already needs Hyperlink's — see
-// renderRun's call site. Every OTHER code segment gets its monospace font
-// from a style instead, so this is the one place in the whole render pass
-// where a font choice is written directly into document.xml rather than
-// referenced by name; it is run-level FONT formatting, not one of the three
-// paragraph-level properties (spacing/ind/shd) the styles-architecture
-// invariant bans.
+// <w:rFonts> via styles.go's codeRunFontsXML — the single source SourceCode
+// and VerbatimChar themselves build their own <w:rFonts> from, so this
+// method's output is always byte-identical to whichever of those two styles
+// applies. It has two call sites now: the one narrow edge case (inline code
+// that is ALSO a hyperlink's text, "[`code`](url)") that cannot reference
+// either style at all, because a run's <w:rPr> permits at most one
+// <w:rStyle> and this combination already needs Hyperlink's; and, as of the
+// GenOffice-compatibility task, every ordinary fenced-code-block line too
+// (see renderRun's codeBlockLine case) — GenOffice does not apply a
+// paragraph style's <w:rFonts>, so a code run needs this written directly
+// even though pStyle="SourceCode" already carries the identical font by
+// reference. It is run-level FONT formatting, not one of the three
+// paragraph-level properties (spacing/ind) the styles-architecture invariant
+// still bans inline everywhere.
 func (c *renderCtx) codeFontXML() string {
-	return `<w:rFonts w:ascii="` + c.fonts.codeLatin + `" w:eastAsia="` + c.fonts.codeEastAsia +
-		`" w:hAnsi="` + c.fonts.codeLatin + `" w:cs="` + c.fonts.codeLatin + `"/>`
+	return codeRunFontsXML(c.fonts)
 }
 
 // renderParagraph renders one paraBlock as a <w:p> element. Per the
@@ -1330,11 +1343,17 @@ func (c *renderCtx) codeFontXML() string {
 // or two of these on a single paragraph in practice, but emitting them in
 // schema order keeps the output valid even if it did.
 //
-// <w:pBdr> survives inline only for isHR: a horizontal rule is a one-off
-// empty paragraph, never repeated as a shared visual identity the way
+// <w:pBdr> survives inline for isHR (a horizontal rule is a one-off empty
+// paragraph, never repeated as a shared visual identity the way
 // SourceCode/Quote/ListParagraph/TableGrid are, so there is no shared style
-// for it to move into, and the plan's invariant does not ban <w:pBdr>
-// (only <w:spacing>/<w:ind>/<w:shd>).
+// for it to move into -- this predates the styles-architecture plan
+// entirely) AND, as of the GenOffice-compatibility task, for isCode too:
+// SourceCode's own <w:pBdr>/<w:shd> are copied directly onto the paragraph
+// alongside the pStyle reference, because GenOffice does not resolve a
+// paragraph style's border or shading at all. See
+// TestWrite_NoInlineVisualPropertiesInDocumentXML's own doc comment for the
+// full, narrowed statement of which properties are still banned inline and
+// which two named exceptions (plus this pre-existing third one) are not.
 //
 // forceBold ORs bold onto every inline segment (used for a table header
 // row) regardless of the markdown markers parseInline already resolved.
@@ -1402,6 +1421,16 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleQuote)
 	case b.isCode:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleSourceCode)
+		// GenOffice-compatibility copy of SourceCode's own border and
+		// shading (see styles.go's codeBorderXML/codeShadingXML): the
+		// pStyle reference above already carries both by name, but
+		// GenOffice does not apply a paragraph style's <w:pBdr> or <w:shd>
+		// at all, so every code paragraph also gets them written directly.
+		// <w:pBdr> then <w:shd> is CT_PPr's schema order, both ahead of the
+		// <w:jc> switch below (which isCode never actually sets, but keeps
+		// this correct even if it did).
+		pPr.WriteString(codeBorderXML)
+		pPr.WriteString(codeShadingXML)
 	case b.isHR, b.isCell:
 		// No pStyle: isHR has no text to indent, and isCell must stay on
 		// Normal so TableGrid's own pPr cascade (styles.go) governs its
@@ -1613,6 +1642,14 @@ func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) 
 		}
 	case seg.code && !codeBlockLine:
 		rPr.WriteString(`<w:rStyle w:val="VerbatimChar"/>`)
+	case codeBlockLine:
+		// GenOffice-compatibility copy of SourceCode's own <w:rFonts> (see
+		// codeFontXML's doc comment and styles.go's codeRunFontsXML): the
+		// pStyle="SourceCode" reference below already carries this font by
+		// name, but GenOffice does not resolve a paragraph style's
+		// <w:rFonts>, so every code-block-line run also gets it written
+		// directly.
+		rPr.WriteString(ctx.codeFontXML())
 	}
 	if seg.bold {
 		rPr.WriteString("<w:b/>")

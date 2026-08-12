@@ -268,16 +268,19 @@ func TestWrite_IndentedCodeBlockRecognizedAfterListEnds(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Defect 2: a code block needs a real visual container -- a border with
-// padding, referenced from a style, never inline (the project's core
-// invariant).
+// padding, referenced from a style AND, as of the GenOffice-compatibility
+// task, ALSO copied directly onto each code paragraph (see styles.go's
+// codeBorderXML doc comment: GenOffice does not apply a paragraph style's
+// <w:pBdr> at all, so the style-only reference this test used to require is
+// not sufficient on its own).
 // ---------------------------------------------------------------------------
 
-func TestWrite_CodeBlockContainerBorderLivesInStyleNotInline(t *testing.T) {
+func TestWrite_CodeBlockContainerBorderLivesInStyleAndInline(t *testing.T) {
 	md := "```\nline one\nline two\n```\n"
 	d, _, _ := writeAndReopen(t, md)
 	doc, _ := d.Part(DocumentPart)
-	if strings.Contains(string(doc), "<w:pBdr") {
-		t.Errorf("document.xml carries an inline <w:pBdr> for a code block; it must live in the SourceCode style instead:\n%s", string(doc))
+	if !strings.Contains(string(doc), "<w:pBdr") {
+		t.Errorf("document.xml has no inline <w:pBdr> on the code paragraph; GenOffice does not resolve the SourceCode style's border, so a code block would show no box in it:\n%s", string(doc))
 	}
 
 	styles, _ := d.Part("word/styles.xml")

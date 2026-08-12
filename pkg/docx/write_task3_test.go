@@ -135,12 +135,19 @@ func TestResolveFontOptions_PartialOverrideFallsBackForTheRest(t *testing.T) {
 // and cross-page header repeat
 // ---------------------------------------------------------------------------
 
-// The header row's shading and bold must come from TableGrid's own
-// <w:tblStylePr w:type="firstRow"> conditional formatting -- never as an
-// inline <w:shd>/<w:b> written directly onto the header row's cells in
-// document.xml, which would violate this project's core invariant
-// (TestWrite_NoInlineVisualPropertiesInDocumentXML).
-func TestType_TableHeaderShadedViaStyleNotInline(t *testing.T) {
+// The header row's shading must come from TableGrid's own
+// <w:tblStylePr w:type="firstRow"> conditional formatting (the semantic
+// anchor -- see TestType_TableLookActivatesFirstRowShading) AND, as of the
+// GenOffice/Google-Docs-compatibility task, ALSO be copied directly onto
+// each header cell's own <w:tcPr> (see styles.go's tableHeaderShadingXML
+// doc comment: neither Google Docs nor GenOffice applies a table style's
+// conditional formatting at all, so the style-only version this test used
+// to require left the header unshaded in both). Bold needs no such change:
+// it has been written directly via paraBlock.forceBold on the header run
+// since before this task, so it was never at risk of this defect. Data-row
+// cells must still carry no shd at all -- the header exception is scoped to
+// the header row only, not the whole table.
+func TestType_TableHeaderShadedViaStyleAndInline(t *testing.T) {
 	styles := string(buildStylesXML())
 	tg := styleBlock(t, []byte(styles), StyleTableGrid)
 	if !strings.Contains(tg, `<w:tblStylePr w:type="firstRow">`) {
@@ -155,13 +162,16 @@ func TestType_TableHeaderShadedViaStyleNotInline(t *testing.T) {
 
 	md := "| a | b |\n|---|---|\n| 1 | 2 |\n"
 	s := generateAndReadDocumentXML(t, md)
-	tblStart := strings.Index(s, "<w:tbl>")
-	tblEnd := strings.Index(s, "</w:tbl>")
-	if tblStart < 0 || tblEnd < 0 {
-		t.Fatal("no <w:tbl> found; test would be vacuous")
+	rowRE := regexp.MustCompile(`<w:tr>.*?</w:tr>`)
+	rows := rowRE.FindAllString(s, -1)
+	if len(rows) != 2 {
+		t.Fatalf("got %d <w:tr> rows, want 2 (1 header + 1 data)", len(rows))
 	}
-	if strings.Contains(s[tblStart:tblEnd], "<w:shd") {
-		t.Errorf("document.xml's table carries an inline <w:shd>, which must live in styles.xml instead:\n%s", s[tblStart:tblEnd])
+	if !strings.Contains(rows[0], `<w:tcPr><w:shd w:val="clear" w:fill="DDE5F0"/></w:tcPr>`) {
+		t.Errorf("header row = %s, want an inline header-shading <w:tcPr><w:shd>", rows[0])
+	}
+	if strings.Contains(rows[1], "<w:shd") {
+		t.Errorf("data row = %s, must not carry inline <w:shd> -- the header exception is scoped to the header row only", rows[1])
 	}
 }
 
