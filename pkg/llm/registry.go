@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -8,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/dnsoa/go/env"
+	"github.com/millken/deepai/pkg/secret"
 )
 
 // ProviderConfig holds provider initialization parameters.
@@ -52,6 +55,13 @@ func resolveConfig(name string, overrides ProviderConfig) (resolvedConfig, error
 	apiKey := overrides.APIKey
 	if apiKey == "" && def.apiKeyVar != "" {
 		apiKey = env.Get(def.apiKeyVar, "")
+	}
+	// A key may arrive sealed from .env or from an explicit ProviderConfig.
+	// Reveal is a no-op on plaintext, so calling it here is safe even when
+	// ProviderFor has already revealed the value.
+	apiKey, err := secret.Reveal(apiKey)
+	if err != nil {
+		return resolvedConfig{}, fmt.Errorf("api key for provider %q: %w", name, err)
 	}
 	baseURL := overrides.BaseURL
 	if baseURL == "" && def.baseURLVar != "" {
@@ -246,7 +256,14 @@ func (r *ModelRegistry) ProviderFor(name string) (LLMProvider, string, error) {
 		return nil, "", fmt.Errorf("unknown model alias %q; available: %s", name, strings.Join(r.order, ", "))
 	}
 
-	cacheKey := providerCacheKey(def)
+	// Resolve once and thread it through: this used to be decrypted twice
+	// per call, once for the cache key and once to build the provider.
+	apiKey, err := resolveAPIKey(def)
+	if err != nil {
+		return nil, "", fmt.Errorf("api key for model %q: %w", def.Name, err)
+	}
+
+	cacheKey := providerCacheKey(def, apiKey)
 	// Fast path: read lock.
 	r.mu.RLock()
 	if p, ok := r.providers[cacheKey]; ok {
@@ -262,7 +279,7 @@ func (r *ModelRegistry) ProviderFor(name string) (LLMProvider, string, error) {
 	if p, ok := r.providers[cacheKey]; ok {
 		return p, def.Model, nil
 	}
-	p, err := buildProviderFromDef(def)
+	p, err := buildProviderFromDef(def, apiKey)
 	if err != nil {
 		return nil, "", fmt.Errorf("init model %q: %w", def.Name, err)
 	}
@@ -272,10 +289,20 @@ func (r *ModelRegistry) ProviderFor(name string) (LLMProvider, string, error) {
 
 // providerCacheKey builds a cache key that uniquely identifies a provider
 // configuration so identical configs reuse the same LLMProvider instance.
-func providerCacheKey(def ModelDef) string {
-	apiKey := resolveAPIKey(def)
+// The key takes a digest of the API key rather than the key itself — the
+// cache map has no need to hold a live credential.
+func providerCacheKey(def ModelDef, apiKey string) string {
 	return strings.ToLower(strings.TrimSpace(def.Provider)) + "|" +
-		strings.TrimSpace(def.BaseURL) + "|" + apiKey
+		strings.TrimSpace(def.BaseURL) + "|" + keyDigest(apiKey)
+}
+
+// keyDigest hashes a resolved API key for use in cache keys.
+func keyDigest(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return hex.EncodeToString(sum[:8])
 }
 
 // ResolveBaseURL returns the effective base URL for a ModelDef after applying
@@ -295,24 +322,27 @@ func ResolveBaseURL(def ModelDef) string {
 }
 
 // resolveAPIKey determines the API key for a ModelDef: if APIKeyEnv is set,
-// read from that env var; otherwise fall back to the provider's default env var.
-func resolveAPIKey(def ModelDef) string {
+// read from that env var; otherwise fall back to the provider's default env
+// var. Sealed values are revealed here, at the point of use, so the process
+// environment holds only ciphertext.
+func resolveAPIKey(def ModelDef) (string, error) {
 	if envVar := strings.TrimSpace(def.APIKeyEnv); envVar != "" {
-		return env.Get(envVar, "")
+		return secret.Reveal(env.Get(envVar, ""))
 	}
 	pd, ok := providerDefs[strings.ToLower(strings.TrimSpace(def.Provider))]
 	if !ok || pd.apiKeyVar == "" {
-		return ""
+		return "", nil
 	}
-	return env.Get(pd.apiKeyVar, "")
+	return secret.Reveal(env.Get(pd.apiKeyVar, ""))
 }
 
-// buildProviderFromDef creates a new LLMProvider from a ModelDef, resolving
-// API key and base URL with the same env-var fallback as resolveConfig.
-func buildProviderFromDef(def ModelDef) (LLMProvider, error) {
+// buildProviderFromDef creates a new LLMProvider from a ModelDef using an
+// already-resolved API key, with the same base-URL env fallback as
+// resolveConfig.
+func buildProviderFromDef(def ModelDef, apiKey string) (LLMProvider, error) {
 	name := strings.ToLower(strings.TrimSpace(def.Provider))
 	rc, err := resolveConfig(name, ProviderConfig{
-		APIKey:  resolveAPIKey(def),
+		APIKey:  apiKey,
 		BaseURL: def.BaseURL,
 	})
 	if err != nil {
@@ -328,8 +358,10 @@ func (r *ModelRegistry) InjectProvider(provider, baseURL, apiKey string, p LLMPr
 	if r == nil {
 		return
 	}
+	// Must match providerCacheKey exactly, or injection silently stops
+	// resolving.
 	key := strings.ToLower(strings.TrimSpace(provider)) + "|" +
-		strings.TrimSpace(baseURL) + "|" + apiKey
+		strings.TrimSpace(baseURL) + "|" + keyDigest(apiKey)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.providers[key] = p
