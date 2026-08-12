@@ -195,9 +195,9 @@ func computeNotes(names []string, paras []Para, revisions revisionSummary) []str
 	}
 	if revisions.InsCount > 0 || revisions.DelCount > 0 {
 		notes = append(notes, fmt.Sprintf(
-			"document contains unreviewed tracked changes from author(s) %q (%d insertion(s), %d deletion(s)); "+
+			"document contains unreviewed tracked changes from author(s) %s (%d insertion(s), %d deletion(s)); "+
 				"paragraph text above is rendered as if every revision were already accepted (inserted text shown, deleted text omitted)",
-			revisions.Authors, revisions.InsCount, revisions.DelCount))
+			formatAuthorList(revisions.Authors), revisions.InsCount, revisions.DelCount))
 	}
 	return notes
 }

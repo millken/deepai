@@ -106,14 +106,18 @@ const (
 		"call unless the user explicitly asked for direct edits with no review step. With it on, each change lands " +
 		"as a Word revision (w:ins/w:del) in the review pane, not as a finalized edit — after such a call, tell the " +
 		"user the changes are pending review in Word, never that you \"made\" or \"applied\" them, and say how to " +
-		"accept or reject each one (Word's Review tab). Calling docx_edit repeatedly on the same file across a " +
-		"chunked polish (one call per section) is expected to keep working: your own earlier tracked changes in " +
-		"that file never cause a later call to refuse. If docx_edit DOES refuse because the document already " +
-		"contains unreviewed revisions from a DIFFERENT author, its error names which author's revisions those are " +
-		"— tell the user about them and let them decide: either they open the file in Word and accept/reject those " +
-		"revisions first, or, only once they explicitly confirm it is fine, retry the same call with author set to " +
-		"match the one the error names. Do not turn track_changes off to route around the refusal on your own " +
-		"judgment — that risks silently mixing someone else's unreviewed changes with yours in the same file."
+		"accept or reject each one (Word's Review tab). Set docx_edit's author argument once and reuse the EXACT " +
+		"same value on every call in this editing round, the same way you repeat protect on every call: a gate " +
+		"compares each call's author against the document's existing revisions, and switching authors mid-round " +
+		"(or leaving it unset on one call and set on another) makes a later call look like someone else's " +
+		"unreviewed work and refuses it. As long as every call in the round uses that same author, calling " +
+		"docx_edit repeatedly on the same file across a chunked polish (one call per section) is expected to keep " +
+		"working. If docx_edit DOES refuse because the document already contains unreviewed revisions from a " +
+		"DIFFERENT author, its error names which author's revisions those are — tell the user about them and let " +
+		"them decide: either they open the file in Word and accept/reject those revisions first, or, only once " +
+		"they explicitly confirm it is fine, retry the same call with author set to match the one the error names. " +
+		"Do not turn track_changes off to route around the refusal on your own judgment — that risks silently " +
+		"mixing someone else's unreviewed changes with yours in the same file."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{

@@ -535,3 +535,107 @@ func TestHadRevisionsAtOpen_DivergesFromHasRevisionsAfterAnEditProducesOne(t *te
 		t.Fatal("hadRevisionsAtOpen flipped to true after rescan; it must only ever reflect the FIRST scan at OpenDocument time")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// scanRevisions: author collection beyond w:ins/w:del (review-round fix).
+// ---------------------------------------------------------------------------
+
+// TestScanRevisions_CollectsAuthorFromEveryTrackChangeElement is a
+// table-driven, minimal-fixture pin for each element task-3's review named
+// as a false-allow hazard if scanRevisions only looked at w:ins/w:del: a
+// reviewer's tracked move, table-cell insert/delete, or formatting change
+// carries its own w:author and must show up in Authors, even though none of
+// these elements are w:ins or w:del themselves and so must NOT move
+// InsCount/DelCount.
+func TestScanRevisions_CollectsAuthorFromEveryTrackChangeElement(t *testing.T) {
+	tests := []struct {
+		name string
+		xml  string
+	}{
+		{"moveFrom", `<w:p><w:moveFrom w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z">` +
+			`<w:r><w:t>moved away</w:t></w:r></w:moveFrom></w:p>`},
+		{"moveTo", `<w:p><w:moveTo w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z">` +
+			`<w:r><w:t>moved here</w:t></w:r></w:moveTo></w:p>`},
+		{"cellIns", `<w:tbl><w:tr><w:tc><w:tcPr><w:cellIns w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z"/></w:tcPr>` +
+			`<w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`},
+		{"cellDel", `<w:tbl><w:tr><w:tc><w:tcPr><w:cellDel w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z"/></w:tcPr>` +
+			`<w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`},
+		{"rPrChange", `<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z">` +
+			`<w:rPr/></w:rPrChange></w:rPr><w:t>bold now</w:t></w:r></w:p>`},
+		{"pPrChange", `<w:p><w:pPr><w:jc w:val="center"/><w:pPrChange w:id="1" w:author="Mover" w:date="2026-01-01T00:00:00Z">` +
+			`<w:pPr/></w:pPrChange></w:pPr><w:r><w:t>centered now</w:t></w:r></w:p>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sum := scanRevisions([]byte(tt.xml))
+			if len(sum.Authors) != 1 || sum.Authors[0] != "Mover" {
+				t.Errorf("Authors = %v, want [\"Mover\"]", sum.Authors)
+			}
+			if sum.InsCount != 0 || sum.DelCount != 0 {
+				t.Errorf("InsCount/DelCount = %d/%d, want 0/0 (a %s is not a w:ins/w:del)", sum.InsCount, sum.DelCount, tt.name)
+			}
+		})
+	}
+}
+
+// TestScanRevisions_InsDelCountsUnaffectedByOtherTrackChangeElements pins
+// the other half: a document mixing w:ins/w:del with the other
+// track-change-family elements must count only the former, so
+// computeNotes' "N insertion(s), M deletion(s)" wording in read notes stays
+// accurate even once the author set (correctly) grew to cover more element
+// kinds.
+func TestScanRevisions_InsDelCountsUnaffectedByOtherTrackChangeElements(t *testing.T) {
+	doc := []byte(`<w:p><w:ins w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:t>x</w:t></w:r></w:ins>` +
+		`<w:moveFrom w:id="2" w:author="B" w:date="2026-01-01T00:00:00Z"><w:r><w:t>y</w:t></w:r></w:moveFrom>` +
+		`<w:del w:id="3" w:author="A" w:date="2026-01-01T00:00:00Z"><w:delText>z</w:delText></w:del></w:p>`)
+	sum := scanRevisions(doc)
+	if sum.InsCount != 1 {
+		t.Errorf("InsCount = %d, want 1", sum.InsCount)
+	}
+	if sum.DelCount != 1 {
+		t.Errorf("DelCount = %d, want 1", sum.DelCount)
+	}
+	if len(sum.Authors) != 2 || sum.Authors[0] != "A" || sum.Authors[1] != "B" {
+		t.Errorf("Authors = %v, want [\"A\" \"B\"] (sorted, deduplicated)", sum.Authors)
+	}
+}
+
+// TestScanRevisions_TrimsWhitespaceFromAuthor and
+// TestEffectiveAuthor_TrimsWhitespace pin the review's TrimSpace requirement
+// (finding 5): both sides of the gate's author comparison must agree that
+// incidental leading/trailing whitespace is not part of the identity, or a
+// caller-supplied author differing from an on-disk one only by whitespace
+// would manufacture a spurious "different author" refusal that trimming on
+// only one side could never fix.
+func TestScanRevisions_TrimsWhitespaceFromAuthor(t *testing.T) {
+	doc := []byte(`<w:p><w:ins w:id="1" w:author="  Reviewer  " w:date="2026-01-01T00:00:00Z">` +
+		`<w:r><w:t>x</w:t></w:r></w:ins></w:p>`)
+	sum := scanRevisions(doc)
+	if len(sum.Authors) != 1 || sum.Authors[0] != "Reviewer" {
+		t.Errorf("Authors = %v, want [\"Reviewer\"] (trimmed)", sum.Authors)
+	}
+}
+
+func TestEffectiveAuthor_TrimsWhitespace(t *testing.T) {
+	if got := effectiveAuthor("  Reviewer  "); got != "Reviewer" {
+		t.Errorf("effectiveAuthor(%q) = %q, want %q", "  Reviewer  ", got, "Reviewer")
+	}
+	if got := effectiveAuthor("   "); got != defaultRevisionAuthor {
+		t.Errorf("effectiveAuthor of a whitespace-only author = %q, want the default %q", got, defaultRevisionAuthor)
+	}
+}
+
+// TestFormatAuthorList pins finding 5's other half: a comma-separated list
+// for a human/LLM-facing message, and "(unnamed)" — not a bare "[]" — when
+// no author names were found at all.
+func TestFormatAuthorList(t *testing.T) {
+	if got := formatAuthorList(nil); got != "(unnamed)" {
+		t.Errorf("formatAuthorList(nil) = %q, want %q", got, "(unnamed)")
+	}
+	if got := formatAuthorList([]string{"A"}); got != "A" {
+		t.Errorf("formatAuthorList([A]) = %q, want %q", got, "A")
+	}
+	if got := formatAuthorList([]string{"A", "B"}); got != "A, B" {
+		t.Errorf("formatAuthorList([A B]) = %q, want %q", got, "A, B")
+	}
+}

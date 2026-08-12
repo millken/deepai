@@ -16,41 +16,112 @@ import (
 // batch's EditOptions.Author is "" — see effectiveAuthor and attrs below.
 const defaultRevisionAuthor = "deepai"
 
-// effectiveAuthor returns author, or defaultRevisionAuthor when author is
-// "". This is the single place that default lives, so both attrs (which
-// stamps it onto every w:ins/w:del a TrackChanges batch produces) and
-// edit.go's track_changes author gate (which must judge an UNTRACKED batch —
-// one that never builds a revisionCtx at all — by the same identity a
-// tracked one would have carried) agree on what "no author given" means.
+// effectiveAuthor returns author, trimmed of surrounding whitespace, or
+// defaultRevisionAuthor when that trims to "". This is the single place
+// that default lives, so both attrs (which stamps it onto every w:ins/w:del
+// a TrackChanges batch produces) and edit.go's track_changes author gate
+// (which must judge an UNTRACKED batch — one that never builds a
+// revisionCtx at all — by the same identity a tracked one would have
+// carried) agree on what "no author given" means. Trimming here, not just
+// at the tool layer (pkg/tools/builtin/docx.go already trims author before
+// it reaches EditOptions), makes the comparison correct for any caller of
+// this package directly, and keeps it symmetric with scanRevisions, which
+// trims every w:author value it reads off disk the same way — otherwise an
+// author matching an existing revision except for incidental whitespace
+// would manufacture a spurious "different author" refusal that trimming on
+// only one side could not fix.
 func effectiveAuthor(author string) string {
+	author = strings.TrimSpace(author)
 	if author == "" {
 		return defaultRevisionAuthor
 	}
 	return author
 }
 
-// revisionSummary aggregates every <w:ins>/<w:del> element found anywhere in
-// a document.xml — run-level wraps and the self-closing paragraph-mark form
-// alike — into a count of each and the distinct w:author values they carry.
-// Document computes this twice: once at OpenDocument time, to seed
+// formatAuthorList renders a list of revision authors for a human/LLM
+// facing message: comma-separated, or "(unnamed)" when empty. The empty
+// case is reachable only when every revision element scanRevisions found
+// had no w:author attribute at all (or one that was empty/whitespace-only)
+// — malformed input, since Word always writes a real reviewer name, but not
+// something a caller-facing message should render as a bare "[]".
+func formatAuthorList(authors []string) string {
+	if len(authors) == 0 {
+		return "(unnamed)"
+	}
+	return strings.Join(authors, ", ")
+}
+
+// revisionSummary aggregates every revision-tracking element found anywhere
+// in a document.xml — <w:ins>/<w:del> (run-level wraps and the self-closing
+// paragraph-mark form alike), plus every other WordprocessingML element that
+// carries its own w:author (w:moveFrom/w:moveTo for tracked text moves,
+// w:cellIns/w:cellDel for tracked table-cell insert/delete, and
+// w:rPrChange/w:pPrChange for tracked formatting changes) — into a count of
+// <w:ins>/<w:del> specifically and the distinct w:author values ANY of them
+// carry. Document computes this twice: once at OpenDocument time, to seed
 // revisionAuthorsAtOpen (edit.go's track_changes author gate), and again on
 // every rescan, to feed computeNotes' "this document has unreviewed
 // revisions" declaration — see document.go.
+//
+// The author set intentionally covers more elements than the ins/del count
+// does: missing an author here is a false-ALLOW hazard (the gate would let
+// an edit past a reviewer's pending w:rPrChange, say, because it only ever
+// heard about w:ins/w:del authors), whereas the ins/del count staying
+// narrower only affects the read-side "N insertions/M deletions" note's
+// wording, not any safety property. See task-3's review round for the
+// concrete case (moveFrom/moveTo/cellIns/cellDel/rPrChange/pPrChange all
+// carry w:author per their CT_TrackChange-family schemas, and none of them
+// are w:ins/w:del themselves).
 type revisionSummary struct {
 	InsCount int
 	DelCount int
 	// Authors is sorted and deduplicated, and never contains "": a
-	// <w:ins>/<w:del> with no w:author attribute (malformed input; Word
-	// always writes one) contributes to the count but not to this list.
+	// revision element with no w:author attribute, or one that is empty or
+	// whitespace-only (malformed input; Word always writes a real name),
+	// contributes to the ins/del count but not to this list. Every value
+	// here is also trimmed of surrounding whitespace (see effectiveAuthor's
+	// doc comment for why both sides of the comparison need to agree on
+	// that).
 	Authors []string
 }
 
+// isRevisionAuthorElement reports whether n is one of the WordprocessingML
+// elements that carries its own w:author identifying who made a tracked
+// change: w:ins/w:del themselves, plus w:moveFrom/w:moveTo (tracked text
+// moves), w:cellIns/w:cellDel (tracked table-cell insert/delete), and
+// w:rPrChange/w:pPrChange (tracked formatting changes). scanRevisions uses
+// this to decide which elements' w:author to collect; over-collecting
+// (treating an element as a revision source when it turns out not to carry
+// one) is harmless (wordAttrVal simply finds nothing), while
+// under-collecting is the false-allow hazard the type's doc comment
+// describes, so this list errs toward including any TrackChange-family
+// element task-3's review named.
+func isRevisionAuthorElement(n xml.Name) bool {
+	switch {
+	case isWordElement(n, "ins"),
+		isWordElement(n, "del"),
+		isWordElement(n, "moveFrom"),
+		isWordElement(n, "moveTo"),
+		isWordElement(n, "cellIns"),
+		isWordElement(n, "cellDel"),
+		isWordElement(n, "rPrChange"),
+		isWordElement(n, "pPrChange"):
+		return true
+	default:
+		return false
+	}
+}
+
 // scanRevisions walks documentXML as a token stream (independent of Scan's
-// paragraph indexing, so it also sees a document with zero paragraphs or one
-// Scan would refuse) and builds a revisionSummary from every <w:ins>/<w:del>
-// start element it finds. A decode error (should not happen for bytes that
-// already passed Scan) just ends the walk early with whatever was
-// accumulated so far, mirroring maxWordID's best-effort tolerance above.
+// paragraph indexing, and independent of any txbxDepth/inPara-style nesting
+// guard, so it also sees a revision inside a text box or one wrapping a
+// whole paragraph at the body level — see edit.go's Edit doc comment for
+// why that unconditional walk matters to the gate) and builds a
+// revisionSummary: InsCount/DelCount from <w:ins>/<w:del> specifically, and
+// Authors from every element isRevisionAuthorElement recognizes. A decode
+// error (should not happen for bytes that already passed Scan) just ends
+// the walk early with whatever was accumulated so far, mirroring
+// maxWordID's best-effort tolerance above.
 func scanRevisions(documentXML []byte) revisionSummary {
 	dec := xml.NewDecoder(bytes.NewReader(documentXML))
 	var sum revisionSummary
@@ -69,13 +140,20 @@ func scanRevisions(documentXML []byte) revisionSummary {
 			sum.InsCount++
 		case isWordElement(se.Name, "del"):
 			sum.DelCount++
-		default:
+		}
+		if !isRevisionAuthorElement(se.Name) {
 			continue
 		}
-		if val, ok := wordAttrVal(se, "author"); ok && val != "" && !seen[val] {
-			seen[val] = true
-			sum.Authors = append(sum.Authors, val)
+		val, ok := wordAttrVal(se, "author")
+		if !ok {
+			continue
 		}
+		val = strings.TrimSpace(val)
+		if val == "" || seen[val] {
+			continue
+		}
+		seen[val] = true
+		sum.Authors = append(sum.Authors, val)
 	}
 	sort.Strings(sum.Authors)
 	return sum

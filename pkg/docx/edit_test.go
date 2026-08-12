@@ -1388,6 +1388,73 @@ func TestEdit_AllowsReopenedDocumentWhenAuthorMatchesExistingRevisions(t *testin
 	}
 }
 
+// TestEdit_RefusesWhenTextBoxContainsOtherAuthorRevision is a review-round
+// fix: the gate used to trigger on d.hadRevisionsAtOpen, which comes from
+// Scan's per-PARAGRAPH HasRevisions flag — and that flag is never set for a
+// <w:ins>/<w:del> found INSIDE a <w:txbxContent> subtree, because scan.go's
+// ins/del cases are guarded by "&& txbxDepth == 0" (the whole subtree is
+// skipped, on purpose, so its duplicated mc:Choice/mc:Fallback text isn't
+// indexed twice — see Scan's doc comment). d.revisionAuthorsAtOpen, by
+// contrast, comes from scanRevisions' whole-document token walk, which does
+// NOT skip text boxes, so it already sees "reviewer" here — the bug was
+// gating on the wrong signal, not missing data. Before the fix, this
+// document had hadRevisionsAtOpen == false (no paragraph's flag was ever
+// set) while revisionAuthorsAtOpen == ["reviewer"], so Edit fell straight
+// through the gate and applied the edit even though a human reviewer's
+// pending revision — invisible to the paragraph scan, but named in
+// docx_read's notes — was sitting in the same file.
+func TestEdit_RefusesWhenTextBoxContainsOtherAuthorRevision(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:drawing><wps:txbx><w:txbxContent>`+
+		`<w:p><w:ins w:id="1" w:author="reviewer" w:date="2026-01-01T00:00:00Z">`+
+		`<w:r><w:t>inside box</w:t></w:r></w:ins></w:p>`+
+		`</w:txbxContent></wps:txbx></w:drawing></w:r></w:p>`+
+		`<w:p><w:r><w:t>second</w:t></w:r></w:p>`)
+
+	if d.HasRevisions() {
+		t.Fatal("test setup: HasRevisions() = true; this test needs the paragraph-level scan to miss the textbox revision for the gate bug to be exercised")
+	}
+	if len(d.revisionAuthorsAtOpen) == 0 {
+		t.Fatal("test setup: revisionAuthorsAtOpen is empty; scanRevisions should have found \"reviewer\" inside the text box")
+	}
+
+	_, err := d.Edit([]Edit{{Para: 2, Text: "x"}}, EditOptions{})
+	if err == nil {
+		t.Fatal("Edit succeeded despite an other-author revision hidden inside a text box — false allow")
+	}
+	if !strings.Contains(err.Error(), "reviewer") {
+		t.Errorf("error = %q, want it to name the other author (reviewer)", err)
+	}
+}
+
+// TestEdit_RefusesWhenBodyLevelInsWrapsWholeParagraph covers the other shape
+// the same bug missed: a <w:ins> that wraps an entire <w:p> as the BODY's
+// direct child (rather than a run inside an already-open paragraph). When
+// Scan sees this <w:ins> StartElement, inPara is still false (the <w:p>
+// hasn't opened yet), so paraHasRevisions is never set for the paragraph
+// inside it either — same false-negative on the paragraph-level signal,
+// same true-positive on scanRevisions' unconditional whole-document walk.
+func TestEdit_RefusesWhenBodyLevelInsWrapsWholeParagraph(t *testing.T) {
+	d := bodyDoc(t, `<w:ins w:id="1" w:author="reviewer" w:date="2026-01-01T00:00:00Z">`+
+		`<w:p><w:r><w:t>inserted paragraph</w:t></w:r></w:p>`+
+		`</w:ins>`+
+		`<w:p><w:r><w:t>second</w:t></w:r></w:p>`)
+
+	if d.HasRevisions() {
+		t.Fatal("test setup: HasRevisions() = true; this test needs the paragraph-level scan to miss the body-level ins for the gate bug to be exercised")
+	}
+	if len(d.revisionAuthorsAtOpen) == 0 {
+		t.Fatal("test setup: revisionAuthorsAtOpen is empty; scanRevisions should have found \"reviewer\" from the body-level <w:ins>")
+	}
+
+	_, err := d.Edit([]Edit{{Para: 2, Text: "x"}}, EditOptions{})
+	if err == nil {
+		t.Fatal("Edit succeeded despite an other-author revision hidden in a body-level <w:ins><w:p> — false allow")
+	}
+	if !strings.Contains(err.Error(), "reviewer") {
+		t.Errorf("error = %q, want it to name the other author (reviewer)", err)
+	}
+}
+
 // TestEdit_TrackChanges_RunWithSeveralTextNodesIsRefusedPerEditNotBatch is
 // the self-review's most important check: cloneRunWithText refuses a run
 // holding more than one <w:t> (see its doc comment — this is exactly the

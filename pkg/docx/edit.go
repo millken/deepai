@@ -153,33 +153,59 @@ const (
 // collision pass has run.
 //
 // Edit refuses the entire batch up front, with an error rather than a
-// per-edit Reason, when the document ALREADY contained revision marks
-// (w:ins/w:del) the moment it was opened (d.hadRevisionsAtOpen) AND at least
-// one of those revisions' w:author values is not this batch's own author
-// (d.revisionAuthorsAtOpen minus effectiveAuthor(opts.Author) is non-empty).
-// Gating on AUTHOR, not merely on hadRevisionsAtOpen's bool, is what lets a
+// per-edit Reason, when the document ALREADY contained revision marks the
+// moment it was opened AND at least one of those revisions' w:author values
+// is not this batch's own author (d.revisionAuthorsAtOpen minus
+// effectiveAuthor(opts.Author) is non-empty).
+//
+// The trigger for this check is len(d.revisionAuthorsAtOpen) > 0, NOT
+// d.hadRevisionsAtOpen. An earlier version of this gate used
+// hadRevisionsAtOpen (itself derived from Scan's per-PARAGRAPH HasRevisions
+// flag) and that was a false-allow hazard: scan.go's <w:ins>/<w:del> cases
+// are guarded by "&& txbxDepth == 0" (a text box's whole subtree, including
+// any revision marks inside it, is deliberately not paragraph-indexed — see
+// Scan's doc comment), and separately, a <w:ins> that wraps an entire <w:p>
+// as the body's direct child fires its StartElement before that <w:p> has
+// opened, so paraHasRevisions never gets set for the paragraph inside it
+// either. Both shapes leave every Para.HasRevisions flag false (so
+// hadRevisionsAtOpen is false) even though a real, other-author revision is
+// sitting in the file — and scanRevisions (which builds
+// d.revisionAuthorsAtOpen) walks the ENTIRE document.xml token stream with
+// no such guard, so it already saw that author correctly. Gating on the
+// authors set directly, rather than re-deriving "were there any revisions
+// at all" from the paragraph cache and hoping the two data sources agree,
+// closes that gap by construction: whenever scanRevisions found ANY author,
+// the comparison runs, regardless of what the paragraph-level scan saw.
+//
+// Gating on AUTHOR, not merely on "were there any revisions", is what lets a
 // document reopened between calls — the tool layer's per-call
 // OpenDocument/Edit/Save cycle (pkg/tools/builtin/docx.go) reopens fresh
-// every time, so d.hadRevisionsAtOpen is true again on every call after the
-// first one wrote its own revisions — keep landing: this batch's own
-// earlier tracked changes are recognized as its own and never trigger the
-// refusal, while someone else's still-pending revisions (a human reviewer's
-// edits sitting in the file, or a different author's polish pass) do. This
-// deliberately does NOT use HasRevisions(): that method reads the CURRENT
-// paragraph cache, which a TrackChanges edit itself flips to true via
-// rescan, and gating on it (even author-aware) would need the CURRENT
-// authors too, when what this check needs is what was already there BEFORE
-// this session touched anything — exactly what hadRevisionsAtOpen/
-// revisionAuthorsAtOpen capture once, at open, and never update.
+// every time, so d.revisionAuthorsAtOpen is non-empty again on every call
+// after the first one wrote its own revisions — keep landing: this batch's
+// own earlier tracked changes are recognized as its own and never trigger
+// the refusal, while someone else's still-pending revisions (a human
+// reviewer's edits sitting in the file, or a different author's polish
+// pass) do. This deliberately does NOT use HasRevisions(): that method
+// reads the CURRENT paragraph cache, which a TrackChanges edit itself flips
+// to true via rescan, and gating on it (even author-aware) would need the
+// CURRENT authors too, when what this check needs is what was already
+// there BEFORE this session touched anything — exactly what
+// revisionAuthorsAtOpen captures once, at open, and never updates.
 // HasRevisions() keeps its existing meaning unchanged for read.go/format.go's
-// own, unrelated uses of it.
+// own, unrelated uses of it. hadRevisionsAtOpen itself is left in place
+// (see its own doc comment) purely as the bookkeeping it always was; Edit no
+// longer reads it.
 //
 // When the document was never touched by TrackChanges (opts.TrackChanges is
 // false), the batch's identity for this comparison is still
 // effectiveAuthor(opts.Author) — the same default ("deepai") a TrackChanges
 // batch with the same opts.Author would have stamped — so an untracked
 // "finish the polish, tracking off" call right after a tracked one is judged
-// by the same identity, not treated as authorless.
+// by the same identity, not treated as authorless. Both sides of the
+// comparison are trimmed of surrounding whitespace (effectiveAuthor for the
+// caller, scanRevisions for what's already on disk), so a caller-supplied
+// author differing from an existing one only by incidental whitespace does
+// not manufacture a spurious "different author" refusal.
 //
 // On success, Edit re-scans the document (rescan) so that Paras() and
 // TotalParas() reflect the new state immediately. If the combined patch
@@ -190,7 +216,7 @@ const (
 // bytes one Save/SaveAs call away from overwriting the user's file on
 // disk.
 func (d *Document) Edit(edits []Edit, opts EditOptions) (EditResult, error) {
-	if d.hadRevisionsAtOpen {
+	if len(d.revisionAuthorsAtOpen) > 0 {
 		caller := effectiveAuthor(opts.Author)
 		var other []string
 		for _, a := range d.revisionAuthorsAtOpen {
@@ -200,13 +226,13 @@ func (d *Document) Edit(edits []Edit, opts EditOptions) (EditResult, error) {
 		}
 		if len(other) > 0 {
 			return EditResult{}, fmt.Errorf(
-				"docx: this document already contains unreviewed revision marks (w:ins/w:del) from author(s) %q, "+
-					"which does not include this batch's author %q; tell the user about these pending revisions "+
-					"so they can decide what to do: open the file in Word and accept or reject them first, or — "+
-					"only once they explicitly confirm it is fine to build on top of them — retry this edit with "+
-					"author set to match one of them (e.g. author=%q) so it is recognized as continuing the same "+
-					"review rather than starting an unrelated one",
-				other, caller, other[0])
+				"docx: this document already contains unreviewed revision marks (w:ins/w:del or similar) from "+
+					"author(s) %s, which does not include this batch's author %q; tell the user about these pending "+
+					"revisions so they can decide what to do: open the file in Word and accept or reject them "+
+					"first, or — only once they explicitly confirm it is fine to build on top of them — retry this "+
+					"edit with author set to match one of them (e.g. author=%q) so it is recognized as continuing "+
+					"the same review rather than starting an unrelated one",
+				formatAuthorList(other), caller, other[0])
 		}
 	}
 

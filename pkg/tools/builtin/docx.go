@@ -515,11 +515,13 @@ func DocxEditTool() models.Tool {
 			"paragraph, optionally narrowed to a run index or a literal find substring, and applies replace " +
 			"(default), insert_before, insert_after, or delete. A refused edit does not block the rest of the " +
 			"batch. Pass track_changes to write every edit in the batch as a Word tracked-change revision instead " +
-			"of rewriting text directly. Refuses a document that already contained revision marks when it was " +
-			"opened — accept or reject those in Word first, then reopen. Backs up the original file once, " +
-			"before the first overwrite, to <path>.bak. This tool does not touch fonts, size, spacing, or " +
-			"alignment — for that, including changing just one paragraph's font size, call docx_format with " +
-			"start_para/end_para set to the paragraph range to change.",
+			"of rewriting text directly. Refuses, before applying anything, only when the document already " +
+			"contains unreviewed revision marks from a DIFFERENT author than this call's own author (see the " +
+			"author argument) — your own earlier revisions under the same author never block a later call, so a " +
+			"multi-call chunked polish keeps working as long as every call in the round uses the same author. " +
+			"Backs up the original file once, before the first overwrite, to <path>.bak. This tool does not touch " +
+			"fonts, size, spacing, or alignment — for that, including changing just one paragraph's font size, " +
+			"call docx_format with start_para/end_para set to the paragraph range to change.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -552,12 +554,19 @@ func DocxEditTool() models.Tool {
 					"type": "boolean",
 					"description": "When true, every edit in this batch lands as a Word revision (w:ins/w:del) instead of being written " +
 						"directly — the user opens the document in Word and accepts or rejects each change in the review pane; " +
-						"nothing is silently finalized. Defaults to false (direct edit). Refuses, before applying anything, a " +
-						"document that already contained revision marks when it was opened — accept or reject those in Word first.",
+						"nothing is silently finalized. Defaults to false (direct edit). Refuses, before applying anything, when the " +
+						"document already contains unreviewed revisions from a different author than this call's author (see the " +
+						"author argument) — accept or reject those in Word first, or retry with author set to match them once the " +
+						"user has explicitly confirmed that is fine.",
 				},
 				"author": map[string]any{
-					"type":        "string",
-					"description": "The reviewer name stamped as w:author on every revision this batch produces. Defaults to \"deepai\" when omitted, empty, or whitespace-only. Ignored when track_changes is false.",
+					"type": "string",
+					"description": "The reviewer name stamped as w:author on every revision this batch produces, AND compared against " +
+						"any revisions already in the document to decide whether to refuse the call — that comparison runs even " +
+						"when track_changes is false. Defaults to \"deepai\" when omitted, empty, or whitespace-only. Use the exact " +
+						"same author on every docx_edit call within one editing round, the same way you repeat protect on every " +
+						"call: switching authors mid-round makes the next call look like someone else's unreviewed work and " +
+						"triggers the same refusal.",
 				},
 			},
 			"required": []any{"path", "edits"},
