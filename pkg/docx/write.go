@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,15 +40,20 @@ type WriteOptions struct {
 	// verbatim as plain text and declared in WriteResult.Notes -- see
 	// detectImages/buildNotes.
 	Markdown string
-	// Title, when non-empty, becomes the document's first paragraph,
-	// styled as Heading1 ahead of anything parsed from Markdown.
-	//
-	// The alternative was writing it into docProps/core.xml's <dc:title>
-	// instead (or as well). That would need a sixth OOXML part purely to
-	// carry a value most readers show only in file-properties dialogs,
-	// never in the document body. A visible Heading1 is what a reader
-	// opening the file actually sees, needs no extra part, and is what a
-	// user asking to "give this document a title" almost always means.
+	// Title, when non-empty, becomes the document's first paragraph, styled
+	// as Heading1 ahead of anything parsed from Markdown -- UNLESS Markdown
+	// already opens with its own level-1 ATX heading (see
+	// markdownStartsWithH1), in which case Title is not prepended a second
+	// time. A model asked to "give this a title" and shown the Markdown
+	// syntax brief will often do both -- pass Title AND write "# Title" as
+	// the document's own first line -- and prepending unconditionally used
+	// to duplicate that heading (P1a's Defect 4: the same title rendered
+	// three times over in one real generated document). Title is also
+	// written into docProps/core.xml's <dc:title>, the OPC-standard
+	// location Word's File > Info panel reads from independently of
+	// anything in the document body; that part (plus its Content_Types and
+	// root .rels registrations) is added only when Title is non-empty, so a
+	// title-less document's package shape is unchanged.
 	Title string
 }
 
@@ -114,13 +120,24 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	}
 	body.WriteString(documentXMLFooter)
 
+	hasTitle := opts.Title != ""
 	entries := []zipEntry{
-		{name: contentTypesPart, data: []byte(contentTypesXML)},
-		{name: "_rels/.rels", data: []byte(rootRelsXML)},
+		{name: contentTypesPart, data: []byte(buildContentTypesXML(hasTitle))},
+		{name: "_rels/.rels", data: []byte(buildRootRelsXML(hasTitle))},
 		{name: DocumentPart, data: []byte(body.String())},
 		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels))},
 		{name: "word/styles.xml", data: []byte(stylesPartXML)},
 		{name: "word/numbering.xml", data: []byte(numberingXML)},
+	}
+	if hasTitle {
+		coreXML, err := docPropsCoreXML(opts.Title)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("docx: render docProps/core.xml: %w", err)
+		}
+		// Appended after the fixed five parts: entry order only has to be
+		// deterministic (writeNewDocx replays this exact slice every call),
+		// not match any particular position Word itself would choose.
+		entries = append(entries, zipEntry{name: docPropsCorePart, data: []byte(coreXML)})
 	}
 
 	if err := writeNewDocx(path, entries); err != nil {
@@ -318,26 +335,52 @@ var (
 )
 
 // parseMarkdown turns opts into the blocks WriteDocx renders and the Notes
-// it reports. Title, when set, is prepended as its own Heading1 block
-// ahead of anything parsed from Markdown. If nothing produced any block at
-// all (empty or all-blank input, no Title), a single empty paragraph
-// block is emitted instead of zero: a .docx body conventionally always
-// carries at least one paragraph, and this is the only way to guarantee
-// that without also making every ordinary blank separator produce spurious
-// empty paragraphs (see buildBlocks).
+// it reports. Title, when set, is prepended as its own Heading1 block ahead
+// of anything parsed from Markdown -- UNLESS Markdown already opens with
+// its own level-1 heading (markdownStartsWithH1), which would otherwise
+// duplicate it: a model asked to title a document commonly does both,
+// passing Title AND writing "# Title" as Markdown's own first line, and
+// that combination is the normal case this guards, not an edge case (see
+// WriteOptions.Title and Defect 4 in the package's write-quality report).
+// If nothing produced any block at all (empty or all-blank input, no
+// Title), a single empty paragraph block is emitted instead of zero: a
+// .docx body conventionally always carries at least one paragraph, and
+// this is the only way to guarantee that without also making every
+// ordinary blank separator produce spurious empty paragraphs (see
+// buildBlocks).
 func parseMarkdown(opts WriteOptions) ([]block, []string) {
 	unit := inferListIndentUnit(opts.Markdown)
 	blocks, tableNotes := buildBlocks(opts.Markdown, unit)
 	hasImage := detectImages(opts.Markdown)
 	notes := buildNotes(hasImage, tableNotes)
 
-	if opts.Title != "" {
+	if opts.Title != "" && !markdownStartsWithH1(opts.Markdown) {
 		blocks = append([]block{{para: &paraBlock{heading: 1, text: opts.Title}}}, blocks...)
 	}
 	if len(blocks) == 0 {
 		blocks = []block{{para: &paraBlock{heading: 0, text: ""}}}
 	}
 	return blocks, notes
+}
+
+// markdownStartsWithH1 reports whether markdown's first non-blank line is
+// itself a level-1 ATX heading ("# ..."), skipping any number of leading
+// blank lines. It deliberately does not account for a document that opens
+// directly inside an unclosed fenced code block -- there is no such thing,
+// since a fence has to be opened by a "```"/"~~~" line first, and that
+// opening line is not itself blank -- so the simple line-by-line scan here
+// never needs buildBlocks' inFence bookkeeping.
+func markdownStartsWithH1(markdown string) bool {
+	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
+	for _, line := range strings.Split(markdown, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		m := headingRE.FindStringSubmatch(trimmed)
+		return m != nil && len(m[1]) == 1
+	}
+	return false
 }
 
 // buildBlocks walks Markdown line by line and produces one block per
@@ -742,8 +785,8 @@ func renderTable(tb *tableBlock, ctx *renderCtx) (string, int, error) {
 	out.WriteString("<w:tbl>")
 	out.WriteString(tableBordersXML)
 	out.WriteString("<w:tblGrid>")
-	for c := 0; c < tb.cols; c++ {
-		out.WriteString(`<w:gridCol w:w="2000"/>`)
+	for _, w := range tableColumnWidthsTwips(tb.cols) {
+		fmt.Fprintf(&out, `<w:gridCol w:w="%d"/>`, w)
 	}
 	out.WriteString("</w:tblGrid>")
 
@@ -768,11 +811,45 @@ func renderTable(tb *tableBlock, ctx *renderCtx) (string, int, error) {
 	return out.String(), paraCount, nil
 }
 
+// tableColumnWidthsTwips divides contentWidthTwips evenly across cols
+// columns, in twips, for <w:tblGrid>. Integer division alone would either
+// lose twips (floor division, e.g. 9360/7 = 1337, and 7*1337 = 9359 — one
+// twip short of the page) or need a separate rounding pass to fix that up;
+// the classic remainder-distribution technique used here avoids both in
+// one step: the first (contentWidthTwips % cols) columns get one extra
+// twip apiece, so the returned slice always sums to EXACTLY
+// contentWidthTwips, no column differing from another by more than a
+// single twip — an amount no reader could ever perceive. See
+// TestWrite_TableColumnWidthsSumToContentWidth, which checks this for
+// column counts that do and do not divide evenly.
+func tableColumnWidthsTwips(cols int) []int {
+	if cols <= 0 {
+		return nil
+	}
+	base := contentWidthTwips / cols
+	rem := contentWidthTwips % cols
+	widths := make([]int, cols)
+	for i := range widths {
+		widths[i] = base
+		if i < rem {
+			widths[i]++
+		}
+	}
+	return widths
+}
+
 // tableBordersXML is the <w:tblPr> every generated table shares: a single
-// thin border on every edge and between every cell. Column widths in
-// <w:tblGrid> (see renderTable) are placeholders — w:type="auto" on
-// <w:tblW> lets Word size columns to content rather than trusting them.
-const tableBordersXML = `<w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>` +
+// thin border on every edge and between every cell, sized to the full
+// content width (w:type="pct" with w:w="5000", OOXML's fiftieths-of-a-
+// percent unit for exactly 100%) rather than the "0"/"auto" this package
+// used to write. "auto" told Word the width was nonbinding and it was free
+// to shrink columns below even their already-too-narrow <w:tblGrid>
+// values to fit cell content — the direct cause of the user's cells
+// wrapping after two or three characters. <w:tblLayout w:type="fixed"/>
+// goes further and turns off Word's content-based autofit algorithm
+// entirely, so the widths tableColumnWidthsTwips computed are the ones
+// Word actually draws, not merely a hint it may override.
+const tableBordersXML = `<w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblLayout w:type="fixed"/><w:tblBorders>` +
 	`<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
 	`<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
 	`<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>` +
@@ -1039,10 +1116,18 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		pPr.WriteString(hrBorderXML)
 	}
 	if b.isCode {
+		// Shading before spacing before ind matches CT_PPr's fixed schema
+		// order (pBdr, shd, spacing, ind, jc) -- the same "even though this
+		// package rarely combines them" discipline as everywhere else in
+		// this function.
 		pPr.WriteString(codeShadingXML)
+		pPr.WriteString(codeSpacingXML)
 	}
-	if b.isQuote {
+	switch {
+	case b.isQuote:
 		pPr.WriteString(blockquoteIndentXML)
+	case b.isCode:
+		pPr.WriteString(codeIndentXML)
 	}
 	switch b.jc {
 	case "left", "center", "right":
@@ -1101,14 +1186,92 @@ func renderRuns(segs []segment, ctx *renderCtx) (string, error) {
 	return out.String(), nil
 }
 
-// renderRun renders one segment as a <w:r> element. Text is escaped with
+// namedHTMLEntities maps the entity names that actually appear in prose to
+// their decoded characters. This is not the full HTML5 entity table (there
+// are thousands, most obscure) -- it is the small set a markdown author
+// realistically types by hand or a renderer commonly emits: &nbsp; (a
+// non-breaking space, U+00A0 -- the specific complaint that motivated this,
+// since without decoding it Word prints the seven characters "&nbsp;"
+// verbatim), the five XML/HTML predefined entities, and three punctuation
+// entities (ellipsis, em dash, en dash) common in prose. An entity not in
+// this map is left untouched by decodeHTMLEntities rather than dropped or
+// guessed at.
+var namedHTMLEntities = map[string]string{
+	"nbsp":   " ",
+	"amp":    "&",
+	"lt":     "<",
+	"gt":     ">",
+	"quot":   "\"",
+	"apos":   "'",
+	"hellip": "…",
+	"mdash":  "—",
+	"ndash":  "–",
+}
+
+// htmlEntityRE matches one HTML/XML character or numeric entity reference:
+// a named form ("&amp;"), a decimal numeric form ("&#160;"), or a
+// hexadecimal numeric form ("&#x2014;" or "&#X2014;"). The '&' at the start
+// and ';' at the end are both captured (not just the body) so
+// decodeHTMLEntities can hand the whole matched text back unchanged when
+// the entity turns out to be unrecognized.
+var htmlEntityRE = regexp.MustCompile(`&(#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z]+);`)
+
+// decodeHTMLEntities decodes the named and numeric entities markdown prose
+// actually carries (see namedHTMLEntities) before the text is XML-escaped
+// for <w:t> -- see renderRun, which calls this on every non-code segment.
+// An entity this function does not recognize is left exactly as written,
+// rather than dropped, since a silently vanished "&foo;" would be a worse
+// surprise than a literal one a reader can at least see and search for.
+//
+// Order matters: this MUST run before escapeXMLText, never after. Consider
+// a literal "&amp;lt;" already present in the source (someone's own
+// escaped "&lt;", not markup this package produced). regexp's
+// ReplaceAllStringFunc scans left to right and never rescans a
+// replacement, so it matches only the leftmost, innermost entity: "&amp;"
+// at position 0, decoded to "&". The remaining "lt;" has no leading '&' of
+// its own, so it is copied through untouched. The result is the four
+// literal characters "&lt;" -- not a second decode pass that would turn it
+// into a real "<". escapeXMLText then re-escapes that lone "&" back to
+// "&amp;" for the XML, so the document's <w:t> ends up containing
+// "&amp;lt;", which every XML parser (Word included) resolves back to the
+// literal text "&lt;" a reader sees -- exactly the four characters the
+// source asked for, never a structural "<". See
+// TestWrite_DoubleEscapedEntityStaysLiteral.
+func decodeHTMLEntities(s string) string {
+	if !strings.Contains(s, "&") {
+		return s
+	}
+	return htmlEntityRE.ReplaceAllStringFunc(s, func(m string) string {
+		body := m[1 : len(m)-1] // strip leading '&' and trailing ';'
+		switch {
+		case strings.HasPrefix(body, "#x") || strings.HasPrefix(body, "#X"):
+			if n, err := strconv.ParseInt(body[2:], 16, 32); err == nil && n > 0 {
+				return string(rune(n))
+			}
+		case strings.HasPrefix(body, "#"):
+			if n, err := strconv.ParseInt(body[1:], 10, 32); err == nil && n > 0 {
+				return string(rune(n))
+			}
+		default:
+			if r, ok := namedHTMLEntities[body]; ok {
+				return r
+			}
+		}
+		return m // unrecognized: stays literal
+	})
+}
+
+// renderRun renders one segment as a <w:r> element. Text is decoded for HTML
+// entities (decodeHTMLEntities, above) -- unless the segment is code, which
+// Item 1 requires survive verbatim, entities included -- then escaped with
 // this package's own escapeXMLText (splice.go) — the same function edit.go
 // already relies on to keep "&"/"<" in inserted text from producing
 // "unreadable content" — and xml:space="preserve" is added whenever the
-// segment has leading or trailing whitespace, via the same needsPreserve
-// splice.go uses, so Word does not collapse spaces at a run boundary (e.g.
-// the space between "plain " and "bold" in "plain **bold**") and, for a
-// code paragraph, so indentation at the start of a code line survives.
+// (decoded) segment has leading or trailing whitespace, via the same
+// needsPreserve splice.go uses, so Word does not collapse spaces at a run
+// boundary (e.g. the space between "plain " and "bold" in "plain **bold**")
+// and, for a code paragraph, so indentation at the start of a code line
+// survives.
 //
 // <w:rPr> children are emitted in CT_RPr's schema order: rStyle (a link's
 // Hyperlink character style) before rFonts (a code segment's monospace
@@ -1118,7 +1281,11 @@ func renderRun(seg segment) (string, error) {
 	if seg.text == "" {
 		return "", nil
 	}
-	escaped, err := escapeXMLText(seg.text)
+	text := seg.text
+	if !seg.code {
+		text = decodeHTMLEntities(text)
+	}
+	escaped, err := escapeXMLText(text)
 	if err != nil {
 		return "", err
 	}
@@ -1138,7 +1305,7 @@ func renderRun(seg segment) (string, error) {
 	}
 
 	preserve := ""
-	if needsPreserve(seg.text) {
+	if needsPreserve(text) {
 		preserve = ` xml:space="preserve"`
 	}
 
@@ -1173,25 +1340,109 @@ const documentXMLHeader = `<?xml version="1.0" encoding="UTF-8" standalone="yes"
 	`xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
 	`<w:body>`
 
-const documentXMLFooter = `<w:sectPr>` +
-	`<w:pgSz w:w="12240" w:h="15840"/>` +
-	`<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>` +
-	`</w:sectPr>` +
-	`</w:body></w:document>`
+// Page geometry for the generated document's one and only section:
+// pgSz.w/h and each pgMar side. These are also the single source of truth
+// for contentWidthTwips (below), which every generated table's
+// <w:tblGrid> divides -- Defect 2's fix. Before this fix a table hardcoded
+// 2000-twip columns with no relationship at all to the page these
+// constants describe: three columns used 6000 of the page's 9360 usable
+// twips (64%), and <w:tblW w:type="auto"> let Word shrink them even
+// further to fit cell content, wrapping every cell into a tower of
+// characters two or three wide.
+const (
+	pageWidthTwips        = 12240
+	pageHeightTwips       = 15840
+	pageMarginTopTwips    = 1440
+	pageMarginRightTwips  = 1440
+	pageMarginBottomTwips = 1440
+	pageMarginLeftTwips   = 1440
+	pageHeaderTwips       = 720
+	pageFooterTwips       = 720
+)
 
-const contentTypesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-	`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
-	`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
-	`<Default Extension="xml" ContentType="application/xml"/>` +
-	`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
-	`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>` +
-	`<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>` +
-	`</Types>`
+// contentWidthTwips is the horizontal space available for body content --
+// page width minus the left and right margins -- and is what every
+// generated table's columns must sum to exactly (see
+// tableColumnWidthsTwips). On the constants above this comes out to
+// 12240 - 1440 - 1440 = 9360, but nothing in this package hardcodes that
+// number: it is always recomputed from pageWidthTwips/pageMarginLeftTwips/
+// pageMarginRightTwips, the same three constants documentXMLFooter writes
+// into <w:pgSz>/<w:pgMar>, so the two can never drift out of sync with
+// each other even if the page geometry above ever changes.
+const contentWidthTwips = pageWidthTwips - pageMarginLeftTwips - pageMarginRightTwips
 
-const rootRelsXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-	`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
-	`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
-	`</Relationships>`
+var documentXMLFooter = fmt.Sprintf(
+	`<w:sectPr><w:pgSz w:w="%d" w:h="%d"/>`+
+		`<w:pgMar w:top="%d" w:right="%d" w:bottom="%d" w:left="%d" w:header="%d" w:footer="%d" w:gutter="0"/>`+
+		`</w:sectPr></w:body></w:document>`,
+	pageWidthTwips, pageHeightTwips,
+	pageMarginTopTwips, pageMarginRightTwips, pageMarginBottomTwips, pageMarginLeftTwips,
+	pageHeaderTwips, pageFooterTwips,
+)
+
+// docPropsCorePart is the OPC-standard location for core document
+// properties (title, author, etc.) -- Word's File > Info panel, and its
+// title bar in some views, read <dc:title> from here, independently of
+// whatever the document body itself contains. WriteDocx only ever adds
+// this entry when Title is non-empty (see docPropsCoreXML/hasTitle in
+// WriteDocx); a title-less document's package is exactly the five parts
+// it has always had.
+const docPropsCorePart = "docProps/core.xml"
+
+// buildContentTypesXML builds [Content_Types].xml. The docProps/core.xml
+// Override is included only when hasTitle is true, matching WriteDocx only
+// adding that entry in the same condition -- an Override for a part that
+// does not exist would itself make the package invalid.
+func buildContentTypesXML(hasTitle bool) string {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	b.WriteString(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`)
+	b.WriteString(`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>`)
+	b.WriteString(`<Default Extension="xml" ContentType="application/xml"/>`)
+	b.WriteString(`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>`)
+	b.WriteString(`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`)
+	b.WriteString(`<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>`)
+	if hasTitle {
+		b.WriteString(`<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>`)
+	}
+	b.WriteString(`</Types>`)
+	return b.String()
+}
+
+// buildRootRelsXML builds _rels/.rels, the package's root relationships
+// part. The core-properties relationship (rId2, pointing at
+// docPropsCorePart) is included only when hasTitle is true, mirroring
+// buildContentTypesXML -- a relationship target that does not exist in the
+// package is exactly the kind of thing that makes Word declare a file
+// corrupt.
+func buildRootRelsXML(hasTitle bool) string {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	b.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
+	b.WriteString(`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>`)
+	if hasTitle {
+		b.WriteString(`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>`)
+	}
+	b.WriteString(`</Relationships>`)
+	return b.String()
+}
+
+// docPropsCoreXML renders docProps/core.xml, carrying title into
+// <dc:title> -- see docPropsCorePart. title is XML-escaped the same way
+// any other user-supplied text this package writes is (escapeXMLText),
+// since a title containing "&" or "<" would otherwise produce the same
+// "unreadable content" failure as an unescaped run.
+func docPropsCoreXML(title string) (string, error) {
+	escaped, err := escapeXMLText(title)
+	if err != nil {
+		return "", fmt.Errorf("escape title: %w", err)
+	}
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ` +
+		`xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+		`<dc:title>` + string(escaped) + `</dc:title>` +
+		`</cp:coreProperties>`, nil
+}
 
 // buildDocRelsXML builds word/_rels/document.xml.rels: the two
 // permanently-fixed relationships from word/document.xml (styles.xml at
@@ -1308,6 +1559,26 @@ const codeFontXML = `<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Conso
 // matches what Word itself writes and avoids relying on an implicit
 // default for a value the schema does not treat as truly optional.
 const codeShadingXML = `<w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>`
+
+// codeSpacingXML is Defect 3's fix for the striped-bands look: every
+// generated paragraph inherits stylesPartXML's docDefaults pPrDefault
+// spacing (w:after="200" w:line="276" w:lineRule="auto") unless it
+// overrides it, and a fenced code block never did, so Word drew a visible
+// gap after every single code LINE (each line is its own paragraph — see
+// paraBlock.isCode) and a stack of separate shaded bars resulted instead
+// of one contiguous shaded band. Setting before/after to 0 and single
+// (240/"auto") line spacing on every code paragraph makes consecutive code
+// lines sit flush against each other, so codeShadingXML's fill reads as
+// one block.
+const codeSpacingXML = `<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>`
+
+// codeIndentXML gives a fenced code block a small, consistent left indent —
+// enough to visually separate it from the page margin the way a code block
+// should read as its own block, but modest next to blockquoteIndentXML's
+// 360 twips (a quarter of that) so it stays close to body text's own left
+// edge rather than reading as its own deeply-nested level, which is what
+// the user's document showed with no indent management at all.
+const codeIndentXML = `<w:ind w:left="120"/>`
 
 // blockquoteBorderXML/blockquoteIndentXML are Item 3's block-quote
 // treatment: a left border (the same "quoted text" visual convention
