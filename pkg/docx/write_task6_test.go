@@ -145,6 +145,27 @@ func TestWrite_DoubledTrailingBackslashStaysLiteral(t *testing.T) {
 	}
 }
 
+// TestWrite_TrailingBackslashFollowedBySpaceIsNotAHardBreak is code-review
+// fix #2: a backslash followed by a trailing space ("line\ ") is neither
+// hard-break shape -- not 2+ trailing spaces (there's only one), and not a
+// backslash at the true end of the line either (a space follows it) --  so
+// it must fall through to the ordinary case: the single trailing space is
+// swallowed by the general trim, and the lone backslash survives as
+// literal text (CommonMark: backslash before whitespace is not an
+// escape). An earlier version of splitTrailingHardBreak trimmed trailing
+// spaces/tabs BEFORE checking the backslash suffix, which wrongly treated
+// this the same as a true trailing "\" with nothing after it.
+func TestWrite_TrailingBackslashFollowedBySpaceIsNotAHardBreak(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "line one\\ \nline two\n")
+	p := d.Paras()[0]
+	if len(p.Breaks) != 0 {
+		t.Errorf("Breaks = %v, want none -- a trailing backslash followed by a space is not a hard break", p.Breaks)
+	}
+	if !strings.Contains(paraVisibleText(p), `\`) {
+		t.Errorf("visible text = %q, want the lone backslash to survive as literal text", paraVisibleText(p))
+	}
+}
+
 // TestWrite_HardBreakInListItemDoesNotLeakMarker guards against the
 // hardBreakMarker sentinel character ever surviving into rendered text for
 // a paraBlock kind that never goes through buildBlocks' accLines/flush path
@@ -158,6 +179,32 @@ func TestWrite_HardBreakInListItemDoesNotLeakMarker(t *testing.T) {
 		if strings.Contains(paraVisibleText(p), hardBreakMarker) {
 			t.Fatalf("hardBreakMarker leaked into rendered text: %q", paraVisibleText(p))
 		}
+	}
+}
+
+// TestWrite_HardBreakInsideBlockQuote is code-review fix #3: a block
+// quote joins its own lines the same soft-wrap-by-default way an ordinary
+// paragraph does (flushQuote's prior plain strings.Join(quoteLines, " ")
+// mirrored flush()'s own prior behavior exactly), so a hard line break
+// inside a quote must get the same <w:br/> treatment a hard break in an
+// ordinary paragraph already does, not silently do nothing (the two-heads-
+// empty gap the review flagged: neither implemented nor declared).
+func TestWrite_HardBreakInsideBlockQuote(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "> line one  \n> line two\n")
+	var quote *Para
+	for i, p := range d.Paras() {
+		if p.Style == StyleQuote {
+			quote = &d.Paras()[i]
+		}
+	}
+	if quote == nil {
+		t.Fatal("no Quote-styled paragraph found")
+	}
+	if len(quote.Runs) != 2 || quote.Runs[0].Text != "line one" || quote.Runs[1].Text != "line two" {
+		t.Errorf("quote runs = %+v, want [\"line one\" \"line two\"]", quote.Runs)
+	}
+	if len(quote.Breaks) != 1 {
+		t.Errorf("Breaks = %v, want exactly 1 entry (a <w:br/> inside the quote)", quote.Breaks)
 	}
 }
 
@@ -286,7 +333,14 @@ func TestWrite_KnownHTMLEntityIsNotDeclaredUnknown(t *testing.T) {
 // contract's positive half: a document exercising every construct this
 // package DOES fully support -- across Tasks 2-6 -- must still produce an
 // empty Notes slice. This is the fixture the brief asks for: "构造一个覆盖
-// 全部已支持构造的 markdown 断言 notes==[]".
+// 全部已支持构造的 markdown 断言 notes==[]". Per the code-review pass on
+// this task, it also folds in a fenced code block and an inline `code`
+// span whose CONTENT is deliberately shaped like every one of the five
+// declared-in-notes constructs (an HTML tag, a bare URL, a task-list
+// checkbox, a footnote marker) -- code content renders completely
+// verbatim (Item 1) and so must never itself trigger any of those notes;
+// see structuralGaps/collectProseText's own doc comments for the false-
+// positive this guards against.
 func TestWrite_ComprehensiveSupportedDocumentProducesNoNotes(t *testing.T) {
 	md := strings.Join([]string{
 		"# Heading One",
@@ -299,6 +353,8 @@ func TestWrite_ComprehensiveSupportedDocumentProducesNoNotes(t *testing.T) {
 		"",
 		"Body **bold** and *italic* and ***both*** and ~~struck~~ and `code`, " +
 			"escaped \\*not em\\* and 100\\% done.",
+		"",
+		"An inline code span that looks like HTML/a URL: `<div>https://fake.example/x</div>`.",
 		"",
 		"Hard break line one  ",
 		"hard break line two.",
@@ -314,7 +370,8 @@ func TestWrite_ComprehensiveSupportedDocumentProducesNoNotes(t *testing.T) {
 		"| --- | --- |",
 		"| 1 | a\\|b |",
 		"",
-		"> a block quote",
+		"> a block quote  ",
+		"> with a hard break inside it",
 		"",
 		"---",
 		"",
@@ -323,10 +380,13 @@ func TestWrite_ComprehensiveSupportedDocumentProducesNoNotes(t *testing.T) {
 		"___",
 		"",
 		"```",
-		"code block line",
+		"<div>fake html in a code block</div>",
+		"- [ ] fake task list item in a code block",
+		"see https://fake.example.com/in-code-block",
+		"[^1] fake footnote marker in a code block",
 		"```",
 		"",
-		"    indented code line",
+		"    <span>fake html in an indented code block</span>",
 		"",
 		"[a link](https://example.com/page \"Example Title\")",
 		"",
@@ -334,5 +394,34 @@ func TestWrite_ComprehensiveSupportedDocumentProducesNoNotes(t *testing.T) {
 	_, res, _ := writeAndReopen(t, md)
 	if len(res.Notes) != 0 {
 		t.Errorf("Notes = %v, want none for fully supported input", res.Notes)
+	}
+}
+
+// TestWrite_CodeBlockContentDoesNotTriggerNotesFalsePositives is the
+// isolated, minimal version of the same code-review fix, kept separate
+// from the larger comprehensive fixture above so a future regression here
+// points directly at the cause: a document consisting of ONLY a heading
+// plus a fenced code block whose content is shaped like HTML/a bare URL/a
+// task-list item/a footnote marker, plus one inline code span shaped like
+// an HTML tag, must produce no notes at all -- none of that content is
+// ever run through parseInline, so none of it can have silently degraded.
+func TestWrite_CodeBlockContentDoesNotTriggerNotesFalsePositives(t *testing.T) {
+	md := strings.Join([]string{
+		"# Title",
+		"",
+		"See `<div>inline code, not real HTML</div>`.",
+		"",
+		"```",
+		"<div>not real html</div>",
+		"- [ ] not a real task list item",
+		"https://fake.example.com/not-a-real-bare-url",
+		"<https://fake.example.com/not-a-real-autolink>",
+		"[^1] not a real footnote marker",
+		"```",
+		"",
+	}, "\n")
+	_, res, _ := writeAndReopen(t, md)
+	if len(res.Notes) != 0 {
+		t.Errorf("Notes = %v, want none -- code block/inline code content must never trigger a notes false positive", res.Notes)
 	}
 }

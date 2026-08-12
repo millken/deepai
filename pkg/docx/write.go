@@ -549,7 +549,10 @@ func parseMarkdown(opts WriteOptions) ([]block, []string) {
 	unit := inferListIndentUnit(markdown)
 	blocks, tableNotes, hasRefDef := buildBlocks(markdown, unit)
 	hasImage := detectImages(markdown)
-	gaps := detectStructuralGaps(markdown)
+	// detectStructuralGaps scans the already-PARSED blocks, not markdown
+	// itself -- see structuralGaps' own doc comment for why (code block
+	// content must never be scanned for these five shapes).
+	gaps := detectStructuralGaps(blocks)
 	notes := buildNotes(hasImage, tableNotes, hasRefDef, gaps)
 
 	if opts.Title != "" && !markdownStartsWithH1(markdown) {
@@ -655,12 +658,20 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	}
 
 	var quoteLines []string
+	// quoteBreaks mirrors accBreaks above, one entry per quoteLines line --
+	// a block quote joins its own lines the same soft-wrap-by-default way
+	// an ordinary paragraph does (see flush), so a hard line break inside a
+	// quote needs the identical marker-based join, not a separate
+	// mechanism (see the quoteRE branch below, which populates this in
+	// lockstep with quoteLines).
+	quoteBreaks := []bool{}
 	flushQuote := func() {
 		if len(quoteLines) == 0 {
 			return
 		}
-		text := strings.Join(quoteLines, " ")
+		text := joinWithHardBreaks(quoteLines, quoteBreaks)
 		quoteLines = quoteLines[:0]
+		quoteBreaks = quoteBreaks[:0]
 		blocks = append(blocks, block{para: &paraBlock{text: text, isQuote: true}})
 	}
 
@@ -924,9 +935,25 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			blocks = append(blocks, block{para: &paraBlock{isHR: true}})
 			continue
 		}
-		if m := quoteRE.FindStringSubmatch(trimmed); m != nil {
+		if quoteRE.MatchString(trimmed) {
 			flush()
-			quoteLines = append(quoteLines, m[1])
+			// A hard line break inside a quote (Task 6 review fix #3) can
+			// only be detected from the RAW line, never from `trimmed`:
+			// `trimmed` already ran an unconditional strings.TrimSpace,
+			// which erases the two-trailing-spaces shape before it could
+			// ever be seen -- the exact reason splitTrailingHardBreak
+			// itself must run on `line`, not `trimmed` (see its own doc
+			// comment). content re-runs quoteRE against splitTrailingHardBreak's
+			// output rather than reusing `trimmed`'s own match, so the ">"
+			// marker is stripped from text that has ALSO already had any
+			// hard-break marker/whitespace removed from its end.
+			text, hardBreak := splitTrailingHardBreak(line)
+			content := text
+			if cm := quoteRE.FindStringSubmatch(text); cm != nil {
+				content = cm[1]
+			}
+			quoteLines = append(quoteLines, content)
+			quoteBreaks = append(quoteBreaks, hardBreak)
 			continue
 		}
 		flushQuote()
@@ -1088,14 +1115,27 @@ const hardBreakMarker = ""
 // which covers a DIFFERENT shape, backslash-before-a-letter, and is
 // unaffected). A trailing backslash caught here is now consumed into a
 // <w:br/> instead and never reaches parseInlineCtx at all.
+//
+// The backslash check below is deliberately against `line` directly, NOT
+// against a whitespace-trimmed copy: CommonMark's backslash hard break
+// requires the backslash to be the line's literal LAST character, with no
+// trailing whitespace after it at all. "line\ " (backslash then a single
+// trailing space) is neither shape -- not 2+ trailing spaces (only one),
+// and not a backslash-at-end-of-line either, since a space follows it --
+// so it must fall through to the plain TrimSpace return below and be
+// treated as an ordinary line (the lone backslash then survives into
+// parseInlineCtx as literal text, per its own escape rule: backslash
+// followed by whitespace is not an escape). An earlier version of this
+// function first trimmed trailing spaces/tabs and THEN checked the
+// backslash suffix, which wrongly treated "line\ " the same as "line\" --
+// see TestWrite_TrailingBackslashFollowedBySpaceIsNotAHardBreak.
 func splitTrailingHardBreak(line string) (text string, hardBreak bool) {
 	trimmedRight := strings.TrimRight(line, " ")
 	if len(line)-len(trimmedRight) >= 2 {
 		return strings.TrimSpace(trimmedRight), true
 	}
-	trimmedRight = strings.TrimRight(line, " \t")
-	if strings.HasSuffix(trimmedRight, `\`) && !strings.HasSuffix(trimmedRight, `\\`) {
-		return strings.TrimSpace(trimmedRight[:len(trimmedRight)-1]), true
+	if strings.HasSuffix(line, `\`) && !strings.HasSuffix(line, `\\`) {
+		return strings.TrimSpace(line[:len(line)-1]), true
 	}
 	return strings.TrimSpace(line), false
 }
@@ -1199,16 +1239,28 @@ func detectImages(markdown string) bool {
 	return imageRE.MatchString(markdown)
 }
 
-// structuralGaps counts, across the whole raw markdown document, four more
-// silent-degradation shapes Task 6 (write-quality report's C3) requires
-// buildNotes to declare -- none of which is cheaper to actually render
-// structurally than to detect and declare (unlike strikethrough/hard line
-// breaks, which this task implements outright -- see parseInlineCtx's "~~"
-// branch and splitTrailingHardBreak). See detectStructuralGaps for how each
-// field is counted, and its own doc comment for why a blanket regex scan
-// over the raw markdown -- the same pragmatic approach detectImages and
-// hasRefDef already use -- is enough here rather than a construct-aware
-// pass tied into buildBlocks' line-by-line state machine.
+// structuralGaps counts four more silent-degradation shapes Task 6
+// (write-quality report's C3) requires buildNotes to declare -- none of
+// which is cheaper to actually render structurally than to detect and
+// declare (unlike strikethrough/hard line breaks, which this task
+// implements outright -- see parseInlineCtx's "~~" branch and
+// splitTrailingHardBreak). See detectStructuralGaps for how each field is
+// counted.
+//
+// Critically, this is counted from the already-PARSED blocks, never from
+// a blanket regex pass over the raw markdown text: a first version of this
+// task did exactly that (matching detectImages/hasRefDef's existing
+// pragmatic-regex style), and a code-review pass caught the resulting
+// false positives dead-on -- a fenced/indented code block's own CONTENT,
+// which this package correctly renders completely verbatim (Item 1: no
+// markdown is ever interpreted inside code), would also get scanned for
+// "<div>"/"[^1]"/"- [ ]"/"https://" shapes and wrongly declared as an
+// undeclared-literal HTML tag/footnote/task-list/bare-URL -- notes lying
+// in the exact direction this whole task exists to prevent (claiming a
+// degradation that never actually happened). See collectProseText, which
+// only gathers text from paraBlocks that actually go through parseInline
+// (i.e. excludes isCode entirely), with inline `code` spans additionally
+// stripped out of what remains.
 type structuralGaps struct {
 	// htmlTags counts an inline or block-level HTML tag ("<div>", "</div>",
 	// "<br/>", "<span class=\"x\">") -- written as literal text, since this
@@ -1275,26 +1327,89 @@ var (
 	// footnoteRE matches a footnote marker/definition, "[^1]"/"[^note]" --
 	// see structuralGaps.footnotes' own doc comment.
 	footnoteRE = regexp.MustCompile(`\[\^[^\]\n]+\]`)
-	// taskListItemRE matches a GFM task-list item's checkbox marker at the
-	// start of a list item's own content -- see
-	// structuralGaps.taskListItems' own doc comment. (?m) makes '^' match
-	// after every "\n", not just at the start of the whole document, since
-	// a task-list item can appear anywhere in a multi-line document.
-	taskListItemRE = regexp.MustCompile(`(?m)^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]`)
+	// inlineCodeSpanRE matches a same-line inline `code` span, mirroring
+	// parseInlineCtx's own backtick handling closely enough for a
+	// detection-only pass: collectProseText strips every match before the
+	// four regexes above ever see the text, so "`<div>`" -- correctly
+	// rendered as a literal monospace run, per Item 1 -- is never also
+	// declared as an undeclared-literal HTML tag. This does not handle a
+	// code span containing a literal backtick (CommonMark's `` `` ``
+	// double-backtick-delimiter escape hatch) -- an accepted, narrower
+	// simplification for a notes-count heuristic, not a rendering path.
+	inlineCodeSpanRE = regexp.MustCompile("`[^`\n]*`")
+	// taskCheckboxRE matches a GFM task-list checkbox at the very start of
+	// a list item's OWN content -- i.e. it is matched against a paraBlock's
+	// text after buildBlocks' listItemRE has already stripped the
+	// "-"/"*"/"+" marker and its following whitespace, not against a raw
+	// source line (a raw-line regex was this function's first version,
+	// and -- see structuralGaps' own doc comment -- had the same
+	// code-block false-positive problem the other four fields had, since a
+	// code sample containing a literal "- [ ] ..." line would also match
+	// it). countTaskListItems below is what supplies that already-stripped
+	// text, one isList paraBlock at a time.
+	taskCheckboxRE = regexp.MustCompile(`^\[[ xX]\][ \t]`)
 )
 
-// detectStructuralGaps scans markdown once for each of structuralGaps'
-// four counted shapes. Like detectImages/hasRefDef before it, this is a
-// blanket regex pass over the raw text rather than something threaded
-// through buildBlocks' own line-by-line classification: none of these four
-// constructs changes how a LINE is classified (an HTML tag, footnote
-// marker, task-list checkbox, or bare URL can all sit inside an otherwise
-// perfectly ordinary paragraph/list-item/table-cell line), so there is no
-// natural hook in buildBlocks' state machine to count them from, and
-// re-scanning the whole document once more here is cheap next to actually
-// rendering it.
-func detectStructuralGaps(markdown string) structuralGaps {
-	working := linkSpanRE.ReplaceAllString(markdown, "")
+// collectProseText concatenates exactly the text that Task 6's five notes
+// checks must scan: every non-code paraBlock's raw text (heading, ordinary
+// paragraph, list item, quote) and every table cell's text, with any
+// inline `code` span stripped out of each piece first (inlineCodeSpanRE).
+// An isCode paraBlock contributes nothing at all -- see structuralGaps' own
+// doc comment for the false-positive this fixes: code block content is
+// never run through parseInline (renderCodeBlockRuns renders it completely
+// verbatim, per Item 1), so it can never actually silently degrade into
+// literal HTML/footnote/task-list/autolink text the way prose can, and
+// scanning it anyway just produces a note that lies about what happened. A
+// reference-link definition line dropped by buildBlocks' refDefRE branch
+// (hasRefDef) similarly contributes nothing here for the identical
+// reason: it produces no block at all, so it is never written to the
+// document either.
+func collectProseText(blocks []block) string {
+	var b strings.Builder
+	for _, blk := range blocks {
+		switch {
+		case blk.para != nil:
+			if blk.para.isCode {
+				continue
+			}
+			b.WriteString(inlineCodeSpanRE.ReplaceAllString(blk.para.text, ""))
+			b.WriteByte('\n')
+		case blk.table != nil:
+			for _, row := range blk.table.rows {
+				for _, cell := range row.cells {
+					b.WriteString(inlineCodeSpanRE.ReplaceAllString(cell.text, ""))
+					b.WriteByte('\n')
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
+// countTaskListItems walks blocks directly (not collectProseText's
+// concatenated string) so that taskCheckboxRE is matched against exactly
+// one isList paraBlock's own already-marker-stripped text at a time --
+// see taskCheckboxRE's own doc comment for why a list item's structural
+// identity (isList), not a line-shaped regex, is what this must be gated
+// on.
+func countTaskListItems(blocks []block) int {
+	n := 0
+	for _, blk := range blocks {
+		if blk.para != nil && blk.para.isList && taskCheckboxRE.MatchString(blk.para.text) {
+			n++
+		}
+	}
+	return n
+}
+
+// detectStructuralGaps scans blocks -- the same parsed result WriteDocx is
+// about to render, NOT the raw markdown text (see structuralGaps' own doc
+// comment for why that distinction is load-bearing) -- once for each of
+// structuralGaps' four counted shapes.
+func detectStructuralGaps(blocks []block) structuralGaps {
+	prose := collectProseText(blocks)
+
+	working := linkSpanRE.ReplaceAllString(prose, "")
 	working = imageRE.ReplaceAllString(working, "")
 
 	autolinks := autolinkRE.FindAllString(working, -1)
@@ -1304,8 +1419,8 @@ func detectStructuralGaps(markdown string) structuralGaps {
 
 	return structuralGaps{
 		htmlTags:            len(tags),
-		footnotes:           len(footnoteRE.FindAllString(markdown, -1)),
-		taskListItems:       len(taskListItemRE.FindAllString(markdown, -1)),
+		footnotes:           len(footnoteRE.FindAllString(prose, -1)),
+		taskListItems:       countTaskListItems(blocks),
 		autolinkAndBareURLs: len(autolinks) + len(bareURLs),
 	}
 }
