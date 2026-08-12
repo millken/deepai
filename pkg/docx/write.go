@@ -37,13 +37,25 @@ type WriteOptions struct {
 	// real hyperlinks -- see renderCtx), "> " block quotes, ATX-style setext
 	// headings (a text line immediately followed by a full "="/"-{2,}"
 	// underline becomes Heading1/Heading2 -- see buildBlocks' setextH1RE/
-	// setextH2RE branch), and a "---" horizontal rule (disambiguated from a
-	// table separator row and a setext heading underline by precedence --
-	// table, then setext, then hr -- see buildBlocks' hrRE branch). The one
-	// thing this package never renders is an image (![alt](url)): no part
-	// of its OOXML skeleton embeds binary data, so an image is written
-	// verbatim as plain text and declared in WriteResult.Notes -- see
-	// detectImages/buildNotes.
+	// setextH2RE branch), a "---"/"***"/"___" horizontal rule (disambiguated
+	// from a table separator row and a setext heading underline by
+	// precedence -- table, then setext, then hr -- see buildBlocks' hrRE
+	// branch), ~~strikethrough~~ (a run-level <w:strike/>, nestable inside
+	// bold/italic like any other marker -- see parseInlineCtx's "~~"
+	// branch), and a hard line break: a line ending in two-or-more trailing
+	// spaces or a single trailing backslash becomes a <w:br/> instead of
+	// being soft-wrapped into the next line with a plain space (see
+	// splitTrailingHardBreak/expandHardBreaks). The one thing this package
+	// never renders is an image (![alt](url)): no part of its OOXML
+	// skeleton embeds binary data, so an image is written verbatim as plain
+	// text and declared in WriteResult.Notes -- see detectImages/buildNotes.
+	// A handful of other constructs are recognized but deliberately not
+	// rendered structurally -- inline/block HTML, footnote markers
+	// ([^label]), GFM task-list checkboxes ([ ]/[x]), autolinks (<url>) and
+	// bare URLs, and unrecognized HTML entities -- each written as literal
+	// text and declared once, with an occurrence count, in
+	// WriteResult.Notes; see detectStructuralGaps/buildNotes and
+	// renderCtx.unknownEntities.
 	Markdown string
 	// Title, when non-empty, becomes the document's first paragraph, styled
 	// as Heading1 ahead of anything parsed from Markdown -- UNLESS Markdown
@@ -209,6 +221,13 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	// TestWrite_IllegalCharInLinkURLIsCountedInNotes pin.
 	if ctx.strippedXMLChars > 0 {
 		notes = append(notes, stripNoteFor(ctx.strippedXMLChars))
+	}
+	// ctx.unknownEntities is folded in at the same point, for the same
+	// reason (renderRun -- the only place that increments it -- has now
+	// run for every segment in the document): see renderCtx.unknownEntities'
+	// own doc comment.
+	if ctx.unknownEntities > 0 {
+		notes = append(notes, unknownEntityNoteFor(ctx.unknownEntities))
 	}
 
 	if err := writeNewDocx(path, entries); err != nil {
@@ -421,13 +440,16 @@ var (
 	// hyperlinks now, resolved and rendered inline by parseInlineCtx, not
 	// detected up front the way an unsupported construct is.
 	imageRE = regexp.MustCompile(`!\[[^\]\n]*\]\([^)\n]*\)`)
-	// hrRE matches a thematic-break line: three or more hyphens and nothing
-	// else (the brief's own examples, and the one form this package
-	// supports -- CommonMark also allows "***"/"___" and interior spaces,
-	// which this does not implement). See buildBlocks' hrRE branch for how
-	// this is disambiguated from a GFM table separator row and a setext
-	// heading underline.
-	hrRE = regexp.MustCompile(`^-{3,}$`)
+	// hrRE matches a thematic-break line: three or more hyphens, asterisks,
+	// or underscores and nothing else -- CommonMark's three interchangeable
+	// thematic-break spellings ("---", "***", "___"). Interior spaces
+	// ("* * *") are still not implemented, matching this package's existing
+	// simplification for the dash form. Task 6 added the "*"/"_" spellings
+	// (write-quality report's C3: these two used to fall through to being
+	// printed as literal text, undeclared); the dash form predates that
+	// task. See buildBlocks' hrRE branch for how this is disambiguated from
+	// a GFM table separator row and a setext heading underline.
+	hrRE = regexp.MustCompile(`^(?:-{3,}|\*{3,}|_{3,})$`)
 	// setextH1RE/setextH2RE match a setext heading's underline: one or more
 	// '=' characters for H1, two or more '-' characters for H2 (the task
 	// brief's own threshold -- a single '-' is neither a valid hr nor,
@@ -527,7 +549,8 @@ func parseMarkdown(opts WriteOptions) ([]block, []string) {
 	unit := inferListIndentUnit(markdown)
 	blocks, tableNotes, hasRefDef := buildBlocks(markdown, unit)
 	hasImage := detectImages(markdown)
-	notes := buildNotes(hasImage, tableNotes, hasRefDef)
+	gaps := detectStructuralGaps(markdown)
+	notes := buildNotes(hasImage, tableNotes, hasRefDef, gaps)
 
 	if opts.Title != "" && !markdownStartsWithH1(markdown) {
 		blocks = append([]block{{para: &paraBlock{heading: 1, text: opts.Title}}}, blocks...)
@@ -607,12 +630,23 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	// to came from inside a list. See
 	// TestWrite_ListContinuationFollowedByDashesIsNotSetext.
 	accInList := false
+	// accBreaks[i] records whether a hard line break (see
+	// splitTrailingHardBreak) sat at the end of accLines[i] in the source --
+	// i.e. whether the join between accLines[i] and accLines[i+1] must
+	// become hardBreakMarker instead of the ordinary single-space soft-wrap
+	// join. It is only ever appended to in lockstep with accLines (one
+	// entry per line, trailing entry meaningless since there is no i+1 to
+	// join to) and reset alongside it everywhere accLines is reset -- see
+	// flush and the setext branches further down, which both discard
+	// accLines without going through flush.
+	accBreaks := []bool{}
 	flush := func() {
 		if len(accLines) == 0 {
 			return
 		}
-		text := strings.Join(accLines, " ")
+		text := joinWithHardBreaks(accLines, accBreaks)
 		accLines = accLines[:0]
+		accBreaks = accBreaks[:0]
 		accInList = false
 		if strings.TrimSpace(text) == "" {
 			return
@@ -852,8 +886,16 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 		// runs, a genuine table separator has already been ruled out.
 		if len(accLines) > 0 && !accInList {
 			if setextH1RE.MatchString(trimmed) {
+				// A heading's text is always a single line visually -- a
+				// hard break recorded in accBreaks here (a setext heading's
+				// source text ending a line in "  " or "\") is simply
+				// ignored, same as the ordinary strings.Join(accLines, " ")
+				// this replaces; heading text has never carried an embedded
+				// <w:br/> in this package, and this task's brief does not
+				// ask for that to change.
 				text := strings.Join(accLines, " ")
 				accLines = accLines[:0]
+				accBreaks = accBreaks[:0]
 				flushQuote()
 				blocks = append(blocks, block{para: &paraBlock{heading: 1, text: text}})
 				continue
@@ -861,6 +903,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			if setextH2RE.MatchString(trimmed) {
 				text := strings.Join(accLines, " ")
 				accLines = accLines[:0]
+				accBreaks = accBreaks[:0]
 				flushQuote()
 				blocks = append(blocks, block{para: &paraBlock{heading: 2, text: text}})
 				continue
@@ -914,7 +957,9 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			blocks = append(blocks, block{para: &paraBlock{heading: 0, text: trimmed}})
 			continue
 		}
-		accLines = append(accLines, trimmed)
+		text, hardBreak := splitTrailingHardBreak(line)
+		accLines = append(accLines, text)
+		accBreaks = append(accBreaks, hardBreak)
 		accInList = accInList || inListContext
 	}
 	flush()
@@ -1003,6 +1048,81 @@ func hasLeadingIndent(line string) bool {
 	return len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
 }
 
+// hardBreakMarker is a private-use-area sentinel character embedded by
+// joinWithHardBreaks between two lines that a hard line break separated in
+// the source, and later consumed by expandHardBreaks -- never by
+// parseInlineCtx, whose default byte-copy case simply copies its 3 UTF-8
+// bytes through unexamined (none of them equal an ASCII byte parseInlineCtx
+// treats specially: '\\', '`', '[', '*', '_' are all < 0x80, and U+E000
+// encodes as the three bytes 0xEE 0x80 0x80) -- and never written to a
+// <w:t> itself, since expandHardBreaks always splits it back out into a
+// separate <w:br/> run before renderRun ever sees the segment text. Using a
+// real (if unlikely-to-occur-in-prose) character rather than, say, a NUL
+// byte sidesteps any risk of colliding with escapeXMLText/isLegalXMLChar's
+// own control-character handling in the rare case a marker somehow survived
+// unexpanded (e.g. inside a code span -- see expandHardBreaks' doc comment).
+const hardBreakMarker = ""
+
+// splitTrailingHardBreak reports whether line -- a single raw source line,
+// BEFORE the strings.TrimSpace every other classification in buildBlocks
+// applies -- ends in one of CommonMark's two hard-line-break markers: two
+// or more trailing spaces, or a single trailing backslash (not a doubled
+// "\\\\", which is itself an escaped, literal backslash per parseInlineCtx's
+// own escape rule, not a break marker -- see Task 4/C4). Either marker, if
+// present, is stripped from the returned text along with any whitespace
+// around it; text is otherwise identical to strings.TrimSpace(line) (see
+// the non-hard-break return below), so callers can use this in place of
+// TrimSpace without changing behavior for the common (non-hard-break) case.
+//
+// This must run on line, never on the already-computed `trimmed` variable
+// buildBlocks' loop uses for every other check: strings.TrimSpace(line)
+// unconditionally erases exactly the two-or-more-trailing-spaces shape this
+// function needs to detect BEFORE it can classify the line, so `trimmed`
+// itself can never distinguish a hard-break line from an ordinary one.
+//
+// Task 6's brief flips this package's own prior behavior for the trailing-
+// backslash case: before this task, a line ending "...text\" fell through
+// to parseInlineCtx's escape branch, which -- backslash followed by
+// whitespace or end-of-string, neither ASCII punctuation -- left the
+// backslash as literal text (see TestWrite_BackslashBeforeNonPunctuationStaysLiteral,
+// which covers a DIFFERENT shape, backslash-before-a-letter, and is
+// unaffected). A trailing backslash caught here is now consumed into a
+// <w:br/> instead and never reaches parseInlineCtx at all.
+func splitTrailingHardBreak(line string) (text string, hardBreak bool) {
+	trimmedRight := strings.TrimRight(line, " ")
+	if len(line)-len(trimmedRight) >= 2 {
+		return strings.TrimSpace(trimmedRight), true
+	}
+	trimmedRight = strings.TrimRight(line, " \t")
+	if strings.HasSuffix(trimmedRight, `\`) && !strings.HasSuffix(trimmedRight, `\\`) {
+		return strings.TrimSpace(trimmedRight[:len(trimmedRight)-1]), true
+	}
+	return strings.TrimSpace(line), false
+}
+
+// joinWithHardBreaks joins lines the same way flush()'s prior plain
+// strings.Join(accLines, " ") did, except that the separator after
+// lines[i] becomes hardBreakMarker instead of a single space wherever
+// breaks[i] is true (breaks[len(lines)-1], if present, is never consulted --
+// there is no line after the last one to join to). See hardBreakMarker's
+// own doc comment for why this marker, rather than a literal "\n" or
+// "<w:br/>" string, is safe to embed in text that is about to be handed to
+// parseInline.
+func joinWithHardBreaks(lines []string, breaks []bool) string {
+	var b strings.Builder
+	for i, line := range lines {
+		if i > 0 {
+			if breaks[i-1] {
+				b.WriteString(hardBreakMarker)
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
 // inferListIndentUnit scans markdown for list-item lines (skipping fenced
 // code, so a code sample containing lines that happen to look like list
 // items never pollutes this) and returns the smallest positive
@@ -1079,11 +1199,122 @@ func detectImages(markdown string) bool {
 	return imageRE.MatchString(markdown)
 }
 
-// buildNotes turns what buildBlocks/detectImages observed into
-// WriteResult.Notes. Lists, tables, code blocks, and links are NOT
-// declared here: all four are now rendered structurally (lists/tables as
-// of Task 2, code/links as of this task), so declaring them unsupported
-// would be actively wrong (see the updated
+// structuralGaps counts, across the whole raw markdown document, four more
+// silent-degradation shapes Task 6 (write-quality report's C3) requires
+// buildNotes to declare -- none of which is cheaper to actually render
+// structurally than to detect and declare (unlike strikethrough/hard line
+// breaks, which this task implements outright -- see parseInlineCtx's "~~"
+// branch and splitTrailingHardBreak). See detectStructuralGaps for how each
+// field is counted, and its own doc comment for why a blanket regex scan
+// over the raw markdown -- the same pragmatic approach detectImages and
+// hasRefDef already use -- is enough here rather than a construct-aware
+// pass tied into buildBlocks' line-by-line state machine.
+type structuralGaps struct {
+	// htmlTags counts an inline or block-level HTML tag ("<div>", "</div>",
+	// "<br/>", "<span class=\"x\">") -- written as literal text, since this
+	// package has no HTML parser and no way to translate arbitrary HTML
+	// into OOXML.
+	htmlTags int
+	// footnotes counts a footnote marker, "[^label]" -- both a reference
+	// usage and the leading marker of a "[^label]: text" definition line
+	// (see refDefRE's own doc comment for why a footnote definition is
+	// deliberately excluded from that regex and left to print as an
+	// ordinary paragraph instead of being resolved into a real Word
+	// footnote).
+	footnotes int
+	// taskListItems counts a GFM task-list item's checkbox marker at the
+	// front of a list item ("- [ ] todo", "* [x] done"): buildBlocks'
+	// listItemRE already turns the surrounding line into an ordinary list
+	// item (Task 2), but the "[ ]"/"[x]" text itself renders as literal
+	// characters, never an interactive checkbox or content control.
+	taskListItems int
+	// autolinkAndBareURLs counts a CommonMark autolink ("<https://...>",
+	// "<user@example.com>") or a bare "http(s)://" URL sitting directly in
+	// prose -- neither is resolved into a real hyperlink the way a
+	// "[text](url)" link is (see parseInlineCtx's '[' branch): both render
+	// as literal text. The two are declared together, in one note, because
+	// the brief treats them as one user-facing gap ("a URL you can see but
+	// not click"), not two.
+	autolinkAndBareURLs int
+}
+
+var (
+	// htmlTagRE matches an HTML tag: '<', an optional '/', then a name
+	// starting with a letter (a valid tag name must), then anything up to
+	// the closing '>' that is not itself '<' or a newline (so a tag can
+	// never swallow a second, unrelated '<...>' or span multiple lines).
+	// This is deliberately broad rather than an exhaustive real-HTML-tag
+	// allowlist, matching this package's existing pragmatic-regex style
+	// (imageRE, refDefRE) -- detectStructuralGaps runs it only AFTER
+	// autolinkRE's matches have been removed from consideration (below),
+	// since an autolink's content starts with a letter too ("<https://...>"
+	// looks exactly like a tag named "https" would to this regex alone).
+	htmlTagRE = regexp.MustCompile(`</?[a-zA-Z][^<>\n]*>`)
+	// autolinkRE matches CommonMark's <scheme:...>/<user@host> autolink
+	// form: an angle-bracket-enclosed absolute URI or email address with no
+	// internal whitespace. See htmlTagRE's doc comment for why this must be
+	// matched, and its matches discarded, before htmlTagRE runs.
+	autolinkRE = regexp.MustCompile(`<(?:[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s<>]+|[^\s<>@]+@[^\s<>]+\.[^\s<>]+)>`)
+	// bareURLRE matches a plain "http://" or "https://" URL with no
+	// enclosing markup at all. detectStructuralGaps runs this only after
+	// removing every resolved `[text](url)` link span (linkSpanRE) and
+	// every autolink (autolinkRE) from consideration, so it only ever
+	// counts a URL sitting directly in prose with nothing marking it up as
+	// a link at all.
+	bareURLRE = regexp.MustCompile(`\bhttps?://[^\s<>()\[\]]+`)
+	// linkSpanRE approximates a resolved `[text](url)` link span for the
+	// sole purpose of removing it before bareURLRE/htmlTagRE scan the rest
+	// of the text in detectStructuralGaps -- otherwise a real hyperlink's
+	// own URL would be double-counted as an unsupported "bare URL". It
+	// mirrors imageRE's simpler [^\]\n]/[^)\n] character classes, not
+	// matchLinkAt's exact balanced-parenthesis handling: a rough
+	// approximation is enough for a detection-only pass (worst case, an
+	// unusual URL containing its own literal parentheses is overcounted by
+	// one -- a wrong count in a note, not a misrendered document).
+	linkSpanRE = regexp.MustCompile(`\[[^\]\n]*\]\([^)\n]*\)`)
+	// footnoteRE matches a footnote marker/definition, "[^1]"/"[^note]" --
+	// see structuralGaps.footnotes' own doc comment.
+	footnoteRE = regexp.MustCompile(`\[\^[^\]\n]+\]`)
+	// taskListItemRE matches a GFM task-list item's checkbox marker at the
+	// start of a list item's own content -- see
+	// structuralGaps.taskListItems' own doc comment. (?m) makes '^' match
+	// after every "\n", not just at the start of the whole document, since
+	// a task-list item can appear anywhere in a multi-line document.
+	taskListItemRE = regexp.MustCompile(`(?m)^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]`)
+)
+
+// detectStructuralGaps scans markdown once for each of structuralGaps'
+// four counted shapes. Like detectImages/hasRefDef before it, this is a
+// blanket regex pass over the raw text rather than something threaded
+// through buildBlocks' own line-by-line classification: none of these four
+// constructs changes how a LINE is classified (an HTML tag, footnote
+// marker, task-list checkbox, or bare URL can all sit inside an otherwise
+// perfectly ordinary paragraph/list-item/table-cell line), so there is no
+// natural hook in buildBlocks' state machine to count them from, and
+// re-scanning the whole document once more here is cheap next to actually
+// rendering it.
+func detectStructuralGaps(markdown string) structuralGaps {
+	working := linkSpanRE.ReplaceAllString(markdown, "")
+	working = imageRE.ReplaceAllString(working, "")
+
+	autolinks := autolinkRE.FindAllString(working, -1)
+	withoutAutolinks := autolinkRE.ReplaceAllString(working, "")
+	bareURLs := bareURLRE.FindAllString(withoutAutolinks, -1)
+	tags := htmlTagRE.FindAllString(withoutAutolinks, -1)
+
+	return structuralGaps{
+		htmlTags:            len(tags),
+		footnotes:           len(footnoteRE.FindAllString(markdown, -1)),
+		taskListItems:       len(taskListItemRE.FindAllString(markdown, -1)),
+		autolinkAndBareURLs: len(autolinks) + len(bareURLs),
+	}
+}
+
+// buildNotes turns what buildBlocks/detectImages/detectStructuralGaps
+// observed into WriteResult.Notes. Lists, tables, code blocks, and links
+// are NOT declared here: all four are now rendered structurally
+// (lists/tables as of Task 2, code/links as of this task), so declaring
+// them unsupported would be actively wrong (see the updated
 // TestWrite_UnsupportedSyntaxIsDeclared, which now asserts their absence).
 // Images remain the one inline construct this package never renders (no
 // part of the OOXML skeleton embeds binary data), so they are still
@@ -1091,10 +1322,12 @@ func detectImages(markdown string) bool {
 // structural compromise even within an otherwise-supported,
 // well-formed-enough table: a ragged row's cells were dropped or padded
 // rather than silently misaligning the rest of the table — see
-// parseTable. Nothing here is declared unconditionally:
+// parseTable. gaps declares the four Task 6 (C3) additions -- HTML,
+// footnotes, task-list checkboxes, autolinks/bare URLs -- each only when
+// its count is nonzero. Nothing here is declared unconditionally:
 // TestWrite_SupportedOnlyInputProducesNoNotes depends on fully-supported
 // input producing an empty slice.
-func buildNotes(hasImage bool, tableNotes []string, hasRefDef bool) []string {
+func buildNotes(hasImage bool, tableNotes []string, hasRefDef bool, gaps structuralGaps) []string {
 	var notes []string
 	if hasImage {
 		notes = append(notes, "images are not embedded; written as plain text")
@@ -1111,7 +1344,65 @@ func buildNotes(hasImage bool, tableNotes []string, hasRefDef bool) []string {
 		// construct cannot pass through silently).
 		notes = append(notes, "reference-style link definitions ([label]: url) are dropped, and [text][label] references are written as plain text, not hyperlinks")
 	}
+	if gaps.htmlTags > 0 {
+		notes = append(notes, htmlTagNoteFor(gaps.htmlTags))
+	}
+	if gaps.footnotes > 0 {
+		notes = append(notes, footnoteNoteFor(gaps.footnotes))
+	}
+	if gaps.taskListItems > 0 {
+		notes = append(notes, taskListNoteFor(gaps.taskListItems))
+	}
+	if gaps.autolinkAndBareURLs > 0 {
+		notes = append(notes, autolinkBareURLNoteFor(gaps.autolinkAndBareURLs))
+	}
 	return notes
+}
+
+// htmlTagNoteFor, footnoteNoteFor, taskListNoteFor and autolinkBareURLNoteFor
+// render buildNotes' four Task 6 (C3) declarations, each with its own
+// occurrence count (n is always > 0 -- buildNotes only calls these when a
+// count is nonzero) and its own singular/plural wording, matching
+// stripNoteFor's existing convention just below.
+func htmlTagNoteFor(n int) string {
+	if n == 1 {
+		return "1 inline/block HTML tag is written as literal text, not interpreted"
+	}
+	return fmt.Sprintf("%d inline/block HTML tags are written as literal text, not interpreted", n)
+}
+
+func footnoteNoteFor(n int) string {
+	if n == 1 {
+		return "1 footnote marker ([^...]) is not supported; written as literal text"
+	}
+	return fmt.Sprintf("%d footnote markers ([^...]) are not supported; written as literal text", n)
+}
+
+func taskListNoteFor(n int) string {
+	if n == 1 {
+		return "1 task-list checkbox ([ ]/[x]) is written as literal text, not a real checkbox"
+	}
+	return fmt.Sprintf("%d task-list checkboxes ([ ]/[x]) are written as literal text, not real checkboxes", n)
+}
+
+func autolinkBareURLNoteFor(n int) string {
+	if n == 1 {
+		return "1 autolink or bare URL is written as literal text, not a hyperlink"
+	}
+	return fmt.Sprintf("%d autolinks or bare URLs are written as literal text, not hyperlinks", n)
+}
+
+// unknownEntityNoteFor renders WriteDocx's declaration that n (n > 0)
+// HTML/XML entity references were left exactly as written because
+// decodeHTMLEntities did not recognize them -- see
+// renderCtx.unknownEntities' own doc comment. Parallels stripNoteFor
+// immediately below, which declares a related but distinct count (a
+// RECOGNIZED numeric entity naming an illegal XML codepoint).
+func unknownEntityNoteFor(n int) string {
+	if n == 1 {
+		return "1 unrecognized HTML entity is left as literal text"
+	}
+	return fmt.Sprintf("%d unrecognized HTML entities are left as literal text", n)
 }
 
 // stripNoteFor renders WriteDocx's declaration that n characters (n > 0)
@@ -1422,13 +1713,24 @@ const tableTblPrXML = `<w:tblPr><w:tblStyle w:val="` + StyleTableGrid + `"/>` +
 // italic (see parseInlineCtx's '[' branch), though code+link can only
 // arise from the unusual “ [`code`](url) “ and is rendered with the
 // hyperlink style taking precedence over the monospace font, same as any
-// other bold/italic combination with code.
+// other bold/italic combination with code. strike marks ~~strikethrough~~
+// (Task 6, C3): unlike the code-block border/shading duplication elsewhere
+// in this file, <w:strike/> is a plain run property with no paragraph-level
+// or style-level counterpart to keep in sync, so it needs no GenOffice-
+// compatibility copy the way isCode/isQuote's <w:pBdr> do.
+//
+// isBreak marks a synthetic, textless segment standing in for a hard line
+// break (see expandHardBreaks): when true, every other field is meaningless
+// and renderRun emits a bare "<w:r><w:br/></w:r>" instead of consulting
+// text/bold/italic/code/link at all.
 type segment struct {
-	text   string
-	bold   bool
-	italic bool
-	code   bool
-	link   string
+	text    string
+	bold    bool
+	italic  bool
+	code    bool
+	strike  bool
+	link    string
+	isBreak bool
 }
 
 // parseInline splits a paragraph's raw text into segments, resolving
@@ -1450,19 +1752,19 @@ type segment struct {
 // text — there is no path that leaves a dangling <w:rPr> or half-written
 // run.
 func parseInline(s string) []segment {
-	return parseInlineCtx(s, false, false)
+	return parseInlineCtx(s, false, false, false)
 }
 
-// parseInlineCtx is parseInline's recursive worker: bold and italic are the
-// formatting already in effect from an enclosing marker pair (ambient
-// state), and any marker resolved here sets its own flag with the other
-// left untouched.
-func parseInlineCtx(s string, bold, italic bool) []segment {
+// parseInlineCtx is parseInline's recursive worker: bold, italic and strike
+// are the formatting already in effect from an enclosing marker pair
+// (ambient state), and any marker resolved here sets its own flag with the
+// others left untouched.
+func parseInlineCtx(s string, bold, italic, strike bool) []segment {
 	var segs []segment
 	var buf strings.Builder
 	flush := func() {
 		if buf.Len() > 0 {
-			segs = append(segs, segment{text: buf.String(), bold: bold, italic: italic})
+			segs = append(segs, segment{text: buf.String(), bold: bold, italic: italic, strike: strike})
 			buf.Reset()
 		}
 	}
@@ -1494,13 +1796,35 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			// monospace run, per Item 1.
 			if j := strings.IndexByte(s[i+1:], '`'); j >= 0 {
 				flush()
-				segs = append(segs, segment{text: s[i+1 : i+1+j], bold: bold, italic: italic, code: true})
+				segs = append(segs, segment{text: s[i+1 : i+1+j], bold: bold, italic: italic, strike: strike, code: true})
 				i += 1 + j + 1
 				continue
 			}
 			// Unclosed inline-code marker: keep the backtick as literal text.
 			buf.WriteByte(c)
 			i++
+			continue
+		}
+		if c == '~' && i+1 < n && s[i+1] == '~' {
+			// GFM strikethrough: "~~text~~" -> a run-level <w:strike/>
+			// (Task 6, C3). Only the exact two-tilde delimiter is
+			// recognized -- GFM does not define a single-"~" form the way
+			// CommonMark defines single-"*"/"_" italics, so there is no
+			// third, one-character branch here the way there is for
+			// */_ below. indexClosingMarker's underscore-specific intraword
+			// filtering never triggers for '~' (marker[0] != '_'), so this
+			// is a plain substring search for the closing "~~", same as the
+			// "**" bold branch below.
+			marker := s[i : i+2]
+			if j := indexClosingMarker(s, i+2, marker); j >= 0 {
+				flush()
+				segs = append(segs, parseInlineCtx(s[i+2:i+2+j], bold, italic, true)...)
+				i += 2 + j + 2
+				continue
+			}
+			// Unclosed strikethrough marker: keep it as literal text.
+			buf.WriteString(marker)
+			i += 2
 			continue
 		}
 		if c == '[' && (i == 0 || s[i-1] != '!') {
@@ -1511,7 +1835,7 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			// detectImages), not resolved into a link here.
 			if text, url, end, ok := matchLinkAt(s, i); ok {
 				flush()
-				inner := parseInlineCtx(text, bold, italic)
+				inner := parseInlineCtx(text, bold, italic, strike)
 				for _, seg := range inner {
 					seg.link = url
 					segs = append(segs, seg)
@@ -1541,7 +1865,7 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			if !(c == '_' && intrawordUnderscore(s, i, 3)) {
 				if j := indexClosingMarker(s, i+3, marker3); j >= 0 {
 					flush()
-					segs = append(segs, parseInlineCtx(s[i+3:i+3+j], true, true)...)
+					segs = append(segs, parseInlineCtx(s[i+3:i+3+j], true, true, strike)...)
 					i += 3 + j + 3
 					continue
 				}
@@ -1570,7 +1894,7 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			}
 			if j := indexClosingMarker(s, i+2, marker); j >= 0 {
 				flush()
-				segs = append(segs, parseInlineCtx(s[i+2:i+2+j], true, italic)...)
+				segs = append(segs, parseInlineCtx(s[i+2:i+2+j], true, italic, strike)...)
 				i += 2 + j + 2
 				continue
 			}
@@ -1588,7 +1912,7 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			}
 			if j := indexClosingMarker(s, i+1, marker); j >= 0 {
 				flush()
-				segs = append(segs, parseInlineCtx(s[i+1:i+1+j], bold, true)...)
+				segs = append(segs, parseInlineCtx(s[i+1:i+1+j], bold, true, strike)...)
 				i += 1 + j + 1
 				continue
 			}
@@ -1803,6 +2127,17 @@ type renderCtx struct {
 	// still tells the caller it did -- see xmlEscapeText's doc comment
 	// (splice.go) for why silence there would be actively wrong.
 	strippedXMLChars int
+	// unknownEntities accumulates, the same way strippedXMLChars does,
+	// every HTML/XML entity reference decodeHTMLEntities did not recognize
+	// (see namedHTMLEntities) and so left exactly as written -- e.g.
+	// "&foo;" or a malformed "&#zz;". WriteDocx folds this into an
+	// "unrecognized HTML entity" note once rendering finishes (Task 6,
+	// C3): decodeHTMLEntities itself already had a considered, documented
+	// reason to leave such an entity alone rather than drop or guess at
+	// it, but that decision must still be declared, not left for the
+	// caller to notice only by opening the file and seeing a literal
+	// "&foo;" in the text.
+	unknownEntities int
 }
 
 // hyperlinkRel is one <Relationship> this document needs beyond the two
@@ -1944,6 +2279,17 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 				segs[i].bold = true
 			}
 		}
+		// expandHardBreaks turns any hardBreakMarker left inside a
+		// segment's text (see splitTrailingHardBreak/joinWithHardBreaks in
+		// buildBlocks) into a real, textless isBreak segment between the
+		// text on either side of it. It must run after parseInline, which
+		// is what splits b.text into per-formatting segments in the first
+		// place; running it after the forceBold loop above (rather than
+		// before) means a split-off piece inherits forceBold's already-set
+		// bold flag along with everything else the original segment
+		// carried, instead of needing forceBold's loop to also walk the
+		// newly split pieces.
+		segs = expandHardBreaks(segs)
 		// codeBlockLine is always false here: a code-block paragraph is
 		// handled entirely above, so renderRuns/renderRun's codeBlockLine
 		// branch is now reached only via renderCodeBlockRuns's own direct
@@ -2077,6 +2423,60 @@ func renderRuns(segs []segment, ctx *renderCtx) (string, error) {
 	return out.String(), nil
 }
 
+// expandHardBreaks scans parseInline's output for any segment whose text
+// still contains hardBreakMarker -- planted by joinWithHardBreaks when
+// buildBlocks joined two source lines that a hard line break (two-or-more
+// trailing spaces, or a trailing backslash -- see splitTrailingHardBreak)
+// separated, rather than an ordinary soft-wrap space -- and splits it into
+// however many text-carrying segments the marker demands, with a
+// textless, isBreak segment (rendered as a bare <w:r><w:br/></w:r> by
+// renderRun) spliced in at each split point. A segment with no marker at
+// all (the common case: most paragraphs have no hard break) is returned
+// unchanged, not copied, so this is a no-op pass over an already-supported
+// document.
+//
+// A code segment is deliberately left untouched even if it somehow
+// contains the marker: Item 1's rule that markdown/formatting is never
+// interpreted inside inline `code` extends to this marker too, since it is
+// itself just another (private-use-area) character as far as a `code` span
+// is concerned. This can only actually arise from an unusual unterminated
+// inline-code span spanning a hard-broken line -- see parseInlineCtx's '`'
+// branch -- and, left alone, the marker's 3 raw UTF-8 bytes simply render
+// as one more literal (if invisible) character inside the code run; no
+// existing test exercises this corner, and it is not what this task's
+// brief asks for.
+//
+// An empty text piece adjacent to a break (e.g. two consecutive hard
+// breaks, or a break at the very start/end of the segment) is dropped
+// rather than turned into an empty-text run: renderRun's own early return
+// already treats seg.text == "" as "nothing to write" for every non-code-
+// block caller, so keeping it here would just be a run that renders as
+// nothing between two <w:br/>s -- unlike renderCodeBlockRuns' blank code
+// LINE, an empty inline-text piece carries no positional information a
+// reader (or scan.go's Para.Breaks) needs to preserve.
+func expandHardBreaks(segs []segment) []segment {
+	out := make([]segment, 0, len(segs))
+	for _, seg := range segs {
+		if seg.code || !strings.Contains(seg.text, hardBreakMarker) {
+			out = append(out, seg)
+			continue
+		}
+		parts := strings.Split(seg.text, hardBreakMarker)
+		for i, part := range parts {
+			if i > 0 {
+				out = append(out, segment{isBreak: true})
+			}
+			if part == "" {
+				continue
+			}
+			piece := seg
+			piece.text = part
+			out = append(out, piece)
+		}
+	}
+	return out
+}
+
 // renderCodeBlockRuns renders one code-block paragraph's full text -- b.text
 // after mergeCodeBlocks (buildBlocks, above) has joined every line of the
 // block with "\n" -- as the runs of a SINGLE <w:p>: one <w:r> per line,
@@ -2193,12 +2593,22 @@ var htmlEntityRE = regexp.MustCompile(`&(#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z]+);`)
 // illegal character, and counts it the same way, so the two sources add up
 // into one honest total for WriteDocx's "stripped N invalid XML
 // character(s)" note. The second return value is that count.
-func decodeHTMLEntities(s string) (string, int) {
+//
+// The third return value counts a DIFFERENT thing (Task 6, C3): every
+// entity reference htmlEntityRE matched but this function did not
+// recognize at all -- an unlisted name ("&foo;"), or a numeric reference
+// whose digits failed to parse -- and so left completely unchanged rather
+// than decoding. This is not the same population strippedXMLChars/invalid
+// counts (a RECOGNIZED numeric entity naming an illegal XML codepoint,
+// still decoded via decodeNumericRune, just replaced with U+FFFD); an
+// unrecognized entity's "return m" branch never touches invalid at all.
+// renderRun folds this into ctx.unknownEntities, which WriteDocx declares
+// in Notes once rendering finishes, the same way strippedXMLChars is.
+func decodeHTMLEntities(s string) (out string, invalid, unknown int) {
 	if !strings.Contains(s, "&") {
-		return s, 0
+		return s, 0, 0
 	}
-	invalid := 0
-	out := htmlEntityRE.ReplaceAllStringFunc(s, func(m string) string {
+	out = htmlEntityRE.ReplaceAllStringFunc(s, func(m string) string {
 		body := m[1 : len(m)-1] // strip leading '&' and trailing ';'
 		switch {
 		case strings.HasPrefix(body, "#x") || strings.HasPrefix(body, "#X"):
@@ -2214,9 +2624,10 @@ func decodeHTMLEntities(s string) (string, int) {
 				return r
 			}
 		}
+		unknown++
 		return m // unrecognized: stays literal
 	})
-	return out, invalid
+	return out, invalid, unknown
 }
 
 // decodeNumericRune returns the character a numeric entity's codepoint r
@@ -2287,15 +2698,26 @@ func decodeNumericRune(r rune, invalid *int) string {
 // TestWrite_FencedCodeBlockLeadingBlankLineSurvives for the leading case
 // specifically. Neither scan.go nor read.go is on this task's list of
 // files it may modify, so the fix has to live entirely on the write side.
+//
+// seg.isBreak (Task 6) short-circuits everything above: a hard-line-break
+// segment carries no text, formatting, or link at all, and renders as
+// nothing but a bare "<w:r><w:br/></w:r>" -- deliberately checked before
+// the seg.text == "" early return just below, since an isBreak segment's
+// text is always "" and would otherwise hit that return and vanish instead
+// of producing the break it exists to produce.
 func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) {
+	if seg.isBreak {
+		return "<w:r><w:br/></w:r>", nil
+	}
 	if seg.text == "" && !codeBlockLine {
 		return "", nil
 	}
 	text := seg.text
 	if !seg.code {
-		var entityInvalid int
-		text, entityInvalid = decodeHTMLEntities(text)
+		var entityInvalid, entityUnknown int
+		text, entityInvalid, entityUnknown = decodeHTMLEntities(text)
 		ctx.strippedXMLChars += entityInvalid
+		ctx.unknownEntities += entityUnknown
 	}
 	escaped, invalid, err := escapeXMLText(text)
 	ctx.strippedXMLChars += invalid
@@ -2336,6 +2758,16 @@ func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) 
 	}
 	if seg.italic {
 		rPr.WriteString("<w:i/>")
+	}
+	if seg.strike {
+		// CT_RPr schema order places strike after b/i, matching this
+		// function's existing "schema order even though this package
+		// rarely combines them" convention. Unlike isCode/isQuote's
+		// <w:pBdr>/<w:shd>, there is no GenOffice-compatibility copy to
+		// write here: <w:strike/> is already a direct run property, not
+		// something a style reference could fail to carry through (see
+		// segment.strike's own doc comment).
+		rPr.WriteString("<w:strike/>")
 	}
 
 	preserve := ""
