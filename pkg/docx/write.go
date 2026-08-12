@@ -429,10 +429,44 @@ var (
 	// branch and buildNotes' hasRefDef branch). Group 1 is the label (checked
 	// separately for a leading '^', which marks a footnote definition, a
 	// different and already-unsupported construct this must not also
-	// swallow); group 2 is the destination; group 3, if present, is the
-	// quoted title.
+	// swallow); group 2 is the destination (checked separately by
+	// looksLikeLinkDestination -- this regex alone is deliberately loose
+	// about group 2's shape, matching any non-whitespace run, since
+	// requiring a URL-like pattern here as well would just duplicate that
+	// function inline); group 3, if present, is the quoted title.
 	refDefRE = regexp.MustCompile(`^\[([^\]]+)\]:\s+(\S+)(?:\s+"([^"]*)")?\s*$`)
 )
+
+// looksLikeLinkDestination reports whether dest (refDefRE's group 2) is
+// shaped enough like a URL to treat "[label]: dest" as a genuine
+// reference-link definition rather than an ordinary line of prose that
+// happens to start with "[something]:" -- a code-review finding against
+// the first version of this fix: "[Alice]: Hi", "[TODO]: later", and a
+// "[label]: word" line sitting in the middle of an otherwise ordinary
+// paragraph are all far more common in real documents (dialogue,
+// checklists) than an actual reference-link definition, and matching
+// refDefRE alone silently deleted every one of them -- worse than the
+// original defect, which at least left the text visible.
+//
+// The bar for "looks like a URL" is deliberately narrow rather than
+// "contains a colon" or similar: dest must either contain "://" (an
+// absolute URL with any scheme, e.g. "https://example.com"), or start
+// with one of a short list of shapes that are unambiguously a link
+// target and never the start of an ordinary word -- "/" or "#" (a
+// site-relative or same-page fragment reference) or "mailto:". Anything
+// else -- "Hi", "later", "fix", a bare word or sentence -- is treated as
+// ordinary paragraph text, not a definition to drop.
+func looksLikeLinkDestination(dest string) bool {
+	if strings.Contains(dest, "://") {
+		return true
+	}
+	for _, prefix := range []string{"/", "#", "mailto:"} {
+		if strings.HasPrefix(dest, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // parseMarkdown turns opts into the blocks WriteDocx renders and the Notes
 // it reports. Title, when set, is prepended as its own Heading1 block ahead
@@ -666,7 +700,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			i += consumed - 1
 			continue
 		}
-		if m := refDefRE.FindStringSubmatch(trimmed); m != nil && !strings.HasPrefix(m[1], "^") {
+		if m := refDefRE.FindStringSubmatch(trimmed); m != nil && !strings.HasPrefix(m[1], "^") && looksLikeLinkDestination(m[2]) {
 			// A reference-link definition line: dropped rather than
 			// printed as a literal paragraph (Item I3) and flagged via
 			// hasRefDef so buildNotes can declare it, per the notes
@@ -676,7 +710,12 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			// "[^1]: ..." -- alone: those are a different, separately
 			// unsupported construct (see the write-quality report's C3),
 			// and this line shape would otherwise misparse a footnote's
-			// prose as if it were a URL.
+			// prose as if it were a URL. The looksLikeLinkDestination
+			// check is what keeps this branch from also swallowing
+			// ordinary "[Label]: word" lines -- dialogue, TODOs -- that
+			// are not link definitions at all; see that function's doc
+			// comment for the code-review finding that made this
+			// necessary and exactly where the line is drawn.
 			flush()
 			flushQuote()
 			hasRefDef = true

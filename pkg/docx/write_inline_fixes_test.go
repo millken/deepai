@@ -184,3 +184,93 @@ func TestWrite_ReferenceLinkDefinitionLineIsNotPrintedAsBodyText(t *testing.T) {
 		t.Errorf("Notes = %v, want a declaration about reference-style link definitions", res.Notes)
 	}
 }
+
+// --- Code-review follow-up: refDefRE was too broad ---
+//
+// The first cut of refDefRE matched ANY "[label]: word" line as a
+// reference-link definition and silently dropped it, regardless of
+// whether the "word" after the colon looked anything like a URL. That is
+// worse than the original defect: ordinary dialogue/prose lines shaped
+// like "[Alice]: Hi" or "[TODO]: fix later" are far more common than real
+// reference-link definitions, and the old code made those vanish
+// entirely -- invisible data loss, versus the pre-fix bug's merely ugly
+// but visible literal definition line. The three tests below are the
+// review's own reproduction scenarios; the fourth confirms a genuine
+// URL-shaped definition is still dropped and declared.
+
+// TestWrite_DialogueLabelLinesAreNotMistakenForLinkDefinitions is the
+// review's first repro: "[Alice]: Hi\n\n[Bob]: Hello\n" used to produce
+// ZERO paragraphs (both lines silently swallowed as bogus "definitions").
+func TestWrite_DialogueLabelLinesAreNotMistakenForLinkDefinitions(t *testing.T) {
+	d, res, _ := writeAndReopen(t, "[Alice]: Hi\n\n[Bob]: Hello\n")
+	paras := d.Paras()
+	if len(paras) != 2 {
+		t.Fatalf("got %d paragraphs, want 2 (both dialogue lines preserved): %+v", len(paras), paras)
+	}
+	if got, want := paraVisibleText(paras[0]), "[Alice]: Hi"; got != want {
+		t.Errorf("paras[0] text = %q, want %q", got, want)
+	}
+	if got, want := paraVisibleText(paras[1]), "[Bob]: Hello"; got != want {
+		t.Errorf("paras[1] text = %q, want %q", got, want)
+	}
+	if len(res.Notes) != 0 {
+		t.Errorf("Notes = %v, want none: neither line is a real link definition", res.Notes)
+	}
+}
+
+// TestWrite_TODOLabelLineIsNotMistakenForLinkDefinition is the review's
+// second repro: a "[TODO]: word" line whose destination is a single
+// ordinary word, not a URL. A single word after the colon is exactly the
+// shape refDefRE's own grammar accepts (destination is "\S+", with no
+// remaining text required to fail the "$" anchor), so unlike a multi-word
+// sentence this one only survives once the destination itself is checked
+// for looking like a URL.
+func TestWrite_TODOLabelLineIsNotMistakenForLinkDefinition(t *testing.T) {
+	d, res, _ := writeAndReopen(t, "[TODO]: later\n")
+	paras := d.Paras()
+	if len(paras) != 1 {
+		t.Fatalf("got %d paragraphs, want 1", len(paras))
+	}
+	if got, want := paraVisibleText(paras[0]), "[TODO]: later"; got != want {
+		t.Errorf("visible text = %q, want %q (line must survive verbatim)", got, want)
+	}
+	if len(res.Notes) != 0 {
+		t.Errorf("Notes = %v, want none: this is not a real link definition", res.Notes)
+	}
+}
+
+// TestWrite_LabelLineInsideAParagraphIsNotMistakenForLinkDefinition is the
+// review's third repro: a "[label]: word"-shaped line in the MIDDLE of a
+// soft-wrapped paragraph used to be silently dropped (and, worse, split
+// the surrounding text into two separate paragraphs because the old code
+// unconditionally called flush() before skipping the line).
+func TestWrite_LabelLineInsideAParagraphIsNotMistakenForLinkDefinition(t *testing.T) {
+	d, res, _ := writeAndReopen(t, "Some intro.\n[Alice]: Hi\nMore text.\n")
+	paras := d.Paras()
+	if len(paras) != 1 {
+		t.Fatalf("got %d paragraphs, want 1 (soft-wrapped lines stay one paragraph): %+v", len(paras), paras)
+	}
+	if got, want := paraVisibleText(paras[0]), "Some intro. [Alice]: Hi More text."; got != want {
+		t.Errorf("visible text = %q, want %q (middle line must not vanish)", got, want)
+	}
+	if len(res.Notes) != 0 {
+		t.Errorf("Notes = %v, want none: this is not a real link definition", res.Notes)
+	}
+}
+
+// TestWrite_URLShapedReferenceDefinitionIsStillDroppedAndDeclared confirms
+// the narrowed refDefRE still catches an actual reference-link definition:
+// tightening the match must not regress the original fix.
+func TestWrite_URLShapedReferenceDefinitionIsStillDroppedAndDeclared(t *testing.T) {
+	d, res, _ := writeAndReopen(t, "[ref]: https://example.com\n")
+	for _, p := range d.Paras() {
+		text := paraVisibleText(p)
+		if strings.Contains(text, "https://example.com") {
+			t.Errorf("a genuine reference-link definition line leaked into body text: %q", text)
+		}
+	}
+	joined := strings.Join(res.Notes, " | ")
+	if !strings.Contains(joined, "reference-style") {
+		t.Errorf("Notes = %v, want a declaration about reference-style link definitions", res.Notes)
+	}
+}
