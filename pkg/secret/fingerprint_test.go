@@ -112,3 +112,87 @@ func TestDefaultDiscoverAllEmptyHardwareTierWhenNoDisks(t *testing.T) {
 		t.Errorf("hardware tier = %+v, want empty", groups[0])
 	}
 }
+
+// withMachineID replaces the OS machine ID lookup for one test.
+func withMachineID(t *testing.T, id string) {
+	t.Helper()
+	prev := machineIDFn
+	machineIDFn = func() string { return id }
+	t.Cleanup(func() { machineIDFn = prev })
+}
+
+func TestInstallTierUsedOnlyWhenNoDisks(t *testing.T) {
+	withMachineID(t, "d28d273a06f44c9b9c9c5bc966b0c43d")
+
+	// Disks present: the install tier must stay empty so its copyable
+	// material never joins a hardware-bound seal.
+	withDisks(t, []diskInfo{{Serial: "S7U4NU0Y444140F"}})
+	groups := defaultDiscoverAll()
+	if len(groups[0]) == 0 {
+		t.Fatal("hardware tier should be populated")
+	}
+	if len(groups[1]) != 0 {
+		t.Errorf("install tier = %+v, want empty while disks exist", groups[1])
+	}
+
+	// No disks: the install tier takes over.
+	withDisks(t, nil)
+	groups = defaultDiscoverAll()
+	if len(groups[1]) != 1 {
+		t.Fatalf("install tier = %+v, want 1 source", groups[1])
+	}
+	if groups[1][0].mode != ModeInstall {
+		t.Errorf("mode = %v, want ModeInstall", groups[1][0].mode)
+	}
+	if groups[1][0].value != "d28d273a06f44c9b9c9c5bc966b0c43d" {
+		t.Errorf("value = %q", groups[1][0].value)
+	}
+}
+
+func TestInstallTierRejectsDegenerateMachineID(t *testing.T) {
+	withDisks(t, nil)
+	withMachineID(t, "")
+
+	groups := defaultDiscoverAll()
+	if len(groups[1]) != 0 {
+		t.Errorf("install tier = %+v, want empty for an unreadable machine ID", groups[1])
+	}
+	// The constant tier must still be there, so sealing never fails and
+	// never falls back to plaintext.
+	if len(groups[2]) != 1 {
+		t.Errorf("constant tier = %+v, want exactly one source", groups[2])
+	}
+}
+
+func TestSealOnCloudHostStillProducesCiphertext(t *testing.T) {
+	// A cloud instance with no disk serial and no machine ID must still
+	// seal: the alternative is storing the key in plaintext.
+	withDisks(t, nil)
+	withMachineID(t, "")
+
+	prev := discoverAll
+	discoverAll = defaultDiscoverAll
+	t.Cleanup(func() { discoverAll = prev })
+
+	sealed, err := Seal(testKey)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if !IsSealed(sealed) {
+		t.Fatal("value is not sealed")
+	}
+	h, err := Inspect(sealed)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if h.Mode != ModeObfuscate {
+		t.Errorf("Mode = %v, want ModeObfuscate", h.Mode)
+	}
+	got, err := Reveal(sealed)
+	if err != nil {
+		t.Fatalf("Reveal: %v", err)
+	}
+	if got != testKey {
+		t.Errorf("Reveal = %q, want %q", got, testKey)
+	}
+}

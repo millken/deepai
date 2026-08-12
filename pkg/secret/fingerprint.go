@@ -73,9 +73,17 @@ const obfuscationConstant = "deepai-no-machine-binding-v1"
 var discoverAll = defaultDiscoverAll
 
 func defaultDiscoverAll() [][]source {
+	disks := diskSources()
+	var install []source
+	// The machine ID is a file or registry value and so travels with a
+	// copied config. It is therefore only consulted when no real hardware
+	// serial exists -- never alongside one.
+	if len(disks) == 0 {
+		install = installSources()
+	}
 	return [][]source{
-		diskSources(),
-		nil, // ModeInstall — filled in by OS machine ID lookup
+		disks,
+		install,
 		{{mode: ModeObfuscate, value: obfuscationConstant}},
 	}
 }
@@ -214,4 +222,19 @@ func diskSources() []source {
 		out = append(out, source{mode: ModeHardware, value: s})
 	}
 	return out
+}
+
+// machineIDFn is the OS machine ID lookup. Replaced in tests.
+var machineIDFn = machineID
+
+// installSources returns the OS machine ID as binding material, used on
+// cloud instances, WSL2, and VMs whose virtual disks report no usable
+// serial. Weaker than a disk serial but far better than a bare constant:
+// it keeps a sealed .env from opening on a different instance.
+func installSources() []source {
+	id := usableID(machineIDFn())
+	if id == "" {
+		return nil
+	}
+	return []source{{mode: ModeInstall, value: id}}
 }
