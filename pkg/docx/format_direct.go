@@ -369,12 +369,26 @@ func planParaPPrPatches(doc []byte, openEnd int, ppr elemInfo, children map[stri
 // scanned exactly the same way: elem is only ever the <w:r>...</w:r> span
 // itself, never the enclosing wrapper, so this function neither sees nor
 // needs to care what (if anything) contains the run.
+//
+// rPr's own true closing tag is found via a small depth counter (targetDepth
+// below), not by matching the next EndElement literally named "rPr" the way
+// an earlier version of this function did: <w:rPr> can legally wrap a
+// <w:rPrChange><w:rPr>...</w:rPr></w:rPrChange> holding a REVISION'S
+// historical run properties — a same-named element nested inside itself.
+// Matching by name alone found the NESTED rPr's close instead of the outer
+// one's, truncating rpr.closeStart early; the follow-up scanDirectChildren
+// call below inherits the same fix for rFonts/sz/szCs, which would
+// otherwise be read from (and rewritten into) the historical copy instead
+// of the run's current properties (format capability review follow-up,
+// same root cause as Critical 2).
 func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs elemInfo, err error) {
 	sub := doc[elem.Start:elem.End]
 	dec := xml.NewDecoder(bytes.NewReader(sub))
 
 	var prevOffset int
-	var rootSeen, rprSeen, inRPR bool
+	var rootSeen bool
+	var tracking bool
+	var targetDepth int
 
 	for {
 		tok, terr := dec.Token()
@@ -394,30 +408,37 @@ func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs ele
 			case isWordElement(t.Name, "r") && !rootSeen:
 				rootSeen = true
 				openEnd = elem.Start + offset
-			case isWordElement(t.Name, "rPr") && !rprSeen:
-				rprSeen = true
+			case tracking:
+				// Anything encountered once the outer rPr is being tracked
+				// (including, critically, a NESTED <w:rPr> such as
+				// <w:rPrChange>'s historical copy) only ever deepens
+				// targetDepth; it can never re-trigger the case below.
+				targetDepth++
+			case !rpr.found && isWordElement(t.Name, "rPr"):
 				rpr = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-				if !sc {
-					inRPR = true
+				if sc {
+					rpr.closeStart = rpr.tagSpan.End
+				} else {
+					tracking = true
+					targetDepth = 0
 				}
-			case isWordElement(t.Name, "rFonts") && inRPR && !rfonts.found:
-				rfonts = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "sz") && inRPR && !sz.found:
-				sz = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "szCs") && inRPR && !szcs.found:
-				szcs = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
 			}
 		case xml.EndElement:
-			if isWordElement(t.Name, "rPr") && inRPR {
-				rpr.closeStart = elem.Start + prevOffset
-				inRPR = false
+			if tracking {
+				if targetDepth == 0 {
+					rpr.closeStart = elem.Start + prevOffset
+					tracking = false
+				} else {
+					targetDepth--
+				}
 			}
 		}
 		prevOffset = offset
 	}
 
-	if rpr.found && rpr.selfClosing {
-		rpr.closeStart = rpr.tagSpan.End
+	if rpr.found && !rpr.selfClosing {
+		children := scanDirectChildren(doc[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
+		rfonts, sz, szcs = children["rFonts"], children["sz"], children["szCs"]
 	}
 	return openEnd, rpr, rfonts, sz, szcs, nil
 }

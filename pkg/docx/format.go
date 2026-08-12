@@ -497,6 +497,15 @@ var pPrChildOrder = []string{
 	"rPr", "sectPr", "pPrChange",
 }
 
+// rPrFontSizeOrder names the three EG_RPrBase leaves Format itself ever
+// edits (rFonts, sz, szCs), used as the "want" list for scanDirectChildren
+// when scanning an rPr's own DIRECT children — as opposed to a same-named
+// element that happens to be nested arbitrarily deeper inside it (most
+// notably a <w:rPrChange> wrapping a revision's historical <w:rPr>, which
+// carries its own rFonts/sz/szCs that must never be mistaken for the
+// current ones).
+var rPrFontSizeOrder = []string{"rFonts", "sz", "szCs"}
+
 // leafOp is one candidate edit against a sibling leaf element inside a
 // known container (docDefaults' rPr/pPr, or a heading style's rPr), given
 // in the same order those siblings appear in the OOXML schema. active
@@ -582,7 +591,24 @@ func scanDirectChildren(fragment []byte, base int, order []string) map[string]el
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			break // EOF, or malformed — the caller's own outer scan already validates well-formedness
+			// Ordinarily plain EOF: fragment is a complete run of sibling
+			// elements sliced from [container.tagSpan.End,
+			// container.closeStart), so decoding it in isolation normally
+			// reaches EOF cleanly without ever erroring. This is NOT a
+			// guarantee that fragment is correctly bounded, though: a
+			// container's own closeStart can itself be wrong if the
+			// caller's OUTER scan mistook a same-named nested element's
+			// close for the container's own (the exact class of bug this
+			// function exists to fix one level down — see scanRunProps'
+			// and scanDocDefaults' <w:rPrChange> handling, and pPr's own
+			// unresolved <w:pPrChange><w:pPr> case, which is NOT fixed
+			// here). A wrongly-bounded fragment is typically still
+			// well-formed on its own (it just ends at a legitimate
+			// sub-boundary), so it would silently produce an incomplete or
+			// wrong "found" map rather than an error — breaking out on any
+			// decode error is only a safety net for genuinely malformed
+			// input, not a correctness guarantee for the fragment's bounds.
+			break
 		}
 		offset := int(dec.InputOffset())
 		switch t := tok.(type) {
@@ -827,19 +853,28 @@ func synthesizeDocDefaultsPatches(styles []byte, rootEnd int, dd, rpd, ppd elemI
 // are tracked structurally in THIS pass (booleans gate matches the same way
 // scan.go's paraDepth/pPrDepth do) — this is deliberately narrower than a
 // general path engine, scoped to exactly the chain §4.3's measured facts
-// describe. pPrDefault's pPr children (spacing/jc, plus every other
-// CT_PPr-schema anchor buildPPrOps needs) are deliberately NOT matched
-// inline here with a boolean the way rFonts/sz/szCs are: pPr is itself
-// CT_PPrGeneral, which may carry a nested <w:rPr> (paragraph mark run
-// properties) that can carry its OWN <w:spacing> (character spacing) — a
-// same-named but different property a boolean can't tell apart from pPr's
-// own, because the boolean never closes over the nested rPr (format
-// capability review, Critical 2). scanDirectChildren's depth tracking is
-// what tells them apart.
+// describe. Neither rPr's nor pPrDefault's pPr's own DIRECT children
+// (rFonts/sz/szCs; spacing/jc plus every other CT_PPr-schema anchor
+// buildPPrOps needs) are matched inline here with a boolean: rPr can wrap a
+// <w:rPrChange> holding a REVISION'S historical <w:rPr> (with its own
+// rFonts/sz/szCs), and pPr is itself CT_PPrGeneral, which may carry a
+// nested <w:rPr> (paragraph mark run properties) that can carry its OWN
+// <w:spacing> (character spacing) — in both cases a same-named but
+// different property nested one or more levels down that a boolean can't
+// tell apart from the container's own, because the boolean never closes
+// over the nested container (format capability review, Critical 2 and its
+// rPr/rPrChange follow-up). rPr's own true closing tag is likewise found
+// via a small depth counter (rprDepth/trackingRPr below), not by matching
+// the next EndElement literally named "rPr", for the same reason: that
+// would find the NESTED rPr's close instead of the outer one's. The
+// scanDirectChildren calls below (for both rPr's and pPr's own direct
+// children) inherit the same fix.
 func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr elemInfo, pprChildren map[string]elemInfo, rootEnd int, err error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
-	var inDD, inRPD, inRPR, inPPD, inPPR bool
+	var inDD, inRPD, inPPD, inPPR bool
+	var trackingRPr bool
+	var rprDepth int
 	var sawRoot bool
 
 	for {
@@ -872,17 +907,20 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 				if !sc {
 					inRPD = true
 				}
+			case trackingRPr:
+				// Anything encountered once rPr is being tracked (including
+				// a NESTED <w:rPr>, e.g. <w:rPrChange>'s historical copy)
+				// only ever deepens rprDepth; it can never re-trigger the
+				// case below.
+				rprDepth++
 			case isWordElement(t.Name, "rPr") && inRPD && !rpr.found:
 				rpr = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-				if !sc {
-					inRPR = true
+				if sc {
+					rpr.closeStart = rpr.tagSpan.End
+				} else {
+					trackingRPr = true
+					rprDepth = 0
 				}
-			case isWordElement(t.Name, "rFonts") && inRPR && !rfonts.found:
-				rfonts = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "sz") && inRPR && !sz.found:
-				sz = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "szCs") && inRPR && !szcs.found:
-				szcs = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
 			case isWordElement(t.Name, "pPrDefault") && dd.found && !ppd.found:
 				ppd = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
 				if !sc {
@@ -894,21 +932,16 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 					inPPR = true
 				}
 			}
-			// spacing/jc (and every other CT_PPrBase leaf) are deliberately
-			// NOT matched here: pPrDefault's own <w:pPr> is CT_PPrGeneral,
-			// which may itself carry a nested <w:rPr> (paragraph mark run
-			// properties) — and that rPr can carry its OWN <w:spacing>
-			// (character spacing), a different property with the same tag
-			// name. inPPR alone can't tell the two apart; see the
-			// scanDirectChildren call below, which tracks nesting DEPTH
-			// instead of a boolean that never closes over the nested rPr
-			// (format capability review, Critical 2).
 
 		case xml.EndElement:
 			switch {
-			case isWordElement(t.Name, "rPr") && inRPR:
-				rpr.closeStart = prevOffset
-				inRPR = false
+			case trackingRPr:
+				if rprDepth == 0 {
+					rpr.closeStart = prevOffset
+					trackingRPr = false
+				} else {
+					rprDepth--
+				}
 			case isWordElement(t.Name, "rPrDefault") && inRPD:
 				rpd.closeStart = prevOffset
 				inRPD = false
@@ -926,8 +959,9 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 		prevOffset = offset
 	}
 
-	if rpr.found && rpr.selfClosing {
-		rpr.closeStart = rpr.tagSpan.End
+	if rpr.found && !rpr.selfClosing {
+		rprChildren := scanDirectChildren(styles[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
+		rfonts, sz, szcs = rprChildren["rFonts"], rprChildren["sz"], rprChildren["szCs"]
 	}
 	if ppr.found && ppr.selfClosing {
 		ppr.closeStart = ppr.tagSpan.End
@@ -1061,6 +1095,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 	var pPrDepth int
 	var rprSeen bool
 	var lookingForRFonts bool
+	var rprContentStart int
 
 	for {
 		tok, terr := dec.Token()
@@ -1095,6 +1130,16 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 					patches = append(patches, PatchRawSpan(styles, span, newTag))
 				} else {
 					lookingForRFonts = true
+					// span.End is exactly where this rPr's own content
+					// starts (right after its "<w:rPr...>" open tag) — the
+					// EG_RPrBase-mandated FIRST-child slot rFonts must land
+					// in if this rPr closes without ever containing one
+					// (see the EndElement case below). Capturing it here,
+					// rather than using the close tag's own offset, is the
+					// fix for Minor 13's other instance: rFonts landing
+					// after pre-existing content such as <w:b/> instead of
+					// before it.
+					rprContentStart = span.End
 				}
 			case inHeading && lookingForRFonts && isWordElement(t.Name, "rFonts"):
 				newTag := buildTag("rFonts", rFontsLiteralAttrs(t.Attr, font), true)
@@ -1109,10 +1154,13 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 			case isWordElement(t.Name, "rPr") && inHeading && rprSeen:
 				if lookingForRFonts {
 					// The style's rPr closed without ever containing
-					// rFonts: insert one as its only child. prevOffset is
-					// exactly where </w:rPr> begins, i.e. right after
-					// whatever (if anything) rPr already contains.
-					patches = append(patches, PatchRawSpan(styles, Span{prevOffset, prevOffset},
+					// rFonts: insert one as its FIRST child, at
+					// rprContentStart — not here at prevOffset (right
+					// before </w:rPr>, i.e. LAST), which would land the new
+					// rFonts after whatever direct formatting (e.g. <w:b/>)
+					// this rPr already carries, violating EG_RPrBase's
+					// "rFonts precedes every other run property" order.
+					patches = append(patches, PatchRawSpan(styles, Span{rprContentStart, rprContentStart},
 						buildTag("rFonts", rFontsLiteralAttrs(nil, font), true)))
 					lookingForRFonts = false
 				}

@@ -2,6 +2,8 @@ package docx
 
 import (
 	"encoding/xml"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -26,7 +28,7 @@ func assertPPrChildOrder(t *testing.T, pPrXML string) {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			if err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			t.Fatalf("pPr fixture is not well-formed XML: %v\n%s", err, pPrXML)
@@ -305,5 +307,116 @@ func TestPlanStylesPatches_InsertedRFontsLandsBeforeExistingBold(t *testing.T) {
 	bIdx := strings.Index(rpr, "<w:b/>")
 	if rfontsIdx == -1 || bIdx == -1 || rfontsIdx > bIdx {
 		t.Errorf("<w:rFonts> must precede the pre-existing <w:b/>: %s", rpr)
+	}
+}
+
+// --- Follow-up review findings (same root cause: "a boolean flag never
+// closes over a nested container of the same kind"), found by a later
+// review pass over this same fix. <w:rPrChange> wraps a historical snapshot
+// of an OLDER <w:rPr> (revision tracking); <inRPR-as-boolean> code mistook
+// that nested rPr's own rFonts/sz/szCs — and even its closing tag — for the
+// CURRENT rPr's. ---
+
+// TestDirect_RunFormat_IgnoresHistoricalPropertiesInsideRPrChange is the
+// direct-formatting-path regression test: a run's rPr carrying revision
+// history (<w:rPrChange><w:rPr>...old properties...</w:rPr></w:rPrChange>)
+// must have its historical rFonts/sz left completely alone, and the new
+// font/size must land in the CURRENT rPr (before <w:rPrChange>), not be
+// silently absorbed into editing the historical copy in place.
+func TestDirect_RunFormat_IgnoresHistoricalPropertiesInsideRPrChange(t *testing.T) {
+	doc := []byte(`<w:p><w:r><w:rPr><w:rPrChange w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z">` +
+		`<w:rPr><w:rFonts w:ascii="Old"/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr><w:t>x</w:t></w:r></w:p>`)
+	paras, err := Scan(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("changed %d paragraphs, want 1", n)
+	}
+	s := string(got)
+	if err := checkWellFormed(got); err != nil {
+		t.Fatalf("result is not well-formed XML: %v", err)
+	}
+	if !strings.Contains(s, `w:ascii="Old"`) {
+		t.Errorf("historical rFonts inside <w:rPrChange> was corrupted: %s", s)
+	}
+	if !strings.Contains(s, `w:val="20"`) {
+		t.Errorf("historical sz inside <w:rPrChange> was corrupted: %s", s)
+	}
+	if !strings.Contains(s, `w:ascii="Georgia"`) {
+		t.Errorf("the new font was not applied to the run's CURRENT rPr: %s", s)
+	}
+	if !strings.Contains(s, `<w:sz w:val="28"/>`) {
+		t.Errorf("the new size was not applied to the run's CURRENT rPr: %s", s)
+	}
+	newRFontsIdx := strings.Index(s, `w:ascii="Georgia"`)
+	rprChangeIdx := strings.Index(s, "<w:rPrChange")
+	if newRFontsIdx == -1 || rprChangeIdx == -1 || newRFontsIdx > rprChangeIdx {
+		t.Errorf("the new rFonts must land in the current rPr, before <w:rPrChange>: %s", s)
+	}
+}
+
+// TestPlanStylesPatches_IgnoresHistoricalPropertiesInsideRPrChange is the
+// same bug on the whole-document docDefaults rPr chain (format.go's
+// scanDocDefaults/planStylesPatches).
+func TestPlanStylesPatches_IgnoresHistoricalPropertiesInsideRPrChange(t *testing.T) {
+	const styles = `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		`<w:docDefaults><w:rPrDefault><w:rPr><w:rPrChange w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z">` +
+		`<w:rPr><w:rFonts w:ascii="Old"/><w:sz w:val="20"/></w:rPr></w:rPrChange></w:rPr></w:rPrDefault></w:docDefaults>` +
+		`<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>` +
+		`</w:styles>`
+	out := applyStylesPatches(t, []byte(styles), FormatOptions{BodyFont: "Georgia", BodySizePt: 14})
+
+	rpd := extractElem(t, out, "<w:rPrDefault>", "</w:rPrDefault>")
+	if !strings.Contains(rpd, `w:ascii="Old"`) {
+		t.Errorf("historical rFonts inside <w:rPrChange> was corrupted: %s", rpd)
+	}
+	if !strings.Contains(rpd, `w:val="20"`) {
+		t.Errorf("historical sz inside <w:rPrChange> was corrupted: %s", rpd)
+	}
+	if !strings.Contains(rpd, `w:ascii="Georgia"`) {
+		t.Errorf("the new body font was not applied: %s", rpd)
+	}
+	newRFontsIdx := strings.Index(rpd, `w:ascii="Georgia"`)
+	rprChangeIdx := strings.Index(rpd, "<w:rPrChange")
+	if newRFontsIdx == -1 || rprChangeIdx == -1 || newRFontsIdx > rprChangeIdx {
+		t.Errorf("the new rFonts must land in the current rPr, before <w:rPrChange>: %s", rpd)
+	}
+}
+
+// TestFormat_HeadingFontInsertedRFontsLandsBeforeExistingBold is
+// planHeadingFontPatches's own instance of the same rFonts-must-be-first
+// bug (Minor 13's root cause): a heading style's rPr that already carries
+// other direct formatting (bold) but no rFonts had a newly inserted rFonts
+// land at rPr's END (right before </w:rPr>) instead of its first child
+// slot (EG_RPrBase order).
+func TestFormat_HeadingFontInsertedRFontsLandsBeforeExistingBold(t *testing.T) {
+	const styles = `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		`<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/></w:rPr></w:style>` +
+		`</w:styles>`
+	patches, err := planHeadingFontPatches([]byte(styles), "Georgia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Apply([]byte(styles), patches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if err := checkWellFormed(out); err != nil {
+		t.Fatalf("result is not well-formed XML: %v", err)
+	}
+	rpr := extractElem(t, s, "<w:rPr>", "</w:rPr>")
+	if !strings.Contains(rpr, "<w:b/>") {
+		t.Errorf("existing bold was wiped: %s", rpr)
+	}
+	rfontsIdx := strings.Index(rpr, "<w:rFonts")
+	bIdx := strings.Index(rpr, "<w:b/>")
+	if rfontsIdx == -1 || bIdx == -1 || rfontsIdx > bIdx {
+		t.Errorf("<w:rFonts> must precede the pre-existing <w:b/> (EG_RPrBase schema order): %s", rpr)
 	}
 }
