@@ -12,6 +12,7 @@ type Result struct {
 	exitCode int
 	duration time.Duration
 	err      error
+	timedOut bool
 }
 
 func (r *Result) Stdout() string {
@@ -47,6 +48,32 @@ func (r *Result) Error() error {
 		return nil
 	}
 	return r.err
+}
+
+// TimedOut reports whether the command was killed because it ran out of time
+// rather than exiting on its own.
+//
+// Without this the two are indistinguishable to the caller: a killed process
+// reports exit code -1, which is the same value used for "failed to start",
+// and a command that hangs silently produces no output to explain itself. An
+// agent handed `{"stdout":"","stderr":"","exit_code":-1}` cannot tell that it
+// timed out, so it re-runs the command — which is exactly what happened in
+// session 20260812_093415_fc6e: eight `dart test` retries, 120s apiece.
+func (r *Result) TimedOut() bool {
+	if r == nil {
+		return false
+	}
+	return r.timedOut
+}
+
+// WithTimedOut returns r marked as timed out. Separate from NewResult so the
+// common construction path stays a five-argument call.
+func (r *Result) WithTimedOut(timedOut bool) *Result {
+	if r == nil {
+		return nil
+	}
+	r.timedOut = timedOut
+	return r
 }
 
 // String formats the execution result for display.
