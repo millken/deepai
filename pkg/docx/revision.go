@@ -6,10 +6,80 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// defaultRevisionAuthor is the w:author value a tracked change gets when its
+// batch's EditOptions.Author is "" — see effectiveAuthor and attrs below.
+const defaultRevisionAuthor = "deepai"
+
+// effectiveAuthor returns author, or defaultRevisionAuthor when author is
+// "". This is the single place that default lives, so both attrs (which
+// stamps it onto every w:ins/w:del a TrackChanges batch produces) and
+// edit.go's track_changes author gate (which must judge an UNTRACKED batch —
+// one that never builds a revisionCtx at all — by the same identity a
+// tracked one would have carried) agree on what "no author given" means.
+func effectiveAuthor(author string) string {
+	if author == "" {
+		return defaultRevisionAuthor
+	}
+	return author
+}
+
+// revisionSummary aggregates every <w:ins>/<w:del> element found anywhere in
+// a document.xml — run-level wraps and the self-closing paragraph-mark form
+// alike — into a count of each and the distinct w:author values they carry.
+// Document computes this twice: once at OpenDocument time, to seed
+// revisionAuthorsAtOpen (edit.go's track_changes author gate), and again on
+// every rescan, to feed computeNotes' "this document has unreviewed
+// revisions" declaration — see document.go.
+type revisionSummary struct {
+	InsCount int
+	DelCount int
+	// Authors is sorted and deduplicated, and never contains "": a
+	// <w:ins>/<w:del> with no w:author attribute (malformed input; Word
+	// always writes one) contributes to the count but not to this list.
+	Authors []string
+}
+
+// scanRevisions walks documentXML as a token stream (independent of Scan's
+// paragraph indexing, so it also sees a document with zero paragraphs or one
+// Scan would refuse) and builds a revisionSummary from every <w:ins>/<w:del>
+// start element it finds. A decode error (should not happen for bytes that
+// already passed Scan) just ends the walk early with whatever was
+// accumulated so far, mirroring maxWordID's best-effort tolerance above.
+func scanRevisions(documentXML []byte) revisionSummary {
+	dec := xml.NewDecoder(bytes.NewReader(documentXML))
+	var sum revisionSummary
+	seen := make(map[string]bool)
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch {
+		case isWordElement(se.Name, "ins"):
+			sum.InsCount++
+		case isWordElement(se.Name, "del"):
+			sum.DelCount++
+		default:
+			continue
+		}
+		if val, ok := wordAttrVal(se, "author"); ok && val != "" && !seen[val] {
+			seen[val] = true
+			sum.Authors = append(sum.Authors, val)
+		}
+	}
+	sort.Strings(sum.Authors)
+	return sum
+}
 
 // revisionCtx carries the identity a tracked-change constructor needs to
 // stamp onto every <w:ins>/<w:del> (and paragraph-mark <w:ins/>/<w:del/>)
@@ -102,10 +172,7 @@ func maxWordID(documentXML []byte) int {
 func (rc *revisionCtx) attrs() string {
 	id := rc.nextID
 	rc.nextID++
-	author := rc.Author
-	if author == "" {
-		author = "deepai"
-	}
+	author := effectiveAuthor(rc.Author)
 	// Author is attribute-value text, so it goes through the same escaping
 	// as element content (both cover the same five XML metacharacters,
 	// including the quote characters an attribute value needs escaped that

@@ -56,6 +56,34 @@ func TestNotes_DeclaresUnreadContent(t *testing.T) {
 	}
 }
 
+// TestNotes_DeclaresPendingRevisions is task-3's I4 fix: a document that
+// already carries unreviewed w:ins/w:del (structure.docx has one of each,
+// both authored "fixture" — see TestHasRevisions_DetectsExistingMarks) must
+// say so in Notes(), naming the author and the ins/del counts, and warning
+// that the rendered text above already reflects every revision as accepted.
+// Before this fix, Read/Outline rendered w:ins content as indistinguishable
+// plain text and w:delText as if it never existed, with no declaration
+// anywhere a caller could see.
+func TestNotes_DeclaresPendingRevisions(t *testing.T) {
+	d, err := OpenDocument(fixture)
+	if err != nil {
+		t.Fatalf("OpenDocument: %v", err)
+	}
+	notes := strings.Join(d.Notes(), " | ")
+	if !strings.Contains(notes, "fixture") {
+		t.Errorf("Notes = %q, want it to name the revision author (fixture)", notes)
+	}
+	if !strings.Contains(notes, "1 insertion") {
+		t.Errorf("Notes = %q, want it to count 1 insertion", notes)
+	}
+	if !strings.Contains(notes, "1 deletion") {
+		t.Errorf("Notes = %q, want it to count 1 deletion", notes)
+	}
+	if !strings.Contains(strings.ToLower(notes), "accepted") {
+		t.Errorf("Notes = %q, want it to say rendered text reflects revisions as accepted", notes)
+	}
+}
+
 func TestNotes_EmptyWhenNothingIsOmitted(t *testing.T) {
 	d, err := OpenDocument(outlineFixture)
 	if err != nil {
@@ -141,7 +169,7 @@ func TestComputeNotes_DeclaresEachOmittedPartKind(t *testing.T) {
 		"word/endnotes.xml",
 		"word/comments.xml",
 	}
-	notes := strings.Join(computeNotes(names, nil), " | ")
+	notes := strings.Join(computeNotes(names, nil, revisionSummary{}), " | ")
 	if !strings.Contains(notes, "footnotes") {
 		t.Errorf("notes = %q, want it to mention footnotes", notes)
 	}
@@ -157,7 +185,7 @@ func TestComputeNotes_DeclaresEachOmittedPartKind(t *testing.T) {
 // over paras looking for SkippedTextBox, which neither fixture triggers.
 func TestComputeNotes_DeclaresSkippedTextBoxes(t *testing.T) {
 	paras := []Para{{Index: 1}, {Index: 2, SkippedTextBox: true}}
-	notes := strings.Join(computeNotes(nil, paras), " | ")
+	notes := strings.Join(computeNotes(nil, paras, revisionSummary{}), " | ")
 	if !strings.Contains(notes, "text box") {
 		t.Errorf("notes = %q, want it to mention skipped text boxes", notes)
 	}
@@ -167,7 +195,7 @@ func TestComputeNotes_DeclaresSkippedTextBoxes(t *testing.T) {
 // the two tests above are meaningfully asserting presence, not just any
 // non-empty string.
 func TestComputeNotes_EmptyWhenNothingOmitted(t *testing.T) {
-	if notes := computeNotes([]string{"word/document.xml"}, []Para{{Index: 1}}); len(notes) != 0 {
+	if notes := computeNotes([]string{"word/document.xml"}, []Para{{Index: 1}}, revisionSummary{}); len(notes) != 0 {
 		t.Errorf("notes = %v, want none", notes)
 	}
 }

@@ -1235,8 +1235,35 @@ func TestEdit_TrackChanges_TwoConsecutiveChunkedEditsBothSucceed(t *testing.T) {
 	if err := d.Save(); err != nil {
 		t.Fatalf("Save after two chunked tracked edits: %v", err)
 	}
-	if _, err := OpenDocument(d.path); err != nil {
-		t.Errorf("saved document is not reopenable: %v", err)
+	reopened, err := OpenDocument(d.path)
+	if err != nil {
+		t.Fatalf("saved document is not reopenable: %v", err)
+	}
+
+	// This is the part the test used to be missing (the C1/task-3 false
+	// positive): everything above ran on the SAME *Document instance for
+	// both tracked edits, so d.hadRevisionsAtOpen never actually became true
+	// mid-test — that only proved the gate tolerates revisions ADDED after
+	// open, never the tool layer's real shape, where every docx_edit call
+	// opens a FRESH Document (pkg/tools/builtin/docx.go re-OpenDocuments the
+	// path on every call). reopened.hadRevisionsAtOpen IS true here (both
+	// prior batches' w:ins/w:del are now on disk), so a third tracked edit
+	// on reopened is what actually exercises the author-based gate
+	// (edit.go): it must still land, because this batch's author ("deepai",
+	// the default both prior batches also used) matches what is already on
+	// disk.
+	res3, err := reopened.Edit(
+		[]Edit{{Para: 6, Find: strp("Body"), Text: "BODY3"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err != nil {
+		t.Fatalf("third tracked Edit on a REOPENED document returned an error — the gate is blocking a same-author reopen: %v", err)
+	}
+	if !res3.Outcomes[0].Applied {
+		t.Fatalf("third tracked edit on a reopened document was refused: %s", res3.Outcomes[0].Reason)
+	}
+	if got := paraTextAt(t, reopened, 6); !strings.Contains(got, "BODY3") {
+		t.Errorf("paragraph 6 = %q, want it to contain BODY3 (third edit's ins, on the reopened document)", got)
 	}
 }
 
@@ -1271,6 +1298,93 @@ func TestEdit_TrackChanges_ThreeConsecutiveEditsAllSucceed(t *testing.T) {
 		if got := paraTextAt(t, d, tc.para); !strings.Contains(got, tc.text) {
 			t.Errorf("paragraph %d = %q, want it to contain %q", tc.para, got, tc.text)
 		}
+	}
+}
+
+// TestEdit_RefusesReopenedDocumentWithOtherAuthorRevisions pins the half of
+// the author-based gate that must still refuse: a document reopened from
+// disk carrying a DIFFERENT author's pending revisions is not something a
+// same-author-default batch may silently build on top of, tracked or not.
+// The refusal must name the other author and give an actionable next step
+// (per task-3's brief: no "that's not a bug" dead end).
+func TestEdit_RefusesReopenedDocumentWithOtherAuthorRevisions(t *testing.T) {
+	d := editableDoc(t)
+	if _, err := d.Edit(
+		[]Edit{{Para: 2, Find: strp("Body"), Text: "BODY"}},
+		EditOptions{TrackChanges: true, Author: "reviewer", Now: testNow},
+	); err != nil {
+		t.Fatalf("setup tracked Edit: %v", err)
+	}
+	if err := d.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reopened, err := OpenDocument(d.path)
+	if err != nil {
+		t.Fatalf("OpenDocument: %v", err)
+	}
+
+	_, err = reopened.Edit([]Edit{{Para: 3, Find: strp("Body"), Text: "BODY2"}}, EditOptions{})
+	if err == nil {
+		t.Fatal("Edit on a document with another author's pending revisions returned nil error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "reviewer") {
+		t.Errorf("error = %q, want it to name the other author (reviewer)", msg)
+	}
+	if !strings.Contains(strings.ToLower(msg), "word") {
+		t.Errorf("error = %q, want it to point at resolving the pending revisions in Word", msg)
+	}
+	if !strings.Contains(msg, "author=") {
+		t.Errorf("error = %q, want it to give the actionable next step of retrying with a matching author", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "not a bug") {
+		t.Errorf("error = %q, must not use the unhelpful \"not a bug\" dead-end wording", msg)
+	}
+
+	// tracked or not, the same other-author revisions still refuse the batch.
+	_, err = reopened.Edit(
+		[]Edit{{Para: 3, Find: strp("Body"), Text: "BODY2"}},
+		EditOptions{TrackChanges: true, Now: testNow},
+	)
+	if err == nil {
+		t.Fatal("tracked Edit on a document with another author's pending revisions returned nil error")
+	}
+}
+
+// TestEdit_AllowsReopenedDocumentWhenAuthorMatchesExistingRevisions covers
+// the other half: once the user explicitly authorizes continuing as the
+// same author the existing revisions carry (the gate's own suggested next
+// step), the edit must land — with track_changes on OR off, since an
+// untracked "finish this polish, tracking off now" call is exactly the
+// third-call shape the tool layer's document-editor profile also needs to
+// work.
+func TestEdit_AllowsReopenedDocumentWhenAuthorMatchesExistingRevisions(t *testing.T) {
+	d := editableDoc(t)
+	if _, err := d.Edit(
+		[]Edit{{Para: 2, Find: strp("Body"), Text: "BODY"}},
+		EditOptions{TrackChanges: true, Now: testNow}, // Author "" -> "deepai"
+	); err != nil {
+		t.Fatalf("setup tracked Edit: %v", err)
+	}
+	if err := d.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reopened, err := OpenDocument(d.path)
+	if err != nil {
+		t.Fatalf("OpenDocument: %v", err)
+	}
+
+	// Untracked, author left "" -> defaults to "deepai", matching what is
+	// already on disk.
+	res, err := reopened.Edit([]Edit{{Para: 3, Find: strp("Body"), Text: "BODY2"}}, EditOptions{})
+	if err != nil {
+		t.Fatalf("untracked Edit on a same-author reopened document returned an error: %v", err)
+	}
+	if !res.Outcomes[0].Applied {
+		t.Fatalf("untracked edit was refused: %s", res.Outcomes[0].Reason)
+	}
+	if got := paraTextAt(t, reopened, 3); !strings.Contains(got, "BODY2") {
+		t.Errorf("paragraph 3 = %q, want it to contain BODY2", got)
 	}
 }
 

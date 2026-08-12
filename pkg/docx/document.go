@@ -38,6 +38,18 @@ type Document struct {
 	// state) unchanged, since read.go and format.go both use it for other
 	// decisions.
 	hadRevisionsAtOpen bool
+	// revisionAuthorsAtOpen is the sorted, deduplicated set of w:author
+	// values already present on any w:ins/w:del the moment OpenDocument
+	// finished its first scan — captured then and never updated afterward,
+	// for exactly the same reason hadRevisionsAtOpen is captured once (see
+	// its doc comment just above). Edit's track_changes gate (edit.go)
+	// compares this set against the batch's own author instead of refusing
+	// outright whenever hadRevisionsAtOpen is true: a caller reopening a
+	// document whose only existing revisions are ones ITS OWN earlier
+	// tracked-changes call already wrote — the tool layer's per-call
+	// re-OpenDocument, chunked-polish case this whole task exists for — must
+	// not be blocked by revisions it recognizes as its own.
+	revisionAuthorsAtOpen []string
 }
 
 // OpenDocument opens path as a .docx package, scans its main document part
@@ -57,6 +69,7 @@ func OpenDocument(path string) (*Document, error) {
 	// before any Edit call in this session has had a chance to add
 	// revisions of its own — see hadRevisionsAtOpen's doc comment.
 	d.hadRevisionsAtOpen = d.HasRevisions()
+	d.revisionAuthorsAtOpen = scanRevisions(d.doc).Authors
 	return d, nil
 }
 
@@ -82,7 +95,7 @@ func (d *Document) rescan() error {
 	}
 	d.doc = data
 	d.paras = paras
-	d.notes = computeNotes(d.pkg.Names(), paras)
+	d.notes = computeNotes(d.pkg.Names(), paras, scanRevisions(data))
 	return nil
 }
 
@@ -126,12 +139,16 @@ func (d *Document) Notes() []string {
 	return out
 }
 
-// computeNotes inspects a package's part names and its scanned paragraphs
-// for content Document does not surface: headers, footers, footnotes,
-// endnotes, comments, and any skipped text box. It takes names as a plain
+// computeNotes inspects a package's part names, its scanned paragraphs, and
+// a current-state revisionSummary for content Document does not surface, or
+// surfaces only partially: headers, footers, footnotes, endnotes, comments,
+// any skipped text box, and — per the I4 finding — any pending w:ins/w:del
+// revision marks, since Read/Outline render paragraph text as if every
+// revision were already accepted (inserted text shown, deleted text
+// omitted) without saying so anywhere else. It takes names as a plain
 // []string (rather than a *Package) so it can be unit-tested with synthetic
 // inputs that don't require building a real .docx fixture.
-func computeNotes(names []string, paras []Para) []string {
+func computeNotes(names []string, paras []Para, revisions revisionSummary) []string {
 	var (
 		hasHeader    bool
 		hasFooter    bool
@@ -175,6 +192,12 @@ func computeNotes(names []string, paras []Para) []string {
 			notes = append(notes, "one or more text boxes were skipped")
 			break
 		}
+	}
+	if revisions.InsCount > 0 || revisions.DelCount > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"document contains unreviewed tracked changes from author(s) %q (%d insertion(s), %d deletion(s)); "+
+				"paragraph text above is rendered as if every revision were already accepted (inserted text shown, deleted text omitted)",
+			revisions.Authors, revisions.InsCount, revisions.DelCount))
 	}
 	return notes
 }

@@ -154,15 +154,32 @@ const (
 //
 // Edit refuses the entire batch up front, with an error rather than a
 // per-edit Reason, when the document ALREADY contained revision marks
-// (w:ins/w:del) the moment it was opened (d.hadRevisionsAtOpen) — reopening
-// a document that carries its own earlier tracked changes and editing it
-// again is not supported in this phase; see hadRevisionsAtOpen's doc
-// comment. This deliberately does NOT use HasRevisions(): that method
-// reads the CURRENT paragraph cache, which a TrackChanges edit itself
-// flips to true via rescan, and gating on it would block the second chunk
-// of a chunked, tracked-changes polish from ever landing — the main use
-// case TrackChanges exists for. HasRevisions() keeps its existing meaning
-// unchanged for read.go/format.go's own, unrelated uses of it.
+// (w:ins/w:del) the moment it was opened (d.hadRevisionsAtOpen) AND at least
+// one of those revisions' w:author values is not this batch's own author
+// (d.revisionAuthorsAtOpen minus effectiveAuthor(opts.Author) is non-empty).
+// Gating on AUTHOR, not merely on hadRevisionsAtOpen's bool, is what lets a
+// document reopened between calls — the tool layer's per-call
+// OpenDocument/Edit/Save cycle (pkg/tools/builtin/docx.go) reopens fresh
+// every time, so d.hadRevisionsAtOpen is true again on every call after the
+// first one wrote its own revisions — keep landing: this batch's own
+// earlier tracked changes are recognized as its own and never trigger the
+// refusal, while someone else's still-pending revisions (a human reviewer's
+// edits sitting in the file, or a different author's polish pass) do. This
+// deliberately does NOT use HasRevisions(): that method reads the CURRENT
+// paragraph cache, which a TrackChanges edit itself flips to true via
+// rescan, and gating on it (even author-aware) would need the CURRENT
+// authors too, when what this check needs is what was already there BEFORE
+// this session touched anything — exactly what hadRevisionsAtOpen/
+// revisionAuthorsAtOpen capture once, at open, and never update.
+// HasRevisions() keeps its existing meaning unchanged for read.go/format.go's
+// own, unrelated uses of it.
+//
+// When the document was never touched by TrackChanges (opts.TrackChanges is
+// false), the batch's identity for this comparison is still
+// effectiveAuthor(opts.Author) — the same default ("deepai") a TrackChanges
+// batch with the same opts.Author would have stamped — so an untracked
+// "finish the polish, tracking off" call right after a tracked one is judged
+// by the same identity, not treated as authorless.
 //
 // On success, Edit re-scans the document (rescan) so that Paras() and
 // TotalParas() reflect the new state immediately. If the combined patch
@@ -174,11 +191,23 @@ const (
 // disk.
 func (d *Document) Edit(edits []Edit, opts EditOptions) (EditResult, error) {
 	if d.hadRevisionsAtOpen {
-		return EditResult{}, fmt.Errorf(
-			"docx: this document already contained revision marks (w:ins/w:del) when it was opened; " +
-				"reopening a document that carries your own earlier tracked changes and editing it again " +
-				"is not supported yet in this phase — open the file in Word, accept or reject the existing " +
-				"revisions, save, then reopen it here to continue editing")
+		caller := effectiveAuthor(opts.Author)
+		var other []string
+		for _, a := range d.revisionAuthorsAtOpen {
+			if a != caller {
+				other = append(other, a)
+			}
+		}
+		if len(other) > 0 {
+			return EditResult{}, fmt.Errorf(
+				"docx: this document already contains unreviewed revision marks (w:ins/w:del) from author(s) %q, "+
+					"which does not include this batch's author %q; tell the user about these pending revisions "+
+					"so they can decide what to do: open the file in Word and accept or reject them first, or — "+
+					"only once they explicitly confirm it is fine to build on top of them — retry this edit with "+
+					"author set to match one of them (e.g. author=%q) so it is recognized as continuing the same "+
+					"review rather than starting an unrelated one",
+				other, caller, other[0])
+		}
 	}
 
 	matchers := compileProtect(opts.Protect)

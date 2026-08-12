@@ -106,10 +106,14 @@ const (
 		"call unless the user explicitly asked for direct edits with no review step. With it on, each change lands " +
 		"as a Word revision (w:ins/w:del) in the review pane, not as a finalized edit — after such a call, tell the " +
 		"user the changes are pending review in Word, never that you \"made\" or \"applied\" them, and say how to " +
-		"accept or reject each one (Word's Review tab). If docx_edit refuses because the document already contained " +
-		"revision marks when it was opened, that is not a bug: tell the user to accept or reject the existing " +
-		"revisions in Word first, then retry — do not turn track_changes off to work around the refusal, since that " +
-		"would silently mix reviewed and unreviewed changes in the same file."
+		"accept or reject each one (Word's Review tab). Calling docx_edit repeatedly on the same file across a " +
+		"chunked polish (one call per section) is expected to keep working: your own earlier tracked changes in " +
+		"that file never cause a later call to refuse. If docx_edit DOES refuse because the document already " +
+		"contains unreviewed revisions from a DIFFERENT author, its error names which author's revisions those are " +
+		"— tell the user about them and let them decide: either they open the file in Word and accept/reject those " +
+		"revisions first, or, only once they explicitly confirm it is fine, retry the same call with author set to " +
+		"match the one the error names. Do not turn track_changes off to route around the refusal on your own " +
+		"judgment — that risks silently mixing someone else's unreviewed changes with yours in the same file."
 )
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{

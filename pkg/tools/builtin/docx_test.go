@@ -425,6 +425,31 @@ func TestDocxRead_DeclaresOmittedParts(t *testing.T) {
 	}
 }
 
+// TestDocxRead_DeclaresPendingRevisions is task-3's I4 fix at the tool
+// layer: docx_read on a document that already carries unreviewed
+// w:ins/w:del (structure.docx, both authored "fixture") must declare that in
+// notes, since the returned markdown otherwise shows w:ins content as
+// ordinary text and w:delText not at all, with nothing telling the model the
+// body it just read is not simply "the document's current text".
+func TestDocxRead_DeclaresPendingRevisions(t *testing.T) {
+	p := docxFixture(t, "structure.docx")
+	res, err := callDocxRead(t, map[string]any{"path": p, "full": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes, _ := decodeRead(t, res)["notes"].([]any)
+	joined := ""
+	for _, n := range notes {
+		joined += n.(string) + " | "
+	}
+	if !strings.Contains(joined, "fixture") {
+		t.Errorf("notes = %q, want it to name the revision author (fixture)", joined)
+	}
+	if !strings.Contains(strings.ToLower(joined), "revision") && !strings.Contains(strings.ToLower(joined), "tracked change") {
+		t.Errorf("notes = %q, want it to declare pending revisions", joined)
+	}
+}
+
 func TestDocxRead_UnknownHeadingErrors(t *testing.T) {
 	p := docxFixture(t, "outline.docx")
 	if _, err := callDocxRead(t, map[string]any{"path": p, "heading": "No Such Heading"}); err == nil {
@@ -907,6 +932,73 @@ func TestDocxEdit_TrackChangesTrueProducesRevisionsAndIsEchoed(t *testing.T) {
 	first := outcomes[0].(map[string]any)
 	if first["before"] != "Body" || first["after"] != "BODY" {
 		t.Errorf("before/after = %v/%v, want Body/BODY unchanged by track_changes", first["before"], first["after"])
+	}
+}
+
+// TestDocxEdit_ThreeConsecutiveCallsOnSamePathAllSucceed is the tool-layer
+// reproduction of task-3's C1 defect: DocxEditHandler calls
+// docx.OpenDocument fresh on every invocation (there is no long-lived
+// *Document across calls the way pkg/docx's own tests can hold one), so the
+// old hadRevisionsAtOpen-is-a-bool gate saw its OWN first tracked edit's
+// w:ins/w:del on every later OpenDocument and refused the entire batch —
+// including an ordinary, untracked edit — from the second docx_edit call
+// onward. That is exactly the shape the document-editor profile's
+// chunked-polish workflow (track_changes:true, one docx_edit per chunk)
+// hits on its very second call. The fix is author-based: this batch's own
+// earlier revisions (same default "deepai" author both calls use) must
+// never trigger the refusal. Three real, independent handler calls on the
+// same path — not the same in-memory Document — are required to prove it;
+// pkg/docx/edit_test.go's own multi-edit tests reuse one *Document and so
+// cannot catch this (see that file's TestEdit_TrackChanges_
+// TwoConsecutiveChunkedEditsBothSucceed for the now-fixed false positive).
+func TestDocxEdit_ThreeConsecutiveCallsOnSamePathAllSucceed(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+
+	res1, err := callDocxEdit(t, map[string]any{
+		"path":          p,
+		"track_changes": true,
+		"edits":         []any{map[string]any{"para": float64(2), "find": "Body", "text": "BODY-1"}},
+	})
+	if err != nil {
+		t.Fatalf("first docx_edit call: %v", err)
+	}
+	if out := decodeRead(t, res1); out["applied"] != float64(1) {
+		t.Fatalf("first call: applied = %v, want 1; content=%s", out["applied"], res1.Content)
+	}
+
+	res2, err := callDocxEdit(t, map[string]any{
+		"path":          p,
+		"track_changes": true,
+		"edits":         []any{map[string]any{"para": float64(3), "find": "Body", "text": "BODY-2"}},
+	})
+	if err != nil {
+		t.Fatalf("second docx_edit call on the same path returned an error — this is the C1 regression: %v", err)
+	}
+	if out := decodeRead(t, res2); out["applied"] != float64(1) {
+		t.Fatalf("second call: applied = %v, want 1; content=%s", out["applied"], res2.Content)
+	}
+
+	res3, err := callDocxEdit(t, map[string]any{
+		"path":          p,
+		"track_changes": false,
+		"edits":         []any{map[string]any{"para": float64(6), "find": "Body", "text": "BODY-3"}},
+	})
+	if err != nil {
+		t.Fatalf("third docx_edit call (track_changes off) on the same path returned an error: %v", err)
+	}
+	if out := decodeRead(t, res3); out["applied"] != float64(1) {
+		t.Fatalf("third call: applied = %v, want 1; content=%s", out["applied"], res3.Content)
+	}
+
+	after, err := callDocxRead(t, map[string]any{"path": p, "start_para": float64(2), "end_para": float64(6)})
+	if err != nil {
+		t.Fatalf("callDocxRead: %v", err)
+	}
+	md, _ := decodeRead(t, after)["markdown"].(string)
+	for _, want := range []string{"BODY-1", "BODY-2", "BODY-3"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown = %q, want it to contain %q", md, want)
+		}
 	}
 }
 
