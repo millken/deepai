@@ -473,6 +473,30 @@ func rFontsLiteralAttrs(existing []xml.Attr, font string) []xml.Attr {
 	return kept
 }
 
+// pPrChildOrder is CT_PPr's child sequence: CT_PPrBase's own sequence,
+// followed by CT_PPr's trailing rPr/sectPr/pPrChange (rPr must follow every
+// CT_PPrBase element and precede sectPr; sectPr must precede pPrChange).
+// Copied verbatim from the design brief (.superpowers/sdd/task-1-brief.md,
+// Task 1), which in turn transcribes ECMA-376's CT_PPrBase/CT_PPr
+// definitions. Format only ever edits "spacing" and "jc" itself, but the
+// FULL list is needed as an anchor set: a newly inserted <w:spacing>/<w:jc>
+// must land immediately before whichever LATER sibling in this order
+// already exists in the document, even when that sibling is something this
+// package never edits (rPr, ind, sectPr, ...) -- see applyLeafOps and its
+// callers. Getting this wrong produces well-formed but schema-illegal XML
+// that Word "repairs" by silently dropping the offending properties
+// (format capability review, Critical 1).
+var pPrChildOrder = []string{
+	"pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr",
+	"widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs",
+	"suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct",
+	"topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd",
+	"snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents",
+	"suppressOverlap", "jc", "textDirection", "textAlignment",
+	"textboxTightWrap", "outlineLvl", "divId", "cnfStyle",
+	"rPr", "sectPr", "pPrChange",
+}
+
 // leafOp is one candidate edit against a sibling leaf element inside a
 // known container (docDefaults' rPr/pPr, or a heading style's rPr), given
 // in the same order those siblings appear in the OOXML schema. active
@@ -524,6 +548,156 @@ func applyLeafOps(doc []byte, containerCloseStart int, ops []leafOp) []Patch {
 	if pending.Len() > 0 {
 		patches = append(patches, PatchRawSpan(doc, Span{containerCloseStart, containerCloseStart}, pending.String()))
 	}
+	return patches
+}
+
+// scanDirectChildren decodes fragment — the raw bytes strictly BETWEEN some
+// container's own start and end tags, e.g. a <w:pPr>'s or <w:rPr>'s inner
+// content — and reports, for each name in order that occurs as a DIRECT
+// child (nesting depth 0 within fragment), its elemInfo (first occurrence
+// only; found is the zero value, i.e. absent, for every other name). base
+// is added to every offset so the returned spans are absolute into the full
+// document/part fragment was sliced from.
+//
+// Depth is tracked structurally with a single counter, incremented on every
+// StartElement and decremented on every EndElement, while inside the
+// fragment — including a self-closing element's own, since
+// encoding/xml.Decoder always synthesizes a matching EndElement for one, so
+// the increment/decrement pair still nets to zero and never disturbs a
+// sibling's depth. This is what lets a leaf nested inside an UNTRACKED
+// sibling (e.g. a <w:spacing> nested inside a paragraph's own <w:rPr>,
+// itself a direct child of <w:pPr>) be told apart from the identically
+// named element sitting directly in the container being scanned — the fix
+// for the "a boolean flag never closes over a nested container of the same
+// kind" class of bug (format capability review, Critical 2).
+func scanDirectChildren(fragment []byte, base int, order []string) map[string]elemInfo {
+	want := make(map[string]bool, len(order))
+	for _, n := range order {
+		want[n] = true
+	}
+	found := make(map[string]elemInfo, len(order))
+
+	dec := xml.NewDecoder(bytes.NewReader(fragment))
+	var prevOffset, depth int
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break // EOF, or malformed — the caller's own outer scan already validates well-formedness
+		}
+		offset := int(dec.InputOffset())
+		switch t := tok.(type) {
+		case xml.StartElement:
+			localSpan := Span{prevOffset, offset}
+			if depth == 0 && want[t.Name.Local] && isWordprocessingMLNamespace(t.Name.Space) {
+				if _, exists := found[t.Name.Local]; !exists {
+					found[t.Name.Local] = elemInfo{
+						found:       true,
+						tagSpan:     Span{base + prevOffset, base + offset},
+						selfClosing: isSelfClosingSpan(fragment, localSpan),
+						attrs:       t.Attr,
+					}
+				}
+			}
+			depth++
+		case xml.EndElement:
+			if depth > 0 {
+				depth--
+			}
+		}
+		prevOffset = offset
+	}
+	return found
+}
+
+// buildPPrOps returns the leafOps applyLeafOps (or renderActiveLeaves, for a
+// brand new pPr being synthesized from scratch) needs to land <w:spacing>/
+// <w:jc> at the schema-correct position among a pPr's other children: one
+// leafOp per name in pPrChildOrder, in that order, with "spacing"/"jc"
+// marked active (and given their new attributes) when lineSpacing/align
+// requests a change, and every other name serving purely as an ANCHOR —
+// present (when found in children) so a new element merges in immediately
+// before whichever later, otherwise-untracked sibling (rPr, ind, sectPr,
+// ...) already exists, instead of always landing at pPr's very end
+// (format capability review, Critical 1). children may be nil — reading a
+// nil map always returns the zero elemInfo (not found) — which is exactly
+// "no pPr exists yet to anchor against", the shape a brand new pPr needs.
+func buildPPrOps(children map[string]elemInfo, lineSpacing float64, align string) []leafOp {
+	ops := make([]leafOp, 0, len(pPrChildOrder))
+	for _, name := range pPrChildOrder {
+		op := leafOp{info: children[name], local: name}
+		switch name {
+		case "spacing":
+			if lineSpacing != 0 {
+				op.active = true
+				line := lineSpacingTo240ths(lineSpacing)
+				op.attrs = setAttr(setAttr(op.info.attrs, "line", line), "lineRule", "auto")
+			}
+		case "jc":
+			if align != "" {
+				op.active = true
+				op.attrs = setAttr(op.info.attrs, "val", align)
+			}
+		}
+		ops = append(ops, op)
+	}
+	return ops
+}
+
+// planRPrFontSizePatches builds the patches for one rPr's direct font/size
+// formatting (an rPr that already exists with real content — the caller
+// handles "no rPr at all" and "self-closing <w:rPr/>" itself), given
+// containerOpenEnd/containerCloseStart (rPr's own tagSpan.End/closeStart)
+// and what the caller already scanned for rfonts/sz/szcs.
+//
+// rFonts, when newly inserted, always lands as rPr's very FIRST child
+// (EG_RPrBase requires it precede every other run property) by anchoring
+// directly to containerOpenEnd, rather than being merged via applyLeafOps'
+// normal "insert immediately before the next TRACKED sibling" rule — which
+// would let it land after existing but UNTRACKED content such as <w:b/>,
+// since that rule only ever looks at siblings later in ITS OWN ops list,
+// never at what (if anything) precedes them (format capability review,
+// Minor 13, same root cause as Critical 1). sz/szCs keep using
+// applyLeafOps' ordinary merge, unchanged from before.
+//
+// The one collision this has to guard against: if sz or szCs is itself
+// rPr's literal first child (its tagSpan starts exactly at
+// containerOpenEnd) and is being rewritten in place, applyLeafOps already
+// produces a patch starting at that same offset — a second, independent
+// patch at the identical zero-width offset would make Apply reject the
+// whole batch as overlapping. So the newly built rFonts tag is merged as a
+// TEXT PREFIX onto that existing patch instead of being appended as its own.
+func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart int, rfonts, sz, szcs elemInfo, font string, sizePt float64) []Patch {
+	remOps := []leafOp{{info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
+	if sizePt != 0 {
+		half := ptToHalfPoints(sizePt)
+		remOps[0].active = true
+		remOps[0].attrs = setAttr(sz.attrs, "val", half)
+		remOps[1].active = true
+		remOps[1].attrs = setAttr(szcs.attrs, "val", half)
+	}
+	remPatches := applyLeafOps(doc, containerCloseStart, remOps)
+
+	var patches []Patch
+	if font != "" {
+		if rfonts.found {
+			patches = append(patches, PatchRawSpan(doc, rfonts.tagSpan,
+				buildTag("rFonts", rFontsLiteralAttrs(rfonts.attrs, font), true)))
+		} else {
+			newTag := buildTag("rFonts", rFontsLiteralAttrs(nil, font), true)
+			merged := false
+			for i := range remPatches {
+				if remPatches[i].Content.Start == containerOpenEnd {
+					remPatches[i].NewText = newTag + remPatches[i].NewText
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				patches = append(patches, PatchRawSpan(doc, Span{containerOpenEnd, containerOpenEnd}, newTag))
+			}
+		}
+	}
+	patches = append(patches, remPatches...)
 	return patches
 }
 
@@ -635,23 +809,34 @@ func synthesizeDocDefaultsPatches(styles []byte, rootEnd int, dd, rpd, ppd elemI
 }
 
 // scanDocDefaults locates styles.xml's <w:docDefaults> chain in one pass:
-// the rPr triple (rFonts/sz/szCs, under rPrDefault) and the pPr pair
-// (spacing/jc, under pPrDefault). Each returned elemInfo's found field says
-// whether that element exists at all; rpr/ppr additionally carry
-// closeStart, the insertion point to use when every one of their tracked
-// children is missing. dd/rpd/ppd also carry closeStart now (populated the
-// same way, on their own end tag) so planStylesPatches can synthesize
-// whichever part of the chain a minimal generator's styles.xml omitted —
-// see synthesizeDocDefaultsPatches — rather than only ever editing an
-// already-complete chain. rootEnd is the offset right after the root
-// <w:styles ...> element's own start tag: the insertion point for a brand
-// new <w:docDefaults>, which must land as <w:styles>'s FIRST child.
+// the rPr triple (rFonts/sz/szCs, under rPrDefault) directly, and pPrDefault
+// itself (as ppr) so pprChildren can be filled in via a SEPARATE
+// scanDirectChildren pass over exactly ppr's own inner bytes once its span
+// is known. Each returned elemInfo's found field says whether that element
+// exists at all; rpr/ppr additionally carry closeStart, the insertion point
+// to use when every one of their tracked children is missing. dd/rpd/ppd
+// also carry closeStart now (populated the same way, on their own end tag)
+// so planStylesPatches can synthesize whichever part of the chain a minimal
+// generator's styles.xml omitted — see synthesizeDocDefaultsPatches —
+// rather than only ever editing an already-complete chain. rootEnd is the
+// offset right after the root <w:styles ...> element's own start tag: the
+// insertion point for a brand new <w:docDefaults>, which must land as
+// <w:styles>'s FIRST child.
 //
 // Only docDefaults and its direct rPrDefault/pPrDefault/rPr/pPr descendants
-// are tracked structurally (booleans gate matches the same way scan.go's
-// paraDepth/pPrDepth do) — this is deliberately narrower than a general
-// path engine, scoped to exactly the chain §4.3's measured facts describe.
-func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc elemInfo, rootEnd int, err error) {
+// are tracked structurally in THIS pass (booleans gate matches the same way
+// scan.go's paraDepth/pPrDepth do) — this is deliberately narrower than a
+// general path engine, scoped to exactly the chain §4.3's measured facts
+// describe. pPrDefault's pPr children (spacing/jc, plus every other
+// CT_PPr-schema anchor buildPPrOps needs) are deliberately NOT matched
+// inline here with a boolean the way rFonts/sz/szCs are: pPr is itself
+// CT_PPrGeneral, which may carry a nested <w:rPr> (paragraph mark run
+// properties) that can carry its OWN <w:spacing> (character spacing) — a
+// same-named but different property a boolean can't tell apart from pPr's
+// own, because the boolean never closes over the nested rPr (format
+// capability review, Critical 2). scanDirectChildren's depth tracking is
+// what tells them apart.
+func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr elemInfo, pprChildren map[string]elemInfo, rootEnd int, err error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
 	var inDD, inRPD, inRPR, inPPD, inPPR bool
@@ -663,7 +848,7 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd,
+			return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd,
 				fmt.Errorf("scan styles.xml docDefaults: %w", terr)
 		}
 		offset := int(dec.InputOffset())
@@ -708,11 +893,16 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 				if !sc {
 					inPPR = true
 				}
-			case isWordElement(t.Name, "spacing") && inPPR && !spacing.found:
-				spacing = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "jc") && inPPR && !jc.found:
-				jc = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
 			}
+			// spacing/jc (and every other CT_PPrBase leaf) are deliberately
+			// NOT matched here: pPrDefault's own <w:pPr> is CT_PPrGeneral,
+			// which may itself carry a nested <w:rPr> (paragraph mark run
+			// properties) — and that rPr can carry its OWN <w:spacing>
+			// (character spacing), a different property with the same tag
+			// name. inPPR alone can't tell the two apart; see the
+			// scanDirectChildren call below, which tracks nesting DEPTH
+			// instead of a boolean that never closes over the nested rPr
+			// (format capability review, Critical 2).
 
 		case xml.EndElement:
 			switch {
@@ -742,7 +932,10 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, s
 	if ppr.found && ppr.selfClosing {
 		ppr.closeStart = ppr.tagSpan.End
 	}
-	return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd, nil
+	if ppr.found && !ppr.selfClosing {
+		pprChildren = scanDirectChildren(styles[ppr.tagSpan.End:ppr.closeStart], ppr.tagSpan.End, pPrChildOrder)
+	}
+	return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd, nil
 }
 
 // planStylesPatches builds every styles.xml patch resolved requests
@@ -769,7 +962,7 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 	wantPPrChain := opts.LineSpacing != 0 || opts.Align != ""
 
 	if wantRPrChain || wantPPrChain {
-		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, spacing, jc, rootEnd, err := scanDocDefaults(styles)
+		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd, err := scanDocDefaults(styles)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -779,51 +972,57 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 		needPPrSynthesis := false
 
 		if wantRPrChain {
-			ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 			if opts.BodyFont != "" {
-				ops[0].active = true
-				ops[0].attrs = rFontsLiteralAttrs(rfonts.attrs, opts.BodyFont)
 				applied = append(applied, fmt.Sprintf("body font -> %s", opts.BodyFont))
 			}
 			if opts.BodySizePt != 0 {
-				half := ptToHalfPoints(opts.BodySizePt)
-				ops[1].active = true
-				ops[1].attrs = setAttr(sz.attrs, "val", half)
-				ops[2].active = true
-				ops[2].attrs = setAttr(szcs.attrs, "val", half)
 				applied = append(applied, fmt.Sprintf("body size -> %gpt", opts.BodySizePt))
 			}
 			if dd.found && rpd.found && rpr.found {
-				// The chain fully exists already: edit its leaves in place,
-				// the exact same patches this package has always produced —
-				// byte-identical output for a document that already has
-				// the chain is a hard guarantee, so this branch must stay
-				// untouched by the synthesis path below.
-				patches = append(patches, applyLeafOps(styles, rpr.closeStart, ops)...)
+				// The chain fully exists already: edit its leaves in place —
+				// byte-identical output for a document that already has a
+				// complete rFonts/sz/szCs is a hard guarantee for the case
+				// nothing here needed to move. planRPrFontSizePatches (not
+				// the old bare applyLeafOps call) additionally makes sure a
+				// newly inserted rFonts lands as rPr's first child rather
+				// than after unrelated existing content (Minor 13).
+				patches = append(patches, planRPrFontSizePatches(
+					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, opts.BodyFont, opts.BodySizePt)...)
 			} else {
 				needRPrSynthesis = true
+				ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
+				if opts.BodyFont != "" {
+					ops[0].active = true
+					ops[0].attrs = rFontsLiteralAttrs(rfonts.attrs, opts.BodyFont)
+				}
+				if opts.BodySizePt != 0 {
+					half := ptToHalfPoints(opts.BodySizePt)
+					ops[1].active = true
+					ops[1].attrs = setAttr(sz.attrs, "val", half)
+					ops[2].active = true
+					ops[2].attrs = setAttr(szcs.attrs, "val", half)
+				}
 				rprInner = renderActiveLeaves(ops)
 			}
 		}
 
 		if wantPPrChain {
-			ops := []leafOp{{info: spacing, local: "spacing"}, {info: jc, local: "jc"}}
 			if opts.LineSpacing != 0 {
-				ops[0].active = true
-				line := lineSpacingTo240ths(opts.LineSpacing)
-				ops[0].attrs = setAttr(setAttr(spacing.attrs, "line", line), "lineRule", "auto")
 				applied = append(applied, fmt.Sprintf("line spacing -> %g", opts.LineSpacing))
 			}
 			if opts.Align != "" {
-				ops[1].active = true
-				ops[1].attrs = setAttr(jc.attrs, "val", opts.Align)
 				applied = append(applied, fmt.Sprintf("alignment -> %s", opts.Align))
 			}
 			if dd.found && ppd.found && ppr.found {
-				patches = append(patches, applyLeafOps(styles, ppr.closeStart, ops)...)
+				// buildPPrOps (not a bare 2-element ops list) anchors the
+				// insertion against pPrDefault's pPr's FULL set of tracked
+				// children, so a newly inserted spacing/jc lands in
+				// CT_PPr's schema order even when that pPr also carries a
+				// paragraph-mark <w:rPr> or other properties (Critical 1).
+				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, opts.LineSpacing, opts.Align))...)
 			} else {
 				needPPrSynthesis = true
-				pprInner = renderActiveLeaves(ops)
+				pprInner = renderActiveLeaves(buildPPrOps(nil, opts.LineSpacing, opts.Align))
 			}
 		}
 

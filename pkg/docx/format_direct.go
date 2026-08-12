@@ -231,11 +231,11 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, lineS
 			continue
 		}
 
-		openEnd, ppr, spacing, jc, err := scanParaProps(documentXML, p.Span)
+		openEnd, ppr, children, err := scanParaProps(documentXML, p.Span)
 		if err != nil {
 			return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
 		}
-		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, spacing, jc, lineSpacing, align)...)
+		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, children, lineSpacing, align)...)
 		changed++
 	}
 
@@ -314,11 +314,13 @@ func buildRunRPr(rprAttrs []xml.Attr, font string, sizePt float64) string {
 //  2. <w:rPr/> present but self-closing (no properties at all): expand it
 //     in place, preserving whatever attributes the <w:rPr> tag itself
 //     carried.
-//  3. <w:rPr>...</w:rPr> present with content: delegate to applyLeafOps,
-//     the same merge-not-replace machinery planStylesPatches already uses
-//     for docDefaults — an existing <w:rFonts>/<w:sz>/<w:szCs> is rewritten
-//     in place (never duplicated) and everything else already inside
-//     <w:rPr> (bold, colour, ...) is left completely alone.
+//  3. <w:rPr>...</w:rPr> present with content: delegate to
+//     planRPrFontSizePatches, the merge-not-replace machinery
+//     planStylesPatches's docDefaults path also uses — an existing
+//     <w:rFonts>/<w:sz>/<w:szCs> is rewritten in place (never duplicated), a
+//     newly inserted <w:rFonts> lands as rPr's first child (EG_RPrBase
+//     order), and everything else already inside <w:rPr> (bold, colour, ...)
+//     is left completely alone.
 func planRunRPrPatches(doc []byte, openEnd int, rpr, rfonts, sz, szcs elemInfo, font string, sizePt float64) []Patch {
 	if !rpr.found {
 		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildRunRPr(nil, font, sizePt))}
@@ -326,20 +328,7 @@ func planRunRPrPatches(doc []byte, openEnd int, rpr, rfonts, sz, szcs elemInfo, 
 	if rpr.selfClosing {
 		return []Patch{PatchRawSpan(doc, rpr.tagSpan, buildRunRPr(rpr.attrs, font, sizePt))}
 	}
-
-	ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
-	if font != "" {
-		ops[0].active = true
-		ops[0].attrs = rFontsLiteralAttrs(rfonts.attrs, font)
-	}
-	if sizePt != 0 {
-		half := ptToHalfPoints(sizePt)
-		ops[1].active = true
-		ops[1].attrs = setAttr(sz.attrs, "val", half)
-		ops[2].active = true
-		ops[2].attrs = setAttr(szcs.attrs, "val", half)
-	}
-	return applyLeafOps(doc, rpr.closeStart, ops)
+	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, font, sizePt)
 }
 
 // planParaPPrPatches is planRunRPrPatches's paragraph-level twin: the same
@@ -347,27 +336,21 @@ func planRunRPrPatches(doc []byte, openEnd int, rpr, rfonts, sz, szcs elemInfo, 
 // <w:pPr><w:spacing>/<w:jc> instead of <w:rPr><w:rFonts>/<w:sz>/<w:szCs>.
 // The self-closing-<w:p/> case is handled one level up, by
 // expandSelfClosingParagraph, before this function is ever called — by the
-// time openEnd/ppr/spacing/jc reach here, the paragraph itself is known to
-// have a content model.
-func planParaPPrPatches(doc []byte, openEnd int, ppr, spacing, jc elemInfo, lineSpacing float64, align string) []Patch {
+// time openEnd/ppr/children reach here, the paragraph itself is known to
+// have a content model. children is pPr's full set of tracked direct
+// children (scanParaProps, via scanDirectChildren) — buildPPrOps uses all of
+// it as an anchor set so a newly inserted spacing/jc lands in CT_PPr's
+// schema order even when pPr also carries an <w:rPr>, <w:ind>, or
+// <w:sectPr> (format capability review, Critical 1), not merely relative to
+// spacing/jc themselves.
+func planParaPPrPatches(doc []byte, openEnd int, ppr elemInfo, children map[string]elemInfo, lineSpacing float64, align string) []Patch {
 	if !ppr.found {
 		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildParaPPr(nil, lineSpacing, align))}
 	}
 	if ppr.selfClosing {
 		return []Patch{PatchRawSpan(doc, ppr.tagSpan, buildParaPPr(ppr.attrs, lineSpacing, align))}
 	}
-
-	ops := []leafOp{{info: spacing, local: "spacing"}, {info: jc, local: "jc"}}
-	if lineSpacing != 0 {
-		ops[0].active = true
-		line := lineSpacingTo240ths(lineSpacing)
-		ops[0].attrs = setAttr(setAttr(spacing.attrs, "line", line), "lineRule", "auto")
-	}
-	if align != "" {
-		ops[1].active = true
-		ops[1].attrs = setAttr(jc.attrs, "val", align)
-	}
-	return applyLeafOps(doc, ppr.closeStart, ops)
+	return applyLeafOps(doc, ppr.closeStart, buildPPrOps(children, lineSpacing, align))
 }
 
 // scanRunProps scans elem — a single run's <w:r>...</w:r> byte range, as
@@ -452,7 +435,17 @@ func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs ele
 // EndElement at the SAME offset with no content in between, making
 // "openEnd" land right after the "/>" — outside the (nonexistent) content
 // model — rather than anywhere a <w:pPr> could actually be inserted.
-func scanParaProps(doc []byte, span Span) (openEnd int, ppr, spacing, jc elemInfo, err error) {
+//
+// children is the full set of pPr's direct children scanDirectChildren
+// tracks (pPrChildOrder) — not merely spacing/jc — found via a SEPARATE
+// pass over pPr's own inner bytes once its span is known, rather than
+// inline in the loop below via a boolean flag: a boolean here would
+// misidentify a <w:spacing>/<w:jc>-shaped element nested inside pPr's own
+// <w:rPr> (paragraph mark run properties) as one of pPr's own direct
+// children, exactly the "inPPR never closes over the nested rPr" bug from
+// the format capability review (Critical 2). children is nil when pPr
+// itself is missing or self-closing (nothing to scan).
+func scanParaProps(doc []byte, span Span) (openEnd int, ppr elemInfo, children map[string]elemInfo, err error) {
 	sub := doc[span.Start:span.End]
 	dec := xml.NewDecoder(bytes.NewReader(sub))
 
@@ -465,7 +458,7 @@ func scanParaProps(doc []byte, span Span) (openEnd int, ppr, spacing, jc elemInf
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return 0, ppr, spacing, jc, fmt.Errorf("scan paragraph properties: %w", terr)
+			return 0, ppr, nil, fmt.Errorf("scan paragraph properties: %w", terr)
 		}
 		offset := int(dec.InputOffset())
 
@@ -483,10 +476,6 @@ func scanParaProps(doc []byte, span Span) (openEnd int, ppr, spacing, jc elemInf
 				if !sc {
 					inPPR = true
 				}
-			case isWordElement(t.Name, "spacing") && inPPR && !spacing.found:
-				spacing = elemInfo{found: true, tagSpan: s, selfClosing: sc, attrs: t.Attr}
-			case isWordElement(t.Name, "jc") && inPPR && !jc.found:
-				jc = elemInfo{found: true, tagSpan: s, selfClosing: sc, attrs: t.Attr}
 			}
 		case xml.EndElement:
 			if isWordElement(t.Name, "pPr") && inPPR {
@@ -500,5 +489,8 @@ func scanParaProps(doc []byte, span Span) (openEnd int, ppr, spacing, jc elemInf
 	if ppr.found && ppr.selfClosing {
 		ppr.closeStart = ppr.tagSpan.End
 	}
-	return openEnd, ppr, spacing, jc, nil
+	if ppr.found && !ppr.selfClosing {
+		children = scanDirectChildren(doc[ppr.tagSpan.End:ppr.closeStart], ppr.tagSpan.End, pPrChildOrder)
+	}
+	return openEnd, ppr, children, nil
 }
