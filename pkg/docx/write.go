@@ -34,9 +34,12 @@ type WriteOptions struct {
 	// bold header, ragged rows padded/truncated and declared -- see
 	// parseTable), fenced ``` code blocks (markdown is not interpreted
 	// inside one -- see paraBlock.isCode), [text](url) links (rendered as
-	// real hyperlinks -- see renderCtx), "> " block quotes, and a "---"
-	// horizontal rule (disambiguated from a table separator row and a
-	// setext heading underline -- see buildBlocks' hrRE branch). The one
+	// real hyperlinks -- see renderCtx), "> " block quotes, ATX-style setext
+	// headings (a text line immediately followed by a full "="/"-{2,}"
+	// underline becomes Heading1/Heading2 -- see buildBlocks' setextH1RE/
+	// setextH2RE branch), and a "---" horizontal rule (disambiguated from a
+	// table separator row and a setext heading underline by precedence --
+	// table, then setext, then hr -- see buildBlocks' hrRE branch). The one
 	// thing this package never renders is an image (![alt](url)): no part
 	// of its OOXML skeleton embeds binary data, so an image is written
 	// verbatim as plain text and declared in WriteResult.Notes -- see
@@ -336,6 +339,17 @@ type paraBlock struct {
 	isQuote     bool
 	isHR        bool
 	isCell      bool
+	// codeBreak is set (by buildBlocks, only on the first isCode paraBlock
+	// of a fresh code block) when the source actually had a blank line
+	// between this block and whatever isCode block precedes it -- see
+	// mergeCodeBlocks' doc comment for why this exists: a blank line
+	// between two code blocks produces no block of its own (buildBlocks'
+	// general blank-line branch just flushes and continues), so without
+	// this marker mergeCodeBlocks cannot tell "two blocks the source
+	// genuinely separated" apart from "one block's own internal lines" by
+	// adjacency in the blocks slice alone. Meaningless when isCode is
+	// false.
+	codeBreak bool
 }
 
 // tableCell is one <w:tc>'s content: raw markdown text (inline emphasis is
@@ -414,6 +428,23 @@ var (
 	// this is disambiguated from a GFM table separator row and a setext
 	// heading underline.
 	hrRE = regexp.MustCompile(`^-{3,}$`)
+	// setextH1RE/setextH2RE match a setext heading's underline: one or more
+	// '=' characters for H1, two or more '-' characters for H2 (the task
+	// brief's own threshold -- a single '-' is neither a valid hr nor,
+	// here, a valid H2 underline, so it stays ordinary paragraph text, same
+	// as before this fix existed). buildBlocks only consults these when a
+	// paragraph is already accumulating in accLines -- a setext heading is
+	// always "text line(s) immediately followed by an underline line", never
+	// the underline appearing on its own -- and checks them BEFORE hrRE, so
+	// "---" right after a text line becomes a Heading2, not a swallowed or
+	// literal horizontal rule; hrRE only ever matches "---" with no
+	// preceding paragraph in progress (accLines empty). setextH2RE's 2-or-
+	// more threshold deliberately overlaps hrRE's 3-or-more range (e.g.
+	// "---" satisfies both): that overlap is exactly what the accLines-
+	// empty/non-empty split disambiguates, not a separate character-count
+	// rule.
+	setextH1RE = regexp.MustCompile(`^=+$`)
+	setextH2RE = regexp.MustCompile(`^-{2,}$`)
 	// quoteRE matches one block-quote line, capturing its content after the
 	// "> " (or bare ">") marker. The optional single space after '>' mirrors
 	// CommonMark, which does not require it.
@@ -481,14 +512,24 @@ func looksLikeLinkDestination(dest string) bool {
 // .docx body conventionally always carries at least one paragraph, and
 // this is the only way to guarantee that without also making every
 // ordinary blank separator produce spurious empty paragraphs (see
-// buildBlocks).
+// buildBlocks). Also strips a leading UTF-8 byte-order mark (U+FEFF),
+// present unconditionally regardless of which of docx_write's two mutually
+// exclusive input paths (inline markdown or markdown_path) produced opts --
+// see WriteOptions.Markdown's doc comment for why: a BOM is an
+// editor/Windows-tooling artifact of how the text was SAVED, orthogonal to
+// which of the two ways it reached this function, so both must be treated
+// identically rather than only stripping it on one path and leaving the
+// other to silently misdetect its first line. Left unstripped, "\ufeff#
+// Title" fails headingRE (the BOM is not "#") and the whole first line
+// falls through to being an ordinary paragraph instead of Heading1 -- I10.
 func parseMarkdown(opts WriteOptions) ([]block, []string) {
-	unit := inferListIndentUnit(opts.Markdown)
-	blocks, tableNotes, hasRefDef := buildBlocks(opts.Markdown, unit)
-	hasImage := detectImages(opts.Markdown)
+	markdown := strings.TrimPrefix(opts.Markdown, "\ufeff")
+	unit := inferListIndentUnit(markdown)
+	blocks, tableNotes, hasRefDef := buildBlocks(markdown, unit)
+	hasImage := detectImages(markdown)
 	notes := buildNotes(hasImage, tableNotes, hasRefDef)
 
-	if opts.Title != "" && !markdownStartsWithH1(opts.Markdown) {
+	if opts.Title != "" && !markdownStartsWithH1(markdown) {
 		blocks = append([]block{{para: &paraBlock{heading: 1, text: opts.Title}}}, blocks...)
 	}
 	if len(blocks) == 0 {
@@ -552,12 +593,27 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	lines := strings.Split(markdown, "\n")
 
 	var accLines []string
+	// accInList records whether ANY line currently buffered in accLines was
+	// appended while inListContext was true -- i.e. accLines holds a list
+	// item's indented continuation text, not an ordinary top-level
+	// paragraph (see the accLines-append fallback below, and this
+	// function's own doc comment on why a continuation line falls all the
+	// way through to that same buffer an ordinary paragraph uses). This
+	// cannot simply be read off inListContext at setext-check time instead:
+	// inListContext is reset per-line based on THAT line's own indentation
+	// (see the hasLeadingIndent check below), so by the time an unindented
+	// setext underline is itself being classified, inListContext has
+	// already flipped back to false even though the text it would attach
+	// to came from inside a list. See
+	// TestWrite_ListContinuationFollowedByDashesIsNotSetext.
+	accInList := false
 	flush := func() {
 		if len(accLines) == 0 {
 			return
 		}
 		text := strings.Join(accLines, " ")
 		accLines = accLines[:0]
+		accInList = false
 		if strings.TrimSpace(text) == "" {
 			return
 		}
@@ -572,6 +628,28 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 		text := strings.Join(quoteLines, " ")
 		quoteLines = quoteLines[:0]
 		blocks = append(blocks, block{para: &paraBlock{text: text, isQuote: true}})
+	}
+
+	// pendingCodeBreak/appendCode implement the I1 fix: a blank line that
+	// genuinely separates two code blocks in the source must stop them from
+	// merging into one paraBlock/one box, even though the blank line itself
+	// produces no block at all (see the trimmed=="" branch below) and so
+	// leaves nothing in the blocks slice for mergeCodeBlocks to see. Every
+	// isCode paraBlock this function appends goes through appendCode, which
+	// stamps codeBreak=true on exactly the first line of a fresh code block
+	// IF a real separating blank line was consumed since the previous code
+	// line -- see paraBlock.codeBreak's own doc comment. pendingCodeBreak
+	// being left true across intervening non-code blocks (a heading, an
+	// ordinary paragraph, ...) is harmless: those blocks already break
+	// mergeCodeBlocks' adjacency requirement on their own, so the flag's
+	// value on the next isCode block that eventually follows one of them
+	// never actually gets consulted for a merge decision against something
+	// non-adjacent.
+	pendingCodeBreak := false
+	appendCode := func(text string) {
+		cb := pendingCodeBreak
+		pendingCodeBreak = false
+		blocks = append(blocks, block{para: &paraBlock{text: text, isCode: true, codeBreak: cb}})
 	}
 
 	inFence := false
@@ -594,7 +672,14 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			// block would leave inIndentedCode dangling true underneath the
 			// fenced section, corrupting whatever line follows the fence's
 			// close. Any buffered blank lines are dropped with it, same as
-			// any other dedent that ends the block.
+			// any other dedent that ends the block -- and, same as that
+			// other dedent below, dropping a nonzero buffered count here
+			// means a real blank-line separator existed between the
+			// indented block that just ended and whatever this fence opens
+			// or closes, so pendingCodeBreak is set the same way.
+			if pendingBlankIndentedLines > 0 {
+				pendingCodeBreak = true
+			}
 			inIndentedCode = false
 			pendingBlankIndentedLines = 0
 			// The opening/closing delimiter itself -- and any info string
@@ -619,7 +704,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			// for an unclosed fenced code block (it runs to the end of the
 			// document) rather than being a bug unique to this package;
 			// see TestWrite_UnterminatedFenceRunsToEndOfDocument.
-			blocks = append(blocks, block{para: &paraBlock{text: line, isCode: true}})
+			appendCode(line)
 			continue
 		}
 		if trimmed == "" {
@@ -633,21 +718,35 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			}
 			flush()
 			flushQuote()
+			// A blank line reaching here (i.e. NOT swallowed by an
+			// in-progress indented block above) is a real separator in the
+			// source: whatever code block preceded it, if any, ends here,
+			// and whatever code block follows, if any, must not be merged
+			// back into it -- see appendCode's doc comment.
+			pendingCodeBreak = true
 			continue
 		}
 
 		if inIndentedCode {
 			if rest, ok := stripIndentedCodePrefix(line); ok {
 				for ; pendingBlankIndentedLines > 0; pendingBlankIndentedLines-- {
-					blocks = append(blocks, block{para: &paraBlock{text: "", isCode: true}})
+					appendCode("")
 				}
-				blocks = append(blocks, block{para: &paraBlock{text: rest, isCode: true}})
+				appendCode(rest)
 				continue
 			}
 			// Dedented: the block ends here. Any buffered blank lines were
 			// trailing it, not part of it, so they are simply dropped, and
 			// THIS line falls through to be classified fresh below -- it is
-			// not itself part of the block that just ended.
+			// not itself part of the block that just ended. Those dropped
+			// blanks were still a real separator between this block and
+			// whatever code block might come next, so pendingCodeBreak is
+			// set the same way the ordinary blank-line branch above sets it
+			// -- this indented block just buffered them instead of hitting
+			// that branch directly.
+			if pendingBlankIndentedLines > 0 {
+				pendingCodeBreak = true
+			}
 			inIndentedCode = false
 			pendingBlankIndentedLines = 0
 		}
@@ -721,20 +820,62 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			hasRefDef = true
 			continue
 		}
-		// hrRE only ever matches here, after the table branch above has
-		// already had first refusal: a line that legitimately serves as a
-		// GFM separator row was already consumed as part of its table (the
-		// "i += consumed - 1" above skips past it), so this loop iteration
-		// never revisits it. What remains ambiguous is the OTHER case the
-		// brief warns about: "---" underlining a preceding paragraph
-		// (a setext heading, which this package does not implement). The
-		// rule chosen here is "only a horizontal rule when it is not
-		// immediately continuing an in-progress paragraph" — checked via
-		// len(accLines) == 0 — so "Heading\n---" (no blank line between)
-		// falls through to the accLines append below instead, becoming the
-		// literal paragraph "Heading ---" rather than either a heading or a
-		// swallowed rule. A "---" preceded by a blank line, a heading, a
-		// list item, or nothing at all (accLines empty) is a rule.
+		// Setext heading (M1): a paragraph already accumulating in accLines
+		// (i.e. NOT a blank line, a list item, a table, or nothing at all --
+		// none of those populate accLines) immediately followed by an
+		// all-'=' or all-'-{2,}' underline becomes a real Heading1/Heading2,
+		// consuming the ENTIRE accumulated paragraph as the heading's text
+		// (joined with " ", the same soft-line-break rule flush() itself
+		// uses) rather than printing the underline as literal body text.
+		// accInList must also be false: a list ITEM's own text never
+		// reaches accLines (it becomes its own block immediately -- see the
+		// list-item branch above), but its indented CONTINUATION lines do
+		// fall all the way through to the accLines append at the bottom of
+		// this loop while still under an open list -- accInList (not
+		// inListContext, which the hasLeadingIndent reset above may have
+		// already flipped back to false for THIS unindented underline line
+		// by the time we get here) is what remembers that. Without this
+		// guard, "- item\n  more\n---\n" would turn the list item's own
+		// continuation text into a Heading2 instead of leaving it, and the
+		// list, alone -- see accInList's own doc comment and
+		// TestWrite_ListContinuationFollowedByDashesIsNotSetext.
+		//
+		// This must run BEFORE the hrRE check just below, per the task
+		// brief's required precedence (table, then setext, then hr): an
+		// all-dash underline like "---" satisfies BOTH setextH2RE (>=2
+		// dashes) and hrRE (>=3 dashes), and it is accLines being non-empty
+		// -- a text paragraph genuinely precedes it -- that must decide it
+		// is a setext underline, not a rule, before hrRE ever gets a look.
+		// The table branch above already has its own, earlier first refusal
+		// (a table's separator row is consumed as part of parseTable and
+		// this loop never revisits it), so by the time either check here
+		// runs, a genuine table separator has already been ruled out.
+		if len(accLines) > 0 && !accInList {
+			if setextH1RE.MatchString(trimmed) {
+				text := strings.Join(accLines, " ")
+				accLines = accLines[:0]
+				flushQuote()
+				blocks = append(blocks, block{para: &paraBlock{heading: 1, text: text}})
+				continue
+			}
+			if setextH2RE.MatchString(trimmed) {
+				text := strings.Join(accLines, " ")
+				accLines = accLines[:0]
+				flushQuote()
+				blocks = append(blocks, block{para: &paraBlock{heading: 2, text: text}})
+				continue
+			}
+		}
+		// hrRE only ever matches here, after the table branch above and the
+		// setext branch just above have already had first refusal: a line
+		// that legitimately serves as a GFM separator row was already
+		// consumed as part of its table (the "i += consumed - 1" above skips
+		// past it), so this loop iteration never revisits it, and a "---"
+		// immediately continuing an in-progress paragraph is now a setext
+		// Heading2, not a rule. What reaches here is exactly a "---" with NO
+		// paragraph in progress -- checked via len(accLines) == 0 -- which is
+		// unambiguously a horizontal rule: preceded by a blank line, a
+		// heading, a list item, or nothing at all.
 		if hrRE.MatchString(trimmed) && len(accLines) == 0 {
 			flushQuote()
 			blocks = append(blocks, block{para: &paraBlock{isHR: true}})
@@ -757,7 +898,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 				flush()
 				inIndentedCode = true
 				pendingBlankIndentedLines = 0
-				blocks = append(blocks, block{para: &paraBlock{text: rest, isCode: true}})
+				appendCode(rest)
 				continue
 			}
 		}
@@ -774,6 +915,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			continue
 		}
 		accLines = append(accLines, trimmed)
+		accInList = accInList || inListContext
 	}
 	flush()
 	flushQuote()
@@ -805,10 +947,20 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 // combined appearance but makes it explicit and universal (every
 // renderer, not just Word) instead of relying on the border-merge
 // assumption the rest of this task removes everywhere else.
+//
+// It is NOT agnostic to a genuine blank-line separator, though (the I1 fix,
+// task-5-brief.md): b.para.codeBreak, stamped by buildBlocks' appendCode
+// helper only on the first line of a fresh code block that a real blank
+// line separated from whatever code came before it, stops the merge here
+// even though the two blocks are still adjacent in the blocks slice (the
+// blank line itself produced no block for this loop to see otherwise). Two
+// fenced blocks with a blank line between them are therefore two boxes;
+// two fenced blocks with nothing at all between them (codeBreak never set,
+// since no blank line was ever consumed) are still the one edge case above.
 func mergeCodeBlocks(blocks []block) []block {
 	merged := make([]block, 0, len(blocks))
 	for _, b := range blocks {
-		if b.para != nil && b.para.isCode && len(merged) > 0 {
+		if b.para != nil && b.para.isCode && !b.para.codeBreak && len(merged) > 0 {
 			if prev := merged[len(merged)-1].para; prev != nil && prev.isCode {
 				prev.text += "\n" + b.para.text
 				continue
@@ -1050,15 +1202,43 @@ func buildRowCells(cells, align []string, want int) []tableCell {
 
 // splitTableRow splits one pipe-table row into cell strings, tolerating
 // optional leading/trailing pipes ("| a | b |" and "a | b" both split into
-// ["a", "b"]).
+// ["a", "b"]) and a backslash-escaped pipe ("\|") inside a cell, which is
+// unescaped to a literal "|" in that cell's text rather than being treated
+// as a delimiter (I2: "| a\|b | c |" must split into exactly two cells,
+// "a|b" and "c", not three via an unescaped split that then silently drops
+// the row as ragged). This is GFM's own minimum bar for pipe escaping in a
+// table cell; it does not also special-case a pipe inside inline `code`
+// (CommonMark itself does not require table-cell splitting to look inside
+// inline code spans, and doing so here would need a second, code-aware pass
+// duplicating parseInline's own lexing).
+//
+// The leading/trailing pipe strip below runs BEFORE the escape-aware split
+// and is deliberately not itself escape-aware: an actual GFM table row's
+// optional delimiter pipe is punctuation supplied by the row's shape, not
+// cell content, and cannot itself be the first/last character of an
+// escaped sequence (there is nothing for a backslash immediately at
+// position 0 to have escaped).
 func splitTableRow(line string) []string {
 	t := strings.TrimSpace(line)
 	t = strings.TrimPrefix(t, "|")
 	t = strings.TrimSuffix(t, "|")
-	parts := strings.Split(t, "|")
-	for i := range parts {
-		parts[i] = strings.TrimSpace(parts[i])
+
+	var parts []string
+	var cur strings.Builder
+	for i := 0; i < len(t); i++ {
+		if t[i] == '\\' && i+1 < len(t) && t[i+1] == '|' {
+			cur.WriteByte('|')
+			i++
+			continue
+		}
+		if t[i] == '|' {
+			parts = append(parts, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(t[i])
 	}
+	parts = append(parts, strings.TrimSpace(cur.String()))
 	return parts
 }
 
@@ -1724,13 +1904,14 @@ func (c *renderCtx) codeFontXML() string {
 // paragraph, never repeated as a shared visual identity the way
 // SourceCode/Quote/ListParagraph/TableGrid are, so there is no shared style
 // for it to move into -- this predates the styles-architecture plan
-// entirely) AND, as of the GenOffice-compatibility task, for isCode too:
-// SourceCode's own <w:pBdr>/<w:shd> are copied directly onto the paragraph
-// alongside the pStyle reference, because GenOffice does not resolve a
-// paragraph style's border or shading at all. See
-// TestWrite_NoInlineVisualPropertiesInDocumentXML's own doc comment for the
-// full, narrowed statement of which properties are still banned inline and
-// which two named exceptions (plus this pre-existing third one) are not.
+// entirely) AND, as of the GenOffice-compatibility task, for isCode AND
+// isQuote too: SourceCode's own <w:pBdr>/<w:shd>, and Quote's own <w:pBdr>
+// (I9), are each copied directly onto their paragraph alongside the pStyle
+// reference, because GenOffice does not resolve a paragraph style's border
+// or shading at all. See TestWrite_NoInlineVisualPropertiesInDocumentXML's
+// own doc comment for the full, narrowed statement of which properties are
+// still banned inline and which named exceptions (plus this pre-existing
+// isHR one) are not.
 //
 // forceBold ORs bold onto every inline segment (used for a table header
 // row) regardless of the markdown markers parseInline already resolved.
@@ -1797,6 +1978,13 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleListParagraph)
 	case b.isQuote:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleQuote)
+		// GenOffice-compatibility copy of Quote's own left border (see
+		// styles.go's quoteBorderXML doc comment): the pStyle reference
+		// above already carries it by name, but GenOffice does not apply a
+		// paragraph style's <w:pBdr> at all, so every quote paragraph also
+		// gets it written directly -- the same mechanism as the isCode
+		// case just below (I9).
+		pPr.WriteString(quoteBorderXML)
 	case b.isCode:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleSourceCode)
 		// GenOffice-compatibility copy of SourceCode's own border and

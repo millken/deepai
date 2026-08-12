@@ -13,7 +13,9 @@ import (
 // all, and neither Google Docs nor GenOffice applies a table style's
 // <w:tblStylePr> conditional formatting. Both copies come from the exact
 // same source in styles.go (codeBorderXML, codeShadingXML,
-// codeRunFontsXML, tableHeaderShadingXML) so they cannot hand-drift apart.
+// codeRunFontsXML, tableHeaderShadingXML, quoteBorderXML -- the last one
+// added by the later I9 fix, task-5-brief.md) so they cannot hand-drift
+// apart.
 //
 // The tests below extract both copies independently from a real
 // WriteDocx+reopen round trip and compare them as strings, rather than
@@ -89,6 +91,41 @@ func TestWrite_InlineHeaderShadingMatchesStyle(t *testing.T) {
 	}
 	if inlineShading != styleShading {
 		t.Errorf("inline header shd = %s, style's shd = %s -- the two copies have drifted apart", inlineShading, styleShading)
+	}
+}
+
+// A block quote's left border must be byte-identical between the Quote
+// style (styles.xml) and the direct copy on each quote paragraph
+// (document.xml) -- the I9 fix (task-5-brief.md): the code-block/
+// table-header GenOffice-compatibility copies above left Quote's own
+// left border style-only, so GenOffice showed no border on a block quote
+// even though the style itself was correct.
+func TestWrite_InlineQuoteBorderMatchesStyle(t *testing.T) {
+	md := "> quoted text\n"
+	d, _, _ := writeAndReopen(t, md)
+
+	styles, _ := d.Part("word/styles.xml")
+	q := styleBlock(t, styles, StyleQuote)
+	pBdrRE := regexp.MustCompile(`<w:pBdr>.*?</w:pBdr>`)
+	styleBorder := pBdrRE.FindString(q)
+	if styleBorder == "" {
+		t.Fatalf("Quote style = %s, missing pBdr; test would be vacuous", q)
+	}
+
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+	paraRE := regexp.MustCompile(`<w:pPr><w:pStyle w:val="Quote"/>.*?</w:pPr>`)
+	quotePPr := paraRE.FindString(s)
+	if quotePPr == "" {
+		t.Fatalf("no Quote paragraph pPr found in document.xml: %s", s)
+	}
+	inlineBorder := pBdrRE.FindString(quotePPr)
+	if inlineBorder == "" {
+		t.Fatalf("quote paragraph's pPr = %s, missing inline pBdr", quotePPr)
+	}
+
+	if inlineBorder != styleBorder {
+		t.Errorf("inline pBdr = %s, style's pBdr = %s -- the two copies have drifted apart", inlineBorder, styleBorder)
 	}
 }
 

@@ -1074,23 +1074,30 @@ func TestWrite_HorizontalRuleDoesNotEatTableSeparatorRow(t *testing.T) {
 }
 
 // A bare "---" directly under a paragraph line, with no blank line between
-// them, is a setext heading underline in CommonMark (which this package
-// does not implement as a heading) -- not a horizontal rule. The rule
-// chosen here (buildBlocks: only a horizontal rule when accLines is empty)
-// falls back to treating the whole thing as one literal paragraph rather
-// than silently discarding the "---" as if it were a rule.
+// them, is a setext heading underline in CommonMark -- not a horizontal
+// rule. Superseded by the M1 fix (task-5-brief.md): this used to pin the
+// pre-fix fallback of printing the whole thing as one literal paragraph
+// ("Heading ---"), which was itself the M1 defect this task closes; now it
+// pins the actual CommonMark-correct outcome, a real Heading2, while still
+// checking the negative half of the original assertion (never rendered as
+// a horizontal rule either) -- see TestWrite_SetextH2BecomesHeading2 and
+// TestWrite_TableSetextAndHRDoNotMisfireOnEachOther for the fuller Setext
+// coverage this test's name predates.
 func TestWrite_HorizontalRuleDoesNotEatSetextHeadingUnderline(t *testing.T) {
 	d, _, _ := writeAndReopen(t, "Heading\n---\n\nNext para\n")
 	paras := d.Paras()
 	if len(paras) != 2 {
-		t.Fatalf("got %d paragraphs, want 2 (\"Heading ---\" merged, then \"Next para\"): %+v", len(paras), paras)
+		t.Fatalf("got %d paragraphs, want 2 (the setext Heading2, then \"Next para\"): %+v", len(paras), paras)
+	}
+	if paras[0].Style != "Heading2" {
+		t.Errorf("paras[0].Style = %q, want Heading2 (a setext underline must produce a real heading)", paras[0].Style)
 	}
 	var text strings.Builder
 	for _, r := range paras[0].Runs {
 		text.WriteString(r.Text)
 	}
-	if text.String() != "Heading ---" {
-		t.Errorf("paras[0] text = %q, want %q", text.String(), "Heading ---")
+	if text.String() != "Heading" {
+		t.Errorf("paras[0] text = %q, want %q (must not contain the literal '---' underline)", text.String(), "Heading")
 	}
 	doc, _ := d.Part(DocumentPart)
 	if strings.Contains(string(doc), "<w:pBdr><w:bottom") {
@@ -1345,7 +1352,7 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 // TestWrite_NoInlineVisualPropertiesInDocumentXML is the core, deliberately
 // exhaustive invariant this task exists to establish: document.xml must
 // never carry a paragraph-level visual property (<w:spacing>, <w:ind>,
-// <w:shd>, or <w:pBdr>) inline outside two narrow, deliberate exceptions.
+// <w:shd>, or <w:pBdr>) inline outside a few narrow, deliberate exceptions.
 // Those properties belong in styles.xml, referenced by name
 // (<w:pStyle>/<w:rStyle>/<w:tblStyle>), so a future change that reaches for
 // "just inline it, it's simpler" regresses this test immediately instead
@@ -1356,15 +1363,15 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 // stop: every construct that needs either still gets it exclusively from a
 // style.
 //
-// <w:shd> and <w:pBdr> get two named, narrow exceptions, both added by the
-// renderer-compatibility task that also added this comment (see
-// styles.go's codeBorderXML/codeShadingXML/tableHeaderShadingXML doc
-// comments for the full reasoning) -- this is a deliberate compatibility
-// measure, not an erosion of the invariant, because the renderer that
-// motivates it (GenOffice, the user's own local previewer; Google Docs for
-// the table case) does not resolve those two style properties AT ALL, so a
-// style-only version is invisible there no matter how correct the style
-// itself is:
+// <w:shd> and <w:pBdr> get three named, narrow exceptions, added by the
+// renderer-compatibility task that also added this comment plus the later
+// I9 fix (see styles.go's codeBorderXML/codeShadingXML/
+// tableHeaderShadingXML/quoteBorderXML doc comments for the full
+// reasoning) -- this is a deliberate compatibility measure, not an erosion
+// of the invariant, because the renderer that motivates it (GenOffice, the
+// user's own local previewer; Google Docs for the table case) does not
+// resolve those two style properties AT ALL, so a style-only version is
+// invisible there no matter how correct the style itself is:
 //
 //  1. A fenced-code-block paragraph (<w:pStyle w:val="SourceCode"/>) may
 //     carry BOTH <w:pBdr> and <w:shd> inline, byte-identical to
@@ -1374,8 +1381,12 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 //     carry <w:shd> (never <w:pBdr> -- TableGrid has none to copy), also
 //     byte-identical to TableGrid's <w:tblStylePr> copy -- neither Google
 //     Docs nor GenOffice applies a table style's conditional formatting.
+//  3. A block-quote paragraph (<w:pStyle w:val="Quote"/>) may carry
+//     <w:pBdr> (never <w:shd> -- Quote has none to copy), byte-identical
+//     to Quote's own left-border copy -- GenOffice does not apply a
+//     paragraph style's border here either (I9).
 //
-// A horizontal rule's own <w:pBdr> (hrBorderXML) is a THIRD, pre-existing
+// A horizontal rule's own <w:pBdr> (hrBorderXML) is a FOURTH, pre-existing
 // exception that predates this task entirely: an isHR paragraph was never
 // routed through a shared style to begin with (see renderParagraph's own
 // doc comment), so there is nothing for it to have "moved out of" -- it is
@@ -1383,8 +1394,8 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 // not because it is part of this task's compatibility work.
 //
 // Every OTHER paragraph, and every DATA-row table cell, must still carry
-// neither <w:shd> nor <w:pBdr> -- the two exceptions are scoped to exactly
-// the constructs named above, not "anywhere convenient."
+// neither <w:shd> nor <w:pBdr> -- the exceptions are scoped to exactly the
+// constructs named above, not "anywhere convenient."
 //
 // The markdown below exercises every construct that used to (or still
 // does) write one of these properties: a heading, an ordinary paragraph, a
@@ -1403,7 +1414,8 @@ func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
 	}
 
 	// <w:shd>/<w:pBdr> are banned on every <w:p> except a SourceCode
-	// paragraph (both) or an isHR paragraph (pBdr only, via hrBorderXML).
+	// paragraph (both), a Quote paragraph (pBdr only), or an isHR paragraph
+	// (pBdr only, via hrBorderXML).
 	paraRE := regexp.MustCompile(`<w:p>.*?</w:p>`)
 	paras := paraRE.FindAllString(x, -1)
 	if len(paras) == 0 {
@@ -1411,12 +1423,13 @@ func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
 	}
 	for _, p := range paras {
 		isCodePara := strings.Contains(p, `<w:pStyle w:val="SourceCode"/>`)
+		isQuotePara := strings.Contains(p, `<w:pStyle w:val="Quote"/>`)
 		isHRPara := strings.Contains(p, hrBorderXML)
 		if strings.Contains(p, "<w:shd") && !isCodePara {
 			t.Errorf("<w:shd appears inline on a non-code paragraph: %s", p)
 		}
-		if strings.Contains(p, "<w:pBdr") && !isCodePara && !isHRPara {
-			t.Errorf("<w:pBdr appears inline on a paragraph that is neither code nor an hr: %s", p)
+		if strings.Contains(p, "<w:pBdr") && !isCodePara && !isQuotePara && !isHRPara {
+			t.Errorf("<w:pBdr appears inline on a paragraph that is neither code, quote, nor an hr: %s", p)
 		}
 	}
 

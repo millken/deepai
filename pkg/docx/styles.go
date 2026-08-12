@@ -543,12 +543,30 @@ func verbatimCharStyleXML(f fontOptions) string {
 		`</w:style>`
 }
 
+// quoteBorderXML is Quote's own <w:pBdr> (its left border) -- pulled out to
+// its own constant, the same GenOffice-compatibility mechanism as
+// codeBorderXML/codeShadingXML/tableHeaderShadingXML above (see
+// codeBorderXML's own doc comment for the full reasoning): GenOffice does
+// not resolve a paragraph style's <w:pBdr> at all, so a block quote styled
+// ONLY via Quote's pStyle reference shows no left border in it, even though
+// the style itself is correct and Word/Google Docs render it fine. Those
+// three constants covered the code-block and table-header cases; Quote's
+// own left border was the one paragraph-level border this package's
+// GenOffice-compatibility task left style-only (I9) -- write.go's
+// renderParagraph now writes a byte-identical copy of this SAME constant
+// directly onto each isQuote paragraph, exactly as codeBorderXML is copied
+// onto each isCode paragraph, so the two copies cannot hand-drift apart.
+// See TestWrite_InlineQuoteBorderMatchesStyle (write_inline_visuals_test.go),
+// which extracts both copies independently from a real WriteDocx+reopen
+// round trip the same way the code-block/table-header tests already do.
+const quoteBorderXML = `<w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="7F7F7F"/></w:pBdr>`
+
 // quoteStyleXML renders a "> " blockquote line as an indented,
 // left-bordered, italicized paragraph — the plan's style table's three
 // properties for Quote, nothing more.
 const quoteStyleXML = `<w:style w:type="paragraph" w:styleId="Quote">` +
 	`<w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>` +
-	`<w:pPr><w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="7F7F7F"/></w:pBdr>` +
+	`<w:pPr>` + quoteBorderXML +
 	`<w:ind w:left="360"/></w:pPr>` +
 	`<w:rPr><w:i/></w:rPr></w:style>`
 
