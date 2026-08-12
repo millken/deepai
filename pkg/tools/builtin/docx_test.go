@@ -1418,6 +1418,11 @@ func TestDocxFormat_RejectsWrongTypedFields(t *testing.T) {
 		{"body_font not a string", map[string]any{"body_font": float64(1)}},
 		{"body_size_pt not a number", map[string]any{"body_size_pt": "big"}},
 		{"line_spacing not a number", map[string]any{"line_spacing": "double"}},
+		{"line_spacing_exact_pt not a number", map[string]any{"line_spacing_exact_pt": "double"}},
+		{"east_asia_font not a string", map[string]any{"east_asia_font": float64(1)}},
+		{"first_line_indent_chars not a number", map[string]any{"first_line_indent_chars": "two"}},
+		{"space_before_pt not a number", map[string]any{"space_before_pt": "six"}},
+		{"space_after_pt not a number", map[string]any{"space_after_pt": "six"}},
 		{"align not a string", map[string]any{"align": true}},
 		{"normalize not a boolean", map[string]any{"normalize": "yes"}},
 		{"page_numbers not a boolean", map[string]any{"page_numbers": "yes"}},
@@ -1843,6 +1848,217 @@ func TestDocxFormat_WithoutRangeRemainsDocumentWide(t *testing.T) {
 	docAfter := zipEntry(t, p, docx.DocumentPart)
 	if !bytes.Equal(docBefore, docAfter) {
 		t.Error("a rules-only (no range) call changed word/document.xml; body_font without a range must land only in word/styles.xml")
+	}
+}
+
+// --- Task 8: align center/right, east_asia_font, first_line_indent_chars,
+// space_before_pt/space_after_pt, line_spacing_exact_pt, end to end through
+// the tool layer ---
+
+// TestDocxFormat_AlignCenterAndRightAppliedDocumentWide pins Critical 3's
+// fix at the tool layer: "center"/"right" used to have nowhere to go
+// (pkg/docx rejected them outright); both now land in styles.xml's
+// docDefaults <w:jc>.
+func TestDocxFormat_AlignCenterAndRightAppliedDocumentWide(t *testing.T) {
+	for _, align := range []string{"center", "right"} {
+		t.Run(align, func(t *testing.T) {
+			p := docxFixture(t, "outline.docx")
+			res, err := callDocxFormat(t, map[string]any{
+				"path":  p,
+				"rules": map[string]any{"align": align},
+			})
+			if err != nil {
+				t.Fatalf("DocxFormatHandler: %v", err)
+			}
+			out := decodeRead(t, res)
+			applied, _ := out["applied"].([]any)
+			if len(applied) == 0 {
+				t.Fatalf("applied is empty for align=%q (content=%s)", align, res.Content)
+			}
+			styles := string(zipEntry(t, p, "word/styles.xml"))
+			if !strings.Contains(styles, `<w:jc w:val="`+align+`"/>`) {
+				t.Errorf("styles.xml docDefaults lacks <w:jc w:val=%q/>: %s", align, styles)
+			}
+		})
+	}
+}
+
+// TestDocxFormat_EastAsiaFontOrthogonalToBodyFont pins EastAsiaFont's own
+// contract at the tool layer: body_font alone must leave docDefaults'
+// eastAsia font untouched, and east_asia_font alone must leave ascii/hAnsi
+// untouched — the fix for "中文宋体+西文 Times 表达不了" (format capability
+// review, Important 8).
+func TestDocxFormat_EastAsiaFontOrthogonalToBodyFont(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia", "east_asia_font": "SimSun"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	var haveFont, haveEastAsia bool
+	for _, a := range applied {
+		s, _ := a.(string)
+		if strings.Contains(s, "body font") {
+			haveFont = true
+		}
+		if strings.Contains(s, "east asia font") {
+			haveEastAsia = true
+		}
+	}
+	if !haveFont || !haveEastAsia {
+		t.Errorf("applied = %v, want both a body-font and an east-asia-font entry", applied)
+	}
+	styles := string(zipEntry(t, p, "word/styles.xml"))
+	dd := styles[strings.Index(styles, "<w:docDefaults>"):strings.Index(styles, "</w:docDefaults>")]
+	if !strings.Contains(dd, `w:ascii="Georgia"`) {
+		t.Errorf("docDefaults lacks the Latin font: %s", dd)
+	}
+	if !strings.Contains(dd, `w:eastAsia="SimSun"`) {
+		t.Errorf("docDefaults lacks the east-asia font: %s", dd)
+	}
+}
+
+// TestDocxFormat_FirstLineIndentCharsLandsOnInd covers the whole-document
+// path end to end: 2 characters -> firstLineChars="200" plus the twips
+// fallback.
+func TestDocxFormat_FirstLineIndentCharsLandsOnInd(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"first_line_indent_chars": float64(2)},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatalf("applied is empty (content=%s)", res.Content)
+	}
+	styles := string(zipEntry(t, p, "word/styles.xml"))
+	if !strings.Contains(styles, `w:firstLineChars="200"`) {
+		t.Errorf("styles.xml lacks firstLineChars=200: %s", styles)
+	}
+	if !strings.Contains(styles, `w:firstLine="420"`) {
+		t.Errorf("styles.xml lacks the firstLine twips fallback (420): %s", styles)
+	}
+}
+
+// TestDocxFormat_SpaceBeforeAndAfterLandOnSameSpacingElementAsLineSpacing
+// covers space_before_pt/space_after_pt combined with line_spacing in ONE
+// call, landing on the SAME <w:spacing> element without duplicating it.
+func TestDocxFormat_SpaceBeforeAndAfterLandOnSameSpacingElementAsLineSpacing(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path": p,
+		"rules": map[string]any{
+			"line_spacing":    1.5,
+			"space_before_pt": float64(6),
+			"space_after_pt":  float64(12),
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) < 3 {
+		t.Fatalf("applied = %v, want at least 3 entries (line spacing, space before, space after)", applied)
+	}
+	styles := string(zipEntry(t, p, "word/styles.xml"))
+	dd := styles[strings.Index(styles, "<w:docDefaults>"):strings.Index(styles, "</w:docDefaults>")]
+	if strings.Count(dd, "<w:spacing ") != 1 {
+		t.Errorf("docDefaults has %d <w:spacing> elements, want exactly 1 (before/after/line must merge into one tag): %s",
+			strings.Count(dd, "<w:spacing "), dd)
+	}
+	if !strings.Contains(dd, `w:before="120"`) || !strings.Contains(dd, `w:after="240"`) || !strings.Contains(dd, `w:line="360"`) {
+		t.Errorf("docDefaults spacing lacks before=120/after=240/line=360: %s", dd)
+	}
+}
+
+// TestDocxFormat_LineSpacingExactPtLandsAsExactLineRule covers
+// line_spacing_exact_pt end to end: 24pt -> w:line="480" w:lineRule="exact".
+func TestDocxFormat_LineSpacingExactPtLandsAsExactLineRule(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"line_spacing_exact_pt": float64(24)},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) == 0 {
+		t.Fatalf("applied is empty (content=%s)", res.Content)
+	}
+	styles := string(zipEntry(t, p, "word/styles.xml"))
+	if !strings.Contains(styles, `w:line="480" w:lineRule="exact"`) {
+		t.Errorf("styles.xml lacks w:line=480/w:lineRule=exact: %s", styles)
+	}
+}
+
+// TestDocxFormat_LineSpacingMutexRejectedAtToolLayer confirms the domain
+// rule (pkg/docx's validateAlignAndLineSpacingMutex) surfaces as an error
+// through the tool handler, not just at the pkg/docx API.
+func TestDocxFormat_LineSpacingMutexRejectedAtToolLayer(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	if _, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"line_spacing": 1.5, "line_spacing_exact_pt": float64(24)},
+	}); err == nil {
+		t.Fatal("line_spacing + line_spacing_exact_pt together was accepted; want an error")
+	}
+}
+
+// TestDocxFormat_RangeAppliesNewTask8FieldsDirectly exercises the
+// paragraph-range path for all four new fields at once, confirming they
+// land as DIRECT formatting in word/document.xml, never word/styles.xml.
+func TestDocxFormat_RangeAppliesNewTask8FieldsDirectly(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	stylesBefore := zipEntry(t, p, "word/styles.xml")
+
+	res, err := callDocxFormat(t, map[string]any{
+		"path":       p,
+		"start_para": float64(2),
+		"end_para":   float64(2),
+		"rules": map[string]any{
+			"east_asia_font":          "SimSun",
+			"first_line_indent_chars": float64(2),
+			"space_before_pt":         float64(6),
+			"space_after_pt":          float64(12),
+			"line_spacing_exact_pt":   float64(24),
+		},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) < 5 {
+		t.Fatalf("applied = %v, want at least 5 entries", applied)
+	}
+
+	docXML := readDocumentXML(t, p)
+	for _, want := range []string{
+		`w:eastAsia="SimSun"`,
+		`w:firstLineChars="200"`,
+		`w:before="120"`,
+		`w:after="240"`,
+		`w:line="480" w:lineRule="exact"`,
+	} {
+		if !strings.Contains(docXML, want) {
+			t.Errorf("word/document.xml lacks %s: %s", want, docXML)
+		}
+	}
+
+	stylesAfter := zipEntry(t, p, "word/styles.xml")
+	if !bytes.Equal(stylesBefore, stylesAfter) {
+		t.Error("word/styles.xml changed; a ranged call must land purely in word/document.xml")
 	}
 }
 

@@ -40,10 +40,8 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 		return FormatResult{}, fmt.Errorf(
 			"docx: normalize collapses empty paragraphs document-wide and cannot be combined with a paragraph range")
 	}
-	switch opts.Align {
-	case "", "left", "justify":
-	default:
-		return FormatResult{}, fmt.Errorf("docx: unknown alignment %q; want \"left\" or \"justify\"", opts.Align)
+	if err := validateAlignAndLineSpacingMutex(opts.Align, opts.LineSpacing, opts.LineSpacingExactPt); err != nil {
+		return FormatResult{}, err
 	}
 
 	total := d.TotalParas()
@@ -72,7 +70,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 
 	var result FormatResult
 
-	wantsRunFormat := opts.BodyFont != "" || opts.BodySizePt != 0
+	wantsRunFormat := opts.BodyFont != "" || opts.BodySizePt != 0 || opts.EastAsiaFont != ""
 	if wantsRunFormat {
 		emptyCount := 0
 		for _, p := range paras {
@@ -81,7 +79,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			}
 		}
 
-		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.BodySizePt)
+		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.EastAsiaFont, opts.BodySizePt)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct run formatting: %w", err)
 		}
@@ -97,6 +95,10 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, n))
 		}
+		if opts.EastAsiaFont != "" {
+			result.Applied = append(result.Applied, fmt.Sprintf(
+				"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.EastAsiaFont, n))
+		}
 		if opts.BodySizePt != 0 {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d size -> %gpt (%d paragraph(s))", from, to, opts.BodySizePt, n))
@@ -104,13 +106,22 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 		if emptyCount > 0 {
 			result.Notes = append(result.Notes, fmt.Sprintf(
 				"%d empty paragraph(s) in the range have no runs, so font/size direct formatting was skipped for them; "+
-					"paragraph-level formatting (line spacing/alignment) still applies", emptyCount))
+					"paragraph-level formatting (line spacing/alignment/first-line indent/spacing before/after) still applies", emptyCount))
 		}
 	}
 
-	wantsParaFormat := opts.LineSpacing != 0 || opts.Align != ""
+	wantsParaFormat := opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 || opts.Align != "" ||
+		opts.FirstLineIndentChars != 0 || opts.SpaceBeforePt != 0 || opts.SpaceAfterPt != 0
 	if wantsParaFormat {
-		out, n, err := applyDirectParaFormat(working, paras, from, to, opts.LineSpacing, opts.Align)
+		req := pParaRequest{
+			LineSpacing:          opts.LineSpacing,
+			LineSpacingExactPt:   opts.LineSpacingExactPt,
+			SpaceBeforePt:        opts.SpaceBeforePt,
+			SpaceAfterPt:         opts.SpaceAfterPt,
+			Align:                opts.Align,
+			FirstLineIndentChars: opts.FirstLineIndentChars,
+		}
+		out, n, err := applyDirectParaFormat(working, paras, from, to, req)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
 		}
@@ -122,9 +133,25 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, n))
 		}
+		if opts.LineSpacingExactPt != 0 {
+			result.Applied = append(result.Applied, fmt.Sprintf(
+				"paragraph %d-%d line spacing -> exact %gpt (%d paragraph(s))", from, to, opts.LineSpacingExactPt, n))
+		}
+		if opts.SpaceBeforePt != 0 {
+			result.Applied = append(result.Applied, fmt.Sprintf(
+				"paragraph %d-%d space before -> %gpt (%d paragraph(s))", from, to, opts.SpaceBeforePt, n))
+		}
+		if opts.SpaceAfterPt != 0 {
+			result.Applied = append(result.Applied, fmt.Sprintf(
+				"paragraph %d-%d space after -> %gpt (%d paragraph(s))", from, to, opts.SpaceAfterPt, n))
+		}
 		if opts.Align != "" {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d alignment -> %s (%d paragraph(s))", from, to, opts.Align, n))
+		}
+		if opts.FirstLineIndentChars != 0 {
+			result.Applied = append(result.Applied, fmt.Sprintf(
+				"paragraph %d-%d first line indent -> %g chars (%d paragraph(s))", from, to, opts.FirstLineIndentChars, n))
 		}
 	}
 
@@ -138,12 +165,14 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 
 // applyDirectRunFormat rewrites every run's own <w:rPr> for every paragraph
 // in [from,to] (1-based, inclusive) that has at least one run, setting font
-// (via <w:rFonts>, skipped when "") and/or sizePt (via <w:sz>+<w:szCs> kept
-// in sync, skipped when 0). A paragraph with zero runs is left completely
-// untouched — there is no <w:r> to attach a <w:rPr> to — and does not count
-// toward the returned paragraph count; callers that need to report this
-// (Format's Notes) must compute it themselves from paras, the same slice
-// this function was given.
+// (via <w:rFonts> ascii/hAnsi/eastAsia/cs, skipped when "") and/or
+// eastAsiaFont (via the SAME <w:rFonts>'s eastAsia ONLY, skipped when "")
+// and/or sizePt (via <w:sz>+<w:szCs> kept in sync, skipped when 0). A
+// paragraph with zero runs is left completely untouched — there is no
+// <w:r> to attach a <w:rPr> to — and does not count toward the returned
+// paragraph count; callers that need to report this (Format's Notes) must
+// compute it themselves from paras, the same slice this function was
+// given.
 //
 // A single <w:r> is only ever patched once even if it produced more than
 // one Run (scan.go's Run.Elem doc comment: a <w:r> with multiple <w:t>
@@ -152,8 +181,8 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 // paras must be Scan's output for documentXML (or an equivalent rescan) —
 // stale offsets from an earlier version of the bytes would corrupt the
 // splice.
-func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font string, sizePt float64) ([]byte, int, error) {
-	if font == "" && sizePt == 0 {
+func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, eastAsiaFont string, sizePt float64) ([]byte, int, error) {
+	if font == "" && eastAsiaFont == "" && sizePt == 0 {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
 		return out, 0, nil
@@ -177,11 +206,11 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font s
 			}
 			seenElems[r.Elem] = true
 
-			openEnd, rpr, rfonts, sz, szcs, err := scanRunProps(documentXML, r.Elem)
+			openEnd, rpr, children, err := scanRunProps(documentXML, r.Elem)
 			if err != nil {
 				return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
 			}
-			patches = append(patches, planRunRPrPatches(documentXML, openEnd, rpr, rfonts, sz, szcs, font, sizePt)...)
+			patches = append(patches, planRunRPrPatches(documentXML, openEnd, rpr, children, font, eastAsiaFont, sizePt)...)
 			touchedThisPara = true
 		}
 		if touchedThisPara {
@@ -202,15 +231,16 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font s
 }
 
 // applyDirectParaFormat rewrites every paragraph's own <w:pPr> for every
-// paragraph in [from,to] (1-based, inclusive), setting lineSpacing (via
-// <w:spacing w:line=... w:lineRule="auto">, skipped when 0) and/or align
-// (via <w:jc>, skipped when ""). Unlike applyDirectRunFormat, a paragraph
-// with zero runs is NOT skipped: paragraph-level properties apply to an
-// empty paragraph exactly as they do to any other, including a genuinely
-// self-closing <w:p/> (expanded in place into <w:p><w:pPr>...</w:pPr></w:p>
-// — there is no content model to insert into otherwise).
-func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, lineSpacing float64, align string) ([]byte, int, error) {
-	if lineSpacing == 0 && align == "" {
+// paragraph in [from,to] (1-based, inclusive), applying req's fields
+// (LineSpacing/LineSpacingExactPt/SpaceBeforePt/SpaceAfterPt all land on
+// the SAME <w:spacing>; Align on <w:jc>; FirstLineIndentChars on <w:ind>).
+// Unlike applyDirectRunFormat, a paragraph with zero runs is NOT skipped:
+// paragraph-level properties apply to an empty paragraph exactly as they
+// do to any other, including a genuinely self-closing <w:p/> (expanded in
+// place into <w:p><w:pPr>...</w:pPr></w:p> — there is no content model to
+// insert into otherwise).
+func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req pParaRequest) ([]byte, int, error) {
+	if req.isZero() {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
 		return out, 0, nil
@@ -225,7 +255,7 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, lineS
 		}
 
 		if isSelfClosingSpan(documentXML, p.Span) {
-			newXML := expandSelfClosingParagraph(documentXML, p.Span, lineSpacing, align)
+			newXML := expandSelfClosingParagraph(documentXML, p.Span, req)
 			patches = append(patches, PatchRawSpan(documentXML, p.Span, newXML))
 			changed++
 			continue
@@ -235,7 +265,7 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, lineS
 		if err != nil {
 			return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
 		}
-		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, children, lineSpacing, align)...)
+		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, children, req)...)
 		changed++
 	}
 
@@ -255,13 +285,13 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, lineS
 // <w:p ...><w:pPr>...</w:pPr></w:p>, carrying over whatever attributes the
 // original tag had (e.g. w:rsidR) by editing the existing bytes rather than
 // synthesizing a bare "<w:p>" that would silently drop them.
-func expandSelfClosingParagraph(doc []byte, span Span, lineSpacing float64, align string) string {
+func expandSelfClosingParagraph(doc []byte, span Span, req pParaRequest) string {
 	openTag := string(doc[span.Start:span.End])
 	withoutSlash := strings.TrimSuffix(openTag, "/>") + ">"
 
 	var b strings.Builder
 	b.WriteString(withoutSlash)
-	b.WriteString(buildParaPPr(nil, lineSpacing, align))
+	b.WriteString(buildParaPPr(nil, req))
 	b.WriteString("</w:p>")
 	return b.String()
 }
@@ -270,17 +300,15 @@ func expandSelfClosingParagraph(doc []byte, span Span, lineSpacing float64, alig
 // used both by expandSelfClosingParagraph and by planParaPPrPatches when no
 // <w:pPr> exists at all. pprAttrs carries attributes to place on the
 // <w:pPr> tag itself (preserved when an existing self-closing <w:pPr/> is
-// being expanded; nil for a brand new one).
-func buildParaPPr(pprAttrs []xml.Attr, lineSpacing float64, align string) string {
+// being expanded; nil for a brand new one). Delegating to
+// buildPPrOps(nil, req)/renderActiveLeaves (rather than hand-rendering
+// spacing/jc in a fixed order, as an earlier version of this function did)
+// is what lets a brand new pPr pick up FirstLineIndentChars' <w:ind> in the
+// schema-correct position (between spacing and jc) for free.
+func buildParaPPr(pprAttrs []xml.Attr, req pParaRequest) string {
 	var b strings.Builder
 	b.WriteString(buildTag("pPr", pprAttrs, false))
-	if lineSpacing != 0 {
-		line := lineSpacingTo240ths(lineSpacing)
-		b.WriteString(buildTag("spacing", setAttr(setAttr(nil, "line", line), "lineRule", "auto"), true))
-	}
-	if align != "" {
-		b.WriteString(buildTag("jc", setAttr(nil, "val", align), true))
-	}
+	b.WriteString(renderActiveLeaves(buildPPrOps(nil, req)))
 	b.WriteString("</w:pPr>")
 	return b.String()
 }
@@ -289,11 +317,11 @@ func buildParaPPr(pprAttrs []xml.Attr, lineSpacing float64, align string) string
 // mirroring buildParaPPr for the run-level case. rprAttrs carries
 // attributes for the <w:rPr> tag itself (preserved when an existing
 // self-closing <w:rPr/> is being expanded; nil for a brand new one).
-func buildRunRPr(rprAttrs []xml.Attr, font string, sizePt float64) string {
+func buildRunRPr(rprAttrs []xml.Attr, font, eastAsiaFont string, sizePt float64) string {
 	var b strings.Builder
 	b.WriteString(buildTag("rPr", rprAttrs, false))
-	if font != "" {
-		b.WriteString(buildTag("rFonts", rFontsLiteralAttrs(nil, font), true))
+	if font != "" || eastAsiaFont != "" {
+		b.WriteString(buildTag("rFonts", rFontsDirectRangeAttrs(nil, font, eastAsiaFont), true))
 	}
 	if sizePt != 0 {
 		half := ptToHalfPoints(sizePt)
@@ -302,6 +330,32 @@ func buildRunRPr(rprAttrs []xml.Attr, font string, sizePt float64) string {
 	}
 	b.WriteString("</w:rPr>")
 	return b.String()
+}
+
+// rFontsDirectRangeAttrs is the paragraph-range direct-formatting path's
+// font-attrs builder. When eastAsiaFont is "" it reduces EXACTLY to
+// rFontsLiteralAttrs(existing, latinFont) — this path's pre-existing,
+// tested behavior (literal ascii/hAnsi/eastAsia/cs all set to the same
+// font) is left completely unchanged, since EastAsiaFont's whole point
+// (task 8 brief) is to be new, additive, opt-in behavior, never a silent
+// change to what body_font alone already did on a range before
+// EastAsiaFont existed. When eastAsiaFont is non-"", it is applied AFTER,
+// overriding just w:eastAsia (and dropping eastAsiaTheme) — so
+// latinFont != "" && eastAsiaFont != "" together yields ascii/hAnsi/cs =
+// latinFont, eastAsia = eastAsiaFont (the orthogonal-but-combinable
+// outcome BodyFont/EastAsiaFont's own doc comments describe), and
+// eastAsiaFont alone (latinFont == "") leaves ascii/hAnsi/cs completely
+// untouched, only setting eastAsia.
+func rFontsDirectRangeAttrs(existing []xml.Attr, latinFont, eastAsiaFont string) []xml.Attr {
+	attrs := existing
+	if latinFont != "" {
+		attrs = rFontsLiteralAttrs(attrs, latinFont)
+	}
+	if eastAsiaFont != "" {
+		attrs = dropAttrs(attrs, "eastAsiaTheme", "eastAsia")
+		attrs = append(attrs, xml.Attr{Name: xml.Name{Local: "eastAsia"}, Value: eastAsiaFont})
+	}
+	return attrs
 }
 
 // planRunRPrPatches builds the patches for one run's direct font/size
@@ -319,38 +373,41 @@ func buildRunRPr(rprAttrs []xml.Attr, font string, sizePt float64) string {
 //     planStylesPatches's docDefaults path also uses — an existing
 //     <w:rFonts>/<w:sz>/<w:szCs> is rewritten in place (never duplicated), a
 //     newly inserted <w:rFonts> lands as rPr's first child (EG_RPrBase
-//     order), and everything else already inside <w:rPr> (bold, colour, ...)
-//     is left completely alone.
-func planRunRPrPatches(doc []byte, openEnd int, rpr, rfonts, sz, szcs elemInfo, font string, sizePt float64) []Patch {
+//     order), a newly inserted <w:sz>/<w:szCs> lands before whichever later
+//     EG_RPrBase sibling already exists (task 8 brief, §3a), and everything
+//     else already inside <w:rPr> (bold, colour, ...) is left completely
+//     alone. children is rPr's full set of tracked direct children
+//     (scanRunProps, via scanDirectChildren against rPrChildOrder).
+func planRunRPrPatches(doc []byte, openEnd int, rpr elemInfo, children map[string]elemInfo, font, eastAsiaFont string, sizePt float64) []Patch {
 	if !rpr.found {
-		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildRunRPr(nil, font, sizePt))}
+		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildRunRPr(nil, font, eastAsiaFont, sizePt))}
 	}
 	if rpr.selfClosing {
-		return []Patch{PatchRawSpan(doc, rpr.tagSpan, buildRunRPr(rpr.attrs, font, sizePt))}
+		return []Patch{PatchRawSpan(doc, rpr.tagSpan, buildRunRPr(rpr.attrs, font, eastAsiaFont, sizePt))}
 	}
-	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, font, sizePt, rFontsLiteralAttrs)
+	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, children, font, eastAsiaFont, sizePt, rFontsDirectRangeAttrs)
 }
 
 // planParaPPrPatches is planRunRPrPatches's paragraph-level twin: the same
 // three shapes (missing / self-closing / present-with-content), landing on
-// <w:pPr><w:spacing>/<w:jc> instead of <w:rPr><w:rFonts>/<w:sz>/<w:szCs>.
-// The self-closing-<w:p/> case is handled one level up, by
+// <w:pPr><w:spacing>/<w:ind>/<w:jc> instead of <w:rPr><w:rFonts>/<w:sz>/
+// <w:szCs>. The self-closing-<w:p/> case is handled one level up, by
 // expandSelfClosingParagraph, before this function is ever called — by the
 // time openEnd/ppr/children reach here, the paragraph itself is known to
 // have a content model. children is pPr's full set of tracked direct
 // children (scanParaProps, via scanDirectChildren) — buildPPrOps uses all of
-// it as an anchor set so a newly inserted spacing/jc lands in CT_PPr's
-// schema order even when pPr also carries an <w:rPr>, <w:ind>, or
-// <w:sectPr> (format capability review, Critical 1), not merely relative to
-// spacing/jc themselves.
-func planParaPPrPatches(doc []byte, openEnd int, ppr elemInfo, children map[string]elemInfo, lineSpacing float64, align string) []Patch {
+// it as an anchor set so a newly inserted spacing/ind/jc lands in CT_PPr's
+// schema order even when pPr also carries an <w:rPr> or a <w:sectPr>
+// (format capability review, Critical 1), not merely relative to
+// spacing/ind/jc themselves.
+func planParaPPrPatches(doc []byte, openEnd int, ppr elemInfo, children map[string]elemInfo, req pParaRequest) []Patch {
 	if !ppr.found {
-		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildParaPPr(nil, lineSpacing, align))}
+		return []Patch{PatchRawSpan(doc, Span{openEnd, openEnd}, buildParaPPr(nil, req))}
 	}
 	if ppr.selfClosing {
-		return []Patch{PatchRawSpan(doc, ppr.tagSpan, buildParaPPr(ppr.attrs, lineSpacing, align))}
+		return []Patch{PatchRawSpan(doc, ppr.tagSpan, buildParaPPr(ppr.attrs, req))}
 	}
-	return applyLeafOps(doc, ppr.closeStart, buildPPrOps(children, lineSpacing, align))
+	return applyLeafOps(doc, ppr.closeStart, buildPPrOps(children, req))
 }
 
 // scanRunProps scans elem — a single run's <w:r>...</w:r> byte range, as
@@ -380,8 +437,13 @@ func planParaPPrPatches(doc []byte, openEnd int, ppr elemInfo, children map[stri
 // call below inherits the same fix for rFonts/sz/szCs, which would
 // otherwise be read from (and rewritten into) the historical copy instead
 // of the run's current properties (format capability review follow-up,
-// same root cause as Critical 2).
-func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs elemInfo, err error) {
+// same root cause as Critical 2). children is rPr's full set of tracked
+// direct children (scanDirectChildren against rPrChildOrder — not merely
+// rFonts/sz/szCs), the same "full anchor set, not three individually named
+// leaves" shape scanParaProps already returns for pPr, needed so a newly
+// inserted sz/szCs can anchor against whichever later EG_RPrBase sibling
+// (u, rPrChange, ...) already exists (task 8 brief, §3a).
+func scanRunProps(doc []byte, elem Span) (openEnd int, rpr elemInfo, children map[string]elemInfo, err error) {
 	sub := doc[elem.Start:elem.End]
 	dec := xml.NewDecoder(bytes.NewReader(sub))
 
@@ -396,7 +458,7 @@ func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs ele
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return 0, rpr, rfonts, sz, szcs, fmt.Errorf("scan run properties: %w", terr)
+			return 0, rpr, nil, fmt.Errorf("scan run properties: %w", terr)
 		}
 		offset := int(dec.InputOffset())
 
@@ -437,10 +499,9 @@ func scanRunProps(doc []byte, elem Span) (openEnd int, rpr, rfonts, sz, szcs ele
 	}
 
 	if rpr.found && !rpr.selfClosing {
-		children := scanDirectChildren(doc[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
-		rfonts, sz, szcs = children["rFonts"], children["sz"], children["szCs"]
+		children = scanDirectChildren(doc[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrChildOrder)
 	}
-	return openEnd, rpr, rfonts, sz, szcs, nil
+	return openEnd, rpr, children, nil
 }
 
 // scanParaProps is scanRunProps's paragraph-level twin: scans span — a

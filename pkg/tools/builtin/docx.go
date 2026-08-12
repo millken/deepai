@@ -616,20 +616,23 @@ func DocxFormatTool() models.Tool {
 		ParallelSafe: false,
 		Description: "Apply formatting to a .docx. Two modes, chosen by whether start_para/end_para is given: " +
 			"(1) WITHOUT a range (the default): changes the document's DEFAULT styles — a named template " +
-			"(corporate, academic, minimal), heading/body font, body size, line spacing, alignment, margins, and " +
-			"collapsing runs of consecutive empty paragraphs. This is document-wide: every paragraph that does " +
-			"not already carry its own direct formatting picks up the new default. (2) WITH start_para/end_para " +
-			"(1-based, inclusive): applies DIRECT formatting — font, size, line spacing, alignment — to only the " +
-			"paragraphs in that range, which overrides the document's default styles for exactly those " +
-			"paragraphs. This is the way to change one paragraph's (or a few paragraphs') font size, font, line " +
-			"spacing, or alignment without reformatting the rest of the document — use this instead of editing " +
-			"the file with a script. template, heading_font, margins_mm, and normalize are document-level " +
-			"concepts and are refused with an explicit error if combined with a range. Never changes body text " +
-			"either way. Reports which rules actually changed something in applied — including how many " +
-			"paragraphs were affected when a range was used — and an empty or no-op rules object says so " +
-			"explicitly rather than looking identical to a real change. page_numbers and rebuild_toc are not " +
-			"supported yet and return an explicit error rather than being silently ignored, with or without a " +
-			"range. Backs up the original file once, before the first overwrite, to <path>.bak.",
+			"(corporate, academic, minimal), heading/body/east-asia font, body size, line spacing (multiple or " +
+			"exact points), alignment (left/center/right/justify), first-line indent, space before/after, " +
+			"margins, and collapsing runs of consecutive empty paragraphs. This is document-wide: every " +
+			"paragraph that does not already carry its own direct formatting picks up the new default. " +
+			"(2) WITH start_para/end_para (1-based, inclusive): applies DIRECT formatting — the same font/size/" +
+			"spacing/alignment/indent fields — to only the paragraphs in that range, which overrides the " +
+			"document's default styles for exactly those paragraphs. This is the way to change one paragraph's " +
+			"(or a few paragraphs') formatting without reformatting the rest of the document — use this instead " +
+			"of editing the file with a script. template, heading_font, margins_mm, and normalize are " +
+			"document-level concepts and are refused with an explicit error if combined with a range. " +
+			"line_spacing and line_spacing_exact_pt are mutually exclusive — giving both is an error, on either " +
+			"path. Never changes body text either way. Reports which rules actually changed something in " +
+			"applied — including how many paragraphs were affected when a range was used — and an empty or " +
+			"no-op rules object says so explicitly rather than looking identical to a real change. page_numbers " +
+			"and rebuild_toc are not supported yet and return an explicit error rather than being silently " +
+			"ignored, with or without a range. Backs up the original file once, before the first overwrite, to " +
+			"<path>.bak.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -650,11 +653,28 @@ func DocxFormatTool() models.Tool {
 					"description": "Formatting rules to apply. Every field is optional; an empty or omitted object is a no-op.",
 					"properties": map[string]any{
 						"template":     map[string]any{"type": "string", "description": "Named preset: corporate, academic, or minimal. Explicit fields below override the preset's values."},
-						"heading_font": map[string]any{"type": "string", "description": "Replaces Heading1-9's font"},
-						"body_font":    map[string]any{"type": "string", "description": "Replaces the document's default font"},
+						"heading_font": map[string]any{"type": "string", "description": "Replaces Heading1-9's font (ascii/hAnsi only; combine with east_asia_font in the same call to also set the heading's CJK font)"},
+						"body_font":    map[string]any{"type": "string", "description": "Replaces the document's default LATIN font (ascii/hAnsi only). Orthogonal to east_asia_font — an existing CJK font survives untouched unless east_asia_font is also given."},
+						"east_asia_font": map[string]any{
+							"type":        "string",
+							"description": "Replaces the document's default EAST ASIAN font only (w:eastAsia). Independent of body_font/heading_font — set it alongside either to change both the Latin and CJK font pair in one call, or alone to change only the CJK font.",
+						},
 						"body_size_pt": map[string]any{"type": "number", "description": "Replaces the document's default font size, in points"},
-						"line_spacing": map[string]any{"type": "number", "description": "Line spacing as a multiple of a single line (1.0, 1.15, 2.0, ...)"},
-						"align":        map[string]any{"type": "string", "description": "left or justify"},
+						"line_spacing": map[string]any{
+							"type":        "number",
+							"description": "Line spacing as a multiple of a single line (1.0, 1.15, 2.0, ...); w:lineRule=\"auto\". Mutually exclusive with line_spacing_exact_pt — giving both is an error.",
+						},
+						"line_spacing_exact_pt": map[string]any{
+							"type":        "number",
+							"description": "Fixed line height in points (w:line = pt*20 twips, w:lineRule=\"exact\"), instead of a multiple of a line. Mutually exclusive with line_spacing — giving both is an error.",
+						},
+						"align": map[string]any{"type": "string", "description": "One of: left, center, right, justify"},
+						"first_line_indent_chars": map[string]any{
+							"type":        "number",
+							"description": "First-line indent measured in CHARACTER widths (2 is the conventional opening indent for a Chinese paragraph). Writes w:ind w:firstLineChars=n*100 (hundredths of a character, what Word renders relative to the current font size) plus a fixed w:firstLine twips fallback for readers that ignore firstLineChars.",
+						},
+						"space_before_pt": map[string]any{"type": "number", "description": "Paragraph spacing before, in points (w:spacing w:before = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_after_pt."},
+						"space_after_pt":  map[string]any{"type": "number", "description": "Paragraph spacing after, in points (w:spacing w:after = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_before_pt."},
 						"margins_mm": map[string]any{
 							"type":        "array",
 							"items":       map[string]any{"type": "number"},
@@ -858,6 +878,13 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 		}
 		opts.BodyFont = s
 	}
+	if v, present := raw["east_asia_font"]; present && v != nil {
+		s, ok := v.(string)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.east_asia_font must be a string")
+		}
+		opts.EastAsiaFont = s
+	}
 	if v, present := raw["align"]; present && v != nil {
 		s, ok := v.(string)
 		if !ok {
@@ -884,6 +911,36 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 		return docx.FormatOptions{}, err
 	}
 	opts.LineSpacing = lineSpacing
+
+	// line_spacing_exact_pt is line_spacing's mutually-exclusive sibling —
+	// both type-checked here the same never-coerce way, but the actual
+	// mutual-exclusion RULE (both non-zero is an error) is enforced by
+	// pkg/docx (validateAlignAndLineSpacingMutex), the same domain-rule
+	// split this file's own doc comment already documents for align/
+	// template (task 8 brief's "参数校验层拒绝" requirement).
+	lineSpacingExactPt, err := docxFormatNumberArg(raw, "line_spacing_exact_pt")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.LineSpacingExactPt = lineSpacingExactPt
+
+	firstLineIndentChars, err := docxFormatNumberArg(raw, "first_line_indent_chars")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.FirstLineIndentChars = firstLineIndentChars
+
+	spaceBeforePt, err := docxFormatNumberArg(raw, "space_before_pt")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.SpaceBeforePt = spaceBeforePt
+
+	spaceAfterPt, err := docxFormatNumberArg(raw, "space_after_pt")
+	if err != nil {
+		return docx.FormatOptions{}, err
+	}
+	opts.SpaceAfterPt = spaceAfterPt
 
 	if err := requireNotRequested(raw, "page_numbers",
 		"docx_format: page_numbers is not supported yet — adding page numbers requires a new word/footerN.xml "+

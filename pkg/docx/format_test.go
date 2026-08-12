@@ -53,6 +53,10 @@ func TestFormat_BodySizeLandsInDocDefaultsAndSyncsSzCs(t *testing.T) {
 // TestFormat_HeadingFontRemovesThemeAttributes is the trap this task exists
 // to avoid: the fixture's heading rFonts carries w:asciiTheme="majorHAnsi",
 // and a literal w:ascii added beside it is ignored by Word — the theme wins.
+// It also pins task 8's follow-on fix: HeadingFont on its own no longer
+// touches eastAsia/eastAsiaTheme/cs/cstheme at all (that pair is
+// EastAsiaFont's own job — see TestFormat_HeadingFontWithEastAsiaFont
+// below), so those two *Theme attributes are expected to SURVIVE here.
 func TestFormat_HeadingFontRemovesThemeAttributes(t *testing.T) {
 	d, _ := formatDoc(t)
 	if _, err := d.Format(FormatOptions{HeadingFont: "Georgia"}); err != nil {
@@ -64,8 +68,33 @@ func TestFormat_HeadingFontRemovesThemeAttributes(t *testing.T) {
 	if !strings.Contains(h1, `w:ascii="Georgia"`) {
 		t.Errorf("Heading1 lacks the literal font:\n%s", h1)
 	}
+	if strings.Contains(h1, "asciiTheme=") || strings.Contains(h1, "hAnsiTheme=") {
+		t.Errorf("Heading1 still carries ascii/hAnsi theme font attributes, which override the literal one:\n%s", h1)
+	}
+	if !strings.Contains(h1, "eastAsiaTheme=") {
+		t.Errorf("Heading1 lost its eastAsiaTheme attribute; HeadingFont alone must not touch eastAsia at all:\n%s", h1)
+	}
+}
+
+// TestFormat_HeadingFontWithEastAsiaFont covers HeadingFont+EastAsiaFont
+// given together in the SAME call: only then does the heading's own
+// eastAsia font/theme get replaced too (task 8 brief; task 7 复审遗留).
+func TestFormat_HeadingFontWithEastAsiaFont(t *testing.T) {
+	d, _ := formatDoc(t)
+	if _, err := d.Format(FormatOptions{HeadingFont: "Georgia", EastAsiaFont: "SimSun"}); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	s := stylesXML(t, d)
+	h1 := s[strings.Index(s, `w:styleId="Heading1"`):]
+	h1 = h1[:strings.Index(h1, "</w:style>")]
+	if !strings.Contains(h1, `w:ascii="Georgia"`) {
+		t.Errorf("Heading1 lacks the literal Latin font:\n%s", h1)
+	}
+	if !strings.Contains(h1, `w:eastAsia="SimSun"`) {
+		t.Errorf("Heading1 lacks the literal east-asia font:\n%s", h1)
+	}
 	if strings.Contains(h1, "Theme=") {
-		t.Errorf("Heading1 still carries theme font attributes, which override the literal one:\n%s", h1)
+		t.Errorf("Heading1 still carries a theme font attribute:\n%s", h1)
 	}
 }
 
@@ -251,11 +280,22 @@ func TestFormat_NoOptionsIsANoOp(t *testing.T) {
 // so it was never shadowing line spacing to begin with), and Header/Footer/
 // Caption now revert to their ORIGINAL (pre-task-7) bytes, confirmed by diff
 // against the pristine fixture.
+//
+// styles.xml's hash/length were re-captured a THIRD time for task 8:
+// HeadingFont alone (given here, with no EastAsiaFont) no longer touches
+// eastAsia/cs at all (see planHeadingFontPatches' own doc comment) — this
+// fixture's nine Heading1-9 styles each keep their original
+// eastAsiaTheme="majorEastAsia"/cstheme="majorBidi" instead of having them
+// replaced with literal eastAsia="Georgia"/cs="Georgia" the way the
+// pre-task-8 code did. Verified directly: the ONLY byte difference from the
+// previous capture is exactly those two theme attributes surviving on all
+// nine headings (+162 bytes = 18 bytes/heading * 9), confirmed by diffing
+// styles.xml before/after this task's change against the previous capture.
 func TestFormat_NoRangeOutputIsUnchangedByDirectFormatting(t *testing.T) {
 	const (
-		wantStylesSHA256 = "652d1588e33e791b9166b956e0bcadf48ee84ffdd2113a019142635cabd99428"
+		wantStylesSHA256 = "64fcc7c0665521939b960fdf1859b9d48e219184946d6b9b4e60261a9f2e248d"
 		wantDocSHA256    = "d84400b6456f8f3be5a02edee299c543f191a9aff867d6dbe9598d795b44e5e9"
-		wantStylesLen    = 349159
+		wantStylesLen    = 349321
 		wantDocLen       = 3709
 	)
 	d, _ := formatDoc(t)

@@ -299,7 +299,7 @@ func TestPlanHeadingFontPatches_SecondIdenticalCallProducesNoPatches(t *testing.
 		`<w:rPr><w:rFonts w:ascii="Cambria"/></w:rPr></w:style>` +
 		`</w:styles>`)
 
-	first, touched, err := planHeadingFontPatches(styles, "Georgia")
+	first, touched, err := planHeadingFontPatches(styles, "Georgia", "")
 	if err != nil {
 		t.Fatalf("first planHeadingFontPatches: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestPlanHeadingFontPatches_SecondIdenticalCallProducesNoPatches(t *testing.
 		t.Fatalf("Apply: %v", err)
 	}
 
-	second, _, err := planHeadingFontPatches(out, "Georgia")
+	second, _, err := planHeadingFontPatches(out, "Georgia", "")
 	if err != nil {
 		t.Fatalf("second planHeadingFontPatches: %v", err)
 	}

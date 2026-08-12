@@ -19,7 +19,7 @@ func TestDirect_OnlyTheRangeIsTouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 2, 2, "Georgia", 0)
+	got, n, err := applyDirectRunFormat(doc, paras, 2, 2, "Georgia", "", 0)
 	if err != nil {
 		t.Fatalf("applyDirectRunFormat: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestDirect_OnlyTheRangeIsTouched(t *testing.T) {
 func TestDirect_MergesIntoExistingRunProperties(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", 14)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestDirect_MergesIntoExistingRunProperties(t *testing.T) {
 func TestDirect_InsertsRunPropertiesWhenAbsent(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 14)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestDirect_InsertsRunPropertiesWhenAbsent(t *testing.T) {
 func TestDirect_UpdatesAnExistingSizeInsteadOfDuplicating(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", 14)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestDirect_UpdatesAnExistingSizeInsteadOfDuplicating(t *testing.T) {
 func TestDirect_IsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	once, n1, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", 14)
+	once, n1, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestDirect_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectRunFormat(once, paras2, 1, 2, "Georgia", 14)
+	twice, n2, err := applyDirectRunFormat(once, paras2, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 		t.Fatalf("paragraph 1 fixture must have zero runs")
 	}
 
-	runOut, runN, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", 14)
+	runOut, runN, err := applyDirectRunFormat(doc, paras, 1, 2, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 		t.Errorf("empty paragraph 1 was touched by run-level formatting: %s", p1)
 	}
 
-	paraOut, paraN, err := applyDirectParaFormat(doc, paras, 1, 2, 1.5, "")
+	paraOut, paraN, err := applyDirectParaFormat(doc, paras, 1, 2, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 func TestDirect_LeavesTextUntouched(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:t>hello world</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	got, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 14)
+	got, _, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestDirect_RunInsideHyperlinkIsFormatted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 14)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("no pPr at all", func(t *testing.T) {
 		doc := []byte(`<w:p><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "justify")
+		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +280,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("pPr present but lacking the target property", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "justify")
+		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -302,7 +302,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("target property already present", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:spacing w:line="240" w:lineRule="auto"/><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "justify")
+		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -335,7 +335,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "justify")
+	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectParaFormat(got, gotParas, 1, 1, 1.5, "justify")
+	twice, n2, err := applyDirectParaFormat(got, gotParas, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	once, n1, err := applyDirectParaFormat(doc, paras, 1, 1, 1.15, "justify")
+	once, n1, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectParaFormat(once, paras2, 1, 1, 1.15, "justify")
+	twice, n2, err := applyDirectParaFormat(once, paras2, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestDirect_NoFieldsIsANoOp(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
 
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", 0)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestDirect_NoFieldsIsANoOp(t *testing.T) {
 		t.Errorf("output changed for an empty run-format request: %s", got)
 	}
 
-	got2, n2, err := applyDirectParaFormat(doc, paras, 1, 1, 0, "")
+	got2, n2, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,11 +581,66 @@ func TestFormat_DocumentOnlyRulesErrorWithARange(t *testing.T) {
 	}
 }
 
-// TestFormat_RangeRejectsUnknownAlignment mirrors the whole-document path's
-// validation for Align, which the direct-formatting path must not skip.
+// TestFormat_RangeAcceptsAllFourAlignments pins task 8's Critical-3 fix:
+// align used to accept only "left"/"justify" (and format_direct_test.go
+// used to lock in a hard rejection of "center" right here) — "center" and
+// "right" are now first-class, on both the range path (this test) and the
+// whole-document path (TestFormat_WholeDocumentAcceptsAllFourAlignments
+// below).
+func TestFormat_RangeAcceptsAllFourAlignments(t *testing.T) {
+	for _, align := range []string{"left", "center", "right", "justify"} {
+		t.Run(align, func(t *testing.T) {
+			d := directFixtureDoc(t)
+			if _, err := d.Format(FormatOptions{StartPara: 1, Align: align}); err != nil {
+				t.Fatalf("Format with align=%q: %v", align, err)
+			}
+			doc, _ := d.Part(DocumentPart)
+			want := `<w:jc w:val="` + align + `"/>`
+			if !strings.Contains(string(doc), want) {
+				t.Errorf("document.xml lacks %s: %s", want, doc)
+			}
+		})
+	}
+}
+
+// TestFormat_WholeDocumentAcceptsAllFourAlignments is
+// TestFormat_RangeAcceptsAllFourAlignments's whole-document-path twin.
+func TestFormat_WholeDocumentAcceptsAllFourAlignments(t *testing.T) {
+	for _, align := range []string{"left", "center", "right", "justify"} {
+		t.Run(align, func(t *testing.T) {
+			out := applyStylesPatches(t, []byte(stylesEmptyDocDefaults), FormatOptions{Align: align})
+			want := `<w:jc w:val="` + align + `"/>`
+			if !strings.Contains(out, want) {
+				t.Errorf("styles.xml lacks %s: %s", want, out)
+			}
+		})
+	}
+}
+
+// TestFormat_RangeRejectsUnknownAlignment covers a genuinely unknown value
+// (not one of the four real ones) — validation must still reject something
+// that isn't a real alignment at all.
 func TestFormat_RangeRejectsUnknownAlignment(t *testing.T) {
 	d := directFixtureDoc(t)
-	if _, err := d.Format(FormatOptions{StartPara: 1, Align: "center"}); err == nil {
+	if _, err := d.Format(FormatOptions{StartPara: 1, Align: "middle"}); err == nil {
 		t.Fatal("an unknown alignment was accepted with a range; want an error")
 	}
+}
+
+// TestFormat_LineSpacingAndLineSpacingExactPtAreMutuallyExclusive covers
+// the brief's explicit validation requirement: giving both in the SAME
+// call must error, on both paths.
+func TestFormat_LineSpacingAndLineSpacingExactPtAreMutuallyExclusive(t *testing.T) {
+	t.Run("whole document", func(t *testing.T) {
+		d := directFixtureDoc(t)
+		if _, err := d.Format(FormatOptions{LineSpacing: 1.5, LineSpacingExactPt: 24}); err == nil {
+			t.Fatal("line_spacing + line_spacing_exact_pt together was accepted; want an error")
+		}
+	})
+	t.Run("paragraph range", func(t *testing.T) {
+		d := directFixtureDoc(t)
+		if _, err := d.Format(FormatOptions{StartPara: 1, LineSpacing: 1.5, LineSpacingExactPt: 24}); err == nil {
+			t.Fatal("line_spacing + line_spacing_exact_pt together was accepted with a range; want an error")
+		}
+	})
 }

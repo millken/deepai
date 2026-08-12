@@ -85,7 +85,7 @@ func TestDirect_ParagraphFormat_SpacingAndJcLandBeforeExistingRPr(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "justify")
+	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestDirect_ParagraphFormat_SpacingLandsBeforeExistingInd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "")
+	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestDirect_ParagraphFormat_JcLandsBeforeExistingSectPr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 0, "justify")
+	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestDirect_ParagraphFormat_IgnoresCharacterSpacingInsideNestedRPr(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, 1.5, "")
+	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestDirect_RunFormat_InsertedRFontsLandsBeforeExistingBold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 0)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +330,7 @@ func TestDirect_RunFormat_IgnoresHistoricalPropertiesInsideRPrChange(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", 14)
+	got, n, err := applyDirectRunFormat(doc, paras, 1, 1, "Georgia", "", 14)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestFormat_HeadingFontInsertedRFontsLandsBeforeExistingBold(t *testing.T) {
 	const styles = `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
 		`<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/></w:rPr></w:style>` +
 		`</w:styles>`
-	patches, _, err := planHeadingFontPatches([]byte(styles), "Georgia")
+	patches, _, err := planHeadingFontPatches([]byte(styles), "Georgia", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestFormat_HeadingFontIgnoresHistoricalRFontsInsideRPrChange(t *testing.T) 
 		`<w:rPr><w:b/><w:rPrChange w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z">` +
 		`<w:rPr><w:rFonts w:ascii="Old"/></w:rPr></w:rPrChange></w:rPr></w:style>` +
 		`</w:styles>`
-	patches, _, err := planHeadingFontPatches([]byte(styles), "Georgia")
+	patches, _, err := planHeadingFontPatches([]byte(styles), "Georgia", "")
 	if err != nil {
 		t.Fatal(err)
 	}

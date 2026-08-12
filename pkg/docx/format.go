@@ -57,10 +57,54 @@ type FormatOptions struct {
 	// e.g. docx_write's own BodyText style (format capability review,
 	// Critical 4; write review, I4).
 	LineSpacing float64
-	// Align, if non-"", is "left" or "justify": it lands on docDefaults's
-	// <w:pPrDefault><w:pPr><w:jc>, plus the same <w:jc> wherever a style
-	// basedOn Normal (per BodyFont's own exclusions) already sets one.
+	// Align, if non-"", is one of "left"/"center"/"right"/"justify": it
+	// lands on docDefaults's <w:pPrDefault><w:pPr><w:jc>, plus the same
+	// <w:jc> wherever a style basedOn Normal (per BodyFont's own
+	// exclusions) already sets one.
 	Align string
+	// EastAsiaFont, if non-"", replaces the document's default EAST ASIAN
+	// font ONLY: it lands on docDefaults' rPr's <w:rFonts w:eastAsia=...>,
+	// dropping any competing eastAsiaTheme, and on the SAME rFonts of
+	// Normal and any style basedOn it (per BodyFont's own exclusions) that
+	// already declares its own eastAsia font, shadowing docDefaults
+	// otherwise. It never touches ascii/hAnsi/cs — orthogonal to BodyFont
+	// (task 8 brief, §2; format capability review, Important 8's own
+	// "中文宋体+西文 Times 表达不了" complaint). With a paragraph range
+	// (StartPara/EndPara), it lands on each targeted run's own
+	// <w:rPr><w:rFonts w:eastAsia=...> instead. With HeadingFont in the
+	// SAME call, it also sets Heading1..9's own eastAsia font — see
+	// HeadingFont's own doc comment for why HeadingFont alone no longer
+	// touches eastAsia at all.
+	EastAsiaFont string
+	// FirstLineIndentChars, if non-zero, sets a first-line indent measured
+	// in CHARACTER widths (2 is the conventional opening indent for a
+	// Chinese paragraph — see styles.go's bodyTextStyleXML for this
+	// package's own docx_write equivalent): it lands on <w:ind
+	// w:firstLineChars="n*100"/> (hundredths of a character — the unit
+	// Word actually renders relative to the paragraph's current font
+	// size) AND, as a fixed-size fallback for any reader that ignores
+	// firstLineChars, w:firstLine in twips — see firstLineTwipsFromChars's
+	// doc comment for the fixed points-per-character assumption behind
+	// that fallback value. Lands on docDefaults' pPr (plus the style-chain
+	// rewrite, per BodyFont's own exclusions) whole-document, or each
+	// targeted paragraph's own <w:pPr><w:ind> with a range.
+	FirstLineIndentChars float64
+	// SpaceBeforePt/SpaceAfterPt, if non-zero, set paragraph spacing
+	// before/after in points: they land as w:before/w:after (twips,
+	// pt*20) on the SAME <w:spacing> element LineSpacing/
+	// LineSpacingExactPt land w:line/w:lineRule on — CT_PPr only has one
+	// <w:spacing> child, so a call setting more than one of these fields
+	// together always merges into a single tag, never two.
+	SpaceBeforePt float64
+	SpaceAfterPt  float64
+	// LineSpacingExactPt, if non-zero, sets a FIXED line height in points
+	// (as opposed to LineSpacing's multiple-of-a-single-line): it lands on
+	// <w:spacing w:line="pt*20" w:lineRule="exact"/> instead of
+	// LineSpacing's w:lineRule="auto". Mutually exclusive with
+	// LineSpacing — both non-zero in the same call is a validation error
+	// (resolveFormatOptions/formatDirectRange), since they would
+	// otherwise silently fight over the same w:line/w:lineRule attributes.
+	LineSpacingExactPt float64
 	// MarginsMM, if non-nil, must have exactly 4 values: top, right,
 	// bottom, left, in millimeters. It lands on word/document.xml's
 	// <w:sectPr><w:pgMar> (every one found, in case of multiple sections),
@@ -195,7 +239,9 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	var result FormatResult
 
 	wantsStyles := resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
-		resolved.LineSpacing != 0 || resolved.Align != "" || resolved.HeadingFont != ""
+		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
+		resolved.HeadingFont != "" || resolved.EastAsiaFont != "" ||
+		resolved.FirstLineIndentChars != 0 || resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0
 	if wantsStyles {
 		styles, ok := d.Part("word/styles.xml")
 		if !ok {
@@ -277,7 +323,9 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	// looks like this" when some do not (format capability review,
 	// Critical 4 / §2's masking-detection requirement).
 	if resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
-		resolved.LineSpacing != 0 || resolved.Align != "" {
+		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
+		resolved.EastAsiaFont != "" || resolved.FirstLineIndentChars != 0 ||
+		resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0 {
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
@@ -309,15 +357,33 @@ func resolveFormatOptions(opts FormatOptions) (FormatOptions, error) {
 	}
 	resolved.Template = ""
 
-	switch resolved.Align {
-	case "", "left", "justify":
-	default:
-		return FormatOptions{}, fmt.Errorf("docx: unknown alignment %q; want \"left\" or \"justify\"", resolved.Align)
+	if err := validateAlignAndLineSpacingMutex(resolved.Align, resolved.LineSpacing, resolved.LineSpacingExactPt); err != nil {
+		return FormatOptions{}, err
 	}
 	if err := validateMargins(resolved.MarginsMM); err != nil {
 		return FormatOptions{}, err
 	}
 	return resolved, nil
+}
+
+// validateAlignAndLineSpacingMutex enforces the two cross-field rules
+// shared by BOTH Format paths (whole-document, via resolveFormatOptions,
+// and paragraph-range, via formatDirectRange): Align must be one of the
+// four values <w:jc> supports, and LineSpacing/LineSpacingExactPt are
+// mutually exclusive — giving both would otherwise silently fight over the
+// same <w:spacing> w:line/w:lineRule attributes, whichever leafOp happened
+// to be built last winning with no error at all (task 8 brief's explicit
+// "参数校验层拒绝" requirement).
+func validateAlignAndLineSpacingMutex(align string, lineSpacing, lineSpacingExactPt float64) error {
+	switch align {
+	case "", "left", "center", "right", "justify":
+	default:
+		return fmt.Errorf("docx: unknown alignment %q; want \"left\", \"center\", \"right\", or \"justify\"", align)
+	}
+	if lineSpacing != 0 && lineSpacingExactPt != 0 {
+		return fmt.Errorf("docx: line_spacing and line_spacing_exact_pt are mutually exclusive; give at most one")
+	}
+	return nil
 }
 
 // mergeFormatOptions returns explicit with every zero-valued field
@@ -380,6 +446,53 @@ func lineSpacingTo240ths(mult float64) string {
 // mmToTwips converts millimeters to twips for w:pgMar (25.4mm -> 1440).
 func mmToTwips(mm float64) string {
 	return fmt.Sprintf("%d", int(math.Round(mm*twipsPerMM)))
+}
+
+// ptToTwips converts points to twips (20 twips per point) for
+// w:spacing's w:before/w:after and its w:line when w:lineRule="exact":
+// 6pt -> 120, 24pt -> 480.
+func ptToTwips(pt float64) string {
+	return fmt.Sprintf("%d", int(math.Round(pt*20)))
+}
+
+// firstLineCharsHundredths converts a character count to w:ind's
+// w:firstLineChars unit (hundredths of a character, the value Word
+// actually renders relative to the paragraph's own current font size):
+// 2 -> "200".
+func firstLineCharsHundredths(chars float64) string {
+	return fmt.Sprintf("%d", int(math.Round(chars*100)))
+}
+
+// twipsPerIndentChar is the fixed twips-per-character assumption behind
+// w:firstLine's fallback value (for a reader that ignores firstLineChars
+// entirely): one full-width CJK character renders at roughly its font
+// size's width, and this package's own docx_write output already bakes in
+// exactly this assumption — styles.go's bodyTextStyleXML hardcodes
+// `<w:ind w:firstLine="420"/>` for a two-character indent, and
+// reference-values.md spells out why: "firstLine="420" = 2 个中文字符
+// (10.5pt 时约 420 twips)", i.e. 210 twips/char = 10.5pt * 20. Reusing
+// that exact constant here keeps FirstLineIndentChars' twips fallback
+// consistent with this package's own generator instead of inventing a
+// second, different approximation.
+const twipsPerIndentChar = 210
+
+// firstLineTwipsFromChars converts a character count to the w:firstLine
+// twips fallback — see twipsPerIndentChar's own doc comment for the
+// assumption behind the conversion factor: 2 -> "420".
+func firstLineTwipsFromChars(chars float64) string {
+	return fmt.Sprintf("%d", int(math.Round(chars*twipsPerIndentChar)))
+}
+
+// attrEquals reports whether attrs carries local literally equal to want —
+// the per-attribute analogue of tagUnchanged (below), needed wherever more
+// than one independently-requested field lands on the SAME element
+// (rFonts' ascii/hAnsi vs eastAsia; spacing's line/lineRule vs before vs
+// after; ind's firstLineChars/firstLine) and each field's own "did THIS
+// specific thing change" status must not be polluted by whichever sibling
+// attribute on that same tag also changed.
+func attrEquals(attrs []xml.Attr, local, want string) bool {
+	v, ok := wordAttrVal(xml.StartElement{Attr: attrs}, local)
+	return ok && v == want
 }
 
 // elemInfo describes one XML element Format either found while scanning a
@@ -513,12 +626,23 @@ func rFontsLiteralAttrs(existing []xml.Attr, font string) []xml.Attr {
 	return kept
 }
 
-// rFontsBodyLatinAttrs is rFontsLiteralAttrs' narrower sibling for
-// FormatOptions.BodyFont specifically: it sets ONLY ascii/hAnsi (dropping
-// their own *Theme counterparts, for the same "literal beats theme" reason
-// rFontsLiteralAttrs drops all four), and leaves eastAsia/eastAsiaTheme/cs/
-// cstheme completely untouched — whatever East Asian font (or theme
-// reference) existing carried survives byte for byte.
+// rFontsLatinAndEastAsiaAttrs sets ascii/hAnsi to latinFont (when non-"")
+// and eastAsia to eastAsiaFont (when non-""), each COMPLETELY
+// independently — the shared plumbing behind BodyFont/EastAsiaFont's
+// orthogonality (task 8 brief, §2) and, combined, HeadingFont+
+// EastAsiaFont's (planHeadingFontPatches). Dropping a field's own *Theme
+// counterpart (asciiTheme/hAnsiTheme for latinFont, eastAsiaTheme for
+// eastAsiaFont — Word resolves a *Theme attribute in preference to a
+// literal face name, silently ignoring the literal one otherwise) only
+// ever happens when that field's OWN literal value is being set, so a call
+// that only touches one of the two pairs never disturbs whatever the OTHER
+// pair (literal or *Theme) already had. cs/csTheme are never touched by
+// either field: complex-script runs are out of scope for BodyFont,
+// HeadingFont, AND EastAsiaFont alike (format capability review, Important
+// 8, and its heading-path follow-up — task 8 brief's own "heading_font 路径
+// 也不应再把 eastAsia 打成 Latin 字体" note, which applies equally to the
+// pre-existing "and cs too" half of the old rFontsLiteralAttrs-everywhere
+// behavior).
 //
 // This exists because rFontsLiteralAttrs' "set every one of the four to the
 // same literal name" behavior is exactly wrong for a whole-document body
@@ -529,18 +653,43 @@ func rFontsLiteralAttrs(existing []xml.Attr, font string) []xml.Attr {
 // also mean "and replace the Chinese font with a Latin-only face that has no
 // CJK glyphs at all" (format capability review, Important 8; write review,
 // I5 — template=corporate silently turning docx_write's own 微软雅黑 into
-// Calibri). HeadingFont and the paragraph-range direct-formatting path
-// still use rFontsLiteralAttrs unchanged: this task's mandate is narrowly
-// "stop body_font from destroying eastAsia" (see FormatOptions.BodyFont's
-// own doc comment), not a general east-asia-aware font API — that is
-// Task 8's separate FormatOptions field.
-func rFontsBodyLatinAttrs(existing []xml.Attr, font string) []xml.Attr {
-	kept := dropAttrs(existing, "asciiTheme", "hAnsiTheme", "ascii", "hAnsi")
-	kept = append(kept,
-		xml.Attr{Name: xml.Name{Local: "ascii"}, Value: font},
-		xml.Attr{Name: xml.Name{Local: "hAnsi"}, Value: font},
-	)
+// Calibri). The paragraph-range direct-formatting path's own BodyFont-alone
+// behavior is DELIBERATELY left unchanged (rFontsDirectRangeAttrs in
+// format_direct.go): this task's mandate is to make EastAsiaFont's own
+// effect precise and orthogonal, not to retroactively change what
+// body_font-alone already did on a range before EastAsiaFont existed.
+func rFontsLatinAndEastAsiaAttrs(existing []xml.Attr, latinFont, eastAsiaFont string) []xml.Attr {
+	kept := existing
+	if latinFont != "" {
+		kept = dropAttrs(kept, "asciiTheme", "hAnsiTheme", "ascii", "hAnsi")
+		kept = append(kept,
+			xml.Attr{Name: xml.Name{Local: "ascii"}, Value: latinFont},
+			xml.Attr{Name: xml.Name{Local: "hAnsi"}, Value: latinFont},
+		)
+	}
+	if eastAsiaFont != "" {
+		kept = dropAttrs(kept, "eastAsiaTheme", "eastAsia")
+		kept = append(kept, xml.Attr{Name: xml.Name{Local: "eastAsia"}, Value: eastAsiaFont})
+	}
 	return kept
+}
+
+// rFontsLatinUnchanged/rFontsEastAsiaUnchanged report whether attrs already
+// renders font literally for ascii+hAnsi (respectively eastAsia alone),
+// with no *Theme attribute competing for precedence — i.e. whether
+// rFontsLatinAndEastAsiaAttrs(attrs, font, "") / ("", font) would be a
+// byte-for-byte no-op for that ONE field. Needed (instead of the whole-tag
+// tagUnchanged below) wherever BodyFont and EastAsiaFont might BOTH be
+// requested against the SAME <w:rFonts> in one call: each field's own
+// "did this actually change" status must not be polluted by whatever the
+// OTHER field's value already was.
+func rFontsLatinUnchanged(attrs []xml.Attr, font string) bool {
+	return !hasAttr(attrs, "asciiTheme") && !hasAttr(attrs, "hAnsiTheme") &&
+		attrEquals(attrs, "ascii", font) && attrEquals(attrs, "hAnsi", font)
+}
+
+func rFontsEastAsiaUnchanged(attrs []xml.Attr, font string) bool {
+	return !hasAttr(attrs, "eastAsiaTheme") && attrEquals(attrs, "eastAsia", font)
 }
 
 // pPrChildOrder is CT_PPr's child sequence: CT_PPrBase's own sequence,
@@ -567,14 +716,32 @@ var pPrChildOrder = []string{
 	"rPr", "sectPr", "pPrChange",
 }
 
-// rPrFontSizeOrder names the three EG_RPrBase leaves Format itself ever
-// edits (rFonts, sz, szCs), used as the "want" list for scanDirectChildren
-// when scanning an rPr's own DIRECT children — as opposed to a same-named
-// element that happens to be nested arbitrarily deeper inside it (most
-// notably a <w:rPrChange> wrapping a revision's historical <w:rPr>, which
-// carries its own rFonts/sz/szCs that must never be mistaken for the
-// current ones).
-var rPrFontSizeOrder = []string{"rFonts", "sz", "szCs"}
+// rPrChildOrder is CT_RPr's child sequence: EG_RPrBase's own sequence
+// (ECMA-376 §17.3.1.24's rPr/rStyle-through-oMath group, in schema order),
+// followed by CT_RPr's own trailing rPrChange, which must always be LAST
+// (it holds a revision's historical run properties). This is rPr's
+// counterpart to pPrChildOrder above — same purpose, same technique (task
+// 8 brief, §3a; a gap Task 1's own report explicitly flagged as left open:
+// "rPr 的其余 EG_RPrBase 属性... 不在本任务范围内"). Format only ever edits
+// rFonts/sz/szCs itself, but the FULL list is needed as an anchor set: a
+// newly inserted <w:sz>/<w:szCs> must land immediately before whichever
+// LATER sibling in this order already exists — most importantly
+// <w:rPrChange>, since CT_RPr requires it be the LAST child, so blindly
+// inserting at the container's end (the pre-Task-8 behavior) would land
+// AFTER it, producing well-formed but schema-illegal XML — the same
+// failure mode as Critical 1, one level down. rFonts itself is NOT
+// inserted through this anchor set: EG_RPrBase requires it precede every
+// other run property, so it is always anchored directly to the
+// container's own opening position instead (planRPrFontSizePatches).
+var rPrChildOrder = []string{
+	"rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
+	"strike", "dstrike", "outline", "shadow", "emboss", "imprint",
+	"noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing",
+	"w", "kern", "position", "sz", "szCs", "highlight", "u", "effect",
+	"bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang",
+	"eastAsianLayout", "specVanish", "oMath",
+	"rPrChange",
+}
 
 // leafOp is one candidate edit against a sibling leaf element inside a
 // known container (docDefaults' rPr/pPr, or a heading style's rPr), given
@@ -705,33 +872,89 @@ func scanDirectChildren(fragment []byte, base int, order []string) map[string]el
 	return found
 }
 
+// pParaRequest bundles every pPr-level field Format's whole-document and
+// paragraph-range paths can request against a pPr's own spacing/ind/jc
+// leaves, so buildPPrOps' signature doesn't keep growing one positional
+// float64/string parameter at a time as Task 8 adds first-line indent and
+// before/after spacing alongside the pre-existing line-spacing-multiple/
+// align pair. LineSpacing and LineSpacingExactPt are mutually exclusive
+// (validated before a request is ever built — resolveFormatOptions/
+// formatDirectRange); SpaceBeforePt/SpaceAfterPt land on the SAME
+// <w:spacing> element as whichever line-spacing field is set, never a
+// second one, since CT_PPr only has one <w:spacing> child.
+type pParaRequest struct {
+	LineSpacing          float64
+	LineSpacingExactPt   float64
+	SpaceBeforePt        float64
+	SpaceAfterPt         float64
+	Align                string
+	FirstLineIndentChars float64
+}
+
+// isZero reports whether req asks for nothing at all — the no-op case
+// applyDirectParaFormat short-circuits on, mirroring
+// applyDirectRunFormat's own "font == "" && sizePt == 0" check.
+func (req pParaRequest) isZero() bool {
+	return req.LineSpacing == 0 && req.LineSpacingExactPt == 0 &&
+		req.SpaceBeforePt == 0 && req.SpaceAfterPt == 0 &&
+		req.Align == "" && req.FirstLineIndentChars == 0
+}
+
 // buildPPrOps returns the leafOps applyLeafOps (or renderActiveLeaves, for a
 // brand new pPr being synthesized from scratch) needs to land <w:spacing>/
-// <w:jc> at the schema-correct position among a pPr's other children: one
-// leafOp per name in pPrChildOrder, in that order, with "spacing"/"jc"
-// marked active (and given their new attributes) when lineSpacing/align
-// requests a change, and every other name serving purely as an ANCHOR —
-// present (when found in children) so a new element merges in immediately
-// before whichever later, otherwise-untracked sibling (rPr, ind, sectPr,
-// ...) already exists, instead of always landing at pPr's very end
+// <w:ind>/<w:jc> at the schema-correct position among a pPr's other
+// children: one leafOp per name in pPrChildOrder, in that order, with
+// "spacing"/"ind"/"jc" marked active (and given their new attributes) when
+// req asks for a change, and every other name serving purely as an
+// ANCHOR — present (when found in children) so a new element merges in
+// immediately before whichever later, otherwise-untracked sibling (rPr,
+// sectPr, ...) already exists, instead of always landing at pPr's very end
 // (format capability review, Critical 1). children may be nil — reading a
 // nil map always returns the zero elemInfo (not found) — which is exactly
 // "no pPr exists yet to anchor against", the shape a brand new pPr needs.
-func buildPPrOps(children map[string]elemInfo, lineSpacing float64, align string) []leafOp {
+//
+// "spacing" combines LineSpacing/LineSpacingExactPt (w:line/w:lineRule) AND
+// SpaceBeforePt/SpaceAfterPt (w:before/w:after) into ONE tag/patch, since
+// they are all attributes of the SAME <w:spacing> element — building two
+// separate patches against the same span would make Apply reject the batch
+// as overlapping.
+func buildPPrOps(children map[string]elemInfo, req pParaRequest) []leafOp {
 	ops := make([]leafOp, 0, len(pPrChildOrder))
 	for _, name := range pPrChildOrder {
 		op := leafOp{info: children[name], local: name}
 		switch name {
 		case "spacing":
-			if lineSpacing != 0 {
+			attrs := op.info.attrs
+			active := false
+			switch {
+			case req.LineSpacing != 0:
+				attrs = setAttr(setAttr(attrs, "line", lineSpacingTo240ths(req.LineSpacing)), "lineRule", "auto")
+				active = true
+			case req.LineSpacingExactPt != 0:
+				attrs = setAttr(setAttr(attrs, "line", ptToTwips(req.LineSpacingExactPt)), "lineRule", "exact")
+				active = true
+			}
+			if req.SpaceBeforePt != 0 {
+				attrs = setAttr(attrs, "before", ptToTwips(req.SpaceBeforePt))
+				active = true
+			}
+			if req.SpaceAfterPt != 0 {
+				attrs = setAttr(attrs, "after", ptToTwips(req.SpaceAfterPt))
+				active = true
+			}
+			op.active = active
+			op.attrs = attrs
+		case "ind":
+			if req.FirstLineIndentChars != 0 {
 				op.active = true
-				line := lineSpacingTo240ths(lineSpacing)
-				op.attrs = setAttr(setAttr(op.info.attrs, "line", line), "lineRule", "auto")
+				op.attrs = setAttr(setAttr(op.info.attrs,
+					"firstLineChars", firstLineCharsHundredths(req.FirstLineIndentChars)),
+					"firstLine", firstLineTwipsFromChars(req.FirstLineIndentChars))
 			}
 		case "jc":
-			if align != "" {
+			if req.Align != "" {
 				op.active = true
-				op.attrs = setAttr(op.info.attrs, "val", align)
+				op.attrs = setAttr(op.info.attrs, "val", req.Align)
 			}
 		}
 		ops = append(ops, op)
@@ -743,7 +966,13 @@ func buildPPrOps(children map[string]elemInfo, lineSpacing float64, align string
 // formatting (an rPr that already exists with real content — the caller
 // handles "no rPr at all" and "self-closing <w:rPr/>" itself), given
 // containerOpenEnd/containerCloseStart (rPr's own tagSpan.End/closeStart)
-// and what the caller already scanned for rfonts/sz/szcs.
+// and children, the FULL set of rPr's own direct children scanDirectChildren
+// tracks against rPrChildOrder (not merely rFonts/sz/szCs) — used the same
+// way buildPPrOps uses pPrChildOrder's full set: a newly inserted sz/szCs
+// must land immediately before whichever LATER sibling in CT_RPr's schema
+// order already exists (u, rPrChange, ...), never always at the container's
+// end, which would land AFTER a trailing <w:rPrChange> — illegal, since
+// CT_RPr requires rPrChange be its LAST child (task 8 brief, §3a).
 //
 // rFonts, when newly inserted, always lands as rPr's very FIRST child
 // (EG_RPrBase requires it precede every other run property) by anchoring
@@ -763,30 +992,33 @@ func buildPPrOps(children map[string]elemInfo, lineSpacing float64, align string
 // whole batch as overlapping. So the newly built rFonts tag is merged as a
 // TEXT PREFIX onto that existing patch instead of being appended as its own.
 //
-// fontAttrs builds the new <w:rFonts> attribute list from whatever the
-// element already carried (nil when synthesizing a brand new one) — callers
-// pass rFontsBodyLatinAttrs for FormatOptions.BodyFont's whole-document path
-// (preserve eastAsia) and rFontsLiteralAttrs everywhere else (HeadingFont,
-// paragraph-range direct formatting), which still intentionally sets every
-// one of ascii/hAnsi/eastAsia/cs to the same literal name.
-func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart int, rfonts, sz, szcs elemInfo, font string, sizePt float64, fontAttrs func([]xml.Attr, string) []xml.Attr) []Patch {
-	remOps := []leafOp{{info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
-	if sizePt != 0 {
-		half := ptToHalfPoints(sizePt)
-		remOps[0].active = true
-		remOps[0].attrs = setAttr(sz.attrs, "val", half)
-		remOps[1].active = true
-		remOps[1].attrs = setAttr(szcs.attrs, "val", half)
+// latinFont/eastAsiaFont are independent (BodyFont/EastAsiaFont's own
+// orthogonality) — rFonts is only ever touched at all when at least one of
+// them is non-"". fontAttrs builds the new <w:rFonts> attribute list from
+// whatever the element already carried (nil when synthesizing a brand new
+// one) — callers pass rFontsLatinAndEastAsiaAttrs for FormatOptions.
+// BodyFont/EastAsiaFont's whole-document path and rFontsDirectRangeAttrs
+// for the paragraph-range direct-formatting path (format_direct.go).
+func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart int, children map[string]elemInfo, latinFont, eastAsiaFont string, sizePt float64, fontAttrs func([]xml.Attr, string, string) []xml.Attr) []Patch {
+	ops := make([]leafOp, 0, len(rPrChildOrder))
+	for _, name := range rPrChildOrder {
+		op := leafOp{info: children[name], local: name}
+		if sizePt != 0 && (name == "sz" || name == "szCs") {
+			op.active = true
+			op.attrs = setAttr(op.info.attrs, "val", ptToHalfPoints(sizePt))
+		}
+		ops = append(ops, op)
 	}
-	remPatches := applyLeafOps(doc, containerCloseStart, remOps)
+	remPatches := applyLeafOps(doc, containerCloseStart, ops)
 
 	var patches []Patch
-	if font != "" {
+	if latinFont != "" || eastAsiaFont != "" {
+		rfonts := children["rFonts"]
 		if rfonts.found {
 			patches = append(patches, PatchRawSpan(doc, rfonts.tagSpan,
-				buildTag("rFonts", fontAttrs(rfonts.attrs, font), true)))
+				buildTag("rFonts", fontAttrs(rfonts.attrs, latinFont, eastAsiaFont), true)))
 		} else {
-			newTag := buildTag("rFonts", fontAttrs(nil, font), true)
+			newTag := buildTag("rFonts", fontAttrs(nil, latinFont, eastAsiaFont), true)
 			merged := false
 			for i := range remPatches {
 				if remPatches[i].Content.Start == containerOpenEnd {
@@ -946,7 +1178,7 @@ func synthesizeDocDefaultsPatches(styles []byte, rootEnd int, dd, rpd, ppd elemI
 // would find the NESTED rPr's close instead of the outer one's. The
 // scanDirectChildren calls below (for both rPr's and pPr's own direct
 // children) inherit the same fix.
-func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr elemInfo, pprChildren map[string]elemInfo, rootEnd int, err error) {
+func scanDocDefaults(styles []byte) (dd, rpd, rpr elemInfo, rprChildren map[string]elemInfo, ppd, ppr elemInfo, pprChildren map[string]elemInfo, rootEnd int, err error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
 	var inDD, inRPD, inPPD, inPPR bool
@@ -960,7 +1192,7 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd,
+			return dd, rpd, rpr, rprChildren, ppd, ppr, pprChildren, rootEnd,
 				fmt.Errorf("scan styles.xml docDefaults: %w", terr)
 		}
 		offset := int(dec.InputOffset())
@@ -1037,8 +1269,7 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 	}
 
 	if rpr.found && !rpr.selfClosing {
-		rprChildren := scanDirectChildren(styles[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
-		rfonts, sz, szcs = rprChildren["rFonts"], rprChildren["sz"], rprChildren["szCs"]
+		rprChildren = scanDirectChildren(styles[rpr.tagSpan.End:rpr.closeStart], rpr.tagSpan.End, rPrChildOrder)
 	}
 	if ppr.found && ppr.selfClosing {
 		ppr.closeStart = ppr.tagSpan.End
@@ -1046,7 +1277,7 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 	if ppr.found && !ppr.selfClosing {
 		pprChildren = scanDirectChildren(styles[ppr.tagSpan.End:ppr.closeStart], ppr.tagSpan.End, pPrChildOrder)
 	}
-	return dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd, nil
+	return dd, rpd, rpr, rprChildren, ppd, ppr, pprChildren, rootEnd, nil
 }
 
 // planStylesPatches builds every styles.xml patch resolved requests
@@ -1087,16 +1318,19 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 	var patches []Patch
 	var applied []string
 	var notes []string
-	var fontChanged, sizeChanged, spacingChanged, alignChanged bool
+	var fontChanged, sizeChanged, eastAsiaChanged bool
+	var spacingChanged, spaceBeforeChanged, spaceAfterChanged, alignChanged, firstLineIndentChanged bool
 
-	wantRPrChain := opts.BodyFont != "" || opts.BodySizePt != 0
-	wantPPrChain := opts.LineSpacing != 0 || opts.Align != ""
+	wantRPrChain := opts.BodyFont != "" || opts.BodySizePt != 0 || opts.EastAsiaFont != ""
+	wantPPrChain := opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 || opts.Align != "" ||
+		opts.SpaceBeforePt != 0 || opts.SpaceAfterPt != 0 || opts.FirstLineIndentChars != 0
 
 	if wantRPrChain || wantPPrChain {
-		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd, err := scanDocDefaults(styles)
+		dd, rpd, rpr, rprChildren, ppd, ppr, pprChildren, rootEnd, err := scanDocDefaults(styles)
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		rfonts, sz, szcs := rprChildren["rFonts"], rprChildren["sz"], rprChildren["szCs"]
 
 		var rprInner, pprInner string
 		needRPrSynthesis := false
@@ -1110,26 +1344,37 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 				// nothing here needed to move. planRPrFontSizePatches (not
 				// the old bare applyLeafOps call) additionally makes sure a
 				// newly inserted rFonts lands as rPr's first child rather
-				// than after unrelated existing content (Minor 13).
-				// rFontsBodyLatinAttrs (not rFontsLiteralAttrs) is BodyFont's
-				// own font-attrs builder: it leaves docDefaults' eastAsia
-				// font alone (format capability review, Important 8).
+				// than after unrelated existing content (Minor 13), and a
+				// newly inserted sz/szCs lands before whichever later
+				// EG_RPrBase sibling (u, rPrChange, ...) already exists
+				// (task 8 brief, §3a). rFontsLatinAndEastAsiaAttrs is
+				// BodyFont/EastAsiaFont's shared font-attrs builder: it
+				// touches ascii/hAnsi and eastAsia completely independently
+				// (format capability review, Important 8).
 				//
-				// effFont/effSize are opts.BodyFont/opts.BodySizePt
-				// SUPPRESSED to ""/0 when the leaf(s) already render
-				// byte-identically to what's requested (tagUnchanged) —
-				// planRPrFontSizePatches already treats ""/0 as "not
-				// requested" for exactly this leaf, the same code path a
-				// caller who only ever asked for ONE of the two fields
-				// already exercises, so no new merge/anchoring logic is
-				// needed to get idempotency for free.
+				// effFont/effEastAsiaFont/effSize are opts.BodyFont/
+				// opts.EastAsiaFont/opts.BodySizePt SUPPRESSED to ""/0 when
+				// that ONE field already renders byte-identically to what's
+				// requested (rFontsLatinUnchanged/rFontsEastAsiaUnchanged/
+				// tagUnchanged) — planRPrFontSizePatches already treats
+				// ""/0 as "not requested" for exactly this leaf, the same
+				// code path a caller who only ever asked for ONE of the
+				// fields already exercises, so no new merge/anchoring logic
+				// is needed to get idempotency for free.
 				effFont := opts.BodyFont
 				if effFont != "" {
-					newTag := buildTag("rFonts", rFontsBodyLatinAttrs(rfonts.attrs, effFont), true)
-					if tagUnchanged(styles, rfonts, newTag) {
+					if rFontsLatinUnchanged(rfonts.attrs, effFont) {
 						effFont = ""
 					} else {
 						fontChanged = true
+					}
+				}
+				effEastAsiaFont := opts.EastAsiaFont
+				if effEastAsiaFont != "" {
+					if rFontsEastAsiaUnchanged(rfonts.attrs, effEastAsiaFont) {
+						effEastAsiaFont = ""
+					} else {
+						eastAsiaChanged = true
 					}
 				}
 				effSize := opts.BodySizePt
@@ -1144,22 +1389,34 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 					}
 				}
 				patches = append(patches, planRPrFontSizePatches(
-					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, effFont, effSize, rFontsBodyLatinAttrs)...)
+					styles, rpr.tagSpan.End, rpr.closeStart, rprChildren, effFont, effEastAsiaFont, effSize, rFontsLatinAndEastAsiaAttrs)...)
 			} else {
 				needRPrSynthesis = true
-				ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 				if opts.BodyFont != "" {
-					ops[0].active = true
-					ops[0].attrs = rFontsBodyLatinAttrs(rfonts.attrs, opts.BodyFont)
 					fontChanged = true // synthesis always creates something new
 				}
+				if opts.EastAsiaFont != "" {
+					eastAsiaChanged = true
+				}
 				if opts.BodySizePt != 0 {
-					half := ptToHalfPoints(opts.BodySizePt)
-					ops[1].active = true
-					ops[1].attrs = setAttr(sz.attrs, "val", half)
-					ops[2].active = true
-					ops[2].attrs = setAttr(szcs.attrs, "val", half)
 					sizeChanged = true
+				}
+				ops := make([]leafOp, 0, len(rPrChildOrder))
+				for _, name := range rPrChildOrder {
+					op := leafOp{info: rprChildren[name], local: name}
+					switch name {
+					case "rFonts":
+						if opts.BodyFont != "" || opts.EastAsiaFont != "" {
+							op.active = true
+							op.attrs = rFontsLatinAndEastAsiaAttrs(rfonts.attrs, opts.BodyFont, opts.EastAsiaFont)
+						}
+					case "sz", "szCs":
+						if opts.BodySizePt != 0 {
+							op.active = true
+							op.attrs = setAttr(op.info.attrs, "val", ptToHalfPoints(opts.BodySizePt))
+						}
+					}
+					ops = append(ops, op)
 				}
 				rprInner = renderActiveLeaves(ops)
 			}
@@ -1167,30 +1424,53 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 
 		if wantPPrChain {
 			if dd.found && ppd.found && ppr.found {
-				// buildPPrOps (not a bare 2-element ops list) anchors the
+				// buildPPrOps (not a bare handful of leafOps) anchors the
 				// insertion against pPrDefault's pPr's FULL set of tracked
-				// children, so a newly inserted spacing/jc lands in
+				// children, so a newly inserted spacing/ind/jc lands in
 				// CT_PPr's schema order even when that pPr also carries a
 				// paragraph-mark <w:rPr> or other properties (Critical 1).
-				// effLineSpacing/effAlign mirror effFont/effSize above.
+				// effLineSpacing/effLineSpacingExactPt/effSpaceBeforePt/
+				// effSpaceAfterPt/effAlign/effFirstLineIndentChars mirror
+				// effFont/effSize above: each is independently suppressed
+				// to ""/0 when that ONE field (not the whole shared
+				// <w:spacing>/<w:ind> tag) already renders what's
+				// requested — attrEquals, the per-attribute analogue of
+				// tagUnchanged, is what makes that possible even though
+				// line/before/after all share ONE <w:spacing> element.
 				effLineSpacing := opts.LineSpacing
-				if effLineSpacing != 0 {
-					if sp, ok := pprChildren["spacing"]; ok {
-						newTag := buildTag("spacing", setAttr(setAttr(sp.attrs, "line", lineSpacingTo240ths(effLineSpacing)), "lineRule", "auto"), true)
-						if tagUnchanged(styles, sp, newTag) {
-							effLineSpacing = 0
-						} else {
-							spacingChanged = true
-						}
-					} else {
-						spacingChanged = true // not found -> definitely a new insert
+				effLineSpacingExactPt := opts.LineSpacingExactPt
+				effSpaceBeforePt := opts.SpaceBeforePt
+				effSpaceAfterPt := opts.SpaceAfterPt
+				if sp, ok := pprChildren["spacing"]; ok {
+					if effLineSpacing != 0 && attrEquals(sp.attrs, "line", lineSpacingTo240ths(effLineSpacing)) && attrEquals(sp.attrs, "lineRule", "auto") {
+						effLineSpacing = 0
+					} else if effLineSpacing != 0 {
+						spacingChanged = true
 					}
+					if effLineSpacingExactPt != 0 && attrEquals(sp.attrs, "line", ptToTwips(effLineSpacingExactPt)) && attrEquals(sp.attrs, "lineRule", "exact") {
+						effLineSpacingExactPt = 0
+					} else if effLineSpacingExactPt != 0 {
+						spacingChanged = true
+					}
+					if effSpaceBeforePt != 0 && attrEquals(sp.attrs, "before", ptToTwips(effSpaceBeforePt)) {
+						effSpaceBeforePt = 0
+					} else if effSpaceBeforePt != 0 {
+						spaceBeforeChanged = true
+					}
+					if effSpaceAfterPt != 0 && attrEquals(sp.attrs, "after", ptToTwips(effSpaceAfterPt)) {
+						effSpaceAfterPt = 0
+					} else if effSpaceAfterPt != 0 {
+						spaceAfterChanged = true
+					}
+				} else {
+					spacingChanged = spacingChanged || effLineSpacing != 0 || effLineSpacingExactPt != 0
+					spaceBeforeChanged = spaceBeforeChanged || effSpaceBeforePt != 0
+					spaceAfterChanged = spaceAfterChanged || effSpaceAfterPt != 0
 				}
 				effAlign := opts.Align
 				if effAlign != "" {
 					if jc, ok := pprChildren["jc"]; ok {
-						newTag := buildTag("jc", setAttr(jc.attrs, "val", effAlign), true)
-						if tagUnchanged(styles, jc, newTag) {
+						if attrEquals(jc.attrs, "val", effAlign) {
 							effAlign = ""
 						} else {
 							alignChanged = true
@@ -1199,16 +1479,43 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 						alignChanged = true
 					}
 				}
-				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, effLineSpacing, effAlign))...)
+				effFirstLineIndentChars := opts.FirstLineIndentChars
+				if effFirstLineIndentChars != 0 {
+					if ind, ok := pprChildren["ind"]; ok &&
+						attrEquals(ind.attrs, "firstLineChars", firstLineCharsHundredths(effFirstLineIndentChars)) &&
+						attrEquals(ind.attrs, "firstLine", firstLineTwipsFromChars(effFirstLineIndentChars)) {
+						effFirstLineIndentChars = 0
+					} else {
+						firstLineIndentChanged = true
+					}
+				}
+				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, pParaRequest{
+					LineSpacing: effLineSpacing, LineSpacingExactPt: effLineSpacingExactPt,
+					SpaceBeforePt: effSpaceBeforePt, SpaceAfterPt: effSpaceAfterPt,
+					Align: effAlign, FirstLineIndentChars: effFirstLineIndentChars,
+				}))...)
 			} else {
 				needPPrSynthesis = true
-				if opts.LineSpacing != 0 {
+				if opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 {
 					spacingChanged = true
+				}
+				if opts.SpaceBeforePt != 0 {
+					spaceBeforeChanged = true
+				}
+				if opts.SpaceAfterPt != 0 {
+					spaceAfterChanged = true
 				}
 				if opts.Align != "" {
 					alignChanged = true
 				}
-				pprInner = renderActiveLeaves(buildPPrOps(nil, opts.LineSpacing, opts.Align))
+				if opts.FirstLineIndentChars != 0 {
+					firstLineIndentChanged = true
+				}
+				pprInner = renderActiveLeaves(buildPPrOps(nil, pParaRequest{
+					LineSpacing: opts.LineSpacing, LineSpacingExactPt: opts.LineSpacingExactPt,
+					SpaceBeforePt: opts.SpaceBeforePt, SpaceAfterPt: opts.SpaceAfterPt,
+					Align: opts.Align, FirstLineIndentChars: opts.FirstLineIndentChars,
+				}))
 			}
 		}
 
@@ -1222,10 +1529,14 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 	// touchedHeadingIDs is ready for planStyleChainShadowPatches' same-call
 	// exemption (task 7 follow-up review, F3/F4) — patch ORDER in the
 	// returned slice does not matter (Apply sorts by offset), only this
-	// data dependency does.
+	// data dependency does. opts.EastAsiaFont is threaded through so a
+	// heading's own eastAsia font is fixed in the SAME pass whenever both
+	// fields are requested together — see planHeadingFontPatches and
+	// HeadingFont's own doc comment for why HeadingFont alone no longer
+	// touches eastAsia at all (task 8 brief; task 7 复审遗留).
 	var touchedHeadingIDs map[string]bool
 	if opts.HeadingFont != "" {
-		headingPatches, touched, err := planHeadingFontPatches(styles, opts.HeadingFont)
+		headingPatches, touched, err := planHeadingFontPatches(styles, opts.HeadingFont, opts.EastAsiaFont)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1238,7 +1549,7 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 
 	// docDefaults is the cascade's WEAKEST layer: Normal and any style
 	// basedOn it (BodyText, and every real Word/WPS document's own named
-	// styles) can carry the very same rFonts/sz/spacing/jc explicitly,
+	// styles) can carry the very same rFonts/sz/spacing/jc/ind explicitly,
 	// which then keeps outranking whatever docDefaults now says — the whole
 	// point of this task (format capability review, Critical 4; write
 	// review, I4/I5). planStyleChainShadowPatches finds and rewrites every
@@ -1253,12 +1564,19 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 		notes = append(notes, chainNotes...)
 		fontChanged = fontChanged || chainChanged["body font"]
 		sizeChanged = sizeChanged || chainChanged["body size"]
+		eastAsiaChanged = eastAsiaChanged || chainChanged["east asia font"]
 		spacingChanged = spacingChanged || chainChanged["line spacing"]
+		spaceBeforeChanged = spaceBeforeChanged || chainChanged["space before"]
+		spaceAfterChanged = spaceAfterChanged || chainChanged["space after"]
 		alignChanged = alignChanged || chainChanged["alignment"]
+		firstLineIndentChanged = firstLineIndentChanged || chainChanged["first line indent"]
 	}
 
 	if opts.BodyFont != "" && fontChanged {
 		applied = append(applied, fmt.Sprintf("body font -> %s", opts.BodyFont))
+	}
+	if opts.EastAsiaFont != "" && eastAsiaChanged {
+		applied = append(applied, fmt.Sprintf("east asia font -> %s", opts.EastAsiaFont))
 	}
 	if opts.BodySizePt != 0 && sizeChanged {
 		applied = append(applied, fmt.Sprintf("body size -> %gpt", opts.BodySizePt))
@@ -1266,19 +1584,39 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 	if opts.LineSpacing != 0 && spacingChanged {
 		applied = append(applied, fmt.Sprintf("line spacing -> %g", opts.LineSpacing))
 	}
+	if opts.LineSpacingExactPt != 0 && spacingChanged {
+		applied = append(applied, fmt.Sprintf("line spacing -> exact %gpt", opts.LineSpacingExactPt))
+	}
+	if opts.SpaceBeforePt != 0 && spaceBeforeChanged {
+		applied = append(applied, fmt.Sprintf("space before -> %gpt", opts.SpaceBeforePt))
+	}
+	if opts.SpaceAfterPt != 0 && spaceAfterChanged {
+		applied = append(applied, fmt.Sprintf("space after -> %gpt", opts.SpaceAfterPt))
+	}
 	if opts.Align != "" && alignChanged {
 		applied = append(applied, fmt.Sprintf("alignment -> %s", opts.Align))
+	}
+	if opts.FirstLineIndentChars != 0 && firstLineIndentChanged {
+		applied = append(applied, fmt.Sprintf("first line indent -> %g chars", opts.FirstLineIndentChars))
 	}
 
 	return patches, applied, notes, nil
 }
 
 // planHeadingFontPatches rewrites every Heading1..Heading9 style's
-// <w:rPr><w:rFonts> to font, stripping *Theme attributes the same way
-// planStylesPatches's body-font path does. If a matched heading style has
-// an <w:rPr> but no <w:rFonts> inside it, one is inserted as that rPr's
-// first child; if the rPr itself is self-closing (<w:rPr/>, carrying no
-// properties at all), it is expanded in place to hold the new rFonts.
+// <w:rPr><w:rFonts> ascii/hAnsi to font (stripping their *Theme
+// counterparts), and eastAsia to eastAsiaFont too — but ONLY when
+// eastAsiaFont is non-"" (i.e. FormatOptions.EastAsiaFont was ALSO given in
+// this same Format call). HeadingFont on its own no longer touches eastAsia
+// (or cs) at all: it used to, via rFontsLiteralAttrs, which silently turned
+// a Chinese heading's own CJK font into whatever Latin heading_font was
+// requested — the exact "heading_font 路径也不应再把 eastAsia 打成 Latin 字体"
+// defect Task 7's own review left open for this task to close (task 8
+// brief; format capability review, Important 8's heading-path follow-up).
+// If a matched heading style has an <w:rPr> but no <w:rFonts> inside it,
+// one is inserted as that rPr's first child; if the rPr itself is
+// self-closing (<w:rPr/>, carrying no properties at all), it is expanded
+// in place to hold the new rFonts.
 //
 // A heading's rPr can wrap a <w:rPrChange><w:rPr>...</w:rPr></w:rPrChange>
 // holding a REVISION'S historical run properties — a same-named <w:rPr>
@@ -1301,7 +1639,7 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 // heading that legitimately got its own new font this call is not masking
 // body_font in any sense worth a caveat about, even on a second identical
 // call where the heading's font already matched and no patch was needed.
-func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]bool, error) {
+func planHeadingFontPatches(styles []byte, font, eastAsiaFont string) ([]Patch, map[string]bool, error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
 	var patches []Patch
@@ -1350,7 +1688,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]boo
 				if sc {
 					// No properties at all: expand in place so the new
 					// rFonts has somewhere to live.
-					newTag := "<w:rPr>" + buildTag("rFonts", rFontsLiteralAttrs(nil, font), true) + "</w:rPr>"
+					newTag := "<w:rPr>" + buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(nil, font, eastAsiaFont), true) + "</w:rPr>"
 					patches = append(patches, PatchRawSpan(styles, span, newTag))
 				} else {
 					trackingRPr = true
@@ -1381,7 +1719,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]boo
 					// reports nothing changed instead of unconditionally
 					// re-writing (and re-saving/backing-up) a byte-identical
 					// styles.xml (task 7 follow-up review round 2, F1).
-					newTag := buildTag("rFonts", rFontsLiteralAttrs(rf.attrs, font), true)
+					newTag := buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(rf.attrs, font, eastAsiaFont), true)
 					if !tagUnchanged(styles, rf, newTag) {
 						patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
 					}
@@ -1393,7 +1731,7 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]boo
 					// this rPr already carries, violating EG_RPrBase's
 					// "rFonts precedes every other run property" order.
 					patches = append(patches, PatchRawSpan(styles, Span{rprTagSpan.End, rprTagSpan.End},
-						buildTag("rFonts", rFontsLiteralAttrs(nil, font), true)))
+						buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(nil, font, eastAsiaFont), true)))
 				}
 			case isWordElement(t.Name, "pPr") && pPrDepth > 0:
 				pPrDepth--
@@ -1421,8 +1759,8 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, map[string]boo
 // omit entirely and which planStylesPatches does synthesize).
 type styleElem struct {
 	id, typ, basedOn, name string
-	rprChildren            map[string]elemInfo // rFonts/sz/szCs, keyed as rPrFontSizeOrder
-	pprChildren            map[string]elemInfo // spacing/jc (and other pPrChildOrder anchors, unused here)
+	rprChildren            map[string]elemInfo // rFonts/sz/szCs (and other rPrChildOrder anchors, unused here)
+	pprChildren            map[string]elemInfo // spacing/ind/jc (and other pPrChildOrder anchors, unused here)
 }
 
 // styleChildNames is the direct children of a <w:style> element this
@@ -1497,7 +1835,7 @@ func scanAllStyles(styles []byte) ([]styleElem, error) {
 				buildErr = err
 				return e
 			}
-			e.rprChildren = scanDirectChildren(styles[rpr.tagSpan.End:closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
+			e.rprChildren = scanDirectChildren(styles[rpr.tagSpan.End:closeStart], rpr.tagSpan.End, rPrChildOrder)
 		}
 		return e
 	}
@@ -1917,12 +2255,19 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 		}
 
 		if eligibleForBodyChainRewrite(s, byID) {
-			if opts.BodyFont != "" {
+			if opts.BodyFont != "" || opts.EastAsiaFont != "" {
 				if rf, ok := s.rprChildren["rFonts"]; ok {
-					newTag := buildTag("rFonts", rFontsBodyLatinAttrs(rf.attrs, opts.BodyFont), true)
-					if !tagUnchanged(styles, rf, newTag) {
+					fontChanges := opts.BodyFont != "" && !rFontsLatinUnchanged(rf.attrs, opts.BodyFont)
+					eastAsiaChanges := opts.EastAsiaFont != "" && !rFontsEastAsiaUnchanged(rf.attrs, opts.EastAsiaFont)
+					if fontChanges || eastAsiaChanges {
+						newTag := buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(rf.attrs, opts.BodyFont, opts.EastAsiaFont), true)
 						patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
-						changed["body font"] = true
+						if fontChanges {
+							changed["body font"] = true
+						}
+						if eastAsiaChanges {
+							changed["east asia font"] = true
+						}
 					}
 				}
 			}
@@ -1943,13 +2288,39 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 					}
 				}
 			}
-			if opts.LineSpacing != 0 {
-				if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "line") {
-					line := lineSpacingTo240ths(opts.LineSpacing)
-					newTag := buildTag("spacing", setAttr(setAttr(sp.attrs, "line", line), "lineRule", "auto"), true)
-					if !tagUnchanged(styles, sp, newTag) {
-						patches = append(patches, PatchRawSpan(styles, sp.tagSpan, newTag))
-						changed["line spacing"] = true
+			if opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 || opts.SpaceBeforePt != 0 || opts.SpaceAfterPt != 0 {
+				if sp, ok := s.pprChildren["spacing"]; ok {
+					attrs := sp.attrs
+					var lineChanges, beforeChanges, afterChanges bool
+					if opts.LineSpacing != 0 && hasAttr(sp.attrs, "line") {
+						attrs = setAttr(setAttr(attrs, "line", lineSpacingTo240ths(opts.LineSpacing)), "lineRule", "auto")
+						lineChanges = true
+					} else if opts.LineSpacingExactPt != 0 && hasAttr(sp.attrs, "line") {
+						attrs = setAttr(setAttr(attrs, "line", ptToTwips(opts.LineSpacingExactPt)), "lineRule", "exact")
+						lineChanges = true
+					}
+					if opts.SpaceBeforePt != 0 && hasAttr(sp.attrs, "before") {
+						attrs = setAttr(attrs, "before", ptToTwips(opts.SpaceBeforePt))
+						beforeChanges = true
+					}
+					if opts.SpaceAfterPt != 0 && hasAttr(sp.attrs, "after") {
+						attrs = setAttr(attrs, "after", ptToTwips(opts.SpaceAfterPt))
+						afterChanges = true
+					}
+					if lineChanges || beforeChanges || afterChanges {
+						newTag := buildTag("spacing", attrs, true)
+						if !tagUnchanged(styles, sp, newTag) {
+							patches = append(patches, PatchRawSpan(styles, sp.tagSpan, newTag))
+							if lineChanges {
+								changed["line spacing"] = true
+							}
+							if beforeChanges {
+								changed["space before"] = true
+							}
+							if afterChanges {
+								changed["space after"] = true
+							}
+						}
 					}
 				}
 			}
@@ -1959,6 +2330,17 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 					if !tagUnchanged(styles, jc, newTag) {
 						patches = append(patches, PatchRawSpan(styles, jc.tagSpan, newTag))
 						changed["alignment"] = true
+					}
+				}
+			}
+			if opts.FirstLineIndentChars != 0 {
+				if ind, ok := s.pprChildren["ind"]; ok && (hasAttr(ind.attrs, "firstLine") || hasAttr(ind.attrs, "firstLineChars")) {
+					newTag := buildTag("ind", setAttr(setAttr(ind.attrs,
+						"firstLineChars", firstLineCharsHundredths(opts.FirstLineIndentChars)),
+						"firstLine", firstLineTwipsFromChars(opts.FirstLineIndentChars)), true)
+					if !tagUnchanged(styles, ind, newTag) {
+						patches = append(patches, PatchRawSpan(styles, ind.tagSpan, newTag))
+						changed["first line indent"] = true
 					}
 				}
 			}
@@ -1979,6 +2361,11 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 				masked["body font"] = append(masked["body font"], label)
 			}
 		}
+		if opts.EastAsiaFont != "" && !exemptFont {
+			if _, ok := s.rprChildren["rFonts"]; ok {
+				masked["east asia font"] = append(masked["east asia font"], label)
+			}
+		}
 		if opts.BodySizePt != 0 {
 			_, hasSz := s.rprChildren["sz"]
 			_, hasSzCs := s.rprChildren["szCs"]
@@ -1986,9 +2373,19 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 				masked["body size"] = append(masked["body size"], label)
 			}
 		}
-		if opts.LineSpacing != 0 {
+		if opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 {
 			if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "line") {
 				masked["line spacing"] = append(masked["line spacing"], label)
+			}
+		}
+		if opts.SpaceBeforePt != 0 {
+			if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "before") {
+				masked["space before"] = append(masked["space before"], label)
+			}
+		}
+		if opts.SpaceAfterPt != 0 {
+			if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "after") {
+				masked["space after"] = append(masked["space after"], label)
 			}
 		}
 		if opts.Align != "" {
@@ -1996,10 +2393,18 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 				masked["alignment"] = append(masked["alignment"], label)
 			}
 		}
+		if opts.FirstLineIndentChars != 0 {
+			if ind, ok := s.pprChildren["ind"]; ok && (hasAttr(ind.attrs, "firstLine") || hasAttr(ind.attrs, "firstLineChars")) {
+				masked["first line indent"] = append(masked["first line indent"], label)
+			}
+		}
 	}
 
 	var notes []string
-	for _, field := range []string{"body font", "body size", "line spacing", "alignment"} {
+	for _, field := range []string{
+		"body font", "east asia font", "body size", "line spacing",
+		"space before", "space after", "alignment", "first line indent",
+	} {
 		names := masked[field]
 		if len(names) == 0 {
 			continue
@@ -2045,20 +2450,26 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 // review, F6).
 func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]string, error) {
 	wantFont := opts.BodyFont != ""
+	wantEastAsia := opts.EastAsiaFont != ""
 	wantSize := opts.BodySizePt != 0
-	wantSpacing := opts.LineSpacing != 0
+	wantSpacing := opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0
+	wantSpaceBefore := opts.SpaceBeforePt != 0
+	wantSpaceAfter := opts.SpaceAfterPt != 0
 	wantAlign := opts.Align != ""
-	if !wantFont && !wantSize && !wantSpacing && !wantAlign {
+	wantFirstLineIndent := opts.FirstLineIndentChars != 0
+	if !wantFont && !wantEastAsia && !wantSize && !wantSpacing && !wantSpaceBefore &&
+		!wantSpaceAfter && !wantAlign && !wantFirstLineIndent {
 		return nil, nil
 	}
 
-	var fontHits, sizeHits, spacingHits, alignHits []int
+	var fontHits, eastAsiaHits, sizeHits, spacingHits, spaceBeforeHits, spaceAfterHits []int
+	var alignHits, firstLineIndentHits []int
 
 	for _, p := range paras {
 		if isCodeLikeName(p.Style) {
 			continue
 		}
-		if wantSpacing || wantAlign {
+		if wantSpacing || wantSpaceBefore || wantSpaceAfter || wantAlign || wantFirstLineIndent {
 			_, ppr, children, err := scanParaProps(doc, p.Span)
 			if err != nil {
 				return nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
@@ -2069,25 +2480,46 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 						spacingHits = append(spacingHits, p.Index)
 					}
 				}
+				if wantSpaceBefore {
+					if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "before") {
+						spaceBeforeHits = append(spaceBeforeHits, p.Index)
+					}
+				}
+				if wantSpaceAfter {
+					if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "after") {
+						spaceAfterHits = append(spaceAfterHits, p.Index)
+					}
+				}
 				if wantAlign {
 					if _, ok := children["jc"]; ok {
 						alignHits = append(alignHits, p.Index)
 					}
 				}
+				if wantFirstLineIndent {
+					if ind, ok := children["ind"]; ok && (hasAttr(ind.attrs, "firstLine") || hasAttr(ind.attrs, "firstLineChars")) {
+						firstLineIndentHits = append(firstLineIndentHits, p.Index)
+					}
+				}
 			}
 		}
-		if wantFont || wantSize {
-			paraFont, paraSize := false, false
+		if wantFont || wantEastAsia || wantSize {
+			paraFont, paraEastAsia, paraSize := false, false, false
 			for _, r := range p.Runs {
-				_, rpr, rfonts, sz, _, err := scanRunProps(doc, r.Elem)
+				_, rpr, children, err := scanRunProps(doc, r.Elem)
 				if err != nil {
 					return nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
 				}
 				if !rpr.found || rpr.selfClosing {
 					continue
 				}
-				if wantFont && rfonts.found {
-					paraFont = true
+				rfonts, sz := children["rFonts"], children["sz"]
+				if (wantFont || wantEastAsia) && rfonts.found {
+					if wantFont {
+						paraFont = true
+					}
+					if wantEastAsia {
+						paraEastAsia = true
+					}
 				}
 				if wantSize && sz.found {
 					paraSize = true
@@ -2095,6 +2527,9 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 			}
 			if paraFont {
 				fontHits = append(fontHits, p.Index)
+			}
+			if paraEastAsia {
+				eastAsiaHits = append(eastAsiaHits, p.Index)
 			}
 			if paraSize {
 				sizeHits = append(sizeHits, p.Index)
@@ -2116,9 +2551,13 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 			len(hits), label, strings.Join(nums, ", ")))
 	}
 	add(fontHits, "font")
+	add(eastAsiaHits, "east asia font")
 	add(sizeHits, "size")
 	add(spacingHits, "line spacing")
+	add(spaceBeforeHits, "space before")
+	add(spaceAfterHits, "space after")
 	add(alignHits, "alignment")
+	add(firstLineIndentHits, "first-line indent")
 	return notes, nil
 }
 
