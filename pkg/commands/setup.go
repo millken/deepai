@@ -14,6 +14,7 @@ import (
 
 	"charm.land/huh/v2"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/secret"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -287,7 +288,6 @@ func runSetupDatabase(cmd *cobra.Command, args []string) error {
 // --- Setup sections ---
 
 func setupProvider(cfg *Config, envPath string) error {
-	oldProvider := cfg.Provider
 	provider := cfg.Provider
 	providerOpts := huh.NewOptions[string]()
 	for _, name := range providerNames() {
@@ -304,27 +304,35 @@ func setupProvider(cfg *Config, envPath string) error {
 	cfg.Provider = provider
 
 	info := providerInfo[provider]
-	// Read key for the NEW provider (may differ from old one).
-	apiKey := loadEnvValue(envPath, info.envVar)
-	// If provider changed and new provider has no key, clear default.
-	if provider != oldProvider && apiKey == "" {
-		apiKey = ""
+	// The stored key is sealed on disk. Prefilling the form would mean
+	// decrypting it back into memory for no benefit, so an empty answer
+	// means "keep what is there".
+	title := fmt.Sprintf("API key (%s)", info.envVar)
+	if loadEnvValue(envPath, info.envVar) != "" {
+		title += " — leave blank to keep the current key"
 	}
 
+	var apiKey string
 	if err := huh.NewInput().
-		Title(fmt.Sprintf("API key (%s)", info.envVar)).
+		Title(title).
 		Value(&apiKey).
 		EchoMode(huh.EchoModePassword).
 		Run(); err != nil {
 		return err
 	}
 
-	// Save API key to .env immediately.
 	if apiKey != "" {
-		if err := saveEnvValue(envPath, info.envVar, apiKey); err != nil {
+		sealed, err := secret.Seal(apiKey)
+		if err != nil {
+			return fmt.Errorf("seal API key: %w", err)
+		}
+		if err := saveEnvValue(envPath, info.envVar, sealed); err != nil {
 			return fmt.Errorf("save .env: %w", err)
 		}
-		fmt.Printf("  Saved API key to %s\n", envPath)
+		fmt.Printf("  Saved sealed API key to %s\n", envPath)
+		if w := sealWarning(); w != "" {
+			fmt.Println(w)
+		}
 	}
 
 	// Base URL (optional for any provider).
@@ -507,7 +515,60 @@ func saveEnvValue(path, key, value string) error {
 	}
 
 	content := strings.Join(lines, "\n")
-	return os.WriteFile(path, []byte(content), 0600)
+	return writeEnvAtomic(path, []byte(content))
+}
+
+// writeEnvAtomic replaces path's contents without ever exposing a partial
+// or world-readable file. os.CreateTemp creates at 0600, so the mode is
+// right from creation rather than being widened and then narrowed. The temp
+// file is made in the same directory because rename is only atomic within
+// one filesystem.
+func writeEnvAtomic(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".env-tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmp := f.Name()
+	// A no-op once the rename below succeeds; on any earlier failure it
+	// keeps a copy of the credentials from being left behind.
+	defer os.Remove(tmp)
+
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// sealWarning returns a message when this host cannot bind sealed keys to
+// hardware, and "" when it can. Degrading is a silent loss of protection,
+// so it must be stated rather than assumed.
+func sealWarning() string {
+	info := secret.Fingerprint()
+	switch info.Mode {
+	case secret.ModeHardware:
+		return ""
+	case secret.ModeInstall:
+		return "  Note: no disk serial number is readable here, so the key is bound to\n" +
+			"  this OS install rather than to hardware. Reinstalling the OS will\n" +
+			"  require re-entering it."
+	default:
+		return "  Warning: no disk serial number and no OS machine ID are readable here\n" +
+			"  (common on cloud instances and WSL2), so the key is obfuscated but NOT\n" +
+			"  bound to this machine: anyone with the file and a deepai binary can\n" +
+			"  read it. It is still safe from tools that merely read the file."
+	}
 }
 
 func createDefaultDeepaiMD(dir string) {
