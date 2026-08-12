@@ -78,11 +78,24 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 
 	wantsRunFormat := opts.BodyFont != "" || opts.BodySizePt != 0 || opts.BodyEastAsiaFont != ""
 	if wantsRunFormat {
+		// A paragraph with no runs at all is either genuinely empty OR
+		// holds ONLY a skipped text box (Para.SkippedTextBox) -- Scan does
+		// not surface a text box's own text as Runs, so "no runs" does not
+		// mean "no visible content" for those. Reporting the latter as
+		// "empty paragraph" would be a lie (task 10 brief item 4 / format
+		// capability review Minor 15); the two are tracked and reported
+		// separately below.
 		emptyCount := 0
+		var textBoxParas []int
 		for _, p := range paras {
-			if p.Index >= from && p.Index <= to && len(p.Runs) == 0 {
-				emptyCount++
+			if p.Index < from || p.Index > to || len(p.Runs) != 0 {
+				continue
 			}
+			if p.SkippedTextBox {
+				textBoxParas = append(textBoxParas, p.Index)
+				continue
+			}
+			emptyCount++
 		}
 
 		out, n, err := applyDirectRunFormat(working, paras, from, to, opts.BodyFont, opts.BodyEastAsiaFont, opts.BodySizePt)
@@ -97,22 +110,47 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 				return FormatResult{}, fmt.Errorf("docx: rescan after direct run formatting: %w", err)
 			}
 		}
+		// n counts only paragraphs a byte actually changed for (task 10
+		// brief item 3): a repeat call whose runs already carry exactly the
+		// requested font/size reports n==0, so the field is reported as an
+		// "already ..." note instead of a (false) Applied entry, mirroring
+		// the whole-document path's own already-empty-Applied convention
+		// (docxFormatNoChangeNote at the tool layer).
 		if opts.BodyFont != "" {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d font -> %s (%d paragraph(s))", from, to, opts.BodyFont, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d font already %s; no change", from, to, opts.BodyFont))
+			}
 		}
 		if opts.BodyEastAsiaFont != "" {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.BodyEastAsiaFont, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d east asia font -> %s (%d paragraph(s))", from, to, opts.BodyEastAsiaFont, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d east asia font already %s; no change", from, to, opts.BodyEastAsiaFont))
+			}
 		}
 		if opts.BodySizePt != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d size -> %gpt (%d paragraph(s))", from, to, opts.BodySizePt, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d size -> %gpt (%d paragraph(s))", from, to, opts.BodySizePt, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d size already %gpt; no change", from, to, opts.BodySizePt))
+			}
 		}
 		if emptyCount > 0 {
 			result.Notes = append(result.Notes, fmt.Sprintf(
 				"%d empty paragraph(s) in the range have no runs, so font/size direct formatting was skipped for them; "+
 					"paragraph-level formatting (line spacing/alignment/first-line indent/spacing before/after) still applies", emptyCount))
+		}
+		for _, idx := range textBoxParas {
+			result.Notes = append(result.Notes, fmt.Sprintf(
+				"paragraph %d is inside a text box; direct formatting skipped", idx))
 		}
 	}
 
@@ -136,29 +174,62 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			changed = true
 		}
 		result.Notes = append(result.Notes, dropNotes...)
+		// n counts only paragraphs a byte actually changed for (task 10
+		// brief item 3) -- see the run-format block's identical comment
+		// above.
 		if opts.LineSpacing != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d line spacing already %g; no change", from, to, opts.LineSpacing))
+			}
 		}
 		if opts.LineSpacingExactPt != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d line spacing -> exact %gpt (%d paragraph(s))", from, to, opts.LineSpacingExactPt, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d line spacing -> exact %gpt (%d paragraph(s))", from, to, opts.LineSpacingExactPt, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d line spacing already exact %gpt; no change", from, to, opts.LineSpacingExactPt))
+			}
 		}
 		if opts.SpaceBeforePt != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d space before -> %gpt (%d paragraph(s))", from, to, opts.SpaceBeforePt, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d space before -> %gpt (%d paragraph(s))", from, to, opts.SpaceBeforePt, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d space before already %gpt; no change", from, to, opts.SpaceBeforePt))
+			}
 		}
 		if opts.SpaceAfterPt != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d space after -> %gpt (%d paragraph(s))", from, to, opts.SpaceAfterPt, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d space after -> %gpt (%d paragraph(s))", from, to, opts.SpaceAfterPt, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d space after already %gpt; no change", from, to, opts.SpaceAfterPt))
+			}
 		}
 		if opts.Align != "" {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d alignment -> %s (%d paragraph(s))", from, to, opts.Align, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d alignment -> %s (%d paragraph(s))", from, to, opts.Align, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d alignment already %s; no change", from, to, opts.Align))
+			}
 		}
 		if opts.FirstLineIndentChars != 0 {
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"paragraph %d-%d first line indent -> %g chars (%d paragraph(s))", from, to, opts.FirstLineIndentChars, n))
+			if n > 0 {
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"paragraph %d-%d first line indent -> %g chars (%d paragraph(s))", from, to, opts.FirstLineIndentChars, n))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"paragraph %d-%d first line indent already %g chars; no change", from, to, opts.FirstLineIndentChars))
+			}
 		}
 	}
 
@@ -167,6 +238,12 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			return FormatResult{}, err
 		}
 	}
+	// TotalParas is always populated (docx_edit parity, task 10 brief item
+	// 1); ParaCountChanged is always false -- no field this path accepts can
+	// change paragraph count (Normalize, the only one that can, is refused
+	// outright above when combined with a range). total was already
+	// captured before any mutation, so it is exactly the current count.
+	result.TotalParas = total
 	return result, nil
 }
 
@@ -217,7 +294,17 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 			if err != nil {
 				return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
 			}
-			patches = append(patches, planRunRPrPatches(documentXML, openEnd, rpr, children, font, eastAsiaFont, sizePt)...)
+			// filterChangedPatches drops any leaf rewrite that would leave
+			// its span byte-identical to what it already is -- the
+			// byte-level idempotency check task 10 brief item 3 requires: a
+			// run whose rPr already carries exactly the requested font/size
+			// must not be counted as "changed" on a repeat call (task 8
+			// review's range-path finding).
+			runPatches := filterChangedPatches(planRunRPrPatches(documentXML, openEnd, rpr, children, font, eastAsiaFont, sizePt))
+			if len(runPatches) == 0 {
+				continue
+			}
+			patches = append(patches, runPatches...)
 			touchedThisPara = true
 		}
 		if touchedThisPara {
@@ -295,7 +382,17 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req p
 				afterAutoDropped++
 			}
 		}
-		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, children, req)...)
+		// filterChangedPatches: see applyDirectRunFormat's identical comment
+		// above -- a paragraph whose pPr already carries exactly the
+		// requested spacing/align/indent must not be counted as "changed"
+		// on a repeat call (task 10 brief item 3; this is the specific
+		// function task 8's review named: "applyDirectParaFormat 对区间每段
+		// 无条件 changed++").
+		paraPatches := filterChangedPatches(planParaPPrPatches(documentXML, openEnd, ppr, children, req))
+		if len(paraPatches) == 0 {
+			continue
+		}
+		patches = append(patches, paraPatches...)
 		changed++
 	}
 

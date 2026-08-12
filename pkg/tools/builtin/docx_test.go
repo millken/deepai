@@ -1070,6 +1070,43 @@ func TestDocxEdit_TrackChangesFalseIsByteIdenticalToOmitted(t *testing.T) {
 	}
 }
 
+// bodyDocxFixture builds a minimal .docx (just [Content_Types].xml and
+// word/document.xml, no styles.xml -- mirroring pkg/docx's own internal
+// bodyDoc test helper, which this package cannot import since it is
+// unexported) whose document.xml body is exactly bodyXML, and returns its
+// path. Used by tests that need a specific paragraph shape (e.g. consecutive
+// empty paragraphs for normalize) that the committed testdata fixtures do
+// not happen to contain.
+func bodyDocxFixture(t *testing.T, bodyXML string) string {
+	t.Helper()
+	docXML := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		`<w:body>` + bodyXML + `</w:body></w:document>`
+	p := filepath.Join(t.TempDir(), "synthetic.docx")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	entries := []struct{ name, content string }{
+		{"[Content_Types].xml", `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`},
+		{docx.DocumentPart, docXML},
+	}
+	for _, e := range entries {
+		w, err := zw.Create(e.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(e.content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 // callDocxFormat is docx_format's test-only entry point, mirroring
 // callDocxRead/callDocxEdit.
 func callDocxFormat(t *testing.T, args map[string]any) (models.ToolResult, error) {
@@ -1222,6 +1259,64 @@ func TestDocxFormat_SecondIdenticalCallReportsNoChangeNote(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("notes = %v, want the no-change note on a second identical call", notes)
+	}
+}
+
+// TestDocxFormat_NormalizeReportsParaCountChangedAndIndexAdvice pins task 10
+// brief item 1 / seams review C2: normalize deletes paragraphs, which shifts
+// every later paragraph's index the same way an insert/delete batch through
+// docx_edit does. docx_format must report this the same way docx_edit
+// already does (total_paras/para_count_changed/index_advice -- the same
+// docxIndexAdvice constant, builtin/docx.go:443), or a caller that read
+// paragraph indices before this call and edits by index afterward silently
+// targets the wrong paragraph.
+func TestDocxFormat_NormalizeReportsParaCountChangedAndIndexAdvice(t *testing.T) {
+	p := bodyDocxFixture(t, `<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p/><w:p/><w:p/><w:p><w:r><w:t>two</w:t></w:r></w:p>`)
+	res, err := callDocxFormat(t, map[string]any{"path": p, "rules": map[string]any{"normalize": true}})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+
+	totalParas, ok := out["total_paras"].(float64)
+	if !ok {
+		t.Fatalf("total_paras missing or not a number: %v (content=%s)", out["total_paras"], res.Content)
+	}
+	if totalParas != 3 {
+		t.Errorf("total_paras = %v, want 3 (three empties collapsed to one)", totalParas)
+	}
+	if out["para_count_changed"] != true {
+		t.Errorf("para_count_changed = %v, want true", out["para_count_changed"])
+	}
+	advice, _ := out["index_advice"].(string)
+	if advice != docxIndexAdvice {
+		t.Errorf("index_advice = %q, want %q", advice, docxIndexAdvice)
+	}
+}
+
+// TestDocxFormat_NonNormalizeRuleOmitsIndexAdvice is the negative case: a
+// rule that never changes paragraph count must report para_count_changed
+// false and total_paras still populated (docx_edit parity), with no
+// index_advice at all (omitempty), not a stale or fabricated one.
+func TestDocxFormat_NonNormalizeRuleOmitsIndexAdvice(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"body_font": "Georgia"},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	totalParas, ok := out["total_paras"].(float64)
+	if !ok || totalParas <= 0 {
+		t.Fatalf("total_paras missing or not a positive number: %v (content=%s)", out["total_paras"], res.Content)
+	}
+	if out["para_count_changed"] != false {
+		t.Errorf("para_count_changed = %v, want false", out["para_count_changed"])
+	}
+	if _, present := out["index_advice"]; present {
+		t.Errorf("index_advice = %v, want the key absent entirely (omitempty)", out["index_advice"])
 	}
 }
 
@@ -1853,6 +1948,67 @@ func TestDocxFormat_RangeRejectsDocumentWideOnlyRules(t *testing.T) {
 				t.Errorf("%s rejected with a range still modified the file on disk", tt.name)
 			}
 		})
+	}
+}
+
+// TestDocxFormat_RangeSecondIdenticalCallDoesNotRewriteFile is the range
+// path's tool-layer counterpart to TestDocxFormat_SecondIdenticalCallReportsNoChangeNote:
+// calling docx_format twice with the exact same start_para/end_para and
+// rules must report an empty applied (with an "already ..." note) and, most
+// importantly, must NOT touch the file or the backup a second time — task 10
+// brief item 3 (task 8 review's range-path finding that a repeat call
+// unconditionally re-reported success and rewrote the file even though no
+// byte actually changed).
+func TestDocxFormat_RangeSecondIdenticalCallDoesNotRewriteFile(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	args := map[string]any{
+		"path":       p,
+		"start_para": float64(2),
+		"end_para":   float64(2),
+		"rules":      map[string]any{"body_font": "Georgia", "align": "center"},
+	}
+
+	first, err := callDocxFormat(t, args)
+	if err != nil {
+		t.Fatalf("first DocxFormatHandler: %v", err)
+	}
+	firstOut := decodeRead(t, first)
+	if applied, _ := firstOut["applied"].([]any); len(applied) == 0 {
+		t.Fatalf("first call's applied is empty; the rule never took effect (content=%s)", first.Content)
+	}
+	afterFirst, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := callDocxFormat(t, args)
+	if err != nil {
+		t.Fatalf("second DocxFormatHandler: %v", err)
+	}
+	secondOut := decodeRead(t, second)
+	if applied, _ := secondOut["applied"].([]any); len(applied) != 0 {
+		t.Errorf("second identical call's applied = %v, want empty (content=%s)", applied, second.Content)
+	}
+	notes, _ := secondOut["notes"].([]any)
+	found := false
+	for _, n := range notes {
+		if s, ok := n.(string); ok && strings.Contains(s, "already") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want an \"already ...\" note on the second identical call", notes)
+	}
+	if secondOut["backup_created"] != false {
+		t.Errorf("backup_created = %v on the second call, want false (nothing changed, so no new backup)", secondOut["backup_created"])
+	}
+
+	afterSecond, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterFirst, afterSecond) {
+		t.Error("the second identical range call rewrote the file even though nothing changed")
 	}
 }
 

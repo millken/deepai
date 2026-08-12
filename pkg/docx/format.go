@@ -146,6 +146,22 @@ type FormatResult struct {
 	// went wrong: most notably, that Normalize's punctuation-spacing pass is
 	// out of scope for this task and was not performed.
 	Notes []string
+	// TotalParas is the document's paragraph count AFTER this call, i.e.
+	// Document.TotalParas() immediately after Format returns — the same
+	// field EditResult already reports (edit.go), for the same reason: a
+	// caller needs it regardless of whether ParaCountChanged is true, to
+	// validate a range it is about to request next.
+	TotalParas int
+	// ParaCountChanged reports whether TotalParas differs from the
+	// paragraph count when this call started. Normalize is the only
+	// FormatOptions field that can make this true (it deletes empty
+	// paragraphs); every other field only ever changes formatting, never
+	// paragraph count. When true, every paragraph index a caller obtained
+	// from an earlier docx_read (or an earlier docx_format range) may now
+	// point at the wrong paragraph — see the tool layer's docxIndexAdvice,
+	// which this field is what triggers (task 10 brief, item 1 / seams
+	// review C2: "normalize 改段落数却无索引失效信号").
+	ParaCountChanged bool
 }
 
 // formatTemplates holds the P2a-brief's three named presets, already
@@ -231,6 +247,42 @@ func requireWordNamespacePrefix(name string, partXML []byte) error {
 		return errors.New("docx: document uses a non-standard namespace prefix; formatting is not supported for this file")
 	}
 	return nil
+}
+
+// patchIsNoop reports whether applying p would leave its target span
+// byte-identical to what it already is. Every patch pkg/docx's formatting
+// code builds is Raw (PatchRawSpan, never PatchRun — see planStylesPatches,
+// planMarginPatches, applyLeafOps, applyDirectRunFormat/applyDirectParaFormat),
+// which snapshots the pre-patch bytes into Old at scan time (PatchRawSpan's
+// own doc comment): comparing that snapshot to NewText is exactly the
+// byte-level idempotency check task 10 brief item 3 requires ("幂等判定必须
+// 是字节级（splice 结果与原字节比较），不是‘applied 为空’这种弱信号"). A
+// non-raw patch (never produced by this package's own formatting code, but
+// checked here defensively) is never treated as a no-op — Old there tracks
+// PatchRun's own <w:t> content, not a full-tag replacement, and comparing it
+// against NewText the way a raw patch's is compared would be meaningless.
+func patchIsNoop(p Patch) bool {
+	return p.Raw && p.Old != nil && string(p.Old) == p.NewText
+}
+
+// filterChangedPatches drops every patch in patches that patchIsNoop reports
+// as a no-op, keeping Apply's overlap/ordering invariants intact (fewer
+// patches, same non-overlapping spans). Used by the paths that do not
+// already pre-suppress a leaf's own request field to ""/0 before building a
+// patch for it (planMarginPatches, applyDirectRunFormat, applyDirectParaFormat)
+// — the whole-document docDefaults/style-chain path achieves the same
+// no-rewrite-when-unchanged result earlier, per leaf, via tagUnchanged/
+// attrEquals suppression (see planStylesPatches' "eff*" locals), so it does
+// not need this filter, but running it there too would be a no-op in
+// itself.
+func filterChangedPatches(patches []Patch) []Patch {
+	out := make([]Patch, 0, len(patches))
+	for _, p := range patches {
+		if !patchIsNoop(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // stylesMissingErr builds a rich error for "package has no word/styles.xml
@@ -333,12 +385,38 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		return FormatResult{}, err
 	}
 
+	// totalBefore is captured before ANY mutation, so it reflects the
+	// document as it stood when this call started -- the "before" half of
+	// ParaCountChanged's before/after comparison (task 10 brief, item 1 /
+	// seams review C2).
+	totalBefore := d.TotalParas()
+
 	var result FormatResult
 
 	wantsStyles := resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
 		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
 		resolved.HeadingFont != "" || resolved.BodyEastAsiaFont != "" ||
 		resolved.FirstLineIndentChars != 0 || resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0
+	wantsMargins := resolved.MarginsMM != nil
+	// wantsDirectFormatMaskingScan mirrors the condition guarding the
+	// masking-notes block near the end of this function: both need
+	// word/document.xml, just for a read-only scan rather than a mutation.
+	wantsDirectFormatMaskingScan := resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
+		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
+		resolved.BodyEastAsiaFont != "" || resolved.FirstLineIndentChars != 0 ||
+		resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0
+	wantsDocumentPart := wantsMargins || resolved.Normalize || wantsDirectFormatMaskingScan
+
+	// Task 10 brief item 5 (task 9 review follow-up): validate BOTH parts'
+	// namespace prefix up front, before mutating anything, rather than
+	// interleaved with each block's own mutation the way the pre-task-10
+	// code had it -- which let a call needing BOTH parts (e.g. body_font:
+	// styles.xml's docDefaults AND, via the masking scan below,
+	// document.xml) rewrite styles.xml in memory via d.SetPart and only
+	// THEN discover document.xml's prefix was invalid, leaving this
+	// Document half-applied even though the error return means nothing
+	// reaches disk. Checking both here, before either SetPart call, makes
+	// the whole operation all-or-nothing again.
 	if wantsStyles {
 		styles, ok := d.Part("word/styles.xml")
 		if !ok {
@@ -347,6 +425,22 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		if err := requireWordNamespacePrefix("word/styles.xml", styles); err != nil {
 			return FormatResult{}, err
 		}
+	}
+	if wantsDocumentPart {
+		doc, ok := d.Part(DocumentPart)
+		if !ok {
+			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
+		}
+		if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
+			return FormatResult{}, err
+		}
+	}
+
+	if wantsStyles {
+		// Already validated above; d.Part is re-read here (rather than
+		// reusing the slice from the precheck) because nothing else has
+		// touched this part in between, so this is simply the same bytes.
+		styles, _ := d.Part("word/styles.xml")
 		patches, applied, notes, err := planStylesPatches(styles, resolved, usedStyleIDs(d.Paras()))
 		if err != nil {
 			return FormatResult{}, err
@@ -364,14 +458,13 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		result.Notes = append(result.Notes, notes...)
 	}
 
-	wantsMargins := resolved.MarginsMM != nil
 	if wantsMargins || resolved.Normalize {
+		// Re-read: wantsStyles' block above may have run (styles.xml only,
+		// never document.xml), so this is still document.xml's pristine
+		// bytes -- already namespace-validated above.
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
-		}
-		if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
-			return FormatResult{}, err
 		}
 		working := doc
 		changed := false
@@ -425,16 +518,16 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	// honestly instead of letting Applied read as "every paragraph now
 	// looks like this" when some do not (format capability review,
 	// Critical 4 / §2's masking-detection requirement).
-	if resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
-		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
-		resolved.BodyEastAsiaFont != "" || resolved.FirstLineIndentChars != 0 ||
-		resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0 {
+	if wantsDirectFormatMaskingScan {
+		// Re-read: the margins/normalize block above may have rewritten
+		// document.xml via d.SetPart, so this must be the CURRENT bytes, not
+		// the ones validated in the precheck -- but since neither this
+		// package's patches nor SetPart ever change the root element's own
+		// namespace declaration, that earlier validation still holds; no
+		// need to check again.
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
-		}
-		if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
-			return FormatResult{}, err
 		}
 		maskNotes, err := directFormatMaskingNotes(doc, d.Paras(), resolved)
 		if err != nil {
@@ -443,6 +536,12 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		result.Notes = append(result.Notes, maskNotes...)
 	}
 
+	// TotalParas/ParaCountChanged mirror EditResult's own fields (edit.go):
+	// Normalize is the only field above that can ever change paragraph
+	// count, but this is computed generically (compare before/after) rather
+	// than special-cased on Normalize, the same way edit.go does it.
+	result.TotalParas = d.TotalParas()
+	result.ParaCountChanged = result.TotalParas != totalBefore
 	return result, nil
 }
 

@@ -1,6 +1,7 @@
 package docx
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -129,7 +130,14 @@ func TestDirect_UpdatesAnExistingSizeInsteadOfDuplicating(t *testing.T) {
 
 // TestDirect_IsIdempotent applies the same run format twice and requires
 // byte-identical output — without in-place updates the XML would grow a new
-// <w:sz>/<w:rFonts> on every call until Word rejected the file.
+// <w:sz>/<w:rFonts> on every call until Word rejected the file. n2 must be 0
+// (not 2, the pre-task-10 expectation): the second call's patches are all
+// byte-identical no-ops against what the first call already wrote, so
+// applyDirectRunFormat's own byte-level idempotency check (filterChangedPatches)
+// must recognize that NEITHER paragraph actually changed this time — the
+// signal formatDirectRange uses to gate Applied vs. a "already ..." note and
+// skip rewriting the file a second time (task 10 brief, item 3; task 8
+// review's "range 路...第二次相同调用字节不变仍全报 applied").
 func TestDirect_IsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
@@ -145,8 +153,11 @@ func TestDirect_IsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n1 != 2 || n2 != 2 {
-		t.Errorf("changed counts = %d, %d, want 2, 2", n1, n2)
+	if n1 != 2 {
+		t.Errorf("first call's changed count = %d, want 2", n1)
+	}
+	if n2 != 0 {
+		t.Errorf("second identical call's changed count = %d, want 0 (no byte actually changed)", n2)
 	}
 	if string(once) != string(twice) {
 		t.Errorf("applying the same format twice was not idempotent:\nonce:  %s\ntwice: %s", once, twice)
@@ -359,8 +370,13 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n2 != 1 {
-		t.Errorf("changed %d paragraphs on the second pass, want 1", n2)
+	// n2 is 0, not 1 (task 10 brief, item 3): the paragraph is no longer
+	// self-closing after the first pass, so the second pass takes the
+	// "found, not self-closing" branch, and every leaf it would rewrite
+	// (spacing/jc) already carries exactly the requested value — a true
+	// byte-level no-op, which must not be counted as "changed".
+	if n2 != 0 {
+		t.Errorf("changed %d paragraphs on the second pass, want 0 (no byte actually changed)", n2)
 	}
 	if string(got) != string(twice) {
 		t.Errorf("expanding a self-closing paragraph was not idempotent:\nonce:  %s\ntwice: %s", got, twice)
@@ -368,7 +384,8 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 }
 
 // TestDirect_ParagraphFormatIsIdempotent mirrors the run-level idempotency
-// test for the paragraph-level path.
+// test for the paragraph-level path. n2 must be 0 (task 10 brief, item 3):
+// see TestDirect_IsIdempotent's doc comment for why.
 func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
@@ -384,8 +401,11 @@ func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n1 != 1 || n2 != 1 {
-		t.Errorf("changed counts = %d, %d, want 1, 1", n1, n2)
+	if n1 != 1 {
+		t.Errorf("first call's changed count = %d, want 1", n1)
+	}
+	if n2 != 0 {
+		t.Errorf("second identical call's changed count = %d, want 0 (no byte actually changed)", n2)
 	}
 	if string(once) != string(twice) {
 		t.Errorf("applying the same paragraph format twice was not idempotent:\nonce:  %s\ntwice: %s", once, twice)
@@ -491,6 +511,89 @@ func TestFormat_RangeNotesSkippedEmptyParagraphsForRunFormat(t *testing.T) {
 	doc, _ := d.Part(DocumentPart)
 	if !strings.Contains(string(doc), `<w:sz w:val="28"/>`) {
 		t.Errorf("the non-empty paragraph in range was not formatted: %s", doc)
+	}
+}
+
+// TestFormatDirectRange_SecondIdenticalCallReportsAlreadyNoteAndDoesNotRewrite
+// is the range path's counterpart to
+// TestDocxFormat_SecondIdenticalCallReportsNoChangeNote (the whole-document
+// path, pkg/tools/builtin/docx_test.go): calling Format twice with the exact
+// same range and rules must report an empty Applied plus an "already ..."
+// note on the second call, AND must not rewrite word/document.xml a second
+// time — task 10 brief item 3 / task 8 review's "range 路...第二次相同调用
+// 字节不变仍全报 applied" (applyDirectParaFormat/applyDirectRunFormat
+// unconditionally counting every in-range paragraph as changed regardless
+// of whether any byte actually differed).
+func TestFormatDirectRange_SecondIdenticalCallReportsAlreadyNoteAndDoesNotRewrite(t *testing.T) {
+	d := directFixtureDoc(t)
+	first, err := d.Format(FormatOptions{StartPara: 2, EndPara: 2, BodySizePt: 14, Align: "center"})
+	if err != nil {
+		t.Fatalf("first Format: %v", err)
+	}
+	if len(first.Applied) == 0 {
+		t.Fatalf("first call's Applied is empty; the rule never took effect")
+	}
+	docAfterFirst, _ := d.Part(DocumentPart)
+	docAfterFirstCopy := append([]byte(nil), docAfterFirst...)
+
+	second, err := d.Format(FormatOptions{StartPara: 2, EndPara: 2, BodySizePt: 14, Align: "center"})
+	if err != nil {
+		t.Fatalf("second Format: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("second identical call's Applied = %v, want empty (nothing actually changed)", second.Applied)
+	}
+	joined := strings.Join(second.Notes, "|")
+	if !strings.Contains(joined, "already") {
+		t.Errorf("second call's Notes = %v, want an \"already ...\" note", second.Notes)
+	}
+	docAfterSecond, _ := d.Part(DocumentPart)
+	if !bytes.Equal(docAfterFirstCopy, docAfterSecond) {
+		t.Errorf("second identical call rewrote document.xml even though nothing changed:\nfirst:  %s\nsecond: %s", docAfterFirstCopy, docAfterSecond)
+	}
+}
+
+// TestFormatDirectRange_SetsTotalParasAndNeverChangesParaCount pins task 10
+// brief item 1's range-path half: TotalParas is always populated (docx_edit
+// parity), and ParaCountChanged is always false — no FormatOptions field the
+// range path accepts can change paragraph count (Normalize is refused
+// outright when combined with a range).
+func TestFormatDirectRange_SetsTotalParasAndNeverChangesParaCount(t *testing.T) {
+	d := directFixtureDoc(t)
+	before := d.TotalParas()
+	res, err := d.Format(FormatOptions{StartPara: 1, EndPara: 2, BodySizePt: 14})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	if res.TotalParas != before {
+		t.Errorf("TotalParas = %d, want %d", res.TotalParas, before)
+	}
+	if res.ParaCountChanged {
+		t.Error("ParaCountChanged = true, want false: a paragraph range never changes paragraph count")
+	}
+}
+
+// TestFormatDirectRange_TextBoxParagraphNoteIsHonest pins task 10 brief item
+// 4 / format capability review Minor 15: a paragraph whose only content is a
+// skipped text box (Para.SkippedTextBox) has zero Runs, exactly like a
+// genuinely empty paragraph, but is NOT empty -- a reader sees the text box's
+// content. The skipped-for-run-formatting note must say so honestly instead
+// of claiming "empty paragraph".
+func TestFormatDirectRange_TextBoxParagraphNoteIsHonest(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:drawing><wps:txbx><w:txbxContent>`+
+		`<w:p><w:r><w:t>inside box</w:t></w:r></w:p>`+
+		`</w:txbxContent></wps:txbx></w:drawing></w:r></w:p>`+
+		`<w:p><w:r><w:t>second</w:t></w:r></w:p>`)
+	res, err := d.Format(FormatOptions{StartPara: 1, EndPara: 2, BodySizePt: 14})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	joined := strings.Join(res.Notes, "|")
+	if !strings.Contains(joined, "paragraph 1 is inside a text box; direct formatting skipped") {
+		t.Errorf("Notes = %v, want an honest text-box note naming paragraph 1", res.Notes)
+	}
+	if strings.Contains(joined, "empty paragraph") {
+		t.Errorf("Notes = %v, want no dishonest \"empty paragraph\" note for the text-box paragraph", res.Notes)
 	}
 }
 

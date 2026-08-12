@@ -583,6 +583,17 @@ type docxFormatOutput struct {
 	// response shape it has to infer "nothing happened" from.
 	Applied []string `json:"applied"`
 	Notes   []string `json:"notes,omitempty"`
+	// TotalParas/ParaCountChanged/IndexAdvice mirror docxEditOutput's own
+	// fields exactly (task 10 brief, item 1 / seams review C2): normalize is
+	// the only rule that can delete paragraphs, but a caller cannot tell
+	// that from applied/notes alone -- an earlier read→normalize→edit
+	// sequence would otherwise silently target the wrong paragraph by index,
+	// with the edit itself reporting applied:true. Always present (like
+	// docx_edit's own TotalParas), so a caller can validate a range it is
+	// about to request next regardless of whether ParaCountChanged is true.
+	TotalParas       int    `json:"total_paras"`
+	ParaCountChanged bool   `json:"para_count_changed"`
+	IndexAdvice      string `json:"index_advice,omitempty"`
 	// BackupPath/BackupCreated mirror docxEditOutput's fields exactly (see
 	// its doc comment): BackupPath alone can't distinguish a backup this
 	// call just created from one an earlier call already made.
@@ -627,11 +638,18 @@ func DocxFormatTool() models.Tool {
 			"of editing the file with a script. template, heading_font, margins_mm, and normalize are " +
 			"document-level concepts and are refused with an explicit error if combined with a range. " +
 			"line_spacing and line_spacing_exact_pt are mutually exclusive — giving both is an error, on either " +
-			"path. Never changes body text either way. Reports which rules actually changed something in " +
-			"applied — including how many paragraphs were affected when a range was used — and an empty or " +
-			"no-op rules object says so explicitly rather than looking identical to a real change. page_numbers " +
-			"and rebuild_toc are not supported yet and return an explicit error rather than being silently " +
-			"ignored, with or without a range. Backs up the original file once, before the first overwrite, to " +
+			"path. Every rule except normalize only changes formatting, never body text. normalize is the one " +
+			"exception: it deletes runs of consecutive empty paragraphs, which shifts every later paragraph's " +
+			"index the same way an insert/delete through docx_edit does — the response's total_paras/" +
+			"para_count_changed/index_advice fields report this exactly like docx_edit's own, so re-read the " +
+			"outline or range before issuing further paragraph-indexed calls whenever para_count_changed is " +
+			"true. Reports which rules actually changed something in applied — including how many paragraphs " +
+			"were affected when a range was used — with an empty or no-op rules object, or a rule whose target " +
+			"already matched (reported in notes as \"already ...\" instead), saying so explicitly rather than " +
+			"looking identical to a real change; a call that changed nothing at all does not rewrite the file or " +
+			"touch the backup. page_numbers and rebuild_toc are not supported yet and return an explicit error " +
+			"rather than being silently ignored, with or without a range. Backs up the original file once, " +
+			"before the first overwrite, to " +
 			"<path>.bak.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -741,10 +759,15 @@ func DocxFormatHandler(ctx context.Context, call models.ToolCall) (models.ToolRe
 	}
 
 	out := docxFormatOutput{
-		Applied:       formatResult.Applied,
-		Notes:         formatResult.Notes,
-		BackupPath:    backupPath,
-		BackupCreated: backupCreated,
+		Applied:          formatResult.Applied,
+		Notes:            formatResult.Notes,
+		TotalParas:       formatResult.TotalParas,
+		ParaCountChanged: formatResult.ParaCountChanged,
+		BackupPath:       backupPath,
+		BackupCreated:    backupCreated,
+	}
+	if formatResult.ParaCountChanged {
+		out.IndexAdvice = docxIndexAdvice
 	}
 	if out.Applied == nil {
 		out.Applied = []string{}

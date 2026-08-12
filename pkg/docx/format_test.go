@@ -223,6 +223,52 @@ func TestFormat_TemplateExpandsAndExplicitFieldsWin(t *testing.T) {
 	}
 }
 
+// TestFormat_NormalizeSetsTotalParasAndParaCountChanged pins task 10 brief
+// item 1 / seams review C2: normalize deletes paragraphs, so
+// FormatResult.TotalParas/ParaCountChanged must report that the same way
+// EditResult already does for docx_edit, letting the tool layer trigger
+// docxIndexAdvice instead of leaving a caller's earlier paragraph indices
+// silently stale.
+func TestFormat_NormalizeSetsTotalParasAndParaCountChanged(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p/><w:p/><w:p/><w:p><w:r><w:t>two</w:t></w:r></w:p>`)
+	before := d.TotalParas()
+	res, err := d.Format(FormatOptions{Normalize: true})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	after := d.TotalParas()
+	if after != before-2 {
+		t.Fatalf("TotalParas after normalize = %d, want %d (three empties collapse to one, removing 2)", after, before-2)
+	}
+	if res.TotalParas != after {
+		t.Errorf("FormatResult.TotalParas = %d, want %d (Document.TotalParas() immediately after Format)", res.TotalParas, after)
+	}
+	if !res.ParaCountChanged {
+		t.Error("ParaCountChanged = false, want true: normalize deleted paragraphs, so earlier paragraph indices are now stale")
+	}
+}
+
+// TestFormat_NonNormalizeCallReportsParaCountUnchanged is
+// TestFormat_NormalizeSetsTotalParasAndParaCountChanged's negative case: a
+// rule that never touches paragraph count must report TotalParas (still
+// populated, the same way docx_edit always populates it regardless of
+// ParaCountChanged) and ParaCountChanged=false, not the zero value that
+// would look identical to "never computed".
+func TestFormat_NonNormalizeCallReportsParaCountUnchanged(t *testing.T) {
+	d, _ := formatDoc(t)
+	before := d.TotalParas()
+	res, err := d.Format(FormatOptions{BodySizePt: 14})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	if res.TotalParas != before {
+		t.Errorf("TotalParas = %d, want %d (body_size_pt never changes paragraph count)", res.TotalParas, before)
+	}
+	if res.ParaCountChanged {
+		t.Error("ParaCountChanged = true, want false")
+	}
+}
+
 func TestFormat_UnknownTemplateErrors(t *testing.T) {
 	d, _ := formatDoc(t)
 	if _, err := d.Format(FormatOptions{Template: "fancy"}); err == nil {
