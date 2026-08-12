@@ -257,7 +257,7 @@ compaction 时 ai 文本截断到 200 字节（`compactAssistantTextKeep`）。
   压缩视图，只用于组装 `ChatRequest`。视图用完即弃，不影响 canonical 状态。
 
 这意味着 T1/T4 的老化逻辑作用于**派生视图**，而非 canonical 消息。age 信息不存放在
-Message 上，而是由视图层扫描 canonical 消息的 `aiTurnIndex` 序号计算（见 §T1
+Message 上，而是由视图层扫描 canonical 消息的 `userTurnIndex` 序号计算（见 §T1
 "age 时间轴定义"），不依赖任何运行时字段或外部传入的 turn 编号。
 
 这条原则使 T1/T4 的"复用同一基础设施"成为真正的同源 —— 它们是同一个视图派生函数
@@ -294,7 +294,7 @@ prompt 视图，其中历史 `RoleTool` 消息的 `Content` 按"年龄"递减预
 结构，就地改 Content 会破坏持久化一致性、被 compaction 抹掉运行时字段、且
 `ToolResult.Content`（message.go:87）与 `Message.Content` 双份存储导致只改一份无效。
 
-#### age 时间轴定义（关键算法，修正版）
+#### age 时间轴定义（关键算法，修正版 v2）
 
 > ⚠ 早期版本的 age 算法有两个致命错误：
 > 1. `turnOfLastAI` 初始化为 `currentTurn` 再 `++`，导致 age 恒为 0 或负数
@@ -302,61 +302,79 @@ prompt 视图，其中历史 `RoleTool` 消息的 `Content` 按"年龄"递减预
 >    纯文本 AI 消息（react.go:433），且新 Run 会带入整个 session 历史（repl.go:517），
 >    `turn` 变量只计当前 Run 的循环，不是绝对位置。
 
-**正确的 age 定义：基于扫描的绝对 assistant-turn 序号**
+> ⚠ **v2 修正（读取死循环事故）**：v1 把**每条 RoleAI 消息**当作 age 边界。这在
+> "一条 assistant 消息批量发多个 tool_call"的假设下成立，但实测模型（glm-5.2 等）
+> **一条消息只发一个 tool_call**，于是"age 3"只需 3 次工具调用就到了 —— 而
+> `read_file` 在 age≥3 的预算是 300 字节，还附带"re-call read_file"提示。后果：
+> 连读第 4 个文件就把第 1 个挤没，模型照提示重读，重读又挤掉下一个，形成**无法
+> 自行退出的读取循环**。真实事故：session `20260812_093415_fc6e` 在 7 个文件之间
+> 发了 1136 次 `read_file`（其中同一个文件 858 次），整个会话报废。
+>
+> 根因不是预算数值，而是 age 轴选错了：**同一个用户请求内的工作集必须完整保留**，
+> 否则模型没有任何出路，只能重新获取被删掉的信息。因此 v2 把 age 轴改为
+> **用户轮次**：age = "几个用户请求之前"。请求内的膨胀交给 compaction（75% 的
+> 二道防线）处理，而不是靠悄悄删掉模型正在用的东西来处理。
+
+**正确的 age 定义：基于扫描的绝对 user-turn 序号**
 
 age 不依赖 `Run` 的 `turn` 变量，而是由视图函数扫描 `runMessages` 独立计算：
 
-**第一步：定义"assistant-turn"**
+**第一步：定义"user-turn"**
 
-每一条 `RoleAI` 消息（无论是否含 tool_calls）都是一个 assistant-turn 的边界。
-扫描时为每条 RoleAI 消息分配一个**递增的序号**（从 0 开始），称为它的 `aiTurnIndex`。
+每一条 `RoleHuman` 消息开启一个新 turn。扫描时为每条 RoleHuman 消息分配一个
+**递增的序号**（从 0 开始）；它触发的所有 assistant 消息与 tool 结果都继承这个
+序号，因此"agent 为同一个用户请求做的全部工作"共享同一个 age。
 
 ```
 消息序列示例（跨多次 Run 的 session 历史）：
-  [0] human        "帮我看看这个项目"
-  [1] AI (tools)   aiTurnIndex=0  ← 调用 list_dir + read_file
-  [2] tool         属于 aiTurnIndex=0
-  [3] tool         属于 aiTurnIndex=0
-  [4] AI (tools)   aiTurnIndex=1  ← 调用 grep
-  [5] tool         属于 aiTurnIndex=1
-  [6] AI (text)    aiTurnIndex=2  ← 纯文本回复，Run 结束
+  [0] human        "帮我看看这个项目"        userTurnIndex=0
+  [1] AI (tools)   属于 userTurnIndex=0     ← 调用 list_dir
+  [2] tool         属于 userTurnIndex=0
+  [3] AI (tools)   属于 userTurnIndex=0     ← 调用 read_file
+  [4] tool         属于 userTurnIndex=0
+  [5] AI (tools)   属于 userTurnIndex=0     ← 调用 grep
+  [6] tool         属于 userTurnIndex=0
+  [7] AI (text)    属于 userTurnIndex=0     ← 纯文本回复，Run 结束
   --- 下一次 Run（新用户消息）---
-  [7] human        "再看看那个函数"
-  [8] AI (tools)   aiTurnIndex=3  ← 调用 read_file
-  [9] tool         属于 aiTurnIndex=3
-  [10] AI (text)   aiTurnIndex=4  ← 纯文本回复，Run 结束（当前请求前）
+  [8] human        "再看看那个函数"          userTurnIndex=1
+  [9] AI (tools)   属于 userTurnIndex=1     ← 调用 read_file
+  [10] tool        属于 userTurnIndex=1
+  [11] AI (text)   属于 userTurnIndex=1     ← 纯文本回复，Run 结束（当前请求前）
 ```
 
 **第二步：tool 消息归属**
 
-每条 `RoleTool` 消息归属于它**前面最近的** RoleAI 消息的 `aiTurnIndex`。
-（ReAct 循环保证 tool 消息总是跟在发起调用的 AI 消息之后。）
+每条 `RoleTool` 消息归属于它**前面最近的** RoleHuman 消息的 `userTurnIndex`
+（等价于：归属它所在的那个用户请求）。第一条 RoleHuman 之前的消息（system
+prompt、带入的状态）按 turn 0 处理。
 
 **第三步：age 计算**
 
 ```
-totalAITurns = 扫描得到的 RoleAI 消息总数（上例中 = 5）
-对每条 RoleTool 消息 M（归属 aiTurnIndex = K）：
-  age = totalAITurns - 1 - K
+totalTurns = 扫描得到的 RoleHuman 消息总数（上例中 = 2）
+对每条消息 M（归属 userTurnIndex = K）：
+  age = totalTurns - 1 - K
 ```
 
 上例中：
-- 消息 [2]（aiTurnIndex=0）：age = 5-1-0 = **4** → 激进压缩
-- 消息 [5]（aiTurnIndex=1）：age = 5-1-1 = **3** → 激进压缩
-- 消息 [9]（aiTurnIndex=3）：age = 5-1-3 = **1** → 轻度压缩
+- 消息 [2]/[4]/[6]（userTurnIndex=0）：age = 2-1-0 = **1** → 轻度压缩（8KB）
+- 消息 [10]（userTurnIndex=1）：age = 2-1-1 = **0** → 当前请求，不压缩
 
 **为什么这个定义正确**：
 
-1. **不依赖 `Run` 的 `turn` 变量**：`totalAITurns` 由扫描得出，跨 Run 的 session
+1. **不依赖 `Run` 的 `turn` 变量**：`totalTurns` 由扫描得出，跨 Run 的 session
    历史也有正确的绝对位置。
-2. **纯文本 AI 消息也是边界**：不假设"只有 tool-call AI 才算 turn"。纯文本 AI
-   消息（Run 结束时的最终回复）也分配 `aiTurnIndex`，但它后面没有 tool 消息，
-   所以不影响任何 tool 的 age —— 它只是让 `totalAITurns` 正确递增。
-3. **当前请求的 tool 结果 age=0**：当前 turn 的 tool 结果归属最后一个 aiTurnIndex
-   （= `totalAITurns - 1`），age = `totalAITurns - 1 - (totalAITurns - 1)` = 0，
-   不压缩。这正是期望行为。
+2. **不假设模型每条消息发几个 tool_call**：这是 v1 致命错误的来源。一个用户请求
+   里模型是发 3 次单调用还是 1 次三调用，对 age 不再有任何影响 —— 而 v1 下这个
+   差异等于 3 倍的老化速度。
+3. **当前请求的所有工作 age=0**：模型正在做的这件事的全部工具结果都归属最后一个
+   `userTurnIndex`，age = 0，不压缩。**这是防死循环的核心不变量**：绝不在模型还
+   需要某份内容时把它删掉再叫它重新获取。
 4. **compaction 安全**：compaction 保留 Role 和相对顺序，扫描结果在 compaction 后
-   仍然正确（只是消息变少，aiTurnIndex 重新编号，但相对 age 关系不变）。
+   仍然正确（只是消息变少，userTurnIndex 重新编号，但相对 age 关系不变）。
+5. **请求内膨胀有人管**：单个请求内不老化，膨胀由 compaction 在 75% 处接手。分工
+   清晰：aging 管**跨请求**衰减（无损、只作用于视图），compaction 管**请求内**溢出
+   （有损、最后手段）。
 
 #### 上下文压力门槛（避免短会话过度压缩）
 
@@ -425,18 +443,21 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
         }
     }
 
-    // 第一步：扫描建立 aiTurnIndex，统计 totalAITurns
-    aiTurnIndex := -1
-    ownerTurn := make([]int, len(messages)) // 每条消息归属的 aiTurnIndex
+    // 第一步：扫描建立 userTurnIndex，统计 totalTurns
+    turnIndex := -1
+    ownerTurn := make([]int, len(messages)) // 每条消息归属的 userTurnIndex
     for i, msg := range messages {
-        if msg.Role == models.RoleAI {
-            aiTurnIndex++
+        if msg.Role == models.RoleHuman {
+            turnIndex++
         }
-        ownerTurn[i] = aiTurnIndex
+        ownerTurn[i] = turnIndex
+        if ownerTurn[i] < 0 {
+            ownerTurn[i] = 0 // 第一条 human 之前的消息按 turn 0 处理
+        }
     }
-    totalAITurns := aiTurnIndex + 1 // -1 表示无 AI 消息
-    if totalAITurns == 0 {
-        return messages // 无 AI 消息，无需压缩
+    totalTurns := turnIndex + 1 // -1 表示还没有用户消息
+    if totalTurns == 0 {
+        return messages // 无用户请求，无需压缩
     }
 
     // 第二步：派生视图，按 age 压缩（T1: RoleTool + T4: RoleAI 同一遍历）
@@ -445,7 +466,7 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 
     for i := range view {
         msg := &view[i]
-        age := totalAITurns - 1 - ownerTurn[i]
+        age := totalTurns - 1 - ownerTurn[i]
         if age <= 0 {
             continue // 当前 turn，不压缩
         }
@@ -626,15 +647,15 @@ JSON schema 的 `description` 字段有时与工具 `Description` 重复。审�
 75% 阈值触发。
 
 **T4 方案**：与 T1 共用同一个 `buildPromptView` 函数及其 age 时间轴（§T1 的
-`aiTurnIndex`/`totalAITurns` 扫描）。在同一个遍历中，对 `RoleAI` 消息的文本 Content
+`userTurnIndex`/`totalTurns` 扫描）。在同一个遍历中，对 `RoleAI` 消息的文本 Content
 做渐进式压缩。ToolCalls.Arguments 在 T4 视图层不压缩（见 §9.3，含与 compaction 的
 范围限定）。
 
 **为什么 T4 现在能真正复用 T1 基础设施**：
 
-T1 的 age 时间轴（§T1 "age 时间轴定义"）把**每条** RoleAI 消息（无论是否含
-tool_calls）都分配了 `aiTurnIndex`。因此 RoleAI 消息自身的 age 也能直接计算：
-`age = totalAITurns - 1 - 自身的aiTurnIndex`。T4 不需要任何额外的扫描或字段。
+T1 的 age 时间轴（§T1 "age 时间轴定义"）为**每条**消息都算出了所属的
+`userTurnIndex` —— RoleAI 消息也一样。因此 RoleAI 消息自身的 age 直接可得：
+`age = totalTurns - 1 - 自身的userTurnIndex`。T4 不需要任何额外的扫描或字段。
 
 **压缩范围：仅 Content（文本），不含 ToolCalls.Arguments**
 
@@ -683,7 +704,7 @@ age>=4    : 保留首 200 字节（等同 compaction 现状）
 ```go
 // 在 buildPromptView 第二步遍历中，与 RoleTool 分支并列：
 if msg.Role == models.RoleAI {
-    age := totalAITurns - 1 - ownerTurn[i] // ownerTurn[i] 即自身的 aiTurnIndex
+    age := totalTurns - 1 - ownerTurn[i] // ownerTurn[i] 即所属的 userTurnIndex
 
     // 仅压缩 Content（文本）；ToolCalls 结构（含 Arguments）完全不动
     budget := cfg.conversationBudget(age)
@@ -971,7 +992,7 @@ provider 返回的 `Usage.InputTokens`（react.go:417 已有 `streamUsage.InputT
 **T1：工具结果时效老化（视图层方案）—— ✅ 已完成**
 
 1. ✅ 实现 `buildPromptView(messages, cfg, contextWindow)`（`pkg/agent/aging.go`）——
-   从 canonical 消息派生 prompt 视图，扫描建立 aiTurnIndex，按 age 压缩历史
+   从 canonical 消息派生 prompt 视图，扫描建立 userTurnIndex，按 age 压缩历史
    RoleTool 的 Content。函数内已含 T4 的 `case RoleAI` 分支，默认不启用。
 2. ✅ 接入点：`react.go` 组装 `ChatRequest` 处，`Messages: promptView`
    （`promptView = buildPromptView(runMessages, a.aging, a.contextWindow)`；
@@ -1280,7 +1301,7 @@ T1 和 T4 **不能分别启用** —— 它们是同一个 `buildPromptView` 遍
 由同一个 `AgingConfig` 驱动。如果需要"只启用 T1 不启用 T4"，将 `ConversationBudgets`
 设为空 map（所有 age 返回 0 = 不压缩）。
 
-> **设计理由**：T1/T4 共用 age 时间轴（`aiTurnIndex` 扫描）和视图派生基础设施。
+> **设计理由**：T1/T4 共用 age 时间轴（`userTurnIndex` 扫描）和视图派生基础设施。
 > 拆成两个独立配置会导致两个 `buildPromptView` 或两次扫描，违背"同一次遍历"的设计。
 > 用一个 `AgingConfig` 里的两组 budget map 表达"对哪类内容、在哪个 age、压到多少"。
 

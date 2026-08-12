@@ -1,11 +1,15 @@
 package commands
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"charm.land/huh/v2"
@@ -388,7 +392,72 @@ func LoadConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	warnUnknownConfigKeys(path, data)
 	return cfg, nil
+}
+
+// warnUnknownConfigKeys reports config keys the decoder did not recognize.
+//
+// A mistyped key is silently dropped by yaml.Unmarshal, and a silently dropped
+// key means the setting the user wrote is simply not in effect — with no
+// feedback anywhere. That is not hypothetical: `cotext_window: 1000000`
+// (missing an "n") left the context window at the 192k default, which moved
+// aging's 40% gate and compaction's 75% trigger about 5x earlier than intended
+// and helped drive a read loop through a whole session before anyone noticed.
+//
+// Deliberately a warning, not an error: a config file written by a newer or
+// older deepai must keep loading. Unrecognized keys are ignored exactly as
+// before — the only change is that you hear about it.
+func warnUnknownConfigKeys(path string, data []byte) {
+	for _, key := range unknownConfigKeys(data) {
+		msg := fmt.Sprintf("%s: unknown key %q was ignored — check for a typo", path, key.name)
+		if key.line > 0 {
+			msg = fmt.Sprintf("%s line %d: unknown key %q was ignored — check for a typo",
+				path, key.line, key.name)
+		}
+		fmt.Fprintf(os.Stderr, "  config warning: %s\n", msg)
+		slog.Warn("unknown config key ignored", "path", path, "key", key.name, "line", key.line)
+	}
+}
+
+// configKeyIssue is one unrecognized key: its name and, when yaml reported it,
+// the line it sits on.
+type configKeyIssue struct {
+	name string
+	line int
+}
+
+// unknownFieldRE matches gopkg.in/yaml.v3's KnownFields complaint, e.g.
+// `line 5: field cotext_window not found in type commands.Config`. The line
+// prefix is absent for some documents, hence the optional group.
+var unknownFieldRE = regexp.MustCompile(`(?:line (\d+): )?field (\S+) not found in type`)
+
+// unknownConfigKeys re-decodes data in strict mode purely to collect the keys
+// Config does not declare. Type errors (a string where an int belongs) are
+// skipped: those are the business of the real Unmarshal in LoadConfig, which
+// reports them as errors and whose verdict must not be second-guessed here.
+func unknownConfigKeys(data []byte) []configKeyIssue {
+	var probe Config
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	err := dec.Decode(&probe)
+	if err == nil {
+		return nil
+	}
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return nil // EOF on an empty file, or a syntax error LoadConfig already surfaced
+	}
+	var out []configKeyIssue
+	for _, e := range typeErr.Errors {
+		m := unknownFieldRE.FindStringSubmatch(e)
+		if m == nil {
+			continue
+		}
+		line, _ := strconv.Atoi(m[1])
+		out = append(out, configKeyIssue{name: m[2], line: line})
+	}
+	return out
 }
 
 func saveConfig(path string, cfg *Config) error {

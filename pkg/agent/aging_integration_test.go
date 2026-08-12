@@ -60,10 +60,11 @@ func (p *captureProvider) seen() []models.Message {
 func TestAging_EndToEnd(t *testing.T) {
 	big := strings.Repeat("x", 10000)
 	history := []models.Message{
-		{Role: models.RoleHuman, Content: "explore the repo"},
-		aiTools(""),                  // aiTurnIndex 0
-		toolMsg("read_file", big),    // owner 0 -> age 1 in the view -> compressed
-		aiTools(""),                  // aiTurnIndex 1 (latest)
+		{Role: models.RoleHuman, Content: "explore the repo"}, // turn 0
+		aiTools(""),               //
+		toolMsg("read_file", big), // owner 0 -> age 1 in the view -> compressed
+		{Role: models.RoleHuman, Content: "now find the callers"}, // turn 1 (latest)
+		aiTools(""),                  //
 		toolMsg("grep", "small hit"), // owner 1 -> age 0 -> untouched
 	}
 

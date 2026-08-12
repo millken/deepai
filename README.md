@@ -558,7 +558,7 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 | 机制 | 说明 | 启用方式 |
 |------|------|---------|
 | **Phase 0 指标** | 每轮记录 provider token 数与各工具结果字节桶，输出为 JSONL | `token_metrics: "1"` 或 `DEEPAI_TOKEN_METRICS=1` |
-| **T1 工具结果老化** | 历史工具结果按年龄压缩（上下文压力 >40% 时触发） | `token_aging: true` 或 `DEEPAI_TOKEN_AGING=1` |
+| **T1 工具结果老化** | 历史工具结果按年龄压缩，age 以**用户轮次**计（上下文压力 >40% 时触发；当前请求内的工具结果永不压缩） | `token_aging: true` 或 `DEEPAI_TOKEN_AGING=1` |
 | **T4 对话压缩** | 历史 AI 消息文本与 ToolCall 参数按年龄压缩 | 待校准（配置预留） |
 | **上下文压缩** | 上下文窗口 75% 时自动压缩，保留最近 N 条 | 默认启用（需 `context_window > 0`） |
 

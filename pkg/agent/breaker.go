@@ -76,9 +76,25 @@ const maxConsecutiveValidationFailures = 8
 // before injecting a non-fatal hint nudging the model to change approach.
 // maxRepeatFails: consecutive identical invocations that also fail (including
 // bash non-zero exit) before hard-stopping the run.
+// maxRepeatCallsCumulative / maxRepeatCallsHardStop bound identical calls that
+// are NOT consecutive. maxRepeatCalls above only counts a run of the same key,
+// so the loop that actually burned session 20260812_093415_fc6e was invisible
+// to it: the model cycled read_file over three files (A, B, A, A, B, A …), and
+// every switch reset the consecutive counter before it reached 5. It made 1136
+// read_file calls over 7 distinct paths — 858 of them the same path — without
+// the breaker ever emitting a single hint.
+//
+// Counting per key for the whole run catches any cycle length. A hint goes out
+// every maxRepeatCallsCumulative identical calls, and the run hard-stops at
+// maxRepeatCallsHardStop: by then the model has been told three times and is
+// not recovering on its own, so stopping and reporting beats burning the
+// remaining budget. Both are per (tool, arguments) — a re-read after an edit
+// (different content, same args) is normal and stays well under the floor.
 const (
-	maxRepeatCalls = 5
-	maxRepeatFails = 8
+	maxRepeatCalls           = 5
+	maxRepeatFails           = 8
+	maxRepeatCallsCumulative = 6
+	maxRepeatCallsHardStop   = 24
 )
 
 // repeatKey builds a deduplication key from tool name and arguments hash.
@@ -106,11 +122,17 @@ type toolCallBreaker struct {
 	repeatCount   int
 	repeatFail    int
 	prevRepeatKey string
+
+	// repeatTotals counts identical invocations across the WHOLE run, keyed
+	// the same way. Unlike repeatCount it never resets, so a model cycling
+	// between two or three calls cannot hide from it.
+	repeatTotals map[string]int
 }
 
 func newToolCallBreaker() *toolCallBreaker {
 	return &toolCallBreaker{
 		validationFailures: make(map[string]int),
+		repeatTotals:       make(map[string]int),
 	}
 }
 
@@ -168,12 +190,49 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 		}
 		return out
 	}
+	// Cumulative repeat detection: same call, anywhere in this run. Catches
+	// cycles (A, B, A, A, B …) that keep resetting the consecutive counter.
+	if b.repeatTotals == nil {
+		b.repeatTotals = make(map[string]int)
+	}
+	b.repeatTotals[rKey]++
+	if total := b.repeatTotals[rKey]; total >= maxRepeatCallsHardStop {
+		err := fmt.Errorf("identical tool call repeated %d times in one run (%q): the run is looping",
+			total, call.Name)
+		out.fatalErr = err
+		out.fatalAgentErr = &AgentError{
+			Code:    "tool_repeat_loop",
+			Message: err.Error(),
+			Suggestion: "The model kept re-running the same call instead of using what it already had. " +
+				"Re-run with a narrower request, or check whether context compression is discarding " +
+				"the tool results it needs (config.yaml: context_window / token_aging).",
+		}
+		return out
+	} else if total%maxRepeatCallsCumulative == 0 && total > b.repeatCount {
+		// total > repeatCount: the consecutive breaker below is not already
+		// hinting about this same streak, so this hint adds information.
+		out.hintMessages = append(out.hintMessages, models.Message{
+			ID:        newMessageID("human"),
+			SessionID: sessionID,
+			Role:      models.RoleHuman,
+			Metadata:  map[string]string{metaAgentInjected: "true"},
+			Content: fmt.Sprintf(
+				"You have now called %q with these exact arguments %d times in this run, "+
+					"cycling between a few calls. The result is not going to change. "+
+					"Work from what you already have in the conversation; if you genuinely cannot "+
+					"see the content you need, say so instead of re-fetching it.",
+				call.Name, total),
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+
 	// Non-fatal hint: nudge the model to change approach (inject once).
 	if b.repeatCount == maxRepeatCalls {
 		out.hintMessages = append(out.hintMessages, models.Message{
 			ID:        newMessageID("human"),
 			SessionID: sessionID,
 			Role:      models.RoleHuman,
+			Metadata:  map[string]string{metaAgentInjected: "true"},
 			Content: fmt.Sprintf(
 				"You have run %q %d times with identical arguments. "+
 					"If the result isn't changing, you are in a loop. "+
@@ -201,6 +260,7 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 				ID:        newMessageID("human"),
 				SessionID: sessionID,
 				Role:      models.RoleHuman,
+				Metadata:  map[string]string{metaAgentInjected: "true"},
 				Content:   hint,
 				CreatedAt: time.Now().UTC(),
 			})

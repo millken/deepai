@@ -201,14 +201,14 @@ func TestCompactionTrigger_NoDelegationPrompt_StaysUnderThreshold(t *testing.T) 
 func TestCompactionTrigger_ViewVsCanonical_AgingPreventsUnnecessaryCompaction(t *testing.T) {
 	big := strings.Repeat("z", 8000)
 	var history []models.Message
-	// 5 aged read_file turns: with the §5.4 read_file budget (age>=3 -> 300B,
-	// age 2 -> 2048B, age 1 -> 8192B) most of these get compressed hard once
-	// later turns push their age up.
+	// 5 aged read_file user turns: with the §5.4 read_file budget (age>=3 ->
+	// 300B, age 2 -> 2048B, age 1 -> 8192B) most of these get compressed hard
+	// once later user turns push their age up.
 	for i := 0; i < 5; i++ {
-		history = append(history, aiTools(""), toolMsg("read_file", big))
+		history = append(history, human("read another file"), aiTools(""), toolMsg("read_file", big))
 	}
 	// Current turn: untouched by aging (age 0).
-	history = append(history, aiTools(""), toolMsg("read_file", "current turn result"))
+	history = append(history, human("now edit it"), aiTools(""), toolMsg("read_file", "current turn result"))
 
 	a := New(AgentConfig{
 		LLMProvider:   contextMeteringProvider{},
@@ -231,7 +231,7 @@ func TestCompactionTrigger_ViewVsCanonical_AgingPreventsUnnecessaryCompaction(t 
 	// Canonical history must be untouched: the first read_file result must
 	// still be the full 8000-byte string, not compactMessages' "[tool
 	// result: ...]" summary.
-	if len(result.Messages) == 0 || result.Messages[1].Content != big {
+	if len(result.Messages) < 3 || result.Messages[2].Content != big {
 		t.Fatalf("canonical history was mutated by an unnecessary compaction")
 	}
 }
