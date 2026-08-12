@@ -418,6 +418,20 @@ var (
 	// "> " (or bare ">") marker. The optional single space after '>' mirrors
 	// CommonMark, which does not require it.
 	quoteRE = regexp.MustCompile(`^>\s?(.*)$`)
+	// refDefRE matches a reference-link definition line, e.g.
+	// "[1]: https://example.com/docs" or
+	// "[label]: https://example.com \"Title\"". buildBlocks uses this to
+	// keep such a line from falling through to the ordinary-paragraph
+	// case and being printed as literal body text -- Item I3's "definition
+	// line prints in the body" defect -- even though resolving the
+	// corresponding `[text][label]` USAGE elsewhere in the document into
+	// an actual hyperlink is out of scope (see buildBlocks' refDefRE
+	// branch and buildNotes' hasRefDef branch). Group 1 is the label (checked
+	// separately for a leading '^', which marks a footnote definition, a
+	// different and already-unsupported construct this must not also
+	// swallow); group 2 is the destination; group 3, if present, is the
+	// quoted title.
+	refDefRE = regexp.MustCompile(`^\[([^\]]+)\]:\s+(\S+)(?:\s+"([^"]*)")?\s*$`)
 )
 
 // parseMarkdown turns opts into the blocks WriteDocx renders and the Notes
@@ -436,9 +450,9 @@ var (
 // buildBlocks).
 func parseMarkdown(opts WriteOptions) ([]block, []string) {
 	unit := inferListIndentUnit(opts.Markdown)
-	blocks, tableNotes := buildBlocks(opts.Markdown, unit)
+	blocks, tableNotes, hasRefDef := buildBlocks(opts.Markdown, unit)
 	hasImage := detectImages(opts.Markdown)
-	notes := buildNotes(hasImage, tableNotes)
+	notes := buildNotes(hasImage, tableNotes, hasRefDef)
 
 	if opts.Title != "" && !markdownStartsWithH1(opts.Markdown) {
 		blocks = append([]block{{para: &paraBlock{heading: 1, text: opts.Title}}}, blocks...)
@@ -499,7 +513,7 @@ func markdownStartsWithH1(markdown string) bool {
 // indented continuation content looks identical (both are just "an indented
 // line") and swallowing it as code would be actively wrong -- see this
 // task's report for how each list/indent interaction case was checked.
-func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string) {
+func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string, hasRefDef bool) {
 	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(markdown, "\n")
 
@@ -652,6 +666,22 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			i += consumed - 1
 			continue
 		}
+		if m := refDefRE.FindStringSubmatch(trimmed); m != nil && !strings.HasPrefix(m[1], "^") {
+			// A reference-link definition line: dropped rather than
+			// printed as a literal paragraph (Item I3) and flagged via
+			// hasRefDef so buildNotes can declare it, per the notes
+			// contract every other silent structural decision in this
+			// function already honors (see e.g. tableNotes above). The
+			// leading-'^' exclusion leaves footnote definitions --
+			// "[^1]: ..." -- alone: those are a different, separately
+			// unsupported construct (see the write-quality report's C3),
+			// and this line shape would otherwise misparse a footnote's
+			// prose as if it were a URL.
+			flush()
+			flushQuote()
+			hasRefDef = true
+			continue
+		}
 		// hrRE only ever matches here, after the table branch above has
 		// already had first refusal: a line that legitimately serves as a
 		// GFM separator row was already consumed as part of its table (the
@@ -708,7 +738,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	}
 	flush()
 	flushQuote()
-	return mergeCodeBlocks(blocks), tableNotes
+	return mergeCodeBlocks(blocks), tableNotes, hasRefDef
 }
 
 // mergeCodeBlocks collapses every maximal run of consecutive isCode
@@ -873,12 +903,23 @@ func detectImages(markdown string) bool {
 // parseTable. Nothing here is declared unconditionally:
 // TestWrite_SupportedOnlyInputProducesNoNotes depends on fully-supported
 // input producing an empty slice.
-func buildNotes(hasImage bool, tableNotes []string) []string {
+func buildNotes(hasImage bool, tableNotes []string, hasRefDef bool) []string {
 	var notes []string
 	if hasImage {
 		notes = append(notes, "images are not embedded; written as plain text")
 	}
 	notes = append(notes, tableNotes...)
+	if hasRefDef {
+		// See buildBlocks' refDefRE branch: the definition line itself is
+		// dropped (not printed as a body paragraph), and the
+		// corresponding [text][label] reference usage elsewhere in the
+		// document is left as literal text rather than resolved into a
+		// hyperlink -- both halves of that behavior are declared here
+		// together, per the notes contract (an empty Notes must mean the
+		// input rendered exactly as written, so this half-supported
+		// construct cannot pass through silently).
+		notes = append(notes, "reference-style link definitions ([label]: url) are dropped, and [text][label] references are written as plain text, not hyperlinks")
+	}
 	return notes
 }
 
@@ -1210,6 +1251,23 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 	i, n := 0, len(s)
 	for i < n {
 		c := s[i]
+		if c == '\\' && i+1 < n && isASCIIPunct(s[i+1]) {
+			// CommonMark backslash escape: '\' followed by ASCII
+			// punctuation consumes the backslash and emits the
+			// punctuation character literally, so it can never open or
+			// close emphasis, a code span, or a link -- "\*not em\*" must
+			// stay plain text, not italic (see Item C4/Task 4). A
+			// backslash followed by anything else (a letter, digit,
+			// whitespace, or nothing at all -- i+1 == n) is NOT an escape
+			// per CommonMark and is left as a literal backslash, handled
+			// by the default byte-copy case at the bottom of this loop;
+			// that other character is then reprocessed normally on the
+			// next iteration (e.g. "C:\path" keeps both the backslash and
+			// every letter of "path", none of it consumed here).
+			buf.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
 		if c == '`' {
 			// Inline code has the highest precedence: whatever is between
 			// the backticks is emitted completely literally, with no
@@ -1241,6 +1299,33 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 				}
 				i = end
 				continue
+			}
+		}
+		if (c == '*' || c == '_') && i+2 < n && s[i+1] == c && s[i+2] == c {
+			// A run of THREE identical marker characters -- "***"/"___" --
+			// is bold-and-italic combined (CommonMark: 2+1 or 1+2
+			// delimiters stacked). This must be checked, and its closing
+			// run of three found, BEFORE the plain "**" branch below gets
+			// a chance to run: that branch searches for its close
+			// starting right after only the first TWO marker characters,
+			// which for "***x***" finds the THIRD marker character of the
+			// OPENING run itself (mistaking it for part of the content
+			// text, then for half of a close two characters later) --
+			// exactly Item C1's "*x" + stray "*" bug, which also
+			// corrupted every subsequent emphasis span in the same
+			// paragraph because the leftover "*" kept participating in
+			// later marker searches. If no closing run of three exists,
+			// this falls through (no `continue`) to the "**" branch below
+			// unchanged, so a merely-unclosed "***" still degrades the
+			// same well-defined way every other unclosed marker does.
+			marker3 := s[i : i+3]
+			if !(c == '_' && intrawordUnderscore(s, i, 3)) {
+				if j := indexClosingMarker(s, i+3, marker3); j >= 0 {
+					flush()
+					segs = append(segs, parseInlineCtx(s[i+3:i+3+j], true, true)...)
+					i += 3 + j + 3
+					continue
+				}
 			}
 		}
 		if (c == '*' || c == '_') && i+1 < n && s[i+1] == c {
@@ -1308,6 +1393,17 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 // prose) -- there is no separate CJK carve-out to add.
 func isWordRune(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// isASCIIPunct reports whether b is one of CommonMark's ASCII punctuation
+// characters -- the set a backslash escape (see parseInlineCtx's '\'
+// branch) may precede: !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~. This is exactly
+// the four contiguous byte ranges that make up that set on the ASCII table.
+func isASCIIPunct(b byte) bool {
+	return (b >= '!' && b <= '/') ||
+		(b >= ':' && b <= '@') ||
+		(b >= '[' && b <= '`') ||
+		(b >= '{' && b <= '~')
 }
 
 // intrawordUnderscore reports whether the underscore run s[i:i+width]
@@ -1378,17 +1474,74 @@ func matchLinkAt(s string, i int) (text, url string, end int, ok bool) {
 	if j+1 >= len(s) || s[j+1] != '(' {
 		return "", "", 0, false
 	}
-	k := strings.IndexByte(s[j+2:], ')')
-	if k < 0 {
+	// Find the ')' that closes the '(' just consumed, tracking nesting
+	// depth rather than stopping at the first ')' anywhere in the rest of
+	// the string: a bare (unescaped, un-angle-bracketed) URL is allowed to
+	// contain its own balanced parentheses -- e.g.
+	// "https://example.com/wiki/Foo_(bar)" -- and the naive first-')'
+	// search used to cut such a URL off right after "Foo_(bar", leaving a
+	// dangling, un-openable target (Item I3).
+	depth := 1
+	pos := j + 2
+	for pos < len(s) && depth > 0 {
+		switch s[pos] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth == 0 {
+			break
+		}
+		pos++
+	}
+	if depth != 0 {
 		return "", "", 0, false
 	}
-	k += j + 2
+	k := pos
 	text = s[i+1 : j]
-	url = s[j+2 : k]
+	url, _ = splitLinkDestTitle(s[j+2 : k])
 	if strings.Contains(text, "\n") || strings.Contains(url, "\n") {
 		return "", "", 0, false
 	}
 	return text, url, k + 1, true
+}
+
+// splitLinkDestTitle splits the raw content between a link's parentheses
+// -- e.g. `url "title"` from `[t](url "title")` -- into the destination and
+// an optional title, per Item I3: without this, a titled link's title text
+// used to be concatenated straight onto the URL (the relationship target
+// became `https://example.com/page "Example Title"`, which nothing can
+// follow). A title is recognized only as a trailing, double- or
+// single-quoted span preceded by whitespace -- e.g. content ending in
+// `"Example Title"` or `'Example Title'` -- which is the common case this
+// package's simplified (not full CommonMark) link syntax needs to support;
+// a title written with parentheses instead of quotes is not recognized
+// (parentheses there would be ambiguous with the URL's own balanced-paren
+// handling in matchLinkAt) and is left as part of the destination, same as
+// today. When no such trailing quoted span is found, title is empty and
+// url is content unchanged -- the common, title-less case is a no-op.
+func splitLinkDestTitle(content string) (url, title string) {
+	trimmed := strings.TrimRight(content, " \t")
+	if len(trimmed) < 2 {
+		return content, ""
+	}
+	last := trimmed[len(trimmed)-1]
+	if last != '"' && last != '\'' {
+		return content, ""
+	}
+	body := trimmed[:len(trimmed)-1]
+	openIdx := strings.LastIndexByte(body, last)
+	if openIdx <= 0 || body[openIdx-1] != ' ' {
+		// No matching opening quote, or nothing (not even a space)
+		// separates it from the destination -- e.g. a URL that simply
+		// ends in a quote character with no title intended. Treat the
+		// whole thing as the destination, unchanged.
+		return content, ""
+	}
+	url = strings.TrimRight(body[:openIdx-1], " \t")
+	title = body[openIdx+1:]
+	return url, title
 }
 
 // ---------------------------------------------------------------------------
