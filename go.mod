@@ -9,8 +9,9 @@ require (
 	github.com/alecthomas/chroma/v2 v2.27.0
 	github.com/anthropics/anthropic-sdk-go v1.61.0
 	github.com/charmbracelet/glamour v1.0.0
-	github.com/dnsoa/go/env v1.0.0
+	github.com/dnsoa/go/env v1.0.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jaypipes/ghw v0.25.0
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/mattn/go-runewidth v0.0.27
 	github.com/openai/openai-go/v3 v3.49.0
@@ -35,7 +36,6 @@ require (
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/itlightning/dateparse v0.2.1 // indirect
-	github.com/jaypipes/ghw v0.25.0 // indirect
 	github.com/jaypipes/pcidb v1.1.1 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect

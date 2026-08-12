@@ -108,3 +108,28 @@ func TestSealWarningEmptyWhenHardwareBound(t *testing.T) {
 		t.Error("sealWarning is empty on a host without hardware binding")
 	}
 }
+
+func TestLoadEnvValueStripsQuotes(t *testing.T) {
+	// A key written as KEY="value" must resolve to value (no quotes), the
+	// same way goenv's env.Load resolves it for the runtime provider path.
+	// If loadEnvValue returned the quotes verbatim, key seal would encrypt
+	// the quote characters into the ciphertext and every request would 401.
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := `PLAIN=plain
+DOUBLE="double-value"
+SINGLE='single-value'
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadEnvValue(path, "PLAIN"); got != "plain" {
+		t.Errorf("PLAIN = %q, want plain", got)
+	}
+	if got := loadEnvValue(path, "DOUBLE"); got != "double-value" {
+		t.Errorf("DOUBLE = %q, want double-value (quotes must be stripped)", got)
+	}
+	if got := loadEnvValue(path, "SINGLE"); got != "single-value" {
+		t.Errorf("SINGLE = %q, want single-value (quotes must be stripped)", got)
+	}
+}

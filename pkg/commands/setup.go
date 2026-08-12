@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"charm.land/huh/v2"
+	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/secret"
 	"github.com/spf13/cobra"
@@ -481,17 +482,18 @@ func saveConfig(path string, cfg *Config) error {
 	return nil
 }
 
+// loadEnvValue reads one key from a .env file using the same parsing rules as
+// goenv (env.Load): quotes are stripped, inline comments removed, the export
+// prefix honored. This must agree with how root.go loads .env into the process
+// environment, otherwise the value a CLI command sees here would differ from
+// the value the provider receives at runtime -- which is how a key written as
+// KEY="value" once got its quote characters sealed into the ciphertext.
 func loadEnvValue(path, key string) string {
-	data, err := os.ReadFile(path)
+	m, err := env.ReadMap(path)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if val, ok := strings.CutPrefix(line, key+"="); ok {
-			return val
-		}
-	}
-	return ""
+	return m[key]
 }
 
 func saveEnvValue(path, key, value string) error {
