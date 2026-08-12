@@ -126,3 +126,54 @@ func TestWrite_IllegalXMLCharsStrippedAcrossHeadingCodeTableAndLinkText(t *testi
 		t.Errorf("Notes = %v, want a note declaring 4 stripped invalid XML characters (heading+code+table+link)", res.Notes)
 	}
 }
+
+// WriteOptions.Title lands in docProps/core.xml's <dc:title>, a path that
+// never goes through renderRun (parseMarkdown only ever copies Title into
+// a body block when the markdown does NOT already open with its own H1 --
+// see markdownStartsWithH1). An illegal character in Title must still be
+// replaced (never corrupt docProps/core.xml) AND still be counted into the
+// same "stripped N invalid XML character(s)" note renderRun's own findings
+// use -- a caller must never see "Notes: []" on a document that silently
+// sanitized its own declared title.
+func TestWrite_IllegalCharInTitleIsCountedInNotes(t *testing.T) {
+	opts := WriteOptions{
+		Title:    "Bad\x1bTitle",
+		Markdown: "# Real Heading\n\nbody\n",
+	}
+	d, res, _ := writeAndReopen2(t, opts)
+
+	coreXML, ok := d.Part(docPropsCorePart)
+	if !ok {
+		t.Fatalf("no %s part; hasTitle path did not run", docPropsCorePart)
+	}
+	if strings.ContainsRune(string(coreXML), '\x1b') {
+		t.Errorf("docProps/core.xml still contains the illegal control character: %s", coreXML)
+	}
+
+	joined := strings.Join(res.Notes, " | ")
+	if !strings.Contains(joined, "stripped 1 invalid XML character") {
+		t.Errorf("Notes = %v, want a note declaring 1 stripped invalid XML character for the illegal Title", res.Notes)
+	}
+}
+
+// A hyperlink's URL lands in word/_rels/document.xml.rels's Target
+// attribute (buildDocRelsXML), a second path that never goes through
+// renderRun (renderRun only ever sees the link's DISPLAY text). An illegal
+// character in the URL itself must likewise be replaced and counted into
+// the same total.
+func TestWrite_IllegalCharInLinkURLIsCountedInNotes(t *testing.T) {
+	d, res, _ := writeAndReopen(t, "[text](https://example.com/\x1bpath)\n")
+
+	relsXML, ok := d.Part("word/_rels/document.xml.rels")
+	if !ok {
+		t.Fatalf("no word/_rels/document.xml.rels part")
+	}
+	if strings.ContainsRune(string(relsXML), '\x1b') {
+		t.Errorf("word/_rels/document.xml.rels still contains the illegal control character: %s", relsXML)
+	}
+
+	joined := strings.Join(res.Notes, " | ")
+	if !strings.Contains(joined, "stripped 1 invalid XML character") {
+		t.Errorf("Notes = %v, want a note declaring 1 stripped invalid XML character for the illegal link URL", res.Notes)
+	}
+}

@@ -150,15 +150,6 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 			paraCount += n
 		}
 	}
-	// Every renderRun call the loop above just made (body text, headings,
-	// table cells, code-block lines, hyperlink display text) tallied any
-	// XML-1.0-illegal character it had to replace into ctx.strippedXMLChars
-	// -- see renderCtx's own doc comment. Declaring the total here, once
-	// rendering is done rather than per-call, is what keeps the note
-	// singular and additive instead of one repeated line per occurrence.
-	if ctx.strippedXMLChars > 0 {
-		notes = append(notes, stripNoteFor(ctx.strippedXMLChars))
-	}
 	// footerRelID is allocated from the SAME counter addLink draws from
 	// (ctx.nextRelID), after every hyperlink in the body has already
 	// claimed its own id: the two id spaces are one space, not two, so
@@ -174,18 +165,25 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	fontTableRelID := ctx.addFontTableRelID()
 
 	hasTitle := opts.Title != ""
+	// buildDocRelsXML escapes every link's URL and (per its own doc
+	// comment) folds any illegal-character count straight into ctx, so it
+	// must run before the stripped-count note below is built -- not just
+	// before writeNewDocx.
+	docRelsXML := buildDocRelsXML(ctx.rels, footerRelID, fontTableRelID, ctx)
 	entries := []zipEntry{
 		{name: contentTypesPart, data: []byte(buildContentTypesXML(hasTitle))},
 		{name: "_rels/.rels", data: []byte(buildRootRelsXML(hasTitle))},
 		{name: DocumentPart, data: []byte(body.String())},
-		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels, footerRelID, fontTableRelID))},
+		{name: "word/_rels/document.xml.rels", data: []byte(docRelsXML)},
 		{name: "word/styles.xml", data: buildStylesXMLWithFonts(fonts)},
 		{name: "word/numbering.xml", data: []byte(numberingXML)},
 		{name: footer1Part, data: []byte(footer1XML)},
 		{name: fontTablePart, data: []byte(fontTableXML(fonts))},
 	}
 	if hasTitle {
-		coreXML, err := docPropsCoreXML(opts.Title)
+		// docPropsCoreXML likewise escapes Title and folds its count into
+		// ctx -- same ordering requirement as buildDocRelsXML above.
+		coreXML, err := docPropsCoreXML(opts.Title, ctx)
 		if err != nil {
 			return WriteResult{}, fmt.Errorf("docx: render docProps/core.xml: %w", err)
 		}
@@ -193,6 +191,21 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 		// deterministic (writeNewDocx replays this exact slice every call),
 		// not match any particular position Word itself would choose.
 		entries = append(entries, zipEntry{name: docPropsCorePart, data: []byte(coreXML)})
+	}
+
+	// Every escapeXMLText call this render could have made -- renderRun
+	// (body text, headings, table cells, code-block lines, hyperlink
+	// display text), docPropsCoreXML (Title), and buildDocRelsXML (link
+	// URLs) -- has now run and folded its count into ctx.strippedXMLChars
+	// (see renderCtx's own doc comment). Declaring the total here, once,
+	// rather than per-call, is what keeps the note singular and additive
+	// instead of one repeated line per occurrence; doing it any earlier
+	// (e.g. right after the render loop, before Title/URL escaping ran)
+	// would silently drop whatever those two contributed -- exactly the
+	// gap TestWrite_IllegalCharInTitleIsCountedInNotes and
+	// TestWrite_IllegalCharInLinkURLIsCountedInNotes pin.
+	if ctx.strippedXMLChars > 0 {
+		notes = append(notes, stripNoteFor(ctx.strippedXMLChars))
 	}
 
 	if err := writeNewDocx(path, entries); err != nil {
@@ -2114,13 +2127,22 @@ func buildRootRelsXML(hasTitle bool) string {
 // any other user-supplied text this package writes is (escapeXMLText),
 // since a title containing "&" or "<" would otherwise produce the same
 // "unreadable content" failure as an unescaped run.
-func docPropsCoreXML(title string) (string, error) {
-	// The count is discarded: WriteOptions.Title is a short caller-supplied
-	// string, not markdown body content, so it falls outside this task's
-	// "code blocks/tables/headings/hyperlink text" note contract -- but it
-	// still goes through the same illegal-character substitution so a
-	// control character in Title can never corrupt docProps/core.xml.
-	escaped, _, err := escapeXMLText(title)
+//
+// title is NOT markdown body content, so it is not one of the "code
+// blocks/tables/headings/hyperlink text" paths renderRun covers -- but
+// WriteOptions.Title can independently carry an XML-1.0-illegal character
+// (e.g. Title == "Bad\x1bTitle" with the body's own first line supplying a
+// different H1, so parseMarkdown never copies Title into a block renderRun
+// ever sees). escapeXMLText replaces such a character the same as it does
+// everywhere else, and ctx accumulates the count into the SAME
+// ctx.strippedXMLChars renderRun feeds, so WriteDocx's one "stripped N
+// invalid XML character(s)" note still covers it -- a caller must never be
+// able to observe "Notes: []" on a document that silently substituted a
+// character in its own declared title. See
+// TestWrite_IllegalCharInTitleIsCountedInNotes.
+func docPropsCoreXML(title string, ctx *renderCtx) (string, error) {
+	escaped, n, err := escapeXMLText(title)
+	ctx.strippedXMLChars += n
 	if err != nil {
 		return "", fmt.Errorf("escape title: %w", err)
 	}
@@ -2158,7 +2180,16 @@ func docPropsCoreXML(title string) (string, error) {
 // URL containing "&" (an ordinary query-string separator) would otherwise
 // produce the same "unreadable content" failure escapeXMLText already
 // guards against for run text.
-func buildDocRelsXML(rels []hyperlinkRel, footerRelID, fontTableRelID string) string {
+//
+// A URL is not the "hyperlink text" renderRun covers (that's the link's
+// display text, e.g. "x" in "[x](url)") -- but a URL can independently
+// carry an XML-1.0-illegal character (a stray control byte pasted into the
+// href, e.g. "https://example.com/\x1bpath"), and escapeXMLText replaces
+// it here exactly as it does everywhere else. ctx accumulates that count
+// into the SAME ctx.strippedXMLChars renderRun and docPropsCoreXML feed,
+// so it is never lost from WriteDocx's one "stripped N invalid XML
+// character(s)" note -- see TestWrite_IllegalCharInLinkURLIsCountedInNotes.
+func buildDocRelsXML(rels []hyperlinkRel, footerRelID, fontTableRelID string, ctx *renderCtx) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	b.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
@@ -2167,12 +2198,8 @@ func buildDocRelsXML(rels []hyperlinkRel, footerRelID, fontTableRelID string) st
 	fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`, footerRelID)
 	fmt.Fprintf(&b, `<Relationship Id="%s" Type="%s" Target="fontTable.xml"/>`, fontTableRelID, fontTableRelType)
 	for _, r := range rels {
-		// The count is discarded: a link's URL is not the "hyperlink text"
-		// the note contract covers (that's the display text, rendered
-		// through renderRun) -- but the same illegal-character
-		// substitution still applies here so a control character copied
-		// into a URL can never corrupt this Relationship's Target.
-		escapedURL, _, _ := escapeXMLText(r.url)
+		escapedURL, n, _ := escapeXMLText(r.url)
+		ctx.strippedXMLChars += n
 		fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="%s" TargetMode="External"/>`,
 			r.id, escapedURL)
 	}
