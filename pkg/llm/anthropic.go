@@ -151,6 +151,17 @@ func (p *AnthropicProvider) consumeStream(
 				if b, ok := toolCallBuilders[event.Index]; ok {
 					b.args += event.Delta.PartialJSON
 					emitted = true
+					// A large tool-call argument (e.g. write_file's markdown
+					// body) can stream for minutes as nothing but these
+					// fragments — with no Progress signal, the idle watchdog
+					// in pkg/agent/streaming.go would see total silence for
+					// that whole span and cancel a perfectly healthy request
+					// (see StreamChunk.Progress's doc comment). Gated on a
+					// non-empty fragment so an empty delta (were the API to
+					// ever send one) doesn't manufacture busywork.
+					if event.Delta.PartialJSON != "" {
+						ch <- StreamChunk{Model: model, Progress: true}
+					}
 				}
 			}
 		case "content_block_stop":

@@ -85,9 +85,15 @@ func (a *Agent) consumeStream(stream <-chan llm.StreamChunk, cancel context.Canc
 					stopReason: stopReason,
 				}
 			}
-			// Any chunk at all — including one carrying an error — proves
-			// the stream is still alive, so the idle window resets here,
-			// before inspecting what the chunk actually contains.
+			// Any chunk at all — including one carrying an error, and
+			// including a llm.StreamChunk.Progress heartbeat a provider
+			// sends while accumulating a large tool-call argument (see that
+			// field's doc comment) — proves the stream is still alive, so
+			// the idle window resets here, before inspecting what the chunk
+			// actually contains. A Progress chunk carries no
+			// Delta/ToolCalls/Usage/Done/Err by contract, so nothing below
+			// this reset treats it as anything but a no-op: it falls
+			// through every "if chunk.X" check below untouched.
 			if !idleTimer.Stop() {
 				select {
 				case <-idleTimer.C:

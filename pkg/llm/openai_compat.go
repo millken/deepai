@@ -166,6 +166,17 @@ func (p *OpenAICompatProvider) consumeStream(
 					}
 				}
 				b.args += tc.Function.Arguments
+				// See StreamChunk.Progress's doc comment: a large tool-call
+				// argument can stream for minutes as nothing but these
+				// fragments, and without a signal here pkg/agent's stream
+				// idle watchdog would see total silence for that whole span
+				// and cancel a perfectly healthy request. Gated on a
+				// non-empty fragment so the id/name-only initial delta chunk
+				// (which OpenAI-compat providers send with an empty
+				// arguments string) doesn't manufacture busywork.
+				if tc.Function.Arguments != "" {
+					ch <- StreamChunk{Model: model, Progress: true}
+				}
 			}
 			if choice.FinishReason != "" {
 				stopReason = choice.FinishReason

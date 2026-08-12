@@ -50,6 +50,32 @@ type StreamChunk struct {
 	Stop      string            `json:"stop,omitempty"`
 	Done      bool              `json:"done,omitempty"`
 	Err       error             `json:"-"`
+	// Progress marks a chunk sent for exactly one reason: to prove the
+	// underlying stream is still actively producing bytes when those bytes
+	// have nowhere else to go yet — the running case is a large tool-call
+	// argument, streamed to this provider as many "input_json_delta"/
+	// "arguments" fragments that accumulate into a builder and are only
+	// turned into a models.ToolCall once the argument is complete. Before
+	// this field existed, that entire accumulation window was invisible to
+	// the consumer: no chunk of any kind crossed the channel, so
+	// pkg/agent's stream idle watchdog (which resets its timer on ANY
+	// received chunk, before looking at what the chunk contains) saw
+	// nothing and could time out a request that was actually busy.
+	//
+	// A Progress chunk carries no payload — Delta, ToolCalls, Usage, Done,
+	// and Err are all left at their zero value — by construction, not by
+	// convention enforced elsewhere: every provider that sends one MUST
+	// leave every other field zero, or a consumer that (correctly, per this
+	// doc) treats Progress as "nothing to look at here" will silently drop
+	// real content. Consumers that only care whether the stream is alive
+	// (i.e. everyone today) can ignore this field entirely: simply
+	// receiving the chunk already resets an idle timer, since that already
+	// happens unconditionally before any field is inspected. The field
+	// exists so a heartbeat-only chunk is self-describing — distinguishable
+	// from a StreamChunk{} sent (or zero-valued) by mistake — rather than
+	// overloading Delta/ToolCalls/Done with an empty value that already
+	// means something else on every other chunk.
+	Progress bool `json:"-"`
 }
 
 // Usage tracks token counts when a provider returns them.
