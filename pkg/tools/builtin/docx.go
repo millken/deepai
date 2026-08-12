@@ -666,15 +666,15 @@ func DocxFormatTool() models.Tool {
 						},
 						"line_spacing_exact_pt": map[string]any{
 							"type":        "number",
-							"description": "Fixed line height in points (w:line = pt*20 twips, w:lineRule=\"exact\"), instead of a multiple of a line. Mutually exclusive with line_spacing — giving both is an error.",
+							"description": "Fixed line height in points (w:line = pt*20 twips, w:lineRule=\"exact\"), instead of a multiple of a line. Mutually exclusive with line_spacing — giving both is an error. Must be > 0; omit the field to leave it unchanged (0 is rejected).",
 						},
 						"align": map[string]any{"type": "string", "description": "One of: left, center, right, justify"},
 						"first_line_indent_chars": map[string]any{
 							"type":        "number",
-							"description": "First-line indent measured in CHARACTER widths (2 is the conventional opening indent for a Chinese paragraph). Writes w:ind w:firstLineChars=n*100 (hundredths of a character, what Word renders relative to the current font size) plus a fixed w:firstLine twips fallback for readers that ignore firstLineChars.",
+							"description": "First-line indent measured in CHARACTER widths (2 is the conventional opening indent for a Chinese paragraph). Writes w:ind w:firstLineChars=n*100 (hundredths of a character, what Word renders relative to the current font size) plus a fixed w:firstLine twips fallback for readers that ignore firstLineChars. Must be > 0; omit the field to leave it unchanged (0 is rejected).",
 						},
-						"space_before_pt": map[string]any{"type": "number", "description": "Paragraph spacing before, in points (w:spacing w:before = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_after_pt."},
-						"space_after_pt":  map[string]any{"type": "number", "description": "Paragraph spacing after, in points (w:spacing w:after = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_before_pt."},
+						"space_before_pt": map[string]any{"type": "number", "description": "Paragraph spacing before, in points (w:spacing w:before = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_after_pt. Must be > 0; omit the field to leave it unchanged (0 is rejected)."},
+						"space_after_pt":  map[string]any{"type": "number", "description": "Paragraph spacing after, in points (w:spacing w:after = pt*20 twips). Lands on the same element as line_spacing/line_spacing_exact_pt/space_before_pt. Must be > 0; omit the field to leave it unchanged (0 is rejected)."},
 						"margins_mm": map[string]any{
 							"type":        "array",
 							"items":       map[string]any{"type": "number"},

@@ -1515,6 +1515,30 @@ func TestDocxFormat_RejectsNonPositiveNewMeasurementFields(t *testing.T) {
 	}
 }
 
+// TestDocxFormat_ZeroRejectedFieldsDocumentItInSchema is task 9 brief item
+// 7a (Task 8 review round 2's first nit): the four measurement fields that
+// reject an explicit 0 (TestDocxFormat_RejectsNonPositiveNewMeasurementFields,
+// above) must SAY so in their own schema description, not rely on a caller
+// discovering it only by hitting the error.
+func TestDocxFormat_ZeroRejectedFieldsDocumentItInSchema(t *testing.T) {
+	schema := DocxFormatTool().InputSchema
+	props := schema["properties"].(map[string]any)
+	rules := props["rules"].(map[string]any)
+	ruleProps := rules["properties"].(map[string]any)
+
+	want := "Must be > 0; omit the field to leave it unchanged (0 is rejected)."
+	for _, key := range []string{"line_spacing_exact_pt", "first_line_indent_chars", "space_before_pt", "space_after_pt"} {
+		field, ok := ruleProps[key].(map[string]any)
+		if !ok {
+			t.Fatalf("rules.%s is not present in the schema", key)
+		}
+		desc, _ := field["description"].(string)
+		if !strings.Contains(desc, want) {
+			t.Errorf("rules.%s description = %q, want it to contain %q", key, desc, want)
+		}
+	}
+}
+
 // TestDocxFormat_MarginsMMAccepted is the positive counterpart to
 // TestDocxFormat_RejectsBadMarginsMM: a valid 4-element array must be
 // accepted and reported in applied.

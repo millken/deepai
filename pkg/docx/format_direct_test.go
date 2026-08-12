@@ -187,7 +187,7 @@ func TestDirect_EmptyParagraphSkippedForRunFormatButNotForParagraphFormat(t *tes
 		t.Errorf("empty paragraph 1 was touched by run-level formatting: %s", p1)
 	}
 
-	paraOut, paraN, err := applyDirectParaFormat(doc, paras, 1, 2, pParaRequest{LineSpacing: 1.5, Align: ""})
+	paraOut, paraN, _, err := applyDirectParaFormat(doc, paras, 1, 2, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("no pPr at all", func(t *testing.T) {
 		doc := []byte(`<w:p><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +280,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("pPr present but lacking the target property", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:keepNext/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -302,7 +302,7 @@ func TestDirect_MergesIntoExistingParagraphProperties(t *testing.T) {
 	t.Run("target property already present", func(t *testing.T) {
 		doc := []byte(`<w:p><w:pPr><w:spacing w:line="240" w:lineRule="auto"/><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 		paras, _ := Scan(doc)
-		got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+		got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -335,7 +335,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectParaFormat(got, gotParas, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+	twice, n2, _, err := applyDirectParaFormat(got, gotParas, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestDirect_ParagraphFormatExpandsSelfClosingParagraph(t *testing.T) {
 func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	doc := []byte(`<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`)
 	paras, _ := Scan(doc)
-	once, n1, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
+	once, n1, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestDirect_ParagraphFormatIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, n2, err := applyDirectParaFormat(once, paras2, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
+	twice, n2, _, err := applyDirectParaFormat(once, paras2, 1, 1, pParaRequest{LineSpacing: 1.15, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestDirect_NoFieldsIsANoOp(t *testing.T) {
 		t.Errorf("output changed for an empty run-format request: %s", got)
 	}
 
-	got2, n2, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: ""})
+	got2, n2, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}

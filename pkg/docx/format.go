@@ -184,6 +184,103 @@ var headingStyleIDRe = regexp.MustCompile(`^Heading[1-9]$`)
 // inch).
 const twipsPerMM = 1440.0 / 25.4
 
+// wordNamespaceRootPrefix returns the literal XML prefix used on partXML's
+// root element — "w" for "<w:styles>"/"<w:document>", "" for a bare
+// "<styles>" — using xml.Decoder.RawToken rather than the ordinary Token:
+// RawToken never resolves a prefix against its xmlns declaration, so a
+// document that DECLARES the wordprocessingml namespace under some OTHER
+// prefix ("<ns0:document xmlns:ns0=\"...wordprocessingml/2006/main\">", a
+// real shape some non-Word tools produce) is still reported as "ns0", not
+// silently normalized to "w" the way ordinary Token's namespace resolution
+// would report it (isWordprocessingMLNamespace, used for READING elsewhere
+// in this package, deliberately treats both as the same URI — the gap is
+// entirely on the WRITE side: buildTag always emits a literal "w:" prefix,
+// which is only valid when the document actually declares/uses that exact
+// prefix). ok is false only if partXML has no root element at all (empty or
+// malformed content).
+func wordNamespaceRootPrefix(partXML []byte) (prefix string, ok bool) {
+	dec := xml.NewDecoder(bytes.NewReader(partXML))
+	for {
+		tok, err := dec.RawToken()
+		if err != nil {
+			return "", false
+		}
+		if se, isStart := tok.(xml.StartElement); isStart {
+			return se.Name.Space, true
+		}
+	}
+}
+
+// requireWordNamespacePrefix returns a descriptive error if partXML's root
+// element does not use the literal "w:" prefix for wordprocessingml (or no
+// prefix at all is also refused — buildTag's hardcoded "<w:..." emission
+// has no way to honor either), rather than letting Format proceed to
+// insert content under an UNDECLARED "w" prefix, which is what happened
+// silently before (format capability review, Important 9 / task 9 brief,
+// item 5): identify-able-or-not, this package refuses definitively instead
+// of ever writing a byte-corrupt or namespace-broken part. name is only
+// used to phrase the "cannot be read" fallback; the caller-facing message
+// intentionally does not name which part, matching the brief's exact
+// wording.
+func requireWordNamespacePrefix(name string, partXML []byte) error {
+	prefix, ok := wordNamespaceRootPrefix(partXML)
+	if !ok {
+		return fmt.Errorf("docx: %s could not be read as XML", name)
+	}
+	if prefix != "w" {
+		return errors.New("docx: document uses a non-standard namespace prefix; formatting is not supported for this file")
+	}
+	return nil
+}
+
+// stylesMissingErr builds a rich error for "package has no word/styles.xml
+// part": names exactly which of resolved's requested rules cannot be
+// applied without it, and — when the SAME call also asked for margins_mm
+// and/or normalize, which only ever touch word/document.xml — says those
+// are unaffected and can still be retried on their own (format capability
+// review, Important 10 / task 9 brief, item 4): a bare "no styles.xml"
+// error left a caller no way to tell a document-wide font/size/spacing
+// request apart from ones margins/normalize could have satisfied anyway.
+func stylesMissingErr(resolved FormatOptions) error {
+	var affected []string
+	if resolved.HeadingFont != "" {
+		affected = append(affected, "heading_font")
+	}
+	if resolved.BodyFont != "" {
+		affected = append(affected, "body_font")
+	}
+	if resolved.BodyEastAsiaFont != "" {
+		affected = append(affected, "body_east_asia_font")
+	}
+	if resolved.BodySizePt != 0 {
+		affected = append(affected, "body_size_pt")
+	}
+	if resolved.LineSpacing != 0 {
+		affected = append(affected, "line_spacing")
+	}
+	if resolved.LineSpacingExactPt != 0 {
+		affected = append(affected, "line_spacing_exact_pt")
+	}
+	if resolved.Align != "" {
+		affected = append(affected, "align")
+	}
+	if resolved.FirstLineIndentChars != 0 {
+		affected = append(affected, "first_line_indent_chars")
+	}
+	if resolved.SpaceBeforePt != 0 {
+		affected = append(affected, "space_before_pt")
+	}
+	if resolved.SpaceAfterPt != 0 {
+		affected = append(affected, "space_after_pt")
+	}
+	msg := fmt.Sprintf("docx: package has no word/styles.xml part; %s cannot be applied without it — retry the call without %s",
+		strings.Join(affected, ", "), strings.Join(affected, "/"))
+	if resolved.MarginsMM != nil || resolved.Normalize {
+		msg += "; margins_mm/normalize only touch word/document.xml and are unaffected, so they can still be applied on their own"
+	}
+	return errors.New(msg)
+}
+
 // Part returns the named zip entry's current content. It delegates to the
 // underlying Package, aliasing its internal storage exactly as
 // Package.Part does (see that method's doc comment on the aliasing
@@ -245,7 +342,10 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	if wantsStyles {
 		styles, ok := d.Part("word/styles.xml")
 		if !ok {
-			return FormatResult{}, fmt.Errorf("docx: package has no word/styles.xml part")
+			return FormatResult{}, stylesMissingErr(resolved)
+		}
+		if err := requireWordNamespacePrefix("word/styles.xml", styles); err != nil {
+			return FormatResult{}, err
 		}
 		patches, applied, notes, err := planStylesPatches(styles, resolved, usedStyleIDs(d.Paras()))
 		if err != nil {
@@ -269,6 +369,9 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
+		}
+		if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
+			return FormatResult{}, err
 		}
 		working := doc
 		changed := false
@@ -329,6 +432,9 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
+		}
+		if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
+			return FormatResult{}, err
 		}
 		maskNotes, err := directFormatMaskingNotes(doc, d.Paras(), resolved)
 		if err != nil {
@@ -1002,6 +1108,43 @@ func buildPPrOps(children map[string]elemInfo, req pParaRequest) []leafOp {
 	return ops
 }
 
+// pPrDropNotes reports which of req's leaves would silently discard an
+// existing attribute Word treats as mutually exclusive with the new one —
+// the same two "one wins, the other becomes invisible" pairs buildPPrOps'
+// own "spacing"/"ind" cases already drop without comment (review F2): a
+// pre-existing w:hanging/w:hangingChars when FirstLineIndentChars sets
+// w:firstLine (CT_Ind always prefers hanging over firstLine when both are
+// present, so leaving it in place would make the new firstLine silently
+// invisible), and a pre-existing w:beforeAutospacing/w:afterAutospacing
+// when SpaceBeforePt/SpaceAfterPt sets a literal w:before/w:after (Word
+// ignores the literal value entirely whenever the auto-spacing flag is
+// set). Dropping these is correct — the alternative is a requested change
+// that silently does nothing — but doing it with no caveat at all was the
+// gap (task 9 brief, item 7b / task 8 review round 2's third nit): a
+// caller who explicitly set a hanging indent or auto-spacing has no way to
+// learn it was just removed. children may be nil (nothing exists yet to
+// drop, e.g. a brand new pPr being synthesized from scratch), in which
+// case this always returns nil.
+func pPrDropNotes(children map[string]elemInfo, req pParaRequest) []string {
+	var notes []string
+	if req.FirstLineIndentChars != 0 {
+		if ind, ok := children["ind"]; ok && (hasAttr(ind.attrs, "hanging") || hasAttr(ind.attrs, "hangingChars")) {
+			notes = append(notes, "first_line_indent_chars removed an existing hanging indent (w:hanging/w:hangingChars), which would otherwise have taken precedence over the new first-line indent and made it invisible")
+		}
+	}
+	if req.SpaceBeforePt != 0 {
+		if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "beforeAutospacing") {
+			notes = append(notes, "space_before_pt removed an existing w:beforeAutospacing flag, which would otherwise have made the new space_before_pt value invisible")
+		}
+	}
+	if req.SpaceAfterPt != 0 {
+		if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "afterAutospacing") {
+			notes = append(notes, "space_after_pt removed an existing w:afterAutospacing flag, which would otherwise have made the new space_after_pt value invisible")
+		}
+	}
+	return notes
+}
+
 // planRPrFontSizePatches builds the patches for one rPr's direct font/size
 // formatting (an rPr that already exists with real content — the caller
 // handles "no rPr at all" and "self-closing <w:rPr/>" itself), given
@@ -1356,7 +1499,7 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 		needPPrSynthesis := false
 
 		if wantRPrChain {
-			if dd.found && rpd.found && rpr.found {
+			if dd.found && rpd.found && rpr.found && !rpr.selfClosing {
 				// The chain fully exists already: edit its leaves in place —
 				// byte-identical output for a document that already has a
 				// complete rFonts/sz/szCs is a hard guarantee for the case
@@ -1410,7 +1553,12 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 				patches = append(patches, planRPrFontSizePatches(
 					styles, rpr.closeStart, rprChildren, effFont, effBodyEastAsiaFont, effSize, rFontsLatinAndEastAsiaAttrs)...)
 			} else {
-				needRPrSynthesis = true
+				// Either rPr is missing entirely, or it is PRESENT but
+				// self-closing (<w:rPr/>, no properties at all) -- both
+				// need the exact same brand-new leaf content, since a
+				// self-closing rPr has no children to edit in place
+				// either (rprChildren is nil/empty in both shapes, per
+				// scanDocDefaults).
 				if opts.BodyFont != "" {
 					fontChanged = true // synthesis always creates something new
 				}
@@ -1437,12 +1585,26 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 					}
 					ops = append(ops, op)
 				}
-				rprInner = renderActiveLeaves(ops)
+				leaves := renderActiveLeaves(ops)
+				if rpr.found && rpr.selfClosing {
+					// Expand the self-closing tag IN PLACE so the new
+					// leaves land as its own children, not as trailing
+					// SIBLINGS of it (task 9 brief, item 6 / Task 8 review
+					// round 2's old debt: "<w:pPrDefault><w:pPr/></w:pPrDefault>
+					// + any pPr-level field -> <w:pPr/><w:ind/> 平级" — the
+					// identical bug one container up, for rPr). This is the
+					// SAME fix format_direct.go's planRunRPrPatches already
+					// applies to a run's own self-closing <w:rPr/>.
+					patches = append(patches, PatchRawSpan(styles, rpr.tagSpan, "<w:rPr>"+leaves+"</w:rPr>"))
+				} else {
+					needRPrSynthesis = true
+					rprInner = leaves
+				}
 			}
 		}
 
 		if wantPPrChain {
-			if dd.found && ppd.found && ppr.found {
+			if dd.found && ppd.found && ppr.found && !ppr.selfClosing {
 				// buildPPrOps (not a bare handful of leafOps) anchors the
 				// insertion against pPrDefault's pPr's FULL set of tracked
 				// children, so a newly inserted spacing/ind/jc lands in
@@ -1508,13 +1670,24 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 						firstLineIndentChanged = true
 					}
 				}
+				notes = append(notes, pPrDropNotes(pprChildren, pParaRequest{
+					SpaceBeforePt: effSpaceBeforePt, SpaceAfterPt: effSpaceAfterPt, FirstLineIndentChars: effFirstLineIndentChars,
+				})...)
 				patches = append(patches, applyLeafOps(styles, ppr.closeStart, buildPPrOps(pprChildren, pParaRequest{
 					LineSpacing: effLineSpacing, LineSpacingExactPt: effLineSpacingExactPt,
 					SpaceBeforePt: effSpaceBeforePt, SpaceAfterPt: effSpaceAfterPt,
 					Align: effAlign, FirstLineIndentChars: effFirstLineIndentChars,
 				}))...)
 			} else {
-				needPPrSynthesis = true
+				// Either pPr is missing entirely, or it is PRESENT but
+				// self-closing (<w:pPr/>, no properties at all) -- both
+				// need the exact same brand-new leaf content, since a
+				// self-closing pPr has no children to edit in place either
+				// (pprChildren is nil/empty in both shapes, per
+				// scanDocDefaults). Nothing pre-existing to drop a
+				// hanging/autospacing attribute FROM in either shape, so
+				// pPrDropNotes is not consulted here (it would always
+				// return nil against a nil children map).
 				if opts.LineSpacing != 0 || opts.LineSpacingExactPt != 0 {
 					spacingChanged = true
 				}
@@ -1530,11 +1703,22 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 				if opts.FirstLineIndentChars != 0 {
 					firstLineIndentChanged = true
 				}
-				pprInner = renderActiveLeaves(buildPPrOps(nil, pParaRequest{
+				leaves := renderActiveLeaves(buildPPrOps(nil, pParaRequest{
 					LineSpacing: opts.LineSpacing, LineSpacingExactPt: opts.LineSpacingExactPt,
 					SpaceBeforePt: opts.SpaceBeforePt, SpaceAfterPt: opts.SpaceAfterPt,
 					Align: opts.Align, FirstLineIndentChars: opts.FirstLineIndentChars,
 				}))
+				if ppr.found && ppr.selfClosing {
+					// Expand the self-closing tag IN PLACE so the new
+					// leaves land as its own children, not as trailing
+					// SIBLINGS of it (task 9 brief, item 6 / Task 8 review
+					// round 2's old debt: "<w:pPrDefault><w:pPr/></w:pPrDefault>
+					// + any pPr-level field -> <w:pPr/><w:ind/> 平级").
+					patches = append(patches, PatchRawSpan(styles, ppr.tagSpan, "<w:pPr>"+leaves+"</w:pPr>"))
+				} else {
+					needPPrSynthesis = true
+					pprInner = leaves
+				}
 			}
 		}
 
@@ -1563,6 +1747,15 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 		if len(headingPatches) > 0 {
 			patches = append(patches, headingPatches...)
 			applied = append(applied, fmt.Sprintf("heading font -> %s", opts.HeadingFont))
+		}
+		if len(touched) == 0 {
+			// Neither channel (styleId nor w:name) matched any style at
+			// all — heading_font had nothing to act on. Previously this
+			// fell through in total silence: no applied entry (correct)
+			// but no note either, indistinguishable from "matched
+			// everything, nothing needed to change" (task 9 brief, item 3
+			// — format capability review, Important 7).
+			notes = append(notes, "no heading styles found; nothing changed")
 		}
 	}
 
@@ -1622,20 +1815,62 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 	return patches, applied, notes, nil
 }
 
-// planHeadingFontPatches rewrites every Heading1..Heading9 style's
-// <w:rPr><w:rFonts> ascii/hAnsi to font (stripping their *Theme
-// counterparts), and eastAsia to eastAsiaFont too — but ONLY when
-// eastAsiaFont is non-"" (i.e. FormatOptions.BodyEastAsiaFont was ALSO given in
-// this same Format call). HeadingFont on its own no longer touches eastAsia
-// (or cs) at all: it used to, via rFontsLiteralAttrs, which silently turned
-// a Chinese heading's own CJK font into whatever Latin heading_font was
-// requested — the exact "heading_font 路径也不应再把 eastAsia 打成 Latin 字体"
-// defect Task 7's own review left open for this task to close (task 8
-// brief; format capability review, Important 8's heading-path follow-up).
+// styleChildOrder is CT_Style's full child sequence (ECMA-376 §17.7.4.17):
+// the anchor set planHeadingFontPatches needs so a brand-new <w:rPr>
+// inserted for a heading style that has none at all (task 9 brief, item 2 —
+// format capability review, Important 6) lands in the schema-correct
+// position — immediately after <w:pPr> when the style has one, or wherever
+// CT_Style says rPr goes otherwise — and strictly before tblPr/trPr/tcPr/
+// tblStylePr, never unconditionally at the style's own end. Table-type
+// styles (the only ones that ever carry tblPr/trPr/tcPr/tblStylePr) are out
+// of scope for HeadingFont, which only ever matches paragraph-type Heading1
+// ..9 styles, so this list is only ever consulted up through rPr in
+// practice; the trailing names are kept for documentation completeness.
+var styleChildOrder = []string{
+	"name", "aliases", "basedOn", "next", "link", "autoRedefine", "hidden",
+	"uiPriority", "semiHidden", "unhideWhenUsed", "qFormat", "locked",
+	"personal", "personalCompose", "personalReply", "rsid",
+	"pPr", "rPr", "tblPr", "trPr", "tcPr", "tblStylePr",
+}
+
+// planHeadingFontPatches rewrites every heading style's <w:rPr><w:rFonts>
+// ascii/hAnsi to font (stripping their *Theme counterparts), and eastAsia to
+// eastAsiaFont too — but ONLY when eastAsiaFont is non-"" (i.e.
+// FormatOptions.BodyEastAsiaFont was ALSO given in this same Format call).
+// HeadingFont on its own no longer touches eastAsia (or cs) at all: it used
+// to, via rFontsLiteralAttrs, which silently turned a Chinese heading's own
+// CJK font into whatever Latin heading_font was requested — the exact
+// "heading_font 路径也不应再把 eastAsia 打成 Latin 字体" defect Task 7's own
+// review left open for this task to close (task 8 brief; format capability
+// review, Important 8's heading-path follow-up).
+//
+// A style counts as a heading through EITHER of two independent channels
+// (task 9 brief, item 1 — format capability review, Important 5): its
+// w:styleId matching headingStyleIDRe (Heading1..Heading9, the ordinary
+// Word/docx_write convention), OR its own <w:name w:val="heading N"/>
+// matching headingLikeNameRe case-insensitively, regardless of what its
+// styleId happens to be. zh-CN Word and WPS commonly localize/renumber the
+// styleId itself (typically down to a bare "1".."9") while still writing
+// the SAME English w:name Word's own UI derives it from — styleId-only
+// matching was a silent no-op on exactly those documents. Since <w:name>
+// always precedes <w:pPr>/<w:rPr> in CT_Style's own child order, a style's
+// heading-or-not status is always settled by the time either of those is
+// seen, so both channels can be decided in one linear pass with no
+// lookahead/buffering. touched is keyed by styleId regardless of which
+// channel matched, so a name-only match still participates correctly in
+// planStylesPatches' touchedHeadingIDs exemption and in its "no heading
+// styles found" note (item 3, below).
+//
 // If a matched heading style has an <w:rPr> but no <w:rFonts> inside it,
 // one is inserted as that rPr's first child; if the rPr itself is
 // self-closing (<w:rPr/>, carrying no properties at all), it is expanded
-// in place to hold the new rFonts.
+// in place to hold the new rFonts; and if the style has NO <w:rPr> AT ALL —
+// a heading whose font is entirely inherited via basedOn, format capability
+// review Important 6 — one is synthesized and inserted at the
+// schema-correct position via styleChildOrder (right after </w:pPr> when
+// the style has a pPr, otherwise right before </w:style>), rather than left
+// as a silent no-op (task 9 brief, item 2). A fully self-closing
+// <w:style .../> (no children of any kind) is likewise expanded in place.
 //
 // A heading's rPr can wrap a <w:rPrChange><w:rPr>...</w:rPr></w:rPrChange>
 // holding a REVISION'S historical run properties — a same-named <w:rPr>
@@ -1646,30 +1881,48 @@ func planStylesPatches(styles []byte, opts FormatOptions, usedIDs map[string]boo
 // scanRunProps and scanDocDefaults; scanDirectChildren then reads only the
 // rPr's own DIRECT rFonts, so the historical copy is never mistaken for the
 // current one (format capability review follow-up, same root cause as
-// Critical 2 — this function had it twice: once for the close/rFonts-search
-// itself, fixed here, and once for the insertion position, fixed earlier).
+// Critical 2). pPrDepth/pPrFound/pPrCloseEnd give the SAME depth-tracking
+// treatment to the style's own <w:pPr> (which can equally wrap a
+// <w:pPrChange>'s historical <w:pPr>), needed to find that pPr's own true
+// close for the "insert a brand new rPr right after it" anchor above.
 //
 // touched reports every styleId this function structurally matched
-// (headingStyleIDRe on the styleId, exactly the condition below), REGARDLESS
-// of whether a byte-different patch actually resulted — planStylesPatches
-// uses it to exempt exactly these Heading1..9 styles from
-// planStyleChainShadowPatches' "body font" masking note when HeadingFont was
-// also requested in this same call (task 7 follow-up review, F3/F4): a
-// heading that legitimately got its own new font this call is not masking
-// body_font in any sense worth a caveat about, even on a second identical
-// call where the heading's font already matched and no patch was needed.
+// (through either channel), REGARDLESS of whether a byte-different patch
+// actually resulted — planStylesPatches uses it to exempt exactly these
+// heading styles from planStyleChainShadowPatches' "body font" masking note
+// when HeadingFont was also requested in this same call (task 7 follow-up
+// review, F3/F4), and to report "no heading styles found; nothing changed"
+// when it is empty (task 9 brief, item 3): a heading that legitimately got
+// its own new font this call is not masking body_font in any sense worth a
+// caveat about, even on a second identical call where the heading's font
+// already matched and no patch was needed.
 func planHeadingFontPatches(styles []byte, font, eastAsiaFont string) ([]Patch, map[string]bool, error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
 	var patches []Patch
 	touched := map[string]bool{}
 
-	var inHeading bool
+	var insideStyle, curIsHeading bool
+	var curStyleID string
+	var styleSpan Span
+	var styleAttrs []xml.Attr
 	var pPrDepth int
+	var pPrFound bool
+	var pPrCloseEnd int
 	var rprSeen bool
 	var trackingRPr bool
 	var rprDepth int
 	var rprTagSpan Span
+
+	markHeading := func() {
+		curIsHeading = true
+		if curStyleID != "" {
+			touched[curStyleID] = true
+		}
+	}
+	newRFonts := func(existing []xml.Attr) string {
+		return buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(existing, font, eastAsiaFont), true)
+	}
 
 	for {
 		tok, terr := dec.Token()
@@ -1685,30 +1938,51 @@ func planHeadingFontPatches(styles []byte, font, eastAsiaFont string) ([]Patch, 
 		case xml.StartElement:
 			span := Span{prevOffset, offset}
 			switch {
-			case isWordElement(t.Name, "style") && !inHeading:
-				if id, ok := wordAttrVal(t, "styleId"); ok && headingStyleIDRe.MatchString(id) {
-					inHeading = true
-					touched[id] = true
-					pPrDepth = 0
-					rprSeen = false
-					trackingRPr = false
+			case isWordElement(t.Name, "style") && !insideStyle:
+				insideStyle = true
+				styleSpan = span
+				styleAttrs = t.Attr
+				curStyleID, _ = wordAttrVal(t, "styleId")
+				curIsHeading = false
+				pPrDepth, pPrFound, pPrCloseEnd = 0, false, 0
+				rprSeen, trackingRPr = false, false
+				if curStyleID != "" && headingStyleIDRe.MatchString(curStyleID) {
+					markHeading()
 				}
-			case trackingRPr:
+				if isSelfClosingSpan(styles, span) {
+					// No <w:name>/<w:pPr>/<w:rPr> at all to see: this
+					// style's fate (heading via styleId, or not a heading
+					// at all — a fully empty style has no <w:name> for the
+					// name channel to ever match) is already final.
+					if curIsHeading {
+						patches = append(patches, PatchRawSpan(styles, styleSpan,
+							buildTag("style", styleAttrs, false)+"<w:rPr>"+newRFonts(nil)+"</w:rPr></w:style>"))
+					}
+					insideStyle = false
+				}
+			case insideStyle && trackingRPr:
 				// Anything encountered once the heading's own rPr is being
 				// tracked (including a NESTED <w:rPr>, e.g. <w:rPrChange>'s
 				// historical copy) only ever deepens rprDepth; it can never
 				// re-trigger the "found rPr" case below.
 				rprDepth++
-			case inHeading && isWordElement(t.Name, "pPr"):
+			case insideStyle && !curIsHeading && isWordElement(t.Name, "name") && pPrDepth == 0:
+				if v, ok := wordAttrVal(t, "val"); ok && headingLikeNameRe.MatchString(strings.TrimSpace(v)) {
+					markHeading()
+				}
+			case insideStyle && isWordElement(t.Name, "pPr"):
+				if pPrDepth == 0 {
+					pPrFound = true
+				}
 				pPrDepth++
-			case inHeading && isWordElement(t.Name, "rPr") && pPrDepth == 0 && !rprSeen:
+			case insideStyle && isWordElement(t.Name, "rPr") && pPrDepth == 0 && !rprSeen:
 				rprSeen = true
-				sc := isSelfClosingSpan(styles, span)
-				if sc {
+				if isSelfClosingSpan(styles, span) {
 					// No properties at all: expand in place so the new
 					// rFonts has somewhere to live.
-					newTag := "<w:rPr>" + buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(nil, font, eastAsiaFont), true) + "</w:rPr>"
-					patches = append(patches, PatchRawSpan(styles, span, newTag))
+					if curIsHeading {
+						patches = append(patches, PatchRawSpan(styles, span, "<w:rPr>"+newRFonts(nil)+"</w:rPr>"))
+					}
 				} else {
 					trackingRPr = true
 					rprDepth = 0
@@ -1718,7 +1992,7 @@ func planHeadingFontPatches(styles []byte, font, eastAsiaFont string) ([]Patch, 
 
 		case xml.EndElement:
 			switch {
-			case trackingRPr:
+			case insideStyle && trackingRPr:
 				if rprDepth > 0 {
 					rprDepth--
 					break
@@ -1727,35 +2001,59 @@ func planHeadingFontPatches(styles []byte, font, eastAsiaFont string) ([]Patch, 
 				// open, not merely "the next thing literally named rPr").
 				// prevOffset is exactly where this </w:rPr> begins.
 				trackingRPr = false
-				children := scanDirectChildren(styles[rprTagSpan.End:prevOffset], rprTagSpan.End, []string{"rFonts"})
-				if rf, ok := children["rFonts"]; ok {
-					// tagUnchanged: a heading whose rFonts already renders
-					// byte-for-byte identically to font has nothing left to
-					// rewrite — skipping the patch here (rather than always
-					// emitting one) is what makes a second heading_font call
-					// with the same font produce zero patches, so
-					// planStylesPatches' len(headingPatches)>0 gate correctly
-					// reports nothing changed instead of unconditionally
-					// re-writing (and re-saving/backing-up) a byte-identical
-					// styles.xml (task 7 follow-up review round 2, F1).
-					newTag := buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(rf.attrs, font, eastAsiaFont), true)
-					if !tagUnchanged(styles, rf, newTag) {
-						patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+				if curIsHeading {
+					children := scanDirectChildren(styles[rprTagSpan.End:prevOffset], rprTagSpan.End, []string{"rFonts"})
+					if rf, ok := children["rFonts"]; ok {
+						// tagUnchanged: a heading whose rFonts already
+						// renders byte-for-byte identically to font has
+						// nothing left to rewrite — skipping the patch here
+						// (rather than always emitting one) is what makes a
+						// second heading_font call with the same font
+						// produce zero patches, so planStylesPatches'
+						// len(headingPatches)>0 gate correctly reports
+						// nothing changed instead of unconditionally
+						// re-writing (and re-saving/backing-up) a
+						// byte-identical styles.xml (task 7 follow-up
+						// review round 2, F1).
+						newTag := newRFonts(rf.attrs)
+						if !tagUnchanged(styles, rf, newTag) {
+							patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+						}
+					} else {
+						// No rFonts among this rPr's own direct children:
+						// insert one as its FIRST child, at rprTagSpan.End —
+						// not at this close (LAST), which would land the new
+						// rFonts after whatever direct formatting (e.g.
+						// <w:b/>) this rPr already carries, violating
+						// EG_RPrBase's "rFonts precedes every other run
+						// property" order.
+						patches = append(patches, PatchRawSpan(styles, Span{rprTagSpan.End, rprTagSpan.End}, newRFonts(nil)))
 					}
-				} else {
-					// No rFonts among this rPr's own direct children:
-					// insert one as its FIRST child, at rprTagSpan.End —
-					// not at this close (LAST), which would land the new
-					// rFonts after whatever direct formatting (e.g. <w:b/>)
-					// this rPr already carries, violating EG_RPrBase's
-					// "rFonts precedes every other run property" order.
-					patches = append(patches, PatchRawSpan(styles, Span{rprTagSpan.End, rprTagSpan.End},
-						buildTag("rFonts", rFontsLatinAndEastAsiaAttrs(nil, font, eastAsiaFont), true)))
 				}
-			case isWordElement(t.Name, "pPr") && pPrDepth > 0:
+			case insideStyle && isWordElement(t.Name, "pPr") && pPrDepth > 0:
 				pPrDepth--
-			case isWordElement(t.Name, "style") && inHeading:
-				inHeading = false
+				if pPrDepth == 0 {
+					pPrCloseEnd = offset
+				}
+			case insideStyle && isWordElement(t.Name, "style"):
+				if curIsHeading && !rprSeen {
+					// No <w:rPr> anywhere in this heading style at all
+					// (format capability review, Important 6 / task 9
+					// brief, item 2): synthesize one at the schema-correct
+					// position — right after </w:pPr> when this style has
+					// one (CT_Style requires rPr immediately follow pPr),
+					// otherwise right before </w:style> (rPr is then the
+					// first thing CT_Style allows after name/aliases/
+					// basedOn/.../rsid, none of which this package ever
+					// needs to anchor against since it never inserts
+					// anything before them).
+					anchor := prevOffset
+					if pPrFound {
+						anchor = pPrCloseEnd
+					}
+					patches = append(patches, PatchRawSpan(styles, Span{anchor, anchor}, "<w:rPr>"+newRFonts(nil)+"</w:rPr>"))
+				}
+				insideStyle = false
 			}
 		}
 		prevOffset = offset
@@ -1948,10 +2246,12 @@ func styleLeafClose(styles []byte, elem elemInfo, tagName string) (int, error) {
 // (any whitespace, case-insensitive) — the actual value real Word/WPS
 // documents write regardless of localized UI (format capability review,
 // Important 5's own observation that a localized STYLEID like "1"/"2" still
-// carries this English w:name). Used only for the style-CHAIN classification
-// below; heading detection elsewhere in this file (planHeadingFontPatches,
-// HeadingFont) is intentionally unchanged by this task and keeps using
-// headingStyleIDRe on the styleId alone.
+// carries this English w:name). Used for the style-CHAIN classification
+// (isHeadingLikeStyle) AND, since task 9, as planHeadingFontPatches' own
+// second matching channel alongside headingStyleIDRe — a zh-CN/WPS document
+// whose Heading1..9 styleId is localized down to a bare "1".."9" still
+// matches via this regex, so heading_font is no longer a silent no-op on
+// those documents (task 9 brief, item 1).
 var headingLikeNameRe = regexp.MustCompile(`(?i)^heading\s*[1-9]$`)
 
 // normalizeStyleKey folds a style's own w:styleId or w:name into a
@@ -2264,6 +2564,14 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 	var patches []Patch
 	changed := map[string]bool{}    // field label -> a real (byte-different) rewrite happened
 	masked := map[string][]string{} // field label -> style names that still shadow it
+	// dropNotes collects pPrDropNotes' silent-drop caveats (task 9 brief,
+	// item 7b) as each eligible style's own spacing/ind is rewritten below —
+	// the SAME two "one wins, the other becomes invisible" pairs
+	// buildPPrOps' docDefaults path already surfaces via pPrDropNotes, just
+	// duplicated inline here (rather than calling pPrDropNotes itself)
+	// because this loop mutates attrs incrementally per-field instead of
+	// building one pParaRequest up front.
+	var dropNotes []string
 
 	for _, s := range elems {
 		if s.typ != "paragraph" || s.id == "" {
@@ -2341,6 +2649,10 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 						// with w:firstLine below -- clear it whenever we
 						// write a real w:before value.
 						if !attrEquals(sp.attrs, "before", want) || hasAttr(sp.attrs, "beforeAutospacing") {
+							if hasAttr(sp.attrs, "beforeAutospacing") {
+								dropNotes = append(dropNotes, fmt.Sprintf(
+									"space_before_pt removed style %q's own w:beforeAutospacing flag, which would otherwise have made the new value invisible", styleLabel(s)))
+							}
 							attrs = dropAttrs(attrs, "beforeAutospacing")
 							attrs = setAttr(attrs, "before", want)
 							beforeChanges = true
@@ -2349,6 +2661,10 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 					if opts.SpaceAfterPt != 0 && hasAttr(sp.attrs, "after") {
 						want := ptToTwips(opts.SpaceAfterPt)
 						if !attrEquals(sp.attrs, "after", want) || hasAttr(sp.attrs, "afterAutospacing") {
+							if hasAttr(sp.attrs, "afterAutospacing") {
+								dropNotes = append(dropNotes, fmt.Sprintf(
+									"space_after_pt removed style %q's own w:afterAutospacing flag, which would otherwise have made the new value invisible", styleLabel(s)))
+							}
 							attrs = dropAttrs(attrs, "afterAutospacing")
 							attrs = setAttr(attrs, "after", want)
 							afterChanges = true
@@ -2392,6 +2708,10 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 						"firstLine", firstLineTwipsFromChars(opts.FirstLineIndentChars))
 					newTag := buildTag("ind", newAttrs, true)
 					if !tagUnchanged(styles, ind, newTag) {
+						if hasAttr(ind.attrs, "hanging") || hasAttr(ind.attrs, "hangingChars") {
+							dropNotes = append(dropNotes, fmt.Sprintf(
+								"first_line_indent_chars removed style %q's own hanging indent (w:hanging/w:hangingChars), which would otherwise have taken precedence and made it invisible", styleLabel(s)))
+						}
 						patches = append(patches, PatchRawSpan(styles, ind.tagSpan, newTag))
 						changed["first line indent"] = true
 					}
@@ -2470,6 +2790,7 @@ func planStyleChainShadowPatches(styles []byte, opts FormatOptions, usedIDs, tou
 			"style(s) %s carry their own %s that overrides this rule and were left unchanged",
 			strings.Join(quoted, ", "), field))
 	}
+	notes = append(notes, dropNotes...)
 	return patches, changed, notes, nil
 }
 
@@ -2614,19 +2935,43 @@ func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]s
 	return notes, nil
 }
 
-// planMarginPatches rewrites every <w:pgMar> in documentXML (there is
-// ordinarily exactly one, a direct child of <w:body>, but a
-// multi-section document can have more) to carry marginsMM (top, right,
-// bottom, left) converted to twips.
-func planMarginPatches(documentXML []byte, marginsMM []float64) ([]Patch, error) {
-	top := mmToTwips(marginsMM[0])
-	right := mmToTwips(marginsMM[1])
-	bottom := mmToTwips(marginsMM[2])
-	left := mmToTwips(marginsMM[3])
+// sectPrChildOrder is CT_SectPr's child sequence (ECMA-376 §17.6.17): the
+// anchor set planMarginPatches needs so a brand-new <w:pgMar> inserted for
+// a section that has none at all (task 9 brief, item 4 — format
+// capability review, Important 10) lands in the schema-correct position —
+// after any header/footerReference/type/pgSz, before paperSrc/pgBorders/
+// and everything else — rather than failing the whole call the way a
+// missing <w:pgMar> used to. headerReference/footerReference can repeat,
+// but scanDirectChildren only ever needs to know whether AT LEAST ONE
+// occurs before pgMar, so tracking just the first is sufficient as an
+// anchor.
+var sectPrChildOrder = []string{
+	"headerReference", "footerReference", "footnotePr", "endnotePr", "type",
+	"pgSz", "pgMar", "paperSrc", "pgBorders", "lnNumType", "pgNumType",
+	"cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection",
+	"bidi", "rtlGutter", "docGrid", "printerSettings", "sectPrChange",
+}
 
+// scanSectPrs finds every <w:sectPr> in documentXML (ordinarily one, the
+// document body's own trailing section properties, but a multi-section
+// document can have one per section, each living inside the LAST
+// paragraph's own <w:pPr> of its section) and, for each, its own elemInfo
+// (found/tagSpan/selfClosing/closeStart) plus the full set of its direct
+// children scanDirectChildren tracks against sectPrChildOrder — the same
+// "full anchor set, not just the one leaf this package edits" shape
+// scanDocDefaults/scanParaProps already return for pPr/rPr, needed so a
+// newly inserted pgMar lands in schema order relative to whatever else the
+// section already carries. <w:sectPr> never nests (CT_PPrBase, which a
+// pPrChange's historical pPr copy is typed as, does not include sectPr —
+// unlike pPr/rPr, there is no same-named-nested-element trap here), so a
+// plain "in/out" boolean is enough to find each one's own close.
+func scanSectPrs(documentXML []byte) ([]elemInfo, []map[string]elemInfo, error) {
 	dec := xml.NewDecoder(bytes.NewReader(documentXML))
 	var prevOffset int
-	var patches []Patch
+	var infos []elemInfo
+	var childrenList []map[string]elemInfo
+	var in bool
+	var cur elemInfo
 
 	for {
 		tok, terr := dec.Token()
@@ -2634,22 +2979,110 @@ func planMarginPatches(documentXML []byte, marginsMM []float64) ([]Patch, error)
 			if errors.Is(terr, io.EOF) {
 				break
 			}
-			return nil, fmt.Errorf("scan document.xml for pgMar: %w", terr)
+			return nil, nil, fmt.Errorf("scan document.xml for sectPr: %w", terr)
 		}
 		offset := int(dec.InputOffset())
 
-		if se, ok := tok.(xml.StartElement); ok && isWordElement(se.Name, "pgMar") {
-			attrs := setAttr(se.Attr, "top", top)
-			attrs = setAttr(attrs, "right", right)
-			attrs = setAttr(attrs, "bottom", bottom)
-			attrs = setAttr(attrs, "left", left)
-			patches = append(patches, PatchRawSpan(documentXML, Span{prevOffset, offset}, buildTag("pgMar", attrs, true)))
+		switch t := tok.(type) {
+		case xml.StartElement:
+			span := Span{prevOffset, offset}
+			if !in && isWordElement(t.Name, "sectPr") {
+				sc := isSelfClosingSpan(documentXML, span)
+				cur = elemInfo{found: true, tagSpan: span, selfClosing: sc, attrs: t.Attr}
+				if sc {
+					infos = append(infos, cur)
+					childrenList = append(childrenList, nil)
+				} else {
+					in = true
+				}
+			}
+		case xml.EndElement:
+			if in && isWordElement(t.Name, "sectPr") {
+				cur.closeStart = prevOffset
+				infos = append(infos, cur)
+				childrenList = append(childrenList,
+					scanDirectChildren(documentXML[cur.tagSpan.End:cur.closeStart], cur.tagSpan.End, sectPrChildOrder))
+				in = false
+			}
 		}
 		prevOffset = offset
 	}
+	return infos, childrenList, nil
+}
 
-	if len(patches) == 0 {
-		return nil, fmt.Errorf("docx: document.xml has no <w:pgMar> element; cannot set margins")
+// planMarginPatches rewrites every <w:sectPr>'s <w:pgMar> in documentXML
+// (there is ordinarily exactly one, a direct child of <w:body>, but a
+// multi-section document can have more) to carry marginsMM (top, right,
+// bottom, left) converted to twips, preserving whatever else that pgMar
+// already had (header/footer/gutter, in particular). A section that has
+// NO <w:pgMar> at all gets a brand new one INSERTED, at the schema-correct
+// position (right after pgSz/type/headerReference.../footerReference...,
+// whichever of those exist, else as sectPr's first child), carrying OOXML's
+// own conventional pgMar defaults for the three attributes this call never
+// touches (header/footer 720 twips = 0.5in, gutter 0) with marginsMM's four
+// values layered on top — rather than failing the whole call the way a
+// missing <w:pgMar> used to (format capability review, Important 10 /
+// task 9 brief, item 4): a document is not required to declare an explicit
+// <w:pgMar> just because most Word/docx_write output does.
+func planMarginPatches(documentXML []byte, marginsMM []float64) ([]Patch, error) {
+	top := mmToTwips(marginsMM[0])
+	right := mmToTwips(marginsMM[1])
+	bottom := mmToTwips(marginsMM[2])
+	left := mmToTwips(marginsMM[3])
+
+	sects, childrenList, err := scanSectPrs(documentXML)
+	if err != nil {
+		return nil, err
+	}
+	if len(sects) == 0 {
+		return nil, fmt.Errorf("docx: document.xml has no <w:sectPr> element; cannot set margins")
+	}
+
+	buildAttrs := func(existing []xml.Attr) []xml.Attr {
+		attrs := existing
+		if attrs == nil {
+			// Brand-new <w:pgMar>: fall back to OOXML's own conventional
+			// defaults for the three attributes marginsMM never touches, so
+			// an inserted pgMar does not silently claim zero header/footer/
+			// gutter space that was never requested.
+			attrs = []xml.Attr{
+				{Name: xml.Name{Local: "header"}, Value: "720"},
+				{Name: xml.Name{Local: "footer"}, Value: "720"},
+				{Name: xml.Name{Local: "gutter"}, Value: "0"},
+			}
+		}
+		attrs = setAttr(attrs, "top", top)
+		attrs = setAttr(attrs, "right", right)
+		attrs = setAttr(attrs, "bottom", bottom)
+		attrs = setAttr(attrs, "left", left)
+		return attrs
+	}
+
+	var patches []Patch
+	for i, sect := range sects {
+		children := childrenList[i]
+		if pm, ok := children["pgMar"]; ok {
+			patches = append(patches, PatchRawSpan(documentXML, pm.tagSpan, buildTag("pgMar", buildAttrs(pm.attrs), true)))
+			continue
+		}
+		if sect.selfClosing {
+			// <w:sectPr/> with no properties at all: expand it to hold the
+			// new pgMar, exactly like a self-closing pPr/rPr elsewhere in
+			// this file.
+			patches = append(patches, PatchRawSpan(documentXML, sect.tagSpan,
+				buildTag("sectPr", sect.attrs, false)+buildTag("pgMar", buildAttrs(nil), true)+"</w:sectPr>"))
+			continue
+		}
+		ops := make([]leafOp, 0, len(sectPrChildOrder))
+		for _, name := range sectPrChildOrder {
+			op := leafOp{info: children[name], local: name}
+			if name == "pgMar" {
+				op.active = true
+				op.attrs = buildAttrs(nil)
+			}
+			ops = append(ops, op)
+		}
+		patches = append(patches, applyLeafOps(documentXML, sect.closeStart, ops)...)
 	}
 	return patches, nil
 }

@@ -238,8 +238,8 @@ func buildStylesXMLWithFonts(f fontOptions) []byte {
 // pre-typography-task value) and neither carries hAnsi/cs attributes either
 // — the reference's own rFonts never carries either, so this doesn't
 // either. Literal beats theme in Word's own resolution order, which is also
-// why format.go's rFontsLiteralAttrs strips *Theme attributes whenever a
-// literal font is set (see TestFormat_HeadingFontRemovesThemeAttributes'
+// why format.go's rFontsLatinAndEastAsiaAttrs strips *Theme attributes
+// whenever a literal font is set (see TestFormat_HeadingFontRemovesThemeAttributes'
 // doc comment: a literal font added BESIDE a theme one is ignored, the
 // theme wins) — carrying no Theme attributes at all here avoids that trap
 // entirely rather than relying on it being harmless.

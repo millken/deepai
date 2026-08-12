@@ -67,6 +67,9 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 	if !ok {
 		return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
 	}
+	if err := requireWordNamespacePrefix(DocumentPart, doc); err != nil {
+		return FormatResult{}, err
+	}
 	working := doc
 	paras := d.Paras()
 	changed := false
@@ -124,7 +127,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			Align:                opts.Align,
 			FirstLineIndentChars: opts.FirstLineIndentChars,
 		}
-		out, n, err := applyDirectParaFormat(working, paras, from, to, req)
+		out, n, dropNotes, err := applyDirectParaFormat(working, paras, from, to, req)
 		if err != nil {
 			return FormatResult{}, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
 		}
@@ -132,6 +135,7 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 			working = out
 			changed = true
 		}
+		result.Notes = append(result.Notes, dropNotes...)
 		if opts.LineSpacing != 0 {
 			result.Applied = append(result.Applied, fmt.Sprintf(
 				"paragraph %d-%d line spacing -> %g (%d paragraph(s))", from, to, opts.LineSpacing, n))
@@ -242,15 +246,23 @@ func applyDirectRunFormat(documentXML []byte, paras []Para, from, to int, font, 
 // do to any other, including a genuinely self-closing <w:p/> (expanded in
 // place into <w:p><w:pPr>...</w:pPr></w:p> — there is no content model to
 // insert into otherwise).
-func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req pParaRequest) ([]byte, int, error) {
+//
+// notes reports, aggregated across the whole range rather than once per
+// paragraph, the same silent-drop caveats pPrDropNotes covers for the
+// whole-document path (task 9 brief, item 7b): a pre-existing w:hanging/
+// w:hangingChars removed by a real FirstLineIndentChars, or a pre-existing
+// w:beforeAutospacing/w:afterAutospacing removed by a real SpaceBeforePt/
+// SpaceAfterPt.
+func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req pParaRequest) ([]byte, int, []string, error) {
 	if req.isZero() {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, 0, nil
+		return out, 0, nil, nil
 	}
 
 	var patches []Patch
 	changed := 0
+	var hangingDropped, beforeAutoDropped, afterAutoDropped int
 
 	for _, p := range paras {
 		if p.Index < from || p.Index > to {
@@ -266,22 +278,54 @@ func applyDirectParaFormat(documentXML []byte, paras []Para, from, to int, req p
 
 		openEnd, ppr, children, err := scanParaProps(documentXML, p.Span)
 		if err != nil {
-			return nil, 0, fmt.Errorf("paragraph %d: %w", p.Index, err)
+			return nil, 0, nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
+		}
+		if req.FirstLineIndentChars != 0 {
+			if ind, ok := children["ind"]; ok && (hasAttr(ind.attrs, "hanging") || hasAttr(ind.attrs, "hangingChars")) {
+				hangingDropped++
+			}
+		}
+		if req.SpaceBeforePt != 0 {
+			if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "beforeAutospacing") {
+				beforeAutoDropped++
+			}
+		}
+		if req.SpaceAfterPt != 0 {
+			if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "afterAutospacing") {
+				afterAutoDropped++
+			}
 		}
 		patches = append(patches, planParaPPrPatches(documentXML, openEnd, ppr, children, req)...)
 		changed++
 	}
 
+	var notes []string
+	if hangingDropped > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"first_line_indent_chars removed an existing hanging indent (w:hanging/w:hangingChars) in %d paragraph(s) in the range, which would otherwise have taken precedence and made it invisible",
+			hangingDropped))
+	}
+	if beforeAutoDropped > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"space_before_pt removed an existing w:beforeAutospacing flag in %d paragraph(s) in the range, which would otherwise have made the new value invisible",
+			beforeAutoDropped))
+	}
+	if afterAutoDropped > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"space_after_pt removed an existing w:afterAutospacing flag in %d paragraph(s) in the range, which would otherwise have made the new value invisible",
+			afterAutoDropped))
+	}
+
 	if len(patches) == 0 {
 		out := make([]byte, len(documentXML))
 		copy(out, documentXML)
-		return out, changed, nil
+		return out, changed, notes, nil
 	}
 	out, err := Apply(documentXML, patches)
 	if err != nil {
-		return nil, 0, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
+		return nil, 0, nil, fmt.Errorf("docx: apply direct paragraph formatting: %w", err)
 	}
-	return out, changed, nil
+	return out, changed, notes, nil
 }
 
 // expandSelfClosingParagraph rewrites a self-closing <w:p .../> into

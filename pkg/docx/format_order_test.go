@@ -85,7 +85,7 @@ func TestDirect_ParagraphFormat_SpacingAndJcLandBeforeExistingRPr(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
+	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestDirect_ParagraphFormat_SpacingLandsBeforeExistingInd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
+	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestDirect_ParagraphFormat_JcLandsBeforeExistingSectPr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: "justify"})
+	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 0, Align: "justify"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestDirect_ParagraphFormat_IgnoresCharacterSpacingInsideNestedRPr(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, n, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
+	got, n, _, err := applyDirectParaFormat(doc, paras, 1, 1, pParaRequest{LineSpacing: 1.5, Align: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
