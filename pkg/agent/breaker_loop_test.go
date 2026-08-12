@@ -69,3 +69,77 @@ func TestRepeatBreaker_NormalReReadIsNotALoop(t *testing.T) {
 		}
 	}
 }
+
+// TestSameFailureBreaker_CatchesRewordedRetries replays the second loop from
+// session 20260812_093415_fc6e: `dart test` timed out with no output, and the
+// model retried eight times, changing the command text every couple of tries
+// (`| tail -20` → `| tail -30` → no pipe → a single test file). Every change
+// produced a new (tool, arguments) key, so both argument-keyed counters stayed
+// at 1-2 and nothing ever fired.
+func TestSameFailureBreaker_CatchesRewordedRetries(t *testing.T) {
+	b := newToolCallBreaker()
+	commands := []string{
+		"cd flutter && dart test test/reconnect/ 2>&1 | tail -20",
+		"cd flutter && dart test test/reconnect/ 2>&1 | tail -20",
+		"cd flutter && dart test test/reconnect/ 2>&1 | tail -30",
+		"cd flutter && dart test test/reconnect/ 2>&1 | tail -30",
+		"cd flutter && dart test test/reconnect/ 2>&1",
+		"cd flutter && dart test test/reconnect/reconnect_helper_test.dart 2>&1",
+		"cd flutter && dart test test/reconnect/reconnect_helper_test.dart 2>&1 | tail -30",
+		"cd flutter && dart test test/reconnect/reconnect_helper_test.dart 2>&1 | tail -40",
+		"cd flutter && dart test test/ 2>&1",
+		"cd flutter && dart test 2>&1",
+	}
+	// The identical outcome every time: killed at the limit, nothing captured.
+	const timeoutErr = "command TIMED OUT after 120s (limit 120s) and its process group was killed. " +
+		"It produced NO output at all before the kill"
+
+	hints, fatalAt := 0, 0
+	for i, cmd := range commands {
+		call := models.ToolCall{ID: fmt.Sprintf("c%d", i), Name: "bash", Arguments: map[string]any{"command": cmd, "timeout": 120}}
+		obs := b.observe("s1", call, models.ToolResult{
+			CallID:   call.ID,
+			ToolName: "bash",
+			Status:   models.CallStatusFailed,
+			Error:    timeoutErr,
+			Content:  `{"stdout":"","stderr":"","exit_code":-1,"timed_out":true}`,
+		})
+		hints += len(obs.hintMessages)
+		if obs.fatalErr != nil {
+			fatalAt = i + 1
+			break
+		}
+	}
+
+	if hints == 0 {
+		t.Error("eight reworded retries of an identically failing command produced no hint")
+	}
+	if fatalAt == 0 {
+		t.Fatalf("reworded retries never hard-stopped the run (%d hints only)", hints)
+	}
+	if fatalAt != maxSameFailureHardStop {
+		t.Errorf("hard stop at attempt %d, want %d", fatalAt, maxSameFailureHardStop)
+	}
+}
+
+// TestSameFailureBreaker_DifferentFailuresAreNotALoop is the false-positive
+// guard: a model working through genuinely different errors is making progress,
+// however many of them there are.
+func TestSameFailureBreaker_DifferentFailuresAreNotALoop(t *testing.T) {
+	b := newToolCallBreaker()
+	for i := 0; i < 12; i++ {
+		call := models.ToolCall{ID: fmt.Sprintf("c%d", i), Name: "bash", Arguments: map[string]any{"command": fmt.Sprintf("go build ./pkg/%d", i)}}
+		obs := b.observe("s1", call, models.ToolResult{
+			CallID:   call.ID,
+			ToolName: "bash",
+			Status:   models.CallStatusFailed,
+			Error:    fmt.Sprintf("pkg/%d/main.go:%d: undefined: helper%d", i, i+10, i),
+		})
+		if obs.fatalErr != nil {
+			t.Fatalf("distinct failures tripped the breaker at attempt %d", i+1)
+		}
+		if len(obs.hintMessages) > 0 {
+			t.Fatalf("distinct failures produced a loop hint at attempt %d", i+1)
+		}
+	}
+}
