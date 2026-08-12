@@ -255,11 +255,39 @@ func buildStylesXMLWithFonts(f fontOptions) []byte {
 // having omitted it once already. Those patches rewrite whatever literal
 // font f already put here, so they are unaffected by f being configurable
 // now instead of fixed.
+//
+// <w:lang w:eastAsia="zh-CN"> (fixed from a prior "en-US") is what Word
+// actually reads for East Asian line-breaking rules (禁则 -- which
+// punctuation may not start/end a line) and proofing, completely
+// independently of any font choice: w:eastAsia here names a LANGUAGE, not a
+// font, and "en-US" describing East Asian text was simply wrong for a
+// generator whose entire reason for existing (the docx-chinese-typography
+// plan) is Chinese documents. w:val stays "en-US" (this package's body text
+// is authored/reviewed in English even when the East Asian glyphs it embeds
+// are Chinese; changing it would be a different, unrelated claim about the
+// Latin-script language) and w:bidi stays "ar-SA" (Word's own stock
+// default for the field, present before this task and not something this
+// task's bug report is about).
+//
+// This is a constant, not threaded through fontOptions/WriteOptions the way
+// BodyEastAsiaFont is: unlike a font name, this package has no per-caller
+// signal to derive an East Asian language from. A caller CAN already set
+// BodyEastAsiaFont to a non-Chinese CJK face (e.g. "MS Gothic" for
+// Japanese, per that field's own doc comment), and "zh-CN" would then be
+// the wrong proofing language for the SAME reason "en-US" is wrong today --
+// but guessing a language from a font family name is unreliable (many CJK
+// font names are ambiguous or shared across locales), and adding a real
+// WriteOptions.EastAsiaLanguage field is a bigger, separate feature (new
+// option, new resolution/defaulting logic, its own tests) than this task's
+// mandate. Fixing the concrete, always-wrong-for-this-package's-actual-
+// output default (en-US on Chinese text) now, while leaving fine-grained
+// per-caller control as a follow-up if it's ever needed, is the narrower
+// change; see this task's report for the fuller argument either way.
 func docDefaultsXML(f fontOptions) string {
 	return `<w:docDefaults><w:rPrDefault><w:rPr>` +
 		`<w:rFonts w:ascii="` + f.bodyLatin + `" w:eastAsia="` + f.bodyEastAsia + `"/>` +
 		`<w:sz w:val="21"/><w:szCs w:val="21"/>` +
-		`<w:lang w:val="en-US" w:eastAsia="en-US" w:bidi="ar-SA"/>` +
+		`<w:lang w:val="en-US" w:eastAsia="zh-CN" w:bidi="ar-SA"/>` +
 		`</w:rPr></w:rPrDefault>` +
 		`<w:pPrDefault><w:pPr><w:spacing w:after="200" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>` +
 		`</w:docDefaults>`

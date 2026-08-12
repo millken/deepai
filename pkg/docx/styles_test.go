@@ -122,6 +122,29 @@ func TestStyles_DocDefaultsChainIsComplete(t *testing.T) {
 	}
 }
 
+// 7b. <w:lang>'s w:eastAsia attribute is a LANGUAGE (used by Word for East
+// Asian line-breaking/禁则 rules and proofing), not a font -- unrelated to
+// which font w:eastAsia on <w:rFonts> names. This package generates
+// Chinese documents by design (the docx-chinese-typography plan; see
+// defaultBodyEastAsiaFont/defaultCodeEastAsiaFont), so declaring the East
+// Asian proofing language "en-US" (a real defect this pinned once it was
+// found: docDefaultsXML previously copied Word's own US-English stock
+// default for this attribute verbatim, which was never actually correct
+// for this package's own output) mislabels every Chinese character this
+// package ever writes. w:val (the Latin-script language) is deliberately
+// left "en-US" -- unrelated claim, unaffected by this fix.
+func TestStyles_DocDefaultsEastAsianLanguageIsChinese(t *testing.T) {
+	s := string(buildStylesXML())
+	dd := regexp.MustCompile(`<w:docDefaults>.*?</w:docDefaults>`).FindString(s)
+	if dd == "" {
+		t.Fatal("no <w:docDefaults> found")
+	}
+	if !strings.Contains(dd, `<w:lang w:val="en-US" w:eastAsia="zh-CN" w:bidi="ar-SA"/>`) {
+		t.Errorf("docDefaults <w:lang> = %s, want w:eastAsia=\"zh-CN\" (found lang element in: %s)",
+			regexp.MustCompile(`<w:lang[^/]*/>`).FindString(dd), dd)
+	}
+}
+
 // 8. docDefaults must be w:styles' FIRST child. Word treats an
 // out-of-schema-order styles part as corrupt and gives no diagnostic, so
 // this has to be checked, not assumed.

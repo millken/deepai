@@ -156,16 +156,22 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	// and TestType_HyperlinkAndFooterRelIDsDoNotCollide.
 	footerRelID := ctx.addFooterRelID()
 	body.WriteString(documentXMLFooterXML(footerRelID))
+	// fontTableRelID draws from the exact same shared counter, right after
+	// the footer's -- see addFontTableRelID's doc comment for why a
+	// separate counter for this third part would reopen the identical
+	// collision hazard the footer's own id already had to avoid.
+	fontTableRelID := ctx.addFontTableRelID()
 
 	hasTitle := opts.Title != ""
 	entries := []zipEntry{
 		{name: contentTypesPart, data: []byte(buildContentTypesXML(hasTitle))},
 		{name: "_rels/.rels", data: []byte(buildRootRelsXML(hasTitle))},
 		{name: DocumentPart, data: []byte(body.String())},
-		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels, footerRelID))},
+		{name: "word/_rels/document.xml.rels", data: []byte(buildDocRelsXML(ctx.rels, footerRelID, fontTableRelID))},
 		{name: "word/styles.xml", data: buildStylesXMLWithFonts(fonts)},
 		{name: "word/numbering.xml", data: []byte(numberingXML)},
 		{name: footer1Part, data: []byte(footer1XML)},
+		{name: fontTablePart, data: []byte(fontTableXML(fonts))},
 	}
 	if hasTitle {
 		coreXML, err := docPropsCoreXML(opts.Title)
@@ -1170,6 +1176,20 @@ func (c *renderCtx) addFooterRelID() string {
 	return id
 }
 
+// addFontTableRelID allocates the relationship id for word/fontTable.xml
+// from the exact same shared counter addLink/addFooterRelID draw from, for
+// the identical reason addFooterRelID's doc comment gives: a second,
+// independent counter for a THIRD part would still only need one of the
+// two spaces to overlap for Word to resolve a relationship id to the wrong
+// target, which is indistinguishable from file corruption to a user. There
+// is exactly one counter in this package, and every relationship beyond the
+// two permanently-fixed ones (styles.xml, numbering.xml) draws from it.
+func (c *renderCtx) addFontTableRelID() string {
+	id := fmt.Sprintf("rId%d", c.nextRelID)
+	c.nextRelID++
+	return id
+}
+
 // codeFontXML renders c.fonts' code Latin/East-Asian pair as a direct
 // <w:rFonts> — the one narrow edge case (inline code that is ALSO a
 // hyperlink's text, "[`code`](url)") that cannot reference either
@@ -1609,13 +1629,15 @@ func documentXMLFooterXML(footerRelID string) string {
 // it has always had.
 const docPropsCorePart = "docProps/core.xml"
 
-// buildContentTypesXML builds [Content_Types].xml. word/footer1.xml's
-// Override is unconditional -- Part C of the docx-chinese-typography plan
-// adds a footer to every document WriteDocx produces, not an opt-in one, so
-// there is no hasTitle-style flag guarding it. The docProps/core.xml
-// Override is included only when hasTitle is true, matching WriteDocx only
-// adding that entry in the same condition -- an Override for a part that
-// does not exist would itself make the package invalid.
+// buildContentTypesXML builds [Content_Types].xml. word/footer1.xml's and
+// word/fontTable.xml's Overrides are both unconditional -- Part C of the
+// docx-chinese-typography plan adds a footer to every document WriteDocx
+// produces, and this task adds a font table to every document the same way,
+// neither an opt-in --  so neither needs a hasTitle-style flag guarding it.
+// The docProps/core.xml Override is included only when hasTitle is true,
+// matching WriteDocx only adding that entry in the same condition -- an
+// Override for a part that does not exist would itself make the package
+// invalid.
 func buildContentTypesXML(hasTitle bool) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
@@ -1626,6 +1648,7 @@ func buildContentTypesXML(hasTitle bool) string {
 	b.WriteString(`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`)
 	b.WriteString(`<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>`)
 	b.WriteString(`<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>`)
+	b.WriteString(`<Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/>`)
 	if hasTitle {
 		b.WriteString(`<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>`)
 	}
@@ -1674,15 +1697,20 @@ func docPropsCoreXML(title string) (string, error) {
 // registration makes Word declare the whole file corrupt, not just fail to
 // render lists; see TestWrite_NumberingXMLIsDeclaredInContentTypes), the one
 // footer relationship every document gets (footerRelID, Part C of the
-// docx-chinese-typography plan — see renderCtx.addFooterRelID), plus one
-// hyperlink relationship per link the document's render pass collected
-// (rId3 upward, see renderCtx.addLink). This can no longer be a constant,
-// unlike Task 1/2's docRelsXML: the set of hyperlink relationships depends
-// on the document's content, and footerRelID varies with how many of those
-// there are. rels is built by walking blocks in a fixed, deterministic
-// order (WriteDocx's render loop), and footerRelID is allocated exactly
-// once right after that loop finishes, so the SAME markdown always
-// allocates the SAME ids in the SAME order — the determinism guarantee
+// docx-chinese-typography plan — see renderCtx.addFooterRelID), the one
+// font-table relationship every document now also gets (fontTableRelID,
+// this task — see renderCtx.addFontTableRelID; like the footer and
+// styles/numbering, nothing in document.xml's body references it by r:id,
+// Word finds it purely by relationship Type, the same as python-docx's own
+// bundled default.docx), plus one hyperlink relationship per link the
+// document's render pass collected (rId3 upward, see renderCtx.addLink).
+// This can no longer be a constant, unlike Task 1/2's docRelsXML: the set
+// of hyperlink relationships depends on the document's content, and
+// footerRelID/fontTableRelID vary with how many of those there are. rels is
+// built by walking blocks in a fixed, deterministic order (WriteDocx's
+// render loop), and footerRelID/fontTableRelID are allocated exactly once
+// right after that loop finishes, so the SAME markdown always allocates the
+// SAME ids in the SAME order — the determinism guarantee
 // (TestWrite_IsDeterministic) extends to this part too, not just to
 // document.xml.
 //
@@ -1690,19 +1718,317 @@ func docPropsCoreXML(title string) (string, error) {
 // URL containing "&" (an ordinary query-string separator) would otherwise
 // produce the same "unreadable content" failure escapeXMLText already
 // guards against for run text.
-func buildDocRelsXML(rels []hyperlinkRel, footerRelID string) string {
+func buildDocRelsXML(rels []hyperlinkRel, footerRelID, fontTableRelID string) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	b.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
 	b.WriteString(`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`)
 	b.WriteString(`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>`)
 	fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`, footerRelID)
+	fmt.Fprintf(&b, `<Relationship Id="%s" Type="%s" Target="fontTable.xml"/>`, fontTableRelID, fontTableRelType)
 	for _, r := range rels {
 		escapedURL, _ := escapeXMLText(r.url)
 		fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="%s" TargetMode="External"/>`,
 			r.id, escapedURL)
 	}
 	b.WriteString(`</Relationships>`)
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// word/fontTable.xml
+// ---------------------------------------------------------------------------
+
+// fontTablePart is the OPC part name for the font table: the ECMA-376
+// §17.8.3 mechanism that lets Word substitute more sensibly for a font it
+// cannot find, by hinting what KIND of font is missing --
+// <w:charset>/<w:family>/<w:pitch> -- rather than leaving Word to guess with
+// no information at all. Before this task WriteDocx wrote no
+// word/fontTable.xml whatsoever, which is exactly why a machine missing the
+// CJK font named for a code block's East Asian glyphs got an arbitrary
+// substitute with no signal about whether it should even be monospace --
+// the box-drawing misalignment reported against this package's output.
+//
+// This raises the ceiling on substitution; it does not reach web-font
+// fallback. OOXML has no ordered priority list of alternative fonts for
+// Word to walk through -- fontTableXML's <w:pitch>/<w:charset>/<w:family>
+// only bias the SINGLE metric-guided substitution Word already performs on
+// its own, and even a same-shaped substitute will not reproduce the exact
+// 2:1 Latin-to-full-width advance ratio ASCII box-drawing needs against CJK
+// text (see defaultCodeEastAsiaFont's doc comment in styles.go for why even
+// choosing the RIGHT font name does not get that ratio for free). Treat
+// this as "Word now knows the code font was supposed to be fixed-pitch,"
+// not "the alignment problem is solved."
+//
+// <w:altName> (see knownFontMetadata) is narrower still and easy to
+// mis-read as a fallback font. Per ECMA-376 17.8.3.1 (confirmed against
+// three independent renderings of the spec text while building this: an
+// application "should attempt to locate a font with the name specified in
+// the altName element" -- i.e. try the SAME font under a second name --
+// "before doing substitution based on font metrics"). It is an alternate
+// NAME for the identical font (e.g. a Chinese-named font's English name),
+// tried before metric substitution kicks in at all, never a different,
+// visually-substitute font. This package only emits it for name pairs it
+// has independently verified are the same font under two names.
+const fontTablePart = "word/fontTable.xml"
+
+// fontTableRelType is the OPC relationship type Word uses to locate the
+// font table. As with styles.xml and numbering.xml, nothing in
+// document.xml's body references fontTable.xml by r:id -- Word finds it
+// purely by this relationship Type, verified directly against
+// python-docx's own bundled default.docx (word/_rels/document.xml.rels
+// there carries "Type=.../relationships/fontTable Target=fontTable.xml"
+// with no corresponding r:id anywhere in that package's document.xml).
+const fontTableRelType = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable"
+
+// fontMeta is the real, independently-checked metadata this package
+// carries for one specific, named font -- see knownFontMetadata.
+type fontMeta struct {
+	// charset is the legacy Windows charset byte, hex-encoded: "00" (ANSI,
+	// Western/Latin) or "86" (GB2312, Simplified Chinese) or "80"
+	// (SHIFTJIS, Japanese) for every font below -- the same values
+	// observed directly in python-docx's bundled default.docx
+	// (word/fontTable.xml there charsets Times New Roman/Calibri/Cambria
+	// "00" and ＭＳ 明朝/ＭＳ ゴシック "80").
+	charset string
+	// family is CT_Font's coarse design classification. "auto" (let the
+	// consumer decide) is what real Word-authored fontTable.xml uses for
+	// nearly everything, INCLUDING genuinely monospace fonts (python-docx's
+	// default.docx classifies its own Courier entry "auto", not "modern") --
+	// so "auto" is not a weaker or lazier choice than a specific
+	// classification, it is what real Word output actually does for a font
+	// whose true design category it cannot otherwise assert. "modern" is
+	// used only for the two fonts below verified by that same real example
+	// (ＭＳ ゴシック).
+	family string
+	// altName is a genuine alternate NAME for this exact font (its name
+	// under a different locale), never a different substitute font -- see
+	// fontTablePart's doc comment on what ECMA-376 17.8.3.1 actually
+	// specifies. Empty when this package has not independently verified a
+	// real alternate name.
+	altName string
+	// pitch is this font's own, VERIFIED, real fixed/variable-pitch design
+	// -- independent of which role (body or code) a WriteOptions caller
+	// happens to use it for in a given document. Empty when this package
+	// has not independently verified the font's true pitch; fontTableXML
+	// then falls back to a role-based guess for that one name (see
+	// fontTableXML's dedup loop) rather than asserting something unverified
+	// here.
+	//
+	// This field is deliberately NOT keyed off role the way it was before a
+	// verification pass caught the bug: a font's real pitch is a property
+	// of the font, not of how one particular document happens to be using
+	// it, and asserting the wrong one for a font this package's own docs
+	// already describe correctly elsewhere (微软雅黑's doc comment in
+	// styles.go: "an ordinary proportional UI font") would tell Word
+	// something false about it. See fontTableXML's doc comment for the
+	// concrete failure this caused before the fix: this package's own
+	// DEFAULT configuration uses 微软雅黑 for both the body's and the code
+	// block's East Asian font, and declaring the shared entry "fixed"
+	// (because the code role asked for that) meant a machine missing
+	// 微软雅黑 could get a monospace substitute for ordinary Chinese body
+	// text -- exactly the kind of visible misalignment this feature exists
+	// to prevent, just relocated from the code block to the body text.
+	pitch string
+}
+
+// knownFontMetadata carries real, checked metadata for exactly the fonts
+// this package's own documentation already names by value (styles.go's
+// default*Font constants, and defaultCodeEastAsiaFont's doc comment's list
+// of fonts that hold the 2:1 Latin/CJK advance ratio: NSimSun, MS Gothic).
+// It is deliberately NOT a general font database: this package cannot
+// inspect an arbitrary installed font's real PANOSE/OS-2 signature, and
+// asserting one for a name it has never seen would be a fabricated claim,
+// not a verified one -- see fontTableXML's handling of an unrecognized name
+// for what it gets INSTEAD of a (potentially wrong) guess.
+//
+// Each Chinese/Japanese entry's altName is the same font's English-locale
+// name (both directions are listed so the table works no matter which
+// name a caller passes) -- e.g. a font installed as "微软雅黑" on a
+// Chinese-locale system is the identical font Windows lists as "Microsoft
+// YaHei" in English; ECMA-376 17.8.3.1's altName exists precisely for this
+// same-font-different-locale-name case, not for a different, merely
+// similar-looking font.
+//
+// pitch is filled in only where this package has independent, confident
+// grounds to assert it: Calibri and Consolas are unambiguous (Calibri is a
+// standard proportional UI face; Consolas is Microsoft's own monospaced
+// coding font, marketed as such). 微软雅黑/Microsoft YaHei is "variable"
+// on the explicit authority of this package's OWN doc comment elsewhere
+// (defaultCodeEastAsiaFont in styles.go: "微软雅黑 does not have that
+// [2:1] ratio -- it is an ordinary proportional UI font"). 新宋体/NSimSun
+// and ＭＳ ゴシック/MS Gothic are "fixed" on the same doc comment's
+// authority, which names them (alongside Sarasa Gothic and Noto Sans Mono
+// CJK, NOT included here -- see this task's report for why) as fonts that
+// DO hold the 2:1 ratio, i.e. were specifically designed fixed-pitch for
+// this exact code-alignment purpose. 宋体/SimSun and 黑体/SimHei are left
+// with pitch "" (unverified): this package has no independently-confirmed
+// claim about their true pitch flag one way or the other, so they fall
+// back to fontTableXML's role-based guess like any unrecognized font.
+var knownFontMetadata = map[string]fontMeta{
+	"Calibri":         {charset: "00", family: "auto", pitch: "variable"},
+	"Consolas":        {charset: "00", family: "auto", pitch: "fixed"},
+	"微软雅黑":            {charset: "86", family: "auto", altName: "Microsoft YaHei", pitch: "variable"},
+	"Microsoft YaHei": {charset: "86", family: "auto", altName: "微软雅黑", pitch: "variable"},
+	"宋体":              {charset: "86", family: "auto", altName: "SimSun"},
+	"SimSun":          {charset: "86", family: "auto", altName: "宋体"},
+	"黑体":              {charset: "86", family: "auto", altName: "SimHei"},
+	"SimHei":          {charset: "86", family: "auto", altName: "黑体"},
+	"新宋体":             {charset: "86", family: "modern", altName: "NSimSun", pitch: "fixed"},
+	"NSimSun":         {charset: "86", family: "modern", altName: "新宋体", pitch: "fixed"},
+	"ＭＳ ゴシック":         {charset: "80", family: "modern", altName: "MS Gothic", pitch: "fixed"},
+	"MS Gothic":       {charset: "80", family: "modern", altName: "ＭＳ ゴシック", pitch: "fixed"},
+}
+
+// fontTableRole is one (name, intended pitch, script bucket) triple
+// fontTableXML resolves into a <w:font> entry. bucket only matters for a
+// name knownFontMetadata does not recognize (see fontTableXML) -- it is
+// what lets an arbitrary custom East-Asian font still get charset "86"
+// rather than the Latin default "00" without this package pretending to
+// know anything more specific about it.
+type fontTableRole struct {
+	name   string
+	pitch  string
+	bucket string // "latin" | "eastAsia"
+}
+
+// fontTableRoles lists the four fonts fontOptions actually names, paired
+// with the pitch the task calls for per role: "fixed for the code fonts,
+// variable for the body fonts". A caller-supplied custom font (any of
+// WriteOptions' four font fields) flows into fontOptions before this is
+// called (see resolveFontOptions), so this always reflects what THIS
+// document's styles.xml actually uses, not a fixed set of names.
+func fontTableRoles(f fontOptions) []fontTableRole {
+	return []fontTableRole{
+		{name: f.bodyLatin, pitch: "variable", bucket: "latin"},
+		{name: f.bodyEastAsia, pitch: "variable", bucket: "eastAsia"},
+		{name: f.codeLatin, pitch: "fixed", bucket: "latin"},
+		{name: f.codeEastAsia, pitch: "fixed", bucket: "eastAsia"},
+	}
+}
+
+// rolePitchOrVerified resolves the pitch fontTableXML should claim for one
+// role sighting of name: knownFontMetadata's verified, role-INDEPENDENT
+// truth when this package has one (see fontMeta.pitch's doc comment),
+// otherwise r's role-based guess (variable for a body role, fixed for a
+// code role). A verified truth always wins over a role guess -- a role is
+// only ever a stand-in for what this package does not actually know.
+func rolePitchOrVerified(name, rolePitch string) string {
+	if meta, ok := knownFontMetadata[name]; ok && meta.pitch != "" {
+		return meta.pitch
+	}
+	return rolePitch
+}
+
+// fontTableXML renders word/fontTable.xml for f -- the four (deduplicated)
+// font names this document's styles.xml actually references, each with a
+// <w:font> entry carrying at least charset/family/pitch (see
+// fontTablePart's doc comment for why pitch is the load-bearing one).
+//
+// Self-review, pinned by TestWrite_FontTableSharedFontBetweenBodyAndCodeIsMarkedFixed
+// (renamed post-fix; see its own comment): this package's own
+// zero-configuration default sets BodyEastAsiaFont and CodeEastAsiaFont to
+// the identical name (微软雅黑 -- see defaultBodyEastAsiaFont/
+// defaultCodeEastAsiaFont in styles.go), so the dedup loop below sees that
+// one name twice, once per role. A verified font (微软雅黑 is one --
+// rolePitchOrVerified returns "variable" for it regardless of which role
+// asked) never actually conflicts: both sightings resolve to the same
+// truthful value, so there is nothing to arbitrate. This is the fix for a
+// real bug an earlier version of this function had: it computed pitch from
+// ROLE ALONE and let a later "fixed" (code) sighting overwrite an earlier
+// "variable" (body) one, which for 微软雅黑 specifically asserted something
+// false -- 微软雅黑 is an ordinary proportional UI font (see
+// defaultCodeEastAsiaFont's own doc comment in styles.go) -- and meant a
+// machine missing 微软雅黑 could get a monospace substitute for ordinary
+// Chinese BODY text, not just the code block. That is worse than the
+// problem this feature exists to fix, not a harmless simplification.
+//
+// A genuine conflict can still occur for a name knownFontMetadata does NOT
+// carry a verified pitch for (an unrecognized custom font, or 宋体/黑体,
+// which this package has deliberately left unverified -- see
+// knownFontMetadata's doc comment): if the SAME unverified name is used for
+// both a body and a code role, this package has no truthful answer either
+// way, and the last sighting -- always "variable" wins is enforced below
+// -- is chosen for the same reason "fixed" was too aggressive above: a
+// false "variable" only costs the code-alignment hint (no worse than
+// omitting pitch for that font, which is this package's pre-existing
+// behavior), while a false "fixed" risks substituting a monospace face for
+// ordinary running text. See this task's report for the cost this pays in
+// the one case it is NOT free: a genuinely fixed-pitch font shared between
+// body and code (unlikely, and not this package's own default) loses its
+// fixed-pitch hint for the code role.
+func fontTableXML(f fontOptions) string {
+	roles := fontTableRoles(f)
+
+	order := make([]string, 0, len(roles))
+	pitchOf := make(map[string]string, len(roles))
+	bucketOf := make(map[string]string, len(roles))
+	for _, r := range roles {
+		p := rolePitchOrVerified(r.name, r.pitch)
+		if _, ok := pitchOf[r.name]; !ok {
+			order = append(order, r.name)
+			bucketOf[r.name] = r.bucket
+			pitchOf[r.name] = p
+			continue
+		}
+		if p != pitchOf[r.name] {
+			// A real conflict: either an unverified font is doing double
+			// duty as both a body and a code font, or (impossible in
+			// practice, since a verified pitch never varies by role) two
+			// verified claims disagree. Either way, "variable" is the
+			// lower-harm resolution -- see this function's own doc comment.
+			pitchOf[r.name] = "variable"
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	b.WriteString(`<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`)
+	for _, name := range order {
+		b.WriteString(fontEntryXML(name, pitchOf[name], bucketOf[name]))
+	}
+	b.WriteString(`</w:fonts>`)
+	return b.String()
+}
+
+// fontEntryXML renders one <w:font> element for name. When name is not in
+// knownFontMetadata (a custom font a WriteOptions caller supplied that this
+// package has no verified metadata for), it still gets a complete,
+// non-empty entry rather than being skipped: charset/family fall back to a
+// generic, honestly-labeled guess (bucket-appropriate charset, family
+// "auto", no altName) instead of either omitting the font entirely (worse:
+// Word would then have exactly the same zero-information substitution this
+// whole part exists to improve on) or inventing metadata this package has
+// not actually verified (worse: a specific-looking but false claim). altName
+// is never fabricated for an unrecognized name -- see fontMeta's doc
+// comment on what altName actually asserts.
+//
+// CT_Font's child sequence is altName?, panose1?, charset?, family?,
+// notTrueType?, pitch?, sig? -- all optional per schema, which is why this
+// package can validly omit panose1/notTrueType/sig (it has no real data for
+// any of the three for a font it cannot inspect) while still emitting a
+// schema-valid entry in altName-before-charset-before-family-before-pitch
+// order.
+func fontEntryXML(name, pitch, bucket string) string {
+	meta, known := knownFontMetadata[name]
+	charset, family, altName := meta.charset, meta.family, meta.altName
+	if !known {
+		family = "auto"
+		charset = "00"
+		if bucket == "eastAsia" {
+			charset = "86"
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`<w:font w:name="` + name + `">`)
+	if altName != "" {
+		b.WriteString(`<w:altName w:val="` + altName + `"/>`)
+	}
+	b.WriteString(`<w:charset w:val="` + charset + `"/>`)
+	b.WriteString(`<w:family w:val="` + family + `"/>`)
+	b.WriteString(`<w:pitch w:val="` + pitch + `"/>`)
+	b.WriteString(`</w:font>`)
 	return b.String()
 }
 
