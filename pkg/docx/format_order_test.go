@@ -420,3 +420,47 @@ func TestFormat_HeadingFontInsertedRFontsLandsBeforeExistingBold(t *testing.T) {
 		t.Errorf("<w:rFonts> must precede the pre-existing <w:b/> (EG_RPrBase schema order): %s", rpr)
 	}
 }
+
+// TestFormat_HeadingFontIgnoresHistoricalRFontsInsideRPrChange is
+// planHeadingFontPatches's own instance of the "a boolean/unbounded search
+// never closes over a nested container of the same kind" bug: it fixed the
+// INSERTION POSITION (previous test) but still searched for "the first
+// <w:rFonts> encountered anywhere" while looking for one to edit, which
+// finds a historical <w:rFonts> nested inside <w:rPrChange><w:rPr> (a
+// revision's old run properties) instead of the CURRENT rPr's own —
+// rewriting the wrong one and leaving the current rPr with no rFonts at
+// all.
+func TestFormat_HeadingFontIgnoresHistoricalRFontsInsideRPrChange(t *testing.T) {
+	const styles = `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+		`<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>` +
+		`<w:rPr><w:b/><w:rPrChange w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z">` +
+		`<w:rPr><w:rFonts w:ascii="Old"/></w:rPr></w:rPrChange></w:rPr></w:style>` +
+		`</w:styles>`
+	patches, err := planHeadingFontPatches([]byte(styles), "Georgia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Apply([]byte(styles), patches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if err := checkWellFormed(out); err != nil {
+		t.Fatalf("result is not well-formed XML: %v", err)
+	}
+	if !strings.Contains(s, `w:ascii="Old"`) {
+		t.Errorf("historical rFonts inside <w:rPrChange> was corrupted: %s", s)
+	}
+	if !strings.Contains(s, `w:ascii="Georgia"`) {
+		t.Errorf("the new font was not applied to the heading's CURRENT rPr: %s", s)
+	}
+	newRFontsIdx := strings.Index(s, `w:ascii="Georgia"`)
+	bIdx := strings.Index(s, "<w:b/>")
+	rprChangeIdx := strings.Index(s, "<w:rPrChange")
+	if newRFontsIdx == -1 || bIdx == -1 || newRFontsIdx > bIdx {
+		t.Errorf("the new rFonts must land before the pre-existing <w:b/> (EG_RPrBase order): %s", s)
+	}
+	if newRFontsIdx == -1 || rprChangeIdx == -1 || newRFontsIdx > rprChangeIdx {
+		t.Errorf("the new rFonts must land in the current rPr, before <w:rPrChange>: %s", s)
+	}
+}

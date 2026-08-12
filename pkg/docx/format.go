@@ -1086,6 +1086,18 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 // an <w:rPr> but no <w:rFonts> inside it, one is inserted as that rPr's
 // first child; if the rPr itself is self-closing (<w:rPr/>, carrying no
 // properties at all), it is expanded in place to hold the new rFonts.
+//
+// A heading's rPr can wrap a <w:rPrChange><w:rPr>...</w:rPr></w:rPrChange>
+// holding a REVISION'S historical run properties — a same-named <w:rPr>
+// (and, inside it, a same-named <w:rFonts>) nested inside the current one.
+// rprDepth/trackingRPr below find the CURRENT rPr's own true close via
+// depth tracking rather than matching the next EndElement literally named
+// "rPr" (which would be the nested one's), the same fix already applied to
+// scanRunProps and scanDocDefaults; scanDirectChildren then reads only the
+// rPr's own DIRECT rFonts, so the historical copy is never mistaken for the
+// current one (format capability review follow-up, same root cause as
+// Critical 2 — this function had it twice: once for the close/rFonts-search
+// itself, fixed here, and once for the insertion position, fixed earlier).
 func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 	dec := xml.NewDecoder(bytes.NewReader(styles))
 	var prevOffset int
@@ -1094,8 +1106,9 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 	var inHeading bool
 	var pPrDepth int
 	var rprSeen bool
-	var lookingForRFonts bool
-	var rprContentStart int
+	var trackingRPr bool
+	var rprDepth int
+	var rprTagSpan Span
 
 	for {
 		tok, terr := dec.Token()
@@ -1116,8 +1129,14 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 					inHeading = true
 					pPrDepth = 0
 					rprSeen = false
-					lookingForRFonts = false
+					trackingRPr = false
 				}
+			case trackingRPr:
+				// Anything encountered once the heading's own rPr is being
+				// tracked (including a NESTED <w:rPr>, e.g. <w:rPrChange>'s
+				// historical copy) only ever deepens rprDepth; it can never
+				// re-trigger the "found rPr" case below.
+				rprDepth++
 			case inHeading && isWordElement(t.Name, "pPr"):
 				pPrDepth++
 			case inHeading && isWordElement(t.Name, "rPr") && pPrDepth == 0 && !rprSeen:
@@ -1129,41 +1148,39 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 					newTag := "<w:rPr>" + buildTag("rFonts", rFontsLiteralAttrs(nil, font), true) + "</w:rPr>"
 					patches = append(patches, PatchRawSpan(styles, span, newTag))
 				} else {
-					lookingForRFonts = true
-					// span.End is exactly where this rPr's own content
-					// starts (right after its "<w:rPr...>" open tag) — the
-					// EG_RPrBase-mandated FIRST-child slot rFonts must land
-					// in if this rPr closes without ever containing one
-					// (see the EndElement case below). Capturing it here,
-					// rather than using the close tag's own offset, is the
-					// fix for Minor 13's other instance: rFonts landing
-					// after pre-existing content such as <w:b/> instead of
-					// before it.
-					rprContentStart = span.End
+					trackingRPr = true
+					rprDepth = 0
+					rprTagSpan = span
 				}
-			case inHeading && lookingForRFonts && isWordElement(t.Name, "rFonts"):
-				newTag := buildTag("rFonts", rFontsLiteralAttrs(t.Attr, font), true)
-				patches = append(patches, PatchRawSpan(styles, span, newTag))
-				lookingForRFonts = false
 			}
 
 		case xml.EndElement:
 			switch {
-			case isWordElement(t.Name, "pPr") && pPrDepth > 0:
-				pPrDepth--
-			case isWordElement(t.Name, "rPr") && inHeading && rprSeen:
-				if lookingForRFonts {
-					// The style's rPr closed without ever containing
-					// rFonts: insert one as its FIRST child, at
-					// rprContentStart — not here at prevOffset (right
-					// before </w:rPr>, i.e. LAST), which would land the new
+			case trackingRPr:
+				if rprDepth > 0 {
+					rprDepth--
+					break
+				}
+				// The style's rPr's TRUE close (depth-matched to its own
+				// open, not merely "the next thing literally named rPr").
+				// prevOffset is exactly where this </w:rPr> begins.
+				trackingRPr = false
+				children := scanDirectChildren(styles[rprTagSpan.End:prevOffset], rprTagSpan.End, []string{"rFonts"})
+				if rf, ok := children["rFonts"]; ok {
+					newTag := buildTag("rFonts", rFontsLiteralAttrs(rf.attrs, font), true)
+					patches = append(patches, PatchRawSpan(styles, rf.tagSpan, newTag))
+				} else {
+					// No rFonts among this rPr's own direct children:
+					// insert one as its FIRST child, at rprTagSpan.End —
+					// not at this close (LAST), which would land the new
 					// rFonts after whatever direct formatting (e.g. <w:b/>)
 					// this rPr already carries, violating EG_RPrBase's
 					// "rFonts precedes every other run property" order.
-					patches = append(patches, PatchRawSpan(styles, Span{rprContentStart, rprContentStart},
+					patches = append(patches, PatchRawSpan(styles, Span{rprTagSpan.End, rprTagSpan.End},
 						buildTag("rFonts", rFontsLiteralAttrs(nil, font), true)))
-					lookingForRFonts = false
 				}
+			case isWordElement(t.Name, "pPr") && pPrDepth > 0:
+				pPrDepth--
 			case isWordElement(t.Name, "style") && inHeading:
 				inHeading = false
 			}
