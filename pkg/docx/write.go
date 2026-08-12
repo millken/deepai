@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // WriteOptions configures WriteDocx.
@@ -1208,7 +1210,26 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 		}
 		if (c == '*' || c == '_') && i+1 < n && s[i+1] == c {
 			marker := s[i : i+2]
-			if j := strings.Index(s[i+2:], marker); j >= 0 {
+			// CommonMark: '_' (unlike '*') may not open or close emphasis
+			// when it sits inside a word -- immediately preceded AND
+			// followed by a letter or digit (see intrawordUnderscore). A
+			// "__" run flanked that way on both outer edges (e.g. the
+			// "__" in "co__de__will") can't open here at all; fall
+			// through to the literal-text path below. This check is not
+			// redundant with indexClosingMarker's own intraword filtering
+			// on the CLOSING side: without it, a "__" that is itself
+			// intraword-disqualified as an opener could still be accepted
+			// as one if a later, non-flanked "__" happens to close it
+			// (e.g. "foo__bar__ end" -- the second "__" is followed by a
+			// space, so it is a valid closer on its own, but the first
+			// "__" must never have been allowed to open in the first
+			// place).
+			if c == '_' && intrawordUnderscore(s, i, len(marker)) {
+				buf.WriteString(marker)
+				i += 2
+				continue
+			}
+			if j := indexClosingMarker(s, i+2, marker); j >= 0 {
 				flush()
 				segs = append(segs, parseInlineCtx(s[i+2:i+2+j], true, italic)...)
 				i += 2 + j + 2
@@ -1220,7 +1241,13 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 			continue
 		}
 		if c == '*' || c == '_' {
-			if j := strings.IndexByte(s[i+1:], c); j >= 0 {
+			marker := s[i : i+1]
+			if c == '_' && intrawordUnderscore(s, i, len(marker)) {
+				buf.WriteByte(c)
+				i++
+				continue
+			}
+			if j := indexClosingMarker(s, i+1, marker); j >= 0 {
 				flush()
 				segs = append(segs, parseInlineCtx(s[i+1:i+1+j], bold, true)...)
 				i += 1 + j + 1
@@ -1236,6 +1263,68 @@ func parseInlineCtx(s string, bold, italic bool) []segment {
 	}
 	flush()
 	return segs
+}
+
+// isWordRune reports whether r counts as a "word" character for the
+// intraword-underscore rule below: a letter or digit. unicode.IsLetter
+// classifies CJK ideographs (Unicode category Lo) as letters, so "word"
+// here already includes Chinese/Japanese/Korean text, which is the
+// documents this rule exists to protect ("PROXY_ORDER" mixed into Chinese
+// prose) -- there is no separate CJK carve-out to add.
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// intrawordUnderscore reports whether the underscore run s[i:i+width]
+// ("_" or "__") is disqualified from opening OR closing emphasis because
+// it sits inside a word: immediately preceded AND followed by a letter or
+// digit (isWordRune). This is CommonMark's rule that only '*', not '_',
+// may be used for intraword emphasis -- "a*b*c" italicises "b" but
+// "snake_case_name" must stay literal. A run at a string edge, or next to
+// whitespace/punctuation on either side, is never disqualified: only both
+// sides being word characters rules it out, which is why a lone
+// underscore at a word boundary (no partner to pair with) still survives,
+// and why "_word_" at the very start/end of a paragraph still opens/closes
+// (nothing precedes the opener, nothing follows the closer).
+func intrawordUnderscore(s string, i, width int) bool {
+	before := i > 0
+	if before {
+		r, _ := utf8.DecodeLastRuneInString(s[:i])
+		before = isWordRune(r)
+	}
+	if !before {
+		return false
+	}
+	after := i+width < len(s)
+	if after {
+		r, _ := utf8.DecodeRuneInString(s[i+width:])
+		after = isWordRune(r)
+	}
+	return after
+}
+
+// indexClosingMarker finds the next occurrence of marker in s starting at
+// byte offset start, returning its offset relative to start (the same
+// convention as strings.Index(s[start:], marker)), or -1 if none exists.
+// For '*' this is a plain substring search, unchanged from before this
+// rule existed. For '_' it additionally skips any occurrence that
+// intrawordUnderscore disqualifies as a closer -- e.g. in "_word_more_",
+// the "_" right before "more" is intraword (preceded by 'd', followed by
+// 'm') and cannot close, so the search continues past it to the final "_",
+// which is followed by nothing and so can.
+func indexClosingMarker(s string, start int, marker string) int {
+	underscore := marker[0] == '_'
+	for pos := start; ; {
+		rel := strings.Index(s[pos:], marker)
+		if rel < 0 {
+			return -1
+		}
+		abs := pos + rel
+		if !underscore || !intrawordUnderscore(s, abs, len(marker)) {
+			return abs - start
+		}
+		pos = abs + 1
+	}
 }
 
 // matchLinkAt reports whether s[i] (which must be '[') opens a
