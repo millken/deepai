@@ -32,7 +32,7 @@ func mustWellFormedXML(t *testing.T, data []byte) {
 // opts against styles, apply them, and hand back the resulting bytes.
 func applyStylesPatches(t *testing.T, styles []byte, opts FormatOptions) string {
 	t.Helper()
-	patches, _, err := planStylesPatches(styles, opts)
+	patches, _, _, err := planStylesPatches(styles, opts)
 	if err != nil {
 		t.Fatalf("planStylesPatches: %v", err)
 	}

@@ -328,7 +328,7 @@ func planRunRPrPatches(doc []byte, openEnd int, rpr, rfonts, sz, szcs elemInfo, 
 	if rpr.selfClosing {
 		return []Patch{PatchRawSpan(doc, rpr.tagSpan, buildRunRPr(rpr.attrs, font, sizePt))}
 	}
-	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, font, sizePt)
+	return planRPrFontSizePatches(doc, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, font, sizePt, rFontsLiteralAttrs)
 }
 
 // planParaPPrPatches is planRunRPrPatches's paragraph-level twin: the same

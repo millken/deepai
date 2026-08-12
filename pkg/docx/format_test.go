@@ -219,15 +219,26 @@ func TestFormat_NoOptionsIsANoOp(t *testing.T) {
 // TestFormat_NoRangeOutputIsUnchangedByDirectFormatting pins P2a.5's core
 // promise about the EXISTING (whole-document) path: adding paragraph-scoped
 // direct formatting must not change a single byte of what a StartPara==0
-// call produces. The hashes below were captured from this exact Format call
-// against this exact fixture BEFORE format_direct.go existed (see the
-// P2a.5 Task 1 report for how), so a match here is not just "looks the
-// same" — it is the literal pre-task output.
+// call produces. document.xml's hash/length are untouched from the original
+// P2a.5 Task 1 capture (this call sets Normalize/MarginsMM too, both of
+// which land in document.xml, and neither is touched by task 7 below).
+// styles.xml's hash/length WERE re-captured for task 7 (format capability
+// review, Critical 4 / write review I4-I5): the whole-document path now
+// also rewrites whichever real style in this fixture (Heading1-9's own
+// font via the pre-existing HeadingFont path, plus Header/Footer/
+// BodyText2/BodyText3/Caption's own explicit spacing/size, via the new
+// effective-chain rewrite) already shadowed docDefaults — see
+// planStyleChainShadowPatches — so styles.xml legitimately looks different
+// now; Title/Subtitle/IntenseQuote/ListContinue*/NoSpacing/MacroText do NOT
+// change (verified directly against this fixture while re-capturing these
+// constants: the first three are excluded families or lack a based-on-
+// Normal chain, and ListContinue's own <w:spacing> never sets w:line, so it
+// was never shadowing line spacing to begin with).
 func TestFormat_NoRangeOutputIsUnchangedByDirectFormatting(t *testing.T) {
 	const (
-		wantStylesSHA256 = "1b218dcd8bd724029e6db98287049cb65fe6e046ade88fd9147567552e0772ce"
+		wantStylesSHA256 = "61a71bf3a45065b0deeaa9e0ba8e9bd5d7414c54f66baf81c16f0fd8edde7f5d"
 		wantDocSHA256    = "d84400b6456f8f3be5a02edee299c543f191a9aff867d6dbe9598d795b44e5e9"
-		wantStylesLen    = 349141
+		wantStylesLen    = 349159
 		wantDocLen       = 3709
 	)
 	d, _ := formatDoc(t)

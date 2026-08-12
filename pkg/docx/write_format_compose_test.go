@@ -89,3 +89,94 @@ func TestWriteThenFormat_BodyFontSizeLineSpacingAlignLandCorrectly(t *testing.T)
 		t.Fatalf("the formatted document cannot be reopened: %v", err)
 	}
 }
+
+// TestWriteThenFormat_LineSpacingLandsOnTheEffectiveStyleNotJustDocDefaults
+// is the compose-test upgrade the format capability review's Critical 4 and
+// the write review's I4 both call for: docx_write's own BodyText style
+// carries an explicit <w:spacing w:line="360"/> (bodyTextStyleXML, 1.5x),
+// which OUTRANKS docDefaults in Word's cascade. Before this task,
+// Document.Format(LineSpacing) only ever rewrote docDefaults, so this
+// exact composition — docx_write's own product, fed straight into
+// docx_format — silently did nothing: docDefaults changed, applied
+// reported success, and every ordinary paragraph (styled BodyText) kept
+// rendering at the OLD 360 spacing. This test goes past "did not error"
+// (the pre-upgrade version of this file) to the actual effective value:
+// BodyText's own w:line must become 480 (2.0 in 240ths), not just
+// docDefaults'.
+func TestWriteThenFormat_LineSpacingLandsOnTheEffectiveStyleNotJustDocDefaults(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "# Title\n\nSome body text here.\n")
+	if _, err := d.Format(FormatOptions{LineSpacing: 2.0}); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	s := stylesXML(t, d)
+
+	bodyText := s[strings.Index(s, `w:styleId="BodyText"`):]
+	bodyText = bodyText[:strings.Index(bodyText, "</w:style>")]
+	if !strings.Contains(bodyText, `w:line="480"`) {
+		t.Errorf("BodyText's own <w:spacing> was not rewritten to 480 (2.0x in 240ths); it still shadows docDefaults:\n%s", bodyText)
+	}
+
+	dd := s[strings.Index(s, "<w:docDefaults>"):strings.Index(s, "</w:docDefaults>")]
+	if !strings.Contains(dd, `w:line="480"`) {
+		t.Errorf("docDefaults itself was not updated either:\n%s", dd)
+	}
+}
+
+// TestWriteThenFormat_TemplateCorporatePreservesEastAsiaFont is the compose-
+// test upgrade for the write review's I5: docx_write's own docDefaults
+// carries <w:rFonts w:ascii="Calibri" w:eastAsia="微软雅黑"/> (see
+// docDefaultsXML), and template=corporate sets BodyFont="Calibri" — which,
+// before this task, landed via rFontsLiteralAttrs and clobbered ascii AND
+// hAnsi AND eastAsia AND cs to the SAME literal value, silently replacing
+// every Chinese run's font with Calibri (which has no CJK glyphs at all;
+// Word substitutes an arbitrary fallback). BodyFont must only ever touch
+// the Latin half (ascii/hAnsi); an existing eastAsia value must survive
+// byte for byte.
+func TestWriteThenFormat_TemplateCorporatePreservesEastAsiaFont(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "# 标题\n\n正文内容。\n")
+	if _, err := d.Format(FormatOptions{Template: "corporate"}); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	s := stylesXML(t, d)
+	dd := s[strings.Index(s, "<w:docDefaults>"):strings.Index(s, "</w:docDefaults>")]
+
+	if !strings.Contains(dd, `w:eastAsia="微软雅黑"`) {
+		t.Errorf("docDefaults lost its eastAsia font (Chinese text would fall back to a substitute font):\n%s", dd)
+	}
+	if !strings.Contains(dd, `w:ascii="Calibri"`) {
+		t.Errorf("docDefaults lacks the corporate template's Latin body font:\n%s", dd)
+	}
+}
+
+// TestWriteThenFormat_BodyFontNeverTouchesSourceCodeOrHeadingFonts pins the
+// task 7 brief's own explicit invariant (§1: "SourceCode 的等宽字体、HeadingN
+// 的字体绝不被 body_font 触碰"): a document-wide body_font change must never
+// rewrite SourceCode's monospace font — a fenced code block would silently
+// start rendering in a proportional font — nor a heading style's own font.
+// SourceCode and the Heading family are both excluded from
+// planStyleChainShadowPatches' effective-chain rewrite specifically so this
+// holds even when (unlike this fixture) a heading DOES carry its own
+// explicit <w:rFonts> that shadows docDefaults.
+func TestWriteThenFormat_BodyFontNeverTouchesSourceCodeOrHeadingFonts(t *testing.T) {
+	md := "# Title\n\nSome body text.\n\n```\ncode line\n```\n"
+	d, _, _ := writeAndReopen(t, md)
+	if _, err := d.Format(FormatOptions{BodyFont: "Georgia"}); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	s := stylesXML(t, d)
+
+	sc := s[strings.Index(s, `w:styleId="SourceCode"`):]
+	sc = sc[:strings.Index(sc, "</w:style>")]
+	if !strings.Contains(sc, `w:ascii="Consolas"`) {
+		t.Errorf("SourceCode's own monospace font is gone or was rewritten by body_font:\n%s", sc)
+	}
+	if strings.Contains(sc, `w:ascii="Georgia"`) {
+		t.Errorf("SourceCode picked up the new body font, which must never happen:\n%s", sc)
+	}
+
+	h1 := s[strings.Index(s, `w:styleId="Heading1"`):]
+	h1 = h1[:strings.Index(h1, "</w:style>")]
+	if strings.Contains(h1, `w:ascii="Georgia"`) {
+		t.Errorf("Heading1 picked up the new body font, which must never happen without heading_font:\n%s", h1)
+	}
+}

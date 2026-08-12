@@ -26,21 +26,36 @@ type FormatOptions struct {
 	// *Theme attributes Word would otherwise prefer over a literal font
 	// name.
 	HeadingFont string
-	// BodyFont, if non-"", replaces the document's default font, landing on
-	// styles.xml's <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts> (the
-	// fixture's Normal style carries no rPr of its own, so the cascade's
-	// real body-font source is docDefaults, not Normal).
+	// BodyFont, if non-"", replaces the document's default LATIN font: it
+	// lands on styles.xml's <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts>
+	// AND, wherever it would otherwise be silently shadowed, on the SAME
+	// rFonts of Normal and any style basedOn it (transitively) other than
+	// the Heading1..9/Title/Subtitle, Quote, and SourceCode families — see
+	// planStyleChainShadowPatches. Only ascii/hAnsi are ever touched; an
+	// existing eastAsia (and cs) font is left completely alone, so a CJK
+	// document's Chinese/Japanese/Korean font survives a Latin body-font
+	// change untouched (format capability review, Important 8; write
+	// review, I5). FormatResult.Notes names whichever heading-like style
+	// still shadows this rule and any paragraph/run still carrying direct
+	// formatting that does the same.
 	BodyFont string
 	// BodySizePt, if non-zero, replaces the document's default font size in
-	// points, landing on docDefaults's <w:sz> AND <w:szCs> (kept in sync so
-	// CJK/complex-script runs don't keep the old size).
+	// points: it lands on docDefaults's <w:sz> AND <w:szCs> (kept in sync so
+	// CJK/complex-script runs don't keep the old size), plus the same pair
+	// wherever a style basedOn Normal (per BodyFont's own exclusions above)
+	// already declares its own size, shadowing docDefaults otherwise.
 	BodySizePt float64
 	// LineSpacing, if non-zero, is a multiple of a single line (1.0, 1.15,
-	// 2.0, ...), landing on docDefaults's <w:pPrDefault><w:pPr><w:spacing>
-	// as w:line (240ths of a line) with w:lineRule="auto".
+	// 2.0, ...): it lands on docDefaults's <w:pPrDefault><w:pPr><w:spacing>
+	// as w:line (240ths of a line) with w:lineRule="auto", plus the same
+	// <w:spacing>'s w:line wherever a style basedOn Normal (per BodyFont's
+	// own exclusions) already sets one, shadowing docDefaults otherwise —
+	// e.g. docx_write's own BodyText style (format capability review,
+	// Critical 4; write review, I4).
 	LineSpacing float64
-	// Align, if non-"", is "left" or "justify", landing on docDefaults's
-	// <w:pPrDefault><w:pPr><w:jc>.
+	// Align, if non-"", is "left" or "justify": it lands on docDefaults's
+	// <w:pPrDefault><w:pPr><w:jc>, plus the same <w:jc> wherever a style
+	// basedOn Normal (per BodyFont's own exclusions) already sets one.
 	Align string
 	// MarginsMM, if non-nil, must have exactly 4 values: top, right,
 	// bottom, left, in millimeters. It lands on word/document.xml's
@@ -182,7 +197,7 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no word/styles.xml part")
 		}
-		patches, applied, err := planStylesPatches(styles, resolved)
+		patches, applied, notes, err := planStylesPatches(styles, resolved)
 		if err != nil {
 			return FormatResult{}, err
 		}
@@ -196,6 +211,7 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 			}
 		}
 		result.Applied = append(result.Applied, applied...)
+		result.Notes = append(result.Notes, notes...)
 	}
 
 	wantsMargins := resolved.MarginsMM != nil
@@ -247,6 +263,26 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 				return FormatResult{}, err
 			}
 		}
+	}
+
+	// docDefaults and the style chain are only the STYLE layer of Word's
+	// cascade; direct formatting on a specific paragraph/run (e.g. a
+	// previous docx_format start_para/end_para call, or hand-authored
+	// content) outranks even a correctly-rewritten style. Report that
+	// honestly instead of letting Applied read as "every paragraph now
+	// looks like this" when some do not (format capability review,
+	// Critical 4 / §2's masking-detection requirement).
+	if resolved.BodyFont != "" || resolved.BodySizePt != 0 ||
+		resolved.LineSpacing != 0 || resolved.Align != "" {
+		doc, ok := d.Part(DocumentPart)
+		if !ok {
+			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)
+		}
+		maskNotes, err := directFormatMaskingNotes(doc, d.Paras(), resolved)
+		if err != nil {
+			return FormatResult{}, fmt.Errorf("docx: scan for direct-formatting overrides: %w", err)
+		}
+		result.Notes = append(result.Notes, maskNotes...)
 	}
 
 	return result, nil
@@ -473,6 +509,36 @@ func rFontsLiteralAttrs(existing []xml.Attr, font string) []xml.Attr {
 	return kept
 }
 
+// rFontsBodyLatinAttrs is rFontsLiteralAttrs' narrower sibling for
+// FormatOptions.BodyFont specifically: it sets ONLY ascii/hAnsi (dropping
+// their own *Theme counterparts, for the same "literal beats theme" reason
+// rFontsLiteralAttrs drops all four), and leaves eastAsia/eastAsiaTheme/cs/
+// cstheme completely untouched — whatever East Asian font (or theme
+// reference) existing carried survives byte for byte.
+//
+// This exists because rFontsLiteralAttrs' "set every one of the four to the
+// same literal name" behavior is exactly wrong for a whole-document body
+// font change on a CJK document: docx_write's own docDefaults (and any real
+// Chinese Word/WPS document) deliberately pairs a Latin body font with a
+// SEPARATE East Asian one (see styles.go's docDefaultsXML: Calibri +
+// 微软雅黑), and a caller asking to change the LATIN body font has no way to
+// also mean "and replace the Chinese font with a Latin-only face that has no
+// CJK glyphs at all" (format capability review, Important 8; write review,
+// I5 — template=corporate silently turning docx_write's own 微软雅黑 into
+// Calibri). HeadingFont and the paragraph-range direct-formatting path
+// still use rFontsLiteralAttrs unchanged: this task's mandate is narrowly
+// "stop body_font from destroying eastAsia" (see FormatOptions.BodyFont's
+// own doc comment), not a general east-asia-aware font API — that is
+// Task 8's separate FormatOptions field.
+func rFontsBodyLatinAttrs(existing []xml.Attr, font string) []xml.Attr {
+	kept := dropAttrs(existing, "asciiTheme", "hAnsiTheme", "ascii", "hAnsi")
+	kept = append(kept,
+		xml.Attr{Name: xml.Name{Local: "ascii"}, Value: font},
+		xml.Attr{Name: xml.Name{Local: "hAnsi"}, Value: font},
+	)
+	return kept
+}
+
 // pPrChildOrder is CT_PPr's child sequence: CT_PPrBase's own sequence,
 // followed by CT_PPr's trailing rPr/sectPr/pPrChange (rPr must follow every
 // CT_PPrBase element and precede sectPr; sectPr must precede pPrChange).
@@ -692,7 +758,14 @@ func buildPPrOps(children map[string]elemInfo, lineSpacing float64, align string
 // patch at the identical zero-width offset would make Apply reject the
 // whole batch as overlapping. So the newly built rFonts tag is merged as a
 // TEXT PREFIX onto that existing patch instead of being appended as its own.
-func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart int, rfonts, sz, szcs elemInfo, font string, sizePt float64) []Patch {
+//
+// fontAttrs builds the new <w:rFonts> attribute list from whatever the
+// element already carried (nil when synthesizing a brand new one) — callers
+// pass rFontsBodyLatinAttrs for FormatOptions.BodyFont's whole-document path
+// (preserve eastAsia) and rFontsLiteralAttrs everywhere else (HeadingFont,
+// paragraph-range direct formatting), which still intentionally sets every
+// one of ascii/hAnsi/eastAsia/cs to the same literal name.
+func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart int, rfonts, sz, szcs elemInfo, font string, sizePt float64, fontAttrs func([]xml.Attr, string) []xml.Attr) []Patch {
 	remOps := []leafOp{{info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 	if sizePt != 0 {
 		half := ptToHalfPoints(sizePt)
@@ -707,9 +780,9 @@ func planRPrFontSizePatches(doc []byte, containerOpenEnd, containerCloseStart in
 	if font != "" {
 		if rfonts.found {
 			patches = append(patches, PatchRawSpan(doc, rfonts.tagSpan,
-				buildTag("rFonts", rFontsLiteralAttrs(rfonts.attrs, font), true)))
+				buildTag("rFonts", fontAttrs(rfonts.attrs, font), true)))
 		} else {
-			newTag := buildTag("rFonts", rFontsLiteralAttrs(nil, font), true)
+			newTag := buildTag("rFonts", fontAttrs(nil, font), true)
 			merged := false
 			for i := range remPatches {
 				if remPatches[i].Content.Start == containerOpenEnd {
@@ -988,9 +1061,10 @@ func scanDocDefaults(styles []byte) (dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr el
 // guess: it is the standard OOXML structure a document default lives in,
 // so building it is exactly what "set the document default" means when it
 // is not there yet.
-func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, error) {
+func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, []string, error) {
 	var patches []Patch
 	var applied []string
+	var notes []string
 
 	wantRPrChain := opts.BodyFont != "" || opts.BodySizePt != 0
 	wantPPrChain := opts.LineSpacing != 0 || opts.Align != ""
@@ -998,7 +1072,7 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 	if wantRPrChain || wantPPrChain {
 		dd, rpd, rpr, rfonts, sz, szcs, ppd, ppr, pprChildren, rootEnd, err := scanDocDefaults(styles)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		var rprInner, pprInner string
@@ -1020,14 +1094,17 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 				// the old bare applyLeafOps call) additionally makes sure a
 				// newly inserted rFonts lands as rPr's first child rather
 				// than after unrelated existing content (Minor 13).
+				// rFontsBodyLatinAttrs (not rFontsLiteralAttrs) is BodyFont's
+				// own font-attrs builder: it leaves docDefaults' eastAsia
+				// font alone (format capability review, Important 8).
 				patches = append(patches, planRPrFontSizePatches(
-					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, opts.BodyFont, opts.BodySizePt)...)
+					styles, rpr.tagSpan.End, rpr.closeStart, rfonts, sz, szcs, opts.BodyFont, opts.BodySizePt, rFontsBodyLatinAttrs)...)
 			} else {
 				needRPrSynthesis = true
 				ops := []leafOp{{info: rfonts, local: "rFonts"}, {info: sz, local: "sz"}, {info: szcs, local: "szCs"}}
 				if opts.BodyFont != "" {
 					ops[0].active = true
-					ops[0].attrs = rFontsLiteralAttrs(rfonts.attrs, opts.BodyFont)
+					ops[0].attrs = rFontsBodyLatinAttrs(rfonts.attrs, opts.BodyFont)
 				}
 				if opts.BodySizePt != 0 {
 					half := ptToHalfPoints(opts.BodySizePt)
@@ -1066,10 +1143,27 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 		}
 	}
 
+	// docDefaults is the cascade's WEAKEST layer: Normal and any style
+	// basedOn it (BodyText, and every real Word/WPS document's own named
+	// styles) can carry the very same rFonts/sz/spacing/jc explicitly,
+	// which then keeps outranking whatever docDefaults now says — the whole
+	// point of this task (format capability review, Critical 4; write
+	// review, I4/I5). planStyleChainShadowPatches finds and rewrites every
+	// such shadowing leaf that is safe to touch, and reports (via notes,
+	// not applied) whichever heading-like style it deliberately left alone.
+	if wantRPrChain || wantPPrChain {
+		chainPatches, chainNotes, err := planStyleChainShadowPatches(styles, opts)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		patches = append(patches, chainPatches...)
+		notes = append(notes, chainNotes...)
+	}
+
 	if opts.HeadingFont != "" {
 		headingPatches, err := planHeadingFontPatches(styles, opts.HeadingFont)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if len(headingPatches) > 0 {
 			patches = append(patches, headingPatches...)
@@ -1077,7 +1171,7 @@ func planStylesPatches(styles []byte, opts FormatOptions) ([]Patch, []string, er
 		}
 	}
 
-	return patches, applied, nil
+	return patches, applied, notes, nil
 }
 
 // planHeadingFontPatches rewrites every Heading1..Heading9 style's
@@ -1188,6 +1282,549 @@ func planHeadingFontPatches(styles []byte, font string) ([]Patch, error) {
 		prevOffset = offset
 	}
 	return patches, nil
+}
+
+// styleElem is one <w:style> block's classification-relevant facts, plus,
+// for its own DIRECT rPr/pPr (never a nested rPrChange/pPrChange's
+// historical copy — see scanDocDefaults' doc comment for why that
+// distinction matters), whichever of rFonts/sz/szCs/spacing/jc it already
+// declares explicitly. It intentionally carries no insertion-anchor data
+// the way scanDocDefaults' rpr/ppr do (no closeStart, no "missing but
+// wanted" tracking): planStyleChainShadowPatches below only ever REWRITES a
+// leaf that already exists — a style with no explicit rFonts/sz/spacing/jc
+// of its own has nothing shadowing docDefaults to fix, since it already
+// inherits whatever docDefaults now says — so there is never a need to
+// synthesize a brand new element inside some OTHER style, unlike
+// docDefaults' own chain (which docx_write-shaped minimal generators can
+// omit entirely and which planStylesPatches does synthesize).
+type styleElem struct {
+	id, typ, basedOn, name string
+	rprChildren            map[string]elemInfo // rFonts/sz/szCs, keyed as rPrFontSizeOrder
+	pprChildren            map[string]elemInfo // spacing/jc (and other pPrChildOrder anchors, unused here)
+}
+
+// styleChildNames is the direct children of a <w:style> element this
+// package ever needs to read: basedOn (for the cascade graph), name (for
+// classification and for a human-readable label in notes), and pPr/rPr
+// (each rescanned one level deeper for the actual leaves below).
+var styleChildNames = []string{"basedOn", "name", "pPr", "rPr"}
+
+// scanAllStyles decodes styles — a whole word/styles.xml document — into one
+// styleElem per top-level <w:style> element, in document order. It reuses
+// scanDirectChildren (Task 1's depth-tracked mechanism) rather than a new
+// hand-rolled boolean scan: a <w:style>'s own pPr can carry a paragraph-mark
+// <w:rPr> nested inside it, and a table-type style's <w:tblStylePr> carries
+// its OWN nested pPr/rPr/rFonts — exactly the "same-named element nested one
+// level down" trap scanDocDefaults and planHeadingFontPatches already had to
+// fix (format capability review, Critical 2 and its follow-ups), so this
+// scan inherits their fix instead of reintroducing the bug a third time.
+//
+// A <w:style> element never nests inside another <w:style> (CT_Styles is a
+// flat list), so finding each one's own close is a plain "the next
+// </w:style> after this open" — no depth counter needed for THAT part,
+// unlike pPr/rPr.
+func scanAllStyles(styles []byte) ([]styleElem, error) {
+	dec := xml.NewDecoder(bytes.NewReader(styles))
+	var prevOffset int
+	var result []styleElem
+	var inStyle bool
+	var openEnd int
+	var openAttrs []xml.Attr
+	var buildErr error
+
+	build := func(innerStart, innerEnd int) styleElem {
+		var e styleElem
+		if v, ok := wordAttrVal(xml.StartElement{Attr: openAttrs}, "styleId"); ok {
+			e.id = v
+		}
+		if v, ok := wordAttrVal(xml.StartElement{Attr: openAttrs}, "type"); ok {
+			e.typ = v
+		}
+		if innerEnd <= innerStart {
+			return e
+		}
+		// scanDirectChildren finds each depth-0 child's OPEN tag span
+		// correctly (including skipping past a table-type style's
+		// <w:tblStylePr>, which carries its own nested pPr/rPr one level
+		// down) but never computes a container's own closeStart — that is
+		// scanDocDefaults/scanRunProps/scanParaProps's own job, via their
+		// depth-tracked scans, and styleLeafClose below does the same thing
+		// for a style's pPr/rPr specifically.
+		direct := scanDirectChildren(styles[innerStart:innerEnd], innerStart, styleChildNames)
+		if bo, ok := direct["basedOn"]; ok {
+			if v, ok2 := wordAttrVal(xml.StartElement{Attr: bo.attrs}, "val"); ok2 {
+				e.basedOn = v
+			}
+		}
+		if nm, ok := direct["name"]; ok {
+			if v, ok2 := wordAttrVal(xml.StartElement{Attr: nm.attrs}, "val"); ok2 {
+				e.name = v
+			}
+		}
+		if ppr, ok := direct["pPr"]; ok && !ppr.selfClosing {
+			closeStart, err := styleLeafClose(styles, ppr, "pPr")
+			if err != nil {
+				buildErr = err
+				return e
+			}
+			e.pprChildren = scanDirectChildren(styles[ppr.tagSpan.End:closeStart], ppr.tagSpan.End, pPrChildOrder)
+		}
+		if rpr, ok := direct["rPr"]; ok && !rpr.selfClosing {
+			closeStart, err := styleLeafClose(styles, rpr, "rPr")
+			if err != nil {
+				buildErr = err
+				return e
+			}
+			e.rprChildren = scanDirectChildren(styles[rpr.tagSpan.End:closeStart], rpr.tagSpan.End, rPrFontSizeOrder)
+		}
+		return e
+	}
+
+	for {
+		tok, terr := dec.Token()
+		if terr != nil {
+			if errors.Is(terr, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("scan styles.xml style elements: %w", terr)
+		}
+		offset := int(dec.InputOffset())
+
+		switch t := tok.(type) {
+		case xml.StartElement:
+			span := Span{prevOffset, offset}
+			if !inStyle && isWordElement(t.Name, "style") {
+				inStyle = true
+				openEnd = offset
+				openAttrs = t.Attr
+				if isSelfClosingSpan(styles, span) {
+					result = append(result, build(openEnd, openEnd))
+					if buildErr != nil {
+						return nil, buildErr
+					}
+					inStyle = false
+				}
+			}
+		case xml.EndElement:
+			if inStyle && isWordElement(t.Name, "style") {
+				result = append(result, build(openEnd, prevOffset))
+				if buildErr != nil {
+					return nil, buildErr
+				}
+				inStyle = false
+			}
+		}
+		prevOffset = offset
+	}
+	return result, nil
+}
+
+// styleLeafClose finds elem's own matching closing tag inside styles,
+// tolerating a NESTED element of the same tagName one level down — a
+// <w:rPr> can wrap a <w:rPrChange>'s historical <w:rPr>, and (symmetrically)
+// a <w:pPr> can wrap a <w:pPrChange>'s historical <w:pPr> — the same
+// depth-tracking fix already applied to scanDocDefaults/scanRunProps/
+// scanParaProps for exactly this class of bug (format capability review,
+// Critical 2 and its follow-ups). elem must be a found, non-self-closing
+// elemInfo (callers only ever call this after checking both).
+//
+// It decodes forward starting at elem's own OPEN tag (not just after it) so
+// the decoder's own element stack is primed with that open — decoding from
+// tagSpan.End alone would hand encoding/xml.Decoder a stream whose closing
+// </w:pPr>/</w:rPr> has no matching open it ever saw, which it rejects
+// outright as "unexpected end element" — and stops at the first depth-0
+// close, so in practice it only ever reads a small distance past elem's own
+// content, not the rest of styles.xml, even though nothing bounds the byte
+// slice it is handed on the far end.
+func styleLeafClose(styles []byte, elem elemInfo, tagName string) (int, error) {
+	base := elem.tagSpan.Start
+	dec := xml.NewDecoder(bytes.NewReader(styles[base:]))
+	var prevOffset, depth int
+	seenOpen := false
+	for {
+		tok, terr := dec.Token()
+		if terr != nil {
+			return 0, fmt.Errorf("scan styles.xml for %s close: %w", tagName, terr)
+		}
+		offset := int(dec.InputOffset())
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if isWordElement(t.Name, tagName) {
+				depth++
+				seenOpen = true
+			}
+		case xml.EndElement:
+			if isWordElement(t.Name, tagName) {
+				depth--
+				if seenOpen && depth == 0 {
+					return base + prevOffset, nil
+				}
+			}
+		}
+		prevOffset = offset
+	}
+}
+
+// headingLikeNameRe matches a <w:name> value of "heading 1".."heading 9"
+// (any whitespace, case-insensitive) — the actual value real Word/WPS
+// documents write regardless of localized UI (format capability review,
+// Important 5's own observation that a localized STYLEID like "1"/"2" still
+// carries this English w:name). Used only for the style-CHAIN classification
+// below; heading detection elsewhere in this file (planHeadingFontPatches,
+// HeadingFont) is intentionally unchanged by this task and keeps using
+// headingStyleIDRe on the styleId alone.
+var headingLikeNameRe = regexp.MustCompile(`(?i)^heading\s*[1-9]$`)
+
+// quoteFamilyRe/codeFamilyRe are deliberately loose (any style whose name OR
+// styleId contains the word, case-insensitively) rather than an exact-match
+// list: this package's own Quote/SourceCode styleIds match trivially, and a
+// real Word document's built-in "Intense Quote" also needs to match. The
+// cost of this looseness is a false positive on some hypothetical custom
+// style whose name merely contains "quote"/"code" as a substring of an
+// unrelated word — accepted because the failure mode on that side (a style
+// that should have been rewritten is instead left alone and reported in
+// notes for line_spacing/align, silently for font/size per this task's own
+// invariant) is far less harmful than the alternative (silently rewriting a
+// document's actual code or quotation styling because "SourceCode" happened
+// to be the exact match required).
+var (
+	quoteFamilyRe = regexp.MustCompile(`(?i)quote`)
+	codeFamilyRe  = regexp.MustCompile(`(?i)code`)
+)
+
+// isHeadingLikeStyle reports whether s is a heading-or-heading-adjacent
+// display style: Heading1..9 (by styleId or by w:name), or Title/Subtitle
+// (by either). Title/Subtitle are grouped with headings, not left as plain
+// "custom" styles, because they play the exact same role in the format
+// capability review's own evidence (Critical 4: "真实 python-docx 文档：
+// Title/Subtitle 仍是 asciiTheme 主题字体") and in this task's brief (§2's
+// worked example of a style that must be reported, not silently rewritten).
+func isHeadingLikeStyle(s styleElem) bool {
+	if headingStyleIDRe.MatchString(s.id) || headingLikeNameRe.MatchString(strings.TrimSpace(s.name)) {
+		return true
+	}
+	return strings.EqualFold(s.id, "Title") || strings.EqualFold(s.name, "Title") ||
+		strings.EqualFold(s.id, "Subtitle") || strings.EqualFold(s.name, "Subtitle")
+}
+
+// isQuoteLikeStyle/isCodeLikeStyle classify the two other families
+// FormatOptions.BodyFont/BodySizePt/LineSpacing/Align must never touch —
+// SourceCode's monospace font and Quote's distinct look are deliberate, not
+// an oversight, so (unlike headings) a masking style in either family is
+// left out of notes too: see planStyleChainShadowPatches' own doc comment.
+func isQuoteLikeStyle(s styleElem) bool {
+	return quoteFamilyRe.MatchString(s.name) || quoteFamilyRe.MatchString(s.id)
+}
+
+func isCodeLikeStyle(s styleElem) bool {
+	return codeFamilyRe.MatchString(s.name) || codeFamilyRe.MatchString(s.id)
+}
+
+func isExcludedFamilyStyle(s styleElem) bool {
+	return isHeadingLikeStyle(s) || isQuoteLikeStyle(s) || isCodeLikeStyle(s)
+}
+
+// reachesNormalCleanly walks the basedOn chain starting at id, returning
+// true only if it reaches "Normal" WITHOUT passing through a style
+// isExcludedFamilyStyle classifies as heading/quote/code-like along the way
+// (id itself is checked by the caller, not here — this only inspects id and
+// its ANCESTORS). A missing basedOn target, an empty basedOn (chain ends
+// without reaching Normal), or a cycle (guarded by seen) all report false:
+// none of those is "based on Normal", so there is nothing here to safely
+// rewrite.
+func reachesNormalCleanly(id string, byID map[string]styleElem) bool {
+	seen := make(map[string]bool)
+	for i := 0; i < 64; i++ {
+		if id == "Normal" {
+			return true
+		}
+		if id == "" || seen[id] {
+			return false
+		}
+		seen[id] = true
+		s, ok := byID[id]
+		if !ok {
+			return false
+		}
+		if isExcludedFamilyStyle(s) {
+			return false
+		}
+		id = s.basedOn
+	}
+	return false
+}
+
+// eligibleForBodyChainRewrite reports whether s is safe for
+// planStyleChainShadowPatches to REWRITE (as opposed to merely note): Normal
+// itself always is (it IS the cascade's root, not merely reachable from it),
+// and any other paragraph-type style is, provided it is not itself
+// heading/quote/code-like and its basedOn chain reaches Normal without
+// passing through one of those families either. This covers docx_write's
+// own BodyText, a real Word template's Body Text/List Continue/Caption/etc.
+// styles, and any similarly-named custom style — exactly "非
+// Heading/SourceCode/Quote 家族的正文类样式" (task 7 brief, §1).
+func eligibleForBodyChainRewrite(s styleElem, byID map[string]styleElem) bool {
+	if s.id == "Normal" {
+		return true
+	}
+	if s.typ != "paragraph" {
+		return false
+	}
+	if isExcludedFamilyStyle(s) {
+		return false
+	}
+	return reachesNormalCleanly(s.basedOn, byID)
+}
+
+// styleLabel returns s's human-readable w:name, falling back to its
+// styleId when the style has no <w:name> at all (schema-legal, if unusual)
+// — used only for the notes planStyleChainShadowPatches produces.
+func styleLabel(s styleElem) string {
+	if s.name != "" {
+		return s.name
+	}
+	return s.id
+}
+
+// hasAttr reports whether attrs contains an attribute named local,
+// regardless of value — used by planStyleChainShadowPatches to tell "this
+// style's own <w:spacing> sets w:line" (a real line-spacing override) apart
+// from "this style's own <w:spacing> only sets w:after/w:before" (paragraph
+// spacing, unrelated to line spacing, common on real Word template styles —
+// see docDefaultsXML and every heading/body style in this package's own
+// styles.go).
+func hasAttr(attrs []xml.Attr, local string) bool {
+	_, ok := wordAttrVal(xml.StartElement{Attr: attrs}, local)
+	return ok
+}
+
+// planStyleChainShadowPatches walks styles' full style graph and, for every
+// paragraph style that is Normal itself or basedOn it (directly or
+// transitively) EXCLUDING the Heading/Title/Subtitle, Quote, and SourceCode
+// families (eligibleForBodyChainRewrite), rewrites whichever of its own
+// EXPLICIT rFonts/sz/szCs/spacing/jc already shadows the docDefaults value
+// planStylesPatches's docDefaults section just wrote — Word's cascade puts a
+// named style above docDefaults, so a style that already declares its own
+// font/size/spacing/alignment keeps winning over a docDefaults-only edit no
+// matter what docDefaults itself now says (format capability review,
+// Critical 4; write review, I4/I5).
+//
+// This never inserts a new element into another style: a style with no
+// explicit property of its own has nothing shadowing docDefaults to fix — it
+// already inherits the freshly-rewritten default correctly — so only an
+// EXISTING leaf (found in that style's own rprChildren/pprChildren) is ever
+// rewritten in place, via a plain PatchRawSpan on that leaf's own tagSpan,
+// with no anchoring/ordering concerns at all (nothing is being inserted, so
+// CT_PPr/EG_RPrBase's child order can never be violated here).
+//
+// notes reports, for whichever REQUESTED field, the heading-like styles
+// (Heading1..9, Title, Subtitle) that DID shadow it but were deliberately
+// left alone — Quote/SourceCode's own families shadow deliberately too, but
+// are not reported: "SourceCode 的等宽字体、HeadingN 的字体绝不被 body_font 触碰"
+// (brief §1) is this task's invariant for BOTH families equally, but only
+// the heading-like family is also treated as a caller-facing caveat worth a
+// note (brief §2's own Title/Subtitle example) — nobody is surprised that
+// asking for a document-wide body font left their code blocks and
+// blockquotes alone, but a user who set body_font expecting Title/Subtitle
+// to follow along deserves to be told they did not.
+func planStyleChainShadowPatches(styles []byte, opts FormatOptions) ([]Patch, []string, error) {
+	elems, err := scanAllStyles(styles)
+	if err != nil {
+		return nil, nil, err
+	}
+	byID := make(map[string]styleElem, len(elems))
+	for _, s := range elems {
+		if s.id != "" {
+			byID[s.id] = s
+		}
+	}
+	if _, ok := byID["Normal"]; !ok {
+		// No conventional Normal style to anchor the cascade against.
+		// docDefaults alone (planStylesPatches' existing, unconditional
+		// behavior) still applies; guessing at a different root here would
+		// risk rewriting the wrong styles entirely.
+		return nil, nil, nil
+	}
+
+	var patches []Patch
+	masked := map[string][]string{} // field label -> heading-like style names
+
+	for _, s := range elems {
+		if s.typ != "paragraph" || s.id == "" {
+			continue
+		}
+		elig := eligibleForBodyChainRewrite(s, byID)
+		headingMask := !elig && s.id != "Normal" && isHeadingLikeStyle(s) && reachesNormalCleanly(s.basedOn, byID)
+		if !elig && !headingMask {
+			continue
+		}
+		label := styleLabel(s)
+
+		if opts.BodyFont != "" {
+			if rf, ok := s.rprChildren["rFonts"]; ok {
+				if elig {
+					patches = append(patches, PatchRawSpan(styles, rf.tagSpan,
+						buildTag("rFonts", rFontsBodyLatinAttrs(rf.attrs, opts.BodyFont), true)))
+				} else {
+					masked["body font"] = append(masked["body font"], label)
+				}
+			}
+		}
+
+		if opts.BodySizePt != 0 {
+			half := ptToHalfPoints(opts.BodySizePt)
+			sawSize := false
+			if sz, ok := s.rprChildren["sz"]; ok {
+				sawSize = true
+				if elig {
+					patches = append(patches, PatchRawSpan(styles, sz.tagSpan, buildTag("sz", setAttr(sz.attrs, "val", half), true)))
+				}
+			}
+			if szcs, ok := s.rprChildren["szCs"]; ok {
+				sawSize = true
+				if elig {
+					patches = append(patches, PatchRawSpan(styles, szcs.tagSpan, buildTag("szCs", setAttr(szcs.attrs, "val", half), true)))
+				}
+			}
+			if sawSize && !elig {
+				masked["body size"] = append(masked["body size"], label)
+			}
+		}
+
+		if opts.LineSpacing != 0 {
+			if sp, ok := s.pprChildren["spacing"]; ok && hasAttr(sp.attrs, "line") {
+				if elig {
+					line := lineSpacingTo240ths(opts.LineSpacing)
+					patches = append(patches, PatchRawSpan(styles, sp.tagSpan,
+						buildTag("spacing", setAttr(setAttr(sp.attrs, "line", line), "lineRule", "auto"), true)))
+				} else {
+					masked["line spacing"] = append(masked["line spacing"], label)
+				}
+			}
+		}
+
+		if opts.Align != "" {
+			if jc, ok := s.pprChildren["jc"]; ok {
+				if elig {
+					patches = append(patches, PatchRawSpan(styles, jc.tagSpan, buildTag("jc", setAttr(jc.attrs, "val", opts.Align), true)))
+				} else {
+					masked["alignment"] = append(masked["alignment"], label)
+				}
+			}
+		}
+	}
+
+	var notes []string
+	for _, field := range []string{"body font", "body size", "line spacing", "alignment"} {
+		names := masked[field]
+		if len(names) == 0 {
+			continue
+		}
+		quoted := make([]string, len(names))
+		for i, n := range names {
+			quoted[i] = fmt.Sprintf("%q", n)
+		}
+		notes = append(notes, fmt.Sprintf(
+			"style(s) %s carry their own %s that overrides this rule; they were left unchanged (heading/title styles are never rewritten by this rule)",
+			strings.Join(quoted, ", "), field))
+	}
+	return patches, notes, nil
+}
+
+// directFormatMaskingNotes scans doc's paragraphs for DIRECT formatting (a
+// paragraph's own <w:pPr>, or one of its runs' own <w:rPr>) that would keep
+// outranking whatever the docDefaults/style-chain rewrite above just wrote —
+// Word's cascade puts direct formatting above every style, including a
+// freshly-rewritten Normal/BodyText. It reports one honest note per
+// requested field that is actually shadowed this way, naming how many
+// paragraphs are affected and the start_para/end_para range
+// formatDirectRange needs to fix them, rather than letting the
+// whole-document path's Applied read as "every paragraph now looks like
+// this" the way it used to (format capability review, Critical 4 / this
+// task's §2).
+func directFormatMaskingNotes(doc []byte, paras []Para, opts FormatOptions) ([]string, error) {
+	wantFont := opts.BodyFont != ""
+	wantSize := opts.BodySizePt != 0
+	wantSpacing := opts.LineSpacing != 0
+	wantAlign := opts.Align != ""
+	if !wantFont && !wantSize && !wantSpacing && !wantAlign {
+		return nil, nil
+	}
+
+	type hit struct {
+		count      int
+		minP, maxP int
+	}
+	var fontHit, sizeHit, spacingHit, alignHit hit
+	record := func(h *hit, idx int) {
+		if h.count == 0 || idx < h.minP {
+			h.minP = idx
+		}
+		if idx > h.maxP {
+			h.maxP = idx
+		}
+		h.count++
+	}
+
+	for _, p := range paras {
+		if wantSpacing || wantAlign {
+			_, ppr, children, err := scanParaProps(doc, p.Span)
+			if err != nil {
+				return nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
+			}
+			if ppr.found && !ppr.selfClosing {
+				if wantSpacing {
+					if sp, ok := children["spacing"]; ok && hasAttr(sp.attrs, "line") {
+						record(&spacingHit, p.Index)
+					}
+				}
+				if wantAlign {
+					if _, ok := children["jc"]; ok {
+						record(&alignHit, p.Index)
+					}
+				}
+			}
+		}
+		if wantFont || wantSize {
+			paraFont, paraSize := false, false
+			for _, r := range p.Runs {
+				_, rpr, rfonts, sz, _, err := scanRunProps(doc, r.Elem)
+				if err != nil {
+					return nil, fmt.Errorf("paragraph %d: %w", p.Index, err)
+				}
+				if !rpr.found || rpr.selfClosing {
+					continue
+				}
+				if wantFont && rfonts.found {
+					paraFont = true
+				}
+				if wantSize && sz.found {
+					paraSize = true
+				}
+			}
+			if paraFont {
+				record(&fontHit, p.Index)
+			}
+			if paraSize {
+				record(&sizeHit, p.Index)
+			}
+		}
+	}
+
+	var notes []string
+	add := func(h hit, label string) {
+		if h.count == 0 {
+			return
+		}
+		notes = append(notes, fmt.Sprintf(
+			"%d paragraph(s) carry direct %s formatting that overrides this rule; use start_para=%d/end_para=%d to restyle them",
+			h.count, label, h.minP, h.maxP))
+	}
+	add(fontHit, "font")
+	add(sizeHit, "size")
+	add(spacingHit, "line spacing")
+	add(alignHit, "alignment")
+	return notes, nil
 }
 
 // planMarginPatches rewrites every <w:pgMar> in documentXML (there is
