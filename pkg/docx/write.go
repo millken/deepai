@@ -442,15 +442,28 @@ func markdownStartsWithH1(markdown string) bool {
 // buildBlocks walks Markdown line by line and produces one block per
 // heading, per ordinary paragraph, per list item, per table (which
 // consumes multiple lines at once via parseTable), per block-quote run,
-// per horizontal rule, and per line of a fenced code block. Ordinary
-// paragraph lines and block-quote lines are each merged with a single
-// space within their own run (Markdown's soft-line-break model — see
-// flush/flushQuote below); everything else is emitted immediately as its
-// own block rather than merged with neighbors, since merging e.g. two list
-// items into one paragraph would make already-special content actively
-// misleading. unit is the number of leading spaces that make one list
-// nesting level — see inferListIndentUnit, which computes it once per
+// per horizontal rule, and per line of a fenced OR indented code block.
+// Ordinary paragraph lines and block-quote lines are each merged with a
+// single space within their own run (Markdown's soft-line-break model —
+// see flush/flushQuote below); everything else is emitted immediately as
+// its own block rather than merged with neighbors, since merging e.g. two
+// list items into one paragraph would make already-special content
+// actively misleading. unit is the number of leading spaces that make one
+// list nesting level — see inferListIndentUnit, which computes it once per
 // document before this function is called.
+//
+// Indented code blocks (CommonMark's other code-block form, alongside a
+// fence) were not recognized at all before this task: a four-space-indented
+// line with no fence fell straight through to the ordinary-paragraph
+// fallback at the bottom of this loop, which trimmed its leading whitespace
+// away and merged it into a soft-wrapped body paragraph -- the exact defect
+// a real generated document was measured against. inListContext,
+// inIndentedCode and pendingBlankIndentedLines below implement it: a line
+// indented by a tab or >=4 spaces (stripIndentedCodePrefix) opens/continues
+// a code block, EXCEPT while inListContext is true, since a list item's own
+// indented continuation content looks identical (both are just "an indented
+// line") and swallowing it as code would be actively wrong -- see this
+// task's report for how each list/indent interaction case was checked.
 func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string) {
 	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(markdown, "\n")
@@ -479,6 +492,10 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	}
 
 	inFence := false
+	// See this function's own doc comment for what these three implement.
+	inListContext := false
+	inIndentedCode := false
+	pendingBlankIndentedLines := 0
 	tableIndex := 0
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -488,6 +505,15 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			flush()
 			flushQuote()
 			inFence = !inFence
+			// A fence marker unconditionally ends any indented code block
+			// in progress, opening or closing: without this, a literal
+			// "```"-looking line encountered while accumulating an indented
+			// block would leave inIndentedCode dangling true underneath the
+			// fenced section, corrupting whatever line follows the fence's
+			// close. Any buffered blank lines are dropped with it, same as
+			// any other dedent that ends the block.
+			inIndentedCode = false
+			pendingBlankIndentedLines = 0
 			// The opening/closing delimiter itself -- and any info string
 			// after it, e.g. "go" in "```go" -- is consumed here and never
 			// becomes a paragraph: Item 1 says the info string is ignored,
@@ -514,10 +540,47 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			continue
 		}
 		if trimmed == "" {
+			if inIndentedCode {
+				// Buffered, not emitted yet: a blank line is only part of
+				// the block if a further indented line follows it (see the
+				// "Trailing blank lines are not part of the block" rule
+				// below, at the dedent branch).
+				pendingBlankIndentedLines++
+				continue
+			}
 			flush()
 			flushQuote()
 			continue
 		}
+
+		if inIndentedCode {
+			if rest, ok := stripIndentedCodePrefix(line); ok {
+				for ; pendingBlankIndentedLines > 0; pendingBlankIndentedLines-- {
+					blocks = append(blocks, block{para: &paraBlock{text: "", isCode: true}})
+				}
+				blocks = append(blocks, block{para: &paraBlock{text: rest, isCode: true}})
+				continue
+			}
+			// Dedented: the block ends here. Any buffered blank lines were
+			// trailing it, not part of it, so they are simply dropped, and
+			// THIS line falls through to be classified fresh below -- it is
+			// not itself part of the block that just ended.
+			inIndentedCode = false
+			pendingBlankIndentedLines = 0
+		}
+
+		// A line with no leading indentation at all is the unambiguous end
+		// of whatever list was open (a genuine list item, or its indented
+		// continuation, is always indented by definition) -- clearing this
+		// here, before classifying the line, is what lets a LATER indented
+		// block elsewhere in the document be recognized as code again
+		// after the list has ended. A still-indented line (a nested list
+		// item, or its own continuation) leaves this untouched; the list-
+		// item branch below sets it back to true on an actual match.
+		if !hasLeadingIndent(line) {
+			inListContext = false
+		}
+
 		if m := headingRE.FindStringSubmatch(trimmed); m != nil {
 			flush()
 			flushQuote()
@@ -539,6 +602,7 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 				listLevel:   level,
 				listOrdered: ordered,
 			}})
+			inListContext = true
 			continue
 		}
 		if strings.Contains(trimmed, "|") && i+1 < len(lines) && isTableSeparator(lines[i+1]) {
@@ -578,6 +642,21 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			continue
 		}
 		flushQuote()
+		if !inListContext {
+			// Opens a NEW indented code block. Only reached once none of
+			// heading/list-item/table/hr/quote matched -- exactly the
+			// "ordinary paragraph" cases this line would otherwise fall
+			// into below -- and only when no list is currently open, per
+			// this function's own doc comment on the list-interaction
+			// hazard.
+			if rest, ok := stripIndentedCodePrefix(line); ok {
+				flush()
+				inIndentedCode = true
+				pendingBlankIndentedLines = 0
+				blocks = append(blocks, block{para: &paraBlock{text: rest, isCode: true}})
+				continue
+			}
+		}
 		if strings.Contains(trimmed, "|") {
 			// A pipe character with no valid GFM separator row right after
 			// it is not a table -- e.g. ordinary prose like "cost |
@@ -595,6 +674,38 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	flush()
 	flushQuote()
 	return blocks, tableNotes
+}
+
+// stripIndentedCodePrefix reports whether line opens or continues a
+// CommonMark indented code block: prefixed by exactly one tab, or by at
+// least four literal spaces. Exactly one tab, or exactly four spaces, is
+// stripped -- the rest of the line, including any further indentation,
+// survives verbatim: the six-space "      \"a\": 1" strips to the two-space
+// "  \"a\": 1", preserving the source's own relative indentation, per this
+// task's own rule ("Strip exactly the four leading spaces from each line
+// and keep the rest verbatim").
+//
+// This does not implement CommonMark's tab-stop expansion (a tab advances
+// to the next 4-column stop, so e.g. one space then one tab would also
+// qualify under full CommonMark) -- only a bare leading tab or >=4 literal
+// spaces are recognized, a deliberate, documented simplification rather
+// than an oversight; see this task's report.
+func stripIndentedCodePrefix(line string) (rest string, ok bool) {
+	if strings.HasPrefix(line, "\t") {
+		return line[1:], true
+	}
+	if strings.HasPrefix(line, "    ") {
+		return line[4:], true
+	}
+	return line, false
+}
+
+// hasLeadingIndent reports whether line starts with a space or a tab --
+// buildBlocks' signal that a list item, or its own indented continuation,
+// might still be open. A line with NO leading indentation at all is the
+// unambiguous end of whatever list was open.
+func hasLeadingIndent(line string) bool {
+	return len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
 }
 
 // inferListIndentUnit scans markdown for list-item lines (skipping fenced

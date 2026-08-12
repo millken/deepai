@@ -404,6 +404,39 @@ const heading6StyleXML = `<w:style w:type="paragraph" w:styleId="Heading6">` +
 // it, moving code blocks over to pStyle="SourceCode" would have silently
 // dropped the indent rather than merely relocating it.
 //
+// <w:keepNext/><w:keepLines/> and <w:pBdr> are this task's own addition
+// (the code-block-report's "Defect 2": a code block was a run of shaded
+// paragraphs with no visible container -- Word draws paragraph shading
+// edge to edge with no padding, so the code sat flush against the
+// surrounding text). Two containers were considered: a single-cell table
+// (the technique real Word documents commonly use, since a cell supplies a
+// border, background AND internal margins for free), and a paragraph
+// border. The table was rejected specifically for THIS codebase: wrapping
+// every code line in a <w:tc> would make docx_read's scanner report each
+// one as a table cell (Para.Cell != nil), which read.go's renderReadPara
+// cannot be taught to treat differently (it is on this task's forbidden-
+// to-modify list, same as scan.go) -- every code block would start
+// rendering as "(table N row 1 col 1) ..." in Read's markdown output and
+// trip its table-structure note, for a document that has no real table at
+// all. A table would also shift every REAL data table after it to a
+// higher table index, a second, independent behavior change with its own
+// blast radius. A paragraph border pays for none of that: Word merges the
+// borders of contiguous paragraphs that share byte-identical <w:pBdr> XML
+// into a single box around the whole run (the same mechanism "Borders and
+// Shading" applied to a multi-paragraph selection produces), so this one
+// style-level property still yields ONE bordered box around a multi-line
+// code block, not a border around every individual line. w:space on each
+// side is what turns the border into real padding rather than a second
+// line flush against the text: 4pt top/bottom (the gap above the first
+// line and below the last, since Word merges the interior lines' borders
+// away) and 8pt left/right (applied to every line, since a vertical border
+// spans the whole box). keepNext/keepLines is the paragraph-only answer to
+// "keeps together sensibly across pages": the same chaining mechanism
+// heading styles above already use for the identical reason (a heading
+// stranding at the bottom of a page while its body flows to the next) --
+// consecutive keepNext paragraphs pull each other onto the same page
+// wherever Word can manage it.
+//
 // f.codeLatin/f.codeEastAsia (resolved from WriteOptions.CodeLatinFont/
 // CodeEastAsiaFont, defaulting to Consolas/微软雅黑 — see
 // defaultCodeEastAsiaFont's doc comment for what that default does and does
@@ -411,7 +444,14 @@ const heading6StyleXML = `<w:style w:type="paragraph" w:styleId="Heading6">` +
 func sourceCodeStyleXML(f fontOptions) string {
 	return `<w:style w:type="paragraph" w:styleId="SourceCode">` +
 		`<w:name w:val="Source Code"/><w:basedOn w:val="Normal"/><w:qFormat/>` +
-		`<w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>` +
+		`<w:pPr><w:keepNext/><w:keepLines/>` +
+		`<w:pBdr>` +
+		`<w:top w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
+		`<w:left w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
+		`<w:bottom w:val="single" w:sz="4" w:space="4" w:color="BFBFBF"/>` +
+		`<w:right w:val="single" w:sz="4" w:space="8" w:color="BFBFBF"/>` +
+		`</w:pBdr>` +
+		`<w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/>` +
 		`<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>` +
 		`<w:ind w:left="120"/>` +
 		`<w:contextualSpacing/></w:pPr>` +
