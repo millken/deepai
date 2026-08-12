@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Patch replaces one <w:t> element's text content with NewText.
@@ -207,7 +208,12 @@ func Apply(documentXML []byte, patches []Patch) ([]byte, error) {
 			continue
 		}
 
-		escaped, err := escapeXMLText(p.NewText)
+		// The trailing count is discarded here too: same reasoning as
+		// insertOrAppend's edit.go call site -- callers that build a Patch
+		// from caller-supplied text (PatchRun, from an already-validated
+		// edit.Text) have already refused an XML-illegal character before
+		// Apply ever runs.
+		escaped, _, err := escapeXMLText(p.NewText)
 		if err != nil {
 			return nil, err
 		}
@@ -292,12 +298,25 @@ func (p *Package) ApplyToPart(name string, patches []Patch) error {
 // escapeXMLText escapes text for inclusion in element content. Unescaped
 // & or < is the single most common cause of "Word found unreadable
 // content" on a patched document.
-func escapeXMLText(s string) ([]byte, error) {
+//
+// This is the ONE place in the package that turns caller-supplied text
+// into bytes destined for a <w:t> (or an attribute value -- see
+// revisionCtx.attrs): every renderRun call (body text, headings, table
+// cells, code-block lines, hyperlink display text -- see write.go), every
+// non-raw Patch (splice.go, above; edit.go's insertOrAppend), and every
+// tracked-change author/clone (revision.go) all funnel through here. That
+// makes it the single, unavoidable choke point for XML-1.0 well-formedness,
+// not just metacharacter escaping: see xmlEscapeText's own doc comment for
+// why it also enforces the Char production now, not just five
+// metacharacters. The returned int is how many characters this call
+// replaced for being illegal in XML content -- callers that need to
+// declare that to a caller of their own (WriteDocx's Notes) sum it; a
+// caller with nothing to declare it to (revisionCtx.attrs, an insert's
+// literal paragraph text) is free to discard it.
+func escapeXMLText(s string) ([]byte, int, error) {
 	var buf bytes.Buffer
-	if err := xmlEscapeText(&buf, []byte(s)); err != nil {
-		return nil, fmt.Errorf("escape replacement text: %w", err)
-	}
-	return buf.Bytes(), nil
+	n := xmlEscapeText(&buf, []byte(s))
+	return buf.Bytes(), n, nil
 }
 
 // needsPreserve reports whether text has leading or trailing whitespace,
@@ -321,13 +340,45 @@ func withPreserveAttr(tag []byte) ([]byte, error) {
 	return out, nil
 }
 
-// xmlEscapeText escapes the five XML metacharacters. encoding/xml's
-// EscapeText additionally rewrites newlines and tabs to character
-// references, which would needlessly churn bytes in a document where the
-// caller's text legitimately contains them.
-func xmlEscapeText(w *bytes.Buffer, s []byte) error {
-	for _, b := range s {
-		switch b {
+// xmlEscapeText escapes the five XML metacharacters and, before doing so,
+// enforces XML 1.0's Char production (isLegalXMLChar, edit.go): a
+// character that grammar forbids in document content -- a raw control
+// code below U+0020 other than tab/LF/CR, one of the two per-plane
+// noncharacters U+FFFE/U+FFFF, or (defensively) a lone UTF-16 surrogate --
+// is replaced with U+FFFD, the Unicode replacement character, which is
+// itself legal, rather than being written through unescaped.
+//
+// This is not a hypothetical input: pasting ANSI-colored terminal output
+// (which embeds \x1b, ESC) or a stray \x0c (form feed) into markdown
+// destined for docx_write are both ordinary, everyday ways to hit this.
+// Before this existed, this function only recognized five ASCII
+// metacharacters and let every other byte -- illegal or not -- straight
+// through, so either input produced a document.xml that WriteDocx reported
+// as written successfully but that even this package's own OpenDocument
+// refuses to parse ("XML syntax error ... illegal character code"), let
+// alone Word. See TestWrite_IllegalControlCharIsStrippedFromBodyText and
+// the write-quality report's C2 finding.
+//
+// The int return is how many characters this call replaced; escapeXMLText
+// passes it straight back to its caller, and write.go's renderRun sums it
+// into renderCtx.strippedXMLChars so WriteDocx can declare the total via a
+// "stripped N invalid XML character(s)" note -- an empty Notes must never
+// stop meaning "rendered exactly as written" (see docxWriteOutput's own
+// contract in pkg/tools/builtin/docx.go), so silently sanitizing without
+// declaring it would reopen exactly the failure mode this fixes.
+//
+// encoding/xml's EscapeText additionally rewrites newlines and tabs to
+// character references, which would needlessly churn bytes in a document
+// where the caller's text legitimately contains them; this function still
+// does not do that -- tab/LF/CR pass through unescaped exactly as before.
+func xmlEscapeText(w *bytes.Buffer, s []byte) int {
+	invalid := 0
+	for _, r := range string(s) {
+		if !isLegalXMLChar(r) {
+			invalid++
+			r = utf8.RuneError // U+FFFD
+		}
+		switch r {
 		case '&':
 			w.WriteString("&amp;")
 		case '<':
@@ -339,8 +390,8 @@ func xmlEscapeText(w *bytes.Buffer, s []byte) error {
 		case '\'':
 			w.WriteString("&apos;")
 		default:
-			w.WriteByte(b)
+			w.WriteRune(r)
 		}
 	}
-	return nil
+	return invalid
 }

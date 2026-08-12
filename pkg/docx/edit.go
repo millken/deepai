@@ -466,7 +466,12 @@ func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers
 		}
 		rawXML = paraXML
 	} else {
-		escaped, err := escapeXMLText(e.Text)
+		// The trailing count is discarded: planEdit's firstIllegalXMLChar
+		// check (above, before this function is ever reached for a
+		// non-delete op) already refuses any e.Text containing an XML-1.0
+		// illegal character, so escapeXMLText never has anything to strip
+		// here in practice.
+		escaped, _, err := escapeXMLText(e.Text)
 		if err != nil {
 			return nil, before, after, "", fmt.Sprintf("escape insert text: %v", err), "", false
 		}

@@ -110,7 +110,7 @@ func (rc *revisionCtx) attrs() string {
 	// as element content (both cover the same five XML metacharacters,
 	// including the quote characters an attribute value needs escaped that
 	// element content technically doesn't).
-	escapedAuthor, err := escapeXMLText(author)
+	escapedAuthor, _, err := escapeXMLText(author)
 	if err != nil {
 		// escapeXMLText only ever errors from xmlEscapeText, which (per its
 		// own doc comment) never returns a non-nil error for well-formed
@@ -218,7 +218,7 @@ func cloneRunWithText(runElem []byte, newText string, asDelText bool) ([]byte, e
 			"clone run: run has no <w:t> or <w:delText> element to hold newText %q", newText)
 	}
 
-	escaped, err := escapeXMLText(newText)
+	escaped, _, err := escapeXMLText(newText)
 	if err != nil {
 		return nil, fmt.Errorf("clone run: %w", err)
 	}

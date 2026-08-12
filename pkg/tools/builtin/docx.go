@@ -1063,9 +1063,11 @@ func DocxWriteTool() models.Tool {
 			"becomes a clickable hyperlink; > quotes and a standalone --- become a bordered block quote and a " +
 			"horizontal rule. A document with tables, nested lists, and code blocks is exactly what this tool " +
 			"is for — there is no need to write a script instead. The one thing it cannot do is embed images: " +
-			"![alt](url) is written as plain text and declared in notes, never silently dropped. Every other " +
-			"unsupported edge case (e.g. a ragged table row) is declared in notes the same way, so an empty " +
-			"notes field means the input rendered exactly as written. Refuses to create the file if path " +
+			"![alt](url) is written as plain text and declared in notes, never silently dropped. Text containing " +
+			"characters XML forbids (e.g. raw control codes from a pasted ANSI terminal transcript) has those " +
+			"characters replaced rather than producing a file that reports success but will not open, and notes " +
+			"reports how many. Every other unsupported edge case (e.g. a ragged table row) is declared in notes the " +
+			"same way, so an empty notes field means the input rendered exactly as written. Refuses to create the file if path " +
 			"already exists — creating never overwrites; delete the existing file or choose another path " +
 			"first. Returns paras, the number of paragraphs written, so the caller can sanity-check the output " +
 			"size.",

@@ -150,6 +150,15 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 			paraCount += n
 		}
 	}
+	// Every renderRun call the loop above just made (body text, headings,
+	// table cells, code-block lines, hyperlink display text) tallied any
+	// XML-1.0-illegal character it had to replace into ctx.strippedXMLChars
+	// -- see renderCtx's own doc comment. Declaring the total here, once
+	// rendering is done rather than per-call, is what keeps the note
+	// singular and additive instead of one repeated line per occurrence.
+	if ctx.strippedXMLChars > 0 {
+		notes = append(notes, stripNoteFor(ctx.strippedXMLChars))
+	}
 	// footerRelID is allocated from the SAME counter addLink draws from
 	// (ctx.nextRelID), after every hyperlink in the body has already
 	// claimed its own id: the two id spaces are one space, not two, so
@@ -860,6 +869,19 @@ func buildNotes(hasImage bool, tableNotes []string) []string {
 	return notes
 }
 
+// stripNoteFor renders WriteDocx's declaration that n characters (n > 0)
+// were replaced for being illegal in XML 1.0 content -- see
+// renderCtx.strippedXMLChars and xmlEscapeText's doc comment (splice.go).
+// "stripped" describes the user-facing outcome (the character is gone from
+// the visible text, replaced by nothing recognizable), even though the
+// underlying mechanism substitutes U+FFFD rather than deleting outright.
+func stripNoteFor(n int) string {
+	if n == 1 {
+		return "stripped 1 invalid XML character (not valid in a .docx; replaced)"
+	}
+	return fmt.Sprintf("stripped %d invalid XML characters (not valid in a .docx; replaced)", n)
+}
+
 // ---------------------------------------------------------------------------
 // Tables
 // ---------------------------------------------------------------------------
@@ -1385,6 +1407,17 @@ type renderCtx struct {
 	// them mutually collision-free by construction rather than by
 	// coincidence: see addFooterRelID's doc comment.
 	nextRelID int
+	// strippedXMLChars accumulates, across every renderRun call this
+	// document's render pass makes (body text, headings, table cells,
+	// code-block lines, and hyperlink display text all go through
+	// renderRun -- see its own doc comment), how many characters
+	// escapeXMLText and decodeHTMLEntities each had to replace with U+FFFD
+	// for being illegal in XML 1.0 content. WriteDocx sums this into a
+	// "stripped N invalid XML character(s)" note once rendering finishes,
+	// so a document that silently sanitized a pasted control character
+	// still tells the caller it did -- see xmlEscapeText's doc comment
+	// (splice.go) for why silence there would be actively wrong.
+	strippedXMLChars int
 }
 
 // hyperlinkRel is one <Relationship> this document needs beyond the two
@@ -1755,20 +1788,33 @@ var htmlEntityRE = regexp.MustCompile(`&(#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z]+);`)
 // literal text "&lt;" a reader sees -- exactly the four characters the
 // source asked for, never a structural "<". See
 // TestWrite_DoubleEscapedEntityStaysLiteral.
-func decodeHTMLEntities(s string) string {
+//
+// A numeric reference (either form) that names a codepoint XML 1.0
+// forbids in document content -- "&#1;" is SOH, "&#x0B;" is vertical tab,
+// neither legal -- is NOT decoded into that raw illegal character: doing
+// so would hand escapeXMLText (splice.go) text containing an already-
+// decoded control byte no different from one pasted in directly, except
+// arriving one step removed from where that function's own doc comment
+// says to look for it. decodeNumericRune (below) substitutes U+FFFD
+// instead, the same replacement xmlEscapeText makes for a directly-pasted
+// illegal character, and counts it the same way, so the two sources add up
+// into one honest total for WriteDocx's "stripped N invalid XML
+// character(s)" note. The second return value is that count.
+func decodeHTMLEntities(s string) (string, int) {
 	if !strings.Contains(s, "&") {
-		return s
+		return s, 0
 	}
-	return htmlEntityRE.ReplaceAllStringFunc(s, func(m string) string {
+	invalid := 0
+	out := htmlEntityRE.ReplaceAllStringFunc(s, func(m string) string {
 		body := m[1 : len(m)-1] // strip leading '&' and trailing ';'
 		switch {
 		case strings.HasPrefix(body, "#x") || strings.HasPrefix(body, "#X"):
 			if n, err := strconv.ParseInt(body[2:], 16, 32); err == nil && n > 0 {
-				return string(rune(n))
+				return decodeNumericRune(rune(n), &invalid)
 			}
 		case strings.HasPrefix(body, "#"):
 			if n, err := strconv.ParseInt(body[1:], 10, 32); err == nil && n > 0 {
-				return string(rune(n))
+				return decodeNumericRune(rune(n), &invalid)
 			}
 		default:
 			if r, ok := namedHTMLEntities[body]; ok {
@@ -1777,6 +1823,20 @@ func decodeHTMLEntities(s string) string {
 		}
 		return m // unrecognized: stays literal
 	})
+	return out, invalid
+}
+
+// decodeNumericRune returns the character a numeric entity's codepoint r
+// decodes to, unless isLegalXMLChar (edit.go) rejects r as illegal in XML
+// 1.0 content, in which case it increments *invalid and returns U+FFFD
+// instead -- see decodeHTMLEntities' doc comment for why a numeric
+// reference must never be allowed to decode into a raw illegal character.
+func decodeNumericRune(r rune, invalid *int) string {
+	if !isLegalXMLChar(r) {
+		*invalid++
+		return string(utf8.RuneError)
+	}
+	return string(r)
 }
 
 // renderRun renders one segment as a <w:r> element. Text is decoded for HTML
@@ -1840,9 +1900,12 @@ func renderRun(seg segment, ctx *renderCtx, codeBlockLine bool) (string, error) 
 	}
 	text := seg.text
 	if !seg.code {
-		text = decodeHTMLEntities(text)
+		var entityInvalid int
+		text, entityInvalid = decodeHTMLEntities(text)
+		ctx.strippedXMLChars += entityInvalid
 	}
-	escaped, err := escapeXMLText(text)
+	escaped, invalid, err := escapeXMLText(text)
+	ctx.strippedXMLChars += invalid
 	if err != nil {
 		return "", err
 	}
@@ -2052,7 +2115,12 @@ func buildRootRelsXML(hasTitle bool) string {
 // since a title containing "&" or "<" would otherwise produce the same
 // "unreadable content" failure as an unescaped run.
 func docPropsCoreXML(title string) (string, error) {
-	escaped, err := escapeXMLText(title)
+	// The count is discarded: WriteOptions.Title is a short caller-supplied
+	// string, not markdown body content, so it falls outside this task's
+	// "code blocks/tables/headings/hyperlink text" note contract -- but it
+	// still goes through the same illegal-character substitution so a
+	// control character in Title can never corrupt docProps/core.xml.
+	escaped, _, err := escapeXMLText(title)
 	if err != nil {
 		return "", fmt.Errorf("escape title: %w", err)
 	}
@@ -2099,7 +2167,12 @@ func buildDocRelsXML(rels []hyperlinkRel, footerRelID, fontTableRelID string) st
 	fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>`, footerRelID)
 	fmt.Fprintf(&b, `<Relationship Id="%s" Type="%s" Target="fontTable.xml"/>`, fontTableRelID, fontTableRelType)
 	for _, r := range rels {
-		escapedURL, _ := escapeXMLText(r.url)
+		// The count is discarded: a link's URL is not the "hyperlink text"
+		// the note contract covers (that's the display text, rendered
+		// through renderRun) -- but the same illegal-character
+		// substitution still applies here so a control character copied
+		// into a URL can never corrupt this Relationship's Target.
+		escapedURL, _, _ := escapeXMLText(r.url)
 		fmt.Fprintf(&b, `<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="%s" TargetMode="External"/>`,
 			r.id, escapedURL)
 	}
