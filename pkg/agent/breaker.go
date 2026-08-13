@@ -76,9 +76,43 @@ const maxConsecutiveValidationFailures = 8
 // before injecting a non-fatal hint nudging the model to change approach.
 // maxRepeatFails: consecutive identical invocations that also fail (including
 // bash non-zero exit) before hard-stopping the run.
+// maxRepeatCallsCumulative / maxRepeatCallsHardStop bound identical calls that
+// are NOT consecutive. maxRepeatCalls above only counts a run of the same key,
+// so the loop that actually burned session 20260812_093415_fc6e was invisible
+// to it: the model cycled read_file over three files (A, B, A, A, B, A …), and
+// every switch reset the consecutive counter before it reached 5. It made 1136
+// read_file calls over 7 distinct paths — 858 of them the same path — without
+// the breaker ever emitting a single hint.
+//
+// Counting per key for the whole run catches any cycle length. A hint goes out
+// every maxRepeatCallsCumulative identical calls, and the run hard-stops at
+// maxRepeatCallsHardStop: by then the model has been told three times and is
+// not recovering on its own, so stopping and reporting beats burning the
+// remaining budget. Both are per (tool, arguments) — a re-read after an edit
+// (different content, same args) is normal and stays well under the floor.
+//
+// maxSameFailureHint / maxSameFailureHardStop bound a failure that repeats
+// IDENTICALLY while the arguments keep changing. Both counters above are keyed
+// on (tool, arguments), so a model that varies cosmetic details of a command
+// evades them completely: `dart test test/reconnect/ | tail -20`, then
+// `| tail -30`, then no pipe at all, then a single test file — four distinct
+// keys, one identical result (`timed out after 120s`, no output), eight
+// attempts, sixteen minutes of wall clock. Keying on the failure TEXT instead
+// of the arguments catches that: same tool, same failure, N times, however the
+// call was spelled.
+//
+// Both thresholds sit ABOVE maxRepeatFails and maxConsecutiveValidationFailures
+// on purpose. This is the outermost net: when a loop fits one of the specific
+// shapes those breakers describe, they should be the ones to name it (their
+// messages are more precise, and the run stops sooner). This one only fires on
+// what they structurally cannot see.
 const (
-	maxRepeatCalls = 5
-	maxRepeatFails = 8
+	maxRepeatCalls           = 5
+	maxRepeatFails           = 8
+	maxRepeatCallsCumulative = 6
+	maxRepeatCallsHardStop   = 24
+	maxSameFailureHint       = 4
+	maxSameFailureHardStop   = 10
 )
 
 // repeatKey builds a deduplication key from tool name and arguments hash.
@@ -106,11 +140,23 @@ type toolCallBreaker struct {
 	repeatCount   int
 	repeatFail    int
 	prevRepeatKey string
+
+	// repeatTotals counts identical invocations across the WHOLE run, keyed
+	// the same way. Unlike repeatCount it never resets, so a model cycling
+	// between two or three calls cannot hide from it.
+	repeatTotals map[string]int
+
+	// sameFailure counts identical FAILURE outcomes per tool, ignoring the
+	// arguments entirely — the one counter a model cannot dodge by rewording
+	// the command it keeps re-running.
+	sameFailure map[string]int
 }
 
 func newToolCallBreaker() *toolCallBreaker {
 	return &toolCallBreaker{
 		validationFailures: make(map[string]int),
+		repeatTotals:       make(map[string]int),
+		sameFailure:        make(map[string]int),
 	}
 }
 
@@ -168,12 +214,56 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 		}
 		return out
 	}
+	// Cumulative repeat detection: same call, anywhere in this run. Catches
+	// cycles (A, B, A, A, B …) that keep resetting the consecutive counter.
+	if b.repeatTotals == nil {
+		b.repeatTotals = make(map[string]int)
+	}
+	b.repeatTotals[rKey]++
+	if total := b.repeatTotals[rKey]; total >= maxRepeatCallsHardStop {
+		err := fmt.Errorf("identical tool call repeated %d times in one run (%q): the run is looping",
+			total, call.Name)
+		out.fatalErr = err
+		out.fatalAgentErr = &AgentError{
+			Code:    "tool_repeat_loop",
+			Message: err.Error(),
+			Suggestion: "The model kept re-running the same call instead of using what it already had. " +
+				"Re-run with a narrower request, or check whether context compression is discarding " +
+				"the tool results it needs (config.yaml: context_window / token_aging).",
+		}
+		return out
+	} else if total%maxRepeatCallsCumulative == 0 && total > b.repeatCount {
+		// total > repeatCount: the consecutive breaker below is not already
+		// hinting about this same streak, so this hint adds information.
+		out.hintMessages = append(out.hintMessages, models.Message{
+			ID:        newMessageID("human"),
+			SessionID: sessionID,
+			Role:      models.RoleHuman,
+			Metadata:  map[string]string{metaAgentInjected: "true"},
+			Content: fmt.Sprintf(
+				"You have now called %q with these exact arguments %d times in this run, "+
+					"cycling between a few calls. The result is not going to change. "+
+					"Work from what you already have in the conversation; if you genuinely cannot "+
+					"see the content you need, say so instead of re-fetching it.",
+				call.Name, total),
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+
+	// Same failure, whatever the arguments were.
+	if obs, stop := b.observeSameFailure(sessionID, call, result); stop {
+		return obs
+	} else if len(obs.hintMessages) > 0 {
+		out.hintMessages = append(out.hintMessages, obs.hintMessages...)
+	}
+
 	// Non-fatal hint: nudge the model to change approach (inject once).
 	if b.repeatCount == maxRepeatCalls {
 		out.hintMessages = append(out.hintMessages, models.Message{
 			ID:        newMessageID("human"),
 			SessionID: sessionID,
 			Role:      models.RoleHuman,
+			Metadata:  map[string]string{metaAgentInjected: "true"},
 			Content: fmt.Sprintf(
 				"You have run %q %d times with identical arguments. "+
 					"If the result isn't changing, you are in a loop. "+
@@ -201,6 +291,7 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 				ID:        newMessageID("human"),
 				SessionID: sessionID,
 				Role:      models.RoleHuman,
+				Metadata:  map[string]string{metaAgentInjected: "true"},
 				Content:   hint,
 				CreatedAt: time.Now().UTC(),
 			})
@@ -221,6 +312,81 @@ func (b *toolCallBreaker) observe(sessionID string, call models.ToolCall, result
 	}
 
 	return out
+}
+
+// observeSameFailure counts this call's outcome against the "same failure,
+// different arguments" ceiling and returns the hint (or the fatal trip) it
+// earns. Successful results are ignored entirely — and deliberately do NOT
+// reset the count: if the identical failure text keeps coming back, whatever
+// happened in between did not fix it.
+//
+// stop reports that the returned observation is fatal and the caller must
+// return it immediately without running the remaining breakers.
+func (b *toolCallBreaker) observeSameFailure(sessionID string, call models.ToolCall, result models.ToolResult) (out breakerObservation, stop bool) {
+	if !isResultFailed(result) {
+		return out, false
+	}
+	if b.sameFailure == nil {
+		b.sameFailure = make(map[string]int)
+	}
+	key := call.Name + "\x00" + failureSignature(result)
+	b.sameFailure[key]++
+	n := b.sameFailure[key]
+
+	if n >= maxSameFailureHardStop {
+		err := fmt.Errorf("%q failed the same way %d times in one run despite changed arguments: %s",
+			call.Name, n, firstLine(failureSignature(result)))
+		out.fatalErr = err
+		out.fatalAgentErr = &AgentError{
+			Code:    "tool_repeat_loop",
+			Message: err.Error(),
+			Suggestion: "The model kept re-running a call that fails identically every time, " +
+				"rewording it instead of changing the approach. Check the failure above — " +
+				"a command that times out with no output usually means it is waiting on " +
+				"something unavailable.",
+		}
+		return out, true
+	}
+	if n == maxSameFailureHint {
+		out.hintMessages = append(out.hintMessages, models.Message{
+			ID:        newMessageID("human"),
+			SessionID: sessionID,
+			Role:      models.RoleHuman,
+			Metadata:  map[string]string{metaAgentInjected: "true"},
+			Content: fmt.Sprintf(
+				"%q has now failed %d times with the SAME result, even though you changed the "+
+					"arguments each time: %s\n"+
+					"Rewording the call is not working. Change what you are doing — a different "+
+					"tool, a smaller scope, a longer timeout — or tell the user what is blocking you.",
+				call.Name, n, firstLine(failureSignature(result))),
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+	return out, false
+}
+
+// failureSignature is the text that identifies "the same failure". Error is
+// preferred (it is what the model was shown, via toolMessageContent) and
+// Content is the fallback for tools that report failure in their payload —
+// bash's non-zero exit_code JSON, for one.
+func failureSignature(result models.ToolResult) string {
+	if strings.TrimSpace(result.Error) != "" {
+		return result.Error
+	}
+	return result.Content
+}
+
+// firstLine trims a failure signature down to something that reads well inside
+// a hint, without dragging a whole captured stdout along.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
 }
 
 // resetOnCleanBatch clears the global consecutive-validation-failure counter

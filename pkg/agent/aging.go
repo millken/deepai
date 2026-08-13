@@ -72,6 +72,23 @@ type AgingConfig struct {
 	ConversationBudgets map[int]int
 }
 
+// metaAgentInjected marks a RoleHuman message the AGENT synthesized mid-run —
+// a circuit-breaker hint, a view_image attachment, a schema-retry prompt —
+// rather than one the user actually sent. Only real user messages open a new
+// turn on the age axis (see buildPromptView): a synthetic one would age out
+// everything the model is currently working with, which is precisely the
+// failure this axis exists to prevent. The key rides in Message.Metadata,
+// which is in-memory only (the messages table has no metadata column); that is
+// enough, because it only has to hold for the run that injected it — after a
+// reload the message is history, and counting it as a turn there merely makes
+// older material age slightly faster.
+const metaAgentInjected = "agent_injected"
+
+// opensUserTurn reports whether msg starts a new user turn for aging purposes.
+func opensUserTurn(msg models.Message) bool {
+	return msg.Role == models.RoleHuman && msg.Metadata[metaAgentInjected] != "true"
+}
+
 // truncateRuneSafe cuts s to at most n bytes without splitting a multi-byte
 // UTF-8 rune (backing up to the nearest rune start). Slicing by raw byte index
 // would emit invalid UTF-8 for CJK content, which strict providers reject.
@@ -135,8 +152,8 @@ func (c *AgingConfig) conversationBudget(age int) int {
 // buildPromptView derives a request-scoped compressed view of the canonical
 // message history. Historical RoleTool Content (T1) and RoleAI Content (T4) are
 // truncated by age; ToolResult/ToolCalls structure and the canonical messages
-// themselves are left intact. Age is computed by scanning assistant-turn indices
-// (see docs/spec/token-efficiency.md §T1), never from a Run turn counter.
+// themselves are left intact. Age is computed by scanning USER-turn indices (see
+// docs/spec/token-efficiency.md §T1), never from a Run turn counter.
 //
 // contextWindow is the model's window in tokens, used only for the pressure gate.
 func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow int) []models.Message {
@@ -161,20 +178,40 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 		}
 	}
 
-	// Pass 1: assign each message the aiTurnIndex it belongs to. Every RoleAI
-	// message (with or without tool_calls) advances the index; a RoleTool message
-	// inherits the index of the most recent RoleAI before it.
-	aiTurnIndex := -1
+	// Pass 1: assign each message the user-turn index it belongs to. Every
+	// RoleHuman message opens a new turn; the assistant messages and tool
+	// results it produces inherit its index, so everything the agent did while
+	// working on one user request shares one age.
+	//
+	// The axis used to be per-RoleAI-message, which is what caused the read
+	// loop: this agent's models emit ONE tool call per assistant message, so
+	// "age 3" — where read_file's budget floors at 300 bytes and the result is
+	// stamped "re-call read_file to see full output" — arrived after three tool
+	// calls. Reading a fourth file evicted the first, the model re-read it
+	// (as instructed), and that re-read evicted the next: session
+	// 20260812_093415_fc6e spent 1136 read_file calls cycling over 7 files. The
+	// spec's original axis assumed one assistant message batches several tool
+	// calls; with one call per message it made the working set of a single
+	// request unretainable. Age now means "how many user requests ago", so
+	// nothing the model is still working on is ever truncated out from under
+	// it, and in-request overflow is left to compaction (the destructive
+	// last resort) rather than handled by silently deleting the working set.
+	turnIndex := -1
 	ownerTurn := make([]int, len(messages))
 	for i, msg := range messages {
-		if msg.Role == models.RoleAI {
-			aiTurnIndex++
+		if opensUserTurn(msg) {
+			turnIndex++
 		}
-		ownerTurn[i] = aiTurnIndex
+		ownerTurn[i] = turnIndex
+		if ownerTurn[i] < 0 {
+			// Before the first user message (system prompt, carried state):
+			// treat as belonging to the first turn.
+			ownerTurn[i] = 0
+		}
 	}
-	totalAITurns := aiTurnIndex + 1
-	if totalAITurns == 0 {
-		return messages // no assistant turns yet, nothing to age
+	totalTurns := turnIndex + 1
+	if totalTurns == 0 {
+		return messages // no user request yet, nothing to age
 	}
 
 	// Pass 2: derive the view. Shallow-copy the slice; only Content strings are
@@ -185,9 +222,9 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 
 	for i := range view {
 		msg := &view[i]
-		age := totalAITurns - 1 - ownerTurn[i]
+		age := totalTurns - 1 - ownerTurn[i]
 		if age <= 0 {
-			continue // current turn (or pre-first-AI): keep full fidelity
+			continue // current user request: keep full fidelity
 		}
 
 		// Images: strip base64 data from aged messages to save tokens. The

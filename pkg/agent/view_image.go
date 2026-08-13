@@ -63,7 +63,7 @@ func imagesMessage(sessionID string, images []models.MessageImage) models.Messag
 		Role:      models.RoleHuman,
 		Content:   formatImagesText(len(images)),
 		Images:    images,
-		Metadata:  map[string]string{"transient_images": "true"},
+		Metadata:  map[string]string{"transient_images": "true", metaAgentInjected: "true"},
 		CreatedAt: time.Now().UTC(),
 	}
 }

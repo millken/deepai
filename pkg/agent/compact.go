@@ -13,8 +13,13 @@ import (
 const (
 	defaultCompactionThreshold = 0.75
 	defaultCompactionKeepTail  = 6
-	compactToolResultKeep    = 300
-	compactAssistantTextKeep = 200
+	compactToolResultKeep      = 300
+	compactAssistantTextKeep   = 200
+	// summarizedToolResultPrefix / compactAssistantTextSuffix are the markers
+	// that let compaction recognize its OWN output and leave it alone. See
+	// summarizeOldToolResult for why re-summarizing is destructive.
+	summarizedToolResultPrefix = "[tool result: "
+	compactAssistantTextSuffix = " [...]"
 	// compactToolCallArgsKeep is the max JSON byte size for a compacted
 	// tool call's Arguments. Arguments larger than this are replaced with a
 	// placeholder so compaction actually saves space, while small Arguments
@@ -320,31 +325,89 @@ func compactAssistantMessage(msg models.Message) models.Message {
 				names = append(names, tc.Name)
 			}
 			out.Content = fmt.Sprintf("[Called %s]", strings.Join(names, ", "))
-		} else if len(msg.Content) > compactAssistantTextKeep {
-			out.Content = msg.Content[:compactAssistantTextKeep] + " [...]"
 		} else {
-			out.Content = msg.Content
+			out.Content = compactAssistantText(msg.Content)
 		}
-	} else if len(msg.Content) > compactAssistantTextKeep {
-		out.Content = msg.Content[:compactAssistantTextKeep] + " [...]"
 	} else {
-		// Short enough, keep verbatim (but still copy to new struct).
-		out.Content = msg.Content
+		out.Content = compactAssistantText(msg.Content)
 	}
 
 	return out
 }
 
+// compactAssistantText truncates historical assistant text, and — like
+// summarizeOldToolResult — is idempotent: text already carrying the truncation
+// marker is returned untouched rather than re-cut. Re-cutting rune-safely would
+// eat a few bytes of real text per pass and append a second marker every time
+// compaction ran.
+func compactAssistantText(content string) string {
+	if strings.HasSuffix(content, compactAssistantTextSuffix) {
+		return content
+	}
+	if len(content) <= compactAssistantTextKeep {
+		return content // short enough, keep verbatim
+	}
+	return truncateRuneSafe(content, compactAssistantTextKeep) + compactAssistantTextSuffix
+}
+
+// summarizeOldToolResult rewrites a historical tool result down to its first
+// compactToolResultKeep bytes, wrapped in a marker naming the tool.
+//
+// It MUST be idempotent. Compaction runs again on every turn that is over
+// threshold, and the escalation loop in maybeCompact re-runs it over
+// already-compacted messages with smaller tails, so a summary that summarized
+// its own output would nest: with a 25-byte wrapper and only the first 300
+// bytes kept, twelve passes leave nothing but "[tool result: read_file,"
+// prefixes and the payload is gone — permanently, since the compacted messages
+// become the canonical history and get persisted. The model then re-reads the
+// files it can no longer see, which pushes the context back over threshold,
+// which compacts again: the read loop observed in session
+// 20260812_093415_fc6e (1136 read_file calls over 7 distinct files).
+//
+// Returning msg.Content unchanged for an already-summarized message also keeps
+// compactMessages honest about whether it actually compacted anything, which is
+// what lets the compaction-stall guard in maybeCompact engage instead of
+// re-compacting the same tail every turn forever.
 func summarizeOldToolResult(msg models.Message) string {
-	toolName := "unknown"
-	if msg.ToolResult != nil {
-		toolName = msg.ToolResult.ToolName
+	if isSummarizedToolResult(msg.Content) {
+		// Sessions compacted by the buggy version carry nested placeholders
+		// whose payload is already gone — 300 bytes of "[tool result:
+		// read_file, [tool result: read_file, …" per message, ~110k tokens of
+		// pure noise across the session that started this investigation. They
+		// cannot be repaired, but they can stop costing context: collapse them
+		// to one honest line. A single-level summary is left exactly as is,
+		// which is what keeps this function idempotent.
+		if strings.Count(msg.Content, summarizedToolResultPrefix) > 1 {
+			return fmt.Sprintf("%s%s, content lost to an earlier compaction bug]",
+				summarizedToolResultPrefix, toolNameOf(msg))
+		}
+		return msg.Content
 	}
-	content := msg.Content
-	if len(content) > compactToolResultKeep {
-		content = content[:compactToolResultKeep]
+	toolName := toolNameOf(msg)
+	// truncateRuneSafe, not a raw byte slice: cutting mid-rune emits invalid
+	// UTF-8, which strict providers reject outright (same reason aging.go uses
+	// it — CJK tool output makes this the common case, not the edge case).
+	content := truncateRuneSafe(msg.Content, compactToolResultKeep)
+	return fmt.Sprintf("%s%s, %s...]", summarizedToolResultPrefix, toolName, content)
+}
+
+// toolNameOf names the tool a result came from, for summaries and markers.
+func toolNameOf(msg models.Message) string {
+	if msg.ToolResult != nil && msg.ToolResult.ToolName != "" {
+		return msg.ToolResult.ToolName
 	}
-	return fmt.Sprintf("[tool result: %s, %s...]", toolName, content)
+	return "unknown"
+}
+
+// isSummarizedToolResult reports whether content is already the output of
+// summarizeOldToolResult — either a truncated summary or the collapsed marker
+// for a legacy nested one. Requiring the closing bracket as well as the prefix
+// keeps a genuine tool result that merely happens to start with those bytes
+// from being mistaken for a summary; if one ever does slip through, the only
+// consequence is that it is left verbatim instead of being truncated.
+func isSummarizedToolResult(content string) bool {
+	return strings.HasPrefix(content, summarizedToolResultPrefix) &&
+		strings.HasSuffix(content, "]")
 }
 
 func resolveCompactionThreshold(v float64) float64 {

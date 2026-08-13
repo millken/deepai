@@ -51,14 +51,58 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		Stderr:   stderr,
 		ExitCode: result.ExitCode(),
 	}
+	if result.TimedOut() {
+		output.TimedOut = true
+		output.DurationSeconds = result.Duration().Seconds()
+	}
 	data, _ := json.Marshal(output)
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
+	res := models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}
+	if result.TimedOut() {
+		// Status makes the failure legible to the circuit-breaker, the provider
+		// (is_error) and the UI; Error carries the explanation, since
+		// toolMessageContent shows Error INSTEAD OF Content — so it has to hold
+		// the partial output too, or the model would lose it.
+		res.Status = models.CallStatusFailed
+		res.Error = timeoutMessage(timeout, result.Duration(), stdout, stderr)
+	}
+	return res, nil
+}
+
+// timeoutMessage explains a killed command to the model.
+//
+// A silent hang is the worst case for an agent: exit code -1 is also what
+// "failed to start" looks like, and with no output there is nothing to reason
+// about, so the model's only obvious move is to run it again — 8 times, 120s
+// apiece, in session 20260812_093415_fc6e. The message therefore states what
+// happened, that re-running verbatim will hang again, and what the actual
+// alternatives are.
+func timeoutMessage(limit, elapsed time.Duration, stdout, stderr string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "command TIMED OUT after %.0fs (limit %.0fs) and its process group was killed.",
+		elapsed.Seconds(), limit.Seconds())
+
+	partial := strings.TrimSpace(stdout + "\n" + stderr)
+	if partial == "" {
+		b.WriteString(" It produced NO output at all before the kill, so there is nothing to inspect" +
+			" — and re-running the same command will hang the same way." +
+			" Do something different: raise the timeout, run a narrower subset," +
+			" add a flag that makes it non-interactive or more verbose," +
+			" or check whether it is waiting on something unavailable (network, a prompt, a lock).")
+	} else {
+		b.WriteString(" Output captured before the kill (incomplete):\n")
+		b.WriteString(partial)
+	}
+	return b.String()
 }
 
 type BashOutput struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	ExitCode int    `json:"exit_code"`
+	// TimedOut distinguishes "killed for running too long" from an exit code
+	// of -1 for any other reason. DurationSeconds is only set alongside it.
+	TimedOut        bool    `json:"timed_out,omitempty"`
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 }
 
 // truncateOutput truncates output to fit within maxBytes, preserving head 70% and tail 30%

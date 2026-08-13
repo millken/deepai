@@ -203,6 +203,33 @@ export NO_PROXY=localhost,127.0.0.1,.internal   # 例外列表
 
 ---
 
+## API Key 密封
+
+API key 默认以明文存在 `~/.deepai/.env`。任何 CLI agent —— 包括 deepai 自己 —— 都能用 `read_file` 或 `grep` 读到它，然后把它送进远端模型的上下文与日志。密封把文件里的值换成绑定本机磁盘序列号的密文，让读取这个文件的收益归零。
+
+```bash
+deepai key seal            # 把 .env 里现存的明文密钥就地加密
+deepai key set anthropic   # 录入新密钥并直接以密文存储
+deepai key list            # 查看每个密钥是密文、明文还是缺失
+deepai key check           # 查看本机的绑定来源与各密钥能否解密
+```
+
+密封后 `.env` 长这样：
+
+```
+ANTHROPIC_API_KEY=enc:v1:RFBLMQEBAWQ4ZDI3M2EwNmY0NGM5YjljOWM1YmM5...
+```
+
+解密发生在真正发出请求之前，所以进程环境变量里存的也是密文 —— `printenv` 和 `/proc/<pid>/environ` 同样看不到明文。
+
+**绑定与容错。** 密钥绑定到本机固定磁盘的序列号，每块盘各封装一份，因此换掉多块盘中的一块不会锁死。密文拷到另一台机器则无法解密。云主机、WSL2 与部分虚拟机不报可用的磁盘序列号，此时自动降级绑定到 OS 安装 ID，再不行降级为纯混淆 —— 但绝不退回明文。`deepai key check` 会明确显示当前处于哪一级。
+
+**这不是抗本地攻击者的密码学保护。** deepai 以你自己的身份运行，因此凡是它能无交互拿到的密钥材料，同用户的其他进程原理上也能拿到。它提供的是成本壁垒：意外泄露被完全阻断，而拿到明文需要刻意的多步操作。刻意没有提供打印已存密钥的命令。
+
+**向后兼容。** 明文密钥永久可用，现有安装无需任何改动。CI 与容器环境可以继续用明文环境变量。
+
+---
+
 ## 命令行参考
 
 DeepAI 基于 cobra 构建。根命令直接进入 REPL，子命令提供管理功能。
@@ -558,7 +585,7 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 | 机制 | 说明 | 启用方式 |
 |------|------|---------|
 | **Phase 0 指标** | 每轮记录 provider token 数与各工具结果字节桶，输出为 JSONL | `token_metrics: "1"` 或 `DEEPAI_TOKEN_METRICS=1` |
-| **T1 工具结果老化** | 历史工具结果按年龄压缩（上下文压力 >40% 时触发） | `token_aging: true` 或 `DEEPAI_TOKEN_AGING=1` |
+| **T1 工具结果老化** | 历史工具结果按年龄压缩，age 以**用户轮次**计（上下文压力 >40% 时触发；当前请求内的工具结果永不压缩） | `token_aging: true` 或 `DEEPAI_TOKEN_AGING=1` |
 | **T4 对话压缩** | 历史 AI 消息文本与 ToolCall 参数按年龄压缩 | 待校准（配置预留） |
 | **上下文压缩** | 上下文窗口 75% 时自动压缩，保留最近 N 条 | 默认启用（需 `context_window > 0`） |
 

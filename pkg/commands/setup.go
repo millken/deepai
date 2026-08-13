@@ -1,15 +1,21 @@
 package commands
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"charm.land/huh/v2"
+	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/secret"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -43,6 +49,18 @@ type Config struct {
 	// context pressure passes 40% of the window. The DEEPAI_TOKEN_AGING env var,
 	// when set, takes precedence.
 	TokenAging bool `yaml:"token_aging,omitempty"`
+
+	// MemoryAutoRefineDisabled turns off the auto-refine review gate. The field is
+	// named for the disabled state on purpose: a plain bool cannot express a
+	// default of true, since an absent key and an explicit false both unmarshal
+	// to the zero value. Zero here means enabled, which is the default we want.
+	// Disabling the gate falls back to unconditional extraction; it never stops
+	// memory extraction.
+	MemoryAutoRefineDisabled bool `yaml:"memory_auto_refine_disabled,omitempty"`
+	// MemoryRefineInterval is the turn cadence for the auto-refine gate. 0 (or
+	// absent) means "use the default"; a negative value disables auto-refine.
+	// Always read it through resolveRefineInterval, never directly.
+	MemoryRefineInterval int `yaml:"memory_refine_interval,omitempty"`
 
 	// Models defines multiple named model entries for multi-model support.
 	// Each entry binds an alias to a provider+model pair. When non-empty, the
@@ -283,7 +301,6 @@ func runSetupDatabase(cmd *cobra.Command, args []string) error {
 // --- Setup sections ---
 
 func setupProvider(cfg *Config, envPath string) error {
-	oldProvider := cfg.Provider
 	provider := cfg.Provider
 	providerOpts := huh.NewOptions[string]()
 	for _, name := range providerNames() {
@@ -300,27 +317,35 @@ func setupProvider(cfg *Config, envPath string) error {
 	cfg.Provider = provider
 
 	info := providerInfo[provider]
-	// Read key for the NEW provider (may differ from old one).
-	apiKey := loadEnvValue(envPath, info.envVar)
-	// If provider changed and new provider has no key, clear default.
-	if provider != oldProvider && apiKey == "" {
-		apiKey = ""
+	// The stored key is sealed on disk. Prefilling the form would mean
+	// decrypting it back into memory for no benefit, so an empty answer
+	// means "keep what is there".
+	title := fmt.Sprintf("API key (%s)", info.envVar)
+	if loadEnvValue(envPath, info.envVar) != "" {
+		title += " — leave blank to keep the current key"
 	}
 
+	var apiKey string
 	if err := huh.NewInput().
-		Title(fmt.Sprintf("API key (%s)", info.envVar)).
+		Title(title).
 		Value(&apiKey).
 		EchoMode(huh.EchoModePassword).
 		Run(); err != nil {
 		return err
 	}
 
-	// Save API key to .env immediately.
 	if apiKey != "" {
-		if err := saveEnvValue(envPath, info.envVar, apiKey); err != nil {
+		sealed, err := secret.Seal(apiKey)
+		if err != nil {
+			return fmt.Errorf("seal API key: %w", err)
+		}
+		if err := saveEnvValue(envPath, info.envVar, sealed); err != nil {
 			return fmt.Errorf("save .env: %w", err)
 		}
-		fmt.Printf("  Saved API key to %s\n", envPath)
+		fmt.Printf("  Saved sealed API key to %s\n", envPath)
+		if w := sealWarning(); w != "" {
+			fmt.Println(w)
+		}
 	}
 
 	// Base URL (optional for any provider).
@@ -388,7 +413,72 @@ func LoadConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	warnUnknownConfigKeys(path, data)
 	return cfg, nil
+}
+
+// warnUnknownConfigKeys reports config keys the decoder did not recognize.
+//
+// A mistyped key is silently dropped by yaml.Unmarshal, and a silently dropped
+// key means the setting the user wrote is simply not in effect — with no
+// feedback anywhere. That is not hypothetical: `cotext_window: 1000000`
+// (missing an "n") left the context window at the 192k default, which moved
+// aging's 40% gate and compaction's 75% trigger about 5x earlier than intended
+// and helped drive a read loop through a whole session before anyone noticed.
+//
+// Deliberately a warning, not an error: a config file written by a newer or
+// older deepai must keep loading. Unrecognized keys are ignored exactly as
+// before — the only change is that you hear about it.
+func warnUnknownConfigKeys(path string, data []byte) {
+	for _, key := range unknownConfigKeys(data) {
+		msg := fmt.Sprintf("%s: unknown key %q was ignored — check for a typo", path, key.name)
+		if key.line > 0 {
+			msg = fmt.Sprintf("%s line %d: unknown key %q was ignored — check for a typo",
+				path, key.line, key.name)
+		}
+		fmt.Fprintf(os.Stderr, "  config warning: %s\n", msg)
+		slog.Warn("unknown config key ignored", "path", path, "key", key.name, "line", key.line)
+	}
+}
+
+// configKeyIssue is one unrecognized key: its name and, when yaml reported it,
+// the line it sits on.
+type configKeyIssue struct {
+	name string
+	line int
+}
+
+// unknownFieldRE matches gopkg.in/yaml.v3's KnownFields complaint, e.g.
+// `line 5: field cotext_window not found in type commands.Config`. The line
+// prefix is absent for some documents, hence the optional group.
+var unknownFieldRE = regexp.MustCompile(`(?:line (\d+): )?field (\S+) not found in type`)
+
+// unknownConfigKeys re-decodes data in strict mode purely to collect the keys
+// Config does not declare. Type errors (a string where an int belongs) are
+// skipped: those are the business of the real Unmarshal in LoadConfig, which
+// reports them as errors and whose verdict must not be second-guessed here.
+func unknownConfigKeys(data []byte) []configKeyIssue {
+	var probe Config
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	err := dec.Decode(&probe)
+	if err == nil {
+		return nil
+	}
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return nil // EOF on an empty file, or a syntax error LoadConfig already surfaced
+	}
+	var out []configKeyIssue
+	for _, e := range typeErr.Errors {
+		m := unknownFieldRE.FindStringSubmatch(e)
+		if m == nil {
+			continue
+		}
+		line, _ := strconv.Atoi(m[1])
+		out = append(out, configKeyIssue{name: m[2], line: line})
+	}
+	return out
 }
 
 func saveConfig(path string, cfg *Config) error {
@@ -404,17 +494,18 @@ func saveConfig(path string, cfg *Config) error {
 	return nil
 }
 
+// loadEnvValue reads one key from a .env file using the same parsing rules as
+// goenv (env.Load): quotes are stripped, inline comments removed, the export
+// prefix honored. This must agree with how root.go loads .env into the process
+// environment, otherwise the value a CLI command sees here would differ from
+// the value the provider receives at runtime -- which is how a key written as
+// KEY="value" once got its quote characters sealed into the ciphertext.
 func loadEnvValue(path, key string) string {
-	data, err := os.ReadFile(path)
+	m, err := env.ReadMap(path)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if val, ok := strings.CutPrefix(line, key+"="); ok {
-			return val
-		}
-	}
-	return ""
+	return m[key]
 }
 
 func saveEnvValue(path, key, value string) error {
@@ -438,7 +529,60 @@ func saveEnvValue(path, key, value string) error {
 	}
 
 	content := strings.Join(lines, "\n")
-	return os.WriteFile(path, []byte(content), 0600)
+	return writeEnvAtomic(path, []byte(content))
+}
+
+// writeEnvAtomic replaces path's contents without ever exposing a partial
+// or world-readable file. os.CreateTemp creates at 0600, so the mode is
+// right from creation rather than being widened and then narrowed. The temp
+// file is made in the same directory because rename is only atomic within
+// one filesystem.
+func writeEnvAtomic(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".env-tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmp := f.Name()
+	// A no-op once the rename below succeeds; on any earlier failure it
+	// keeps a copy of the credentials from being left behind.
+	defer os.Remove(tmp)
+
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// sealWarning returns a message when this host cannot bind sealed keys to
+// hardware, and "" when it can. Degrading is a silent loss of protection,
+// so it must be stated rather than assumed.
+func sealWarning() string {
+	info := secret.Fingerprint()
+	switch info.Mode {
+	case secret.ModeHardware:
+		return ""
+	case secret.ModeInstall:
+		return "  Note: no disk serial number is readable here, so the key is bound to\n" +
+			"  this OS install rather than to hardware. Reinstalling the OS will\n" +
+			"  require re-entering it."
+	default:
+		return "  Warning: no disk serial number and no OS machine ID are readable here\n" +
+			"  (common on cloud instances and WSL2), so the key is obfuscated but NOT\n" +
+			"  bound to this machine: anyone with the file and a deepai binary can\n" +
+			"  read it. It is still safe from tools that merely read the file."
+	}
 }
 
 func createDefaultDeepaiMD(dir string) {

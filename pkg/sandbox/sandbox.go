@@ -526,5 +526,11 @@ func ExecDirect(ctx context.Context, cmd string, timeout time.Duration) (*Result
 		}
 	}
 
-	return NewResult(stdoutBuf.String(), stderrBuf.String(), exitCode, duration, nil), nil
+	// Deadline exceeded means the kill above was ours (or an enclosing
+	// deadline's), not the command exiting: report it so the caller can say so
+	// instead of passing on a bare exit code of -1. A parent CANCEL (Ctrl-C)
+	// yields context.Canceled and is deliberately not reported as a timeout.
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+
+	return NewResult(stdoutBuf.String(), stderrBuf.String(), exitCode, duration, nil).WithTimedOut(timedOut), nil
 }

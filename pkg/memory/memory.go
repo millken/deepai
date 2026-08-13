@@ -83,6 +83,8 @@ type Service struct {
 	logger        *slog.Logger
 	updateTimeout time.Duration
 	queue         *UpdateQueue
+	reviewer      Reviewer // optional auto-refine review gate
+	verdicts      sync.Map // pairID → gateVerdict ; handed between paired refine jobs
 	sessionMu     sync.Map // sessionID → *sync.Mutex ; serializes Update-to-Save per session
 	lastRetrieved struct {
 		mu   sync.RWMutex

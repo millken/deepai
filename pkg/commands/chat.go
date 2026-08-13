@@ -265,7 +265,12 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	if err := memService.AutoMigrate(ctx); err != nil {
 		slog.Warn("memory auto-migrate failed", "err", err)
 	}
-	memExtractor = memory.NewLLMClient(defaultProvider, defaultModelName)
+	memClient := memory.NewLLMClient(defaultProvider, defaultModelName)
+	memExtractor = memClient
+	// The same client answers the auto-refine gate. Without a reviewer the gate
+	// fails open and every checkpoint extracts unconditionally, so wiring this is
+	// what makes auto-refine an optimisation rather than a no-op.
+	memService.WithReviewer(memClient)
 	prefExtractor = memory.NewPreferenceExtractor(defaultProvider, defaultModelName)
 	slog.Debug("memory service enabled", "store", dbPath)
 
@@ -298,28 +303,30 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Build REPL config.
 	replCfg := chat.ReplConfig{
-		Provider:            cfg.Provider,
-		ModelRegistry:       modelRegistry,
-		DatabaseURL:         cfg.DatabaseURL,
-		ContextWindow:       cfg.ContextWindow,
-		MaxTurns:            maxTurns,
-		RequestTimeout:      resolveRequestTimeout(cfg.RequestTimeout),
-		Query:               query,
-		ResumeSession:       resume,
-		ContinueLast:        continueLast,
-		SystemPrompt:        systemPrompt,
-		WorkDir:             workDir,
-		ToolRegistry:        registry,
-		SkillRegistry:       skillReg,
-		MemoryService:       memService,
-		MemoryExtractor:     memExtractor,
-		PreferenceExtractor: prefExtractor,
-		SessionRepo:         sessStore,
-		InputHistoryFile:    InputHistoryFile(),
-		SandboxBaseDir:      SandboxDir(),
-		MCPReport:           startupReport,
-		Commands:            commands,
-		AgentCatalog:        agentCatalog,
+		Provider:             cfg.Provider,
+		ModelRegistry:        modelRegistry,
+		DatabaseURL:          cfg.DatabaseURL,
+		ContextWindow:        cfg.ContextWindow,
+		MaxTurns:             maxTurns,
+		RequestTimeout:       resolveRequestTimeout(cfg.RequestTimeout),
+		Query:                query,
+		ResumeSession:        resume,
+		ContinueLast:         continueLast,
+		SystemPrompt:         systemPrompt,
+		WorkDir:              workDir,
+		ToolRegistry:         registry,
+		SkillRegistry:        skillReg,
+		MemoryService:        memService,
+		MemoryAutoRefine:     !cfg.MemoryAutoRefineDisabled,
+		MemoryRefineInterval: resolveRefineInterval(cfg.MemoryRefineInterval),
+		MemoryExtractor:      memExtractor,
+		PreferenceExtractor:  prefExtractor,
+		SessionRepo:          sessStore,
+		InputHistoryFile:     InputHistoryFile(),
+		SandboxBaseDir:       SandboxDir(),
+		MCPReport:            startupReport,
+		Commands:             commands,
+		AgentCatalog:         agentCatalog,
 	}
 
 	repl, err := chat.NewRepl(replCfg)
@@ -366,6 +373,29 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 func subagentMaxTokens() *int {
 	n := agent.ResolveMaxOutputTokens()
 	return &n
+}
+
+// defaultRefineInterval is the auto-refine gate cadence when config says
+// nothing. It matches the extraction cadence it replaces, so enabling the gate
+// changes what a checkpoint costs, not how often one happens.
+const defaultRefineInterval = 5
+
+// resolveRefineInterval maps a config value to a usable cadence: absent (0)
+// takes the default, negative disables auto-refine, positive is used as is.
+//
+// The zero case matters. Most config files never mention this key, so reading
+// the field directly would hand the REPL an interval of 0. Guarding on
+// "interval > 0" would then schedule neither a gated refine nor a fallback
+// extraction, and memory would quietly stop being written.
+func resolveRefineInterval(turns int) int {
+	switch {
+	case turns == 0:
+		return defaultRefineInterval
+	case turns < 0:
+		return 0
+	default:
+		return turns
+	}
 }
 
 // resolveRequestTimeout converts a config value (in minutes) to a duration.

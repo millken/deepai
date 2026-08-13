@@ -434,8 +434,10 @@ func TestCompactOnOverflow_MeasuresAgedViewNotCanonicalBytes(t *testing.T) {
 
 	big := strings.Repeat("z", 8000)
 	var msgs []models.Message
+	// One user turn per read, so the aged view is genuinely smaller than
+	// canonical (age is measured in user turns — see buildPromptView).
 	for i := 0; i < 10; i++ {
-		msgs = append(msgs, aiTools(""), toolMsg("read_file", big))
+		msgs = append(msgs, human("read another file"), aiTools(""), toolMsg("read_file", big))
 	}
 
 	a := &Agent{

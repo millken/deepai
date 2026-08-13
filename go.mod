@@ -9,8 +9,9 @@ require (
 	github.com/alecthomas/chroma/v2 v2.27.0
 	github.com/anthropics/anthropic-sdk-go v1.61.0
 	github.com/charmbracelet/glamour v1.0.0
-	github.com/dnsoa/go/env v1.0.0
+	github.com/dnsoa/go/env v1.0.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jaypipes/ghw v0.25.0
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/mattn/go-runewidth v0.0.27
 	github.com/openai/openai-go/v3 v3.49.0
@@ -31,9 +32,11 @@ require (
 	github.com/charmbracelet/x/exp/slice v0.0.0-20260730164118-7e2d3e6c5238 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/dlclark/regexp2/v2 v2.5.2 // indirect
+	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/itlightning/dateparse v0.2.1 // indirect
+	github.com/jaypipes/pcidb v1.1.1 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
@@ -46,9 +49,11 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/yuin/goldmark v1.8.5 // indirect
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
+	howett.net/plist v1.0.2-0.20250314012144-ee69052608d9 // indirect
 )
 
 require (

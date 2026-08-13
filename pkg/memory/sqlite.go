@@ -79,6 +79,15 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_memory_facts_session_updated
 			ON memory_facts(session_id, updated_at DESC, id ASC)`,
+		`CREATE TABLE IF NOT EXISTS memory_refinements (
+			session_id TEXT NOT NULL REFERENCES memories(session_id) ON DELETE CASCADE,
+			id         TEXT NOT NULL,
+			record     TEXT NOT NULL,
+			created_at REAL NOT NULL,
+			PRIMARY KEY (session_id, id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_refinements_session
+			ON memory_refinements(session_id, created_at DESC)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("create memory table: %w", err)
@@ -118,6 +127,14 @@ func (s *SQLiteStore) Save(ctx context.Context, doc Document) error {
 	if err := prepareDocument(&doc); err != nil {
 		return err
 	}
+	return s.inTx(ctx, doc.SessionID, func(tx *sql.Tx) error {
+		return s.saveDocumentTx(ctx, tx, doc)
+	})
+}
+
+// inTx runs fn inside a transaction, rolling back unless fn and the commit
+// both succeed.
+func (s *SQLiteStore) inTx(ctx context.Context, sessionID string, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin memory transaction: %w", err)
@@ -128,6 +145,18 @@ func (s *SQLiteStore) Save(ctx context.Context, doc Document) error {
 			_ = tx.Rollback()
 		}
 	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit memory %q: %w", sessionID, err)
+	}
+	committed = true
+	return nil
+}
+
+// saveDocumentTx upserts the document and replaces its fact set within tx.
+func (s *SQLiteStore) saveDocumentTx(ctx context.Context, tx *sql.Tx, doc Document) error {
 	if err := s.upsertDocument(ctx, tx, doc); err != nil {
 		return err
 	}
@@ -139,10 +168,6 @@ func (s *SQLiteStore) Save(ctx context.Context, doc Document) error {
 			return err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit memory %q: %w", doc.SessionID, err)
-	}
-	committed = true
 	return nil
 }
 
@@ -325,4 +350,153 @@ func parseDBTime(value float64) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(int64(value), 0).UTC()
+}
+
+// --- RefinementStore ---------------------------------------------------------
+
+// maxRefinementsPerSession bounds refinement history per storage key. Records
+// are trimmed oldest-first on every insert so history cannot grow without end.
+const maxRefinementsPerSession = 50
+
+func (s *SQLiteStore) ListRefinements(ctx context.Context, sessionID string, limit int) ([]RefinementRecord, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if limit <= 0 {
+		limit = maxRefinementsPerSession
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		select record
+		from memory_refinements
+		where session_id = ?
+		order by created_at desc, id desc
+		limit ?
+	`, sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list refinements for %q: %w", sessionID, err)
+	}
+	defer rows.Close()
+
+	var records []RefinementRecord
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scan refinements for %q: %w", sessionID, err)
+		}
+		var record RefinementRecord
+		if err := json.Unmarshal([]byte(data), &record); err != nil {
+			return nil, fmt.Errorf("decode refinement for %q: %w", sessionID, err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list refinements for %q: %w", sessionID, err)
+	}
+	return records, nil
+}
+
+func (s *SQLiteStore) GetRefinement(ctx context.Context, sessionID, id string) (RefinementRecord, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	id = strings.TrimSpace(id)
+	row := s.db.QueryRowContext(ctx,
+		`select record from memory_refinements where session_id = ? and id = ?`,
+		sessionID, id,
+	)
+	var data string
+	if err := row.Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RefinementRecord{}, ErrNotFound
+		}
+		return RefinementRecord{}, fmt.Errorf("load refinement %q for %q: %w", id, sessionID, err)
+	}
+	var record RefinementRecord
+	if err := json.Unmarshal([]byte(data), &record); err != nil {
+		return RefinementRecord{}, fmt.Errorf("decode refinement %q: %w", id, err)
+	}
+	return record, nil
+}
+
+func (s *SQLiteStore) InsertRefinement(ctx context.Context, sessionID string, record RefinementRecord) error {
+	sessionID = strings.TrimSpace(sessionID)
+	return s.inTx(ctx, sessionID, func(tx *sql.Tx) error {
+		return s.insertRefinementTx(ctx, tx, sessionID, record)
+	})
+}
+
+func (s *SQLiteStore) DeleteRefinement(ctx context.Context, sessionID, id string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	_, err := s.db.ExecContext(ctx,
+		`delete from memory_refinements where session_id = ? and id = ?`,
+		sessionID, strings.TrimSpace(id),
+	)
+	if err != nil {
+		return fmt.Errorf("delete refinement %q for %q: %w", id, sessionID, err)
+	}
+	return nil
+}
+
+// SaveWithRefinement commits the document and its refinement record together.
+// Splitting them would allow facts to change with no record to roll back by —
+// exactly the state refinement history exists to prevent.
+func (s *SQLiteStore) SaveWithRefinement(ctx context.Context, doc Document, record RefinementRecord) error {
+	if err := prepareDocument(&doc); err != nil {
+		return err
+	}
+	return s.inTx(ctx, doc.SessionID, func(tx *sql.Tx) error {
+		// Document first: memory_refinements.session_id references memories,
+		// and foreign_keys(1) is on in the DSN.
+		if err := s.saveDocumentTx(ctx, tx, doc); err != nil {
+			return err
+		}
+		return s.insertRefinementTx(ctx, tx, doc.SessionID, record)
+	})
+}
+
+// SaveWithRollback commits the rolled-back document, the record describing the
+// rollback, and the removal of the record being rolled back, as one unit.
+func (s *SQLiteStore) SaveWithRollback(ctx context.Context, doc Document, newRecord RefinementRecord, deleteID string) error {
+	if err := prepareDocument(&doc); err != nil {
+		return err
+	}
+	deleteID = strings.TrimSpace(deleteID)
+	return s.inTx(ctx, doc.SessionID, func(tx *sql.Tx) error {
+		if err := s.saveDocumentTx(ctx, tx, doc); err != nil {
+			return err
+		}
+		if err := s.insertRefinementTx(ctx, tx, doc.SessionID, newRecord); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`delete from memory_refinements where session_id = ? and id = ?`,
+			doc.SessionID, deleteID,
+		); err != nil {
+			return fmt.Errorf("delete refinement %q for %q: %w", deleteID, doc.SessionID, err)
+		}
+		return nil
+	})
+}
+
+func (s *SQLiteStore) insertRefinementTx(ctx context.Context, tx *sql.Tx, sessionID string, record RefinementRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal refinement %q: %w", record.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		insert into memory_refinements (session_id, id, record, created_at)
+		values (?, ?, ?, ?)
+	`, sessionID, record.ID, string(data), formatDBTime(record.CreatedAt)); err != nil {
+		return fmt.Errorf("insert refinement %q for %q: %w", record.ID, sessionID, err)
+	}
+	// Trim inside the same transaction so history is bounded even if the caller
+	// never lists it.
+	if _, err := tx.ExecContext(ctx, `
+		delete from memory_refinements
+		where session_id = ? and id not in (
+			select id from memory_refinements
+			where session_id = ?
+			order by created_at desc, id desc
+			limit ?
+		)
+	`, sessionID, sessionID, maxRefinementsPerSession); err != nil {
+		return fmt.Errorf("trim refinements for %q: %w", sessionID, err)
+	}
+	return nil
 }

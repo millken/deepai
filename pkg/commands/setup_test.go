@@ -103,3 +103,61 @@ func TestResolveDefaultAlias(t *testing.T) {
 		})
 	}
 }
+
+// TestUnknownConfigKeys_CatchesTheTypoThatCostASession uses the exact config
+// that silently disabled a 1M context window: `cotext_window` (missing an "n")
+// left the window at the 192k default, pulling aging's and compaction's
+// thresholds ~5x earlier than intended.
+func TestUnknownConfigKeys_CatchesTheTypoThatCostASession(t *testing.T) {
+	data := []byte("provider: anthropic\nmodel: glm-5.2\ncotext_window: 1000000\nrequest_timeout: 0\ntoken_aging: true\n")
+
+	got := unknownConfigKeys(data)
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 unknown key, got %+v", got)
+	}
+	if got[0].name != "cotext_window" {
+		t.Errorf("name = %q, want cotext_window", got[0].name)
+	}
+	if got[0].line != 3 {
+		t.Errorf("line = %d, want 3", got[0].line)
+	}
+}
+
+// TestLoadConfig_UnknownKeyIsNotFatal pins the warning-not-error contract: a
+// config written by a different deepai version must keep loading, with every
+// recognized field intact.
+func TestLoadConfig_UnknownKeyIsNotFatal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(
+		"provider: anthropic\nmodel: glm-5.2\ncotext_window: 1000000\ntoken_aging: true\nsome_future_knob: 7\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("unknown keys must not fail the load: %v", err)
+	}
+	if cfg.Provider != "anthropic" || cfg.Model != "glm-5.2" || !cfg.TokenAging {
+		t.Errorf("recognized fields were lost: %+v", cfg)
+	}
+	if cfg.ContextWindow != 0 {
+		t.Errorf("the typo'd key must stay ignored, got ContextWindow=%d", cfg.ContextWindow)
+	}
+}
+
+func TestUnknownConfigKeys_CleanConfigIsSilent(t *testing.T) {
+	data := []byte("provider: anthropic\nmodel: glm-5.2\ncontext_window: 1000000\ntoken_aging: true\n")
+	if got := unknownConfigKeys(data); len(got) != 0 {
+		t.Errorf("a valid config reported unknown keys: %+v", got)
+	}
+}
+
+func TestUnknownConfigKeys_EmptyAndTypeErrorsAreSilent(t *testing.T) {
+	if got := unknownConfigKeys(nil); len(got) != 0 {
+		t.Errorf("empty config reported unknown keys: %+v", got)
+	}
+	// A type mismatch is LoadConfig's error to report, not an unknown key.
+	if got := unknownConfigKeys([]byte("context_window: not-a-number\n")); len(got) != 0 {
+		t.Errorf("type error was misreported as an unknown key: %+v", got)
+	}
+}

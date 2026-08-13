@@ -1,8 +1,12 @@
 package builtin
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/millken/deepai/pkg/models"
 )
 
 func TestBashOutputLimit(t *testing.T) {
@@ -112,5 +116,95 @@ func TestBashOutputLimitSmallLimit(t *testing.T) {
 	result := truncateOutput(output, maxBytes)
 	if len(result) > maxBytes {
 		t.Errorf("Result length %d exceeds max %d", len(result), maxBytes)
+	}
+}
+
+// TestBashHandler_TimeoutIsExplicit pins the contract that a killed command
+// explains itself. A silently hanging command produces no output at all, so
+// `{"stdout":"","stderr":"","exit_code":-1}` gave the model nothing to reason
+// about and it just re-ran the command — eight times in session
+// 20260812_093415_fc6e.
+func TestBashHandler_TimeoutIsExplicit(t *testing.T) {
+	res, err := BashHandler(context.Background(), models.ToolCall{
+		ID:        "c1",
+		Name:      "bash",
+		Arguments: map[string]any{"command": "sleep 5", "timeout": float64(1)},
+	})
+	if err != nil {
+		t.Fatalf("BashHandler: %v", err)
+	}
+
+	if res.Status != models.CallStatusFailed {
+		t.Errorf("status = %q, want failed (the breaker, the provider and the UI all read this)", res.Status)
+	}
+	if !strings.Contains(res.Error, "TIMED OUT") {
+		t.Errorf("Error does not say it timed out: %q", res.Error)
+	}
+	if !strings.Contains(res.Error, "NO output") {
+		t.Errorf("Error should state that nothing was captured: %q", res.Error)
+	}
+	// The model is told what to do instead of re-running it verbatim.
+	for _, want := range []string{"raise the timeout", "narrower subset"} {
+		if !strings.Contains(res.Error, want) {
+			t.Errorf("Error is missing actionable guidance %q: %s", want, res.Error)
+		}
+	}
+
+	var out BashOutput
+	if err := json.Unmarshal([]byte(res.Content), &out); err != nil {
+		t.Fatalf("content is not BashOutput JSON: %v", err)
+	}
+	if !out.TimedOut {
+		t.Error("BashOutput.timed_out must be set so the payload is self-describing too")
+	}
+	if out.DurationSeconds < 1 {
+		t.Errorf("duration_seconds = %v, want >= 1", out.DurationSeconds)
+	}
+}
+
+// TestBashHandler_TimeoutKeepsPartialOutput: when the command DID print before
+// being killed, that output must survive into the message the model sees —
+// which is res.Error, because toolMessageContent prefers Error over Content.
+func TestBashHandler_TimeoutKeepsPartialOutput(t *testing.T) {
+	res, err := BashHandler(context.Background(), models.ToolCall{
+		ID:        "c2",
+		Name:      "bash",
+		Arguments: map[string]any{"command": "echo starting-work; sleep 5", "timeout": float64(1)},
+	})
+	if err != nil {
+		t.Fatalf("BashHandler: %v", err)
+	}
+	if !strings.Contains(res.Error, "TIMED OUT") {
+		t.Errorf("Error does not say it timed out: %q", res.Error)
+	}
+	if !strings.Contains(res.Error, "starting-work") {
+		t.Errorf("partial output was dropped from the message the model sees: %q", res.Error)
+	}
+}
+
+// TestBashHandler_NormalExitIsUnchanged guards the non-timeout path: no
+// timed_out field, no synthetic failure status.
+func TestBashHandler_NormalExitIsUnchanged(t *testing.T) {
+	res, err := BashHandler(context.Background(), models.ToolCall{
+		ID:        "c3",
+		Name:      "bash",
+		Arguments: map[string]any{"command": "echo hi; exit 3"},
+	})
+	if err != nil {
+		t.Fatalf("BashHandler: %v", err)
+	}
+	if res.Status != "" || res.Error != "" {
+		t.Errorf("a command that exited on its own must not be marked failed by the handler: status=%q err=%q",
+			res.Status, res.Error)
+	}
+	var out BashOutput
+	if err := json.Unmarshal([]byte(res.Content), &out); err != nil {
+		t.Fatalf("content is not BashOutput JSON: %v", err)
+	}
+	if out.TimedOut {
+		t.Error("timed_out set on a command that exited on its own")
+	}
+	if out.ExitCode != 3 {
+		t.Errorf("exit_code = %d, want 3", out.ExitCode)
 	}
 }

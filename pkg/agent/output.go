@@ -169,10 +169,12 @@ func extractJSON(text string) string {
 // to seed the retry request with what went wrong.
 func appendParseError(msgs []models.Message, output string, parseErr error) []models.Message {
 	return append(msgs[:len(msgs):len(msgs)],
-		models.Message{Role: models.RoleHuman, Content: fmt.Sprintf(
-			"Your previous output could not be parsed as the required schema:\n\nError: %s\n\nOutput:\n%s\n\nPlease output valid JSON matching the schema.",
-			parseErr, output,
-		)},
+		models.Message{Role: models.RoleHuman,
+			Metadata: map[string]string{metaAgentInjected: "true"},
+			Content: fmt.Sprintf(
+				"Your previous output could not be parsed as the required schema:\n\nError: %s\n\nOutput:\n%s\n\nPlease output valid JSON matching the schema.",
+				parseErr, output,
+			)},
 	)
 }
 
