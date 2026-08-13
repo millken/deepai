@@ -749,10 +749,10 @@ func buildBlocks(markdown string) (blocks []block, tableNotes []string, hasRefDe
 		text := joinWithHardBreaks(accLines, accBreaks)
 		// wasContinuation/level are snapshotted BEFORE accInList/accLines
 		// are cleared below: this flush might run because a brand-new list
-		// item just matched (which updates curListLevel/curListGroup only
-		// AFTER calling flush -- see the listItemRE branch), so curListLevel
-		// here is still the level of whichever item accLines' buffered
-		// lines actually continued.
+		// item just matched (which updates curListLevel only AFTER calling
+		// flush -- see the listItemRE branch), so curListLevel here is
+		// still the level of whichever item accLines' buffered lines
+		// actually continued.
 		wasContinuation := accInList
 		level := curListLevel
 		accLines = accLines[:0]
@@ -842,6 +842,26 @@ func buildBlocks(markdown string) (blocks []block, tableNotes []string, hasRefDe
 			flush()
 			flushQuote()
 			inFence = !inFence
+			// A fence DELIMITER line (opening or closing) is checked for its
+			// own leading indent exactly like any other line would be (the
+			// "if !hasLeadingIndent(line) { inListContext = false }" reset
+			// below, in the main non-fence path) -- a fence marker used to be
+			// entirely exempt from this, since it always `continue`s before
+			// ever reaching that check, which left inListContext STUCK true
+			// across a top-level (unindented) fenced code block that
+			// followed a list with nothing else in between: a later,
+			// unrelated list would then wrongly be treated as the SAME list
+			// (sharing its run/numId), and the top-level code block itself
+			// would wrongly be tagged codeInList (see appendCode below) and
+			// gain a list indent it should not have. An INDENTED fence
+			// (genuinely inside a list item's own continuation) still
+			// leaves inListContext untouched, exactly as before -- see
+			// TestWrite_FencedBlockInsideListItemStillBecomesCode and
+			// TestWrite_TopLevelFencedCodeBetweenListsDoesNotMergeTheirNumIds/
+			// TestWrite_TopLevelFencedCodeAfterListIsNotTaggedCodeInList.
+			if !hasLeadingIndent(line) {
+				inListContext = false
+			}
 			// A fence marker unconditionally ends any indented code block
 			// in progress, opening or closing: without this, a literal
 			// "```"-looking line encountered while accumulating an indented
@@ -1362,6 +1382,16 @@ func computeListRuns(lines []string) (runOf []int, unitOf map[int]int) {
 		trimmed := strings.TrimSpace(line)
 		if fenceRE.MatchString(trimmed) {
 			inFence = !inFence
+			// Mirrors buildBlocks' own identical fence-delimiter check (see
+			// its doc comment): a top-level (unindented) fence delimiter
+			// ends whatever run was open, exactly like any other unindented
+			// non-list line does, so a fenced code block sitting between two
+			// otherwise-unrelated lists does not merge them into one run
+			// (and so one shared/continuing numId). An INDENTED delimiter
+			// (genuinely inside a list item) leaves activeRun untouched.
+			if !hasLeadingIndent(line) {
+				activeRun = 0
+			}
 			continue
 		}
 		if inFence {
@@ -3701,6 +3731,29 @@ const (
 	continuationNumID = 1000
 )
 
+// allocateOrderedNumID returns the numId assignListNumIDs should use for
+// the ordered run currently being allocated (id), and the value its
+// nextNumID counter should become for the FOLLOWING allocation (following).
+// Ordinarily that is just (next, next+1) -- but next growing large enough
+// to reach continuationNumID (a document with roughly a thousand
+// independent ordered runs) would otherwise hand out THAT id to an
+// ordinary ordered run, producing two <w:num w:numId="1000"> entries in
+// numbering.xml (one for the run, one for continuationNumID's own
+// always-present entry) -- invalid OOXML, and Word drops the numbering
+// entirely rather than picking one. Skipping over continuationNumID here,
+// the one place ordered ids are ever minted, is what keeps the two id
+// spaces (ordinary runs vs. the single fixed continuation id) from ever
+// colliding, without needing continuationNumID to be renumbered to some
+// less-tidy value -- see TestWrite_OrderedNumIDAllocationNeverCollidesWithContinuationNumID,
+// which checks this directly rather than requiring a test to actually
+// build a thousand-list document to exercise it.
+func allocateOrderedNumID(next int) (id, following int) {
+	if next == continuationNumID {
+		next++
+	}
+	return next, next + 1
+}
+
 // bulletChars cycles every 3 levels — the same filled/hollow/square
 // progression Word's own default bullet-list template uses — so a deeply
 // nested list stays visually distinguishable from its grandparent rather
@@ -3715,8 +3768,8 @@ var orderedFormats = []string{"decimal", "lowerLetter", "lowerRoman"}
 // orderedRunInfo is one independent ordered-list run's own numbering
 // allocation, as assignListNumIDs resolves it: numID is the fresh <w:numId>
 // every ordered item in the run resolves to (paraBlock.numID), and
-// overrides maps an ilvl to the <w:startOverride> value buildOrderedNumEntry
-// must emit for it -- present ONLY for a level whose first item in this run
+// overrides maps an ilvl to the <w:startOverride> value buildNumEntry must
+// emit for it -- present ONLY for a level whose first item in this run
 // did not start at 1 (abstractNumId 1's own default), e.g. a contract
 // section opening "5. Fifth clause".
 type orderedRunInfo struct {
@@ -3738,7 +3791,7 @@ type orderedRunInfo struct {
 //     orderedNumIDBase. A fresh numId is itself what makes numbering.xml
 //     restart the run's count at its abstractNum's own default (1) --
 //     independent numIds never share a counter even when they reference the
-//     SAME abstractNumId (see buildOrderedNumEntry). This is also what makes
+//     SAME abstractNumId (see buildNumEntry). This is also what makes
 //     level counters within one run independent per level (a nested ordered
 //     sub-list under an ordered parent counts "a., b., c." on its own,
 //     restarting at the parent's every top-level item, exactly as
@@ -3771,8 +3824,9 @@ func assignListNumIDs(blocks []block) []*orderedRunInfo {
 		}
 		info, ok := groupInfo[blk.para.listGroupID]
 		if !ok {
-			info = &orderedRunInfo{numID: nextNumID, overrides: make(map[int]int)}
-			nextNumID++
+			id, following := allocateOrderedNumID(nextNumID)
+			info = &orderedRunInfo{numID: id, overrides: make(map[int]int)}
+			nextNumID = following
 			groupInfo[blk.para.listGroupID] = info
 			runs = append(runs, info)
 		}
@@ -3915,8 +3969,23 @@ func orderedAbstractNumXML() string {
 // where the sibling list item's own text starts. The w:left value uses the
 // IDENTICAL 720*(lvl+1) formula as the other two abstractNums specifically
 // so the two stay aligned by construction rather than by coincidence --
-// see TestWrite_ListContinuationIndentMatchesListItemIndent, which checks
-// this directly rather than trusting the formula by eyeball.
+// see TestWrite_ListItemContinuationStaysInListWithMatchingIndent, which
+// checks this directly rather than trusting the formula by eyeball.
+//
+// <w:suff w:val="nothing"/> is required for that same alignment to
+// actually hold: CT_Lvl's w:suff defaults to "tab" (whatever separates the
+// number from the following text), and Word still inserts that separator
+// -- and reserves room for it via the paragraph's own tab stops -- even
+// though lvlText is empty here. With no w:hanging to absorb it (there is
+// no hanging indent for the same reason there is no bullet, above), that
+// default tab pushes the paragraph's first line out to the next tab stop
+// (1440 twips, i.e. double this level's own 720 unit) instead of leaving
+// it at w:left where this abstractNum's whole point is to put it --
+// re-breaking the exact alignment the paragraph above just established.
+// "nothing" tells Word to insert no separator at all, so w:left is where
+// the text actually starts. codeInList's SourceCode paragraphs borrow this
+// SAME abstractNum (continuationNumID), so this one fix covers both --
+// see TestWrite_ContinuationAbstractNumSuppressesTabSuffix.
 func continuationAbstractNumXML() string {
 	var b strings.Builder
 	b.WriteString(`<w:abstractNum w:abstractNumId="2">`)
@@ -3925,7 +3994,7 @@ func continuationAbstractNumXML() string {
 		indent := 720 * (lvl + 1)
 		fmt.Fprintf(&b,
 			`<w:lvl w:ilvl="%d"><w:start w:val="1"/><w:numFmt w:val="none"/>`+
-				`<w:lvlText w:val=""/><w:lvlJc w:val="left"/>`+
+				`<w:suff w:val="nothing"/><w:lvlText w:val=""/><w:lvlJc w:val="left"/>`+
 				`<w:pPr><w:ind w:left="%d"/></w:pPr></w:lvl>`,
 			lvl, indent)
 	}

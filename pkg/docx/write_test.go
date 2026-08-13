@@ -768,6 +768,102 @@ func TestWrite_FencedCodeInsideListItemKeepsListIndent(t *testing.T) {
 	}
 }
 
+// Review round-2 finding (a4): a fence delimiter used to be entirely
+// exempt from the hasLeadingIndent-based "list ends here" check every
+// other line goes through (it always `continue`s before ever reaching
+// it), so a TOP-LEVEL (unindented) fenced code block sitting between two
+// otherwise-unrelated ordered lists left inListContext/computeListRuns'
+// activeRun stuck true across it -- silently merging the second list into
+// the first one's run and so its numId, exactly the I7 defect this task
+// otherwise fixes. Both lists here start "1.", so under the bug they
+// would render as a single continuing sequence ("1. 2.") instead of each
+// restarting.
+func TestWrite_TopLevelFencedCodeBetweenListsDoesNotMergeTheirNumIds(t *testing.T) {
+	md := "1. one\n\n```\ntop level code\n```\n\n1. two\n"
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+
+	matches := regexp.MustCompile(`<w:numId w:val="(\d+)"/>`).FindAllStringSubmatch(s, -1)
+	if len(matches) != 2 {
+		t.Fatalf("got %d <w:numId> references, want 2 (one per ordered item): %s", len(matches), s)
+	}
+	if matches[0][1] == matches[1][1] {
+		t.Errorf("both ordered items reference numId %s across a top-level fenced code block -- they must get independent numIds, not be merged into one run", matches[0][1])
+	}
+}
+
+// Review round-2 finding (c3): the same stuck-true inListContext bug also
+// wrongly tagged a top-level fenced code block codeInList (and so gave it
+// a borrowed list indent it must not have) whenever it happened to follow
+// a list with nothing else in between -- a regression Task 11 itself
+// introduced (before this task, appendCode never wrote a <w:numPr> at
+// all, so this specific shape had no visible defect). Only a fence
+// delimiter that is ITSELF indented (genuinely inside a list item) should
+// get that treatment -- see TestWrite_FencedCodeInsideListItemKeepsListIndent.
+func TestWrite_TopLevelFencedCodeAfterListIsNotTaggedCodeInList(t *testing.T) {
+	md := "- item\n\n```\ntop level code\n```\n"
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+
+	codePPr := regexp.MustCompile(`<w:pPr><w:pStyle w:val="SourceCode"/>.*?</w:pPr>`).FindString(s)
+	if codePPr == "" {
+		t.Fatalf("no SourceCode paragraph found in document.xml: %s", s)
+	}
+	if strings.Contains(codePPr, "<w:numPr>") {
+		t.Errorf("a top-level fenced code block was wrongly tagged codeInList (carries a <w:numPr>): %s", codePPr)
+	}
+}
+
+// Review round-2 finding: allocateOrderedNumID is the one place an ordered
+// run's numId is ever minted, and must never hand out continuationNumID
+// itself -- doing so would produce numbering.xml with TWO
+// <w:num w:numId="1000"> entries (one for the ordinary run, one for
+// continuationNumID's own always-present entry), which is invalid OOXML.
+// Checked directly against the pure function rather than by actually
+// building a ~1000-list document to reach the collision.
+func TestWrite_OrderedNumIDAllocationNeverCollidesWithContinuationNumID(t *testing.T) {
+	id, following := allocateOrderedNumID(continuationNumID)
+	if id == continuationNumID {
+		t.Errorf("allocateOrderedNumID(%d) = %d, want it to skip continuationNumID", continuationNumID, id)
+	}
+	if following == continuationNumID {
+		t.Errorf("allocateOrderedNumID(%d) following = %d, want it to also skip continuationNumID for the NEXT allocation", continuationNumID, following)
+	}
+
+	// The ordinary case (nowhere near the reserved id) must still just be
+	// (n, n+1) -- the skip must not perturb every other allocation.
+	if id2, following2 := allocateOrderedNumID(5); id2 != 5 || following2 != 6 {
+		t.Errorf("allocateOrderedNumID(5) = (%d, %d), want (5, 6)", id2, following2)
+	}
+}
+
+// Review round-2 finding: continuationAbstractNumXML's per-level <w:ind>
+// carries no w:hanging (see its own doc comment for why), which means
+// CT_Lvl's w:suff -- defaulting to "tab" -- would otherwise push a
+// continuation paragraph's first line out to the next tab stop instead of
+// leaving it at w:left, re-breaking the very alignment
+// TestWrite_ListItemContinuationStaysInListWithMatchingIndent checks.
+// codeInList's SourceCode paragraphs borrow this SAME abstractNum, so this
+// covers both.
+func TestWrite_ContinuationAbstractNumSuppressesTabSuffix(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "- top item\n    continuation still about top item\n")
+	num, ok := d.Part("word/numbering.xml")
+	if !ok {
+		t.Fatal("word/numbering.xml missing")
+	}
+	ns := string(num)
+
+	m := regexp.MustCompile(`(?s)<w:abstractNum w:abstractNumId="2">(.*?)</w:abstractNum>`).FindStringSubmatch(ns)
+	if m == nil {
+		t.Fatalf("abstractNumId=2 (the continuation abstractNum) not found: %s", ns)
+	}
+	if got, want := strings.Count(m[1], `<w:suff w:val="nothing"/>`), maxListLevel+1; got != want {
+		t.Errorf("abstractNumId=2 has %d <w:suff w:val=\"nothing\"/> entries, want %d (one per level 0..%d)", got, want, maxListLevel)
+	}
+}
+
 // Inline emphasis must still resolve inside a list item, the same as any
 // other paragraph.
 func TestWrite_ListItemRunsInlineEmphasis(t *testing.T) {
@@ -1538,10 +1634,26 @@ func generateAndReadDocumentXML(t *testing.T, md string) string {
 // The markdown below exercises every construct that used to (or still
 // does) write one of these properties: a heading, an ordinary paragraph, a
 // nested list, a block quote, a horizontal rule, a fenced code block, and
-// a table with a header and a data row.
+// a table with a header and a data row. Task 11 (I8) added two more
+// paragraph kinds that also carry a <w:numPr> (a list-item continuation
+// paragraph, and a fenced code block INSIDE a list item) -- a review round
+// found this test's markdown never exercised either, so it was passing
+// vacuously with respect to them; "continuation for b" and the fenced
+// block right after it are that coverage now.
 func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
-	md := "# H\n\nBody.\n\n- a\n    - b\n\n> quote\n\n---\n\n```\ncode\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n"
+	md := "# H\n\nBody.\n\n- a\n    - b\n\n    continuation for b\n\n    ```\n    code in list\n    ```\n\n> quote\n\n---\n\n```\ncode\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n"
 	x := generateAndReadDocumentXML(t, md)
+
+	// Guard against this test silently going back to exercising neither new
+	// paragraph kind (the vacuous-coverage finding above): a ListContinue
+	// paragraph and a SECOND SourceCode paragraph (the in-list one, on top
+	// of the top-level fenced block already covered) must both be present.
+	if !strings.Contains(x, `<w:pStyle w:val="ListContinue"/>`) {
+		t.Fatalf("no ListContinue paragraph found; the continuation-paragraph exception is untested: %s", x)
+	}
+	if got, want := strings.Count(x, `<w:pStyle w:val="SourceCode"/>`), 2; got != want {
+		t.Fatalf("got %d SourceCode paragraphs, want %d (one top-level, one inside the list); the in-list-code exception is untested: %s", got, want, x)
+	}
 
 	// <w:spacing>/<w:ind> stay banned inline everywhere, no exceptions.
 	for _, banned := range []string{"<w:spacing", "<w:ind "} {
