@@ -134,6 +134,24 @@ type FormatOptions struct {
 	// StartPara is 0 is an error — there is no range to end. 1-based,
 	// inclusive.
 	EndPara int
+	// PageNumbers, if true, adds a centered PAGE-field footer to a document
+	// that does not already have one: a new word/footerN.xml part (N picked
+	// to avoid any word/footerN.xml already in the package — see
+	// nextFooterPartName), reusing the exact XML docx_write's own
+	// footer1.xml uses (footer.go's footer1XML), wired in with a narrow
+	// [Content_Types].xml Override, a narrow word/_rels/document.xml.rels
+	// Relationship, and a narrow <w:sectPr> patch inserting
+	// <w:footerReference w:type="default" r:id="..."/> into every section
+	// that lacks one — see addPageNumberFooter (page_numbers.go) for the
+	// full mechanism and sectPrChildOrder for why the insertion always lands
+	// after any existing headerReference and before pgSz. If ANY existing
+	// <w:sectPr> in the document already carries a footerReference, this is
+	// a deliberate no-op: nothing is added, touched, or overwritten, and
+	// FormatResult.Notes explains why instead of silently doing nothing
+	// (task 12 brief, item 2). Document-wide only — refused outright when
+	// combined with a paragraph range (formatDirectRange), the same as
+	// Template/HeadingFont/MarginsMM/Normalize.
+	PageNumbers bool
 }
 
 // FormatResult reports what Document.Format actually changed.
@@ -357,6 +375,19 @@ func (d *Document) SetPart(name string, data []byte) error {
 	return nil
 }
 
+// AddPart adds a brand-new zip entry via the underlying Package (see
+// Package.AddPart) and marks the document modified. Unlike SetPart, this
+// never triggers a rescan: nothing this package ever adds through AddPart
+// is DocumentPart itself (page_numbers.go adds word/footerN.xml, never
+// word/document.xml, which is always reached through SetPart instead).
+func (d *Document) AddPart(name string, data []byte) error {
+	if err := d.pkg.AddPart(name, data); err != nil {
+		return err
+	}
+	d.modified = true
+	return nil
+}
+
 // Format applies FormatOptions to the document. Everything it touches is a
 // narrow byte-range splice against word/styles.xml and/or word/document.xml
 // — never a DOM round-trip — so a Format call that only sets, say,
@@ -405,7 +436,7 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		resolved.LineSpacing != 0 || resolved.LineSpacingExactPt != 0 || resolved.Align != "" ||
 		resolved.BodyEastAsiaFont != "" || resolved.FirstLineIndentChars != 0 ||
 		resolved.SpaceBeforePt != 0 || resolved.SpaceAfterPt != 0
-	wantsDocumentPart := wantsMargins || resolved.Normalize || wantsDirectFormatMaskingScan
+	wantsDocumentPart := wantsMargins || resolved.Normalize || wantsDirectFormatMaskingScan || resolved.PageNumbers
 
 	// Task 10 brief item 5 (task 9 review follow-up): validate BOTH parts'
 	// namespace prefix up front, before mutating anything, rather than
@@ -511,6 +542,19 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 		}
 	}
 
+	if resolved.PageNumbers {
+		applied, note, err := d.addPageNumberFooter()
+		if err != nil {
+			return FormatResult{}, err
+		}
+		if applied != "" {
+			result.Applied = append(result.Applied, applied)
+		}
+		if note != "" {
+			result.Notes = append(result.Notes, note)
+		}
+	}
+
 	// docDefaults and the style chain are only the STYLE layer of Word's
 	// cascade; direct formatting on a specific paragraph/run (e.g. a
 	// previous docx_format start_para/end_para call, or hand-authored
@@ -519,12 +563,12 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	// looks like this" when some do not (format capability review,
 	// Critical 4 / §2's masking-detection requirement).
 	if wantsDirectFormatMaskingScan {
-		// Re-read: the margins/normalize block above may have rewritten
-		// document.xml via d.SetPart, so this must be the CURRENT bytes, not
-		// the ones validated in the precheck -- but since neither this
-		// package's patches nor SetPart ever change the root element's own
-		// namespace declaration, that earlier validation still holds; no
-		// need to check again.
+		// Re-read: the margins/normalize block and the page_numbers block
+		// above may each have rewritten document.xml via d.SetPart, so this
+		// must be the CURRENT bytes, not the ones validated in the precheck
+		// -- but since neither this package's patches nor SetPart ever
+		// change the root element's own namespace declaration, that earlier
+		// validation still holds; no need to check again.
 		doc, ok := d.Part(DocumentPart)
 		if !ok {
 			return FormatResult{}, fmt.Errorf("docx: package has no %s part", DocumentPart)

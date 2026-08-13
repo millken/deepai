@@ -260,6 +260,108 @@ func TestSetPart_UnknownNameReturnsError(t *testing.T) {
 	}
 }
 
+// TestAddPart_AppendsNewEntryKeepingOriginalsByteIdentical is task 12's
+// core fidelity gate for AddPart (brief item 1): adding a brand-new entry
+// must leave every one of the original entries byte-for-byte identical —
+// the same guarantee TestWriteTo_ModifiedPartOnly pins for SetPart — and
+// the new entry must land at the END of the zip, after every original one.
+func TestAddPart_AppendsNewEntryKeepingOriginalsByteIdentical(t *testing.T) {
+	pkg, err := Open(fixture)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	origNames := pkg.Names()
+
+	const newName = "word/footer2.xml"
+	newContent := []byte(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr/>`)
+	if err := pkg.AddPart(newName, newContent); err != nil {
+		t.Fatalf("AddPart: %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "added.docx")
+	if err := pkg.WriteTo(out); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	oldZ, err := zip.OpenReader(fixture)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	defer oldZ.Close()
+	newZ, err := zip.OpenReader(out)
+	if err != nil {
+		t.Fatalf("open new: %v", err)
+	}
+	defer newZ.Close()
+
+	if got, want := len(newZ.File), len(oldZ.File)+1; got != want {
+		t.Fatalf("entry count = %d, want %d (original %d + 1 new)", got, want, len(oldZ.File))
+	}
+
+	// Every ORIGINAL entry, in its original order, byte-identical.
+	for i, want := range origNames {
+		if newZ.File[i].Name != want {
+			t.Fatalf("entry %d name = %q, want %q (original order not preserved)", i, newZ.File[i].Name, want)
+		}
+		oldData := readZipEntry(t, oldZ.File[i])
+		newData := readZipEntry(t, newZ.File[i])
+		if !bytes.Equal(oldData, newData) {
+			t.Errorf("%s: not byte-identical after AddPart (old %d bytes, new %d bytes)", want, len(oldData), len(newData))
+		}
+	}
+
+	// The new entry is last, with the content AddPart was given.
+	last := newZ.File[len(newZ.File)-1]
+	if last.Name != newName {
+		t.Fatalf("last entry name = %q, want %q (new entry must be appended at the tail)", last.Name, newName)
+	}
+	if got := readZipEntry(t, last); !bytes.Equal(got, newContent) {
+		t.Errorf("new entry content = %q, want %q", got, newContent)
+	}
+}
+
+// TestAddPart_RejectsExistingName pins that AddPart is SetPart's mirror
+// image: an existing name must be refused (use SetPart instead), and the
+// package must be left completely unchanged by the rejected call.
+func TestAddPart_RejectsExistingName(t *testing.T) {
+	pkg, err := Open(fixture)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	before, _ := pkg.Part(DocumentPart)
+	beforeCopy := append([]byte(nil), before...)
+	namesBefore := pkg.Names()
+
+	if err := pkg.AddPart(DocumentPart, []byte("data")); err == nil {
+		t.Fatal("AddPart on an existing name succeeded, want error")
+	}
+
+	after, _ := pkg.Part(DocumentPart)
+	if !bytes.Equal(beforeCopy, after) {
+		t.Errorf("AddPart on an existing name mutated that entry's content")
+	}
+	if len(pkg.Names()) != len(namesBefore) {
+		t.Errorf("AddPart on an existing name changed the entry count")
+	}
+}
+
+// TestAddPart_RejectsUnsafeName pins that AddPart runs the exact same
+// checkEntryName guard Open applies to every entry read from disk: a
+// caller-constructed part name is just as capable of a path-traversal
+// escape as one read from an untrusted zip.
+func TestAddPart_RejectsUnsafeName(t *testing.T) {
+	pkg, err := Open(fixture)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := pkg.AddPart("../../evil.xml", []byte("x")); err == nil {
+		t.Fatal("AddPart on an unsafe name succeeded, want error")
+	}
+	if _, ok := pkg.Part("../../evil.xml"); ok {
+		t.Error("AddPart on an unsafe name still added the entry")
+	}
+}
+
 // TestCheckEntryName is a table-driven pin of every branch in
 // checkEntryName, including the control-byte and Windows drive-relative
 // cases that have no fixture-level coverage elsewhere.

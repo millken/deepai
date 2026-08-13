@@ -20,9 +20,11 @@ import (
 //
 // Every FormatOptions field that only makes sense for the WHOLE document —
 // Template (also sets margins), HeadingFont (edits styles.xml, not a
-// paragraph), MarginsMM (a section-level concept), and Normalize (collapses
-// empty paragraphs document-wide) — is rejected outright rather than
-// silently ignored or silently applied document-wide despite the range.
+// paragraph), MarginsMM (a section-level concept), Normalize (collapses
+// empty paragraphs document-wide), and PageNumbers (a section-level
+// <w:sectPr><w:footerReference>, plus new package-level parts) — is
+// rejected outright rather than silently ignored or silently applied
+// document-wide despite the range.
 func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 	if opts.Template != "" {
 		return FormatResult{}, fmt.Errorf(
@@ -39,6 +41,10 @@ func (d *Document) formatDirectRange(opts FormatOptions) (FormatResult, error) {
 	if opts.Normalize {
 		return FormatResult{}, fmt.Errorf(
 			"docx: normalize collapses empty paragraphs document-wide and cannot be combined with a paragraph range")
+	}
+	if opts.PageNumbers {
+		return FormatResult{}, fmt.Errorf(
+			"docx: page_numbers adds a section-level <w:sectPr><w:footerReference>, not a paragraph's direct formatting, so it cannot be combined with a paragraph range")
 	}
 	if err := validateAlignAndLineSpacingMutex(opts.Align, opts.LineSpacing, opts.LineSpacingExactPt); err != nil {
 		return FormatResult{}, err

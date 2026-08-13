@@ -617,9 +617,11 @@ const docxFormatNoChangeNote = "no formatting changes were applied: either no ru
 // document — see pkg/docx.Document.Format's doc comment for the byte-range
 // promise that backs both paths, and formatDirectRange's for which fields
 // only make sense document-wide and are refused when combined with a range.
-// page_numbers and rebuild_toc are named in the schema but always refused
-// regardless of range: see DocxFormatHandler's doc comment for why they
-// cannot be silently dropped.
+// page_numbers is one of those document-wide-only fields (it can add new
+// package parts and a section-level footerReference, neither of which is a
+// paragraph's own formatting) — see DocxFormatHandler's doc comment.
+// rebuild_toc, unlike page_numbers, is named in the schema but always
+// refused regardless of range: see DocxFormatHandler's doc comment for why.
 func DocxFormatTool() models.Tool {
 	return models.Tool{
 		Name:         "docx_format",
@@ -647,9 +649,10 @@ func DocxFormatTool() models.Tool {
 			"were affected when a range was used — with an empty or no-op rules object, or a rule whose target " +
 			"already matched (reported in notes as \"already ...\" instead), saying so explicitly rather than " +
 			"looking identical to a real change; a call that changed nothing at all does not rewrite the file or " +
-			"touch the backup. page_numbers and rebuild_toc are not supported yet and return an explicit error " +
-			"rather than being silently ignored, with or without a range. Backs up the original file once, " +
-			"before the first overwrite, to " +
+			"touch the backup. page_numbers adds a centered page-number footer to a document that has none — see " +
+			"its own schema description for the no-op case where one already exists. rebuild_toc is not supported " +
+			"and returns an explicit error rather than being silently ignored, with or without a range. Backs up " +
+			"the original file once, before the first overwrite, to " +
 			"<path>.bak.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -698,9 +701,13 @@ func DocxFormatTool() models.Tool {
 							"items":       map[string]any{"type": "number"},
 							"description": "Exactly 4 positive values in millimeters: top, right, bottom, left",
 						},
-						"normalize":    map[string]any{"type": "boolean", "description": "Collapse runs of two or more consecutive empty paragraphs down to one"},
-						"page_numbers": map[string]any{"type": "boolean", "description": "Not supported yet; setting this true returns an error instead of being ignored"},
-						"rebuild_toc":  map[string]any{"type": "boolean", "description": "Not supported yet; setting this true returns an error instead of being ignored"},
+						"normalize": map[string]any{"type": "boolean", "description": "Collapse runs of two or more consecutive empty paragraphs down to one"},
+						"page_numbers": map[string]any{
+							"type": "boolean",
+							"description": "Add a centered page-number footer. If the document already has ANY footer, this is a no-op (reported in notes as " +
+								"\"document already has a footer; not modified\") rather than adding a second one or touching the existing footer. Cannot be combined with a paragraph range.",
+						},
+						"rebuild_toc": map[string]any{"type": "boolean", "description": "Not supported; setting this true returns an error instead of being ignored. Rebuilding a table of contents needs repagination, which this pure-Go tool cannot do."},
 					},
 				},
 			},
@@ -711,16 +718,23 @@ func DocxFormatTool() models.Tool {
 }
 
 // DocxFormatHandler parses docx_format's arguments, delegates all
-// formatting semantics to pkg/docx.Document.Format, and owns the three
+// formatting semantics to pkg/docx.Document.Format, and owns the two
 // responsibilities pkg/docx deliberately leaves to the tool layer: backing
-// up the file once before the first overwrite (reusing backupDocxOnce),
-// refusing page_numbers/rebuild_toc outright rather than dropping them
-// (design §4.3: both need a multi-part write pkg/docx does not support
-// yet — page numbers need a new word/footerN.xml entry plus
-// sectPr/footerReference plus a [Content_Types].xml declaration plus a
-// rels entry, and TOC rebuilding needs LibreOffice-driven repagination),
-// and surfacing FormatResult.Applied/Notes so a caller can tell an empty or
+// up the file once before the first overwrite (reusing backupDocxOnce), and
+// surfacing FormatResult.Applied/Notes so a caller can tell an empty or
 // no-op rules object apart from one that actually changed the document.
+//
+// page_numbers used to be refused outright here too, on the theory that it
+// needed a multi-part write pkg/docx could not do (a new word/footerN.xml
+// entry plus sectPr/footerReference plus a [Content_Types].xml declaration
+// plus a rels entry) — task 12 closed that gap: pkg/docx.Package now has
+// AddPart for the one genuinely missing piece (a brand-new zip entry), and
+// docx.FormatOptions.PageNumbers (Document.Format) does the rest, so
+// page_numbers is parsed as an ordinary field below instead of being
+// refused. rebuild_toc is still refused outright (requireNotRequested,
+// below): a table of contents needs actual repagination — recomputing
+// which heading lands on which printed page — which needs a rendering
+// engine such as LibreOffice, not wired in here.
 func DocxFormatHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 	result := models.ToolResult{CallID: call.ID, ToolName: call.Name}
 
@@ -794,10 +808,13 @@ type docxFormatArgs struct {
 // parseDocxFormatArgs extracts docxFormatArgs from the raw JSON arguments
 // map. Like parseDocxEditArgs, it only converts and type-checks: every
 // domain rule pkg/docx has an opinion on (unknown template name, alignment
-// value) is left for Document.Format to enforce. The one rule enforced
-// here that pkg/docx has no visibility into at all is page_numbers/
-// rebuild_toc, since FormatOptions has no fields for them at all — see
-// DocxFormatHandler's doc comment.
+// value, whether a document already has a footer) is left for
+// Document.Format to enforce. rebuild_toc is the one field still refused
+// here outright, since FormatOptions has no field for it at all (a table of
+// contents needs actual repagination, which this pure-Go package cannot do
+// — see DocxFormatHandler's doc comment). page_numbers, as of task 12, is a
+// real FormatOptions field (docx.FormatOptions.PageNumbers) parsed just
+// like normalize below, no longer refused here.
 func parseDocxFormatArgs(raw map[string]any) (docxFormatArgs, error) {
 	path, _ := raw["path"].(string)
 	path = strings.TrimSpace(path)
@@ -867,13 +884,16 @@ func docxFormatIntArg(raw map[string]any, key string) (int, error) {
 // mean e.g. body_size_pt sent as "big" silently becoming 0 — "leave the
 // size alone" — while the call still reports success).
 //
-// page_numbers and rebuild_toc are checked and refused here, before
-// anything is applied: design §4.3 requires an explicit error, not a
-// silently dropped parameter, and refusing before Format is called means a
-// batch that also asked for legitimate changes (e.g. body_font) never
-// applies any of them either — the caller gets one unambiguous outcome
-// (an error identical to what would happen alone) rather than a partial
-// apply it would have to reconcile against what it asked for.
+// rebuild_toc is checked and refused here, before anything is applied:
+// design §4.3 requires an explicit error, not a silently dropped parameter,
+// and refusing before Format is called means a batch that also asked for
+// legitimate changes (e.g. body_font) never applies any of them either —
+// the caller gets one unambiguous outcome (an error identical to what would
+// happen alone) rather than a partial apply it would have to reconcile
+// against what it asked for. page_numbers, as of task 12, is no longer in
+// this category: it is parsed into opts.PageNumbers below like any other
+// field, and Document.Format decides what to do with it (add a footer, or
+// no-op with a note if one already exists).
 func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 	var opts docx.FormatOptions
 	if raw == nil {
@@ -969,17 +989,20 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 	}
 	opts.SpaceAfterPt = spaceAfterPt
 
-	if err := requireNotRequested(raw, "page_numbers",
-		"docx_format: page_numbers is not supported yet — adding page numbers requires a new word/footerN.xml "+
-			"part plus a <w:sectPr><w:footerReference>, a [Content_Types].xml declaration, and a document.xml.rels "+
-			"entry, none of which this tool can create; that needs LibreOffice-backed support planned for a later "+
-			"phase. Tell the user page numbers were not added rather than working around this."); err != nil {
-		return docx.FormatOptions{}, err
+	if v, present := raw["page_numbers"]; present && v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return docx.FormatOptions{}, fmt.Errorf("docx_format: rules.page_numbers must be a boolean")
+		}
+		opts.PageNumbers = b
 	}
+
 	if err := requireNotRequested(raw, "rebuild_toc",
-		"docx_format: rebuild_toc is not supported yet — a table of contents is a field with a cached result "+
-			"that can only be refreshed by repaginating the document, which needs LibreOffice; that is planned for "+
-			"a later phase. Tell the user the TOC was not rebuilt rather than working around this."); err != nil {
+		"docx_format: rebuild_toc is not supported — rebuilding a table of contents means repaginating the whole "+
+			"document (recomputing which heading lands on which printed page), which this pure-Go tool cannot do; "+
+			"that needs a rendering engine such as LibreOffice, which is not wired in. Word itself can refresh a "+
+			"TOC field automatically on open via settings.xml's <w:updateFields/>, but that is a future option this "+
+			"tool does not yet write either. Tell the user the TOC was not rebuilt rather than working around this."); err != nil {
 		return docx.FormatOptions{}, err
 	}
 
@@ -995,13 +1018,14 @@ func parseDocxFormatRules(raw map[string]any) (docx.FormatOptions, error) {
 }
 
 // requireNotRequested checks a boolean rules field that has no
-// corresponding docx.FormatOptions field at all (page_numbers, rebuild_toc):
-// it type-checks the raw value the same as every other field, then errors
-// with msg if and only if the caller actually asked for it (true). A field
-// that is absent, nil, or explicitly false is not a request for the
-// feature — refusing those too would make a caller that always sends the
-// full rules shape (with unwanted features set to false) unable to use
-// docx_format at all.
+// corresponding docx.FormatOptions field at all (rebuild_toc, since task
+// 12; page_numbers used to be the other one before it got a real field —
+// see parseDocxFormatRules): it type-checks the raw value the same as every
+// other field, then errors with msg if and only if the caller actually
+// asked for it (true). A field that is absent, nil, or explicitly false is
+// not a request for the feature — refusing those too would make a caller
+// that always sends the full rules shape (with unwanted features set to
+// false) unable to use docx_format at all.
 func requireNotRequested(raw map[string]any, key, msg string) error {
 	v, present := raw[key]
 	if !present || v == nil {

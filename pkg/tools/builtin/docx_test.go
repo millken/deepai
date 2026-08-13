@@ -1428,33 +1428,94 @@ func TestDocxFormat_ReportsBackupCreated(t *testing.T) {
 	}
 }
 
-// TestDocxFormat_PageNumbersErrorsExplicitly pins design §4.3's requirement
-// directly: page_numbers is Tier 3/P3 (needs a new footer part, a
-// sectPr/footerReference, a Content_Types entry, and a rels entry — none of
-// which this tool can create), and requesting it must return an explicit
-// error, never be silently dropped while the rest of the rules apply.
-func TestDocxFormat_PageNumbersErrorsExplicitly(t *testing.T) {
+// TestDocxFormat_PageNumbersAddsFooterOnPythonDocxStyleFixture is task 12's
+// end-to-end pin for the "no footer yet" path, through the tool layer
+// (parseDocxFormatRules -> docx.FormatOptions.PageNumbers ->
+// Document.Format): outline.docx is a real python-docx product with no
+// header/footer at all (gen_fixtures.py), so a page_numbers:true call must
+// add one, report it in applied, and leave the file readable as a zip with
+// the new word/footer1.xml entry present.
+func TestDocxFormat_PageNumbersAddsFooterOnPythonDocxStyleFixture(t *testing.T) {
 	p := docxFixture(t, "outline.docx")
-	original, err := os.ReadFile(p)
+
+	res, err := callDocxFormat(t, map[string]any{
+		"path":  p,
+		"rules": map[string]any{"page_numbers": true},
+	})
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
+	}
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) != 1 || !strings.Contains(fmt.Sprint(applied[0]), "footer1.xml") {
+		t.Errorf("applied = %v, want one entry naming word/footer1.xml", applied)
+	}
+	notes, _ := out["notes"].([]any)
+	for _, n := range notes {
+		if strings.Contains(fmt.Sprint(n), "already has a footer") {
+			t.Errorf("notes unexpectedly contains the already-has-a-footer note: %v", notes)
+		}
+	}
+
+	footer := zipEntry(t, p, "word/footer1.xml")
+	if len(footer) == 0 {
+		t.Error("word/footer1.xml is empty or missing after page_numbers:true")
+	}
+	docXML := string(zipEntry(t, p, docx.DocumentPart))
+	if !strings.Contains(docXML, "<w:footerReference") {
+		t.Error("document.xml has no <w:footerReference> after page_numbers:true")
+	}
+}
+
+// TestDocxFormat_PageNumbersIsANoOpOnDocxWriteProduct is task 12's
+// end-to-end pin for the "already has a footer" path: docx_write's own
+// output always carries word/footer1.xml plus a footerReference (footer.go,
+// docx-chinese-typography plan Part C), so asking docx_format for
+// page_numbers on it must change nothing and say why, rather than adding a
+// second footer or erroring.
+func TestDocxFormat_PageNumbersIsANoOpOnDocxWriteProduct(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "written.docx")
+	if _, err := callDocxWrite(t, map[string]any{
+		"path":     p,
+		"markdown": "# Title\n\nSome body text.\n",
+	}); err != nil {
+		t.Fatalf("DocxWriteHandler: %v", err)
+	}
+	before, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = callDocxFormat(t, map[string]any{
+
+	res, err := callDocxFormat(t, map[string]any{
 		"path":  p,
-		"rules": map[string]any{"body_font": "Georgia", "page_numbers": true},
+		"rules": map[string]any{"page_numbers": true},
 	})
-	if err == nil {
-		t.Fatal("page_numbers=true was accepted; want an explicit error")
+	if err != nil {
+		t.Fatalf("DocxFormatHandler: %v", err)
 	}
-	if !strings.Contains(err.Error(), "page_numbers") {
-		t.Errorf("error = %q, want it to name page_numbers", err)
+	out := decodeRead(t, res)
+	applied, _ := out["applied"].([]any)
+	if len(applied) != 0 {
+		t.Errorf("applied = %v, want none: docx_write's own product already has a footer", applied)
 	}
+	notes, _ := out["notes"].([]any)
+	found := false
+	for _, n := range notes {
+		if fmt.Sprint(n) == "document already has a footer; not modified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the already-has-a-footer note", notes)
+	}
+
 	after, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(original, after) {
-		t.Error("a call that errors on page_numbers must not apply any of the other rules in the same batch either")
+	if !bytes.Equal(before, after) {
+		t.Error("a no-op page_numbers call on a docx_write product rewrote the file's bytes")
 	}
 }
 
@@ -2012,10 +2073,11 @@ func TestDocxFormat_RangeSecondIdenticalCallDoesNotRewriteFile(t *testing.T) {
 	}
 }
 
-// TestDocxFormat_RangeRejectsPageNumbersAndRebuildToc pins that the
-// always-unsupported flags stay rejected the same way whether or not a
-// paragraph range is also given — no special-casing needed since pkg/docx
-// never even sees them (FormatOptions has no field for either).
+// TestDocxFormat_RangeRejectsPageNumbersAndRebuildToc pins that page_numbers
+// stays rejected when combined with a range: pkg/docx's formatDirectRange
+// refuses FormatOptions.PageNumbers outright, the same way it refuses
+// Template/HeadingFont/MarginsMM/Normalize, since a footer is a
+// section-level concept, not a paragraph's own direct formatting.
 func TestDocxFormat_RangeRejectsPageNumbersAndRebuildToc(t *testing.T) {
 	p := docxFixture(t, "outline.docx")
 	if _, err := callDocxFormat(t, map[string]any{

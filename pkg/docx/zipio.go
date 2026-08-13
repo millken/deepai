@@ -268,14 +268,61 @@ func (p *Package) Part(name string) ([]byte, bool) {
 }
 
 // SetPart stages replacement content for an existing entry, to be written by
-// WriteTo. Adding new entries is out of scope for P1: name must already be
-// one of the package's entries, or SetPart returns a non-nil error and
-// leaves the package unchanged.
+// WriteTo. Adding new entries is out of scope for SetPart: name must already
+// be one of the package's entries, or SetPart returns a non-nil error and
+// leaves the package unchanged. See AddPart for adding a brand-new entry.
 func (p *Package) SetPart(name string, data []byte) error {
 	if _, ok := p.parts[name]; !ok {
 		return fmt.Errorf("docx has no entry named %q", name)
 	}
 	p.parts[name] = data
+	p.modified[name] = true
+	return nil
+}
+
+// AddPart adds a brand-new entry to the package, to be written by WriteTo.
+// This is SetPart's counterpart for the one case SetPart deliberately
+// refuses: name must NOT already exist, or AddPart returns a non-nil error
+// and leaves the package unchanged (use SetPart to replace an existing
+// entry's content instead).
+//
+// The new entry is appended to the END of p.names, so WriteTo's replay of
+// that order writes it as the LAST entry in the output zip, after every
+// original entry — never inserted in the middle, which would renumber
+// nothing (WriteTo iterates by name, not by index) but would still be a
+// gratuitous reordering of entries a byte-diff-minded caller has no reason
+// to expect. Every original entry keeps its own original position, and
+// (being untouched) is still copied via WriteTo's raw-bytes path, so this
+// is the one way to grow a package that preserves every existing entry's
+// bytes exactly (task 12 brief, item 1) — the same fidelity guarantee
+// TestWriteTo_UntouchedPartsAreByteIdentical pins for SetPart already
+// applies here, just for a name that did not exist before AddPart.
+//
+// name is validated with the exact same checkEntryName Open applies to
+// every entry read from disk: a caller-constructed part name is just as
+// capable of smuggling a path-traversal or control-byte entry as one read
+// from an untrusted zip, and AddPart is the only place in this package that
+// invents a NEW name rather than replaying one Open already validated.
+//
+// data is stored as-is; WriteTo synthesizes a fresh zip.FileHeader for it
+// (Name, a Deflate method, and the current time as its Modified stamp,
+// since there is no original header to carry forward the way SetPart's
+// target always has) rather than requiring the caller to supply one.
+func (p *Package) AddPart(name string, data []byte) error {
+	if _, ok := p.parts[name]; ok {
+		return fmt.Errorf("docx already has an entry named %q; use SetPart to replace its content", name)
+	}
+	if err := checkEntryName(name); err != nil {
+		return err
+	}
+	p.names = append(p.names, name)
+	p.parts[name] = data
+	p.raw[name] = nil
+	p.headers[name] = &zip.FileHeader{
+		Name:     name,
+		Method:   zip.Deflate,
+		Modified: time.Now(),
+	}
 	p.modified[name] = true
 	return nil
 }
