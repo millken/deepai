@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,8 +30,10 @@ type WriteOptions struct {
 	// Markdown is the source document. Supported syntax: ATX headings
 	// (# .. ######), blank-line-separated paragraphs, **bold**/__bold__,
 	// *italic*/_italic_, `inline code`, unordered/ordered lists (including
-	// nesting -- see inferListIndentUnit for how leading-space indentation
-	// maps to nesting level), GFM pipe tables (header row, alignment row,
+	// nesting -- see computeListRuns for how leading-space indentation
+	// maps to nesting level, independently per list -- and an ordered
+	// list's own starting number, e.g. "5.", which is honored via
+	// numbering.xml's startOverride -- see assignListNumIDs), GFM pipe tables (header row, alignment row,
 	// bold header, ragged rows padded/truncated and declared -- see
 	// parseTable), fenced ``` code blocks (markdown is not interpreted
 	// inside one -- see paraBlock.isCode), [text](url) links (rendered as
@@ -142,6 +145,15 @@ var docxEpoch = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
 func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 	blocks, notes := parseMarkdown(opts)
 	fonts := resolveFontOptions(opts)
+	// assignListNumIDs resolves every isList paraBlock's final b.numID (the
+	// bulletNumID for unordered items, or a fresh per-run id for ordered
+	// ones -- see paraBlock.numID/listGroupID) and reports the ordered runs
+	// it allocated, in first-encountered order, so buildNumberingXML below
+	// can emit each one's own <w:num> (with a <w:lvlOverride>/
+	// <w:startOverride> wherever the run's own first item did not start at
+	// 1). This must run before the render loop just below, which reads
+	// b.numID back out of the very same blocks.
+	orderedRuns := assignListNumIDs(blocks)
 
 	ctx := newRenderCtx(fonts)
 	var body strings.Builder
@@ -191,7 +203,7 @@ func WriteDocx(path string, opts WriteOptions) (WriteResult, error) {
 		{name: DocumentPart, data: []byte(body.String())},
 		{name: "word/_rels/document.xml.rels", data: []byte(docRelsXML)},
 		{name: "word/styles.xml", data: buildStylesXMLWithFonts(fonts)},
-		{name: "word/numbering.xml", data: []byte(numberingXML)},
+		{name: "word/numbering.xml", data: []byte(buildNumberingXML(orderedRuns))},
 		{name: footer1Part, data: []byte(footer1XML)},
 		{name: fontTablePart, data: []byte(fontTableXML(fonts))},
 	}
@@ -346,18 +358,77 @@ type block struct {
 // paragraph with isCell set gets NO pStyle at all — it stays on Normal, and
 // TableGrid's own <w:pPr> (styles.go) supplies its compact spacing via the
 // table-style cascade instead — see tableTblPrXML's doc comment.
+//
+// isListContinue and codeInList are Task 11's I8 fix: a list item's own
+// indented continuation content used to fall out of the list entirely (an
+// ordinary BodyText paragraph, or -- for a fenced code block -- an
+// unindented SourceCode one), losing the list's indent and so visually
+// detaching from the item it belongs to. isListContinue marks a
+// continuation PROSE paragraph (buildBlocks' flush, when accInList is
+// true); codeInList marks a fenced code block's paraBlock that was opened
+// while a list was still open (buildBlocks' appendCode, when inListContext
+// is true). Both are rendered with an extra <w:numPr> at listLevel
+// referencing continuationNumID -- an invisible (numFmt="none") numbering
+// definition borrowed purely for its per-level <w:ind>, so the
+// continuation's indent is structurally guaranteed to match the list
+// item's own text column (both abstractNums use the identical 720*(lvl+1)
+// formula) without adding a new inline-<w:ind> exception to
+// TestWrite_NoInlineVisualPropertiesInDocumentXML -- <w:numPr> is already
+// that test's own named, structural exception (TestWrite_
+// InvariantAllowsThreeNamedExceptions), just applied here to a paragraph
+// that carries no visible number of its own. listLevel is shared with
+// isList's own meaning (the nesting level to indent at) rather than adding
+// a redundant field; the two are never both true on the same paraBlock.
+// An INDENTED (four-space) code block inside a list item is deliberately
+// NOT given this treatment -- CommonMark's indented form is already
+// ambiguous enough with an ordinary continuation line that this package
+// chose, before this task, to never treat ANY indented line as code while a
+// list is open (see inListContext's own doc comment); this task narrows
+// that gap only for the unambiguous fenced form, where "```" cannot be
+// mistaken for prose. See TestWrite_ContinuationUnderNestedListItemNotSwallowedAsCode,
+// which still pins the indented-form exclusion.
 type paraBlock struct {
-	heading     int
-	text        string
-	isList      bool
-	listLevel   int
-	listOrdered bool
-	jc          string
-	forceBold   bool
-	isCode      bool
-	isQuote     bool
-	isHR        bool
-	isCell      bool
+	heading        int
+	text           string
+	isList         bool
+	listLevel      int
+	listOrdered    bool
+	jc             string
+	forceBold      bool
+	isCode         bool
+	isQuote        bool
+	isHR           bool
+	isCell         bool
+	isListContinue bool
+	codeInList     bool
+	// listGroupID identifies which independent list "run" (computeListRuns)
+	// this isList item belongs to -- a maximal stretch of list-item/
+	// continuation lines with no intervening non-list block. Meaningless
+	// when isList is false. assignListNumIDs consumes this, after
+	// buildBlocks has finished, to give every ordered run its OWN <w:numId>
+	// (I7's fix: two ordered lists separated by other content must not
+	// share one numId and silently continue each other's count) -- unordered
+	// (bullet) items ignore it and always resolve to the single, static
+	// bulletNumID, since a bullet has no number to wrongly continue.
+	listGroupID int
+	// orderedNum is an ordered item's own leading number, parsed straight
+	// from its markdown marker (parseOrderedNum) -- e.g. 5 for "5. Fifth".
+	// Meaningless unless isList && listOrdered. assignListNumIDs uses the
+	// FIRST ordered item at each (listGroupID, listLevel) pair to decide
+	// whether that run needs a <w:lvlOverride>/<w:startOverride> at all
+	// (only when it differs from the abstractNum's own default start of 1);
+	// every later item in the same run/level is left to Word's own
+	// auto-increment.
+	orderedNum int
+	// numID is the resolved <w:numId> renderParagraph writes for an isList
+	// paragraph -- bulletNumID for every unordered item, or the run-specific
+	// id assignListNumIDs allocated via listGroupID for an ordered one.
+	// Resolved once, after buildBlocks returns the whole blocks slice
+	// (assignListNumIDs needs to see every item in a run before it can
+	// allocate that run's single id), rather than inline in buildBlocks
+	// itself, which only ever sees one line at a time. Meaningless when
+	// isList is false.
+	numID int
 	// codeBreak is set (by buildBlocks, only on the first isCode paraBlock
 	// of a fresh code block) when the source actually had a blank line
 	// between this block and whatever isCode block precedes it -- see
@@ -414,9 +485,11 @@ var (
 	// without that space the hashes are part of the text, not a closer.
 	closingHashRE = regexp.MustCompile(`\s+#+\s*$`)
 	// listItemRE matches one list item line, capturing leading indentation
-	// (group 1, used to compute nesting level — see inferListIndentUnit),
-	// the marker (group 2: "-", "*", "+" for unordered, or "<digits>." /
-	// "<digits>)" for ordered), and the item's content after the marker
+	// (group 1, used to compute nesting level — see computeListRuns), the
+	// marker (group 2: "-", "*", "+" for unordered, or "<digits>." /
+	// "<digits>)" for ordered -- the leading digits are also parsed back out,
+	// by parseOrderedNum, as an ordered item's own starting number), and the
+	// item's content after the marker
 	// (group 3). The required run of whitespace after the marker, and the
 	// required non-whitespace first character of the content, are what
 	// keep "*italic*" (no space after the opening '*') from ever being
@@ -546,8 +619,7 @@ func looksLikeLinkDestination(dest string) bool {
 // falls through to being an ordinary paragraph instead of Heading1 -- I10.
 func parseMarkdown(opts WriteOptions) ([]block, []string) {
 	markdown := strings.TrimPrefix(opts.Markdown, "\ufeff")
-	unit := inferListIndentUnit(markdown)
-	blocks, tableNotes, hasRefDef := buildBlocks(markdown, unit)
+	blocks, tableNotes, hasRefDef := buildBlocks(markdown)
 	hasImage := detectImages(markdown)
 	// detectStructuralGaps scans the already-PARSED blocks, not markdown
 	// itself -- see structuralGaps' own doc comment for why (code block
@@ -598,9 +670,14 @@ func markdownStartsWithH1(markdown string) bool {
 // see flush/flushQuote below); everything else is emitted immediately as
 // its own block rather than merged with neighbors, since merging e.g. two
 // list items into one paragraph would make already-special content
-// actively misleading. unit is the number of leading spaces that make one
-// list nesting level — see inferListIndentUnit, which computes it once per
-// document before this function is called.
+// actively misleading. Each list item's own nesting level is its own
+// leading-space count divided by ITS list's own inferred indent unit — see
+// computeListRuns, called once up front, below, which partitions the
+// document's list-item lines into independent runs (Task 11's I6 fix: two
+// unrelated lists in the same document, one 2-space-indented and the other
+// 4-space, each get their own unit now, rather than one unit inferred
+// across the whole document silently mis-leveling whichever list did not
+// set it).
 //
 // Indented code blocks (CommonMark's other code-block form, alongside a
 // fence) were not recognized at all before this task: a four-space-indented
@@ -614,9 +691,31 @@ func markdownStartsWithH1(markdown string) bool {
 // indented continuation content looks identical (both are just "an indented
 // line") and swallowing it as code would be actively wrong -- see this
 // task's report for how each list/indent interaction case was checked.
-func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string, hasRefDef bool) {
+func buildBlocks(markdown string) (blocks []block, tableNotes []string, hasRefDef bool) {
 	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
 	lines := strings.Split(markdown, "\n")
+	// runOf/unitOf partition this document's list-item lines into
+	// independent runs and give each its own indent unit -- see
+	// computeListRuns' own doc comment. Computed once, up front, because a
+	// run's unit cannot be known until every item in it has been seen (the
+	// same reason the whole-document version this replaces had to be a
+	// separate first pass too), whereas the main loop below classifies one
+	// line at a time.
+	runOf, unitOf := computeListRuns(lines)
+	// curListLevel remembers the most recently matched list item's own
+	// level -- see the listItemRE branch below, which sets it, and
+	// flush/appendCode, which read it back to attach continuation content
+	// (I8) to the SAME level the item it followed in the source was at. A
+	// continuation line never itself matches listItemRE, so it has no level
+	// of its own to record; borrowing the innermost open item's is this
+	// package's documented, deliberately lossy simplification for
+	// continuation content that would, in full CommonMark, belong to an
+	// OUTER item instead (see paraBlock.isListContinue's doc comment) --
+	// consistent with the former whole-document inferListIndentUnit's own
+	// precedent (TestWrite_MixedIndentationRoundsPredictably) of choosing
+	// one predictable answer over a more precise but much more involved
+	// reconstruction.
+	curListLevel := 0
 
 	var accLines []string
 	// accInList records whether ANY line currently buffered in accLines was
@@ -648,10 +747,26 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 			return
 		}
 		text := joinWithHardBreaks(accLines, accBreaks)
+		// wasContinuation/level are snapshotted BEFORE accInList/accLines
+		// are cleared below: this flush might run because a brand-new list
+		// item just matched (which updates curListLevel/curListGroup only
+		// AFTER calling flush -- see the listItemRE branch), so curListLevel
+		// here is still the level of whichever item accLines' buffered
+		// lines actually continued.
+		wasContinuation := accInList
+		level := curListLevel
 		accLines = accLines[:0]
 		accBreaks = accBreaks[:0]
 		accInList = false
 		if strings.TrimSpace(text) == "" {
+			return
+		}
+		if wasContinuation {
+			// I8: a list item's own indented continuation text stays
+			// attached to the list (isListContinue), instead of becoming an
+			// ordinary top-level BodyText paragraph -- see
+			// paraBlock.isListContinue's doc comment for the rendering side.
+			blocks = append(blocks, block{para: &paraBlock{text: text, isListContinue: true, listLevel: level}})
 			return
 		}
 		blocks = append(blocks, block{para: &paraBlock{heading: 0, text: text}})
@@ -691,17 +806,33 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 	// never actually gets consulted for a merge decision against something
 	// non-adjacent.
 	pendingCodeBreak := false
-	appendCode := func(text string) {
-		cb := pendingCodeBreak
-		pendingCodeBreak = false
-		blocks = append(blocks, block{para: &paraBlock{text: text, isCode: true, codeBreak: cb}})
-	}
-
-	inFence := false
 	// See this function's own doc comment for what these three implement.
+	// Declared here, ahead of appendCode just below (rather than at their
+	// previous spot immediately ahead of the main loop), because appendCode
+	// itself now reads inListContext -- a closure cannot reference a local
+	// variable declared later in the same function.
+	inFence := false
 	inListContext := false
 	inIndentedCode := false
 	pendingBlankIndentedLines := 0
+	appendCode := func(text string) {
+		cb := pendingCodeBreak
+		pendingCodeBreak = false
+		p := &paraBlock{text: text, isCode: true, codeBreak: cb}
+		// codeInList (I8): a FENCED code block opened while a list is still
+		// open (inListContext true -- see the fenceRE branch at the top of
+		// this loop, which never resets inListContext for a fence delimiter
+		// or its contents) keeps the list's own indent instead of sitting
+		// flush with the page margin -- see paraBlock.isListContinue's doc
+		// comment for why this is scoped to the fenced form only, and
+		// renderParagraph for how the indent is applied.
+		if inListContext {
+			p.codeInList = true
+			p.listLevel = curListLevel
+		}
+		blocks = append(blocks, block{para: p})
+	}
+
 	tableIndex := 0
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -818,18 +949,30 @@ func buildBlocks(markdown string, unit int) (blocks []block, tableNotes []string
 		if m := listItemRE.FindStringSubmatch(line); m != nil {
 			flush()
 			flushQuote()
+			group := runOf[i]
+			unit, ok := unitOf[group]
+			if !ok {
+				unit = defaultListIndentUnit
+			}
 			level := len(m[1]) / unit
 			if level > maxListLevel {
 				level = maxListLevel
 			}
 			ordered := m[2][0] >= '0' && m[2][0] <= '9'
+			var orderedNum int
+			if ordered {
+				orderedNum = parseOrderedNum(m[2])
+			}
 			blocks = append(blocks, block{para: &paraBlock{
 				text:        m[3],
 				isList:      true,
 				listLevel:   level,
 				listOrdered: ordered,
+				listGroupID: group,
+				orderedNum:  orderedNum,
 			}})
 			inListContext = true
+			curListLevel = level
 			continue
 		}
 		if strings.Contains(trimmed, "|") && i+1 < len(lines) && isTableSeparator(lines[i+1]) {
@@ -1163,38 +1306,59 @@ func joinWithHardBreaks(lines []string, breaks []bool) string {
 	return b.String()
 }
 
-// inferListIndentUnit scans markdown for list-item lines (skipping fenced
-// code, so a code sample containing lines that happen to look like list
-// items never pollutes this) and returns the smallest positive
-// leading-space count among them: that width is treated as "one nesting
-// level" for the WHOLE document. This replaces a unit pinned at a fixed
-// constant, which made a 4-space-indented document (CommonMark's own
-// canonical indent width) come out at ilvl 0, 2, 4 instead of 0, 1, 2 —
-// double depth, skipping levels, wrong bullet glyph per level in Word.
-//
-// A document that mixes indentation widths (say, 2 spaces in one place and
-// 3 in another) still gets a single, predictable answer: every item's
-// level is that item's leading-space count divided by this one inferred
-// unit (integer division, in buildBlocks), never a stack that guesses "is
-// this a new level" from context. That can round two DIFFERENT indent
-// widths down to the same level (e.g. unit=2: both 2 and 3 spaces map to
-// level 1) rather than raising an error — a predictable lossy mapping was
-// chosen over rejecting input a person would consider reasonably
-// well-formed.
-//
-// A document with no nested list items at all (every item at indent 0, or
-// no list items whatsoever) has nothing to infer a unit from; 2 is
-// returned in that case as an arbitrary but harmless default, since no
-// item's level calculation is affected by it either way (0 / anything ==
-// 0).
-func inferListIndentUnit(markdown string) int {
-	markdown = strings.ReplaceAll(markdown, "\r\n", "\n")
-	lines := strings.Split(markdown, "\n")
+// defaultListIndentUnit is computeListRuns' fallback indent unit for a run
+// with no positive-indent item of its own (every item at indent 0, a
+// single-level list, or -- unreachable in practice, since runOf only ever
+// assigns a real run number to a line that matched listItemRE -- a run with
+// no items at all). 2 is arbitrary but harmless: a run with nothing to
+// infer a unit from has no item whose level calculation the unit could
+// possibly affect either way (0 / anything == 0).
+const defaultListIndentUnit = 2
 
-	const defaultUnit = 2
+// computeListRuns partitions markdown's list-item lines into independent
+// runs and gives each its own indent unit -- Task 11's shared foundation
+// for both I6 (per-list indent-unit inference) and I7 (per-list ordered
+// numId restart): a run is a maximal sequence of list-item lines,
+// including whatever indented continuation/fenced-code lines sit between
+// them (I8 content that stays "inside" the list -- see buildBlocks'
+// inListContext), with no intervening block that would end the list.
+//
+// This must run as ITS OWN pass, before buildBlocks' main per-line loop,
+// for the same reason the whole-document inferListIndentUnit this replaces
+// had to be: a run's own unit cannot be known until every item in it has
+// been seen, but buildBlocks' loop needs a level for EACH item line the
+// moment it reaches it. lines must already be CRLF-normalized and split
+// exactly the way buildBlocks' own lines are -- runOf is indexed
+// positionally against them, so buildBlocks passes the very same slice
+// rather than re-deriving its own.
+//
+// runOf[i] is 0 for a line that is not itself a list-item line, or the
+// (1-based) run number a list-item line at lines[i] belongs to -- 0 is
+// never a valid run number precisely so a lookup miss and "not a list
+// item" cannot be confused. unitOf[r] is run r's own inferred indent unit:
+// the smallest positive leading-space count among ITS OWN item lines
+// (mirroring inferListIndentUnit's own former per-document rule, just
+// scoped to one run), absent from the map entirely when the run has none
+// (every item at indent 0) -- callers fall back to defaultListIndentUnit
+// in that case, exactly as the old whole-document version did.
+//
+// A run's boundary tracking mirrors buildBlocks' own inListContext state
+// machine closely enough that the two must be read together: fenced code
+// (opening delimiter, contents, and closing delimiter) never ends or
+// starts a run, a blank line alone never ends one either (see buildBlocks'
+// blank-line branch, which does not reset inListContext), and any other
+// non-blank, unindented line unconditionally ends whatever run was open
+// (mirroring buildBlocks' own "if !hasLeadingIndent(line) { inListContext =
+// false }" reset) -- see TestWrite_ListInterruptedThenResumedGetsFreshNumId,
+// which pins exactly that boundary for I7.
+func computeListRuns(lines []string) (runOf []int, unitOf map[int]int) {
+	runOf = make([]int, len(lines))
+	unitOf = make(map[int]int)
+
 	inFence := false
-	min := 0
-	for _, line := range lines {
+	activeRun := 0
+	nextRun := 0
+	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if fenceRE.MatchString(trimmed) {
 			inFence = !inFence
@@ -1203,19 +1367,50 @@ func inferListIndentUnit(markdown string) int {
 		if inFence {
 			continue
 		}
-		m := listItemRE.FindStringSubmatch(line)
-		if m == nil {
+		if trimmed == "" {
 			continue
 		}
-		n := len(m[1])
-		if n > 0 && (min == 0 || n < min) {
-			min = n
+		if m := listItemRE.FindStringSubmatch(line); m != nil {
+			if activeRun == 0 {
+				nextRun++
+				activeRun = nextRun
+			}
+			runOf[i] = activeRun
+			if n := len(m[1]); n > 0 {
+				if cur, ok := unitOf[activeRun]; !ok || n < cur {
+					unitOf[activeRun] = n
+				}
+			}
+			continue
 		}
+		if hasLeadingIndent(line) {
+			// An indented, non-list-item line: I8 continuation/in-list-code
+			// content, which stays inside whatever run is open (it does not
+			// itself need a run number -- only a list-item line's own level
+			// calculation ever consults runOf -- but leaving it 0 here would
+			// be indistinguishable from "not part of any list", so this is
+			// simply never read for these lines, not a correctness
+			// requirement).
+			continue
+		}
+		activeRun = 0
 	}
-	if min == 0 {
-		return defaultUnit
+	return runOf, unitOf
+}
+
+// parseOrderedNum parses an ordered list item's own leading number back out
+// of its marker (listItemRE's group 2, e.g. "5." or "5)") -- always exactly
+// one or more digits followed by '.' or ')', by construction of listItemRE,
+// so the Atoi below cannot fail in practice; the err fallback (1, the same
+// value an abstractNum's own default start already assumes) only guards
+// against that invariant ever being violated, rather than being a case this
+// function's caller expects to hit.
+func parseOrderedNum(marker string) int {
+	n, err := strconv.Atoi(marker[:len(marker)-1])
+	if err != nil {
+		return 1
 	}
-	return min
+	return n
 }
 
 // isTableSeparator reports whether line is a pipe-table separator row, e.g.
@@ -2418,12 +2613,15 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 	var pPr strings.Builder
 	// pStyle is the one paragraph-level style reference every non-plain
 	// paragraph carries; buildBlocks never sets more than one of
-	// heading/isList/isQuote/isCode on the same paraBlock (see the
-	// paraBlock doc comment), so this is a genuine mutual exclusion, not
-	// merely an order-of-precedence choice.
+	// heading/isList/isQuote/isCode/isListContinue on the same paraBlock
+	// (see the paraBlock doc comment), so this is a genuine mutual
+	// exclusion, not merely an order-of-precedence choice. codeInList is
+	// the one exception: it is an ADDITIONAL flag on an isCode paraBlock,
+	// not a separate paragraph kind, so it is handled inside the isCode
+	// case rather than getting its own switch arm.
 	//
 	// The default branch (an ordinary paragraph, heading==0 and none of
-	// isList/isQuote/isCode/isHR/isCell) is Task 2 of the docx-chinese-
+	// isList/isQuote/isCode/isListContinue/isHR/isCell) is Task 2 of the docx-chinese-
 	// typography plan: it references BodyText (styles.go) for the
 	// reference document's first-line indent + 1.5x line spacing. isHR and
 	// isCell are excluded from that default on purpose, not merely left
@@ -2448,6 +2646,15 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		pPr.WriteString(quoteBorderXML)
 	case b.isCode:
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleSourceCode)
+		// codeInList (Task 11's I8 fix): a fenced code block that opened
+		// while a list item was still open borrows continuationNumID purely
+		// for its per-level <w:ind> -- see paraBlock.codeInList's doc
+		// comment. This must come BEFORE codeBorderXML/codeShadingXML just
+		// below: <w:numPr> precedes <w:pBdr>/<w:shd> in CT_PPr's schema
+		// order.
+		if b.codeInList {
+			fmt.Fprintf(&pPr, `<w:numPr><w:ilvl w:val="%d"/><w:numId w:val="%d"/></w:numPr>`, b.listLevel, continuationNumID)
+		}
 		// GenOffice-compatibility copy of SourceCode's own border and
 		// shading (see styles.go's codeBorderXML/codeShadingXML): the
 		// pStyle reference above already carries both by name, but
@@ -2458,6 +2665,15 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		// this correct even if it did).
 		pPr.WriteString(codeBorderXML)
 		pPr.WriteString(codeShadingXML)
+	case b.isListContinue:
+		// Task 11's I8 fix: a list item's own indented continuation
+		// paragraph (buildBlocks' flush, when accInList was true) gets a
+		// dedicated style (analogous to Word's own "List Continue") plus
+		// the same continuationNumID indent-borrowing trick as codeInList
+		// just above -- see paraBlock.isListContinue's doc comment for why
+		// this is <w:numPr>, not an inline <w:ind>.
+		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleListContinue)
+		fmt.Fprintf(&pPr, `<w:numPr><w:ilvl w:val="%d"/><w:numId w:val="%d"/></w:numPr>`, b.listLevel, continuationNumID)
 	case b.isHR, b.isCell:
 		// No pStyle: isHR has no text to indent, and isCell must stay on
 		// Normal so TableGrid's own pPr cascade (styles.go) governs its
@@ -2466,11 +2682,7 @@ func renderParagraph(b paraBlock, ctx *renderCtx) (string, error) {
 		fmt.Fprintf(&pPr, `<w:pStyle w:val="%s"/>`, StyleBodyText)
 	}
 	if b.isList {
-		numID := bulletNumID
-		if b.listOrdered {
-			numID = orderedNumID
-		}
-		fmt.Fprintf(&pPr, `<w:numPr><w:ilvl w:val="%d"/><w:numId w:val="%d"/></w:numPr>`, b.listLevel, numID)
+		fmt.Fprintf(&pPr, `<w:numPr><w:ilvl w:val="%d"/><w:numId w:val="%d"/></w:numPr>`, b.listLevel, b.numID)
 	}
 	if b.isHR {
 		pPr.WriteString(hrBorderXML)
@@ -3448,28 +3660,45 @@ const hrBorderXML = `<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:col
 // treat as invalid.
 const maxListLevel = 8
 
-// bulletNumID and orderedNumID are the fixed, document-wide <w:numId>
-// values every unordered/ordered list paragraph's <w:numPr> refers to.
-// They point at different abstractNums (0 and 1 respectively, see
-// buildNumberingXML) — sharing one numId, or pointing both at the same
-// abstractNum, is exactly what makes an ordered list render as bullets
-// (the brief).
+// bulletNumID, orderedNumIDBase and continuationNumID are the fixed
+// <w:numId> values this package always allocates the same way, regardless
+// of document content. They point at different abstractNums (0, 1, and 2
+// respectively, see buildNumberingXML) — sharing one numId between bullet
+// and ordered items, or pointing both at the same abstractNum, is exactly
+// what would make an ordered list render as bullets (the brief).
 //
-// Because both are single, fixed IDs used for every list of their kind
-// anywhere in the document, two separate ordered lists — e.g. separated by
-// an intervening ordinary paragraph — share the same numId and so CONTINUE
-// the same numbering sequence rather than each restarting at 1. That is a
-// deliberate simplification, not an oversight: the alternative (each
-// contiguous list run restarting) needs a fresh <w:num> with its own
-// <w:lvlOverride>/<w:startOverride> per run, built dynamically per
-// document rather than as this fixed, statically-defined numbering.xml.
-// This package chooses the static, always-deterministic version and
-// accepts the "continues" behavior as its consequence — see
-// TestWrite_ListInterruptedThenResumedSharesNumId, which pins exactly
-// this.
+// bulletNumID is shared by EVERY unordered list item anywhere in the
+// document: a bullet carries no number to wrongly continue, so there is
+// nothing I7 needs to fix for it (see assignListNumIDs).
+//
+// orderedNumIDBase is only the FIRST ordered list run's numId (assigned by
+// assignListNumIDs, in document order) -- every later, independent ordered
+// run gets its own, freshly allocated id starting right after it (see
+// assignListNumIDs' own doc comment), so two ordered lists separated by
+// other content each restart their own numbering rather than silently
+// continuing one shared count. That silent-continuation behavior was this
+// package's OLD, deliberate simplification (a single, static numbering.xml
+// built once, before this task, rather than one assembled per document);
+// I7 in the write-quality report judged it a real defect for the common
+// case this package exists to serve (a contract's numbered clauses, or a
+// procedure's numbered steps, resuming after an unrelated paragraph) and
+// this task replaces it -- see
+// TestWrite_ListInterruptedThenResumedGetsFreshNumId, which used to pin
+// the old "shares numId" behavior as the EXPECTED outcome and now pins its
+// opposite.
+//
+// continuationNumID is Task 11's I8 fix: it names one further, INVISIBLE
+// numbering instance (abstractNumId 2, numFmt "none") that a list
+// item's own continuation paragraph or in-list fenced code block borrows
+// purely for its per-level <w:ind> -- see paraBlock.isListContinue's doc
+// comment for why this, rather than an inline <w:ind>, is how their indent
+// is made to match the list item's own text column. It is a single fixed
+// id, never restarted per run: nothing it produces is ever visibly
+// numbered, so there is nothing for a restart to fix.
 const (
-	bulletNumID  = 1
-	orderedNumID = 2
+	bulletNumID       = 1
+	orderedNumIDBase  = 2
+	continuationNumID = 1000
 )
 
 // bulletChars cycles every 3 levels — the same filled/hollow/square
@@ -3483,24 +3712,146 @@ var bulletChars = []string{"•", "◦", "▪"}
 // uses for nested levels.
 var orderedFormats = []string{"decimal", "lowerLetter", "lowerRoman"}
 
-// numberingXML is word/numbering.xml: one abstractNum for bullets
-// (abstractNumId 0) and one for ordered decimal/letter/roman levels
-// (abstractNumId 1), each defining levels 0..maxListLevel, plus the two
-// <w:num> entries bulletNumID/orderedNumID reference. Built once, here, by
-// a loop rather than written out by hand: 2 x (maxListLevel+1) nearly
-// identical <w:lvl> blocks would otherwise be a lot of easy-to-typo,
-// hard-to-review literal XML.
-var numberingXML = buildNumberingXML()
+// orderedRunInfo is one independent ordered-list run's own numbering
+// allocation, as assignListNumIDs resolves it: numID is the fresh <w:numId>
+// every ordered item in the run resolves to (paraBlock.numID), and
+// overrides maps an ilvl to the <w:startOverride> value buildOrderedNumEntry
+// must emit for it -- present ONLY for a level whose first item in this run
+// did not start at 1 (abstractNumId 1's own default), e.g. a contract
+// section opening "5. Fifth clause".
+type orderedRunInfo struct {
+	numID     int
+	overrides map[int]int
+}
 
-func buildNumberingXML() string {
+// assignListNumIDs is Task 11's I7 fix: it walks blocks in order and
+// resolves every isList paraBlock's final b.numID (renderParagraph reads it
+// straight off the block, see its own doc comment) --
+//
+//   - every UNORDERED item resolves to the single, static bulletNumID: a
+//     bullet has no number to wrongly continue across an interruption, so
+//     nothing here needs to restart for it (see bulletNumID's own doc
+//     comment).
+//   - every ORDERED item resolves to a numId shared by every other ordered
+//     item in the SAME run (paraBlock.listGroupID, from computeListRuns),
+//     first allocated, in the order runs are first encountered, starting at
+//     orderedNumIDBase. A fresh numId is itself what makes numbering.xml
+//     restart the run's count at its abstractNum's own default (1) --
+//     independent numIds never share a counter even when they reference the
+//     SAME abstractNumId (see buildOrderedNumEntry). This is also what makes
+//     level counters within one run independent per level (a nested ordered
+//     sub-list under an ordered parent counts "a., b., c." on its own,
+//     restarting at the parent's every top-level item, exactly as
+//     orderedAbstractNumXML's own per-level lvlText already implies) --
+//     TWO SEPARATE runs sharing that same PARENT relationship would not
+//     currently get that for free, but this package's scope (see this
+//     task's report) stops at "a run interrupted by a non-list block
+//     restarts", not full nested-list numbering fidelity.
+//
+// The returned []*orderedRunInfo is in the order runs were first
+// encountered while walking blocks -- i.e. deterministic document order,
+// required for TestWrite_IsDeterministic -- and is exactly what
+// buildNumberingXML needs to emit each run's own <w:num>.
+func assignListNumIDs(blocks []block) []*orderedRunInfo {
+	groupInfo := make(map[int]*orderedRunInfo)
+	var runs []*orderedRunInfo
+	// seenLevel records the first ordered item seen at each (run, ilvl)
+	// pair: only THAT item's own leading number can produce a
+	// <w:startOverride> for its level -- every later item at the same level
+	// in the same run is left to Word's own auto-increment.
+	seenLevel := make(map[[2]int]bool)
+	nextNumID := orderedNumIDBase
+	for _, blk := range blocks {
+		if blk.para == nil || !blk.para.isList {
+			continue
+		}
+		if !blk.para.listOrdered {
+			blk.para.numID = bulletNumID
+			continue
+		}
+		info, ok := groupInfo[blk.para.listGroupID]
+		if !ok {
+			info = &orderedRunInfo{numID: nextNumID, overrides: make(map[int]int)}
+			nextNumID++
+			groupInfo[blk.para.listGroupID] = info
+			runs = append(runs, info)
+		}
+		key := [2]int{blk.para.listGroupID, blk.para.listLevel}
+		if !seenLevel[key] {
+			seenLevel[key] = true
+			if blk.para.orderedNum != 1 {
+				info.overrides[blk.para.listLevel] = blk.para.orderedNum
+			}
+		}
+		blk.para.numID = info.numID
+	}
+	return runs
+}
+
+// buildNumberingXML assembles word/numbering.xml for one document: the
+// three always-present abstractNums (bullet, ordered, and the invisible
+// continuation one -- abstractNumId 0/1/2, see bulletAbstractNumXML/
+// orderedAbstractNumXML/continuationAbstractNumXML), the three always-present
+// <w:num> entries bulletNumID/orderedNumIDBase/continuationNumID reference,
+// and one further dynamic <w:num> per EXTRA independent ordered run
+// orderedRuns reports (i.e. every run after the first -- the first one IS
+// orderedNumIDBase, so it is folded into that always-present entry rather
+// than duplicated). Unlike the static numbering.xml this replaces (a single
+// package-level var, since nothing about it used to depend on document
+// content), this must now be called fresh per WriteDocx call, after
+// assignListNumIDs has walked that call's own blocks.
+func buildNumberingXML(orderedRuns []*orderedRunInfo) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
 	b.WriteString(`<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">`)
 	b.WriteString(bulletAbstractNumXML())
 	b.WriteString(orderedAbstractNumXML())
-	fmt.Fprintf(&b, `<w:num w:numId="%d"><w:abstractNumId w:val="0"/></w:num>`, bulletNumID)
-	fmt.Fprintf(&b, `<w:num w:numId="%d"><w:abstractNumId w:val="1"/></w:num>`, orderedNumID)
+	b.WriteString(continuationAbstractNumXML())
+	b.WriteString(buildNumEntry(bulletNumID, 0, nil))
+
+	// The first ordered run (if the document has any ordered list at all)
+	// IS orderedNumIDBase -- its own overrides (if any) belong on that
+	// always-present entry, not a separate one; every later run gets its
+	// own new entry below.
+	baseOverrides := map[int]int(nil)
+	extraRuns := orderedRuns
+	if len(orderedRuns) > 0 && orderedRuns[0].numID == orderedNumIDBase {
+		baseOverrides = orderedRuns[0].overrides
+		extraRuns = orderedRuns[1:]
+	}
+	b.WriteString(buildNumEntry(orderedNumIDBase, 1, baseOverrides))
+	b.WriteString(buildNumEntry(continuationNumID, 2, nil))
+	for _, run := range extraRuns {
+		b.WriteString(buildNumEntry(run.numID, 1, run.overrides))
+	}
 	b.WriteString(`</w:numbering>`)
+	return b.String()
+}
+
+// buildNumEntry renders one <w:num> instance referencing abstractNumID,
+// with a <w:lvlOverride>/<w:startOverride> child for every (ilvl, start)
+// pair in overrides -- omitted entirely when overrides is empty/nil, so a
+// run whose every level legitimately started at 1 (abstractNum's own
+// default) gets the plain, one-line form rather than a vacuous override.
+// Levels are emitted in ascending order (overrides is a map, whose
+// iteration order Go leaves unspecified) so this function's own output is
+// deterministic, matching TestWrite_IsDeterministic's requirement on the
+// whole package.
+func buildNumEntry(numID, abstractNumID int, overrides map[int]int) string {
+	if len(overrides) == 0 {
+		return fmt.Sprintf(`<w:num w:numId="%d"><w:abstractNumId w:val="%d"/></w:num>`, numID, abstractNumID)
+	}
+	levels := make([]int, 0, len(overrides))
+	for lvl := range overrides {
+		levels = append(levels, lvl)
+	}
+	sort.Ints(levels)
+	var b strings.Builder
+	fmt.Fprintf(&b, `<w:num w:numId="%d"><w:abstractNumId w:val="%d"/>`, numID, abstractNumID)
+	for _, lvl := range levels {
+		fmt.Fprintf(&b, `<w:lvlOverride w:ilvl="%d"><w:startOverride w:val="%d"/></w:lvlOverride>`, lvl, overrides[lvl])
+	}
+	b.WriteString(`</w:num>`)
 	return b.String()
 }
 
@@ -3540,6 +3891,43 @@ func orderedAbstractNumXML() string {
 				`<w:lvlText w:val="%%%d."/><w:lvlJc w:val="left"/>`+
 				`<w:pPr><w:ind w:left="%d" w:hanging="360"/></w:pPr></w:lvl>`,
 			lvl, orderedFormats[lvl%len(orderedFormats)], lvl+1, indent)
+	}
+	b.WriteString(`</w:abstractNum>`)
+	return b.String()
+}
+
+// continuationAbstractNumXML defines abstractNumId 2: Task 11's I8
+// indent-borrowing mechanism for a list item's own continuation paragraph
+// or in-list fenced code block (see paraBlock.isListContinue's doc
+// comment). numFmt "none" and an empty lvlText mean nothing is ever
+// visibly numbered by this abstractNum -- it exists purely so a paragraph
+// can reference its per-level <w:ind> via the already-allowed <w:numPr>
+// structural exception, instead of writing an inline <w:ind> that would
+// need a brand-new exception to TestWrite_NoInlineVisualPropertiesInDocumentXML's
+// otherwise-absolute "<w:ind> stays banned inline, no exception" rule.
+//
+// Unlike bulletAbstractNumXML/orderedAbstractNumXML, each level's <w:ind>
+// carries no w:hanging: a hanging indent pulls a bullet/number's OWN first
+// line back so a tab can align it with the following text at w:left --
+// there is no bullet/number here to pull back, so every line of a
+// continuation paragraph (there is only ever one "line" in the <w:p>
+// sense, but the principle holds) simply sits flush at w:left, exactly
+// where the sibling list item's own text starts. The w:left value uses the
+// IDENTICAL 720*(lvl+1) formula as the other two abstractNums specifically
+// so the two stay aligned by construction rather than by coincidence --
+// see TestWrite_ListContinuationIndentMatchesListItemIndent, which checks
+// this directly rather than trusting the formula by eyeball.
+func continuationAbstractNumXML() string {
+	var b strings.Builder
+	b.WriteString(`<w:abstractNum w:abstractNumId="2">`)
+	b.WriteString(`<w:multiLevelType w:val="hybridMultilevel"/>`)
+	for lvl := 0; lvl <= maxListLevel; lvl++ {
+		indent := 720 * (lvl + 1)
+		fmt.Fprintf(&b,
+			`<w:lvl w:ilvl="%d"><w:start w:val="1"/><w:numFmt w:val="none"/>`+
+				`<w:lvlText w:val=""/><w:lvlJc w:val="left"/>`+
+				`<w:pPr><w:ind w:left="%d"/></w:pPr></w:lvl>`,
+			lvl, indent)
 	}
 	b.WriteString(`</w:abstractNum>`)
 	return b.String()

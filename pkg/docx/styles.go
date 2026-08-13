@@ -38,6 +38,7 @@ const (
 	StyleVerbatimChar  = "VerbatimChar"
 	StyleQuote         = "Quote"
 	StyleListParagraph = "ListParagraph"
+	StyleListContinue  = "ListContinue"
 	StyleTableGrid     = "TableGrid"
 	StyleHyperlink     = "Hyperlink"
 )
@@ -56,6 +57,7 @@ var allStyleIDs = []string{
 	StyleVerbatimChar,
 	StyleQuote,
 	StyleListParagraph,
+	StyleListContinue,
 	StyleTableGrid,
 	StyleHyperlink,
 }
@@ -218,6 +220,7 @@ func buildStylesXMLWithFonts(f fontOptions) []byte {
 		verbatimCharStyleXML(f) +
 		quoteStyleXML +
 		listParagraphStyleXML +
+		listContinueStyleXML +
 		tableGridStyleXML +
 		hyperlinkStyleXML +
 		`</w:styles>`)
@@ -579,6 +582,23 @@ const quoteStyleXML = `<w:style w:type="paragraph" w:styleId="Quote">` +
 const listParagraphStyleXML = `<w:style w:type="paragraph" w:styleId="ListParagraph">` +
 	`<w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:qFormat/>` +
 	`<w:pPr><w:ind w:left="720"/><w:contextualSpacing/></w:pPr>` +
+	`</w:style>`
+
+// listContinueStyleXML is Task 11's I8 fix: a list item's own continuation
+// paragraph (write.go's paraBlock.isListContinue) references this instead
+// of BodyText, mirroring Word's own built-in "List Continue" style by name.
+// Unlike ListParagraph, it carries NO <w:ind> of its own -- a continuation
+// paragraph's indent has to vary per list nesting level, which a single
+// static style value cannot express, so that indent is supplied per
+// paragraph instead, via a borrowed <w:numPr> (continuationNumID, see
+// write.go's continuationAbstractNumXML) rather than a style property.
+// <w:contextualSpacing/> is carried here for the same reason
+// ListParagraph/SourceCode carry it -- collapsing docDefaultsXML's
+// between-paragraph spacing so a continuation paragraph sits snug under
+// the list item it belongs to instead of visually detaching from it.
+const listContinueStyleXML = `<w:style w:type="paragraph" w:styleId="ListContinue">` +
+	`<w:name w:val="List Continue"/><w:basedOn w:val="Normal"/><w:qFormat/>` +
+	`<w:pPr><w:contextualSpacing/></w:pPr>` +
 	`</w:style>`
 
 // tableGridStyleXML is the fix for the tall-table-row defect. It MUST be

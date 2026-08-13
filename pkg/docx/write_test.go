@@ -2,6 +2,7 @@ package docx
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -613,20 +614,157 @@ func TestWrite_PipeLineWithoutSeparatorIsNotATable(t *testing.T) {
 	}
 }
 
-// This package uses one fixed numId per list kind for the whole document
-// (see bulletNumID/orderedNumID in write.go), so two ordered lists
-// separated by an intervening paragraph share the same numId and their
-// numbering CONTINUES rather than restarting at 1. This is a deliberate,
-// documented choice (the alternative -- restarting -- would need a fresh
-// <w:num>/<w:lvlOverride> per contiguous list run), verified here the only
-// way this package's own reader can: both items reference numId 2, not
-// two different numIds.
-func TestWrite_ListInterruptedThenResumedSharesNumId(t *testing.T) {
+// This test used to be named TestWrite_ListInterruptedThenResumedSharesNumId
+// and pinned the OPPOSITE of what it asserts below: this package used one
+// fixed numId per list kind for the WHOLE document (bulletNumID/
+// orderedNumID in write.go, before Task 11), so two ordered lists separated
+// by an intervening paragraph shared the same numId and their numbering
+// silently CONTINUED rather than restarting -- e.g. a contract's numbered
+// clauses, or a procedure's numbered steps, resuming after an unrelated
+// paragraph would read "3. 4. 5." instead of restarting at "1. 2. 3.". The
+// write-quality report's I7 judged that a real defect (this package's own
+// report reasoned it was "deliberate", but a caller writing a real
+// contract or procedure has no way to know that, and gets silently wrong
+// output), so this test is rewritten rather than left pinning the bug: two
+// ordered lists separated by a non-list block are now independent RUNS
+// (computeListRuns), each getting its OWN, freshly allocated numId
+// (assignListNumIDs) whose counter starts fresh at its abstractNum's own
+// default of 1 -- a numId's counter never carries over from a different
+// numId, even one referencing the SAME abstractNum.
+func TestWrite_ListInterruptedThenResumedGetsFreshNumId(t *testing.T) {
 	d, _, _ := writeAndReopen(t, "1. one\n\ntext in between\n\n1. two\n")
 	doc, _ := d.Part(DocumentPart)
 	s := string(doc)
-	if got := strings.Count(s, `<w:numId w:val="2"/>`); got != 2 {
-		t.Errorf("expected both ordered items to share numId 2 (count = %d)", got)
+
+	numIDRE := regexp.MustCompile(`<w:numId w:val="(\d+)"/>`)
+	matches := numIDRE.FindAllStringSubmatch(s, -1)
+	if len(matches) != 2 {
+		t.Fatalf("got %d <w:numId> references, want 2 (one per ordered item): %s", len(matches), s)
+	}
+	if matches[0][1] == matches[1][1] {
+		t.Errorf("both ordered items reference numId %s -- the second, interrupted-then-resumed list must get its own fresh numId instead of continuing the first's", matches[0][1])
+	}
+
+	num, ok := d.Part("word/numbering.xml")
+	if !ok {
+		t.Fatal("word/numbering.xml missing")
+	}
+	ns := string(num)
+	for _, numID := range []string{matches[0][1], matches[1][1]} {
+		want := `<w:num w:numId="` + numID + `"><w:abstractNumId w:val="1"/></w:num>`
+		if !strings.Contains(ns, want) {
+			t.Errorf("numbering.xml has no plain (no-override) entry for numId %s -- both items in the markdown started at \"1.\", so neither run should need a startOverride: %s", numID, ns)
+		}
+	}
+}
+
+// I7 also requires an ordered list's OWN starting number (e.g. a contract
+// clause numbered "5. Fifth clause", continuing a numbering scheme this
+// package never saw the earlier part of) to be honored rather than reset to
+// 1 -- numbering.xml's <w:lvlOverride>/<w:startOverride> is exactly the
+// OOXML mechanism for that, and assignListNumIDs/buildNumEntry are what
+// wire an ordered run's own first item's number into it.
+func TestWrite_OrderedListHonorsItsOwnStartingNumber(t *testing.T) {
+	d, _, _ := writeAndReopen(t, "5. five\n6. six\n")
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+	m := regexp.MustCompile(`<w:numId w:val="(\d+)"/>`).FindStringSubmatch(s)
+	if m == nil {
+		t.Fatalf("no <w:numId> found in document.xml: %s", s)
+	}
+	numID := m[1]
+
+	num, ok := d.Part("word/numbering.xml")
+	if !ok {
+		t.Fatal("word/numbering.xml missing")
+	}
+	ns := string(num)
+	want := `<w:num w:numId="` + numID + `"><w:abstractNumId w:val="1"/>` +
+		`<w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num>`
+	if !strings.Contains(ns, want) {
+		t.Errorf("numbering.xml missing a startOverride=5 entry for numId %s: %s", numID, ns)
+	}
+}
+
+// I6: each independent list infers its OWN indent unit (computeListRuns),
+// not one unit shared across the whole document (the old
+// inferListIndentUnit this replaces). A document combining a 4-space-nested
+// list and a SEPARATE, later 2-space-nested list must still put BOTH nested
+// items at ilvl 1 -- under the old whole-document inference, the smaller
+// 2-space indent would have become the document's only unit, silently
+// mis-leveling the 4-space list's nested item to ilvl 2 instead of 1 (the
+// exact defect TestWrite_FourSpaceIndentMapsToLevelOne already pins for a
+// document with only ONE list; this is the two-lists-in-one-document case
+// that whole-document inference could not handle at all).
+func TestWrite_TwoIndependentListsEachInferOwnIndentUnit(t *testing.T) {
+	md := "- a\n    - nested four\n\ntext in between\n\n- b\n  - nested two\n"
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+	if got := strings.Count(s, `<w:ilvl w:val="1"/>`); got != 2 {
+		t.Errorf("expected both nested items (4-space list and 2-space list) at ilvl 1 (count = %d): %s", got, s)
+	}
+	if strings.Contains(s, `<w:ilvl w:val="2"/>`) {
+		t.Errorf("the 4-space list's nested item must not fall back to a document-wide 2-space unit and land at ilvl 2: %s", s)
+	}
+}
+
+// I8: a list item's own indented continuation paragraph must stay attached
+// to the list -- styled ListContinue and carrying a <w:numPr> that borrows
+// the list's own per-level indent (continuationNumID) -- rather than
+// falling out as an ordinary top-level BodyText paragraph with no list
+// indent at all.
+func TestWrite_ListItemContinuationStaysInListWithMatchingIndent(t *testing.T) {
+	md := "- top item\n    continuation still about top item\n"
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+
+	contPPr := regexp.MustCompile(`<w:pPr><w:pStyle w:val="ListContinue"/>.*?</w:pPr>`).FindString(s)
+	if contPPr == "" {
+		t.Fatalf("no ListContinue paragraph found in document.xml: %s", s)
+	}
+	if !strings.Contains(contPPr, "<w:numPr>") {
+		t.Errorf("ListContinue paragraph missing <w:numPr> (the list indent it should borrow): %s", contPPr)
+	}
+	if !strings.Contains(contPPr, `<w:ilvl w:val="0"/>`) {
+		t.Errorf("ListContinue paragraph's numPr should be at ilvl 0, matching the item it continues: %s", contPPr)
+	}
+
+	// The continuation's indent (abstractNumId 2, continuationAbstractNumXML)
+	// must equal the list item's own text indent (abstractNumId 0's ilvl=0
+	// <w:ind>), or it would not visually align with the item it continues.
+	num, _ := d.Part("word/numbering.xml")
+	ns := string(num)
+	bulletLvl0 := regexp.MustCompile(`<w:abstractNum w:abstractNumId="0">.*?<w:lvl w:ilvl="0">.*?<w:ind w:left="(\d+)"`).FindStringSubmatch(ns)
+	contLvl0 := regexp.MustCompile(`<w:abstractNum w:abstractNumId="2">.*?<w:lvl w:ilvl="0">.*?<w:ind w:left="(\d+)"`).FindStringSubmatch(ns)
+	if bulletLvl0 == nil || contLvl0 == nil {
+		t.Fatalf("could not extract ilvl=0 indents from numbering.xml: %s", ns)
+	}
+	if bulletLvl0[1] != contLvl0[1] {
+		t.Errorf("continuation indent (%s) does not match the list item's own text indent (%s)", contLvl0[1], bulletLvl0[1])
+	}
+}
+
+// I8: a FENCED code block inside a list item keeps the list's own indent
+// (borrowed via the same continuationNumID mechanism as a continuation
+// paragraph), instead of sitting flush with the page margin the way a
+// top-level code block does.
+func TestWrite_FencedCodeInsideListItemKeepsListIndent(t *testing.T) {
+	md := "- top\n  ```\n  code\n  ```\n"
+	d, _, _ := writeAndReopen(t, md)
+	doc, _ := d.Part(DocumentPart)
+	s := string(doc)
+
+	codePPr := regexp.MustCompile(`<w:pPr><w:pStyle w:val="SourceCode"/>.*?</w:pPr>`).FindString(s)
+	if codePPr == "" {
+		t.Fatalf("no SourceCode paragraph found in document.xml: %s", s)
+	}
+	if !strings.Contains(codePPr, "<w:numPr>") {
+		t.Errorf("in-list fenced code block is missing <w:numPr>; the list's indent was not preserved: %s", codePPr)
+	}
+	if !strings.Contains(codePPr, fmt.Sprintf(`<w:numId w:val="%d"/>`, continuationNumID)) {
+		t.Errorf("in-list fenced code block's numPr does not reference continuationNumID: %s", codePPr)
 	}
 }
 
@@ -1462,7 +1600,14 @@ func TestWrite_NoInlineVisualPropertiesInDocumentXML(t *testing.T) {
 // happens to stop emitting numPr/tblW/jc altogether:
 //
 //   - <w:numPr>: attaches a list item to a numbering definition --
-//     structure, not styling.
+//     structure, not styling. Task 11 (I8) later reuses this SAME
+//     exception for a purpose beyond an actual list item: a list-item
+//     continuation paragraph or an in-list fenced code block also carries
+//     a <w:numPr>, borrowed purely for its per-level <w:ind> (see
+//     paraBlock.isListContinue's doc comment) -- still <w:numPr>, so still
+//     this one named exception, not a new one, and per-level indent values
+//     that could not live in a single static style anyway (see
+//     TestWrite_ListItemContinuationStaysInListWithMatchingIndent).
 //   - <w:tblW>/<w:gridCol>: column widths depend on each table's column
 //     count and the page geometry, so they cannot live in a shared style.
 //   - <w:jc> on a table cell: GFM's per-column alignment is data the
