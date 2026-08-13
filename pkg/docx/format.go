@@ -543,16 +543,14 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 	}
 
 	if resolved.PageNumbers {
-		applied, note, err := d.addPageNumberFooter()
+		applied, notes, err := d.addPageNumberFooter()
 		if err != nil {
 			return FormatResult{}, err
 		}
 		if applied != "" {
 			result.Applied = append(result.Applied, applied)
 		}
-		if note != "" {
-			result.Notes = append(result.Notes, note)
-		}
+		result.Notes = append(result.Notes, notes...)
 	}
 
 	// docDefaults and the style chain are only the STYLE layer of Word's
@@ -3090,10 +3088,26 @@ var sectPrChildOrder = []string{
 // "full anchor set, not just the one leaf this package edits" shape
 // scanDocDefaults/scanParaProps already return for pPr/rPr, needed so a
 // newly inserted pgMar lands in schema order relative to whatever else the
-// section already carries. <w:sectPr> never nests (CT_PPrBase, which a
-// pPrChange's historical pPr copy is typed as, does not include sectPr —
-// unlike pPr/rPr, there is no same-named-nested-element trap here), so a
-// plain "in/out" boolean is enough to find each one's own close.
+// section already carries.
+//
+// Unlike pPr/rPr, this uses a plain "in/out" boolean rather than a depth
+// counter to find each sectPr's own close -- which is NOT actually safe
+// against every same-named-nested-element case (correction: an earlier
+// version of this comment claimed "<w:sectPr> never nests" outright, which
+// is false. CT_SectPrChange -- sectPrChange, the last name in
+// sectPrChildOrder -- legally carries its own nested <w:sectPr>, the
+// historical copy of a tracked change to section properties, exactly the
+// same shape pPrChange/rPrChange nest a historical pPr/rPr inside
+// (scanParaProps/scanRunProps' own targetDepth machinery exists precisely
+// to handle that shape correctly for THOSE two). A document with a genuine
+// <w:sectPrChange><w:sectPr>...</w:sectPr></w:sectPrChange> would make this
+// boolean-based scan close tracking at the INNER sectPr's end tag instead
+// of the outer one's, truncating that section's own closeStart/children.
+// This is left uncorrected for now (review round-3, item 6) because a
+// tracked change to section properties specifically is vanishingly rare in
+// practice and no fixture or real usage has hit it -- but the "never nests"
+// claim itself must not stay in the code as if it were an established
+// invariant the way it genuinely is for CT_PPrBase.
 func scanSectPrs(documentXML []byte) ([]elemInfo, []map[string]elemInfo, error) {
 	dec := xml.NewDecoder(bytes.NewReader(documentXML))
 	var prevOffset int

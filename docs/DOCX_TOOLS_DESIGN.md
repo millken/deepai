@@ -242,7 +242,7 @@ InputSchema: {
     "align":        "left"|"justify"?,
     "margins_mm": [number;4]?,                           // 只能整篇，见下
     "normalize":    boolean?,  // 合并连续空段、统一标点间距；只能整篇，见下
-    "page_numbers": boolean?,  // Tier 3 / P3，见下——无论是否有范围都直接报错
+    "page_numbers": boolean?,  // 任务 12（2026-08-13）起已实现，见下；只能整篇，带范围直接报错
     "rebuild_toc":  boolean?,  // Tier 3 only，见下——无论是否有范围都直接报错
   },
 }
@@ -256,16 +256,16 @@ InputSchema: {
 | 字体 / 字号 | 改**文档默认值**（`rPrDefault/rPr` 的 `<w:rFonts>`/`<w:sz>`+`<w:szCs>`） | 每个目标段落**每个 run** 自己的 `<w:rPr><w:rFonts>`/`<w:sz>`+`<w:szCs>`，与已有的粗体/颜色等属性合并而非覆盖 |
 | 行距 / 对齐 | 改**文档默认值**（`pPrDefault/pPr` 的 `<w:spacing>`/`<w:jc>`） | 每个目标段落自己的 `<w:pPr><w:spacing>`/`<w:jc>` |
 | 机制 | 改样式表默认值——只影响没有自己直接格式化的段落 | **直接格式化**，优先级高于样式表——与用户在 Word 里选中文字改字号是同一种效果 |
-| `template`/`heading_font`/`margins_mm`/`normalize` | 支持 | **拒绝**，报错说明原因（模板/页边距是文档级概念；`heading_font` 改的是标题**样式定义**而非某一段） |
+| `template`/`heading_font`/`margins_mm`/`normalize`/`page_numbers` | 支持 | **拒绝**，报错说明原因（模板/页边距/页码是文档或节级概念；`heading_font` 改的是标题**样式定义**而非某一段） |
 
-给了范围但没给 `end_para` 时默认 `end_para = start_para`（只改这一段）；给了 `end_para` 却没给 `start_para` 是错误（没有范围可言）。`page_numbers`/`rebuild_toc` 无论是否带范围都直接报错——它们本来就不是 `FormatOptions` 的字段，工具层在两种模式下都统一拒绝，不需要额外分支。
+给了范围但没给 `end_para` 时默认 `end_para = start_para`（只改这一段）；给了 `end_para` 却没给 `start_para` 是错误（没有范围可言）。`page_numbers` 带范围时直接报错（它是节级概念，`w:sectPr/w:footerReference` 不落在某一段落上）；`rebuild_toc` 无论是否带范围都直接报错——它不是 `FormatOptions` 的字段，工具层在两种模式下都统一拒绝，不需要额外分支。
 
 其余分层落点仍按原样：
 
 - **字体 / 字号 / 行距 / 对齐 / 页边距（整篇路径）**：改 `word/styles.xml` 与 `word/document.xml` 的 `<w:sectPr>`，Tier 1 纯 Go 可做。
 - **`normalize`**：合并连续空段、统一标点间距是**正文操作**，改的是 `document.xml` 而不是 `styles.xml`。Tier 1 可做（仍走 byte-splice）；有 `soffice` 时可选走 Tier 3 做更彻底的整篇归一。
-- **`page_numbers`**：**Tier 3 / P3**。加页码不是"改一个属性"，而是四处联动：新增 `word/footer1.xml` 条目 + `w:sectPr/w:footerReference` + `[Content_Types].xml` 声明 + `document.xml.rels` 关系项。这既超出 §3.1 的单文件 byte-splice 模型，也要求 zipio 支持**新增条目**（读取侧无冲突——§8 已明确全部条目原样读入保留；但写入侧需要额外设计）。P2 的 `docx_format` 不提供此参数。
-- **`rebuild_toc`**：**Tier 3 only**。TOC 是域（field）+ 缓存的结果文本，重建需要重新分页，纯 Go 做不到；即便有 `soffice` 也要靠宏触发字段更新。无 `soffice` 时该参数直接报错说明不可用，不静默忽略。
+- **`page_numbers`**：**任务 12（2026-08-13）已实现，Tier 1 纯 Go byte-splice**。原判断（"加页码是四处联动，超出单文件 byte-splice 模型，需要 zipio 支持新增条目"）成立，但联动本身并不需要 Tier 2/3——`pkg/docx/zipio.go` 的 `Package.AddPart` 补上了唯一缺的能力（在包内新增一个 zip 条目，`SetPart` 只能替换已有条目），四处联动全部落在纯 Go 窄补丁上：新增 `word/footerN.xml`（内容复用 `docx_write` 自己的页脚 XML）+ `[Content_Types].xml` 的 `Override`（窄补丁插入根元素收尾标签前）+ `document.xml.rels` 的 `Relationship`（同上）+ `word/document.xml` 每个 `<w:sectPr>` 里插入 `<w:footerReference w:type="default" r:id="...">`（落点在已有 `headerReference` 之后、`pgSz` 之前，与 `docx_write` 自己写的顺序一致）。**取舍**：若文档**任一节**已经有 `footerReference`，整个调用视为空操作（`notes` 里明确说明"document already has a footer; not modified"），不猜测调用方是要加第二个页脚还是改已有页脚——即便只有部分小节缺页脚也是如此（更保守，避免对已被用户定制过页脚的文档做出难以预期的部分修改）。文档使用 `<w:titlePg/>`（首页不同）或 `settings.xml` 的 `<w:evenAndOddHeaders/>`（奇偶页不同）时，加的页脚仍然只是 `w:type="default"`，`notes` 里会说明首页/偶数页可能不显示这个页码，行为本身不变。
+- **`rebuild_toc`**：**Tier 3 only**。TOC 是域（field）+ 缓存的结果文本，重建需要重新分页，纯 Go 做不到；即便有 `soffice` 也要靠宏触发字段更新。无 `soffice` 时该参数直接报错说明不可用，不静默忽略；Word 自己可以在打开时通过 `settings.xml` 的 `<w:updateFields/>` 自动刷新域（包括 TOC），但那是本工具尚未实现的未来选项，现状仍不支持。
 
 ### 4.4 `docx_write` —— 新建
 
