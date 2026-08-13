@@ -155,6 +155,33 @@ func TestEdit_FindWithCopiedZWSPStillMatches(t *testing.T) {
 	}
 }
 
+// TestEdit_FindOfOnlyZWSPIsRefusedNotPanicking pins the review's HIGH
+// finding on mapStrippedRange: a paragraph whose only content is itself a
+// ZWSP (e.g. <w:t>​</w:t>, a stray copy-paste artifact rather than
+// anything Read ever writes into a real document) combined with a Find
+// that is ALSO nothing but ZWSP strips down to an empty needle. Go's
+// strings.Count(s, "") returns len(s)+1, which is 1 whenever s is itself
+// empty — so the empty needle used to sail straight past the count!=1
+// guard as if it had matched exactly once, at a zero-length position, and
+// then panic inside mapStrippedRange (origOffset[b-1] with b-1 == -1)
+// instead of failing with an explanation. This must refuse cleanly instead.
+func TestEdit_FindOfOnlyZWSPIsRefusedNotPanicking(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>`+zeroWidthSpace+`</w:t></w:r></w:p>`)
+	res, err := d.Edit([]Edit{{Para: 1, Find: strp(zeroWidthSpace), Text: "x"}}, EditOptions{})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if res.Outcomes[0].Applied {
+		t.Fatal("a find containing only zero-width characters was applied, want refusal")
+	}
+	if res.Outcomes[0].Reason == "" {
+		t.Error("no Reason given for the all-ZWSP find refusal")
+	}
+	if !strings.Contains(res.Outcomes[0].Reason, "zero-width") {
+		t.Errorf("Reason = %q, want it to explain the find was entirely zero-width characters", res.Outcomes[0].Reason)
+	}
+}
+
 // TestEdit_ProtectWithCopiedZWSPStillEnforced is protect's sibling: a
 // protect pattern copied out of Read's rendered markdown (ZWSP and all)
 // must still catch a violation against the real, ZWSP-free document text.

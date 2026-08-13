@@ -193,21 +193,29 @@ func computeNotes(names []string, paras []Para, revisions revisionSummary) []str
 			break
 		}
 	}
-	// Triggered on len(revisions.Authors) > 0, NOT InsCount>0||DelCount>0: the
-	// author set (scanRevisions) already covers w:moveFrom/w:moveTo,
-	// w:cellIns/w:cellDel, and w:rPrChange/w:pPrChange — none of which are
-	// w:ins/w:del themselves — per Task 3's I4 fix (see revisionSummary's own
-	// doc comment). Gating this note on InsCount/DelCount alone left a real
-	// gap: a document containing ONLY, say, a pending w:moveTo from another
-	// author read completely silently (no note at all), while Edit's own
-	// revision gate (which already compares the wider Authors set) refused
-	// and named that same author — read and edit disagreeing about whether
-	// there was anything pending here at all. The two branches below just
-	// choose which of two true statements to make: whether there is a
-	// visible insertion/deletion count to report, or whether the pending
-	// revisions are the kind Read's rendering wouldn't show any sign of
-	// either way (a move or a formatting-only change).
-	if len(revisions.Authors) > 0 {
+	// Triggered on len(revisions.Authors) > 0 as well as InsCount>0||
+	// DelCount>0 — a strict OR of both the old and the Task-3 gate, not a
+	// replacement of one by the other: the author set (scanRevisions)
+	// already covers w:moveFrom/w:moveTo, w:cellIns/w:cellDel, and
+	// w:rPrChange/w:pPrChange — none of which are w:ins/w:del themselves —
+	// per Task 3's I4 fix (see revisionSummary's own doc comment), which is
+	// why Authors alone closes the "document contains ONLY a pending
+	// w:moveTo from another author" gap (Read used to stay silent about it
+	// while Edit's own gate, which already compares the wider Authors set,
+	// refused and named that author). But Authors is deliberately NOT a
+	// superset of "there are w:ins/w:del to report": scanRevisions only adds
+	// an author to Authors when its w:author attribute is present AND
+	// non-blank (see revisionSummary's doc comment) — an anonymous or
+	// blank-authored w:ins/w:del (not something Word itself ever writes, but
+	// seen from other tools or a deliberately anonymized document) still
+	// increments InsCount/DelCount while leaving Authors empty. Gating on
+	// Authors alone, as an earlier version of this fix did, silently
+	// regressed exactly that case relative to the pre-Task-13 code (which
+	// gated on InsCount/DelCount and would have caught it) — this OR keeps
+	// both cases covered at once, and the switch below still uses
+	// formatAuthorList(revisions.Authors), whose own "(unnamed)" fallback
+	// makes an empty Authors list read sensibly either way.
+	if len(revisions.Authors) > 0 || revisions.InsCount > 0 || revisions.DelCount > 0 {
 		switch {
 		case revisions.InsCount > 0 || revisions.DelCount > 0:
 			notes = append(notes, fmt.Sprintf(

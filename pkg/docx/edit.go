@@ -755,6 +755,23 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 	// defusal for the same "copied straight out of Read's markdown" reason —
 	// see stripZWSP's doc comment.
 	find := stripZWSP(findRaw)
+	// A find that is non-empty before stripping but strips down to "" (it
+	// was made up entirely of U+200B, e.g. copied as just the marker's own
+	// zero-width space with no visible text around it) must be refused
+	// explicitly, before it ever reaches strings.Count/strings.Index below:
+	// Go's strings.Count(s, "") returns len(s)+1 (every position, including
+	// the one past the end, "matches" an empty needle) — that is 1 whenever
+	// s is itself empty, so an empty find would sail straight past the
+	// count!=1 guard as if it had matched exactly once, at a zero-length
+	// position with no meaningful start OR end offset. mapStrippedRange
+	// (below) rejects exactly that zero-length shape by design (it needs
+	// b > a), so leaving this case to reach it would panic on
+	// origOffset[b-1] with b-1 == -1, rather than fail with an
+	// explanation.
+	if find == "" {
+		return nil, "", "", "", fmt.Sprintf(
+			"find %q contains only zero-width characters after removing U+200B; provide visible text to search for", findRaw), "", false
+	}
 	rawText := paraTextWithBreaks(para)
 	text, origOffset := stripZWSPMapped(rawText)
 	count := strings.Count(text, find)

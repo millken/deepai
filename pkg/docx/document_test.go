@@ -107,6 +107,32 @@ func TestNotes_DeclaresPendingRevisionsWithNoVisibleInsDel(t *testing.T) {
 	}
 }
 
+// TestNotes_DeclaresPendingRevisionsWithAnonymousAuthor pins the review's
+// MEDIUM finding on the item-9 fix: gating computeNotes' note purely on
+// len(Authors) > 0 silently regressed a case the OLD (InsCount>0||
+// DelCount>0) gate used to catch — scanRevisions only adds an author to
+// Authors when its w:author attribute is present AND non-blank, so a w:ins
+// with an empty (or entirely absent) w:author still increments InsCount
+// while leaving Authors empty. The trigger must be an OR of both gates, not
+// a replacement of one by the other, so this case (not something Word
+// itself writes, but seen from other tools or an anonymized document)
+// keeps getting a note, rendered with formatAuthorList's own "(unnamed)"
+// fallback.
+func TestNotes_DeclaresPendingRevisionsWithAnonymousAuthor(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:ins w:id="1" w:author="" w:date="2024-01-01T00:00:00Z">`+
+		`<w:r><w:t>added</w:t></w:r></w:ins></w:p>`)
+	notes := strings.Join(d.Notes(), " | ")
+	if notes == "" {
+		t.Fatal("Notes = \"\", want a note declaring the anonymous-author w:ins")
+	}
+	if !strings.Contains(notes, "(unnamed)") {
+		t.Errorf("Notes = %q, want it to name the author as (unnamed)", notes)
+	}
+	if !strings.Contains(notes, "1 insertion") {
+		t.Errorf("Notes = %q, want it to count the 1 insertion", notes)
+	}
+}
+
 // TestEdit_RefusesDocumentWithOnlyMoveToRevision is the edit-side companion
 // to the read-side fix above, demonstrating the parity Task 13 restores:
 // both Read and Edit now agree that a move-only revision from another
