@@ -84,6 +84,46 @@ func TestNotes_DeclaresPendingRevisions(t *testing.T) {
 	}
 }
 
+// TestNotes_DeclaresPendingRevisionsWithNoVisibleInsDel pins Task 13's item
+// 9 fix: computeNotes used to trigger its "unreviewed tracked changes" note
+// on InsCount>0||DelCount>0 alone, even though Task 3 already widened the
+// author-collection gate (edit.go's Edit) to the full revisionSummary.Authors
+// set — moveFrom/moveTo, cellIns/cellDel, rPrChange/pPrChange all carry
+// their own w:author without being a w:ins/w:del themselves. A document
+// containing ONLY a pending w:moveTo from another author used to read
+// completely silently (no note at all) while Edit refused and named that
+// same author — read and edit disagreeing about whether anything was
+// pending. The trigger is now len(Authors) > 0, and the wording makes clear
+// there may be no visible insertion/deletion to point to.
+func TestNotes_DeclaresPendingRevisionsWithNoVisibleInsDel(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:moveTo w:id="1" w:author="mover" w:date="2024-01-01T00:00:00Z">`+
+		`<w:r><w:t>moved</w:t></w:r></w:moveTo></w:p>`)
+	notes := strings.Join(d.Notes(), " | ")
+	if !strings.Contains(notes, "mover") {
+		t.Errorf("Notes = %q, want it to name the revision author (mover)", notes)
+	}
+	if strings.Contains(notes, "0 insertion") || strings.Contains(notes, "0 deletion") {
+		t.Errorf("Notes = %q, want it to avoid the misleading \"0 insertion(s), 0 deletion(s)\" wording for a move-only revision", notes)
+	}
+}
+
+// TestEdit_RefusesDocumentWithOnlyMoveToRevision is the edit-side companion
+// to the read-side fix above, demonstrating the parity Task 13 restores:
+// both Read and Edit now agree that a move-only revision from another
+// author is something the caller must be told about, rather than Read
+// staying silent while Edit alone refuses and names the author.
+func TestEdit_RefusesDocumentWithOnlyMoveToRevision(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:moveTo w:id="1" w:author="mover" w:date="2024-01-01T00:00:00Z">`+
+		`<w:r><w:t>moved</w:t></w:r></w:moveTo></w:p>`)
+	_, err := d.Edit([]Edit{{Para: 1, Text: "x"}}, EditOptions{})
+	if err == nil {
+		t.Fatal("Edit on a document with only a moveTo revision returned nil error, want a refusal naming the author")
+	}
+	if !strings.Contains(err.Error(), "mover") {
+		t.Errorf("error = %q, want it to name the moveTo author (mover)", err)
+	}
+}
+
 func TestNotes_EmptyWhenNothingIsOmitted(t *testing.T) {
 	d, err := OpenDocument(outlineFixture)
 	if err != nil {

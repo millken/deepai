@@ -459,7 +459,12 @@ type docxEditOutput struct {
 	TotalParas       int               `json:"total_paras"`
 	ParaCountChanged bool              `json:"para_count_changed"`
 	IndexAdvice      string            `json:"index_advice,omitempty"`
-	BackupPath       string            `json:"backup_path,omitempty"`
+	// Notes carries call-level caveats that apply to the whole batch rather
+	// than one outcome — currently only docxStaleBackupNote, when this
+	// call's backup turned out to be one that already existed. Mirrors
+	// docxFormatOutput's own Notes field.
+	Notes      []string `json:"notes,omitempty"`
+	BackupPath string   `json:"backup_path,omitempty"`
 	// BackupCreated distinguishes a backup this call just created from one
 	// that already existed from an earlier call (finding 8 of the P1c
 	// review): BackupPath alone can't tell those apart, so a second session
@@ -542,9 +547,14 @@ func DocxEditTool() models.Tool {
 					},
 				},
 				"protect": map[string]any{
-					"type":        "array",
-					"items":       map[string]any{"type": "string"},
-					"description": "Regex or literal patterns that must survive every edit touching them",
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+					"description": "Regex or literal patterns that must survive every edit touching them. Two ops check this " +
+						"differently: delete is never refused for removing a protected item — it still applies, and only adds " +
+						"a warning that the removed text matched one; insert_before/insert_after has no \"before\" to compare " +
+						"against, so it is refused only when the inserted text itself matches a pattern in a form (e.g. a " +
+						"version number) that does not already appear anywhere else in the document — i.e. it looks forged or " +
+						"mistyped.",
 				},
 				"reviewed_through_para": map[string]any{
 					"type":        "number",
@@ -606,6 +616,19 @@ type docxFormatOutput struct {
 // all matched nothing to change) is never indistinguishable from a call
 // that silently did nothing by mistake.
 const docxFormatNoChangeNote = "no formatting changes were applied: either no rules were given, or none of the given rules changed anything in this document"
+
+// docxStaleBackupNote is appended to a docx_edit/docx_format result's notes
+// whenever BackupPath is set but BackupCreated is false, i.e. this call
+// found a pre-existing <path>.bak rather than writing a fresh one (I3 of the
+// docx capability review): backupDocxOnce only checks whether a file
+// already sits at that path, never whether it actually belongs to the
+// document currently open at path. A caller pointed at the wrong document
+// (or one restored/copied from elsewhere under the same name) would
+// otherwise be told "backup_path is your rollback point" about a .bak that
+// silently holds a completely different document's content — reporting
+// backup_created:false with no comment leaves that risk for the caller to
+// discover only after already trusting the rollback.
+const docxStaleBackupNote = "pre-existing backup file; verify it belongs to this document before using it for rollback"
 
 // DocxFormatTool describes docx_format to the model. Without start_para/
 // end_para it applies document-wide formatting (fonts, size, line spacing,
@@ -779,6 +802,9 @@ func DocxFormatHandler(ctx context.Context, call models.ToolCall) (models.ToolRe
 		ParaCountChanged: formatResult.ParaCountChanged,
 		BackupPath:       backupPath,
 		BackupCreated:    backupCreated,
+	}
+	if backupPath != "" && !backupCreated {
+		out.Notes = append(out.Notes, docxStaleBackupNote)
 	}
 	if formatResult.ParaCountChanged {
 		out.IndexAdvice = docxIndexAdvice
@@ -1477,6 +1503,9 @@ func DocxEditHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		ReviewedThroughPara: args.ReviewedThroughPara,
 		TrackChanges:        args.TrackChanges,
 	}
+	if backupPath != "" && !backupCreated {
+		out.Notes = append(out.Notes, docxStaleBackupNote)
+	}
 	if editResult.ParaCountChanged {
 		out.IndexAdvice = docxIndexAdvice
 	}
@@ -1589,8 +1618,20 @@ func parseDocxEditArgs(raw map[string]any) (docxEditArgs, error) {
 		// in the batch would let the model believe that edit restyled its
 		// paragraph, when nothing about styling happened at all.
 		if _, hasStyle := em["style"]; hasStyle {
+			// Task 13's I1 fix: this used to say "use docx_format for
+			// paragraph styling", but docx.FormatOptions has no field for a
+			// paragraph style at all (only direct font/size/spacing/
+			// alignment) — that advice sent a caller to a tool that cannot
+			// do it either, with no signal that it was a dead end until the
+			// next call also failed. Saying so plainly here, instead of
+			// pointing anywhere, is the actionable version: there is
+			// currently nowhere to send the caller, and the paragraph this
+			// edit touches (or, for insert_before/insert_after, the new
+			// paragraph it would have created) is left exactly as styled as
+			// it already is.
 			return docxEditArgs{}, fmt.Errorf(
-				"docx_edit: edits[%d] sets style, which is deferred to P2 and not supported here; use docx_format for paragraph styling", i)
+				"docx_edit: edits[%d] sets style, which is not supported: paragraph styles cannot be set by any docx tool yet; "+
+					"the inserted/edited paragraph keeps its current style", i)
 		}
 		edit, err := parseDocxEditItem(em)
 		if err != nil {

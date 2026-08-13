@@ -523,6 +523,13 @@ func TestDocxEdit_AppliesAFindReplace(t *testing.T) {
 // TestDocxEdit_StyleIsRejectedNotIgnored pins design §4.2's note: style is
 // deferred to P2, and silently dropping it would let the model believe it
 // restyled a paragraph.
+// TestDocxEdit_StyleIsRejectedNotIgnored pins Task 13's I1 fix: the error
+// used to point the caller at docx_format ("use docx_format for paragraph
+// styling"), but docx.FormatOptions has no field for a paragraph style at
+// all, so that advice sent a caller to a tool that cannot do it either, with
+// no signal it was a dead end until the very next call also failed. The
+// error must instead say plainly that no docx tool can do this yet, and
+// that the paragraph keeps its current style.
 func TestDocxEdit_StyleIsRejectedNotIgnored(t *testing.T) {
 	p := docxFixture(t, "outline.docx")
 	_, err := callDocxEdit(t, map[string]any{
@@ -532,8 +539,14 @@ func TestDocxEdit_StyleIsRejectedNotIgnored(t *testing.T) {
 	if err == nil {
 		t.Fatal("style was accepted; want an explicit error")
 	}
-	if !strings.Contains(err.Error(), "docx_format") {
-		t.Errorf("error = %q, want it to point at docx_format", err)
+	if strings.Contains(err.Error(), "docx_format") {
+		t.Errorf("error = %q, want it to no longer point at docx_format (which cannot set paragraph styles either)", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be set by any docx tool") {
+		t.Errorf("error = %q, want it to say plainly that no docx tool can set a paragraph style yet", err)
+	}
+	if !strings.Contains(err.Error(), "current style") {
+		t.Errorf("error = %q, want it to say the paragraph keeps its current style", err)
 	}
 }
 
@@ -662,6 +675,42 @@ func TestDocxEdit_ReportsBackupCreated(t *testing.T) {
 	}
 	if second["backup_path"] != first["backup_path"] {
 		t.Errorf("backup_path changed between calls: %v vs %v", first["backup_path"], second["backup_path"])
+	}
+}
+
+// TestDocxEdit_StaleBackupWarnsOnPreExisting pins Task 13's I3 fix: on the
+// second call, backup_created comes back false because backupDocxOnce found
+// the .bak from the first call still sitting there — but that same check
+// only ever looks at whether a file EXISTS at <path>.bak, never whether it
+// actually belongs to the document currently open at path. A caller who
+// only reads backup_created/backup_path has no way to tell "this is safe to
+// roll back to" apart from "this is a stale backup, possibly of a
+// completely different document" — so notes must carry an explicit warning
+// whenever backup_created is false but a backup IS in play.
+func TestDocxEdit_StaleBackupWarnsOnPreExisting(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	edit := func(text string) map[string]any {
+		t.Helper()
+		res, err := callDocxEdit(t, map[string]any{
+			"path":  p,
+			"edits": []any{map[string]any{"para": float64(2), "text": text}},
+		})
+		if err != nil {
+			t.Fatalf("edit %q: %v", text, err)
+		}
+		return decodeRead(t, res)
+	}
+
+	first := edit("first")
+	if notes, _ := first["notes"].([]any); len(notes) != 0 {
+		t.Errorf("notes on the first (backup-creating) edit = %v, want none", notes)
+	}
+
+	second := edit("second")
+	notes, _ := second["notes"].([]any)
+	joined := fmt.Sprint(notes)
+	if !strings.Contains(joined, "pre-existing backup") {
+		t.Errorf("notes = %v, want a warning that the .bak pre-existed and should be verified before rollback", notes)
 	}
 }
 
@@ -1425,6 +1474,37 @@ func TestDocxFormat_ReportsBackupCreated(t *testing.T) {
 	}
 	if second["backup_path"] != first["backup_path"] {
 		t.Errorf("backup_path changed between calls: %v vs %v", first["backup_path"], second["backup_path"])
+	}
+}
+
+// TestDocxFormat_StaleBackupWarnsOnPreExisting mirrors
+// TestDocxEdit_StaleBackupWarnsOnPreExisting: docx_format shares
+// backupDocxOnce with docx_edit, so it has the exact same stale-backup risk
+// and must carry the exact same warning.
+func TestDocxFormat_StaleBackupWarnsOnPreExisting(t *testing.T) {
+	p := docxFixture(t, "outline.docx")
+	format := func(font string) map[string]any {
+		t.Helper()
+		res, err := callDocxFormat(t, map[string]any{
+			"path":  p,
+			"rules": map[string]any{"body_font": font},
+		})
+		if err != nil {
+			t.Fatalf("format %q: %v", font, err)
+		}
+		return decodeRead(t, res)
+	}
+
+	first := format("Georgia")
+	firstNotes, _ := first["notes"].([]any)
+	if strings.Contains(fmt.Sprint(firstNotes), "pre-existing backup") {
+		t.Errorf("notes on the first (backup-creating) call = %v, want no stale-backup warning yet", firstNotes)
+	}
+	second := format("Verdana")
+	notes, _ := second["notes"].([]any)
+	joined := fmt.Sprint(notes)
+	if !strings.Contains(joined, "pre-existing backup") {
+		t.Errorf("notes = %v, want a warning that the .bak pre-existed and should be verified before rollback", notes)
 	}
 }
 
@@ -2340,6 +2420,35 @@ func TestDocxFormat_RangeAppliesNewTask8FieldsDirectly(t *testing.T) {
 	stylesAfter := zipEntry(t, p, "word/styles.xml")
 	if !bytes.Equal(stylesBefore, stylesAfter) {
 		t.Error("word/styles.xml changed; a ranged call must land purely in word/document.xml")
+	}
+}
+
+// docxEditProtectSchemaDescription reads docx_edit's protect field
+// description out of its InputSchema, the same way a model reads it.
+func docxEditProtectSchemaDescription(t *testing.T) string {
+	t.Helper()
+	props, _ := DocxEditTool().InputSchema["properties"].(map[string]any)
+	protect, _ := props["protect"].(map[string]any)
+	desc, _ := protect["description"].(string)
+	if desc == "" {
+		t.Fatal("docx_edit schema has no protect.description")
+	}
+	return desc
+}
+
+// TestDocxEditTool_ProtectSchemaDocumentsTheTwoSpecialCases pins Task 13's
+// M3 fix: the protect field's schema description used to say only "must
+// survive every edit touching them", with no hint that delete and insert
+// are handled differently (delete only warns; insert is checked against
+// forgery, not against a "before"). A model reading only the schema (not
+// pkg/docx's source) had no way to predict either behavior.
+func TestDocxEditTool_ProtectSchemaDocumentsTheTwoSpecialCases(t *testing.T) {
+	desc := docxEditProtectSchemaDescription(t)
+	if !strings.Contains(desc, "delete") || !strings.Contains(strings.ToLower(desc), "warn") {
+		t.Errorf("protect description = %q, want it to say delete only warns, never refuses", desc)
+	}
+	if !strings.Contains(desc, "insert") || !strings.Contains(strings.ToLower(desc), "forg") {
+		t.Errorf("protect description = %q, want it to say insert is checked for forged/mistyped text instead", desc)
 	}
 }
 

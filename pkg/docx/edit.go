@@ -1,6 +1,7 @@
 package docx
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strings"
@@ -510,7 +511,7 @@ func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers
 	target := fmt.Sprintf("an insert %s paragraph %d", strings.TrimPrefix(op, "insert_"), para.Index)
 
 	if broken := forgedProtectedItems(e.Text, documentText(paras), matchers); len(broken) > 0 {
-		return nil, before, after, "", protectReason(broken), "", false
+		return nil, before, after, "", forgedProtectReason(broken), "", false
 	}
 
 	var rawXML string
@@ -540,7 +541,62 @@ func planInsert(doc []byte, e Edit, op string, para Para, paras []Para, matchers
 		span = Span{Start: para.Span.End, End: para.Span.End}
 	}
 	patch := PatchRawSpan(doc, span, rawXML)
-	return []Patch{patch}, before, after, "", "", target, true
+	warning := insertStyleWarning(doc, op, para, paras)
+	return []Patch{patch}, before, after, warning, "", target, true
+}
+
+// insertStyleWarning is planInsert's Warning: the new paragraph is always
+// built as a bare <w:p><w:r><w:t>...</w:t></w:r></w:p> (untracked) or its
+// tracked-changes equivalent — see planInsert/trackedInsertParagraph — with
+// no <w:pPr> at all, so it always renders as Normal style regardless of its
+// neighbours', and no docx tool can currently set a paragraph style (see
+// docx_edit's own "style" key rejection at the tool layer) — a caller
+// cannot fix this up with a follow-up call either. When the insertion point
+// sits between two list items (both neighbours carry their own <w:numPr>),
+// this additionally calls out that the new paragraph will not inherit that
+// list's numbering, since a caller reading only "applied: true" would
+// otherwise reasonably expect a mid-list insert to extend the list.
+func insertStyleWarning(doc []byte, op string, para Para, paras []Para) string {
+	warning := "the inserted paragraph has no paragraph style (defaults to Normal); no docx tool can currently set a paragraph style"
+	before, after := insertNeighbours(op, para, paras)
+	if before != nil && after != nil && hasNumPr(doc, before.Span) && hasNumPr(doc, after.Span) {
+		warning = joinNotes(warning,
+			"inserting into the middle of a numbered/bulleted list; the new paragraph will not inherit that list's numbering")
+	}
+	return warning
+}
+
+// insertNeighbours returns the paragraphs that will immediately flank a new
+// insert_before/insert_after(para) paragraph once it lands, or nil for
+// either side that doesn't exist (the very start/end of the document).
+// paras is the full pre-edit snapshot, indexed the same way planInsert's own
+// documentText(paras) call relies on (paras[i].Index == i+1).
+func insertNeighbours(op string, para Para, paras []Para) (before, after *Para) {
+	idx := para.Index
+	var beforeIdx, afterIdx int
+	if op == opInsertBefore {
+		beforeIdx, afterIdx = idx-1, idx
+	} else {
+		beforeIdx, afterIdx = idx, idx+1
+	}
+	if beforeIdx >= 1 && beforeIdx <= len(paras) {
+		before = &paras[beforeIdx-1]
+	}
+	if afterIdx >= 1 && afterIdx <= len(paras) {
+		after = &paras[afterIdx-1]
+	}
+	return before, after
+}
+
+// hasNumPr reports whether the paragraph occupying span in doc carries a
+// <w:numPr> element, i.e. it is a numbered/bulleted list item. This is a
+// raw substring search rather than a full XML parse: "<w:numPr" can only
+// ever appear in a well-formed document as literal structural markup —
+// paragraph TEXT content is always entity-escaped ("&lt;", never a literal
+// "<") — so a false positive would require a hand-crafted, non-Word
+// document, not any real Word output.
+func hasNumPr(doc []byte, span Span) bool {
+	return bytes.Contains(doc[span.Start:span.End], []byte("<w:numPr"))
 }
 
 // trackedInsertParagraph builds the tracked-changes shape of a new
@@ -687,16 +743,39 @@ func planRunTarget(doc []byte, e Edit, op string, para Para, matchers []protectM
 // rather than silently editing only the first run's portion of the match,
 // is the whole point of "never guess" in §4.2.
 func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
-	find := *e.Find // planEdit already refused a nil or explicitly-empty Find before dispatching here.
-	text := outlineParaText(para)
+	findRaw := *e.Find // planEdit already refused a nil or explicitly-empty Find before dispatching here.
+	// find/text both go through paraTextWithBreaks/stripZWSP rather than
+	// outlineParaText, so a find built by copying text straight out of a
+	// docx_read result — e.g. one physical line of a docx_write code block,
+	// which is a single paragraph whose source lines are joined by
+	// <w:br/> — locates against the SAME text model read renders, not the
+	// no-separator concatenation outlineParaText produces (which would
+	// either fail to match at all, or match the wrong place, with no
+	// explanation). ZWSP stripping undoes Read's own neutralizeParaMarkers
+	// defusal for the same "copied straight out of Read's markdown" reason —
+	// see stripZWSP's doc comment.
+	find := stripZWSP(findRaw)
+	rawText := paraTextWithBreaks(para)
+	text, origOffset := stripZWSPMapped(rawText)
 	count := strings.Count(text, find)
 	if count != 1 {
 		return nil, "", "", "", fmt.Sprintf(
-			"find %q matched %d times in paragraph %d; it must match exactly once (never guessed)", find, count, para.Index), "", false
+			"find %q matched %d times in paragraph %d; it must match exactly once (never guessed)", findRaw, count, para.Index), "", false
 	}
 
-	matchStart := strings.Index(text, find)
-	matchEnd := matchStart + len(find)
+	matchStartStripped := strings.Index(text, find)
+	matchEndStripped := matchStartStripped + len(find)
+	matchStart, matchEnd := mapStrippedRange(origOffset, matchStartStripped, matchEndStripped)
+
+	// breakAfter mirrors paraTextWithBreaks' own insertion rule: a run whose
+	// Index appears here is followed by a "\n" in rawText that belongs to
+	// neither run, so the cum walk below must skip exactly one extra byte
+	// after such a run to stay aligned with matchStart/matchEnd's rawText
+	// coordinates.
+	breakAfter := make(map[int]bool, len(para.Breaks))
+	for _, idx := range para.Breaks {
+		breakAfter[idx] = true
+	}
 
 	runIdx := -1
 	localStart, localEnd := 0, 0
@@ -707,7 +786,9 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 			if matchEnd > runEnd {
 				return nil, "", "", "", fmt.Sprintf(
 					"find %q spans more than one run in paragraph %d; narrow the match to a single run's text or use Run instead — "+
-						"cross-run replacement needs coordinated multi-patch editing, which is P2 work", find, para.Index), "", false
+						"cross-run replacement needs coordinated multi-patch editing, which is P2 work; re-run docx_read with "+
+						"runs:true on this range, then target the exact run with the run parameter, or replace the whole "+
+						"paragraph with text", findRaw, para.Index), "", false
 			}
 			runIdx = i
 			localStart = matchStart - cum
@@ -715,13 +796,16 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 			break
 		}
 		cum = runEnd
+		if breakAfter[r.Index] {
+			cum++
+		}
 	}
 	if runIdx == -1 {
 		// Unreachable given count == 1 (the substring is confirmed present
 		// somewhere in the concatenation), kept as a defensive refusal
 		// instead of a panic/out-of-range slice access.
 		return nil, "", "", "", fmt.Sprintf(
-			"could not locate find %q within a single run of paragraph %d", find, para.Index), "", false
+			"could not locate find %q within a single run of paragraph %d", findRaw, para.Index), "", false
 	}
 
 	run := para.Runs[runIdx]
@@ -773,7 +857,17 @@ func planFindTarget(doc []byte, e Edit, op string, para Para, matchers []protect
 // to tell whether para is the only paragraph in its table cell (see the
 // Cell branch below).
 func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para, matchers []protectMatcher, rc *revisionCtx) ([]Patch, string, string, string, string, string, bool) {
-	before := outlineParaText(para)
+	// paraTextWithBreaks, not outlineParaText: read.go renders this same
+	// paragraph's markdown with "\n" standing in for every <w:br/>, so the
+	// audited Before/After text and the protect check below must reflect
+	// the SAME text a caller who just read the document via docx_read
+	// actually saw — see paraTextWithBreaks' doc comment and planFindTarget's
+	// identical reasoning. This can only make protect MORE accurate, never
+	// less: a protected item whose pattern spans exactly where a <w:br/>
+	// sits (e.g. one crafted from text copied out of Read's own rendering)
+	// used to silently fail to match against the no-separator concatenation
+	// outlineParaText produced, which meant it was never actually enforced.
+	before := paraTextWithBreaks(para)
 	target := fmt.Sprintf("paragraph %d", para.Index)
 
 	if op == opDelete {
@@ -851,6 +945,7 @@ func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para,
 	// tags is touched, only its text content and every other run's text.
 	patches := []Patch{PatchRun(doc, first, e.Text)}
 	warning := ""
+	hyperlinkRemoved := false
 	if len(para.Runs) > 1 {
 		last := para.Runs[len(para.Runs)-1]
 		switch {
@@ -889,10 +984,26 @@ func planParagraphTarget(doc []byte, e Edit, op string, para Para, paras []Para,
 						"whole-paragraph replace cannot remove the trailing runs without breaking the surrounding XML structure — "+
 						"target the individual runs with run or find instead", para.Index), "", false
 			}
+			// The tail span passed checkWellFormed above, so if it contains a
+			// <w:hyperlink> open tag at all, that hyperlink's matching close
+			// tag is also inside the tail (an unbalanced open would have
+			// failed checkWellFormed) — i.e. the WHOLE element, not just part
+			// of it, is about to be removed by the raw splice below. M5:
+			// silently dropping a hyperlink this way must be called out, not
+			// folded into the generic "collapsed formatting" wording, since a
+			// caller reading only that would have no reason to suspect a link
+			// (and the r:id it referenced) is now gone.
+			if bytes.Contains(doc[tail.Start:tail.End], []byte("<w:hyperlink")) {
+				hyperlinkRemoved = true
+			}
 			patches = append(patches, PatchRawSpan(doc, tail, ""))
 		}
 		warning = fmt.Sprintf(
 			"paragraph %d has %d runs; whole-paragraph replace collapsed formatting to the first run's", para.Index, len(para.Runs))
+		if hyperlinkRemoved {
+			warning = joinNotes(warning,
+				"hyperlink removed by this whole-paragraph replace; its relationship id may now be an unused (but Word-tolerated) entry in document.xml.rels")
+		}
 	}
 	return patches, before, after, warning, "", target, true
 }
@@ -1051,14 +1162,16 @@ func joinNotes(base, extra string) string {
 	return base + "; " + extra
 }
 
-// documentText concatenates every paragraph's run text, in document order.
-// planInsert consults it to tell a forged/mistyped protected item (never
-// seen anywhere in the document) apart from a legitimate reference to one
-// that already exists — see forgedProtectedItems.
+// documentText concatenates every paragraph's rendered text (paraTextWithBreaks,
+// the same text model Read renders, per this task's I6 consistency fix), in
+// document order. planInsert consults it to tell a forged/mistyped
+// protected item (never seen anywhere in the document) apart from a
+// legitimate reference to one that already exists — see
+// forgedProtectedItems.
 func documentText(paras []Para) string {
 	var b strings.Builder
 	for _, p := range paras {
-		b.WriteString(outlineParaText(p))
+		b.WriteString(paraTextWithBreaks(p))
 	}
 	return b.String()
 }
@@ -1073,8 +1186,18 @@ func documentText(paras []Para) string {
 // anywhere is exactly a forged or mistyped protected item (e.g. inserting
 // "v9.9.9" when Protect names a version pattern but no "v9.9.9" exists
 // anywhere in the document).
+//
+// Both inserted and docText are ZWSP-stripped before matching (see
+// stripZWSP's doc comment): a caller building e.Text by copying text
+// straight out of a docx_read result carries Read's own marker-neutralizing
+// U+200B along with it, which the actual document bytes never contain.
 func forgedProtectedItems(inserted, docText string, matchers []protectMatcher) []string {
-	if inserted == "" || len(matchers) == 0 {
+	if len(matchers) == 0 {
+		return nil
+	}
+	inserted = stripZWSP(inserted)
+	docText = stripZWSP(docText)
+	if inserted == "" {
 		return nil
 	}
 	var broken []string
@@ -1227,6 +1350,75 @@ func spansCollide(x, y Span) bool {
 	return x.End > y.Start
 }
 
+// stripZWSP removes every zeroWidthSpace (U+200B) from s. Read's own
+// neutralizeParaMarkers (read.go) inserts exactly this character into
+// rendered markdown wherever paragraph text looks like a "[para N]" marker,
+// so a caller who builds a find or protect value by copying text straight
+// out of that markdown carries the invisible character along with it — the
+// underlying document bytes never contain it, so the match would otherwise
+// fail silently, with no clue why. Both find matching (planFindTarget) and
+// every protect check (brokenProtectedItems/forgedProtectedItems, and
+// through them deleteWarning) strip it from their string inputs before
+// comparing, so this one caller mistake cannot manufacture either a
+// spurious "0 matches" find refusal or a silently unenforced protect item.
+func stripZWSP(s string) string {
+	if !strings.Contains(s, zeroWidthSpace) {
+		return s
+	}
+	return strings.ReplaceAll(s, zeroWidthSpace, "")
+}
+
+// stripZWSPMapped is stripZWSP's position-preserving sibling, for the one
+// call site (planFindTarget) that needs to locate a match INSIDE the
+// stripped text and then splice bytes at the corresponding position in the
+// ORIGINAL (unstripped) text: it returns the ZWSP-free string plus
+// origOffset, a slice with one entry per byte of stripped giving that
+// byte's own offset in s. A nil origOffset means "s had no ZWSP to begin
+// with" (checked once up front, rather than on every mapStrippedRange call)
+// — stripped == s in that case, and positions found in it already ARE
+// original-text positions.
+func stripZWSPMapped(s string) (stripped string, origOffset []int) {
+	if !strings.Contains(s, zeroWidthSpace) {
+		return s, nil
+	}
+	var b strings.Builder
+	origOffset = make([]int, 0, len(s))
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], zeroWidthSpace) {
+			i += len(zeroWidthSpace)
+			continue
+		}
+		origOffset = append(origOffset, i)
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String(), origOffset
+}
+
+// mapStrippedRange translates a [a, b) byte range located inside the string
+// stripZWSPMapped produced back into the corresponding range in ITS
+// original string, using the origOffset it returned. b must be > a (every
+// caller here only ever maps a non-empty match). A nil origOffset (the
+// no-ZWSP fast path) is the identity mapping.
+//
+// The end of the range is deliberately origOffset[b-1]+1 rather than
+// origOffset[b]: consider a stripped match ending right before a run of
+// ZWSP characters that were removed from the middle of the original
+// string — origOffset[b], if b is still in range, points PAST that
+// skipped run, at the start of whatever unmatched content follows it, which
+// would silently pull those untouched original bytes into the mapped
+// range. origOffset[b-1]+1 instead lands exactly one past the last original
+// byte the match actually consumed, leaving any skipped ZWSP run (matched
+// or not) outside the mapped span on the correct side. This also makes b ==
+// len(stripped) (a match running to the very end) work with no special
+// case: it never needs an out-of-range origOffset[b] at all.
+func mapStrippedRange(origOffset []int, a, b int) (int, int) {
+	if origOffset == nil {
+		return a, b
+	}
+	return origOffset[a], origOffset[b-1] + 1
+}
+
 // protectMatcher is one compiled EditOptions.Protect entry.
 type protectMatcher struct {
 	// re matches the protected item: either the user's pattern compiled as
@@ -1248,6 +1440,12 @@ func compileProtect(patterns []string) []protectMatcher {
 	}
 	out := make([]protectMatcher, len(patterns))
 	for i, p := range patterns {
+		// A protect pattern built by copying text straight out of a
+		// docx_read result carries Read's own marker-neutralizing U+200B
+		// along with it (see stripZWSP's doc comment); stripping it here,
+		// before compiling, cleans it whether the pattern compiles as a
+		// regex or falls back to the literal branch below.
+		p = stripZWSP(p)
 		if re, err := regexp.Compile(p); err == nil {
 			out[i] = protectMatcher{re: re}
 			continue
@@ -1263,8 +1461,19 @@ func compileProtect(patterns []string) []protectMatcher {
 // after is checked with a plain substring test (not a re-match), since the
 // requirement is that the exact matched text survives, not that it still
 // satisfies the pattern in some possibly-different form.
+//
+// Both before and after are ZWSP-stripped first (see stripZWSP's doc
+// comment) — before/after here are never spliced back into the document by
+// byte offset (unlike planFindTarget's find, this function only ever
+// returns matched STRINGS, never a position), so no span-mapping is needed:
+// stripping is simply a substring cleanup on both sides.
 func brokenProtectedItems(before, after string, matchers []protectMatcher) []string {
-	if before == "" || len(matchers) == 0 {
+	if len(matchers) == 0 {
+		return nil
+	}
+	before = stripZWSP(before)
+	after = stripZWSP(after)
+	if before == "" {
 		return nil
 	}
 	var broken []string
@@ -1282,9 +1491,23 @@ func brokenProtectedItems(before, after string, matchers []protectMatcher) []str
 }
 
 // protectReason formats a refusal reason naming the broken protected
-// item(s), per §4.2's "name the broken item" requirement.
+// item(s), per §4.2's "name the broken item" requirement. Used by
+// replace/delete's protect validation, which compares a Before against an
+// After — see forgedProtectReason for insert's differently-worded sibling,
+// which has no "before" to compare against.
 func protectReason(broken []string) string {
 	return fmt.Sprintf("edit would remove or alter protected item %q (protected items must survive the edit)", broken[0])
+}
+
+// forgedProtectReason formats insert_before/insert_after's protect refusal:
+// unlike replace/delete (protectReason), there is no "before" text an
+// insert could have altered, so reusing protectReason's "edit would remove
+// or alter" wording here would misdescribe what actually happened — nothing
+// existing was touched; the newly inserted text itself looks like a forged
+// or mistyped protected item (see forgedProtectedItems).
+func forgedProtectReason(broken []string) string {
+	return fmt.Sprintf(
+		"insert would introduce text matching protected pattern %q, which does not currently appear in the document", broken[0])
 }
 
 // deleteWarning implements §4.2's delete carve-out: delete never runs

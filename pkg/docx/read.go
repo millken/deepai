@@ -489,6 +489,17 @@ func paraTextWithBreaks(p Para) string {
 // marker Read itself inserts.
 var paraMarkerPattern = regexp.MustCompile(`\[para \d+\]`)
 
+// zeroWidthSpace is U+200B, the character neutralizeParaMarkers inserts to
+// defuse a "[para N]" look-alike in untrusted paragraph text (see its doc
+// comment below). It is package-level, not local to that function, because
+// edit.go's find/protect matching (stripZWSP/stripZWSPMapped) strips this
+// exact character from both sides of every match before comparing: a caller
+// who builds a find or protect value by copying text straight out of Read's
+// rendered markdown carries this invisible character along with it, while
+// the underlying document bytes never contain it, so the two sides need to
+// agree on which character that is.
+const zeroWidthSpace = "\u200b"
+
 // neutralizeParaMarkers breaks up any "[para N]" look-alike sequence in s by
 // inserting a zero-width space (U+200B) right after the "[". Untrusted
 // paragraph text is rendered interleaved with Read's own "[para N]"
@@ -505,7 +516,6 @@ func neutralizeParaMarkers(s string) string {
 	if !strings.Contains(s, "[para ") {
 		return s
 	}
-	zeroWidthSpace := string(rune(0x200B))
 	return paraMarkerPattern.ReplaceAllStringFunc(s, func(m string) string {
 		return "[" + zeroWidthSpace + m[len("["):]
 	})

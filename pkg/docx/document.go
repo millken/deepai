@@ -193,11 +193,34 @@ func computeNotes(names []string, paras []Para, revisions revisionSummary) []str
 			break
 		}
 	}
-	if revisions.InsCount > 0 || revisions.DelCount > 0 {
-		notes = append(notes, fmt.Sprintf(
-			"document contains unreviewed tracked changes from author(s) %s (%d insertion(s), %d deletion(s)); "+
-				"paragraph text above is rendered as if every revision were already accepted (inserted text shown, deleted text omitted)",
-			formatAuthorList(revisions.Authors), revisions.InsCount, revisions.DelCount))
+	// Triggered on len(revisions.Authors) > 0, NOT InsCount>0||DelCount>0: the
+	// author set (scanRevisions) already covers w:moveFrom/w:moveTo,
+	// w:cellIns/w:cellDel, and w:rPrChange/w:pPrChange — none of which are
+	// w:ins/w:del themselves — per Task 3's I4 fix (see revisionSummary's own
+	// doc comment). Gating this note on InsCount/DelCount alone left a real
+	// gap: a document containing ONLY, say, a pending w:moveTo from another
+	// author read completely silently (no note at all), while Edit's own
+	// revision gate (which already compares the wider Authors set) refused
+	// and named that same author — read and edit disagreeing about whether
+	// there was anything pending here at all. The two branches below just
+	// choose which of two true statements to make: whether there is a
+	// visible insertion/deletion count to report, or whether the pending
+	// revisions are the kind Read's rendering wouldn't show any sign of
+	// either way (a move or a formatting-only change).
+	if len(revisions.Authors) > 0 {
+		switch {
+		case revisions.InsCount > 0 || revisions.DelCount > 0:
+			notes = append(notes, fmt.Sprintf(
+				"document contains unreviewed tracked changes from author(s) %s (%d insertion(s), %d deletion(s)); "+
+					"paragraph text above is rendered as if every revision were already accepted (inserted text shown, deleted text omitted)",
+				formatAuthorList(revisions.Authors), revisions.InsCount, revisions.DelCount))
+		default:
+			notes = append(notes, fmt.Sprintf(
+				"document contains unreviewed tracked changes from author(s) %s with no visible insertion/deletion — "+
+					"likely a move or formatting-only revision (e.g. w:moveFrom/w:moveTo, w:rPrChange/w:pPrChange); "+
+					"paragraph text above may not reflect what that pending revision would change",
+				formatAuthorList(revisions.Authors)))
+		}
 	}
 	return notes
 }
