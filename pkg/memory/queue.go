@@ -30,6 +30,8 @@ const (
 	jobIncrementSuspect             // atomic suspect count bump (negative feedback)
 	jobUpdateScopeWithSkill         // user-scope update + skill usage combined
 	jobPreferenceUpdate             // preference extraction with dedup key "pref:"
+	jobRefine                       // auto-refine: run the gate, then extract this scope
+	jobRefineApproved               // auto-refine: extract this scope using another job's verdict
 )
 
 // updateJob represents a pending async memory operation.
@@ -43,6 +45,8 @@ type updateJob struct {
 	factIDs    []string
 	scope      Scope
 	turnID     int    // turn number for dedup key
+	pairID     string // ties the two scopes of one refine together (jobRefine*)
+	pairQueued bool   // jobRefine only: a jobRefineApproved will claim the verdict
 	seq        uint64 // monotonic sequence for dedup
 
 	flushVersion    uint64 // flush version captured at submit (update jobs)
@@ -353,6 +357,20 @@ func (q *UpdateQueue) execute(ctx context.Context, job updateJob) {
 		if err := q.svc.UpdateWith(ctx, job.sessionID, job.messages, job.ext); err != nil {
 			q.svc.logger.Warn("async preference update failed", "session", job.sessionID, "err", err)
 		}
+
+	case jobRefine:
+		// One timeout budget covers BOTH the gate call and the extraction it
+		// gates. Shrinking it starves the extraction after the gate is paid for.
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		ctx = withCapturedFlushVersion(ctx, job)
+		q.svc.runRefineGateJob(ctx, job)
+
+	case jobRefineApproved:
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		ctx = withCapturedFlushVersion(ctx, job)
+		q.svc.runRefineApprovedJob(ctx, job)
 	}
 }
 

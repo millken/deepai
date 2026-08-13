@@ -47,13 +47,53 @@ type ReplConfig struct {
 	MCPReport           string                   // one-line MCP load summary; printed after banner when non-empty
 	AgentCatalog        []agent.AgentInfo
 	Commands            map[string]Command // file-based slash commands; body injected as a user turn
+
+	// MemoryAutoRefine enables the auto-refine review gate. When false the REPL
+	// falls back to unconditional extraction rather than skipping memory work.
+	MemoryAutoRefine bool
+	// MemoryRefineInterval is the gate cadence in turns, already resolved by the
+	// caller (see commands.resolveRefineInterval); 0 means "no gate".
+	MemoryRefineInterval int
 }
 
-// memoryExtractInterval is the turn cadence for async memory extraction in CLI.
+// fallbackExtractInterval is the turn cadence for unconditional async memory
+// extraction — the behaviour used when the auto-refine gate is switched off.
 // Set to 5: covers a typical short exchange in one batch while keeping LLM
 // extraction cost bounded. Compaction always flushes synchronously, so facts
 // are never lost across the context boundary.
-const memoryExtractInterval = 5
+const fallbackExtractInterval = 5
+
+// memoryScheduleMode is what a finished turn should queue for memory.
+type memoryScheduleMode int
+
+const (
+	memoryScheduleNone memoryScheduleMode = iota
+	// memoryScheduleRefine runs the review gate, which decides whether to pay
+	// for an extraction.
+	memoryScheduleRefine
+	// memoryScheduleUnconditional extracts without asking, which is what the
+	// REPL did before the gate existed.
+	memoryScheduleUnconditional
+)
+
+// memoryScheduleFor decides what a finished turn should queue.
+//
+// Any interval that is not a usable cadence means "no gate", never "no memory":
+// the fallback branch keeps extraction running at the pre-gate cadence. Without
+// it, a config that never mentions the key would stop memory extraction outright
+// rather than merely turning off an optimisation.
+func memoryScheduleFor(turn, refineInterval int, autoRefine bool) memoryScheduleMode {
+	if autoRefine && refineInterval > 0 {
+		if turn%refineInterval == 0 {
+			return memoryScheduleRefine
+		}
+		return memoryScheduleNone
+	}
+	if turn%fallbackExtractInterval == 0 {
+		return memoryScheduleUnconditional
+	}
+	return memoryScheduleNone
+}
 
 // ReplUI is the subset of TUI methods the REPL needs. *TUI satisfies it
 // implicitly. Defining it as an interface lets tests inject a mock.
@@ -89,6 +129,7 @@ type ChatRepl struct {
 	currentModel      string // selected model alias (from ModelRegistry)
 	currentEffort     string // reasoning effort: "low", "medium", "high", "disabled", or "" (provider default)
 	imageDetail       string // vision detail: "low" (default), "high", or "" (use "low")
+	refineOverride    *bool  // session-level /refine on|off; nil defers to config
 
 	// carry holds cross-turn Agent state (circuit breaker, active skill,
 	// compaction anchors — see agent.SessionCarry's doc comment) that would
@@ -772,15 +813,29 @@ EventLoop:
 		r.prefSched.RecordToolCalls(turnToolCalls)
 	}
 
-	// Schedule memory update.
-	// Throttle: extract every memoryExtractInterval turns. Compaction performs a
-	// synchronous flush ([pkg/agent/react.go] CancelPendingUpdates+UpdateWith) so
-	// nothing is lost; this guard avoids paying for an LLM extraction call on every
-	// single turn while still capturing facts before context is compacted.
-	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil && r.turn%memoryExtractInterval == 0 {
-		r.cfg.MemoryService.ScheduleUpdateWith(r.sess.ID, r.sess.Messages, r.cfg.MemoryExtractor)
+	// Schedule memory work for this turn.
+	//
+	// The throttle keeps LLM extraction cost bounded; compaction performs a
+	// synchronous flush ([pkg/agent/react.go] CancelPendingUpdates+UpdateWith),
+	// so nothing is lost between checkpoints. With auto-refine on, the gate
+	// decides whether a checkpoint is worth extracting at all; with it off, the
+	// unconditional extraction below is exactly the pre-gate behaviour.
+	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
+		userScopeKey := ""
 		if uid := strings.TrimSpace(r.cfg.WorkDir); uid != "" {
-			r.cfg.MemoryService.ScheduleUpdateWith(memory.UserScope(uid).Key(), r.sess.Messages, r.cfg.MemoryExtractor)
+			userScopeKey = memory.UserScope(uid).Key()
+		}
+		switch memoryScheduleFor(r.turn, r.cfg.MemoryRefineInterval, r.autoRefineEnabled()) {
+		case memoryScheduleRefine:
+			// One gate call decides for both scopes; ScheduleRefine queues a job
+			// per scope so dedup, cancellation and flush versioning stay sharded
+			// by storage key.
+			r.cfg.MemoryService.ScheduleRefine(r.sess.ID, userScopeKey, r.sess.Messages, r.cfg.MemoryExtractor)
+		case memoryScheduleUnconditional:
+			r.cfg.MemoryService.ScheduleUpdateWith(r.sess.ID, r.sess.Messages, r.cfg.MemoryExtractor)
+			if userScopeKey != "" {
+				r.cfg.MemoryService.ScheduleUpdateWith(userScopeKey, r.sess.Messages, r.cfg.MemoryExtractor)
+			}
 		}
 	}
 
@@ -948,6 +1003,8 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.handleImageCommand(parentCtx, cmd.Args)
 	case "imagedetail", "imagequality":
 		r.handleImageDetailCommand(cmd.Args)
+	case "refine":
+		r.handleRefineCommand(parentCtx, cmd.Args)
 	case "doctor":
 		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":

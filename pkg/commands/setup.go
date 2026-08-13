@@ -50,6 +50,18 @@ type Config struct {
 	// when set, takes precedence.
 	TokenAging bool `yaml:"token_aging,omitempty"`
 
+	// MemoryAutoRefineDisabled turns off the auto-refine review gate. The field is
+	// named for the disabled state on purpose: a plain bool cannot express a
+	// default of true, since an absent key and an explicit false both unmarshal
+	// to the zero value. Zero here means enabled, which is the default we want.
+	// Disabling the gate falls back to unconditional extraction; it never stops
+	// memory extraction.
+	MemoryAutoRefineDisabled bool `yaml:"memory_auto_refine_disabled,omitempty"`
+	// MemoryRefineInterval is the turn cadence for the auto-refine gate. 0 (or
+	// absent) means "use the default"; a negative value disables auto-refine.
+	// Always read it through resolveRefineInterval, never directly.
+	MemoryRefineInterval int `yaml:"memory_refine_interval,omitempty"`
+
 	// Models defines multiple named model entries for multi-model support.
 	// Each entry binds an alias to a provider+model pair. When non-empty, the
 	// /model command can switch between them and subagents can select per-task.
