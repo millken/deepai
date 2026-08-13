@@ -1,6 +1,7 @@
 package docx
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -109,6 +110,84 @@ func TestFormat_MarginsLandInSectPrAsTwips(t *testing.T) {
 	}
 }
 
+// TestFormat_MarginsSameValueTwiceIsAnHonestNoOp is the final-review red
+// test for the margins idempotency gap: docx_format's own description
+// promises "changed nothing -> does not write the file or touch the
+// backup", but the margins path used to build fresh <w:pgMar> patches and
+// unconditionally Apply/SetPart them, reporting "applied" and dirtying the
+// Document, even when the new pgMar bytes were identical to what was
+// already there. A second call with the SAME margins_mm must report an
+// empty Applied and leave document.xml byte-for-byte unchanged.
+func TestFormat_MarginsSameValueTwiceIsAnHonestNoOp(t *testing.T) {
+	d, _ := formatDoc(t)
+	mm := []float64{25.4, 25.4, 25.4, 25.4}
+	if _, err := d.Format(FormatOptions{MarginsMM: mm}); err != nil {
+		t.Fatalf("Format (first): %v", err)
+	}
+	firstDoc, _ := d.Part(DocumentPart)
+	firstDocCopy := append([]byte(nil), firstDoc...)
+
+	res, err := d.Format(FormatOptions{MarginsMM: mm})
+	if err != nil {
+		t.Fatalf("Format (second): %v", err)
+	}
+	if len(res.Applied) != 0 {
+		t.Errorf("second identical margins_mm call: Applied = %v, want empty (nothing changed)", res.Applied)
+	}
+	secondDoc, _ := d.Part(DocumentPart)
+	if !bytes.Equal(firstDocCopy, secondDoc) {
+		t.Errorf("second identical margins_mm call rewrote document.xml even though nothing changed:\nfirst:  %s\nsecond: %s", firstDocCopy, secondDoc)
+	}
+}
+
+// TestFormat_MarginsSameValueOnFreshOpenDoesNotDirtyTheDocument is the
+// sharper form of the same red test: a document already saved with
+// margins_mm applied, reopened fresh and given the identical margins_mm
+// again, must leave Document.Modified() false -- which is exactly the
+// signal the tool layer (DocxFormatHandler) uses to decide whether to back
+// up and rewrite the file at all. Modified()==true here would mean a
+// no-op docx_format call still triggers a backup-and-rewrite, tripping the
+// stale-.bak note on every subsequent identical call.
+func TestFormat_MarginsSameValueOnFreshOpenDoesNotDirtyTheDocument(t *testing.T) {
+	d, p := formatDoc(t)
+	mm := []float64{25.4, 25.4, 25.4, 25.4}
+	if _, err := d.Format(FormatOptions{MarginsMM: mm}); err != nil {
+		t.Fatalf("Format (first): %v", err)
+	}
+	if err := d.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	before, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := OpenDocument(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := d2.Format(FormatOptions{MarginsMM: mm})
+	if err != nil {
+		t.Fatalf("Format (second, fresh open): %v", err)
+	}
+	if len(res.Applied) != 0 {
+		t.Errorf("Applied = %v, want empty: repeating the same margins_mm on the saved file changed nothing", res.Applied)
+	}
+	if d2.Modified() {
+		t.Error("Modified() = true after a no-op margins_mm call; the tool layer would back up and rewrite the file for nothing")
+	}
+	if err := d2.Save(); err != nil {
+		t.Fatalf("Save (second): %v", err)
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the file changed after a second, identical margins_mm call even though nothing was supposed to change")
+	}
+}
+
 func TestFormat_RejectsWrongMarginCount(t *testing.T) {
 	d, _ := formatDoc(t)
 	if _, err := d.Format(FormatOptions{MarginsMM: []float64{10, 20}}); err == nil {
@@ -169,6 +248,54 @@ func TestFormat_StylesOnlyChangeLeavesDocumentXMLAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEntriesEqual(t, fixture, p, map[string]bool{"word/styles.xml": true})
+}
+
+// TestFormat_NormalizeSkipsBodyLevelInsWrappingWholeParagraphs is the
+// final-review red test for the normalize revision gate: Format's normalize
+// branch used to call d.HasRevisions(), which only reports the per-
+// paragraph Para.HasRevisions flag Scan derives -- and Scan never sets that
+// flag for a paragraph wrapped by a <w:ins> at the BODY level (inPara is
+// still false when Scan sees the <w:ins> StartElement, exactly the same
+// gap edit.go's track_changes author gate and read.go's computeNotes both
+// had to close via scanRevisions -- see TestEdit_RefusesWhenBodyLevelInsWrapsWholeParagraph).
+// Left unfixed, normalize would silently merge/collapse empty paragraphs
+// another author's pending insertion wraps, and still report success, on
+// a document docx_read would warn about and docx_edit would refuse.
+func TestFormat_NormalizeSkipsBodyLevelInsWrappingWholeParagraphs(t *testing.T) {
+	d := bodyDoc(t, `<w:p><w:r><w:t>one</w:t></w:r></w:p>`+
+		`<w:ins w:id="1" w:author="alice" w:date="2026-01-01T00:00:00Z"><w:p/><w:p/></w:ins>`+
+		`<w:p><w:r><w:t>two</w:t></w:r></w:p>`)
+
+	if d.HasRevisions() {
+		t.Fatal("test setup: HasRevisions() = true; this test needs the paragraph-level scan to miss the body-level ins for the gate bug to be exercised")
+	}
+
+	before, _ := d.Part(DocumentPart)
+	beforeCopy := append([]byte(nil), before...)
+
+	res, err := d.Format(FormatOptions{Normalize: true})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+
+	foundNote := false
+	for _, n := range res.Notes {
+		if strings.Contains(n, "normalize skipped") && strings.Contains(n, "alice") {
+			foundNote = true
+		}
+	}
+	if !foundNote {
+		t.Errorf("Notes = %v, want a \"normalize skipped\" note naming author alice", res.Notes)
+	}
+	for _, a := range res.Applied {
+		if strings.Contains(a, "collapsed") {
+			t.Errorf("Applied = %v, want normalize to be skipped entirely, not collapse paragraphs alice's pending insertion wraps", res.Applied)
+		}
+	}
+	after, _ := d.Part(DocumentPart)
+	if !bytes.Equal(beforeCopy, after) {
+		t.Errorf("document.xml changed even though normalize should have been skipped:\nbefore: %s\nafter:  %s", beforeCopy, after)
+	}
 }
 
 func TestFormat_NormalizeMergesConsecutiveEmptyParagraphs(t *testing.T) {

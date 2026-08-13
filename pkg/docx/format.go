@@ -505,21 +505,60 @@ func (d *Document) Format(opts FormatOptions) (FormatResult, error) {
 			if err != nil {
 				return FormatResult{}, err
 			}
-			out, err := Apply(working, patches)
-			if err != nil {
-				return FormatResult{}, fmt.Errorf("docx: apply margins: %w", err)
+			// filterChangedPatches drops every <w:pgMar> patch that would
+			// leave its span byte-identical to what it already is, the same
+			// byte-level idempotency check the docDefaults/style-chain path
+			// gets for free via tagUnchanged (see planStylesPatches). Without
+			// this, a SECOND call with the SAME margins_mm rewrote every
+			// <w:pgMar> to bytes identical to what was already there,
+			// unconditionally reported "applied", and (via the changed=true
+			// below and Document.SetPart's modified=true) made the tool
+			// layer back up and rewrite an unchanged file — exactly the
+			// stale-.bak-prompt hazard docx_format's "changed nothing ->
+			// does not touch the file or the backup" promise exists to
+			// avoid.
+			patches = filterChangedPatches(patches)
+			if len(patches) > 0 {
+				out, err := Apply(working, patches)
+				if err != nil {
+					return FormatResult{}, fmt.Errorf("docx: apply margins: %w", err)
+				}
+				working = out
+				changed = true
+				result.Applied = append(result.Applied, fmt.Sprintf(
+					"margins -> top %gmm / right %gmm / bottom %gmm / left %gmm",
+					resolved.MarginsMM[0], resolved.MarginsMM[1], resolved.MarginsMM[2], resolved.MarginsMM[3]))
+			} else {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"margins already match top %gmm / right %gmm / bottom %gmm / left %gmm; not modified",
+					resolved.MarginsMM[0], resolved.MarginsMM[1], resolved.MarginsMM[2], resolved.MarginsMM[3]))
 			}
-			working = out
-			changed = true
-			result.Applied = append(result.Applied, fmt.Sprintf(
-				"margins -> top %gmm / right %gmm / bottom %gmm / left %gmm",
-				resolved.MarginsMM[0], resolved.MarginsMM[1], resolved.MarginsMM[2], resolved.MarginsMM[3]))
 		}
 
 		if resolved.Normalize {
-			if d.HasRevisions() {
-				result.Notes = append(result.Notes,
-					"normalize skipped: the document contains revision marks (w:ins/w:del)")
+			// scanRevisions' whole-document token walk (the same judgment
+			// read.go's computeNotes and edit.go's track_changes author gate
+			// use, per document.go:218's "OR both the old and the Task-3
+			// gate" comment) replaces d.HasRevisions() here: that method only
+			// reports Para.HasRevisions, which Scan derives PER PARAGRAPH and
+			// therefore never sees a revision that wraps a WHOLE paragraph at
+			// the body level (e.g. <w:ins w:author="..."><w:p>...</w:p></w:ins>
+			// — Scan's paragraph indexing walks the <w:ins> children, never
+			// treating the wrapper itself as carrying a revision the
+			// paragraph inside it should inherit). That gap let normalize
+			// silently collapse/merge a paragraph another author's pending
+			// insertion depends on and still report success, while the very
+			// same document.xml made docx_read warn about unreviewed
+			// revisions and docx_edit refuse to touch it -- three tools
+			// disagreeing about whether the document has pending revisions
+			// at all. Gating on the same Authors/InsCount/DelCount signal
+			// read/edit already use keeps normalize's judgment consistent
+			// with theirs.
+			revisions := scanRevisions(working)
+			if len(revisions.Authors) > 0 || revisions.InsCount > 0 || revisions.DelCount > 0 {
+				result.Notes = append(result.Notes, fmt.Sprintf(
+					"normalize skipped: the document contains unreviewed tracked changes from author(s) %s (w:ins/w:del or other tracked changes)",
+					formatAuthorList(revisions.Authors)))
 			} else {
 				out, removed, err := normalizeEmptyParagraphs(working)
 				if err != nil {

@@ -240,8 +240,12 @@ InputSchema: {
     "template":     "corporate"|"academic"|"minimal"?,  // 预设模板；只能整篇，见下
     "heading_font": string?,                            // 只能整篇，见下
     "body_font": string?,
+    "body_east_asia_font": string?,  // 任务 8 起已实现：只改东亚（如中文）字体，ascii/hAnsi 保持不变，与 body_font 各自独立
     "body_size_pt": number?,  "line_spacing": number?,
-    "align":        "left"|"justify"?,
+    "line_spacing_exact_pt": number?,  // 任务 8 起已实现：固定行高（w:lineRule="exact"），与 line_spacing 互斥（同给两者报错）
+    "align":        "left"|"center"|"right"|"justify"?,
+    "first_line_indent_chars": number?,  // 任务 8 起已实现：首行缩进，以字符宽度计（中文段落常用 2）
+    "space_before_pt": number?,  "space_after_pt": number?,  // 任务 8 起已实现：段前/段后间距，落在与 line_spacing 同一个 <w:spacing>
     "margins_mm": [number;4]?,                           // 只能整篇，见下
     "normalize":    boolean?,  // 合并连续空段、统一标点间距；只能整篇，见下
     "page_numbers": boolean?,  // 任务 12（2026-08-13）起已实现，见下；只能整篇，带范围直接报错

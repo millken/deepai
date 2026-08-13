@@ -1232,9 +1232,14 @@ func DocxWriteTool() models.Tool {
 			"row) become bordered Word tables with a bold header row and per-column left/center/right alignment; " +
 			"fenced ``` code blocks (and 4-space/tab-indented ones) become a single monospace, shaded, " +
 			"bordered paragraph per block with indentation preserved and lines separated by line breaks; [text](url) " +
-			"becomes a clickable hyperlink; > quotes and a standalone --- become a bordered block quote and a " +
-			"horizontal rule. A document with tables, nested lists, and code blocks is exactly what this tool " +
-			"is for — there is no need to write a script instead. The one thing it cannot do is embed images: " +
+			"becomes a clickable hyperlink; ~~strikethrough~~ becomes struck-through text (nestable inside " +
+			"bold/italic); a line ending in two or more trailing spaces, or in a single trailing backslash, " +
+			"becomes a hard line break within the same paragraph instead of just soft-wrapping; a line of text " +
+			"immediately followed by a line of one or more '=' or two-or-more '-' (a setext heading) becomes " +
+			"Heading1/Heading2, the same as # and ##; > quotes become a bordered block quote, and a standalone " +
+			"---, ***, or ___ becomes a horizontal rule. A document with tables, nested lists, and code blocks " +
+			"is exactly what this tool is for — there is no need to write a script instead. The one thing it " +
+			"cannot do is embed images: " +
 			"![alt](url) is written as plain text and declared in notes, never silently dropped. Text containing " +
 			"characters XML forbids (e.g. raw control codes from a pasted ANSI terminal transcript) has those " +
 			"characters replaced rather than producing a file that reports success but will not open, and notes " +
