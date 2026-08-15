@@ -223,6 +223,8 @@ You lead a team of specialized sub-agents. Use the task tool to delegate when a 
 - Give the sub-agent a self-contained prompt with all needed context (file paths, requirements, constraints).
 - Sub-agents cannot see your conversation history. They start fresh. Always include: what to do, what input/context it needs, and what its final answer should contain.
 - Pass the files the sub-agent needs via context_files instead of pasting their contents into the prompt.
+- Scope each delegation to specific files/line ranges/symbols. Tell the sub-agent to explore via code_map symbol outlines and read_file with start_line/end_line instead of reading files end to end.
+- If a delegation comes back too shallow, re-delegate a NARROWER and more SPECIFIC task (fewer files, explicit line ranges or symbols) — do NOT just raise max_tool_calls: an exhaustive uncapped read-through costs hours and hundreds of thousands of tokens for little extra signal.
 - After a sub-agent completes, review its output before proceeding. If wrong, re-invoke with corrections.
 
 ## Parallel delegation

@@ -24,6 +24,15 @@ type RunResult struct {
 	Messages    []models.Message `json:"messages"`
 	FinalOutput string           `json:"final_output"`
 	Usage       *Usage           `json:"usage,omitempty"`
+	// ToolCalls counts the tool calls this run EXECUTED (parallel and serial
+	// paths). LLMTurns counts LLM round-trips issued (compaction retries
+	// included — each is a real request). Their ratio diagnoses a model's
+	// batching behavior: ~1 call/turn (GLM-style) means N calls cost N
+	// sequential round-trips, while 3+/turn amortizes them. BudgetExhausted
+	// reports whether the MaxToolCalls cap forced the wrap-up turn.
+	ToolCalls       int  `json:"tool_calls"`
+	LLMTurns        int  `json:"llm_turns"`
+	BudgetExhausted bool `json:"budget_exhausted"`
 }
 
 // DefaultMaxOutputTokens is the fallback max output tokens applied to both

@@ -596,3 +596,57 @@ func TestTaskTool_ExplicitZeroMaxToolCallsWins(t *testing.T) {
 		t.Fatalf("Handler() error = %v", err)
 	}
 }
+
+// TestTaskToolCompleted_SetsSubagentStatsData: the task tool must expose the
+// subagent's RunStats workload profile via result.Data["subagent_stats"]
+// (alongside the existing subagent_usage) so persisted tool results carry
+// tool-call/turn/retry/duration data for post-hoc delegation analysis —
+// with Content left untouched.
+func TestTaskToolCompleted_SetsSubagentStatsData(t *testing.T) {
+	stats := &subagent.RunStats{
+		AgentType:    "security-reviewer",
+		Model:        "test-model",
+		ToolCalls:    45,
+		LLMTurns:     47,
+		MaxToolCalls: 45,
+		DurationMS:   234_000,
+	}
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			return &subagent.Task{ID: "task-stats"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{
+				ID:     taskID,
+				Status: subagent.TaskStatusCompleted,
+				Result: "ok",
+				Usage:  &subagent.TokenUsage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
+				Stats:  stats,
+			}, nil
+		},
+	}, nil)
+
+	result, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "call-stats",
+		Name:      "task",
+		Arguments: map[string]any{"description": "run", "prompt": "do it"},
+	})
+	if err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+	if result.Content != "ok" {
+		t.Fatalf("Content = %q, want %q unchanged", result.Content, "ok")
+	}
+	got, ok := result.Data["subagent_stats"].(*subagent.RunStats)
+	if !ok {
+		t.Fatalf("Data[\"subagent_stats\"] missing or wrong type; got %#v", result.Data["subagent_stats"])
+	}
+	if got == nil || *got != *stats {
+		t.Fatalf("Data[\"subagent_stats\"] = %+v, want %+v", got, stats)
+	}
+	// Both keys coexist: usage keeps feeding react.go's parent roll-up while
+	// stats feeds analysis.
+	if result.Data["subagent_usage"] == nil {
+		t.Fatalf("Data[\"subagent_usage\"] = nil, want it kept alongside subagent_stats")
+	}
+}

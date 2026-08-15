@@ -1259,3 +1259,64 @@ func TestSubagentExecutor_SchemaRetryDoesNotMultiplyToolBudget(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 5 (retry must NOT run once the tool-call budget is spent)", provider.callCount)
 	}
 }
+
+// TestSubagentExecutor_RunStatsAggregation pins the workload-stats contract:
+// ExecutionResult.Stats must aggregate every attempt's numbers (initial run +
+// schema retries), carry the resolved AgentType/Model/MaxToolCalls, count the
+// retries it actually launched, and stamp a wall-clock duration — so the
+// persisted task results (task tool's Data["subagent_stats"]) have everything
+// a post-hoc "was this delegation efficient?" analysis needs.
+func TestSubagentExecutor_RunStatsAggregation(t *testing.T) {
+	securityReviewerMaxRetries(t)
+	// Attempt 1: one tool call, then invalid JSON (triggers the retry).
+	// Attempt 2 (retry): valid JSON. Scripted by global Stream index — the
+	// tool-call turn is call 0, attempt 1's final text is call 1, the
+	// retry's final text is call 2.
+	provider := &scriptedOutputProvider{
+		toolCalls: map[int][]models.ToolCall{
+			0: {{ID: "sc-1", Name: "noop", Arguments: map[string]any{}}},
+		},
+		outputs: map[int]string{1: invalidReviewJSON, 2: validReviewJSON},
+	}
+	exec := reviewerExecutor(t, provider)
+
+	execResult, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t-stats", Prompt: "review this", Config: subagent.SubagentConfig{
+			AgentType:    "security-reviewer",
+			Tools:        []string{"noop"},
+			MaxToolCalls: 45,
+		}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+
+	stats := execResult.Stats
+	if stats == nil {
+		t.Fatal("ExecutionResult.Stats = nil, want the aggregated workload profile")
+	}
+	if stats.AgentType != "security-reviewer" {
+		t.Errorf("AgentType = %q, want the resolved agent type", stats.AgentType)
+	}
+	if stats.Model != "configured-model" {
+		t.Errorf("Model = %q, want the registry-resolved model name", stats.Model)
+	}
+	if stats.MaxToolCalls != 45 {
+		t.Errorf("MaxToolCalls = %d, want 45 (caller-explicit cap echoes into stats)", stats.MaxToolCalls)
+	}
+	if stats.ToolCalls != 1 {
+		t.Errorf("ToolCalls = %d, want 1 (the single noop call of attempt 1)", stats.ToolCalls)
+	}
+	if stats.LLMTurns != 3 {
+		t.Errorf("LLMTurns = %d, want 3 (attempt 1's tool turn + final turn, plus the retry's turn)", stats.LLMTurns)
+	}
+	if stats.SchemaRetries != 1 {
+		t.Errorf("SchemaRetries = %d, want 1 (one retry launched after the invalid output)", stats.SchemaRetries)
+	}
+	if stats.BudgetExhausted {
+		t.Errorf("BudgetExhausted = true, want false (the cap was never reached)")
+	}
+	if stats.DurationMS < 0 {
+		t.Errorf("DurationMS = %d, want a non-negative elapsed time", stats.DurationMS)
+	}
+}

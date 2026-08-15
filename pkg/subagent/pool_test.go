@@ -412,3 +412,44 @@ func TestResolveConfig_NoPerTypeDefaults(t *testing.T) {
 		t.Fatalf("caller values dropped: %+v", explicit)
 	}
 }
+
+// TestPoolStartTaskCompletes_CarriesRunStats is the stats sibling of
+// TestPoolStartTaskCompletes_CarriesUsage: the executor's ExecutionResult
+// now carries a RunStats workload profile, and finishTask/snapshot must
+// propagate it onto the Task so the task tool can expose it via
+// Data["subagent_stats"].
+func TestPoolStartTaskCompletes_CarriesRunStats(t *testing.T) {
+	pool := NewPool(fakeExecutor{
+		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
+			return ExecutionResult{
+				Result: "done",
+				Usage:  &TokenUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+				Stats: &RunStats{
+					AgentType:     "general-purpose",
+					ToolCalls:     7,
+					LLMTurns:      9,
+					SchemaRetries: 1,
+					MaxToolCalls:  45,
+					DurationMS:    1234,
+				},
+			}, nil
+		},
+	}, PoolConfig{Timeout: time.Second})
+
+	task, err := pool.StartTask(context.Background(), "test task", "do work", SubagentConfig{AgentType: "general-purpose"})
+	if err != nil {
+		t.Fatalf("StartTask() error = %v", err)
+	}
+
+	completed, err := pool.Wait(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if completed.Stats == nil {
+		t.Fatal("completed.Stats = nil, want the executor's RunStats propagated through finishTask/snapshot")
+	}
+	want := RunStats{AgentType: "general-purpose", ToolCalls: 7, LLMTurns: 9, SchemaRetries: 1, MaxToolCalls: 45, DurationMS: 1234}
+	if *completed.Stats != want {
+		t.Fatalf("completed.Stats = %+v, want %+v", *completed.Stats, want)
+	}
+}

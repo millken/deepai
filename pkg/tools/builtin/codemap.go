@@ -112,6 +112,11 @@ var symbolPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`^\s*(pub\s+)?extern\b.*\bfn\b`),
 		// Type-bearing consts: const Name = [extern|packed] struct/enum/union/opaque/error.
 		regexp.MustCompile(`^\s*(pub\s+)?const\s+\w+\s*=\s*(extern\s+|packed\s+)?(struct|enum|union|opaque|error)\b`),
+		// Top-level mutable state, column-0 only (`pub var g: T`, `var x: T`) —
+		// anchored WITHOUT the leading \s* the other zig patterns carry so
+		// function-local `var`s don't flood the outline. Global state is exactly
+		// what a reviewer/Navigator wants to see listed.
+		regexp.MustCompile(`^(pub\s+)?var\b`),
 	},
 	"java": {
 		regexp.MustCompile(`^\s*(public|private|protected|static|final|abstract|\s)*\s(class|interface|enum)\s`),
@@ -166,6 +171,7 @@ func cleanSignature(line string) string {
 type codeMapFile struct {
 	rel     string
 	abs     string
+	lines   int // total line count (0 when the file could not be read)
 	symbols []symbol
 }
 
@@ -307,7 +313,9 @@ func readCodeMapFile(abs, rel string) codeMapFile {
 	if err != nil {
 		return f
 	}
-	f.symbols = extractSymbols(string(data), filepath.Ext(abs))
+	content := string(data)
+	f.lines = strings.Count(content, "\n") + 1
+	f.symbols = extractSymbols(content, filepath.Ext(abs))
 	return f
 }
 
@@ -316,7 +324,7 @@ func readCodeMapFile(abs, rel string) codeMapFile {
 func renderTree(files []codeMapFile) string {
 	var b strings.Builder
 	for _, f := range files {
-		fmt.Fprintf(&b, "%s  (%d symbols)\n", f.rel, len(f.symbols))
+		fmt.Fprintf(&b, "%s  (%d lines, %d symbols)\n", f.rel, f.lines, len(f.symbols))
 	}
 	b.WriteString("\n[Structure only. Use code_map with depth=symbols and path= to see signatures.]")
 	return b.String()
@@ -330,8 +338,7 @@ func renderSymbols(ctx context.Context, files []codeMapFile, hint bool) string {
 		if len(f.symbols) == 0 {
 			continue
 		}
-		b.WriteString(displayVirtualPath(ctx, f.abs))
-		b.WriteByte('\n')
+		fmt.Fprintf(&b, "%s  (%d lines)\n", displayVirtualPath(ctx, f.abs), f.lines)
 		width := numWidth(f.symbols[len(f.symbols)-1].Line)
 		for _, s := range f.symbols {
 			fmt.Fprintf(&b, "  L %*d  %s\n", width, s.Line, s.Text)
@@ -350,7 +357,7 @@ func renderSymbols(ctx context.Context, files []codeMapFile, hint bool) string {
 func CodeMapTool() models.Tool {
 	return models.Tool{
 		Name:         "code_map",
-		Description:  "Map a codebase's structure without reading full files: lists source files and their function/type/class signatures with line numbers. Use this FIRST when exploring an unfamiliar repo, instead of many read_file/grep calls. depth=tree (default) shows files with symbol counts; depth=symbols shows signatures. Then read_file with start_line/end_line to see an implementation.",
+		Description:  "Map a codebase's structure without reading full files: lists source files with line counts and their function/type/class/global-var signatures with line numbers. Use this FIRST when exploring an unfamiliar repo or sizing up files (instead of wc -l / cat / grep for symbols). depth=tree (default) shows files with line and symbol counts; depth=symbols shows signatures. Then read_file with start_line/end_line to see an implementation.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{

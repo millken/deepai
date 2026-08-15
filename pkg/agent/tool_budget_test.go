@@ -109,6 +109,20 @@ func TestRun_ToolCallBudget_GracefulWrapUp(t *testing.T) {
 	if noticeIdx < lastToolIdx {
 		t.Fatalf("notice at %d precedes last tool result at %d", noticeIdx, lastToolIdx)
 	}
+
+	// Workload stats: the executed-call count, the LLM round-trip count
+	// (tool turns + the wrap-up request), and the exhaustion flag must ride
+	// the RunResult so callers (SubagentExecutor → task tool Data) can
+	// persist them for post-hoc analysis.
+	if result.ToolCalls != 2 {
+		t.Fatalf("ToolCalls = %d, want 2 (the budget)", result.ToolCalls)
+	}
+	if result.LLMTurns != 3 {
+		t.Fatalf("LLMTurns = %d, want 3 (two tool turns + one wrap-up)", result.LLMTurns)
+	}
+	if !result.BudgetExhausted {
+		t.Fatal("BudgetExhausted = false, want true after a wrap-up")
+	}
 }
 
 // emptyWrapUpProvider emits tool calls while tools are offered, and on the
@@ -225,5 +239,34 @@ func TestRun_ToolCallBudget_RefusesPostWrapUpToolCalls(t *testing.T) {
 		if !gotResults[id] {
 			t.Fatalf("tool_use %q has no matching tool_result (history would be unreplayable)", id)
 		}
+	}
+}
+
+// TestRun_WorkloadStats_UncappedRun pins the stats contract for a run that
+// finishes WITHOUT tripping the cap: ToolCalls counts executed calls, LLMTurns
+// counts every LLM round-trip (tool turns + the final text turn), and
+// BudgetExhausted stays false. Uses repeatSuccessProvider (12 tool turns then
+// a final text turn) with no cap configured.
+func TestRun_WorkloadStats_UncappedRun(t *testing.T) {
+	provider := &repeatSuccessProvider{}
+	a := New(AgentConfig{
+		LLMProvider: provider,
+		Tools:       newRegistryWithNoOpTool("echo"),
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "go"},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ToolCalls != 12 {
+		t.Fatalf("ToolCalls = %d, want 12 (provider's scripted tool turns)", result.ToolCalls)
+	}
+	if result.LLMTurns != 13 {
+		t.Fatalf("LLMTurns = %d, want 13 (12 tool turns + 1 final text turn)", result.LLMTurns)
+	}
+	if result.BudgetExhausted {
+		t.Fatal("BudgetExhausted = true, want false (no cap was configured)")
 	}
 }

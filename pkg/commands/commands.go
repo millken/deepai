@@ -9,4 +9,5 @@ func AddCommands(topLevel *cobra.Command) {
 	addVersion(topLevel)
 	addPlugin(topLevel)
 	addKey(topLevel)
+	addAnalyze(topLevel)
 }

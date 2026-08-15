@@ -93,11 +93,34 @@ type Task struct {
 	// finishTask once the executor returns. nil if the task never reached
 	// the executor (e.g. it bailed pre-semaphore) or the executor reported
 	// no usage.
-	Usage       *TokenUsage
+	Usage *TokenUsage
+	// Stats is the subagent's workload profile (tool calls, LLM turns,
+	// retries, wall time, ...), populated alongside Usage by finishTask.
+	// nil on the same paths Usage is.
+	Stats       *RunStats
 	createdAt   time.Time
 	completedAt time.Time
 	done        chan struct{}
 	mu          sync.RWMutex
+}
+
+// RunStats captures the workload profile of a subagent task, mirroring the
+// token accounting TokenUsage does for cost: how the run spent its effort
+// rather than its tokens. Post-hoc analysis of persisted task results uses
+// these to diagnose delegation efficiency — e.g. tool_calls ≈ llm_turns
+// identifies a model issuing one call per turn (N sequential round-trips),
+// and budget_exhausted=true with a large max_tool_calls flags a delegation
+// that was capped mid-work and should have been narrowed instead of
+// re-issued with a higher cap.
+type RunStats struct {
+	AgentType       string `json:"agent_type"`
+	Model           string `json:"model,omitempty"`
+	ToolCalls       int    `json:"tool_calls"`
+	LLMTurns        int    `json:"llm_turns"`
+	SchemaRetries   int    `json:"schema_retries"`
+	MaxToolCalls    int    `json:"max_tool_calls"`
+	BudgetExhausted bool   `json:"budget_exhausted"`
+	DurationMS      int64  `json:"duration_ms"`
 }
 
 // TokenUsage tracks token consumption for a subagent task. Defined locally
@@ -120,6 +143,11 @@ type ExecutionResult struct {
 	// executor's agent run never reported any (e.g. it errored before any
 	// response, or the provider omitted usage).
 	Usage *TokenUsage
+	// Stats is the run's workload profile aggregated across every attempt
+	// (initial + schema retries), populated even on error paths so failed
+	// delegations stay analyzable. nil only when the executor bailed before
+	// any agent run existed.
+	Stats *RunStats
 }
 
 // Executor is the interface for executing subagent tasks.
@@ -146,10 +174,23 @@ func (t *Task) snapshot() *Task {
 		Error:       t.Error,
 		Messages:    append([]models.Message(nil), t.Messages...),
 		Usage:       cloneTokenUsage(t.Usage),
+		Stats:       cloneRunStats(t.Stats),
 		createdAt:   t.createdAt,
 		completedAt: t.completedAt,
 		done:        nil,
 	}
+}
+
+// cloneRunStats returns a copy of the RunStats value pointed to by s, the
+// same isolation contract snapshot() applies to Usage — Stats is written
+// once by finishTask and read-only afterwards, but a snapshot caller still
+// gets its own copy rather than a shared pointer.
+func cloneRunStats(s *RunStats) *RunStats {
+	if s == nil {
+		return nil
+	}
+	v := *s
+	return &v
 }
 
 // cloneTokenUsage returns a copy of the TokenUsage value pointed to by u, so

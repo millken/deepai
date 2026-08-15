@@ -52,12 +52,14 @@ func TestExtractSymbols_Zig(t *testing.T) {
 		"pub const Point = struct {\n    x: i32,\n    y: i32,\n};\n\n" + // line 9
 		"const Color = enum { red, green, blue };\n" + // line 14
 		"const Payload = union(enum) { a: u8, b: u16 };\n" + // line 15
-		"extern \"c\" fn cFunc() void;\n" // line 16
+		"extern \"c\" fn cFunc() void;\n\n" + // line 16
+		"fn withLocal() void {\n    var local: u32 = 1;\n    _ = local;\n}\n\n" + // line 18; local var on line 19
+		"pub var state: u32 = 0;\n" // line 23: top-level global
 	syms := extractSymbols(src, ".zig")
-	if len(syms) != 6 {
-		t.Fatalf("want 6 symbols, got %d: %+v", len(syms), syms)
+	if len(syms) != 8 {
+		t.Fatalf("want 8 symbols, got %d: %+v", len(syms), syms)
 	}
-	wantLines := []int{3, 5, 9, 14, 15, 16}
+	wantLines := []int{3, 5, 9, 14, 15, 16, 18, 23}
 	for i, w := range wantLines {
 		if syms[i].Line != w {
 			t.Errorf("symbol %d: want line %d, got %d (%q)", i, w, syms[i].Line, syms[i].Text)
@@ -69,11 +71,16 @@ func TestExtractSymbols_Zig(t *testing.T) {
 	if syms[2].Text != "pub const Point = struct" {
 		t.Errorf("want 'pub const Point = struct', got %q", syms[2].Text)
 	}
-	// The plain import const must NOT be treated as a symbol.
+	// The plain import const must NOT be treated as a symbol, and a
+	// function-local `var` must not either (the var pattern is anchored to
+	// column 0 for exactly this reason).
 	for _, s := range syms {
-		if s.Line == 1 {
-			t.Errorf("import const should not be a symbol: %+v", s)
+		if s.Line == 1 || s.Line == 19 {
+			t.Errorf("non-declaration line should not be a symbol: %+v", s)
 		}
+	}
+	if syms[7].Text != "pub var state: u32 = 0;" {
+		t.Errorf("want top-level 'pub var state: u32 = 0;', got %q", syms[7].Text)
 	}
 }
 
@@ -107,6 +114,9 @@ func TestCodeMapHandler_TreeMode(t *testing.T) {
 	}
 	if !contains(result.Content, "2 symbols") {
 		t.Errorf("expected main.go to report 2 symbols, got: %s", result.Content)
+	}
+	if !contains(result.Content, "4 lines") {
+		t.Errorf("expected main.go to report 4 lines, got: %s", result.Content)
 	}
 	if contains(result.Content, "vendor") {
 		t.Errorf("should fold vendor/, got: %s", result.Content)
@@ -148,6 +158,11 @@ func TestCodeMapHandler_SymbolsMode(t *testing.T) {
 	// Line numbers must be present so the model can range-read.
 	if !contains(result.Content, "L") || !contains(result.Content, "5") {
 		t.Errorf("expected line numbers, got: %s", result.Content)
+	}
+	// The file header carries the total line count so the model can plan
+	// range reads (and split work) without a separate wc -l.
+	if !contains(result.Content, "(6 lines)") {
+		t.Errorf("expected '(6 lines)' header, got: %s", result.Content)
 	}
 	// Recovery hint.
 	if !contains(result.Content, "read_file") {

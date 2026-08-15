@@ -180,12 +180,22 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				Content:  completed.Result,
 			}
 			// Surface the subagent's token consumption for react.go's parent-run
-			// roll-up (M2-2 12a/12b). Nil-safe: a task that never reported usage
-			// (or never reached the executor) leaves Data unset. Content is left
-			// byte-for-byte untouched — the usage summary lives only in Data, so
-			// model-visible text stays clean.
-			if completed.Usage != nil {
-				result.Data = map[string]any{"subagent_usage": completed.Usage}
+			// roll-up (M2-2 12a/12b) and its workload stats for post-hoc
+			// analysis (persisted tool results are queryable, so tool-call /
+			// turn / retry / duration data lands in the session DB with the
+			// result itself). Nil-safe: a task that never reported either
+			// (or never reached the executor) leaves Data unset. Content is
+			// left byte-for-byte untouched — both summaries live only in
+			// Data, so model-visible text stays clean.
+			if completed.Usage != nil || completed.Stats != nil {
+				data := map[string]any{}
+				if completed.Usage != nil {
+					data["subagent_usage"] = completed.Usage
+				}
+				if completed.Stats != nil {
+					data["subagent_stats"] = completed.Stats
+				}
+				result.Data = data
 			}
 			switch completed.Status {
 			case subagent.TaskStatusCompleted:

@@ -200,6 +200,31 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// clarifications fall back to best-judgment instead of prompting.
 	ctx = tools.WithUserInteraction(ctx, nil)
 
+	// stats is the task's workload profile, returned on EVERY exit path below
+	// (including error/fail-soft ones — failed delegations are exactly the
+	// runs whose cost and shape need analyzing afterwards). Accumulated from
+	// each attempt's RunResult so schema retries can't hide their share.
+	started := time.Now()
+	stats := &subagent.RunStats{
+		AgentType:    string(agentType),
+		Model:        modelName,
+		MaxToolCalls: maxToolCalls,
+	}
+	accumulateStats := func(r *RunResult) {
+		if r == nil {
+			return
+		}
+		stats.ToolCalls += r.ToolCalls
+		stats.LLMTurns += r.LLMTurns
+		stats.BudgetExhausted = stats.BudgetExhausted || r.BudgetExhausted
+	}
+	// execStats stamps the elapsed wall time and hands the accumulated stats
+	// to a return site — the single place DurationMS is written.
+	execStats := func() *subagent.RunStats {
+		stats.DurationMS = time.Since(started).Milliseconds()
+		return stats
+	}
+
 	// runOnce creates a fresh single-use agent, pumps its events through the
 	// same emit() pattern as the original run, and blocks on <-eventsDone
 	// before returning — every attempt (initial and each retry) needs this
@@ -224,6 +249,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		}()
 		result, err := runAgent.Run(ctx, task.ID, msgs)
 		<-eventsDone
+		accumulateStats(result)
 		return result, err
 	}
 
@@ -262,7 +288,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		if result != nil {
 			errUsage = convertSubagentUsage(result.Usage)
 		}
-		return subagent.ExecutionResult{Usage: errUsage}, err
+		return subagent.ExecutionResult{Usage: errUsage, Stats: execStats()}, err
 	}
 
 	// totalUsage accumulates across every attempt (initial + retries) — a
@@ -340,6 +366,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 					Description: task.Description,
 					Message:     "retrying: output failed schema validation",
 				})
+				stats.SchemaRetries++
 
 				retryResult, retryErr := runOnce(retryMsgs, retryBudget, retryToolCalls)
 				if retryResult != nil {
@@ -413,6 +440,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 				Result:   fmt.Sprintf("%s%v. Raw output follows:\n\n%s", outputSchemaWarningPrefix, valErr, result.FinalOutput),
 				Messages: result.Messages,
 				Usage:    convertSubagentUsage(totalUsage),
+				Stats:    execStats(),
 			}, nil
 		}
 	}
@@ -421,6 +449,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		Result:   result.FinalOutput,
 		Messages: result.Messages,
 		Usage:    convertSubagentUsage(totalUsage),
+		Stats:    execStats(),
 	}, nil
 }
 

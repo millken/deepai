@@ -91,6 +91,13 @@ tools:
 一条收尾指令且后续请求不再附带工具，被迫输出最终总结。默认不限，运行由父级上下文（Ctrl+C）、可选的
 `token_budget`、上下文压缩与重复调用熔断器约束。旧配置里的 `max_turns` 键仍然兼容读取。
 
+每次 `task` 调用的结果在 `Data` 里携带 `subagent_usage`（token 消耗，供父级 roll-up）与
+`subagent_stats`（工作量画像：`tool_calls` / `llm_turns` / `schema_retries` / `max_tool_calls` /
+`budget_exhausted` / `duration_ms` / `agent_type` / `model`，随会话持久化）。事后可直接从会话 DB 统计
+委派效率——例如 `tool_calls ≈ llm_turns` 说明模型单轮单调用（N 次调用 = N 个串行回合），`budget_exhausted`
+配大 `max_tool_calls` 说明委派被截断、下次应收窄范围而不是加码上限。委派 guidance（系统提示词）也据此
+约束父模型：结果不够深时**收窄任务范围**（具体文件/行号/符号），不要单纯调大 `max_tool_calls`。
+
 `general-purpose` 的工具是**显式白名单**（不是"全部"）：不含 `git_auto_commit`，也不含任何 MCP 工具
 ——白名单无法枚举 MCP 工具名，所以 MCP 需要按 agent 类型显式开启。需要放宽就在
 `.deepai/agents/general-purpose.yaml` 里写 `tools:`。

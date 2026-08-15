@@ -468,6 +468,25 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// FinalOutput empty — the last turn before the cap is always a
 	// tool-call turn — so the subagent's entire output was dropped).
 	wrapUp := false
+	// llmTurns counts LLM round-trips actually issued (incremented at the
+	// Stream call, so compaction-retry `continue` paths count too — each one
+	// re-sends a real request). Loop state like the counters above: only
+	// mutated on the Run goroutine.
+	llmTurns := 0
+	// newRunResult builds the RunResult for every exit path of this loop so
+	// the workload stats (ToolCalls/LLMTurns/BudgetExhausted) can never be
+	// forgotten on one of them — the same consolidation role sumUsage plays
+	// for token accounting.
+	newRunResult := func(messages []models.Message, finalOutput string) *RunResult {
+		return &RunResult{
+			Messages:        messages,
+			FinalOutput:     finalOutput,
+			Usage:           usage,
+			ToolCalls:       toolCallsExecuted,
+			LLMTurns:        llmTurns,
+			BudgetExhausted: wrapUp,
+		}
+	}
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
@@ -489,7 +508,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				Suggestion: "Increase token budget or simplify the request.",
 			}
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: agentErr})
-			return &RunResult{Messages: runMessages, Usage: usage}, err
+			return newRunResult(runMessages, ""), err
 		}
 
 		// Assemble the system prompt ONCE per turn, before the compaction check,
@@ -574,6 +593,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// stream consumption; on the early Stream()-error return here it is
 		// called explicitly instead, since consumeStream is never reached.
 		reqCtx, cancel := context.WithCancel(ctx)
+		llmTurns++
 		stream, err := a.llm.Stream(reqCtx, req)
 		if err != nil {
 			cancel()
@@ -585,7 +605,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return &RunResult{Messages: runMessages, Usage: usage}, err
+			return newRunResult(runMessages, ""), err
 		}
 
 		streamRes := a.consumeStream(stream, cancel, emit, aiMessageID)
@@ -608,12 +628,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 			err := normalizeRunError(ctx, streamRes.err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return &RunResult{Messages: runMessages, Usage: usage}, err
+			return newRunResult(runMessages, ""), err
 		}
 		if err := ctx.Err(); err != nil {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return &RunResult{Messages: runMessages, Usage: usage}, err
+			return newRunResult(runMessages, ""), err
 		}
 
 		if streamUsage != nil {
@@ -701,7 +721,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// behavior — only wrap-up emptiness means work was lost.
 				err := fmt.Errorf("agent exceeded tool call budget (%d) and the wrap-up turn produced no output", a.maxToolCalls)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
+				return newRunResult(runMessages, ""), err
 			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
@@ -709,11 +729,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				Text:      assistantMessage.Content,
 				Usage:     cloneUsage(usage),
 			})
-			return &RunResult{
-				Messages:    runMessages,
-				FinalOutput: assistantMessage.Content,
-				Usage:       usage,
-			}, nil
+			return newRunResult(runMessages, assistantMessage.Content), nil
 		}
 
 		if wrapUp {
@@ -730,10 +746,10 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			if strings.TrimSpace(text) == "" {
 				err := fmt.Errorf("agent exceeded tool call budget (%d)", a.maxToolCalls)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
+				return newRunResult(runMessages, ""), err
 			}
 			emit(AgentEvent{Type: AgentEventEnd, MessageID: aiMessageID, Text: text, Usage: cloneUsage(usage)})
-			return &RunResult{Messages: runMessages, FinalOutput: text, Usage: usage}, nil
+			return newRunResult(runMessages, text), nil
 		}
 
 		// Parent-budget passthrough (plan §M2.2 carry-forward): compute the
@@ -884,7 +900,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					batch.appendRemaining(results[i+1:])
 					batch.flushPendingHints()
 					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
-					return &RunResult{Messages: batch.runMessages, Usage: usage}, obs.fatalErr
+					return newRunResult(batch.runMessages, ""), obs.fatalErr
 				}
 			}
 			batch.finishBatch()
@@ -892,7 +908,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			if err := ctx.Err(); err != nil {
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: runMessages, Usage: usage}, err
+				return newRunResult(runMessages, ""), err
 			}
 			continue
 		}
@@ -980,14 +996,14 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				batch.appendSynthesizedFailures(toolCalls[idx+1:])
 				batch.flushPendingHints()
 				emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
-				return &RunResult{Messages: batch.runMessages, Usage: usage}, obs.fatalErr
+				return newRunResult(batch.runMessages, ""), obs.fatalErr
 			}
 
 			if err := ctx.Err(); err != nil {
 				batch.flushPendingHints()
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-				return &RunResult{Messages: batch.runMessages, Usage: usage}, err
+				return newRunResult(batch.runMessages, ""), err
 			}
 		}
 		batch.finishBatch()

@@ -289,7 +289,7 @@ type subagentTaskLine struct {
 	taskID      string
 	line        string
 	description string
-	agentType   string    // e.g., "coder", "tester", "bash"
+	agentType   string // e.g., "coder", "tester", "bash"
 	startedAt   time.Time
 	spinnerIdx  int
 }
@@ -1066,44 +1066,44 @@ func (m *tuiModel) View() tea.View {
 		b.WriteString("\n")
 	}
 
-		// Subagent live status (updates in place, not scrollback), one line per
-		// in-flight task, in insertion (start) order. Capped at
-		// maxLiveSubagentLines so a wide fan-out can't push the input prompt
-		// off-screen; every task beyond the cap is still tracked in
-		// m.subagentTasks (terminal events for hidden tasks still fire and
-		// commit to scrollback normally) — only the live rendering is bounded.
-		visible := m.subagentTasks
-		overflow := 0
-		if len(visible) > maxLiveSubagentLines {
-			overflow = len(visible) - maxLiveSubagentLines
-			visible = visible[:maxLiveSubagentLines]
+	// Subagent live status (updates in place, not scrollback), one line per
+	// in-flight task, in insertion (start) order. Capped at
+	// maxLiveSubagentLines so a wide fan-out can't push the input prompt
+	// off-screen; every task beyond the cap is still tracked in
+	// m.subagentTasks (terminal events for hidden tasks still fire and
+	// commit to scrollback normally) — only the live rendering is bounded.
+	visible := m.subagentTasks
+	overflow := 0
+	if len(visible) > maxLiveSubagentLines {
+		overflow = len(visible) - maxLiveSubagentLines
+		visible = visible[:maxLiveSubagentLines]
+	}
+	for _, task := range visible {
+		// Calculate elapsed time for this task
+		elapsed := time.Since(task.startedAt)
+		elapsedSec := int(elapsed.Seconds())
+
+		// Get spinner character for this task
+		spinChar := subagentSpinners[task.spinnerIdx]
+
+		// Build enhanced line with spinner, type, and duration
+		var line string
+		if task.agentType != "" {
+			line = fmt.Sprintf("  ↳ %s [%s] %s (%ds)", spinChar, task.agentType, task.description, elapsedSec)
+		} else if task.line != "" {
+			line = fmt.Sprintf("%s (%ds)", task.line, elapsedSec)
+		} else {
+			line = fmt.Sprintf("  ↳ %s %s (%ds)", spinChar, task.description, elapsedSec)
 		}
-		for _, task := range visible {
-			// Calculate elapsed time for this task
-			elapsed := time.Since(task.startedAt)
-			elapsedSec := int(elapsed.Seconds())
-			
-			// Get spinner character for this task
-			spinChar := subagentSpinners[task.spinnerIdx]
-			
-			// Build enhanced line with spinner, type, and duration
-			var line string
-			if task.agentType != "" {
-				line = fmt.Sprintf("  ↳ %s [%s] %s (%ds)", spinChar, task.agentType, task.description, elapsedSec)
-			} else if task.line != "" {
-				line = fmt.Sprintf("%s (%ds)", task.line, elapsedSec)
-			} else {
-				line = fmt.Sprintf("  ↳ %s %s (%ds)", spinChar, task.description, elapsedSec)
-			}
-			b.WriteString(m.styles.Dim.Render(line))
-			b.WriteString("\n")
-		}
-		if overflow > 0 {
-			// Show summary with total count
-			totalTasks := len(m.subagentTasks)
-			b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more [total: %d tasks]", overflow, totalTasks)))
-			b.WriteString("\n")
-		}
+		b.WriteString(m.styles.Dim.Render(line))
+		b.WriteString("\n")
+	}
+	if overflow > 0 {
+		// Show summary with total count
+		totalTasks := len(m.subagentTasks)
+		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more [total: %d tasks]", overflow, totalTasks)))
+		b.WriteString("\n")
+	}
 
 	// Input region.
 	if m.inputVisible {

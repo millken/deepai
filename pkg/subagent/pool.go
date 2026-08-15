@@ -195,15 +195,16 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		status = TaskStatusFailed
 	}
 
-	p.finishTask(parentCtx, task, status, result.Result, err, result.Messages, result.Usage)
+	p.finishTask(parentCtx, task, status, result.Result, err, result.Messages, result.Usage, result.Stats)
 }
 
-func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, result string, err error, messages []models.Message, usage *TokenUsage) {
+func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, result string, err error, messages []models.Message, usage *TokenUsage, stats *RunStats) {
 	task.mu.Lock()
 	task.Status = status
 	task.Result = result
 	task.Messages = append([]models.Message(nil), messages...)
 	task.Usage = usage
+	task.Stats = stats
 	task.completedAt = time.Now().UTC()
 	if err != nil {
 		task.Error = err.Error()
