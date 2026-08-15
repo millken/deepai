@@ -163,6 +163,28 @@ func (p *AnthropicProvider) consumeStream(
 						ch <- StreamChunk{Model: model, Progress: true}
 					}
 				}
+			case "thinking_delta", "signature_delta":
+				// Extended thinking (reasoning models, incl. GLM via the
+				// anthropic-compat endpoint) streams minutes of thinking_delta
+				// events before the first text/tool token. These carry no
+				// message content, but they ARE stream activity: without a
+				// Progress signal here the idle watchdog in pkg/agent would
+				// see total silence for the whole reasoning phase and cancel
+				// a perfectly healthy request ("stream idle timeout") the
+				// moment a hard problem thinks for longer than the idle
+				// window. Gated on a non-empty payload so a keep-alive-shaped
+				// empty delta doesn't manufacture busywork. (SSE ping events
+				// can't feed the watchdog too — the SDK's ssestream skips
+				// them before this loop ever sees them — so thinking deltas
+				// are the only activity signal a reasoning stream provides.)
+				// Setting emitted too: a thinking-only stream that dies
+				// mid-reasoning has already streamed (and billed) minutes of
+				// output — it must NOT be classified as "nothing was emitted"
+				// and transparently re-run up to 4 attempts.
+				if event.Delta.Thinking != "" || event.Delta.Signature != "" {
+					emitted = true
+					ch <- StreamChunk{Model: model, Progress: true}
+				}
 			}
 		case "content_block_stop":
 			if b, ok := toolCallBuilders[event.Index]; ok {

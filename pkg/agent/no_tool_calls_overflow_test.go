@@ -61,7 +61,7 @@ func TestNoToolCalls_InputContextOverflow_CompactsAndRetries(t *testing.T) {
 
 	a := New(AgentConfig{
 		LLMProvider:        provider,
-		MaxTurns:           10,
+		MaxToolCalls:       10,
 		CompactionKeepTail: 6,
 	})
 
@@ -106,7 +106,7 @@ func TestNoToolCalls_OutputTruncation_DoesNotRetry(t *testing.T) {
 
 	a := New(AgentConfig{
 		LLMProvider:        provider,
-		MaxTurns:           10,
+		MaxToolCalls:       10,
 		CompactionKeepTail: 6,
 	})
 

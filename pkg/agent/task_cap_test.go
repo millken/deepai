@@ -99,7 +99,7 @@ func TestTaskCallFanOutCap_RefusesBeyondLimit(t *testing.T) {
 	}
 
 	provider := &manyTaskCallProvider{totalCalls: maxTaskCallsPerRun + 1}
-	a := New(AgentConfig{LLMProvider: provider, Tools: reg, MaxTurns: maxTaskCallsPerRun + 5})
+	a := New(AgentConfig{LLMProvider: provider, Tools: reg, MaxToolCalls: maxTaskCallsPerRun + 5})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
 		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "fan out a lot"},
@@ -217,7 +217,7 @@ func TestTaskCallFanOutCap_ParallelBatchStraddlesLimit(t *testing.T) {
 
 	soloCalls := maxTaskCallsPerRun - 1
 	provider := &straddleBatchProvider{soloCalls: soloCalls}
-	a := New(AgentConfig{LLMProvider: provider, Tools: reg, MaxTurns: soloCalls + 5})
+	a := New(AgentConfig{LLMProvider: provider, Tools: reg, MaxToolCalls: soloCalls + 5})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
 		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "fan out then batch"},

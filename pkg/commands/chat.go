@@ -26,11 +26,11 @@ import (
 
 // Chat flags shared between root and chat subcommand.
 var chatFlags struct {
-	Query    string
-	Resume   string
-	Continue bool
-	Model    string
-	MaxTurns int
+	Query        string
+	Resume       string
+	Continue     bool
+	Model        string
+	MaxToolCalls int
 }
 
 // resumePickerSentinel is the value assigned to -r when used without an argument.
@@ -49,7 +49,7 @@ func addChat(topLevel *cobra.Command) {
 		Short:  "Start an interactive chat session",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxTurns)
+			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxToolCalls)
 		},
 	}
 
@@ -57,7 +57,8 @@ func addChat(topLevel *cobra.Command) {
 	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
-	cmd.Flags().IntVar(&chatFlags.MaxTurns, "max-turns", 0, "Max agent turns per run (0=unlimited)")
+	cmd.Flags().IntVar(&chatFlags.MaxToolCalls, "max-tool-calls", 0, "Max executed tool calls per run (0=unlimited)")
+	registerMaxTurnsAlias(cmd)
 
 	topLevel.AddCommand(cmd)
 }
@@ -68,10 +69,18 @@ func RegisterChatFlags(cmd *cobra.Command) {
 	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
-	cmd.Flags().IntVar(&chatFlags.MaxTurns, "max-turns", 0, "Max agent turns per run (0=unlimited)")
+	cmd.Flags().IntVar(&chatFlags.MaxToolCalls, "max-tool-calls", 0, "Max executed tool calls per run (0=unlimited)")
+	registerMaxTurnsAlias(cmd)
 }
 
-func runChat(ctx context.Context, query, resume string, continueLast bool, modelOverride string, maxTurns int) error {
+// registerMaxTurnsAlias keeps the pre-rename --max-turns flag working as an
+// alias of --max-tool-calls (same variable), hidden from help.
+func registerMaxTurnsAlias(cmd *cobra.Command) {
+	cmd.Flags().IntVar(&chatFlags.MaxToolCalls, "max-turns", 0, "Deprecated alias for --max-tool-calls")
+	_ = cmd.Flags().MarkHidden("max-turns")
+}
+
+func runChat(ctx context.Context, query, resume string, continueLast bool, modelOverride string, maxToolCalls int) error {
 	// Load config.
 	cfg, err := LoadConfig(ConfigFile())
 	if err != nil {
@@ -307,7 +316,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		ModelRegistry:        modelRegistry,
 		DatabaseURL:          cfg.DatabaseURL,
 		ContextWindow:        cfg.ContextWindow,
-		MaxTurns:             maxTurns,
+		MaxToolCalls:         maxToolCalls,
 		RequestTimeout:       resolveRequestTimeout(cfg.RequestTimeout),
 		Query:                query,
 		ResumeSession:        resume,
@@ -348,7 +357,7 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 		WithContextWindow(contextWindow).
 		WithMaxTokens(subagentMaxTokens()).
 		WithPluginAgentDirs(pluginAgentDirs)
-	subPool := agent.NewSubagentPool(subExecutor, 4, 15*time.Minute)
+	subPool := agent.NewSubagentPool(subExecutor, 0)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))
 

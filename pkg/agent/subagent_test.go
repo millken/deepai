@@ -51,40 +51,28 @@ func TestSubagentMessageFromAgentEvent(t *testing.T) {
 	}
 }
 
-// TestResolveMaxTurns_Priority verifies the MaxTurns resolution chain:
-// caller-explicit > agent type profile > safety floor (6).
-func TestResolveMaxTurns_Priority(t *testing.T) {
-	// Simulate the executor's maxTurns resolution logic.
-	// In production this runs inside Execute(), but the logic is:
-	//   maxTurns = task.Config.MaxTurns    // caller-explicit (max_turns arg)
-	//   if maxTurns <= 0: maxTurns = profileCfg.MaxTurns  // builtin/YAML
-	//   if maxTurns <= 0: maxTurns = 6     // safety floor
-	resolve := func(callerMaxTurns, profileMaxTurns int) int {
-		maxTurns := callerMaxTurns
-		if maxTurns <= 0 {
-			maxTurns = profileMaxTurns
-		}
-		if maxTurns <= 0 {
-			maxTurns = 6
-		}
-		return maxTurns
-	}
-
+// TestResolveMaxToolCalls_Priority pins the PRODUCTION resolution chain
+// (resolveMaxToolCalls, called by Execute): caller-explicit > agent type
+// profile > 0 (no cap). There is deliberately NO safety floor: a fixed
+// default cap cannot fit both small lookups and whole-project delegations,
+// so an unset cap means unlimited and the run is bounded by the parent
+// context, optional token budget, and the repeat-call breaker instead.
+func TestResolveMaxToolCalls_Priority(t *testing.T) {
 	tests := []struct {
-		name            string
-		callerMaxTurns  int
-		profileMaxTurns int
-		want            int
+		name                string
+		callerMaxToolCalls  int
+		profileMaxToolCalls int
+		want                int
 	}{
 		{"caller overrides profile", 20, 10, 20},
 		{"profile used when caller is 0", 0, 10, 10},
-		{"safety floor when both 0", 0, 0, 6},
-		{"caller=0 profile=0 → floor", 0, 0, 6},
+		{"both unset means no cap", 0, 0, 0},
+		{"negative caller treated as unset", -5, 7, 7},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := resolve(tt.callerMaxTurns, tt.profileMaxTurns); got != tt.want {
-				t.Errorf("resolve(%d, %d) = %d, want %d", tt.callerMaxTurns, tt.profileMaxTurns, got, tt.want)
+			if got := resolveMaxToolCalls(tt.callerMaxToolCalls, tt.profileMaxToolCalls); got != tt.want {
+				t.Errorf("resolveMaxToolCalls(%d, %d) = %d, want %d", tt.callerMaxToolCalls, tt.profileMaxToolCalls, got, tt.want)
 			}
 		})
 	}
@@ -194,7 +182,7 @@ func TestSubagentExecutor_PassesTokenBudgetToAgentConfig(t *testing.T) {
 
 	// Sanity: without a TokenBudget, the same provider/tool setup must NOT
 	// trip any budget error (rules out a false positive from something else
-	// in the harness, e.g. MaxTurns).
+	// in the harness, e.g. MaxToolCalls).
 	reg2 := llm.NewSingleModelRegistry("test", "configured-model", "")
 	provider2 := &budgetReportingProvider{tokensPerTurn: 20, toolCallsRemain: 1}
 	reg2.InjectProvider("test", "", "", provider2)
@@ -1133,7 +1121,7 @@ func TestSubagentExecutor_ContextFiles_ThroughRealPool(t *testing.T) {
 
 	provider := &scriptedOutputProvider{outputs: map[int]string{0: "done"}}
 	exec := contextFilesExecutor(t, provider)
-	pool := NewSubagentPool(exec, 1, time.Second)
+	pool := NewSubagentPool(exec, time.Second)
 
 	task, err := pool.StartTask(context.Background(), "test", "review", subagent.SubagentConfig{
 		AgentType:    "general-purpose",
@@ -1183,12 +1171,91 @@ func TestSubagentExecutor_SessionIsolation_NoBreakerCarryAcrossExecutes(t *testi
 			&subagent.Task{
 				ID:     fmt.Sprintf("t%d", i),
 				Prompt: "hi",
-				Config: subagent.SubagentConfig{AgentType: "general-purpose", MaxTurns: 10, Tools: []string{"sfail"}},
+				Config: subagent.SubagentConfig{AgentType: "general-purpose", MaxToolCalls: 10, Tools: []string{"sfail"}},
 			},
 			func(subagent.TaskEvent) {})
 		if err != nil {
 			t.Fatalf("Execute #%d: unexpected error (5 identical failures alone must not trip a fresh breaker — "+
 				"isolation broken if this only fails on the 2nd iteration): %v", i, err)
 		}
+	}
+}
+
+// schemaRetryBudgetProvider drives a capped Strict-schema subagent into the
+// schema-retry loop: while tools are offered it makes one call per turn; once
+// the wrap-up request arrives (no tools) it answers with text that fails the
+// ReviewResult JSON schema. callCount lets the test pin EXACTLY which
+// attempts ran.
+type schemaRetryBudgetProvider struct {
+	callCount int
+}
+
+func (p *schemaRetryBudgetProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *schemaRetryBudgetProvider) Stream(_ context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.callCount++
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		if len(req.Tools) > 0 {
+			ch <- llm.StreamChunk{
+				ToolCalls: []models.ToolCall{{ID: fmt.Sprintf("sr-%d", p.callCount), Name: "read_file"}},
+				Stop:      "tool_calls",
+				Done:      true,
+			}
+			return
+		}
+		// Wrap-up turn: schema-invalid final output (not JSON).
+		ch <- llm.StreamChunk{Message: &models.Message{Role: models.RoleAI, Content: "definitely not json"}, Done: true, Stop: "stop"}
+	}()
+	return ch, nil
+}
+
+// TestSubagentExecutor_SchemaRetryDoesNotMultiplyToolBudget pins the tool-
+// call side of the M2-3 anti-multiplication rule: a Strict-schema subagent
+// whose attempt already spent the whole max_tool_calls budget must NOT get a
+// fresh budget for the schema-validation retry (the pre-fix bug: each retry
+// ran with the full cap again, up to (1+MaxRetries)× the budget). With
+// MaxToolCalls=4: 4 tool turns + 1 wrap-up turn = 5 provider calls, then the
+// retry must be skipped (remaining 0) instead of running a 6th.
+func TestSubagentExecutor_SchemaRetryDoesNotMultiplyToolBudget(t *testing.T) {
+	reg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	toolReg := tools.NewRegistry()
+	// read_file is in security-reviewer's allowlist; a no-op stand-in is fine
+	// — the test counts requests, not tool effects.
+	_ = toolReg.Register(models.Tool{
+		Name: "read_file",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+		Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{ToolName: "read_file", Status: models.CallStatusCompleted, Content: "ok"}, nil
+		},
+	})
+	exec := NewSubagentExecutor(reg, toolReg, nil)
+
+	provider := &schemaRetryBudgetProvider{}
+	reg.InjectProvider("test", "", "", provider)
+
+	res, err := exec.Execute(context.Background(),
+		&subagent.Task{
+			ID:     "t-budget",
+			Prompt: "review",
+			Config: subagent.SubagentConfig{AgentType: "security-reviewer", MaxToolCalls: 4, Tools: []string{"read_file"}},
+		},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil (schema failure must fail-soft, not error)", err)
+	}
+	if !strings.HasPrefix(res.Result, outputSchemaWarningPrefix) {
+		t.Fatalf("Result = %q, want the fail-soft %q prefix", res.Result, outputSchemaWarningPrefix)
+	}
+	// 4 tool turns + 1 wrap-up = 5 calls; a 6th means the retry got a fresh
+	// budget and re-ran with tools re-offered.
+	if provider.callCount != 5 {
+		t.Fatalf("provider calls = %d, want 5 (retry must NOT run once the tool-call budget is spent)", provider.callCount)
 	}
 }

@@ -20,8 +20,6 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-const defaultMaxTurns = 0 // 0 = unlimited, rely on token budget and context cancellation
-
 // defaultStreamIdleTimeout bounds the max silence BETWEEN chunks of a single
 // streaming request (not the total request time — see Agent.streamIdleTimeout).
 // Generous relative to any real provider's chunk cadence, so it only trips on
@@ -40,7 +38,7 @@ type Agent struct {
 	systemPrompt    string
 	temperature     *float64
 	maxTokens       *int
-	maxTurns        int
+	maxToolCalls    int
 	maxTokensBudget int
 	requestTimeout  time.Duration
 	// streamIdleTimeout bounds the max silence BETWEEN chunks of a single
@@ -174,10 +172,10 @@ func New(cfg AgentConfig) *Agent {
 	// Opt-in token-efficiency features (metrics/aging) from env, unless the
 	// caller set them explicitly. No-op by default.
 	applyTokenEfficiencyDefaults(&cfg)
-	maxTurns := cfg.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = defaultMaxTurns
-	}
+	// No default coercion: 0 (and any negative, which every read gates
+	// behind `> 0`) means "no cap" — the deliberate default; a positive
+	// value caps executed tool calls (see the wrap-up logic in Run).
+	maxToolCalls := cfg.MaxToolCalls
 	registry := cfg.Tools
 	if registry == nil {
 		registry = tools.NewRegistry()
@@ -208,7 +206,7 @@ func New(cfg AgentConfig) *Agent {
 		systemPrompt:        strings.TrimSpace(cfg.SystemPrompt),
 		temperature:         cfg.Temperature,
 		maxTokens:           cfg.MaxTokens,
-		maxTurns:            maxTurns,
+		maxToolCalls:        maxToolCalls,
 		maxTokensBudget:     cfg.MaxTokensBudget,
 		requestTimeout:      requestTimeout,
 		streamIdleTimeout:   defaultStreamIdleTimeout,
@@ -450,14 +448,36 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// calls, deciding admission up front on this goroutine), so no atomic is
 	// needed.
 	taskCallCount := 0
+	// toolCallsExecuted counts tool calls actually dispatched (by both the
+	// parallel and serial paths below) against a.maxToolCalls — the
+	// model-agnostic workload cap. A turn counter punishes models that issue
+	// one tool call per turn (GLM/GPT: ~1 call/turn) relative to models that
+	// batch parallel calls (Claude: 3+ calls/turn); counting calls instead
+	// gives every model the same amount of real work before the cap trips.
+	// Incremented only on the Run goroutine (the parallel path fans out
+	// execution but decides admission up front on this goroutine), so no
+	// atomic is needed — same contract as taskCallCount above.
+	toolCallsExecuted := 0
+	// wrapUp flips to true once the tool-call budget is exhausted: every
+	// subsequent request is sent with an EMPTY tool list, a wrap-up notice
+	// appended to the prompt VIEW (never the canonical runMessages — see the
+	// view assembly below), and a stripped system prompt, forcing the model
+	// to produce its final text answer. The run then ends normally through
+	// the no-tool-calls path below instead of hard-failing and discarding
+	// all work (the old "agent exceeded max turns" behavior, which left
+	// FinalOutput empty — the last turn before the cap is always a
+	// tool-call turn — so the subagent's entire output was dropped).
+	wrapUp := false
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
-		// Safety valve: hard turn cap (0 = unlimited)
-		if a.maxTurns > 0 && turn >= a.maxTurns {
-			err := fmt.Errorf("agent exceeded max turns (%d)", a.maxTurns)
-			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
-			return &RunResult{Messages: runMessages, Usage: usage}, err
+		// Safety valve: tool-call cap (0 = unlimited). Compaction/context-
+		// overflow retries (the `continue` paths below) do not consume
+		// budget — only real tool executions do.
+		if a.maxToolCalls > 0 && toolCallsExecuted >= a.maxToolCalls && !wrapUp {
+			wrapUp = true
+			a.logger.Warn("tool call budget exhausted, forcing final answer without tools",
+				"max_tool_calls", a.maxToolCalls, "executed", toolCallsExecuted, "turn", turn)
 		}
 
 		// Token budget check
@@ -501,22 +521,45 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// escalating retry, stall bookkeeping) — see maybeCompact.
 		runMessages, promptView = a.maybeCompact(ctx, sessionID, turn, runMessages, promptView, systemPrompt, emit)
 
+		// Wrap-up request shape (budget exhausted): no tools offered, a
+		// notice appended to the prompt VIEW, and a stripped system prompt.
+		// The notice deliberately never enters runMessages: the canonical
+		// history is persisted and replayed by the REPL for the REST of the
+		// session, while the budget is per-Run — a persisted "do not use
+		// tools" instruction would poison every later turn (which re-offers
+		// tools under a fresh budget). Keeping it view-only mirrors
+		// a.turnInjection's volatile-content pattern (M4-2). Re-appended
+		// every iteration because the view is rebuilt per turn (compaction
+		// retries `continue` through here too).
+		reqSystemPrompt := systemPrompt
+		var reqTools []models.Tool
+		if wrapUp {
+			promptView = append(promptView, toolBudgetExhaustedNotice(sessionID, a.maxToolCalls))
+			reqSystemPrompt = a.wrapUpSystemPrompt()
+		} else {
+			reqTools = a.tools.List()
+		}
+
 		// Phase 0 auxiliary metric: byte breakdown of the outgoing prompt.
 		// Captured before the request; combined with the provider's real token
 		// counts into one per-turn record once the response arrives.
 		var pendingContext ContextBytes
 		if a.metrics != nil {
-			pendingContext = computeContextBytes(promptView, systemPrompt, a.toolSchemaBytes())
+			metricPrompt := systemPrompt
+			if wrapUp {
+				metricPrompt = reqSystemPrompt
+			}
+			pendingContext = computeContextBytes(promptView, metricPrompt, a.toolSchemaBytes())
 		}
 
 		req := llm.ChatRequest{
 			Model:           a.model,
 			Messages:        promptView,
-			Tools:           a.tools.List(),
+			Tools:           reqTools,
 			ReasoningEffort: a.reasoningEffort,
 			Temperature:     a.temperature,
 			MaxTokens:       a.maxTokens,
-			SystemPrompt:    systemPrompt,
+			SystemPrompt:    reqSystemPrompt,
 			ImageDetail:     a.imageDetail,
 		}
 
@@ -648,6 +691,18 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// output truncation, so just warn and end the run below.
 				a.logger.Warn("output truncated (max_tokens/length) and no tool calls; compaction cannot help output truncation", "turn", turn, "stop_reason", stopReason)
 			}
+			if wrapUp && strings.TrimSpace(assistantMessage.Content) == "" {
+				// The forced tool-less wrap-up turn produced NOTHING: every
+				// executed tool call's work would be silently discarded behind
+				// a "successful" run with an empty FinalOutput. Surface a loud
+				// budget error instead so the parent model can see the failure
+				// and react (retry, narrower delegation, ...). A normal empty
+				// final turn (no wrap-up) keeps its historical nil-error
+				// behavior — only wrap-up emptiness means work was lost.
+				err := fmt.Errorf("agent exceeded tool call budget (%d) and the wrap-up turn produced no output", a.maxToolCalls)
+				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
+				return &RunResult{Messages: runMessages, Usage: usage}, err
+			}
 			emit(AgentEvent{
 				Type:      AgentEventEnd,
 				MessageID: aiMessageID,
@@ -659,6 +714,26 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				FinalOutput: assistantMessage.Content,
 				Usage:       usage,
 			}, nil
+		}
+
+		if wrapUp {
+			// A provider returned tool calls despite being offered none — only
+			// possible for a misbehaving backend (the len(toolCalls)==0 branch
+			// above already returned, so calls are non-empty here). Every
+			// tool_use ID on the assistant message above still needs a
+			// matching tool_result for the persisted history to stay
+			// replayable, so synthesize refusals, then end the run with
+			// whatever text came alongside them (graceful when there is any,
+			// error only when there is nothing at all to hand back).
+			runMessages = appendSynthesizedRefusals(runMessages, sessionID, toolCalls,
+				fmt.Sprintf("not executed: tool call budget (%d) exhausted", a.maxToolCalls))
+			if strings.TrimSpace(text) == "" {
+				err := fmt.Errorf("agent exceeded tool call budget (%d)", a.maxToolCalls)
+				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
+				return &RunResult{Messages: runMessages, Usage: usage}, err
+			}
+			emit(AgentEvent{Type: AgentEventEnd, MessageID: aiMessageID, Text: text, Usage: cloneUsage(usage)})
+			return &RunResult{Messages: runMessages, FinalOutput: text, Usage: usage}, nil
 		}
 
 		// Parent-budget passthrough (plan §M2.2 carry-forward): compute the
@@ -734,6 +809,13 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			overCap := make([]bool, len(toolCalls))
 			for i, call := range toolCalls {
 				overCap[i] = taskCallOverCap(&taskCallCount, call)
+			}
+			// Budget counting happens here, on this goroutine, before fan-out:
+			// only admitted calls (not task-cap refusals) execute and count.
+			for i := range toolCalls {
+				if !overCap[i] {
+					toolCallsExecuted++
+				}
 			}
 
 			// When the parent runs under a token budget, split the remaining
@@ -841,6 +923,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// reaches the subagent pool's StartTask.
 				result = synthesizeTaskCapResult(call)
 			} else {
+				toolCallsExecuted++
 				result = a.runOneTool(dispatchCtx, sessionID, call)
 			}
 
@@ -939,4 +1022,42 @@ func (a *Agent) closeEvents() {
 	}
 	close(a.events)
 	a.eventsClosed = true
+}
+
+// toolBudgetExhaustedNotice is the RoleHuman message appended to the prompt
+// VIEW (never the canonical runMessages — see the wrap-up block in Run) when
+// a run's tool-call budget (AgentConfig.MaxToolCalls) is exhausted, right
+// before the wrap-up request that is sent without tools. It carries
+// metaAgentInjected like the breaker's hints and lands in the same safe
+// position they use — after the batch's tool results, never between an
+// assistant tool_calls message and its results (M1-7).
+func toolBudgetExhaustedNotice(sessionID string, maxToolCalls int) models.Message {
+	return models.Message{
+		ID:        newMessageID("human"),
+		SessionID: sessionID,
+		Role:      models.RoleHuman,
+		Metadata:  map[string]string{metaAgentInjected: "true"},
+		Content: fmt.Sprintf(
+			"You have used your tool call limit for this task (%d calls). "+
+				"Do not attempt any further tool calls. Give your final answer now: "+
+				"summarize what you accomplished, the key results or findings, and "+
+				"anything you did not get to complete.",
+			maxToolCalls),
+		CreatedAt: time.Now().UTC(),
+	}
+}
+
+// wrapUpSystemPrompt builds the system prompt for the forced tool-less
+// wrap-up request(s): the base a.systemPrompt (which already carries any
+// applied skill body and a Strict OutputSchema's JSON instruction) plus an
+// explicit no-tools line — but NONE of BuildSystemPrompt's layers (file-op
+// rule, tool recommendations, delegation catalog, plan-mode "call
+// exit_plan_mode"), all of which instruct tool use the request cannot back
+// up and would contradict the wrap-up notice.
+func (a *Agent) wrapUpSystemPrompt() string {
+	extra := "You have no tools available for this request. Do not attempt tool calls; give your final answer now."
+	if a.systemPrompt == "" {
+		return extra
+	}
+	return a.systemPrompt + "\n\n" + extra
 }

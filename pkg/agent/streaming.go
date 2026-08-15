@@ -488,9 +488,9 @@ func newAgentError(err error) *AgentError {
 		agentErr.Code = "deadline_exceeded"
 		agentErr.Suggestion = "Retry with a longer timeout or lower max_tokens."
 		agentErr.Retryable = true
-	case strings.Contains(strings.ToLower(err.Error()), "max turns"):
-		agentErr.Code = "max_turns_exceeded"
-		agentErr.Suggestion = "Increase max turns or simplify the request."
+	case strings.Contains(strings.ToLower(err.Error()), "tool call budget"):
+		agentErr.Code = "tool_call_budget_exceeded"
+		agentErr.Suggestion = "Increase max_tool_calls or simplify the request."
 	case strings.Contains(strings.ToLower(err.Error()), "token budget"):
 		agentErr.Code = "token_budget_exceeded"
 		agentErr.Suggestion = "Increase token budget or simplify the request."

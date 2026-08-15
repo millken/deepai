@@ -28,8 +28,8 @@ func TestTaskToolCompleted(t *testing.T) {
 			if cfg.AgentType != "bash" {
 				t.Fatalf("cfg.AgentType = %s, want bash", cfg.AgentType)
 			}
-			if cfg.MaxTurns != 3 {
-				t.Fatalf("cfg.MaxTurns = %d, want 3", cfg.MaxTurns)
+			if cfg.MaxToolCalls != 3 {
+				t.Fatalf("cfg.MaxToolCalls = %d, want 3", cfg.MaxToolCalls)
 			}
 			return &subagent.Task{ID: "task-1"}, nil
 		},
@@ -496,5 +496,103 @@ func TestTaskTool_AdvertisesAgents(t *testing.T) {
 	if !strings.Contains(withAgents.Description, "code-reviewer — Reviews code") ||
 		!strings.Contains(withAgents.Description, "devops — Deploys things") {
 		t.Fatalf("description should advertise agents: %q", withAgents.Description)
+	}
+}
+
+// TestTaskTool_MaxToolCallsArg verifies the renamed argument passes through
+// and takes precedence over the deprecated max_turns alias.
+func TestTaskTool_MaxToolCallsArg(t *testing.T) {
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			if cfg.MaxToolCalls != 9 {
+				t.Fatalf("cfg.MaxToolCalls = %d, want 9", cfg.MaxToolCalls)
+			}
+			return &subagent.Task{ID: "task-1"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+
+	// max_tool_calls on its own.
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "call-1",
+		Name: "task",
+		Arguments: map[string]any{
+			"description":    "run shell",
+			"prompt":         "echo hi",
+			"max_tool_calls": float64(9),
+		},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+
+	// Both keys: the new one wins.
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "call-2",
+		Name: "task",
+		Arguments: map[string]any{
+			"description":    "run shell",
+			"prompt":         "echo hi",
+			"max_tool_calls": float64(9),
+			"max_turns":      float64(3),
+		},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+}
+
+// TestTaskTool_ExplicitZeroMaxToolCallsWins: an explicit max_tool_calls: 0
+// (documented as "no cap") must not be silently overridden by a co-present
+// legacy max_turns value — the legacy key is read only when the new key is
+// absent, mirroring the YAML loader's precedence.
+func TestTaskTool_ExplicitZeroMaxToolCallsWins(t *testing.T) {
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			if cfg.MaxToolCalls != 0 {
+				t.Fatalf("cfg.MaxToolCalls = %d, want 0 (explicit no-cap must win over legacy max_turns)", cfg.MaxToolCalls)
+			}
+			return &subagent.Task{ID: "task-1"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "call-1",
+		Name: "task",
+		Arguments: map[string]any{
+			"description":    "run shell",
+			"prompt":         "echo hi",
+			"max_tool_calls": float64(0),
+			"max_turns":      float64(5),
+		},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+
+	// Legacy-only still applies (key absent → alias read).
+	legacy := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			if cfg.MaxToolCalls != 5 {
+				t.Fatalf("cfg.MaxToolCalls = %d, want 5 (legacy alias applies when the new key is absent)", cfg.MaxToolCalls)
+			}
+			return &subagent.Task{ID: "task-2"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+	if _, err := legacy.Handler(context.Background(), models.ToolCall{
+		ID:   "call-2",
+		Name: "task",
+		Arguments: map[string]any{
+			"description": "run shell",
+			"prompt":      "echo hi",
+			"max_turns":   float64(5),
+		},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
 	}
 }

@@ -93,7 +93,7 @@ func TestStreamIdleWatchdog_ToolArgumentProgressKeepsStreamAlive(t *testing.T) {
 	}
 
 	provider := &toolArgProgressProvider{fragments: fragments, gap: gap, toolName: "write_file", toolCallID: "call_1"}
-	a := New(AgentConfig{LLMProvider: provider, Tools: newRegistryWithNoOpTool("write_file"), MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: provider, Tools: newRegistryWithNoOpTool("write_file"), MaxToolCalls: 5})
 	a.streamIdleTimeout = idleWindow
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -114,7 +114,7 @@ func TestStreamIdleWatchdog_ToolArgumentProgressKeepsStreamAlive(t *testing.T) {
 // turn has empty Content.
 func TestStreamIdleWatchdog_ToolArgumentOnlyStreamNoStrayText(t *testing.T) {
 	provider := &toolArgProgressProvider{fragments: 5, gap: 5 * time.Millisecond, toolName: "write_file", toolCallID: "call_1"}
-	a := New(AgentConfig{LLMProvider: provider, Tools: newRegistryWithNoOpTool("write_file"), MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: provider, Tools: newRegistryWithNoOpTool("write_file"), MaxToolCalls: 5})
 	a.streamIdleTimeout = 2 * time.Second
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -171,7 +171,7 @@ func TestStreamIdleWatchdog_SilentAfterProgressStillTimesOut(t *testing.T) {
 		select {}
 	}()
 	provider := progressThenHangProvider{ch: ch}
-	a := New(AgentConfig{LLMProvider: provider, MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: provider, MaxToolCalls: 5})
 	a.streamIdleTimeout = idleWindow
 
 	type outcome struct {

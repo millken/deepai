@@ -182,7 +182,7 @@ func TestSubagentExecutor_ProjectYAMLWinsOverPoolDefaults(t *testing.T) {
 
 	exec, provider := profileTestExecutor(t)
 	exec.WithWorkDir(dir)
-	pool := NewSubagentPool(exec, 2, 30*time.Second)
+	pool := NewSubagentPool(exec, 30*time.Second)
 
 	task, err := pool.StartTask(context.Background(), "d", "hi", subagent.SubagentConfig{AgentType: "general-purpose"})
 	if err != nil {
@@ -196,8 +196,8 @@ func TestSubagentExecutor_ProjectYAMLWinsOverPoolDefaults(t *testing.T) {
 		t.Fatalf("task status = %s (%s), want completed", done.Status, done.Error)
 	}
 
-	if done.Config.MaxTurns != 0 {
-		t.Fatalf("task.Config.MaxTurns = %d, want 0 so the profile's max_turns decides (pool must inject no per-type default)", done.Config.MaxTurns)
+	if done.Config.MaxToolCalls != 0 {
+		t.Fatalf("task.Config.MaxToolCalls = %d, want 0 so the profile's max_turns decides (pool must inject no per-type default)", done.Config.MaxToolCalls)
 	}
 	if len(done.Config.Tools) != 0 {
 		t.Fatalf("task.Config.Tools = %v, want empty so the profile's tools decide", done.Config.Tools)
@@ -297,17 +297,17 @@ func TestSubagentExecutor_AgentMDModelResolves(t *testing.T) {
 
 // TestBuiltinAgentTypes_DocumentEditorProfile guards the document-editor
 // profile's two load-bearing knobs (design docs/DOCX_TOOLS_DESIGN.md §6/§5.8):
-// MaxTurns must be an explicit 30 (a zero value gets floored to 15 by
-// subagent.go's safety net, which only covers four or five 2-3-turn polishing
-// chunks), and DefaultTools must include both docx tools or the profile can
-// never touch a document at all.
+// MaxToolCalls must be an explicit 30 (a deliberate cap — 0 would mean no cap
+// at all — sized at ~3 calls per polishing chunk for roughly 10 chunks), and
+// DefaultTools must include both docx tools or the profile can never touch a
+// document at all.
 func TestBuiltinAgentTypes_DocumentEditorProfile(t *testing.T) {
 	cfg, ok := BuiltinAgentTypes[AgentTypeDocEditor]
 	if !ok {
 		t.Fatal("BuiltinAgentTypes[document-editor] is not registered")
 	}
-	if cfg.MaxTurns != 30 {
-		t.Fatalf("document-editor MaxTurns = %d, want 30 (0 would be floored to 15 by the subagent safety net)", cfg.MaxTurns)
+	if cfg.MaxToolCalls != 30 {
+		t.Fatalf("document-editor MaxToolCalls = %d, want 30 (a deliberate cap; 0 would mean unlimited)", cfg.MaxToolCalls)
 	}
 	want := map[string]bool{"docx_read": false, "docx_edit": false, "docx_format": false}
 	for _, name := range cfg.DefaultTools {

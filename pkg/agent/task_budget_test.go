@@ -107,7 +107,7 @@ func runBudgetCase(t *testing.T, parentBudget, usageTotalTokens int, explicitBud
 			hasExplicitBudget:   hasExplicit,
 		},
 		Tools:           reg,
-		MaxTurns:        5,
+		MaxToolCalls:    5,
 		MaxTokensBudget: parentBudget,
 	})
 
@@ -254,7 +254,7 @@ func TestParentBudgetPassthrough_ParallelBatchBothConfigsCarryBudget(t *testing.
 	a := New(AgentConfig{
 		LLMProvider:     &twoTaskCallBudgetProvider{usageTotalTokens: 400},
 		Tools:           reg,
-		MaxTurns:        5,
+		MaxToolCalls:    5,
 		MaxTokensBudget: 1000,
 	})
 

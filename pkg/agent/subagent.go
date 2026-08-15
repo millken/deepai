@@ -121,23 +121,17 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		systemPrompt = profileCfg.SystemPrompt
 	}
 
-	// MaxTurns priority: caller-explicit (max_turns arg) > agent type profile
-	// (builtin/YAML/MD) > safety floor. The pool contributes nothing here — it
+	// MaxToolCalls priority: caller-explicit (max_tool_calls arg) > agent type
+	// profile (builtin/YAML/MD). The pool contributes nothing here — it
 	// deliberately injects no per-type defaults (see Pool.resolveConfig), so a
-	// profile's MaxTurns can no longer be shadowed for the two types the pool
-	// used to special-case.
-	maxTurns := task.Config.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = profileCfg.MaxTurns
-	}
-	if maxTurns <= 0 {
-		// Last resort safety floor: a profile with no MaxTurns (e.g. builtin
-		// general-purpose) must still be bounded. 15 lets a delegated subagent
-		// do meaningful multi-file work (explore + edit + verify) without
-		// hitting the wall mid-task, which at the old 6 turned most delegations
-		// into wasted tokens — the parent had to redo everything from scratch.
-		maxTurns = 15
-	}
+	// profile's value can never be shadowed. 0 (the common case) means NO
+	// workload cap by design: a fixed default cannot fit both small tasks and
+	// whole-project reviews, so the run is bounded by the parent context, the
+	// optional token budget, context compaction, and the repeat-call breaker
+	// instead — the same shape as Claude-style subagents. When a cap IS set,
+	// react.go counts executed tool calls (model-agnostic) and gracefully
+	// wraps up with a final no-tools answer on exhaustion.
+	maxToolCalls := resolveMaxToolCalls(task.Config.MaxToolCalls, profileCfg.MaxToolCalls)
 
 	// Inject OutputSchema prompt into system prompt when available
 	if profileCfg.OutputSchema != nil && profileCfg.OutputSchema.Prompt != "" {
@@ -171,22 +165,24 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// constructs its fresh agent (agents are single-use, react.go's
 	// a.started guard) from the EXACT same config as the original run —
 	// duplicating the struct literal at each retry call site would risk the
-	// two drifting apart over time. tokenBudget is a parameter (not always
-	// task.Config.TokenBudget) so a retry can be given the REMAINING budget
-	// instead of the full budget again (see the retry loop below).
+	// two drifting apart over time. tokenBudget/toolCallBudget are parameters
+	// (not always task.Config.TokenBudget / maxToolCalls) so a retry can be
+	// given the REMAINING budget instead of the full budget again (see the
+	// retry loop below — the same anti-multiplication rule M2-3 applied to
+	// TokenBudget).
 
-	buildAgentConfig := func(tokenBudget int) AgentConfig {
+	buildAgentConfig := func(tokenBudget, toolCallBudget int) AgentConfig {
 		return AgentConfig{
-			LLMProvider: provider,
-			Tools:       registry,
-			MaxTurns:    maxTurns,
-			Model:       modelName,
-			MaxTokens:   e.maxTokens,
-			Temperature: &profileTemperature,
-			Sandbox:     e.sandbox,
-			// runCtx (built by Pool.runTask via context.WithTimeout) always carries
-			// a deadline, so react.go's requestTimeout-from-bare-ctx branch never
-			// fires here — this value only feeds TimeoutError.Duration reporting.
+			LLMProvider:  provider,
+			Tools:        registry,
+			MaxToolCalls: toolCallBudget,
+			Model:        modelName,
+			MaxTokens:    e.maxTokens,
+			Temperature:  &profileTemperature,
+			Sandbox:      e.sandbox,
+			// runCtx (built by Pool.runTask) carries a deadline only when a
+			// task- or pool-level timeout is configured; with none, this value
+			// only feeds TimeoutError.Duration reporting.
 			RequestTimeout: task.Config.Timeout,
 			ContextWindow:  e.contextWindow,
 			SystemPrompt:   systemPrompt,
@@ -208,8 +204,8 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// same emit() pattern as the original run, and blocks on <-eventsDone
 	// before returning — every attempt (initial and each retry) needs this
 	// identically, since Events() is per-Agent-instance.
-	runOnce := func(msgs []models.Message, tokenBudget int) (*RunResult, error) {
-		runAgent := New(buildAgentConfig(tokenBudget))
+	runOnce := func(msgs []models.Message, tokenBudget, toolCallBudget int) (*RunResult, error) {
+		runAgent := New(buildAgentConfig(tokenBudget, toolCallBudget))
 		eventsDone := make(chan struct{})
 		go func() {
 			defer close(eventsDone)
@@ -253,7 +249,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 			Content:   seedContent,
 			CreatedAt: time.Now().UTC(),
 		},
-	}, task.Config.TokenBudget)
+	}, task.Config.TokenBudget, maxToolCalls)
 	if err != nil {
 		// H1: Run() populates Usage on every error path it can (max turns,
 		// token budget exceeded, stream/context errors, ...), so dropping it
@@ -291,14 +287,14 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		if valErr != nil {
 			for retry := 0; retry < profileCfg.OutputSchema.MaxRetries; retry++ {
 				// M2-3 MEDIUM (budget multiplication): a retry must draw down
-				// the SAME task-level budget, not get a fresh one — otherwise
-				// N retries could spend up to N times task.Config.TokenBudget.
-				// Pass the remaining allowance (original minus everything
-				// spent so far); once nothing remains, stop retrying instead
-				// of running one more attempt with a bogus budget (0 means
-				// *unlimited* to AgentConfig, so we must never pass 0 here to
-				// mean "none left") and fall through to the fail-soft return
-				// below with whatever output we already have.
+				// the SAME task-level budgets, not get fresh ones — otherwise
+				// N retries could spend up to N times task.Config.TokenBudget
+				// or maxToolCalls. Pass the remaining allowance (original
+				// minus everything spent so far); once nothing remains, stop
+				// retrying instead of running one more attempt with a bogus
+				// budget (0 means *unlimited* to AgentConfig, so we must never
+				// pass 0 here to mean "none left") and fall through to the
+				// fail-soft return below with whatever output we already have.
 				retryBudget := task.Config.TokenBudget
 				if task.Config.TokenBudget > 0 {
 					spent := 0
@@ -310,6 +306,21 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 						break
 					}
 					retryBudget = remaining
+				}
+				// Same rule for the tool-call budget: count the tool-result
+				// messages the last attempt appended (every executed call —
+				// and every synthesized refusal — produces exactly one), give
+				// the retry only what's left, and stop retrying when the
+				// budget is already spent. Without this, a capped Strict-
+				// schema subagent could execute up to (1+MaxRetries)× its
+				// tool-call budget across attempts.
+				retryToolCalls := maxToolCalls
+				if maxToolCalls > 0 {
+					remaining := maxToolCalls - countToolResultMessages(result.Messages)
+					if remaining <= 0 {
+						break
+					}
+					retryToolCalls = remaining
 				}
 
 				retryMsgs := appendParseError(result.Messages, result.FinalOutput, valErr)
@@ -330,7 +341,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 					Message:     "retrying: output failed schema validation",
 				})
 
-				retryResult, retryErr := runOnce(retryMsgs, retryBudget)
+				retryResult, retryErr := runOnce(retryMsgs, retryBudget, retryToolCalls)
 				if retryResult != nil {
 					totalUsage = sumUsage(totalUsage, retryResult.Usage)
 				}
@@ -413,8 +424,31 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}, nil
 }
 
-// unknownAgentTypeError builds the rejection for an agent_type nothing defines.
-// It lists the types that DO resolve so the model can correct itself on the next
+// resolveMaxToolCalls is the MaxToolCalls resolution chain: caller-explicit
+// (task tool's max_tool_calls arg) > agent-type profile (builtin/YAML/MD) >
+// 0 (no cap). A named function (not inline in Execute) so tests pin the
+// production chain rather than a local copy of it.
+func resolveMaxToolCalls(caller, profile int) int {
+	if caller > 0 {
+		return caller
+	}
+	return profile
+}
+
+// countToolResultMessages counts RoleTool messages in a run's history — one
+// per executed tool call (and per synthesized refusal) — which is how the
+// schema-retry loop derives the tool-call budget an attempt already spent.
+func countToolResultMessages(messages []models.Message) int {
+	n := 0
+	for _, msg := range messages {
+		if msg.Role == models.RoleTool {
+			n++
+		}
+	}
+	return n
+}
+
+// unknownAgentTypeError builds the rejection for an agent_type nothing defines.// It lists the types that DO resolve so the model can correct itself on the next
 // call instead of retrying the same bad name — the same self-correction the
 // unmatched-tools-selector error offers. Enumeration touches disk, which is fine
 // on this error-only path. Any load problems collected while resolving the type
@@ -442,12 +476,13 @@ func (e *SubagentExecutor) unknownAgentTypeError(t AgentType, problems []string)
 // that matters). Tests assert this prefix rather than an error string.
 const outputSchemaWarningPrefix = "WARNING: output failed schema validation: "
 
-// NewSubagentPool creates a pool with a SubagentExecutor.
+// NewSubagentPool creates a pool with a SubagentExecutor. The pool has no
+// local concurrency cap — see subagent.NewPool for why the provider's own
+// rate limiting governs parallelism.
 // Chain WithContextWindow on the result of NewSubagentExecutor if needed.
-func NewSubagentPool(executor *SubagentExecutor, maxConcurrent int, timeout time.Duration) *subagent.Pool {
+func NewSubagentPool(executor *SubagentExecutor, timeout time.Duration) *subagent.Pool {
 	return subagent.NewPool(executor, subagent.PoolConfig{
-		MaxConcurrent: maxConcurrent,
-		Timeout:       timeout,
+		Timeout: timeout,
 	})
 }
 

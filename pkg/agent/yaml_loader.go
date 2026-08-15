@@ -10,10 +10,12 @@ import (
 )
 
 // yamlAgentConfig represents the YAML file structure for agent definitions.
-// MaxTurns and Temperature are pointers so an explicit zero (`max_turns: 0`,
-// `temperature: 0`) is distinguishable from the key being absent — see
-// loadAgentYAML's use of maxTurnsSet/temperatureSet on the resulting
-// AgentTypeConfig.
+// MaxToolCalls and Temperature are pointers so an explicit zero
+// (`max_tool_calls: 0`, `temperature: 0`) is distinguishable from the key
+// being absent — see loadAgentYAML's use of maxToolCallsSet/temperatureSet on
+// the resulting AgentTypeConfig. LegacyMaxTurns reads the deprecated
+// `max_turns` key so pre-rename configs keep working; max_tool_calls wins
+// when both are present.
 type yamlAgentConfig struct {
 	Type             string   `yaml:"type"`
 	Name             string   `yaml:"name"`
@@ -21,7 +23,8 @@ type yamlAgentConfig struct {
 	SystemPrompt     string   `yaml:"system_prompt"`
 	SystemPromptFile string   `yaml:"system_prompt_file"`
 	DefaultTools     []string `yaml:"tools"`
-	MaxTurns         *int     `yaml:"max_turns"`
+	MaxToolCalls     *int     `yaml:"max_tool_calls"`
+	LegacyMaxTurns   *int     `yaml:"max_turns"`
 	Temperature      *float64 `yaml:"temperature"`
 	Model            string   `yaml:"model"`
 }
@@ -65,9 +68,12 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 		DefaultTools: yc.DefaultTools,
 		Model:        yc.Model,
 	}
-	if yc.MaxTurns != nil {
-		cfg.MaxTurns = *yc.MaxTurns
-		cfg.maxTurnsSet = true
+	if yc.MaxToolCalls != nil {
+		cfg.MaxToolCalls = *yc.MaxToolCalls
+		cfg.maxToolCallsSet = true
+	} else if yc.LegacyMaxTurns != nil {
+		cfg.MaxToolCalls = *yc.LegacyMaxTurns
+		cfg.maxToolCallsSet = true
 	}
 	if yc.Temperature != nil {
 		cfg.Temperature = *yc.Temperature
@@ -136,16 +142,16 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig, baseIsBuiltin 
 	if len(override.DefaultTools) > 0 {
 		result.DefaultTools = append([]string(nil), override.DefaultTools...)
 	}
-	// override.MaxTurns/Temperature > 0 catches a positive explicit value;
-	// maxTurnsSet/temperatureSet additionally catches an explicit zero, which
-	// is otherwise indistinguishable from "absent" and would leave the base's
-	// value stuck. The flags are set on result too (not just checked on
+	// override.MaxToolCalls/Temperature > 0 catches a positive explicit value;
+	// maxToolCallsSet/temperatureSet additionally catches an explicit zero,
+	// which is otherwise indistinguishable from "absent" and would leave the
+	// base's value stuck. The flags are set on result too (not just checked on
 	// override) so a further merge layer that reuses this result as ITS
 	// override still sees the value as explicit, instead of resurrecting a
 	// stale base value.
-	if override.MaxTurns > 0 || override.maxTurnsSet {
-		result.MaxTurns = override.MaxTurns
-		result.maxTurnsSet = true
+	if override.MaxToolCalls > 0 || override.maxToolCallsSet {
+		result.MaxToolCalls = override.MaxToolCalls
+		result.maxToolCallsSet = true
 	}
 	if override.Temperature > 0 || override.temperatureSet {
 		result.Temperature = override.Temperature

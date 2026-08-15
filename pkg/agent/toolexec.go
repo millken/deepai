@@ -383,22 +383,33 @@ func (b *toolBatchState) appendRemaining(results []models.ToolResult) {
 	}
 }
 
+// appendSynthesizedRefusals appends synthesized "not executed" placeholder
+// results for calls that were never dispatched (circuit-breaker abort,
+// budget-exhausted wrap-up refusal). One implementation for every refusal
+// site so the tool_use/tool_result pairing invariant lives in one place; the
+// per-site reason string is the only difference.
+func appendSynthesizedRefusals(runMessages []models.Message, sessionID string, calls []models.ToolCall, reason string) []models.Message {
+	for _, call := range calls {
+		synthetic := models.ToolResult{
+			CallID:      call.ID,
+			ToolName:    call.Name,
+			Status:      models.CallStatusFailed,
+			Error:       reason,
+			CompletedAt: time.Now().UTC(),
+		}
+		runMessages = appendToolResultMessage(runMessages, sessionID, synthetic)
+	}
+	return runMessages
+}
+
 // appendSynthesizedFailures appends synthesized "not executed" placeholder
 // results for the rest of a fatal SERIAL batch. Unlike appendRemaining, the
 // serial path never executed these calls, so there are no real results —
 // only a placeholder is needed to keep every tool_use ID paired with a
 // tool_result.
 func (b *toolBatchState) appendSynthesizedFailures(remaining []models.ToolCall) {
-	for _, call := range remaining {
-		synthetic := models.ToolResult{
-			CallID:      call.ID,
-			ToolName:    call.Name,
-			Status:      models.CallStatusFailed,
-			Error:       "not executed: batch aborted by circuit breaker",
-			CompletedAt: time.Now().UTC(),
-		}
-		b.runMessages = appendToolResultMessage(b.runMessages, b.sessionID, synthetic)
-	}
+	b.runMessages = appendSynthesizedRefusals(b.runMessages, b.sessionID, remaining,
+		"not executed: batch aborted by circuit breaker")
 }
 
 // flushPendingHints appends any breaker hints accumulated so far to

@@ -49,7 +49,7 @@ type AgentConfig struct {
 	Tools           *tools.Registry
 	PresentFiles    *tools.PresentFileRegistry
 	AgentType       AgentType
-	MaxTurns        int // safety valve: hard cap on turns (0 = unlimited)
+	MaxToolCalls    int // safety valve: cap on executed tool calls (0 = unlimited); on exhaustion the run wraps up with a final no-tools answer instead of failing
 	MaxTokensBudget int // total token budget across all turns (0 = unlimited)
 	Model           string
 	ReasoningEffort string

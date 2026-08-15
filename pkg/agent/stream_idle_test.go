@@ -48,7 +48,7 @@ func (idleHangProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan
 // hang into an observable, clean test failure instead of hanging the whole
 // test binary.
 func TestStreamIdleWatchdog_FiresOnHungStream(t *testing.T) {
-	a := New(AgentConfig{LLMProvider: idleHangProvider{}, MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: idleHangProvider{}, MaxToolCalls: 5})
 	a.streamIdleTimeout = 50 * time.Millisecond
 
 	type outcome struct {
@@ -107,7 +107,7 @@ func (p *idleGapProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-ch
 }
 
 func TestStreamIdleWatchdog_NormalGapsComplete(t *testing.T) {
-	a := New(AgentConfig{LLMProvider: &idleGapProvider{}, MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: &idleGapProvider{}, MaxToolCalls: 5})
 	a.streamIdleTimeout = 200 * time.Millisecond // gaps of 10ms are well under this
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -156,7 +156,7 @@ func (deadlineAwareChattyProvider) Stream(ctx context.Context, req llm.ChatReque
 func TestStreamIdleWatchdog_ComposesWithRequestTimeout(t *testing.T) {
 	a := New(AgentConfig{
 		LLMProvider:    deadlineAwareChattyProvider{},
-		MaxTurns:       5,
+		MaxToolCalls:   5,
 		RequestTimeout: 100 * time.Millisecond,
 	})
 	// Leave a.streamIdleTimeout at its (generous, 2-minute) default — chunks
@@ -219,7 +219,7 @@ func (errThenHangProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-c
 // RED signature (today): Run blocks forever inside the synchronous drain,
 // so the test-level 1s guard below fires instead of observing a real return.
 func TestStreamIdleWatchdog_ChunkErrorDrainDoesNotBlockRun(t *testing.T) {
-	a := New(AgentConfig{LLMProvider: errThenHangProvider{}, MaxTurns: 5})
+	a := New(AgentConfig{LLMProvider: errThenHangProvider{}, MaxToolCalls: 5})
 
 	done := make(chan error, 1)
 	go func() {

@@ -23,16 +23,17 @@ type AgentOption struct {
 }
 
 func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
-	desc := "Spawn a bounded subagent, stream lifecycle updates, and return its final result. Multiple task calls issued in one turn run concurrently (bounded by the pool)."
+	desc := "Spawn a subagent, stream lifecycle updates, and return its final result. Multiple task calls issued in one turn run concurrently."
 	if extras := formatAgentOptions(agents); extras != "" {
 		desc += " " + extras
 	}
 	return models.Tool{
 		Name: "task",
 		// ParallelSafe: a batch of task calls issued in one assistant turn is
-		// safe to run concurrently. Concurrency is bounded by the pool's
-		// semaphore (pkg/subagent/pool.go), each subagent gets its own
-		// isolated tool registry/agent instance, and this handler only calls
+		// safe to run concurrently. There is no local concurrency limiter
+		// (pkg/subagent/pool.go documents why — the provider's own rate
+		// limiting governs parallelism); each subagent gets its own isolated
+		// tool registry/agent instance, and this handler only calls
 		// StartTask+Wait — it holds no shared mutable state of its own that
 		// concurrent invocations could race on.
 		//
@@ -50,13 +51,14 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"description":   map[string]any{"type": "string", "description": "Short description of the delegated task"},
-				"prompt":        map[string]any{"type": "string", "description": "Detailed instructions for the subagent"},
-				"subagent_type": map[string]any{"type": "string", "description": "Deprecated: use agent_type instead"},
-				"agent_type":    map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
-				"model":         map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
-				"max_turns":     map[string]any{"type": "integer", "description": "Optional max turns override"},
-				"token_budget":  map[string]any{"type": "integer", "description": "Optional max total tokens for this subagent; 0 = unlimited"},
+				"description":    map[string]any{"type": "string", "description": "Short description of the delegated task"},
+				"prompt":         map[string]any{"type": "string", "description": "Detailed instructions for the subagent"},
+				"subagent_type":  map[string]any{"type": "string", "description": "Deprecated: use agent_type instead"},
+				"agent_type":     map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
+				"model":          map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
+				"max_tool_calls": map[string]any{"type": "integer", "description": "Optional cap on the number of tool calls this subagent may execute (0 = no cap). On exhaustion the subagent wraps up with a final answer instead of failing."},
+				"max_turns":      map[string]any{"type": "integer", "description": "Deprecated alias for max_tool_calls"},
+				"token_budget":   map[string]any{"type": "integer", "description": "Optional max total tokens for this subagent; 0 = unlimited"},
 				"context_files": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
@@ -72,7 +74,16 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 
 			description, _ := call.Arguments["description"].(string)
 			prompt, _ := call.Arguments["prompt"].(string)
-			maxTurns := intFromArg(call.Arguments["max_turns"])
+			// Key presence (not a 0 sentinel) decides the legacy fallback: an
+			// explicit max_tool_calls — including an explicit 0 ("no cap") —
+			// always wins; max_turns is read only when the new key is absent,
+			// mirroring the YAML loader's precedence.
+			maxToolCalls := 0
+			if raw, ok := call.Arguments["max_tool_calls"]; ok && raw != nil {
+				maxToolCalls = intFromArg(raw)
+			} else if raw, ok := call.Arguments["max_turns"]; ok && raw != nil {
+				maxToolCalls = intFromArg(raw)
+			}
 			model, _ := call.Arguments["model"].(string)
 			tokenBudget := intFromArg(call.Arguments["token_budget"])
 
@@ -139,7 +150,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 
 			task, err := pool.StartTask(ctx, strings.TrimSpace(description), strings.TrimSpace(prompt), subagent.SubagentConfig{
 				AgentType:    agentType,
-				MaxTurns:     maxTurns,
+				MaxToolCalls: maxToolCalls,
 				Model:        strings.TrimSpace(model),
 				TokenBudget:  tokenBudget,
 				ContextFiles: contextFiles,

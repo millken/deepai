@@ -156,9 +156,9 @@ func TestTaskTool_ParallelBatch_OverlapsSubagents(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &twoTaskCallProvider{},
-		Tools:       reg,
-		MaxTurns:    5,
+		LLMProvider:  &twoTaskCallProvider{},
+		Tools:        reg,
+		MaxToolCalls: 5,
 	})
 
 	start := time.Now()

@@ -39,7 +39,7 @@ func TestMergeConfig(t *testing.T) {
 		SystemPrompt: "You are a coder.",
 		DefaultTools: []string{"bash", "read_file"},
 		Temperature:  0.1,
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 	}
 
 	t.Run("yaml overrides system prompt", func(t *testing.T) {
@@ -100,10 +100,10 @@ func TestMergeConfig(t *testing.T) {
 	})
 
 	t.Run("yaml overrides max_turns", func(t *testing.T) {
-		override := &AgentTypeConfig{MaxTurns: 10}
+		override := &AgentTypeConfig{MaxToolCalls: 10}
 		result := mergeConfig(base, override, true)
-		if result.MaxTurns != 10 {
-			t.Errorf("MaxTurns = %d, want 10", result.MaxTurns)
+		if result.MaxToolCalls != 10 {
+			t.Errorf("MaxToolCalls = %d, want 10", result.MaxToolCalls)
 		}
 	})
 
@@ -123,28 +123,28 @@ func TestMergeConfig(t *testing.T) {
 }
 
 // TestMergeConfig_ChainedMergePreservesExplicitZero: mergeConfig's result
-// must mark maxTurnsSet/temperatureSet = true whenever an override explicitly
+// must mark maxToolCallsSet/temperatureSet = true whenever an override explicitly
 // set them (including to zero), so that if this result is later fed as the
 // OVERRIDE into a further merge layer, the explicit zero is not resurrected
 // by that layer's base value. Without this, result.temperatureSet would stay
 // false (copied from base's zero-value flag), and a subsequent merge using
 // this result as an override would silently discard the explicit 0.
 func TestMergeConfig_ChainedMergePreservesExplicitZero(t *testing.T) {
-	base := AgentTypeConfig{Type: AgentType("reviewer"), Temperature: 0.2, MaxTurns: 8}
-	explicitZero := &AgentTypeConfig{temperatureSet: true, maxTurnsSet: true}
+	base := AgentTypeConfig{Type: AgentType("reviewer"), Temperature: 0.2, MaxToolCalls: 8}
+	explicitZero := &AgentTypeConfig{temperatureSet: true, maxToolCallsSet: true}
 	r1 := mergeConfig(base, explicitZero, true)
-	if r1.Temperature != 0 || r1.MaxTurns != 0 {
-		t.Fatalf("r1 = %+v, want Temperature=0 MaxTurns=0", r1)
+	if r1.Temperature != 0 || r1.MaxToolCalls != 0 {
+		t.Fatalf("r1 = %+v, want Temperature=0 MaxToolCalls=0", r1)
 	}
 
 	// r1 becomes the override for a second merge layer.
-	base2 := AgentTypeConfig{Temperature: 0.9, MaxTurns: 20}
+	base2 := AgentTypeConfig{Temperature: 0.9, MaxToolCalls: 20}
 	r2 := mergeConfig(base2, &r1, true)
 	if r2.Temperature != 0 {
 		t.Errorf("r2.Temperature = %v, want 0 (explicit zero must survive being re-merged as an override)", r2.Temperature)
 	}
-	if r2.MaxTurns != 0 {
-		t.Errorf("r2.MaxTurns = %v, want 0 (explicit zero must survive being re-merged as an override)", r2.MaxTurns)
+	if r2.MaxToolCalls != 0 {
+		t.Errorf("r2.MaxToolCalls = %v, want 0 (explicit zero must survive being re-merged as an override)", r2.MaxToolCalls)
 	}
 }
 
@@ -209,8 +209,8 @@ max_turns: 5
 		if cfg.Temperature != 0.3 {
 			t.Errorf("Temperature = %v, want 0.3", cfg.Temperature)
 		}
-		if cfg.MaxTurns != 5 {
-			t.Errorf("MaxTurns = %d, want 5", cfg.MaxTurns)
+		if cfg.MaxToolCalls != 5 {
+			t.Errorf("MaxToolCalls = %d, want 5", cfg.MaxToolCalls)
 		}
 	})
 
@@ -266,9 +266,9 @@ system_prompt_file: ../../etc/passwd
 // the base's non-zero default.
 func TestLoadAgentYAML_ExplicitZeroOverrides(t *testing.T) {
 	base := AgentTypeConfig{
-		Type:        AgentType("reviewer"),
-		Temperature: 0.2,
-		MaxTurns:    8,
+		Type:         AgentType("reviewer"),
+		Temperature:  0.2,
+		MaxToolCalls: 8,
 	}
 
 	writeYAML := func(t *testing.T, dir, name, body string) {
@@ -316,8 +316,8 @@ func TestLoadAgentYAML_ExplicitZeroOverrides(t *testing.T) {
 			t.Fatalf("loadAgentYAML: %v", err)
 		}
 		result := mergeConfig(base, cfg, true)
-		if result.MaxTurns != 0 {
-			t.Errorf("MaxTurns = %v, want 0 (explicit override)", result.MaxTurns)
+		if result.MaxToolCalls != 0 {
+			t.Errorf("MaxToolCalls = %v, want 0 (explicit override)", result.MaxToolCalls)
 		}
 	})
 
@@ -329,8 +329,8 @@ func TestLoadAgentYAML_ExplicitZeroOverrides(t *testing.T) {
 			t.Fatalf("loadAgentYAML: %v", err)
 		}
 		result := mergeConfig(base, cfg, true)
-		if result.MaxTurns != 8 {
-			t.Errorf("MaxTurns = %v, want 8 (base, unset in yaml)", result.MaxTurns)
+		if result.MaxToolCalls != 8 {
+			t.Errorf("MaxToolCalls = %v, want 8 (base, unset in yaml)", result.MaxToolCalls)
 		}
 	})
 }
@@ -452,4 +452,30 @@ system_prompt: "Custom coder prompt."
 			t.Errorf("SystemPrompt = %q, want custom prompt", cfg.SystemPrompt)
 		}
 	})
+}
+
+// TestLoadAgentYAML_MaxToolCallsKeyPrecedence: the renamed max_tool_calls key
+// wins over the legacy max_turns key when both are present, and the legacy key
+// alone still parses (kept so pre-rename project YAML keeps working).
+func TestLoadAgentYAML_MaxToolCallsKeyPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(agentsDir, "both-keys.yaml"), []byte(
+		"name: Both\nmax_turns: 7\nmax_tool_calls: 11\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadAgentYAML("both-keys", dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MaxToolCalls != 11 {
+		t.Errorf("MaxToolCalls = %d, want 11 (max_tool_calls wins over legacy max_turns)", cfg.MaxToolCalls)
+	}
+	if !cfg.maxToolCallsSet {
+		t.Error("maxToolCallsSet = false, want true (explicit key)")
+	}
 }

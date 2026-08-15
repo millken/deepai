@@ -19,22 +19,22 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
-func TestAgentConfig_DefaultMaxTurns(t *testing.T) {
+func TestAgentConfig_DefaultMaxToolCalls(t *testing.T) {
 	cfg := AgentConfig{}
 	agent := New(cfg)
 	// 0 = unlimited (no hard turn cap)
-	if agent.maxTurns != 0 {
-		t.Errorf("Expected default MaxTurns=0 (unlimited), got %d", agent.maxTurns)
+	if agent.maxToolCalls != 0 {
+		t.Errorf("Expected default MaxToolCalls=0 (unlimited), got %d", agent.maxToolCalls)
 	}
 }
 
-func TestAgentConfig_CustomMaxTurns(t *testing.T) {
+func TestAgentConfig_CustomMaxToolCalls(t *testing.T) {
 	cfg := AgentConfig{
-		MaxTurns: 20,
+		MaxToolCalls: 20,
 	}
 	agent := New(cfg)
-	if agent.maxTurns != 20 {
-		t.Errorf("Expected MaxTurns=20, got %d", agent.maxTurns)
+	if agent.maxToolCalls != 20 {
+		t.Errorf("Expected MaxToolCalls=20, got %d", agent.maxToolCalls)
 	}
 }
 
@@ -438,7 +438,7 @@ func (validationLoopProvider) Stream(ctx context.Context, req llm.ChatRequest) (
 // TestValidationBreaker_TripsDespiteMixedBatch guards M4: a batch that always
 // contains one passing tool must not keep resetting the global consecutive-
 // validation-failure counter. The breaker must still trip within a bounded
-// number of turns rather than looping until MaxTurns.
+// number of turns rather than looping until MaxToolCalls.
 func TestValidationBreaker_TripsDespiteMixedBatch(t *testing.T) {
 	reg := tools.NewRegistry()
 	if err := reg.Register(models.Tool{
@@ -464,9 +464,9 @@ func TestValidationBreaker_TripsDespiteMixedBatch(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: validationLoopProvider{},
-		Tools:       reg,
-		MaxTurns:    50,
+		LLMProvider:  validationLoopProvider{},
+		Tools:        reg,
+		MaxToolCalls: 50,
 	})
 
 	_, err := a.Run(context.Background(), "s1", []models.Message{
@@ -545,9 +545,9 @@ func TestRepeatBreaker_StopsOnRepeatedFailedBash(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &repeatLoopProvider{},
-		Tools:       reg,
-		MaxTurns:    50, // safety net; breaker should trip well before this
+		LLMProvider:  &repeatLoopProvider{},
+		Tools:        reg,
+		MaxToolCalls: 50, // safety net; breaker should trip well before this
 	})
 
 	_, err := a.Run(context.Background(), "s1", []models.Message{
@@ -585,9 +585,9 @@ func TestRepeatBreaker_HintOnRepeatedIdenticalCalls(t *testing.T) {
 
 	provider := &repeatSuccessProvider{}
 	a := New(AgentConfig{
-		LLMProvider: provider,
-		Tools:       reg,
-		MaxTurns:    50,
+		LLMProvider:  provider,
+		Tools:        reg,
+		MaxToolCalls: 50,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -674,9 +674,9 @@ func TestRepeatBreaker_ResetsOnDifferentCall(t *testing.T) {
 
 	provider := &alternatingProvider{}
 	a := New(AgentConfig{
-		LLMProvider: provider,
-		Tools:       reg,
-		MaxTurns:    50,
+		LLMProvider:  provider,
+		Tools:        reg,
+		MaxToolCalls: 50,
 	})
 
 	_, err := a.Run(context.Background(), "s1", []models.Message{
@@ -741,8 +741,8 @@ func (p *parallelRepeatLoopProvider) Chat(context.Context, llm.ChatRequest) (llm
 func (p *parallelRepeatLoopProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
 	p.callCount++
 	ch := make(chan llm.StreamChunk, 1)
-	// Safety net set well beyond MaxTurns (50 in the test): with the breaker
-	// absent the run must hit the MaxTurns cap first, proving the exact
+	// Safety net set well beyond MaxToolCalls (50 in the test): with the breaker
+	// absent the run must hit the MaxToolCalls cap first, proving the exact
 	// failure signature the fix eliminates (max-turns error, not
 	// tool_repeat_loop). With the breaker present it trips within ~4 turns.
 	if p.callCount > 200 {
@@ -770,7 +770,7 @@ func (p *parallelRepeatLoopProvider) Stream(ctx context.Context, req llm.ChatReq
 // tool-execution path (all calls ParallelSafe, batch len > 1): the repeat-call
 // circuit breaker must trip there exactly as it does on the serial path.
 // Without the fix, the parallel path never touches repeatCalls/repeatFails,
-// so the run exhausts MaxTurns instead of stopping on tool_repeat_loop.
+// so the run exhausts MaxToolCalls instead of stopping on tool_repeat_loop.
 func TestRepeatBreaker_StopsOnRepeatedFailedParallelBatch(t *testing.T) {
 	reg := tools.NewRegistry()
 	if err := reg.Register(models.Tool{
@@ -793,9 +793,9 @@ func TestRepeatBreaker_StopsOnRepeatedFailedParallelBatch(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &parallelRepeatLoopProvider{},
-		Tools:       reg,
-		MaxTurns:    50, // safety net; breaker should trip well before this
+		LLMProvider:  &parallelRepeatLoopProvider{},
+		Tools:        reg,
+		MaxToolCalls: 50, // safety net; breaker should trip well before this
 	})
 
 	_, err := a.Run(context.Background(), "s1", []models.Message{
@@ -886,9 +886,9 @@ func TestRepeatBreaker_FatalMidBatchKeepsAllToolResults(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &parallelRepeatLoopProvider3{},
-		Tools:       reg,
-		MaxTurns:    50, // safety net; breaker should trip on turn 3
+		LLMProvider:  &parallelRepeatLoopProvider3{},
+		Tools:        reg,
+		MaxToolCalls: 50, // safety net; breaker should trip on turn 3
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1029,9 +1029,9 @@ func TestSerialBreaker_FatalMidBatchSynthesizesRemainingResults(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &serialRepeatLoopProvider3{},
-		Tools:       reg,
-		MaxTurns:    50, // safety net; breaker should trip on turn 8
+		LLMProvider:  &serialRepeatLoopProvider3{},
+		Tools:        reg,
+		MaxToolCalls: 50, // safety net; breaker should trip on turn 8
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1154,10 +1154,10 @@ func TestParallelBreaker_FatalTailAppendAppliesOffload(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &parallelRepeatLoopProviderOffload{},
-		Tools:       reg,
-		MaxTurns:    50, // safety net; breaker should trip on turn 8
-		OffloadDir:  t.TempDir(),
+		LLMProvider:  &parallelRepeatLoopProviderOffload{},
+		Tools:        reg,
+		MaxToolCalls: 50, // safety net; breaker should trip on turn 8
+		OffloadDir:   t.TempDir(),
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1240,9 +1240,9 @@ func TestRepeatBreaker_HintOnRepeatedIdenticalParallelCalls(t *testing.T) {
 
 	provider := &parallelRepeatSuccessProvider{}
 	a := New(AgentConfig{
-		LLMProvider: provider,
-		Tools:       reg,
-		MaxTurns:    10,
+		LLMProvider:  provider,
+		Tools:        reg,
+		MaxToolCalls: 10,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1321,9 +1321,9 @@ func TestRepeatBreaker_HintDeferredToBatchEnd(t *testing.T) {
 
 	provider := &parallelRepeatSuccessProvider6{}
 	a := New(AgentConfig{
-		LLMProvider: provider,
-		Tools:       reg,
-		MaxTurns:    10,
+		LLMProvider:  provider,
+		Tools:        reg,
+		MaxToolCalls: 10,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1414,9 +1414,9 @@ func TestRepeatBreaker_HintDeferredToBatchEnd_SerialPath(t *testing.T) {
 
 	provider := &serialRepeatSuccessProvider{}
 	a := New(AgentConfig{
-		LLMProvider: provider,
-		Tools:       reg,
-		MaxTurns:    10,
+		LLMProvider:  provider,
+		Tools:        reg,
+		MaxToolCalls: 10,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1521,9 +1521,9 @@ func TestSerialBreaker_HintFlushedAfterSynthesizedResults(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &serialRepeatLoopProviderHintThenFatal{},
-		Tools:       reg,
-		MaxTurns:    50,
+		LLMProvider:  &serialRepeatLoopProviderHintThenFatal{},
+		Tools:        reg,
+		MaxToolCalls: 50,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -1642,9 +1642,9 @@ func TestParallelBreaker_HintFlushedAfterTailAppend(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &parallelRepeatLoopProviderHintThenFatal{},
-		Tools:       reg,
-		MaxTurns:    50,
+		LLMProvider:  &parallelRepeatLoopProviderHintThenFatal{},
+		Tools:        reg,
+		MaxToolCalls: 50,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{

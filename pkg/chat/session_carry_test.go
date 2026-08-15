@@ -70,7 +70,7 @@ func newSessionCarryTestRepl(t *testing.T, provider llm.LLMProvider) (*ChatRepl,
 		cfg: ReplConfig{
 			ModelRegistry: regModel,
 			ToolRegistry:  tools.NewRegistry(),
-			MaxTurns:      10,
+			MaxToolCalls:  10,
 			WorkDir:       t.TempDir(),
 		},
 		ui:           ui,

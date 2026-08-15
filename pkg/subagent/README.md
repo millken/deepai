@@ -6,14 +6,14 @@
 - 通过 `Pool` 统一创建、调度、等待和查询子代理任务。
 - 通过 `Executor` 将实际执行逻辑与任务调度解耦。
 - 通过 `EventSink` 将任务状态和中间过程事件回传给调用方。
-- 提供 `general-purpose` 和 `bash` 两种预置子代理类型。
-- 支持并发限制、任务超时和默认配置回退。
+- 预置子代理类型（`general-purpose`、`bash` 等）由 agent 类型画像（builtin/YAML/MD）解析。
+- 支持可选的任务超时（0 = 不设池级超时）。
 
 主要类型
 - `Pool`：任务池，负责启动任务、等待任务完成和读取任务状态。
 - `Task`：任务实体，包含 `ID`、`RequestID`、`Status`、`Prompt`、`Result`、`Messages` 等信息。
-- `SubagentConfig`：单个任务的配置，例如 `Type`、`MaxTurns`、`Timeout`、`SystemPrompt` 和 `Tools`。
-- `PoolConfig`：池级配置，例如最大并发数、默认超时、日志器和默认任务模板。
+- `SubagentConfig`：单个任务的配置，例如 `Type`、`MaxToolCalls`、`Timeout`、`SystemPrompt` 和 `Tools`。
+- `PoolConfig`：池级配置，例如默认超时（0 = 不设）和日志器。
 - `Executor`：执行接口，负责真正跑任务并产出结果。
 - `ExecutionResult`：执行返回值，包含最终 `Result` 和 `Messages`。
 - `TaskEvent`：任务事件，用于通知开始、运行中、完成、失败、超时或取消。
@@ -21,14 +21,13 @@
 
 任务生命周期
 1. 调用 `Pool.StartTask(...)` 创建任务并进入 `pending`。
-2. 任务获得并发许可后切换到 `running`。
+2. 任务立即切换到 `running`（无本地并发限制）。
 3. `Executor.Execute(...)` 产出最终结果和过程消息。
 4. 任务结束后切换到 `completed`、`failed`、`timed_out` 或 `cancelled`。
 5. 调用 `Pool.Wait(...)` 可以等待任务完成并拿到快照。
 
 预置类型
-- `SubagentGeneralPurpose`：通用型任务，默认 `MaxTurns=6`，工具默认为 `file_ops`。
-- `SubagentBash`：面向 shell/bash 风格任务，默认 `MaxTurns=4`，工具默认为 `bash`。
+- 池本身不注入任何按类型的默认值；`MaxToolCalls`、`Tools` 等由 `Executor` 按 agent 类型画像（builtin > 项目 YAML > 项目 MD > 插件 MD）解析，未设置时表示不设上限。
 
 事件说明
 - `task_started`：任务已创建并进入队列。
@@ -96,10 +95,13 @@ func main() {
 - `Task.CompletedAt()`：返回完成时间，格式为 RFC3339Nano。
 
 调度策略
-- `PoolConfig.MaxConcurrent` 控制同时运行的任务数，默认值为 3。
-- `PoolConfig.Timeout` 作为任务默认超时，默认值为 2 分钟。
+- 没有本地并发上限（原 `PoolConfig.MaxConcurrent` 已移除）：并发由发起方约束
+  （react.go 每次运行最多 `maxTaskCallsPerRun` 个 task 调用）和 provider 自身的
+  速率限制决定——超过 API key 配额的突发会收到 429，由 provider 层退避重试消化，
+  持续失败则显式报错。本地固定上限只会制造不可见的排队。
+- `PoolConfig.Timeout` 作为任务默认超时；0 表示不设池级超时（任务生命周期跟随
+  父级上下文）。
 - `PoolConfig.Logger` 用于输出任务状态日志，默认使用标准日志器。
-- `PoolConfig.Defaults` 用于按子代理类型覆盖默认配置。
 
 测试覆盖
 - [pkg/subagent/pool_test.go](pkg/subagent/pool_test.go#L1) 覆盖了任务完成、超时和未知任务等待等场景。
@@ -111,5 +113,5 @@ func main() {
 
 注意事项
 - `StartTask` 传入的 `prompt` 不能为空。
-- 若 `cfg.Type` 没有对应的池级默认配置（`PoolConfig.Defaults`），`Pool` 只会保留其 `AgentType`，不会套用 `general-purpose` 的 `MaxTurns`/`Tools`；具体的 `MaxTurns`、`Tools` 等由 `Executor` 按该 agent 类型的画像（builtin/YAML/MD）解析决定，画像也没有时再由 `Executor` 应用安全下限。
+- `Pool` 不注入任何按类型的默认值；具体的 `MaxToolCalls`、`Tools` 等由 `Executor` 按 agent 类型的画像（builtin/YAML/MD）解析决定，未设置时表示不设上限。
 - `Wait` 只等待任务结束，不负责重新执行或恢复失败任务。

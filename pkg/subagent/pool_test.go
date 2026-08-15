@@ -164,47 +164,33 @@ func TestPoolStartTaskParentCancelledReportsCancelledNotFailed(t *testing.T) {
 	}
 }
 
-func TestPoolPreSemaphoreBailDistinguishesDeadlineFromCancel(t *testing.T) {
-	// MaxConcurrent 1, first task holds the only slot indefinitely, so the
-	// second task must wait at the pre-semaphore select in runTask. Its
-	// parent ctx has a short deadline (not an explicit cancel), so the bail
-	// must classify as TimedOut, not Cancelled, mirroring the post-execution
-	// ordering (DeadlineExceeded checked before Canceled).
-	release := make(chan struct{})
+func TestPoolExpiredDeadlineClassifiesAsTimedOutNotCancelled(t *testing.T) {
+	// A parent ctx deadline firing mid-execution (the only expiry path now
+	// that the pool no longer queues tasks behind a semaphore) must classify
+	// as TimedOut, not Cancelled: DeadlineExceeded is checked before Canceled
+	// in runTask's status switch. The executor honors its ctx the way the
+	// real SubagentExecutor does.
 	pool := NewPool(fakeExecutor{
 		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
-			<-release
-			return ExecutionResult{Result: "done"}, nil
+			<-ctx.Done()
+			return ExecutionResult{}, ctx.Err()
 		},
-	}, PoolConfig{MaxConcurrent: 1, Timeout: time.Minute})
-	defer close(release)
-
-	holder, err := pool.StartTask(context.Background(), "holder", "hold the slot", SubagentConfig{AgentType: "general-purpose"})
-	if err != nil {
-		t.Fatalf("StartTask() (holder) error = %v", err)
-	}
-	// Give the holder task time to acquire the only semaphore slot.
-	time.Sleep(20 * time.Millisecond)
+	}, PoolConfig{Timeout: time.Minute})
 
 	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	waiter, err := pool.StartTask(shortCtx, "waiter", "wait for the slot", SubagentConfig{AgentType: "general-purpose"})
+	task, err := pool.StartTask(shortCtx, "work", "do work", SubagentConfig{AgentType: "general-purpose"})
 	if err != nil {
-		t.Fatalf("StartTask() (waiter) error = %v", err)
+		t.Fatalf("StartTask() error = %v", err)
 	}
 
-	completed, err := pool.Wait(context.Background(), waiter.ID)
+	completed, err := pool.Wait(context.Background(), task.ID)
 	if err != nil {
-		t.Fatalf("Wait() (waiter) error = %v", err)
+		t.Fatalf("Wait() error = %v", err)
 	}
 	if completed.Status != TaskStatusTimedOut {
-		t.Fatalf("waiter status = %s, want %s (parent ctx deadline, not an explicit cancel)", completed.Status, TaskStatusTimedOut)
-	}
-
-	release <- struct{}{}
-	if _, err := pool.Wait(context.Background(), holder.ID); err != nil {
-		t.Fatalf("Wait() (holder) error = %v", err)
+		t.Fatalf("status = %s, want %s (parent ctx deadline, not an explicit cancel)", completed.Status, TaskStatusTimedOut)
 	}
 }
 
@@ -285,44 +271,32 @@ func TestPoolSnapshot_CopiesTokenUsageNotSharesPointer(t *testing.T) {
 	}
 }
 
-// TestPoolFinishTask_NilUsageOnPreSemaphoreBail verifies the pre-semaphore and
-// cancel bail paths (which never reach the executor) still finish cleanly
-// with a nil Usage rather than panicking or leaving a stale value.
-func TestPoolFinishTask_NilUsageOnPreSemaphoreBail(t *testing.T) {
-	release := make(chan struct{})
+// TestPoolFinishTask_NilUsageOnExpiredDeadline verifies a task dying to its
+// parent deadline mid-execution — which never produces an executor Usage —
+// still finishes cleanly with a nil Usage rather than panicking or leaving a
+// stale value.
+func TestPoolFinishTask_NilUsageOnExpiredDeadline(t *testing.T) {
 	pool := NewPool(fakeExecutor{
 		execute: func(ctx context.Context, task *Task, emit func(TaskEvent)) (ExecutionResult, error) {
-			<-release
-			return ExecutionResult{Result: "done"}, nil
+			<-ctx.Done()
+			return ExecutionResult{}, ctx.Err()
 		},
-	}, PoolConfig{MaxConcurrent: 1, Timeout: time.Minute})
-	defer close(release)
-
-	holder, err := pool.StartTask(context.Background(), "holder", "hold the slot", SubagentConfig{AgentType: "general-purpose"})
-	if err != nil {
-		t.Fatalf("StartTask() (holder) error = %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
+	}, PoolConfig{Timeout: time.Minute})
 
 	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	waiter, err := pool.StartTask(shortCtx, "waiter", "wait for the slot", SubagentConfig{AgentType: "general-purpose"})
+	task, err := pool.StartTask(shortCtx, "work", "do work", SubagentConfig{AgentType: "general-purpose"})
 	if err != nil {
-		t.Fatalf("StartTask() (waiter) error = %v", err)
+		t.Fatalf("StartTask() error = %v", err)
 	}
 
-	completed, err := pool.Wait(context.Background(), waiter.ID)
+	completed, err := pool.Wait(context.Background(), task.ID)
 	if err != nil {
-		t.Fatalf("Wait() (waiter) error = %v", err)
+		t.Fatalf("Wait() error = %v", err)
 	}
 	if completed.Usage != nil {
-		t.Fatalf("completed.Usage = %+v, want nil for a task that never reached the executor", completed.Usage)
-	}
-
-	release <- struct{}{}
-	if _, err := pool.Wait(context.Background(), holder.ID); err != nil {
-		t.Fatalf("Wait() (holder) error = %v", err)
+		t.Fatalf("completed.Usage = %+v, want nil for a task that died before reporting usage", completed.Usage)
 	}
 }
 
@@ -397,12 +371,12 @@ func TestPoolStartTask_ContextFilesReachExecutor(t *testing.T) {
 // TestResolveConfig_NoPerTypeDefaults pins the pool's role: it resolves only
 // what the CALLER passed (plus the pool-wide Timeout fallback) and injects no
 // per-agent-type configuration of its own. The pool used to seed hardcoded
-// defaults for "general-purpose" (MaxTurns 6, Tools [file_ops]) and "bash"
-// (MaxTurns 4, Tools [bash]); because SubagentExecutor.Execute prefers
+// defaults for "general-purpose" (MaxToolCalls 6, Tools [file_ops]) and "bash"
+// (MaxToolCalls 4, Tools [bash]); because SubagentExecutor.Execute prefers
 // task.Config over the resolved agent-type profile, those defaults silently
 // shadowed a project .deepai/agents/<type>.yaml|md for exactly those two types.
 // The agent-type profile (builtin > YAML > MD) is now the single source of
-// truth, with the executor's own safety floor as the last resort.
+// truth.
 func TestResolveConfig_NoPerTypeDefaults(t *testing.T) {
 	p := NewPool(nil, PoolConfig{})
 
@@ -411,8 +385,8 @@ func TestResolveConfig_NoPerTypeDefaults(t *testing.T) {
 		if got.AgentType != agentType {
 			t.Fatalf("AgentType = %q, want %q", got.AgentType, agentType)
 		}
-		if got.MaxTurns != 0 {
-			t.Fatalf("%s MaxTurns = %d, want 0 so the agent-type profile decides", agentType, got.MaxTurns)
+		if got.MaxToolCalls != 0 {
+			t.Fatalf("%s MaxToolCalls = %d, want 0 so the agent-type profile decides", agentType, got.MaxToolCalls)
 		}
 		if len(got.Tools) != 0 {
 			t.Fatalf("%s Tools = %v, want empty so the agent-type profile decides", agentType, got.Tools)
@@ -433,8 +407,8 @@ func TestResolveConfig_NoPerTypeDefaults(t *testing.T) {
 	}
 
 	// Caller-supplied values still win.
-	explicit := p.resolveConfig(SubagentConfig{AgentType: "coder", MaxTurns: 12, Tools: []string{"bash"}})
-	if explicit.MaxTurns != 12 || len(explicit.Tools) != 1 || explicit.Tools[0] != "bash" {
+	explicit := p.resolveConfig(SubagentConfig{AgentType: "coder", MaxToolCalls: 12, Tools: []string{"bash"}})
+	if explicit.MaxToolCalls != 12 || len(explicit.Tools) != 1 || explicit.Tools[0] != "bash" {
 		t.Fatalf("caller values dropped: %+v", explicit)
 	}
 }

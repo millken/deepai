@@ -194,3 +194,127 @@ func TestAnthropicConsumeStream_NoOutputYetStillRetries(t *testing.T) {
 		t.Fatal("consumeStream did not retry a transient error before any output was emitted — unrelated to this fix, but must be unaffected by it")
 	}
 }
+
+// TestAnthropicConsumeStream_ThinkingDeltasSendProgress is the RED test for
+// the reasoning-model idle-timeout false positive: a thinking stream (GLM and
+// Claude extended thinking via the anthropic endpoint) can emit minutes of
+// thinking_delta/signature_delta events before the first text or tool token.
+// Those events carry no message content, but they ARE stream activity — the
+// provider must forward one Progress chunk per non-empty delta so pkg/agent's
+// idle watchdog sees the reasoning phase instead of cancelling a perfectly
+// healthy request ("stream idle timeout") once a hard problem thinks longer
+// than the idle window.
+func TestAnthropicConsumeStream_ThinkingDeltasSendProgress(t *testing.T) {
+	thinkingFrags := []string{"Let me ", "think about ", "this hard problem."}
+	events := []ssestream.Event{
+		anthropicSSEEvent(t, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"role": "assistant", "model": "test-model",
+				"usage": map[string]any{"input_tokens": 11},
+			},
+		}),
+		anthropicSSEEvent(t, "content_block_start", map[string]any{
+			"type": "content_block_start", "index": 0,
+			"content_block": map[string]any{"type": "thinking"},
+		}),
+	}
+	for _, frag := range thinkingFrags {
+		events = append(events, anthropicSSEEvent(t, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": frag},
+		}))
+	}
+	events = append(events,
+		anthropicSSEEvent(t, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "signature_delta", "signature": "sig-1"},
+		}),
+		anthropicSSEEvent(t, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicSSEEvent(t, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 1,
+			"delta": map[string]any{"type": "text_delta", "text": "final answer"},
+		}),
+		anthropicSSEEvent(t, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn"},
+			"usage": map[string]any{"output_tokens": 7},
+		}),
+		anthropicSSEEvent(t, "message_stop", map[string]any{"type": "message_stop"}),
+	)
+
+	decoder := &fakeAnthropicDecoder{events: events}
+	stream := ssestream.NewStream[anthropic.MessageStreamEventUnion](decoder, nil)
+	p := &AnthropicProvider{provider: "anthropic"}
+	ch := make(chan StreamChunk, 64)
+	retry := p.consumeStream(context.Background(), ch, stream, "test-model", false)
+	close(ch)
+	chunks := drainStreamChunks(ch)
+
+	if retry {
+		t.Fatal("consumeStream returned retry=true, want false (stream completed cleanly)")
+	}
+
+	progressCount := 0
+	for i, c := range chunks {
+		if c.Progress {
+			progressCount++
+			if len(c.ToolCalls) != 0 || c.Usage != nil || c.Done || c.Err != nil || c.Message != nil || c.Delta != "" {
+				t.Fatalf("chunk[%d] is a Progress chunk but also carries a payload: %+v", i, c)
+			}
+		}
+	}
+	// One per thinking fragment plus one for the signature delta.
+	if want := len(thinkingFrags) + 1; progressCount != want {
+		t.Fatalf("progress chunk count = %d, want %d (one per thinking_delta + one signature_delta)", progressCount, want)
+	}
+
+	final := chunks[len(chunks)-1]
+	if !final.Done || final.Message == nil || final.Message.Content != "final answer" {
+		t.Fatalf("final chunk = %+v, want Done with text 'final answer' (thinking must not leak into content)", final)
+	}
+	if final.Message.Content == "Let me " {
+		t.Fatal("thinking text leaked into the message content")
+	}
+}
+
+// TestAnthropicConsumeStream_ThinkingDeltasBlockRetry pins the emitted flag
+// for the thinking case: a stream that has streamed minutes of thinking
+// deltas and then dies with a retryable transport error must NOT be retried —
+// the reasoning tokens were already produced and billed, and re-running would
+// re-bill the entire thinking phase (up to 4 attempts) for one response.
+func TestAnthropicConsumeStream_ThinkingDeltasBlockRetry(t *testing.T) {
+	events := []ssestream.Event{
+		anthropicSSEEvent(t, "content_block_start", map[string]any{
+			"type": "content_block_start", "index": 0,
+			"content_block": map[string]any{"type": "thinking"},
+		}),
+		anthropicSSEEvent(t, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": "long reasoning..."},
+		}),
+	}
+	// No terminal events: the decoder runs dry mid-thinking and reports a
+	// transient error, as if the connection dropped mid-reasoning.
+	decoder := &fakeAnthropicDecoder{events: events, err: errors.New("connection reset by peer")}
+	stream := ssestream.NewStream[anthropic.MessageStreamEventUnion](decoder, nil)
+
+	p := &AnthropicProvider{provider: "anthropic"}
+	ch := make(chan StreamChunk, 64)
+	retry := p.consumeStream(context.Background(), ch, stream, "test-model", true /* retryable */)
+	close(ch)
+	chunks := drainStreamChunks(ch)
+
+	if retry {
+		t.Fatal("consumeStream retried after thinking deltas had already streamed — emitted must gate this false (re-running would re-bill the whole thinking phase)")
+	}
+	var sawErr bool
+	for _, c := range chunks {
+		if c.Err != nil {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Fatal("expected the transient error to be surfaced as a chunk since emitted blocked the retry")
+	}
+}

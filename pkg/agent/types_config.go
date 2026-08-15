@@ -30,18 +30,18 @@ type AgentTypeConfig struct {
 	Description  string        `json:"description" yaml:"description"`
 	SystemPrompt string        `json:"system_prompt" yaml:"system_prompt"`
 	DefaultTools []string      `json:"default_tools,omitempty" yaml:"default_tools,omitempty"`
-	MaxTurns     int           `json:"max_turns" yaml:"max_turns"`
+	MaxToolCalls int           `json:"max_tool_calls" yaml:"max_tool_calls"`
 	Temperature  float64       `json:"temperature" yaml:"temperature"`
 	Model        string        `json:"model,omitempty" yaml:"model,omitempty"`
 	OutputSchema *OutputSchema `json:"-" yaml:"-"`
 
-	// maxTurnsSet/temperatureSet mark MaxTurns/Temperature as an explicit
-	// override even when the value is the zero value (0). Only the YAML
-	// loader (yaml_loader.go) sets these, since only YAML can distinguish an
-	// explicit `max_turns: 0` from the key being absent; mergeConfig reads
-	// them to avoid treating an explicit 0 as "unset".
-	maxTurnsSet    bool
-	temperatureSet bool
+	// maxToolCallsSet/temperatureSet mark MaxToolCalls/Temperature as an
+	// explicit override even when the value is the zero value (0). Only the
+	// YAML loader (yaml_loader.go) sets these, since only YAML can
+	// distinguish an explicit `max_tool_calls: 0` from the key being absent;
+	// mergeConfig reads them to avoid treating an explicit 0 as "unset".
+	maxToolCallsSet bool
+	temperatureSet  bool
 }
 
 const (
@@ -148,8 +148,8 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 			"grep", "find", "code_map", "present_file", "ask_clarification",
 			"skill", "web_search", "web_fetch",
 		},
-		MaxTurns:    0,
-		Temperature: 0.2,
+		MaxToolCalls: 0,
+		Temperature:  0.2,
 	},
 	AgentTypeResearch: {
 		Type:         AgentTypeResearch,
@@ -157,7 +157,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for research, reading, and synthesis tasks.",
 		SystemPrompt: researcherSystemPrompt,
 		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.1,
 	},
 	AgentTypeCoder: {
@@ -166,7 +166,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for code generation, debugging, and implementation tasks.",
 		SystemPrompt: coderSystemPrompt,
 		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "skill", "git_auto_commit"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.1,
 	},
 	AgentTypeAnalyst: {
@@ -175,16 +175,22 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for structured analysis and artifact generation.",
 		SystemPrompt: analystSystemPrompt,
 		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.15,
 	},
+	// The three reviewer profiles deliberately set MaxToolCalls 0 (no cap —
+	// same rationale as the global default): a fixed cap cannot fit both a
+	// two-file glance and a whole-repo review, and their Strict OutputSchema
+	// already forces them to stop and emit JSON. Contrast bash (3: a bounded
+	// command-execution errand) and document-editor (30: tuned per docx
+	// chunk) below, which keep deliberate caps.
 	AgentTypeSecurityReviewer: {
 		Type:         AgentTypeSecurityReviewer,
 		Name:         "Security Reviewer",
 		Description:  "Reviews code for security vulnerabilities, injection risks, and permission issues.",
 		SystemPrompt: securityReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
-		MaxTurns:     10,
+		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
 	AgentTypeArchReviewer: {
@@ -193,7 +199,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Reviews code for design patterns, coupling, extensibility, and maintainability.",
 		SystemPrompt: archReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
-		MaxTurns:     10,
+		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
 	AgentTypePerfReviewer: {
@@ -202,7 +208,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Reviews code for algorithm complexity, memory, I/O, and concurrency issues.",
 		SystemPrompt: perfReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
-		MaxTurns:     10,
+		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
 	AgentTypeProductManager: {
@@ -211,7 +217,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Plans features, decomposes requirements, and defines acceptance criteria.",
 		SystemPrompt: productManagerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "ask_clarification"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.15,
 	},
 	AgentTypeArchitect: {
@@ -220,7 +226,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Produces technical design documents, system decomposition, and interface definitions.",
 		SystemPrompt: architectSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
 	AgentTypeBash: {
@@ -229,7 +235,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Execute bash commands and report results.",
 		SystemPrompt: bashSystemPrompt,
 		DefaultTools: []string{"bash"},
-		MaxTurns:     3,
+		MaxToolCalls: 3,
 		Temperature:  0.0,
 	},
 	AgentTypeFrontend: {
@@ -238,7 +244,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for frontend development: HTML/CSS/JS, React/Vue/Angular, responsive design, accessibility, and performance.",
 		SystemPrompt: frontendSystemPrompt,
 		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.15,
 	},
 	AgentTypeUIDesigner: {
@@ -247,7 +253,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for UI/UX design: design systems, wireframes, component specs, color, typography, and interaction patterns.",
 		SystemPrompt: uiDesignerSystemPrompt,
 		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
 	AgentTypeNews: {
@@ -256,7 +262,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for news gathering and summarization: web search, source verification, and structured news reporting.",
 		SystemPrompt: newsSystemPrompt,
 		DefaultTools: []string{"web_search", "web_fetch", "web_fetch_batch", "read_file", "present_file", "ask_clarification"},
-		MaxTurns:     0,
+		MaxToolCalls: 0,
 		Temperature:  0.1,
 	},
 	AgentTypeDocEditor: {
@@ -265,13 +271,14 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Profile for .docx polishing, summarization, and generation: structured read, format-preserving edit, and protected-term validation.",
 		SystemPrompt: docEditorSystemPrompt,
 		DefaultTools: []string{"docx_read", "docx_edit", "docx_format", "docx_write", "read_file", "write_file", "ask_clarification"},
-		// MaxTurns must be explicit and non-zero: subagent.go's safety floor
-		// treats <= 0 as "unset" and coerces it to 15, which only covers
-		// four or five 2-3-turn polishing chunks (design §5.8). 30 covers
-		// roughly 10-12 chunks before a caller needs to fall back to
-		// multiple serial subagent batches for larger documents.
-		MaxTurns:    30,
-		Temperature: 0.2,
+		// MaxToolCalls is an explicit, deliberate cap (0 would mean "no cap"):
+		// a polishing chunk costs ~3 calls (docx_read + docx_edit + validate),
+		// so 30 covers roughly 10 chunks (design §5.8) before a caller needs
+		// to fall back to multiple serial subagent batches for larger
+		// documents. On exhaustion the subagent wraps up gracefully rather
+		// than failing.
+		MaxToolCalls: 30,
+		Temperature:  0.2,
 	},
 }
 

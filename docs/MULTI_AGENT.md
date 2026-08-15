@@ -62,7 +62,7 @@ tools:
   - grep
   - glob
 temperature: 0.2
-max_turns: 10
+max_tool_calls: 30
 ```
 
 或者使用外部 prompt 文件：
@@ -83,8 +83,13 @@ tools:
 `general-purpose`——回落会让拼错的 `agent_type` 拿到一个没有工具白名单的 profile，也就是全部工具，
 与 `tools` 写错时的硬失败策略正好相反。`agent_type` 留空才使用 `general-purpose`。
 
-`max_turns` / `tools` / `temperature` / `model` 一律由上面解析出的 profile 决定（`task` 工具的
-`max_turns`、`model` 等参数可显式覆盖），subagent pool 不再注入任何按类型的默认值。
+`max_tool_calls` / `tools` / `temperature` / `model` 一律由上面解析出的 profile 决定（`task` 工具的
+`max_tool_calls`、`model` 等参数可显式覆盖），subagent pool 不再注入任何按类型的默认值。
+
+`max_tool_calls` 上限的语义是**实际执行的工具调用次数**（0 = 不限制，默认）。与轮数不同，这个计数对
+单轮单调用的模型（GLM/GPT）和批量并行调用的模型（Claude）等价。到达上限时子 agent 不会失败：它收到
+一条收尾指令且后续请求不再附带工具，被迫输出最终总结。默认不限，运行由父级上下文（Ctrl+C）、可选的
+`token_budget`、上下文压缩与重复调用熔断器约束。旧配置里的 `max_turns` 键仍然兼容读取。
 
 `general-purpose` 的工具是**显式白名单**（不是"全部"）：不含 `git_auto_commit`，也不含任何 MCP 工具
 ——白名单无法枚举 MCP 工具名，所以 MCP 需要按 agent 类型显式开启。需要放宽就在

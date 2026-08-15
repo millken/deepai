@@ -29,4 +29,4 @@ tools:
   - present_file
   - ask_clarification
 temperature: 0.2
-max_turns: 30
+max_tool_calls: 30

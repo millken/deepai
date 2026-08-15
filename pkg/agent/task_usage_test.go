@@ -104,9 +104,9 @@ func TestSubagentUsageRollsUpIntoRunResultUsage(t *testing.T) {
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &oneTaskCallProvider{},
-		Tools:       reg,
-		MaxTurns:    5,
+		LLMProvider:  &oneTaskCallProvider{},
+		Tools:        reg,
+		MaxToolCalls: 5,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{
@@ -165,9 +165,9 @@ func TestSubagentUsageRollsUpIntoRunResultUsage_EvenWhenSubagentFails(t *testing
 	}
 
 	a := New(AgentConfig{
-		LLMProvider: &oneTaskCallProvider{},
-		Tools:       reg,
-		MaxTurns:    5,
+		LLMProvider:  &oneTaskCallProvider{},
+		Tools:        reg,
+		MaxToolCalls: 5,
 	})
 
 	result, err := a.Run(context.Background(), "s1", []models.Message{

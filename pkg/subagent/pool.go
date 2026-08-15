@@ -20,23 +20,30 @@ type Pool struct {
 	executor Executor
 	tasks    sync.Map
 	cfg      PoolConfig
-	sem      chan struct{}
 }
 
+// NewPool creates a pool with NO local concurrency limiter, deliberately:
+// there is no semaphore capping how many tasks run at once. Concurrency is
+// governed by the issuers (react.go caps task calls at maxTaskCallsPerRun
+// per run) and by the provider's own rate limiting — a burst that exceeds
+// the API key's limits gets 429s, which the provider layer retries with
+// backoff and surfaces as a visible error when persistent. A hardcoded local
+// cap (the old MaxConcurrent=4) only added invisible queueing: the N+1th
+// task silently waited on a slot with no feedback to the model or user, and
+// no number fits every provider's real capacity anyway.
 func NewPool(executor Executor, cfg PoolConfig) *Pool {
-	if cfg.MaxConcurrent <= 0 {
-		cfg.MaxConcurrent = 3
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 2 * time.Minute
-	}
+	// cfg.Timeout <= 0 means NO pool-wide deadline: a subagent's lifetime is
+	// governed by its parent run's context (user Ctrl+C / the parent's own
+	// request timeout) plus the in-run safety nets (repeat-call breaker,
+	// stream idle watchdog, context-window compaction). A hardcoded wall-clock
+	// governor cannot fit both quick lookups and whole-project delegations,
+	// which can legitimately run for hours.
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	return &Pool{
 		executor: executor,
 		cfg:      cfg,
-		sem:      make(chan struct{}, cfg.MaxConcurrent),
 	}
 }
 
@@ -133,20 +140,6 @@ func (p *Pool) getTask(taskID string) (*Task, bool) {
 func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 	defer close(task.done)
 
-	select {
-	case p.sem <- struct{}{}:
-	case <-parentCtx.Done():
-		// Mirror the post-execution classification ordering: a deadline on
-		// the parent ctx is a timeout, not an explicit cancel.
-		status := TaskStatusCancelled
-		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
-			status = TaskStatusTimedOut
-		}
-		p.finishTask(parentCtx, task, status, "", parentCtx.Err(), nil, nil)
-		return
-	}
-	defer func() { <-p.sem }()
-
 	task.mu.Lock()
 	task.Status = TaskStatusRunning
 	task.mu.Unlock()
@@ -163,7 +156,15 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 	if timeout <= 0 {
 		timeout = p.cfg.Timeout
 	}
-	runCtx, cancel := context.WithTimeout(parentCtx, timeout)
+	// timeout <= 0 (no task- or pool-level deadline configured): run under
+	// the parent ctx directly — lifetime is the parent run's lifetime.
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(parentCtx, timeout)
+	} else {
+		runCtx, cancel = context.WithCancel(parentCtx)
+	}
 	defer cancel()
 
 	result, err := p.executor.Execute(runCtx, task, func(evt TaskEvent) {
@@ -247,11 +248,11 @@ func (p *Pool) emit(ctx context.Context, evt TaskEvent) {
 }
 
 // resolveConfig normalizes a caller-supplied SubagentConfig: it fills in the
-// agent type and the pool-wide Timeout, sanitizes the values, and copies the
-// caller's slices so a task can never alias them. It deliberately injects NO
-// per-agent-type configuration of its own — MaxTurns, Tools, SystemPrompt and
-// Model come from the agent-type profile (builtin > project YAML > project MD >
-// plugin MD), resolved by the executor.
+// agent type and the pool-wide Timeout fallback, sanitizes the values, and
+// copies the caller's slices so a task can never alias them. It deliberately
+// injects NO per-agent-type configuration of its own — MaxToolCalls, Tools,
+// SystemPrompt and Model come from the agent-type profile (builtin > project
+// YAML > project MD > plugin MD), resolved by the executor.
 //
 // The pool used to seed hardcoded per-type defaults here (general-purpose:
 // MaxTurns 6 + Tools [file_ops]; bash: MaxTurns 4 + Tools [bash]). Because
@@ -259,7 +260,7 @@ func (p *Pool) emit(ctx context.Context, evt TaskEvent) {
 // defaults silently shadowed a project .deepai/agents/<type>.yaml|md for
 // exactly those two types, and pinned general-purpose to file_ops even though
 // its builtin profile means "unrestricted". The profile is now the single
-// source of truth, with the executor's MaxTurns safety floor as last resort.
+// source of truth.
 func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 	resolved := cfg
 	resolved.AgentType = cfg.EffectiveAgentType()
@@ -276,11 +277,11 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 	}
 	// Negative values are meaningless and would read as "explicitly set"
 	// downstream (a negative MaxTokensBudget, for instance, is not the same as
-	// unlimited); normalize them to the unset zero so the profile and the
-	// executor's own floors apply. A model can produce one via the task tool's
-	// max_turns / token_budget arguments.
-	if resolved.MaxTurns < 0 {
-		resolved.MaxTurns = 0
+	// unlimited); normalize them to the unset zero so the profile applies. A
+	// model can produce one via the task tool's max_tool_calls / token_budget
+	// arguments.
+	if resolved.MaxToolCalls < 0 {
+		resolved.MaxToolCalls = 0
 	}
 	if resolved.TokenBudget < 0 {
 		resolved.TokenBudget = 0

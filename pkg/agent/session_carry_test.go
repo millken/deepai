@@ -85,7 +85,7 @@ func TestSessionCarry_BreakerTripsAcrossRuns(t *testing.T) {
 
 	reg1 := tools.NewRegistry()
 	registerSFailTool(t, reg1)
-	a1 := New(AgentConfig{LLMProvider: &repeatFailProvider{maxCalls: 4}, Tools: reg1, MaxTurns: 10, Session: session})
+	a1 := New(AgentConfig{LLMProvider: &repeatFailProvider{maxCalls: 4}, Tools: reg1, MaxToolCalls: 10, Session: session})
 	if _, err := a1.Run(context.Background(), "s1", []models.Message{
 		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "go"},
 	}); err != nil {
@@ -94,7 +94,7 @@ func TestSessionCarry_BreakerTripsAcrossRuns(t *testing.T) {
 
 	reg2 := tools.NewRegistry()
 	registerSFailTool(t, reg2)
-	a2 := New(AgentConfig{LLMProvider: &repeatFailProvider{maxCalls: 4}, Tools: reg2, MaxTurns: 10, Session: session})
+	a2 := New(AgentConfig{LLMProvider: &repeatFailProvider{maxCalls: 4}, Tools: reg2, MaxToolCalls: 10, Session: session})
 	_, err := a2.Run(context.Background(), "s1", []models.Message{
 		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "go"},
 	})

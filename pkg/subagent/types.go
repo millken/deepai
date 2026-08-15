@@ -34,9 +34,14 @@ const (
 type SubagentConfig struct {
 	// AgentType is the unified agent type (e.g. "coder", "bash", "security-reviewer").
 	// Takes precedence over Type (SubagentType).
-	AgentType    string
-	Type         SubagentType // Deprecated: use AgentType
-	MaxTurns     int
+	AgentType string
+	Type      SubagentType // Deprecated: use AgentType
+	// MaxToolCalls optionally caps the number of tool calls the subagent may
+	// execute (0 = no cap — the default; the run is bounded by the parent
+	// context, optional TokenBudget, and the repeat-call breaker). When a cap
+	// is set and reached, the subagent gracefully wraps up with a final
+	// no-tools answer instead of failing.
+	MaxToolCalls int
 	Timeout      time.Duration
 	SystemPrompt string
 	Tools        []string
@@ -68,9 +73,8 @@ func (c SubagentConfig) EffectiveAgentType() string {
 // resolves — see Pool.resolveConfig for why a pool-level default map is
 // actively harmful.
 type PoolConfig struct {
-	MaxConcurrent int
-	Timeout       time.Duration
-	Logger        *slog.Logger
+	Timeout time.Duration
+	Logger  *slog.Logger
 }
 
 // Task represents a subagent task.

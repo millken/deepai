@@ -29,7 +29,7 @@ type ReplConfig struct {
 	ModelRegistry       *llm.ModelRegistry
 	DatabaseURL         string
 	ContextWindow       int
-	MaxTurns            int
+	MaxToolCalls        int
 	RequestTimeout      time.Duration
 	Query               string // non-interactive single query
 	ResumeSession       string // session ID or title to resume
@@ -613,7 +613,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		Model:           modelName,
 		ContextWindow:   r.currentContextWindow(),
 		ReasoningEffort: r.currentReasoningEffort(),
-		MaxTurns:        r.cfg.MaxTurns,
+		MaxToolCalls:    r.cfg.MaxToolCalls,
 		// MaxTokens: without this the provider default applies (8192 for
 		// Anthropic), the same limit pkg/commands/chat.go raises for
 		// subagents to avoid truncating a large tool-call argument
