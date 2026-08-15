@@ -219,7 +219,7 @@ func TestEditFile_NotFoundGivesActionableError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing old_string")
 	}
-	if !strings.Contains(err.Error(), "verbatim") {
+	if !strings.Contains(err.Error(), "retry edit_file") {
 		t.Fatalf("error not actionable: %v", err)
 	}
 	_ = res

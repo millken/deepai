@@ -38,7 +38,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	startLine, _ := args["start_line"].(float64)
 	endLine, _ := args["end_line"].(float64)
-	withLineNumbers, _ := args["line_numbers"].(bool)
+	withLineNumbers, lineNumbersSet := args["line_numbers"].(bool)
 	text := string(data)
 	lines := splitFileLines(text)
 
@@ -74,10 +74,18 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		selected := lines[s-1 : e]
+		// Range mode renders line numbers by default so follow-up edits can
+		// reference exact positions, but line_numbers=false returns the raw span
+		// — the numbers are otherwise pasted straight into edit_file's old_string
+		// and can never match the file.
+		if lineNumbersSet && !withLineNumbers {
+			return models.ToolResult{
+				CallID:   call.ID,
+				ToolName: call.Name,
+				Content:  strings.Join(selected, "\n") + "\n",
+			}, nil
+		}
 		var b strings.Builder
-		// Range mode always renders line numbers so follow-up edits can
-		// reference exact positions.
-		_ = withLineNumbers
 		width := numWidth(e)
 		for i, ln := range selected {
 			fmt.Fprintf(&b, "%*d\t%s\n", width, s+i, ln)
@@ -240,7 +248,7 @@ func GlobTool() models.Tool {
 func ReadFileTool() models.Tool {
 	return models.Tool{
 		Name:         "read_file",
-		Description:  "Read a file's contents. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number. Very large files return a structural outline (head + symbol signatures with line numbers + tail); pass full=true or a start_line/end_line range to get exact content.",
+		Description:  "Read a file's contents. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number and a TAB (on by default in range mode — pass line_numbers=false to get the raw span for pasting into edit_file's old_string). Very large files return a structural outline (head + symbol signatures with line numbers + tail); pass full=true or a start_line/end_line range to get exact content.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -251,7 +259,7 @@ func ReadFileTool() models.Tool {
 				"filePath":     map[string]any{"type": "string", "description": "Alias of path (deprecated)"},
 				"start_line":   map[string]any{"type": "number", "description": "1-based inclusive start line; enables line-range mode"},
 				"end_line":     map[string]any{"type": "number", "description": "1-based inclusive end line; pairs with start_line"},
-				"line_numbers": map[string]any{"type": "boolean", "description": "Prefix each line with its 1-based line number (auto when range is set)"},
+				"line_numbers": map[string]any{"type": "boolean", "description": "Prefix each line with its 1-based line number and a TAB (defaults on when a range is set; pass false for raw text to reuse in edit_file)"},
 				"limit":        map[string]any{"type": "number", "description": "Maximum bytes to read (ignored when range is set)"},
 				"full":         map[string]any{"type": "boolean", "description": "Force full content for large files instead of the structural outline"},
 			},
