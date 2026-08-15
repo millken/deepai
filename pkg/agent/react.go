@@ -1039,9 +1039,11 @@ func toolBudgetExhaustedNotice(sessionID string, maxToolCalls int) models.Messag
 		Metadata:  map[string]string{metaAgentInjected: "true"},
 		Content: fmt.Sprintf(
 			"You have used your tool call limit for this task (%d calls). "+
-				"Do not attempt any further tool calls. Give your final answer now: "+
-				"summarize what you accomplished, the key results or findings, and "+
-				"anything you did not get to complete.",
+				"Do not attempt any further tool calls. Give your final answer now, "+
+				"in the exact output format your instructions specify (if a JSON "+
+				"schema or structured format was required, your final answer MUST "+
+				"still follow it): summarize what you accomplished, the key results "+
+				"or findings, and anything you did not get to complete.",
 			maxToolCalls),
 		CreatedAt: time.Now().UTC(),
 	}
