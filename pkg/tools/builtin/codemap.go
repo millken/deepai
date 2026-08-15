@@ -218,6 +218,7 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 		maxFiles = v
 	}
 	includeHidden, _ := args["include_hidden"].(bool)
+	includeTests, _ := args["include_tests"].(bool)
 	includeContent, _ := args["include_content"].(bool)
 	contentBudget := resolveContentBudget(ctx, args)
 
@@ -249,7 +250,7 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: content}, nil
 	}
 
-	files, total, err := walkCodeMap(path, includeHidden, maxFiles)
+	files, total, testsSkipped, err := walkCodeMap(path, includeHidden, includeTests, maxFiles)
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("code_map failed: %w", err)
 	}
@@ -284,12 +285,18 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 	if includeContent {
 		content += "\n[Use depth=api for exported-API outlines only, or drop include_content for structure.]"
 	}
+	if testsSkipped > 0 {
+		content += fmt.Sprintf("\n[%d test files/dirs skipped — pass include_tests=true to include them.]", testsSkipped)
+	}
 
 	data := map[string]any{
 		"file_count": len(files),
 		"total":      total,
 		"truncated":  truncated,
 		"depth":      depth,
+	}
+	if testsSkipped > 0 {
+		data["tests_skipped"] = testsSkipped
 	}
 	if includeContent {
 		data["content_bytes"] = len(content)
@@ -319,12 +326,49 @@ func codeMapResult(call models.ToolCall, content string, files, total int, trunc
 	}
 }
 
+// isTestDir reports whether a directory is, by convention, nothing but
+// tests: Rust/Go integration-test dirs, JS __tests__, Maven/Gradle's
+// src/test. Deliberately excludes bare "test"/"testdata" (too generic —
+// fixtures and helpers live there too); those need per-file naming to match.
+// name is the directory's base name; full is its path (for the src/test
+// suffix rule).
+func isTestDir(name, full string) bool {
+	switch name {
+	case "tests", "__tests__":
+		return true
+	}
+	return strings.HasSuffix(full, "/src/test") // Maven/Gradle main/test split
+}
+
+// isTestFileName reports whether a source file is a test file by per-language
+// naming convention. A naming heuristic, not a semantic one — an oddly named
+// test slips through and a helper named like a test gets folded; both degrade
+// to "look again with include_tests".
+func isTestFileName(name string) bool {
+	n := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(n, "_test.go"),
+		strings.HasSuffix(n, "_test.zig"),
+		strings.HasSuffix(n, "_test.c"), strings.HasSuffix(n, "_test.cpp"), strings.HasSuffix(n, "_test.cc"),
+		strings.HasSuffix(n, "_test.rb"),
+		strings.HasPrefix(n, "test_"),
+		strings.Contains(n, ".test."), strings.Contains(n, ".spec."),
+		strings.HasSuffix(n, "test.java"), strings.HasSuffix(n, "tests.java"):
+		return true
+	}
+	return false
+}
+
 // walkCodeMap collects recognized code files under root, folding build/vendor
 // dirs. It returns up to maxFiles entries plus the true total count so callers
 // can report pagination.
-func walkCodeMap(root string, includeHidden bool, maxFiles int) ([]codeMapFile, int, error) {
+// walkCodeMap collects recognized code files under root, folding build/vendor
+// dirs and — unless includeTests — test files and test-only directories.
+// Skipped tests are counted so the result can tell the model they exist and
+// how to pull them in.
+func walkCodeMap(root string, includeHidden, includeTests bool, maxFiles int) ([]codeMapFile, int, int, error) {
 	var collected []string
-	total := 0
+	total, testsSkipped := 0, 0
 	err := filepath.WalkDir(root, func(fp string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -340,12 +384,20 @@ func walkCodeMap(root string, includeHidden bool, maxFiles int) ([]codeMapFile, 
 			if !includeHidden && (codeMapFoldDirs[name] || strings.HasPrefix(name, ".")) {
 				return filepath.SkipDir
 			}
+			if !includeTests && isTestDir(d.Name(), fp) {
+				testsSkipped++
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !includeHidden && strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		if extToLang(filepath.Ext(d.Name())) == "" {
+			return nil
+		}
+		if !includeTests && isTestFileName(d.Name()) {
+			testsSkipped++
 			return nil
 		}
 		total++
@@ -355,7 +407,7 @@ func walkCodeMap(root string, includeHidden bool, maxFiles int) ([]codeMapFile, 
 		return nil
 	})
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	sort.Strings(collected)
@@ -367,7 +419,7 @@ func walkCodeMap(root string, includeHidden bool, maxFiles int) ([]codeMapFile, 
 		}
 		files = append(files, readCodeMapFile(fp, filepath.ToSlash(rel)))
 	}
-	return files, total, nil
+	return files, total, testsSkipped, nil
 }
 
 func readCodeMapFile(abs, rel string) codeMapFile {
@@ -530,7 +582,7 @@ func renderSymbols(ctx context.Context, files []codeMapFile, hint bool) string {
 func CodeMapTool() models.Tool {
 	return models.Tool{
 		Name:         "code_map",
-		Description:  "Map a codebase's structure without reading full files: lists source files with line counts and their function/type/class/global-var signatures with line numbers. Use this FIRST when exploring an unfamiliar repo or sizing up files (instead of wc -l / cat / grep for symbols). depth=tree (default) shows files with line and symbol counts; depth=symbols shows signatures; depth=api shows EXPORTED declarations only (architecture at a glance, fewest tokens). include_content=true inlines each file's FULL source — one call brings a whole subtree's code into context instead of many read_file round-trips, bounded by max_total_bytes. Then read_file with start_line/end_line to see an implementation.",
+		Description:  "Map a codebase's structure without reading full files: lists source files with line counts and their function/type/class/global-var signatures with line numbers. Use this FIRST when exploring an unfamiliar repo or sizing up files (instead of wc -l / cat / grep for symbols). depth=tree (default) shows files with line and symbol counts; depth=symbols shows signatures; depth=api shows EXPORTED declarations only (architecture at a glance, fewest tokens). include_content=true inlines each file's FULL source — one call brings a whole subtree's code into context instead of many read_file round-trips, bounded by max_total_bytes. Test files are skipped by default (include_tests=true to include them). Then read_file with start_line/end_line to see an implementation.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -542,6 +594,7 @@ func CodeMapTool() models.Tool {
 				"max_total_bytes": map[string]any{"type": "number", "description": "Total content budget in bytes when include_content=true (default: 100000); files past the budget are listed without content"},
 				"max_files":       map[string]any{"type": "number", "description": "Maximum files to include (default: 100); excess is paginated with a notice"},
 				"include_hidden":  map[string]any{"type": "boolean", "description": "Descend into dotted/build/vendor dirs (default: false)"},
+				"include_tests":   map[string]any{"type": "boolean", "description": "Include test files (*_test.go, *_test.zig, *.test.ts, tests/ dirs...). Default: false — tests are skipped to save context; read specific test files with read_file when needed."},
 			},
 			"required": []any{},
 		},

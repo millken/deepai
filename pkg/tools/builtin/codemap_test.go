@@ -431,3 +431,71 @@ func TestResolveContentBudget_Tiers(t *testing.T) {
 		t.Errorf("fallback budget = %d, want 100000", got)
 	}
 }
+
+func TestCodeMapHandler_SkipsTestFilesByDefault(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"main.go":              "package main\n\nfunc main() {}\n",
+		"main_test.go":         "package main\n\nfunc TestMain(t *testing.T) {}\n",
+		"signal.zig":           "pub fn create() void {}\n",
+		"signal_test.zig":      "test \"create\" {}\n",
+		"ui.test.ts":           "export function f() {}\n",
+		"test_helper.py":       "def check():\n    pass\n",
+		"tests/integration.go": "package tests\nfunc Run() {}\n",
+	})
+
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{"path": root}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, skipped := range []string{"main_test.go", "signal_test.zig", "ui.test.ts", "test_helper.py", "integration.go"} {
+		if contains(result.Content, skipped) {
+			t.Errorf("test artifact %q should be skipped by default, got: %s", skipped, result.Content)
+		}
+	}
+	if !contains(result.Content, "main.go") || !contains(result.Content, "signal.zig") {
+		t.Errorf("production files must survive the filter, got: %s", result.Content)
+	}
+	if !contains(result.Content, "test files/dirs skipped") {
+		t.Errorf("result must mention the skipped tests and the recovery flag, got: %s", result.Content)
+	}
+	if v, ok := result.Data["tests_skipped"].(int); !ok || v != 5 {
+		t.Errorf("Data[tests_skipped] = %#v, want 5", result.Data["tests_skipped"])
+	}
+}
+
+func TestCodeMapHandler_IncludeTestsOptIn(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"main.go":      "package main\n\nfunc main() {}\n",
+		"main_test.go": "package main\n\nfunc TestMain(t *testing.T) {}\n",
+	})
+
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root, "include_tests": true, "depth": "symbols",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "TestMain") {
+		t.Errorf("include_tests=true must surface test symbols, got: %s", result.Content)
+	}
+	if contains(result.Content, "skipped") {
+		t.Errorf("no skip notice expected with include_tests=true, got: %s", result.Content)
+	}
+}
+
+func TestCodeMapHandler_SingleTestFileExplicitPath(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"main_test.go": "package main\n\nfunc TestX(t *testing.T) {}\n",
+	})
+	// An EXPLICIT path to a test file is deliberate intent — the filter is a
+	// discovery-time default, not an access restriction.
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root + "/main_test.go",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "TestX") {
+		t.Errorf("explicit test-file path must not be filtered, got: %s", result.Content)
+	}
+}
