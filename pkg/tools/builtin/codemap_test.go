@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 func codeMapCall(args map[string]any) models.ToolCall {
@@ -282,5 +283,151 @@ func TestCodeMapTool_Registered(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("code_map not registered in FileTools()")
+	}
+}
+
+func TestCodeMapHandler_IncludeContent(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"main.go": "package main\n\nfunc main() {}\n",
+		"util.go": "package main\n\ntype Foo struct{}\n",
+		"skip.md": "# not code\n",
+	})
+
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root, "include_content": true,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Both files' full source must be inlined under headers.
+	if !contains(result.Content, "main.go (4 lines) =====") || !contains(result.Content, "func main() {}") {
+		t.Errorf("expected main.go full source inlined, got: %s", result.Content)
+	}
+	if !contains(result.Content, "type Foo struct{}") {
+		t.Errorf("expected util.go full source inlined, got: %s", result.Content)
+	}
+	if contains(result.Content, "skip.md") {
+		t.Errorf("non-code file should be excluded, got: %s", result.Content)
+	}
+	// The no-offload contract: include_content's whole point is having the
+	// content IN context; Data must flag it so the agent's offload path
+	// (24KB threshold) leaves it alone.
+	if v, ok := result.Data["offload_exempt"].(bool); !ok || !v {
+		t.Errorf("Data[offload_exempt] = %#v, want true", result.Data["offload_exempt"])
+	}
+	if result.Data["content_bytes"] == nil {
+		t.Errorf("Data[content_bytes] missing: %#v", result.Data)
+	}
+}
+
+func TestCodeMapHandler_IncludeContent_BudgetExhaustion(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"a.go": "package p\nfunc A() {}\n",
+		"b.go": "package p\nfunc B() {}\n",
+	})
+
+	// Budget only fits the first file: a.go is included, b.go is listed
+	// without content and says how to recover.
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root, "include_content": true, "max_total_bytes": 25,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "func A()") {
+		t.Errorf("a.go should be inlined within budget, got: %s", result.Content)
+	}
+	if contains(result.Content, "func B()") {
+		t.Errorf("b.go content should be omitted past the budget, got: %s", result.Content)
+	}
+	if !contains(result.Content, "b.go") || !contains(result.Content, "budget exhausted") {
+		t.Errorf("b.go should be listed with a budget notice, got: %s", result.Content)
+	}
+}
+
+func TestCodeMapHandler_IncludeContent_SingleFile(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"solo.go": "package p\n\nfunc Only() {}\n",
+	})
+
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root + "/solo.go", "include_content": true,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "func Only() {}") {
+		t.Errorf("expected the single file's full source, got: %s", result.Content)
+	}
+	if v, ok := result.Data["offload_exempt"].(bool); !ok || !v {
+		t.Errorf("Data[offload_exempt] = %#v, want true on the single-file path too", result.Data["offload_exempt"])
+	}
+}
+
+func TestCodeMapHandler_APIDepth(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"api.go": "package p\n\nfunc Exported() {}\nfunc hidden() {}\ntype Public struct{}\ntype private struct{}\n",
+	})
+	result, err := CodeMapHandler(context.Background(), codeMapCall(map[string]any{
+		"path": root, "depth": "api",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !contains(result.Content, "func Exported()") || !contains(result.Content, "type Public struct") {
+		t.Errorf("api depth must keep exported declarations, got: %s", result.Content)
+	}
+	if contains(result.Content, "hidden") || contains(result.Content, "private") {
+		t.Errorf("api depth must drop unexported declarations, got: %s", result.Content)
+	}
+}
+
+func TestExportedSymbols_PerLanguage(t *testing.T) {
+	cases := []struct {
+		ext  string
+		text string
+		want bool
+	}{
+		{".zig", "pub fn create", true},
+		{".zig", "fn internal", false},
+		{".go", "func Run", true},
+		{".go", "func (b B) Method", true},
+		{".go", "func run", false},
+		{".py", "def public", true},
+		{".py", "def _private", false},
+		{".ts", "export function f", true},
+		{".ts", "function f", false},
+		{".c", "int main", true}, // no rule for C: keep everything
+	}
+	for _, c := range cases {
+		if got := isExportedDecl(extToLang(c.ext), c.text); got != c.want {
+			t.Errorf("isExportedDecl(%q, %q) = %v, want %v", c.ext, c.text, got, c.want)
+		}
+	}
+}
+
+// TestResolveContentBudget_Tiers pins the three-tier resolution: explicit
+// argument wins, else derive from the model's context window (10% at ~4
+// bytes/token), else the static fallback. The budget must track the window:
+// GLM 5.3's 1M window affords a 400KB pull where a 200k window gets 80KB.
+func TestResolveContentBudget_Tiers(t *testing.T) {
+	// Explicit argument beats everything.
+	if got := resolveContentBudget(context.Background(), map[string]any{"max_total_bytes": 42}); got != 42 {
+		t.Errorf("explicit budget = %d, want 42", got)
+	}
+	// Window-derived: 1M tokens -> 400KB, 200k -> 80KB.
+	for _, c := range []struct{ window, want int }{
+		{1_000_000, 400_000},
+		{200_000, 80_000},
+		{128_000, 51_200},
+	} {
+		ctx := tools.WithContextWindow(context.Background(), c.window)
+		if got := resolveContentBudget(ctx, nil); got != c.want {
+			t.Errorf("window %d: budget = %d, want %d", c.window, got, c.want)
+		}
+	}
+	// No window: static fallback.
+	if got := resolveContentBudget(context.Background(), nil); got != 100_000 {
+		t.Errorf("fallback budget = %d, want 100000", got)
 	}
 }

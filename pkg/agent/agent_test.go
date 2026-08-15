@@ -1986,3 +1986,72 @@ func TestNonInteractiveAgentHasNoPlanMode(t *testing.T) {
 		t.Fatal("non-interactive subagent must NOT have enter_plan_mode (causes 15m plan-mode stalls)")
 	}
 }
+
+// TestOffload_NoOffloadFlagKeepsContentInContext pins the exemption contract
+// for tools whose deliverable IS large in-context content (code_map with
+// include_content): a handler setting models.ToolDataNoOffload in Data must
+// keep its full Content in the tool result even past the offload threshold,
+// because offloading would write away exactly what the call asked to bring
+// IN. Such handlers bound their own output size instead.
+func TestOffload_NoOffloadFlagKeepsContentInContext(t *testing.T) {
+	tmpDir := t.TempDir()
+	offloadDir := tmpDir + "/offload"
+
+	var contentBuilder strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&contentBuilder, "line %03d: %s\n", i, strings.Repeat("y", 140))
+	}
+	largeContent := contentBuilder.String() // ~30KB, over the 24KB threshold
+
+	reg := tools.NewRegistry()
+	// offloadTestProvider hardcodes a call to "big_tool".
+	if err := reg.Register(models.Tool{
+		Name: "big_tool",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				CallID:   "exempt1",
+				ToolName: "big_tool",
+				Content:  largeContent,
+				Data:     map[string]any{models.ToolDataNoOffload: true},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(AgentConfig{
+		LLMProvider: &offloadTestProvider{},
+		Tools:       reg,
+		OffloadDir:  offloadDir,
+	})
+
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{ID: "m1", SessionID: "s1", Role: models.RoleHuman, Content: "run"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var toolMsg *models.Message
+	for i := range result.Messages {
+		if result.Messages[i].Role == models.RoleTool {
+			toolMsg = &result.Messages[i]
+			break
+		}
+	}
+	if toolMsg == nil {
+		t.Fatal("no tool result message found")
+	}
+	// The full content must still be in context (message Content carries the
+	// tool result text — same convention as the offload test above).
+	if len(toolMsg.Content) < len(largeContent) {
+		t.Fatalf("tool message content = %d bytes, want the full %d bytes kept in context", len(toolMsg.Content), len(largeContent))
+	}
+	if strings.Contains(toolMsg.Content, "[offloaded:") {
+		t.Fatal("exempt tool result was offloaded despite ToolDataNoOffload")
+	}
+	// And nothing landed on disk.
+	if entries, err := os.ReadDir(offloadDir); err == nil && len(entries) != 0 {
+		t.Fatalf("offload dir has %d files, want none for an exempt result", len(entries))
+	}
+}

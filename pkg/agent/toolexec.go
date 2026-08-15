@@ -57,8 +57,15 @@ func toolMessageContent(result models.ToolResult) string {
 // result.Content with a compact reference (path + first/last 50 lines).
 // Returns true if offload occurred. Errors during file write are logged but
 // non-fatal — the result stays in-context (degraded but functional).
+// A handler that set models.ToolDataNoOffload in Data opts its result out —
+// for tools whose contract is delivering large content INTO context (code_map
+// include_content), offloading would defeat the entire call; those handlers
+// enforce their own output budget instead.
 func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bool {
 	if offloadDir == "" || len(result.Content) <= offloadThresholdBytes {
+		return false
+	}
+	if v, ok := result.Data[models.ToolDataNoOffload].(bool); ok && v {
 		return false
 	}
 	// CallID is unique per invocation, making a safe filename.
@@ -209,6 +216,12 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 	toolStarted := time.Now().UTC()
 	toolCtx := tools.WithSandbox(ctx, a.sandbox)
 	toolCtx = tools.WithThreadID(toolCtx, sessionID)
+	// Window-aware handlers (code_map include_content) size their output
+	// budget against the actual model window instead of a global constant —
+	// a 1M-window model can afford a far larger pull than a 128k one.
+	if a.contextWindow > 0 {
+		toolCtx = tools.WithContextWindow(toolCtx, a.contextWindow)
+	}
 	if a.userInteraction != nil {
 		toolCtx = tools.WithUserInteraction(toolCtx, a.userInteraction)
 	}

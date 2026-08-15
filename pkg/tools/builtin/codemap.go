@@ -8,8 +8,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // symbol is a single extracted declaration: its 1-based line and a cleaned
@@ -22,6 +25,18 @@ type symbol struct {
 
 const (
 	codeMapDefaultMaxFiles = 100
+	// codeMapFallbackContentBudget is the combined source-byte budget for an
+	// include_content result when no context window is known (standalone
+	// handler calls, tests). With a window it is ignored: the budget derives
+	// from the window instead (see resolveContentBudget). Either way the
+	// budget replaces the offload threshold as include_content's size guard,
+	// because offloading would write the very content the caller asked to
+	// have in context out to a file and leave a stub behind.
+	codeMapFallbackContentBudget = 100_000
+	// bytesPerToken converts the token budget back to source bytes for the
+	// window-derived budget (~4 source bytes per token is the usual
+	// code-mix estimate).
+	bytesPerToken = 4
 	// Directories folded out of the map: build artifacts and dependency trees
 	// carry no navigational value and dominate token cost. Mirrors the skip
 	// lists in find.go / grep.go, plus a few common generated dirs.
@@ -171,7 +186,8 @@ func cleanSignature(line string) string {
 type codeMapFile struct {
 	rel     string
 	abs     string
-	lines   int // total line count (0 when the file could not be read)
+	lines   int    // total line count (0 when the file could not be read)
+	content string // full source, kept for include_content rendering
 	symbols []symbol
 }
 
@@ -191,15 +207,19 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 
 	depth, _ := args["depth"].(string)
 	depth = strings.TrimSpace(strings.ToLower(depth))
-	if depth != "symbols" {
+	switch depth {
+	case "symbols", "api":
+	default:
 		depth = "tree"
 	}
 
 	maxFiles := codeMapDefaultMaxFiles
-	if v, ok := args["max_files"].(float64); ok && int(v) > 0 {
-		maxFiles = int(v)
+	if v := argPositiveInt(args["max_files"]); v > 0 {
+		maxFiles = v
 	}
 	includeHidden, _ := args["include_hidden"].(bool)
+	includeContent, _ := args["include_content"].(bool)
+	contentBudget := resolveContentBudget(ctx, args)
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -216,6 +236,15 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 			}, nil
 		}
 		f := readCodeMapFile(path, filepath.Base(path))
+		if includeContent {
+			// Full source of one file, still budget-guarded (a single huge
+			// generated file should not silently flood the context).
+			out := renderWithContent(ctx, []codeMapFile{f}, contentBudget)
+			return codeMapResult(call, out, 1, 1, false, "content"), nil
+		}
+		if depth == "api" {
+			f.symbols = exportedSymbols(filepath.Ext(path), f.symbols)
+		}
 		content := renderSymbols(ctx, []codeMapFile{f}, false)
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: content}, nil
 	}
@@ -234,26 +263,60 @@ func CodeMapHandler(ctx context.Context, call models.ToolCall) (models.ToolResul
 
 	truncated := total > len(files)
 	var content string
-	if depth == "symbols" {
+	switch {
+	case includeContent:
+		content = renderWithContent(ctx, files, contentBudget)
+	case depth == "symbols":
 		content = renderSymbols(ctx, files, true)
-	} else {
+	case depth == "api":
+		apiFiles := make([]codeMapFile, len(files))
+		for i, f := range files {
+			f.symbols = exportedSymbols(filepath.Ext(f.abs), f.symbols)
+			apiFiles[i] = f
+		}
+		content = renderSymbols(ctx, apiFiles, true)
+	default:
 		content = renderTree(files)
 	}
 	if truncated {
 		content += fmt.Sprintf("\n[Showing %d of %d files. Narrow with path= or raise max_files.]", len(files), total)
 	}
+	if includeContent {
+		content += "\n[Use depth=api for exported-API outlines only, or drop include_content for structure.]"
+	}
 
+	data := map[string]any{
+		"file_count": len(files),
+		"total":      total,
+		"truncated":  truncated,
+		"depth":      depth,
+	}
+	if includeContent {
+		data["content_bytes"] = len(content)
+		// A full-source result is exactly what the caller asked to have IN
+		// context — flag it so the agent's offload path (which would write
+		// it to disk and leave a stub) leaves it alone. The content budget
+		// above is the size guard instead.
+		data[models.ToolDataNoOffload] = true
+	}
+	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: content, Data: data}, nil
+}
+
+// codeMapResult is the single-file include_content return shape.
+func codeMapResult(call models.ToolCall, content string, files, total int, truncated bool, depth string) models.ToolResult {
 	return models.ToolResult{
 		CallID:   call.ID,
 		ToolName: call.Name,
 		Content:  content,
 		Data: map[string]any{
-			"file_count": len(files),
+			"file_count": files,
 			"total":      total,
 			"truncated":  truncated,
 			"depth":      depth,
+			// Same no-offload contract as the directory path above.
+			models.ToolDataNoOffload: true,
 		},
-	}, nil
+	}
 }
 
 // walkCodeMap collects recognized code files under root, folding build/vendor
@@ -313,10 +376,120 @@ func readCodeMapFile(abs, rel string) codeMapFile {
 	if err != nil {
 		return f
 	}
-	content := string(data)
-	f.lines = strings.Count(content, "\n") + 1
-	f.symbols = extractSymbols(content, filepath.Ext(abs))
+	f.content = string(data)
+	f.lines = strings.Count(f.content, "\n") + 1
+	f.symbols = extractSymbols(f.content, filepath.Ext(abs))
 	return f
+}
+
+// resolveContentBudget is include_content's size limit, in source bytes.
+// Resolution order: an explicit max_total_bytes argument (the model or the
+// caller narrows or widens deliberately) > a window-derived budget (10% of
+// the model's context window, converted at ~4 bytes/token — one tool result
+// should never crowd out the conversation around it) > the static fallback
+// when no window is known.
+func resolveContentBudget(ctx context.Context, args map[string]any) int {
+	if v := argPositiveInt(args["max_total_bytes"]); v > 0 {
+		return v
+	}
+	if window, ok := tools.ContextWindowFromContext(ctx); ok {
+		return window / 10 * bytesPerToken
+	}
+	return codeMapFallbackContentBudget
+}
+
+// argPositiveInt coerces a decoded-JSON numeric argument to a positive int.
+// Model-issued calls arrive as float64 via JSON, but in-process callers
+// (tests, programmatic use) hand over int — accept both so the parameter
+// cannot silently fall back to its default depending on the caller.
+func argPositiveInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	default:
+		return 0
+	}
+}
+
+// renderWithContent emits each file's full source under a header line, in
+// walk order, until the byte budget is exhausted — files past the budget (or
+// individually oversized ones) degrade to the one-line tree entry so the
+// model sees what exists and can re-scope with a narrower path= instead of
+// silently missing files.
+func renderWithContent(ctx context.Context, files []codeMapFile, budget int) string {
+	var b strings.Builder
+	used := 0
+	included, listedOnly := 0, 0
+	for _, f := range files {
+		display := displayVirtualPath(ctx, f.abs)
+		if len(f.content) == 0 {
+			fmt.Fprintf(&b, "%s  (unreadable)\n", display)
+			continue
+		}
+		if used+len(f.content) > budget {
+			fmt.Fprintf(&b, "%s  (%d lines) [content omitted: budget exhausted — narrow path= or raise max_total_bytes]\n", display, f.lines)
+			listedOnly++
+			continue
+		}
+		used += len(f.content)
+		included++
+		fmt.Fprintf(&b, "\n===== %s (%d lines) =====\n%s\n", display, f.lines, f.content)
+	}
+	fmt.Fprintf(&b, "\n[%d files with content (%d bytes), %d listed only; budget %d]\n", included, used, listedOnly, budget)
+	return b.String()
+}
+
+// exportedSymbols filters a file's declarations down to its public API for
+// the depth=api outline. Languages without a usable exported-marker rule (C,
+// Ruby) keep everything — a superset outline degrades gracefully, a missing
+// one does not.
+func exportedSymbols(ext string, syms []symbol) []symbol {
+	lang := extToLang(ext)
+	out := syms[:0:0]
+	for _, s := range syms {
+		if isExportedDecl(lang, s.Text) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// isExportedDecl reports whether a cleaned declaration line is part of the
+// module's public surface, by language convention.
+func isExportedDecl(lang, sig string) bool {
+	t := strings.TrimSpace(sig)
+	f := strings.Fields(t)
+	switch lang {
+	case "zig", "rust":
+		return strings.HasPrefix(t, "pub ")
+	case "go":
+		// func Foo / type Foo — the identifier after the keyword starts
+		// with an uppercase rune.
+		if len(f) >= 2 {
+			// skip receiver forms: func (b B) M
+			name := f[1]
+			if strings.HasPrefix(name, "(") && len(f) >= 4 {
+				name = f[3]
+			}
+			r, _ := utf8.DecodeRuneInString(name)
+			return unicode.IsUpper(r)
+		}
+		return false
+	case "python":
+		// def name / class Name — exported unless underscore-prefixed.
+		if len(f) >= 2 {
+			return !strings.HasPrefix(f[1], "_")
+		}
+		return false
+	case "js", "ts":
+		return strings.HasPrefix(t, "export ")
+	case "java", "php":
+		return strings.HasPrefix(t, "public ")
+	default:
+		return true
+	}
 }
 
 // renderTree lists each file with its symbol count. Cheap orientation without
@@ -357,16 +530,18 @@ func renderSymbols(ctx context.Context, files []codeMapFile, hint bool) string {
 func CodeMapTool() models.Tool {
 	return models.Tool{
 		Name:         "code_map",
-		Description:  "Map a codebase's structure without reading full files: lists source files with line counts and their function/type/class/global-var signatures with line numbers. Use this FIRST when exploring an unfamiliar repo or sizing up files (instead of wc -l / cat / grep for symbols). depth=tree (default) shows files with line and symbol counts; depth=symbols shows signatures. Then read_file with start_line/end_line to see an implementation.",
+		Description:  "Map a codebase's structure without reading full files: lists source files with line counts and their function/type/class/global-var signatures with line numbers. Use this FIRST when exploring an unfamiliar repo or sizing up files (instead of wc -l / cat / grep for symbols). depth=tree (default) shows files with line and symbol counts; depth=symbols shows signatures; depth=api shows EXPORTED declarations only (architecture at a glance, fewest tokens). include_content=true inlines each file's FULL source — one call brings a whole subtree's code into context instead of many read_file round-trips, bounded by max_total_bytes. Then read_file with start_line/end_line to see an implementation.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":           map[string]any{"type": "string", "description": "Directory or file to map (default: current directory). Scope to a subtree to reduce output."},
-				"depth":          map[string]any{"type": "string", "description": "'tree' (default: files + symbol counts) or 'symbols' (signatures with line numbers)"},
-				"max_files":      map[string]any{"type": "number", "description": "Maximum files to include (default: 100); excess is paginated with a notice"},
-				"include_hidden": map[string]any{"type": "boolean", "description": "Descend into dotted/build/vendor dirs (default: false)"},
+				"path":            map[string]any{"type": "string", "description": "Directory or file to map (default: current directory). Scope to a subtree to reduce output."},
+				"depth":           map[string]any{"type": "string", "description": "'tree' (default: files + line and symbol counts), 'symbols' (signatures with line numbers), or 'api' (exported declarations only — architecture at a glance, fewest tokens)"},
+				"include_content": map[string]any{"type": "boolean", "description": "Inline each file's full source (default: false). One call brings a whole subtree's code into context instead of many read_file round-trips; bounded by max_total_bytes."},
+				"max_total_bytes": map[string]any{"type": "number", "description": "Total content budget in bytes when include_content=true (default: 100000); files past the budget are listed without content"},
+				"max_files":       map[string]any{"type": "number", "description": "Maximum files to include (default: 100); excess is paginated with a notice"},
+				"include_hidden":  map[string]any{"type": "boolean", "description": "Descend into dotted/build/vendor dirs (default: false)"},
 			},
 			"required": []any{},
 		},

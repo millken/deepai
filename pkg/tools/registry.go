@@ -26,6 +26,7 @@ const (
 	runtimeContextKey              contextKey = "tool_runtime_context"
 	userInteractionContextKey      contextKey = "tool_user_interaction"
 	remainingTokenBudgetContextKey contextKey = "tool_remaining_token_budget"
+	contextWindowContextKey        contextKey = "tool_context_window"
 )
 
 // UserInteraction handles prompting the human user for input.
@@ -54,6 +55,29 @@ func UserInteractionFromContext(ctx context.Context) UserInteraction {
 // exhausted) is a valid, meaningful value, distinguished from "no parent
 // budget configured at all" via RemainingTokenBudgetFromContext's second
 // return.
+// WithContextWindow attaches the model's context-window size (in tokens) to
+// ctx so a tool can bound its output relative to what the model can hold
+// (code_map's include_content budget is derived from it). Injected by the
+// agent's tool dispatch; standalone handler calls see ok=false and fall
+// back to a static default.
+func WithContextWindow(ctx context.Context, windowTokens int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, contextWindowContextKey, windowTokens)
+}
+
+// ContextWindowFromContext returns the injected context window and whether
+// one was present. ok=false means the dispatching agent had no window
+// configured (or the ctx never flowed through an agent dispatch).
+func ContextWindowFromContext(ctx context.Context) (int, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	w, ok := ctx.Value(contextWindowContextKey).(int)
+	return w, ok && w > 0
+}
+
 func WithRemainingTokenBudget(ctx context.Context, remaining int) context.Context {
 	if ctx == nil {
 		ctx = context.Background()

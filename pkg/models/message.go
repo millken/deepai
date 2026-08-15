@@ -79,6 +79,14 @@ func (c ToolCall) Validate() error {
 	return nil
 }
 
+// ToolDataNoOffload is the Data key a tool handler sets to exempt its result
+// from the agent's large-result offload path: the offload would write the
+// content to disk and leave a stub in context, which is exactly wrong for a
+// tool whose contract is "bring this content INTO context" (code_map with
+// include_content). Such handlers bound their own output size instead of
+// relying on the offload threshold.
+const ToolDataNoOffload = "offload_exempt"
+
 // ToolResult stores the normalized outcome of a tool execution.
 type ToolResult struct {
 	CallID      string         `json:"call_id"`
