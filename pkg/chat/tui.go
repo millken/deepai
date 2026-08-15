@@ -23,6 +23,9 @@ import (
 	"github.com/millken/deepai/pkg/subagent"
 )
 
+// Spinner characters for subagent tasks (distributed phases)
+var subagentSpinners = []string{"⠋", "⠙", "⠹", "⠸"}
+
 // TUI is a single, persistent Bubble Tea program that owns the chat session for
 // its entire lifetime. Completed output is committed to the terminal's native
 // scrollback via tea.Println; only the bottom region (streaming line, status,
@@ -283,8 +286,12 @@ type tuiModel struct {
 // subagentTaskLine is one entry in tuiModel.subagentTasks: the live status
 // line for a single in-flight subagent task.
 type subagentTaskLine struct {
-	taskID string
-	line   string
+	taskID      string
+	line        string
+	description string
+	agentType   string    // e.g., "coder", "tester", "bash"
+	startedAt   time.Time
+	spinnerIdx  int
 }
 
 // maxLiveSubagentLines caps how many subagent status lines View() renders in
@@ -362,6 +369,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case elapsedTickMsg:
 		if m.agentActive {
 			m.elapsed = time.Since(m.turnStart)
+			// Update spinner indices for all subagent tasks to create animation
+			for i := range m.subagentTasks {
+				m.subagentTasks[i].spinnerIdx = (m.subagentTasks[i].spinnerIdx + 1) % 4
+			}
 			return m, m.elapsedTick()
 		}
 		return m, nil
@@ -794,7 +805,16 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if len([]rune(desc)) > 80 {
 			desc = string([]rune(desc)[:77]) + "..."
 		}
-		m.setSubagentLine(evt.TaskID, "  ↳ [subagent] "+desc)
+		// Extract agent type from description if available
+		agentType := ""
+		if strings.Contains(desc, "[") && strings.Contains(desc, "]") {
+			start := strings.Index(desc, "[") + 1
+			end := strings.Index(desc[start:], "]")
+			if end > 0 {
+				agentType = desc[start : start+end]
+			}
+		}
+		m.setSubagentLineWithInfo(evt.TaskID, "  ↳ [subagent] "+desc, desc, agentType)
 		return nil
 	case "task_running":
 		msg := strings.TrimSpace(evt.Message)
@@ -804,7 +824,7 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if d := strings.TrimSpace(evt.Description); d != "" {
 			msg = "[" + d + "] " + msg
 		}
-		m.setSubagentLine(evt.TaskID, "  ↳ "+msg)
+		m.updateSubagentLine(evt.TaskID, "  ↳ "+msg)
 		return nil
 	case "task_completed":
 		m.clearSubagentLine(evt.TaskID)
@@ -834,6 +854,30 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 	return nil
 }
 
+// setSubagentLineWithInfo creates a new task entry with full metadata.
+// Called only when a task first starts (task_started event).
+func (m *tuiModel) setSubagentLineWithInfo(taskID, line, description, agentType string) {
+	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{
+		taskID:      taskID,
+		line:        line,
+		description: description,
+		agentType:   agentType,
+		startedAt:   time.Now(),
+		spinnerIdx:  len(m.subagentTasks) % 4, // Distribute spinner phases
+	})
+}
+
+// updateSubagentLine updates an existing task's line text.
+// Called for task_running events to update progress.
+func (m *tuiModel) updateSubagentLine(taskID, line string) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks[i].line = line
+			return
+		}
+	}
+}
+
 // setSubagentLine appends a new live status line for taskID, or updates it
 // in place if taskID already has an entry (order-preserving).
 func (m *tuiModel) setSubagentLine(taskID, line string) {
@@ -843,7 +887,19 @@ func (m *tuiModel) setSubagentLine(taskID, line string) {
 			return
 		}
 	}
-	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{taskID: taskID, line: line})
+	// New task: record start time and extract description from line
+	desc := line
+	if idx := strings.Index(line, "[subagent]"); idx >= 0 {
+		// Extract description after "[subagent] " prefix
+		desc = strings.TrimSpace(line[idx+len("[subagent]"):])
+	}
+	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{
+		taskID:      taskID,
+		line:        line,
+		description: desc,
+		startedAt:   time.Now(),
+		spinnerIdx:  len(m.subagentTasks) % 4, // Distribute spinner phases
+	})
 }
 
 // clearSubagentLine removes the live status line for taskID, if present,
@@ -1010,26 +1066,44 @@ func (m *tuiModel) View() tea.View {
 		b.WriteString("\n")
 	}
 
-	// Subagent live status (updates in place, not scrollback), one line per
-	// in-flight task, in insertion (start) order. Capped at
-	// maxLiveSubagentLines so a wide fan-out can't push the input prompt
-	// off-screen; every task beyond the cap is still tracked in
-	// m.subagentTasks (terminal events for hidden tasks still fire and
-	// commit to scrollback normally) — only the live rendering is bounded.
-	visible := m.subagentTasks
-	overflow := 0
-	if len(visible) > maxLiveSubagentLines {
-		overflow = len(visible) - maxLiveSubagentLines
-		visible = visible[:maxLiveSubagentLines]
-	}
-	for _, task := range visible {
-		b.WriteString(m.styles.Dim.Render(task.line))
-		b.WriteString("\n")
-	}
-	if overflow > 0 {
-		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more", overflow)))
-		b.WriteString("\n")
-	}
+		// Subagent live status (updates in place, not scrollback), one line per
+		// in-flight task, in insertion (start) order. Capped at
+		// maxLiveSubagentLines so a wide fan-out can't push the input prompt
+		// off-screen; every task beyond the cap is still tracked in
+		// m.subagentTasks (terminal events for hidden tasks still fire and
+		// commit to scrollback normally) — only the live rendering is bounded.
+		visible := m.subagentTasks
+		overflow := 0
+		if len(visible) > maxLiveSubagentLines {
+			overflow = len(visible) - maxLiveSubagentLines
+			visible = visible[:maxLiveSubagentLines]
+		}
+		for _, task := range visible {
+			// Calculate elapsed time for this task
+			elapsed := time.Since(task.startedAt)
+			elapsedSec := int(elapsed.Seconds())
+			
+			// Get spinner character for this task
+			spinChar := subagentSpinners[task.spinnerIdx]
+			
+			// Build enhanced line with spinner, type, and duration
+			var line string
+			if task.agentType != "" {
+				line = fmt.Sprintf("  ↳ %s [%s] %s (%ds)", spinChar, task.agentType, task.description, elapsedSec)
+			} else if task.line != "" {
+				line = fmt.Sprintf("%s (%ds)", task.line, elapsedSec)
+			} else {
+				line = fmt.Sprintf("  ↳ %s %s (%ds)", spinChar, task.description, elapsedSec)
+			}
+			b.WriteString(m.styles.Dim.Render(line))
+			b.WriteString("\n")
+		}
+		if overflow > 0 {
+			// Show summary with total count
+			totalTasks := len(m.subagentTasks)
+			b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more [total: %d tasks]", overflow, totalTasks)))
+			b.WriteString("\n")
+		}
 
 	// Input region.
 	if m.inputVisible {
