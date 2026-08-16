@@ -417,7 +417,7 @@ func (p *Package) WriteTo(dest string) error {
 	//
 	// The probe is deliberately NOT syscall.Umask(0)+restore: that call
 	// mutates PROCESS-GLOBAL state, and deepai executes tools concurrently
-	// (see allParallelSafe in pkg/agent/react.go) and runs a subagent pool,
+	// (see partitionToolCalls in pkg/agent/toolexec.go) and runs a subagent pool,
 	// so any file another goroutine created inside that window would be
 	// produced with no umask applied. Creating and immediately removing a
 	// throwaway probe file achieves the same read without ever touching

@@ -1391,7 +1391,7 @@ func (p *serialRepeatSuccessProvider) Stream(ctx context.Context, req llm.ChatRe
 // TestRepeatBreaker_HintDeferredToBatchEnd_SerialPath is the serial-path
 // counterpart of TestRepeatBreaker_HintDeferredToBatchEnd: the "secho" tool
 // is registered WITHOUT ParallelSafe, so a batch of 6 identical calls to it
-// forces a.allParallelSafe(toolCalls) to be false and the whole batch runs
+// partitions into 6 solo segments (no parallel run), and the whole batch runs
 // through the SERIAL tool-execution loop, not the parallel one. It verifies
 // the same invariant — every RoleTool message of the batch must precede the
 // batch's RoleHuman hint message — on that other code path.

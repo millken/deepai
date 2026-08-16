@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,24 @@ import (
 // Generous relative to any real provider's chunk cadence, so it only trips on
 // a genuinely stalled request.
 const defaultStreamIdleTimeout = 2 * time.Minute
+
+// defaultMaxToolConcurrency bounds how many calls of a single parallel
+// segment execute at once. 10 matches Claude Code's own default
+// (CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY); DEEPAI_MAX_TOOL_CONCURRENCY
+// overrides it here.
+const defaultMaxToolConcurrency = 10
+
+// resolveMaxToolConcurrency reads the env override once per Agent. A missing,
+// unparseable, or non-positive value falls back to the default rather than
+// silently disabling the cap.
+func resolveMaxToolConcurrency() int {
+	if raw := strings.TrimSpace(os.Getenv("DEEPAI_MAX_TOOL_CONCURRENCY")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxToolConcurrency
+}
 
 // Agent runs our custom ReAct loop while delegating model streaming and tool schemas to the LLM provider abstraction.
 type Agent struct {
@@ -49,11 +68,18 @@ type Agent struct {
 	// defaultStreamIdleTimeout; not exposed via AgentConfig — tests in this
 	// package set the field directly.
 	streamIdleTimeout time.Duration
-	events            chan AgentEvent
-	runMu             sync.Mutex
-	eventsMu          sync.RWMutex
-	eventsClosed      bool
-	started           bool
+	// maxToolConcurrency caps how many calls of one parallel segment run at
+	// once. Unbounded fan-out puts every call of a wide batch on the provider
+	// (or the filesystem) simultaneously; a cap keeps a 12-way delegation from
+	// behaving differently in kind from a 3-way one. Defaults to
+	// defaultMaxToolConcurrency, overridable via DEEPAI_MAX_TOOL_CONCURRENCY;
+	// tests in this package set the field directly.
+	maxToolConcurrency int
+	events             chan AgentEvent
+	runMu              sync.Mutex
+	eventsMu           sync.RWMutex
+	eventsClosed       bool
+	started            bool
 
 	// Context compaction
 	contextWindow       int
@@ -210,6 +236,7 @@ func New(cfg AgentConfig) *Agent {
 		maxTokensBudget:     cfg.MaxTokensBudget,
 		requestTimeout:      requestTimeout,
 		streamIdleTimeout:   defaultStreamIdleTimeout,
+		maxToolConcurrency:  resolveMaxToolConcurrency(),
 		events:              make(chan AgentEvent, 128),
 		contextWindow:       cfg.ContextWindow,
 		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
@@ -786,19 +813,34 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		}
 
 		// Tool calls execution.
-		// When ALL tool calls in this batch are declared ParallelSafe, run
-		// them concurrently and only serialize the surrounding event/message
-		// bookkeeping. A single non-parallel-safe call (bash, edit_file,
-		// skill, ...) forces the whole batch to run sequentially. ParallelSafe
-		// is a handler-level thread-safety promise, not a side-effect-freedom
-		// promise: a ParallelSafe tool's Go code has no shared mutable state
-		// that concurrent invocations could race on, but its effects (e.g.
-		// task spawning subagents that write files or run git) can still
-		// collide with each other across goroutines. That cross-goroutine
-		// side-effect discipline is governed by prompt-level constraints
-		// (see delegationStrategy's "Parallel delegation" section), not by
-		// this loop.
-		if a.allParallelSafe(toolCalls) && len(toolCalls) > 1 {
+		// The batch is partitioned into maximal runs of CONSECUTIVE
+		// ParallelSafe calls (see partitionToolCalls); each run executes
+		// concurrently, each unsafe call executes alone, and the runs execute
+		// in batch order so relative ordering is untouched. Requiring the
+		// WHOLE batch to be parallel-safe meant a single bash call alongside
+		// four task calls serialized all four subagents.
+		//
+		// ParallelSafe is a handler-level thread-safety promise, not a
+		// side-effect-freedom promise: a ParallelSafe tool's Go code has no
+		// shared mutable state that concurrent invocations could race on, but
+		// its effects (e.g. task spawning subagents that write files or run
+		// git) can still collide with each other across goroutines. That
+		// cross-goroutine side-effect discipline is governed by prompt-level
+		// constraints (see delegationStrategy's "Parallel delegation"
+		// section), not by this loop.
+		segments := a.partitionToolCalls(toolCalls)
+		hasParallelRun := false
+		for _, seg := range segments {
+			if seg.parallel && seg.end-seg.start > 1 {
+				hasParallelRun = true
+				break
+			}
+		}
+		if hasParallelRun {
+			if len(segments) > 1 {
+				a.logger.Debug("tool batch partitioned",
+					"calls", len(toolCalls), "segments", len(segments))
+			}
 			runningCalls := make([]models.ToolCall, len(toolCalls))
 			for i, call := range toolCalls {
 				emit(AgentEvent{
@@ -854,24 +896,49 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 
 			results := make([]models.ToolResult, len(toolCalls))
-			var wg sync.WaitGroup
-			for i, call := range toolCalls {
-				i, call := i, call
-				if overCap[i] {
-					results[i] = synthesizeTaskCapResult(call)
+			execFor := func(i int, call models.ToolCall) context.Context {
+				if call.Name == "task" && taskCount > 1 {
+					return perTaskCtx
+				}
+				return dispatchCtx
+			}
+			// Segments run in batch order; only the parallel ones fan out.
+			// This preserves the relative order of every call while still
+			// overlapping the consecutive parallel-safe runs — a lone bash
+			// call in a batch of task calls no longer serializes them all.
+			limit := a.maxToolConcurrency
+			if limit <= 0 {
+				limit = defaultMaxToolConcurrency
+			}
+			for _, seg := range segments {
+				if !seg.parallel || seg.end-seg.start == 1 {
+					for i := seg.start; i < seg.end; i++ {
+						if overCap[i] {
+							results[i] = synthesizeTaskCapResult(toolCalls[i])
+							continue
+						}
+						results[i] = a.runOneTool(execFor(i, toolCalls[i]), sessionID, toolCalls[i])
+					}
 					continue
 				}
-				execCtx := dispatchCtx
-				if call.Name == "task" && taskCount > 1 {
-					execCtx = perTaskCtx
+				var wg sync.WaitGroup
+				sem := make(chan struct{}, limit)
+				for i := seg.start; i < seg.end; i++ {
+					i, call := i, toolCalls[i]
+					if overCap[i] {
+						results[i] = synthesizeTaskCapResult(call)
+						continue
+					}
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						results[i] = a.runOneTool(execFor(i, call), sessionID, call)
+					}()
 				}
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					results[i] = a.runOneTool(execCtx, sessionID, call)
-				}()
+				wg.Wait()
 			}
-			wg.Wait()
 
 			// Per-result bookkeeping (usage rollup, offload, message
 			// append, metrics, events, breaker observation) is identical to

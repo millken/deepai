@@ -453,18 +453,44 @@ func (b *toolBatchState) finishBatch() {
 	}
 }
 
-// allParallelSafe reports whether every call in the batch resolves to a
-// registered tool that has declared ParallelSafe=true. Unknown tools and any
-// false flag short-circuit to false so the safe (sequential) path is taken.
-func (a *Agent) allParallelSafe(calls []models.ToolCall) bool {
+// toolSegment is a half-open run [start,end) of a batch that executes as a
+// unit: concurrently when parallel, otherwise one call at a time.
+type toolSegment struct {
+	start, end int
+	parallel   bool
+}
+
+// callParallelSafe fails closed: an unregistered tool is never assumed safe
+// to run alongside anything else.
+func (a *Agent) callParallelSafe(c models.ToolCall) bool {
 	if a.tools == nil {
 		return false
 	}
-	for _, c := range calls {
-		t := a.tools.Get(c.Name)
-		if t == nil || !t.ParallelSafe {
-			return false
+	t := a.tools.Get(c.Name)
+	return t != nil && t.ParallelSafe
+}
+
+// partitionToolCalls splits a batch into maximal runs of CONSECUTIVE
+// parallel-safe calls, with every unsafe call standing alone.
+//
+// Requiring the whole batch to be parallel-safe meant one
+// bash call alongside four task calls ran all five strictly sequentially —
+// four subagents serialized by an unrelated command in the same turn.
+// Partitioning restores concurrency where it is safe while preserving the
+// batch's relative order exactly: segments run in order, so a call never
+// moves ahead of or behind a neighbour it might depend on. Claude Code
+// partitions identically (services/tools/toolOrchestration.ts,
+// partitionToolCalls: "a single non-read-only tool, or multiple consecutive
+// read-only tools").
+func (a *Agent) partitionToolCalls(calls []models.ToolCall) []toolSegment {
+	var segs []toolSegment
+	for i, c := range calls {
+		safe := a.callParallelSafe(c)
+		if safe && len(segs) > 0 && segs[len(segs)-1].parallel && segs[len(segs)-1].end == i {
+			segs[len(segs)-1].end = i + 1
+			continue
 		}
+		segs = append(segs, toolSegment{start: i, end: i + 1, parallel: safe})
 	}
-	return true
+	return segs
 }
