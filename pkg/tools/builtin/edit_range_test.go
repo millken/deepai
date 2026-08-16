@@ -52,6 +52,21 @@ func TestEditFile_RangeStillRejectsAmbiguityInsideWindow(t *testing.T) {
 	}
 }
 
+func TestEditFile_RangeLabelCorrectWithoutTrailingNewline(t *testing.T) {
+	// The window is lines 2-3. Counting newlines in the window prefix
+	// undercounts the last line when the file has no final "\n", producing
+	// "matches 2 times in lines 2-2" — a two-match count inside a window that,
+	// as described, holds one line.
+	path := writeTestFile(t, "foo\nfoo\nfoo")
+	_, err := editRangeCall(t, path, "foo", "bar", map[string]any{"start_line": float64(2)})
+	if err == nil {
+		t.Fatal("expected an ambiguity error")
+	}
+	if !strings.Contains(err.Error(), "lines 2-3") {
+		t.Fatalf("window label is wrong for a file with no trailing newline: %v", err)
+	}
+}
+
 func TestEditFile_RangeExcludesMatchOutsideWindow(t *testing.T) {
 	path := writeTestFile(t, "alpha\nbeta\ngamma\n")
 

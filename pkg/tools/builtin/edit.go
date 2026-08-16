@@ -55,8 +55,9 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	// An optional line window scopes matching, so a short old_string that repeats
 	// elsewhere in the file still resolves uniquely without replace_all.
 	winStart, winEnd := 0, len(content)
+	var firstLine, lastLine int
 	if hasStart || hasEnd {
-		winStart, winEnd, err = lineWindow(content, startLine, endLine, displayPath)
+		winStart, winEnd, firstLine, lastLine, err = lineWindow(content, startLine, endLine, displayPath)
 		if err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 		}
@@ -65,12 +66,11 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	// A range covering the whole file is not a window: there is no "outside".
 	windowed := winStart > 0 || winEnd < len(content)
 	// Match counts reported to the model are region-scoped, so name the region.
+	// The bounds come from lineWindow rather than a newline recount, which
+	// undercounts the final line of a file that does not end in a newline.
 	scope := displayPath
 	if windowed {
-		scope = fmt.Sprintf("lines %d-%d of %s",
-			1+strings.Count(content[:winStart], "\n"),
-			strings.Count(content[:winEnd], "\n"),
-			displayPath)
+		scope = fmt.Sprintf("lines %d-%d of %s", firstLine, lastLine, displayPath)
 	}
 
 	type candidate struct {
@@ -86,12 +86,17 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	// but only after literal matching failed, so genuine tab-separated data is
 	// never rewritten by this path.
 	if sOld, ok := stripLineNumberPrefixes(oldStr); ok && sOld != oldStr {
-		sNew := newStr
-		if stripped, ok := stripLineNumberPrefixes(newStr); ok {
-			sNew = stripped
-		}
-		if sOld != sNew {
-			candidates = append(candidates, candidate{sOld, sNew, "line-number prefixes stripped"})
+		sNew, newStripped := stripLineNumberPrefixes(newStr)
+		// If new_string carries prefixes but does not strip cleanly — deleting a
+		// line makes its numbering jump, which is the common case — there is no
+		// safe replacement text. Using it as-is would write the visible line
+		// numbers into the file while old_string matched the real text, i.e.
+		// silent corruption reported as success. Skip the candidate and let the
+		// edit fail instead.
+		if newStripped || !looksLineNumbered(newStr) {
+			if sOld != sNew {
+				candidates = append(candidates, candidate{sOld, sNew, "line-number prefixes stripped"})
+			}
 		}
 	}
 
@@ -187,14 +192,16 @@ func optionalLineArg(args map[string]any, key string) (int, bool, error) {
 }
 
 // lineWindow converts a 1-based inclusive line range into a byte span of
-// content. The span covers whole lines, including line end's terminating
-// newline. start<=0 means "from line 1"; end<=0 means "through EOF". Reversed
-// bounds are swapped and an over-long end is clamped, matching read_file.
-func lineWindow(content string, start, end int, displayPath string) (int, int, error) {
+// content, returning the span plus the resolved first/last line numbers so
+// callers can describe the window without recounting newlines. The span covers
+// whole lines, including line end's terminating newline. start<=0 means "from
+// line 1"; end<=0 means "through EOF". Reversed bounds are swapped and an
+// over-long end is clamped, matching read_file.
+func lineWindow(content string, start, end int, displayPath string) (from, to, firstLine, lastLine int, err error) {
 	starts := lineStartOffsets(content)
 	total := len(starts)
 	if total == 0 {
-		return 0, 0, fmt.Errorf("%s is empty; drop start_line/end_line", displayPath)
+		return 0, 0, 0, 0, fmt.Errorf("%s is empty; drop start_line/end_line", displayPath)
 	}
 	if start > 0 && end > 0 && start > end {
 		start, end = end, start
@@ -206,15 +213,15 @@ func lineWindow(content string, start, end int, displayPath string) (int, int, e
 		end = total
 	}
 	if start > total {
-		return 0, 0, fmt.Errorf("start_line %d is past the end of %s (%d lines)", start, displayPath, total)
+		return 0, 0, 0, 0, fmt.Errorf("start_line %d is past the end of %s (%d lines)", start, displayPath, total)
 	}
 
-	from := starts[start-1]
-	to := len(content)
+	from = starts[start-1]
+	to = len(content)
 	if end < total {
 		to = starts[end]
 	}
-	return from, to, nil
+	return from, to, start, end, nil
 }
 
 // lineStartOffsets returns the byte offset of each line's first character. A
@@ -272,6 +279,19 @@ func stripLineNumberPrefixes(s string) (string, bool) {
 		result += "\n"
 	}
 	return result, true
+}
+
+// looksLineNumbered reports whether any line of s carries a read_file-style
+// "<spaces><digits><TAB>" prefix. Used to tell "plain replacement text" apart
+// from "a transcript whose numbering did not parse", which must never be
+// written to a file verbatim.
+func looksLineNumbered(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		if _, _, ok := splitLineNumberPrefix(strings.TrimSuffix(line, "\r")); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // splitLineNumberPrefix parses "<spaces><digits><TAB><rest>", returning the

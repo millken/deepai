@@ -79,11 +79,15 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		// — the numbers are otherwise pasted straight into edit_file's old_string
 		// and can never match the file.
 		if lineNumbersSet && !withLineNumbers {
-			return models.ToolResult{
-				CallID:   call.ID,
-				ToolName: call.Name,
-				Content:  strings.Join(selected, "\n") + "\n",
-			}, nil
+			raw := strings.Join(selected, "\n")
+			// Terminate the span only where the file itself does. Inventing a
+			// final newline on a file that lacks one makes the span unmatchable
+			// when it is pasted into edit_file's old_string — which is the whole
+			// reason this mode exists.
+			if e < total || strings.HasSuffix(text, "\n") {
+				raw += "\n"
+			}
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: raw}, nil
 		}
 		var b strings.Builder
 		width := numWidth(e)

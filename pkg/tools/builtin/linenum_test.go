@@ -68,6 +68,35 @@ func TestEditFile_PaddedLineNumbersStripped(t *testing.T) {
 	}
 }
 
+func TestEditFile_NumberedNewStringWithGapNeverWritesPrefixes(t *testing.T) {
+	// Deleting a line makes new_string's numbering jump (3 is gone), so it does
+	// not strip. old_string still strips and matches, and a naive fallback of
+	// "use new_string as-is" writes the visible line numbers straight into the
+	// source file — silent corruption, reported as success. Failing the edit is
+	// the only safe outcome.
+	path := writeTestFile(t, "a\nb\nc\nd\n")
+	if _, err := editCall(t, path, "1\ta\n2\tb\n3\tc\n4\td", "1\ta\n2\tb\n4\td", false); err == nil {
+		t.Fatal("expected an error rather than writing line numbers into the file")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "a\nb\nc\nd\n" {
+		t.Fatalf("file was corrupted: %q", string(got))
+	}
+}
+
+func TestEditFile_UnnumberedNewStringStillAllowed(t *testing.T) {
+	// The ordinary case must keep working: numbered old_string, plain
+	// new_string carrying no line-number prefixes at all.
+	path := writeTestFile(t, "a\nb\nc\n")
+	if _, err := editCall(t, path, "1\ta\n2\tb", "x\ny", false); err != nil {
+		t.Fatalf("edit failed: %v", err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "x\ny\nc\n" {
+		t.Fatalf("got %q", string(got))
+	}
+}
+
 func TestEditFile_TSVContentPrefersLiteralMatch(t *testing.T) {
 	// File genuinely contains "<number>\t<value>" rows. A literal match must win
 	// so stripping never corrupts real tab-separated data.
@@ -130,6 +159,51 @@ func TestReadFile_RangeHonorsLineNumbersFalse(t *testing.T) {
 	}
 	if res.Content != "b\nc\nd\n" {
 		t.Fatalf("got %q, want clean range content", res.Content)
+	}
+}
+
+func TestReadFile_RangeRawSpanPreservesMissingFinalNewline(t *testing.T) {
+	// line_numbers=false exists so the span can be pasted into edit_file's
+	// old_string. Appending a newline the file does not have makes that paste
+	// unmatchable — defeating the entire point of the mode.
+	path := filepath.Join(t.TempDir(), "lines.txt")
+	if err := os.WriteFile(path, []byte("a\nb\nc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReadFileHandler(context.Background(), models.ToolCall{
+		ID: "r", Name: "read_file",
+		Arguments: map[string]any{
+			"path": path, "start_line": float64(2), "end_line": float64(3),
+			"line_numbers": false,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "b\nc" {
+		t.Fatalf("got %q, want %q (no invented trailing newline)", res.Content, "b\nc")
+	}
+}
+
+func TestReadFile_RangeRawSpanKeepsInteriorNewline(t *testing.T) {
+	// A range that stops before EOF still ends with the newline that separates
+	// it from the next line.
+	path := filepath.Join(t.TempDir(), "lines.txt")
+	if err := os.WriteFile(path, []byte("a\nb\nc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReadFileHandler(context.Background(), models.ToolCall{
+		ID: "r", Name: "read_file",
+		Arguments: map[string]any{
+			"path": path, "start_line": float64(1), "end_line": float64(2),
+			"line_numbers": false,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "a\nb\n" {
+		t.Fatalf("got %q, want %q", res.Content, "a\nb\n")
 	}
 }
 
