@@ -118,7 +118,10 @@ func (s *SessionCarry) ClearEditedFiles() {
 	}
 }
 
-func (s *SessionCarry) recordEditedFile(path string) {
+// RecordEditedFile adds one path to the edited-file set. The agent feeds it
+// from the tool-result path; the REPL may also seed it (e.g. a manual
+// /review). Same single-goroutine contract as the rest of the carry.
+func (s *SessionCarry) RecordEditedFile(path string) {
 	if s.editedFiles == nil {
 		s.editedFiles = make(map[string]struct{})
 	}
@@ -153,5 +156,5 @@ func (a *Agent) recordEditedFile(call models.ToolCall, result models.ToolResult)
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	a.session.recordEditedFile(path)
+	a.session.RecordEditedFile(path)
 }

@@ -58,6 +58,17 @@ type ReplConfig struct {
 	// MemoryRefineInterval is the gate cadence in turns, already resolved by the
 	// caller (see commands.resolveRefineInterval); 0 means "no gate".
 	MemoryRefineInterval int
+
+	// ReviewAfterEdit enables the adversarial post-edit review gate
+	// (docs/ADVERSARIAL_REVIEW_DESIGN.md). Default off — the gate blocks the
+	// turn synchronously and spends reviewer tokens, so it is an explicit
+	// opt-in until the detection-rate baseline justifies flipping the
+	// default (design §八-1).
+	ReviewAfterEdit bool
+	// ReviewTokenBudget caps each review subagent's total tokens; 0 = unlimited.
+	ReviewTokenBudget int
+	// ReviewTimeout bounds one review subagent run; 0 uses defaultReviewTimeout.
+	ReviewTimeout time.Duration
 }
 
 // fallbackExtractInterval is the turn cadence for unconditional async memory
@@ -154,6 +165,11 @@ type ChatRepl struct {
 	// orphanWaitOrDefault) — do not share this pointer with anything that
 	// could run concurrently with a turn (e.g. a subagent).
 	carry *agent.SessionCarry
+
+	// reviewNonGitWarned makes the "not a git worktree" review-gate warning
+	// (degraded attribution, no reviewer-write detection) fire once per
+	// session instead of once per edited turn.
+	reviewNonGitWarned bool
 
 	// orphanWait overrides the orphan-turn wait (see orphanWaitOrDefault)
 	// for tests. Zero (the field's default in every real ChatRepl, since
@@ -262,7 +278,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			autoContinue = false
 			r.ui.Info("  Resuming interrupted session...")
 			r.turn++
-			if err := r.runTurnWithSignal(parentCtx, r.continueTurn); err != nil {
+			if err := r.runEpisode(parentCtx, "Continue from where you left off.", r.continueTurn); err != nil {
 				if parentCtx.Err() != nil {
 					break
 				}
@@ -295,7 +311,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			if c, ok := r.cfg.Commands[cmd.Name]; ok {
 				r.turn++
 				body := Expand(c.Body, cmd.Args)
-				turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+				turnErr := r.runEpisode(parentCtx, body, func(ctx context.Context) error {
 					return r.runTurn(ctx, body, nil, false)
 				})
 				if turnErr != nil {
@@ -317,7 +333,10 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// without adding a new human message.
 		if isContinuationInput(line) && len(r.sess.Messages) > 0 {
 			r.turn++
-			if err := r.runTurnWithSignal(parentCtx, r.continueTurn); err != nil {
+			// The continuation phrase is a weak review anchor, but the gate
+			// still sees the full scoped diff; edits made in a continued
+			// turn must not escape review.
+			if err := r.runEpisode(parentCtx, "Continue from where you left off.", r.continueTurn); err != nil {
 				if parentCtx.Err() != nil {
 					break
 				}
@@ -335,7 +354,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// Capture images for this turn (may be nil).
 		turnImages := images
 
-		turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+		turnErr := r.runEpisode(parentCtx, line, func(ctx context.Context) error {
 			return r.runTurn(ctx, line, turnImages, false)
 		})
 		if turnErr != nil {

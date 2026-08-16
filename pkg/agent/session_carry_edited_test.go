@@ -101,7 +101,7 @@ func TestRecordEditedFileNilSessionIsNoop(t *testing.T) {
 func TestEditedFilesDedupSortAndClear(t *testing.T) {
 	s := NewSessionCarry()
 	for _, p := range []string{"/b.go", "/a.go", "/b.go"} {
-		s.recordEditedFile(p)
+		s.RecordEditedFile(p)
 	}
 	got := s.EditedFiles()
 	want := []string{"/a.go", "/b.go"}
@@ -114,7 +114,7 @@ func TestEditedFilesDedupSortAndClear(t *testing.T) {
 		t.Fatalf("EditedFiles() after clear = %v, want nil", got)
 	}
 	// Recording after a clear starts a fresh set.
-	s.recordEditedFile("/c.go")
+	s.RecordEditedFile("/c.go")
 	if got := s.EditedFiles(); len(got) != 1 || got[0] != "/c.go" {
 		t.Fatalf("EditedFiles() after clear+record = %v, want [/c.go]", got)
 	}
