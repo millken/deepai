@@ -1046,6 +1046,8 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.handleImageDetailCommand(cmd.Args)
 	case "refine":
 		r.handleRefineCommand(parentCtx, cmd.Args)
+	case "review":
+		r.handleReviewCommand(parentCtx, cmd.Args)
 	case "doctor":
 		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":

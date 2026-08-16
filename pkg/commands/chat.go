@@ -338,6 +338,9 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		Commands:             commands,
 		AgentCatalog:         agentCatalog,
 		TaskCanceller:        subPool,
+		ReviewAfterEdit:      cfg.ReviewAfterEdit,
+		ReviewTokenBudget:    resolveReviewTokenBudget(cfg.ReviewTokenBudget),
+		ReviewTimeout:        resolveReviewTimeout(cfg.ReviewTimeoutMinutes),
 	}
 
 	repl, err := chat.NewRepl(replCfg)

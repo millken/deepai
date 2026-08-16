@@ -255,12 +255,33 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 		r.ui.Info("  review: not a git worktree — bash-side edits are invisible to attribution, and reviewer writes cannot be detected")
 	}
 
-	diff, oversized := buildReviewDiff(r.cfg.WorkDir, after, scope)
-	if oversized {
-		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
+	verdict, ok := r.dispatchReview(parentCtx, initialRequest, scope, after)
+	if !ok {
+		return "" // fail-soft; dispatchReview already warned
+	}
+	if isPassVerdict(verdict) {
+		r.carry.ClearEditedFiles()
+		r.ui.Info("  review: pass — " + verdictSummary(verdict))
 		return ""
 	}
+	if round >= maxReviewRounds {
+		r.presentIssues(fmt.Sprintf(
+			"  review: STILL FAILING after %d fix rounds — human judgment needed. Unresolved issues:", maxReviewRounds), verdict)
+		return ""
+	}
+	r.ui.Info(fmt.Sprintf("  review: %d issue(s) — entering fix round %d/%d", len(verdict.Issues), round+1, maxReviewRounds))
+	return synthesizeFixMessage(round+1, verdict)
+}
 
+// dispatchReview runs the degradation ladder and the reviewer for one scope.
+// Shared by the automatic gate and the manual /review command; ok=false is
+// always fail-soft and already warned.
+func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot) (*agent.ReviewResult, bool) {
+	diff, oversized := buildReviewDiff(r.cfg.WorkDir, snap, scope)
+	if oversized {
+		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
+		return nil, false
+	}
 	// Degradation rung (b): when the full-text bundle would blow the
 	// subagent context cap (a hard task failure, not a truncation), drop
 	// context_files and let the read-only reviewer pull what it needs.
@@ -268,25 +289,18 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	if contextBundleBytes(scope) > reviewContextBundleCap {
 		contextFiles = nil
 	}
+	return r.runReview(parentCtx, initialRequest, diff, contextFiles, snap)
+}
 
-	verdict, ok := r.runReview(parentCtx, initialRequest, diff, contextFiles, after)
-	if !ok {
-		return "" // fail-soft; runReview already warned
+func isPassVerdict(v *agent.ReviewResult) bool {
+	return strings.EqualFold(v.Verdict, "pass") || len(v.Issues) == 0
+}
+
+func verdictSummary(v *agent.ReviewResult) string {
+	if s := strings.TrimSpace(v.Summary); s != "" {
+		return s
 	}
-	if strings.EqualFold(verdict.Verdict, "pass") || len(verdict.Issues) == 0 {
-		r.carry.ClearEditedFiles()
-		summary := strings.TrimSpace(verdict.Summary)
-		if summary == "" {
-			summary = "no reproducible failure scenario found"
-		}
-		r.ui.Info("  review: pass — " + summary)
-		return ""
-	}
-	if round >= maxReviewRounds {
-		r.presentUnresolvedIssues(verdict)
-		return ""
-	}
-	return synthesizeFixMessage(round+1, verdict)
+	return "no reproducible failure scenario found"
 }
 
 // runReview dispatches one correctness-reviewer subagent through the
@@ -469,13 +483,107 @@ func synthesizeFixMessage(round int, v *agent.ReviewResult) string {
 	return b.String()
 }
 
-// presentUnresolvedIssues is the end of the line (design §八-6): the cap is
-// hit, nothing is auto-fixed or rolled back — the findings go to the human.
-func (r *ChatRepl) presentUnresolvedIssues(v *agent.ReviewResult) {
+// presentIssues renders a verdict's issue list to the user under the given
+// header. Used both at the round cap (design §八-6: nothing is auto-fixed
+// or rolled back — the findings go to the human) and by manual /review.
+func (r *ChatRepl) presentIssues(header string, v *agent.ReviewResult) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "  review: STILL FAILING after %d fix rounds — human judgment needed. Unresolved issues:\n", maxReviewRounds)
+	b.WriteString(header)
+	b.WriteString("\n")
 	writeIssueList(&b, v.Issues)
 	r.ui.Info(b.String())
+}
+
+// handleReviewCommand implements /review: no argument runs one manual
+// review of the pending edit scope (falling back to the whole dirty
+// worktree — manual mode means the user explicitly asked, so their own
+// uncommitted changes are fair game, design §4.5); on/off toggles the
+// automatic gate for this session; status reports the configuration.
+func (r *ChatRepl) handleReviewCommand(parentCtx context.Context, args string) {
+	switch strings.ToLower(strings.TrimSpace(args)) {
+	case "on":
+		r.cfg.ReviewAfterEdit = true
+		r.ui.Info("  review: automatic post-edit review ON for this session")
+	case "off":
+		r.cfg.ReviewAfterEdit = false
+		r.ui.Info("  review: automatic post-edit review OFF for this session")
+	case "status":
+		state := "off"
+		if r.cfg.ReviewAfterEdit {
+			state = "on"
+		}
+		budget := "unlimited"
+		if r.cfg.ReviewTokenBudget > 0 {
+			budget = fmt.Sprintf("%d tokens", r.cfg.ReviewTokenBudget)
+		}
+		timeout := r.cfg.ReviewTimeout
+		if timeout <= 0 {
+			timeout = defaultReviewTimeout
+		}
+		r.ui.Info(fmt.Sprintf("  review: auto %s | budget %s | timeout %s | pending files %d",
+			state, budget, timeout, len(r.carry.EditedFiles())))
+	case "":
+		r.runManualReview(parentCtx)
+	default:
+		r.ui.Info("  Usage: /review [on|off|status]")
+	}
+}
+
+func (r *ChatRepl) runManualReview(parentCtx context.Context) {
+	snap := takeWorktreeSnapshot(r.cfg.WorkDir)
+	scope := r.carry.EditedFiles()
+	if len(scope) == 0 {
+		scope = snap.dirtyFiles()
+	}
+	if len(scope) == 0 {
+		r.ui.Info("  review: nothing to review — no recorded edits and a clean worktree")
+		return
+	}
+	verdict, ok := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap)
+	if !ok {
+		return
+	}
+	if isPassVerdict(verdict) {
+		r.carry.ClearEditedFiles()
+		r.ui.Info("  review: pass — " + verdictSummary(verdict))
+		return
+	}
+	r.presentIssues(fmt.Sprintf("  review: %d issue(s) found:", len(verdict.Issues)), verdict)
+}
+
+// lastUserRequest recovers the review anchor for a manual review: the most
+// recent genuine user message — synthesized fix messages are skipped by
+// their prefix. Falls back to a neutral instruction in an empty session.
+func (r *ChatRepl) lastUserRequest() string {
+	if r.sess != nil {
+		for i := len(r.sess.Messages) - 1; i >= 0; i-- {
+			m := r.sess.Messages[i]
+			if m.Role != models.RoleHuman {
+				continue
+			}
+			if strings.HasPrefix(m.Content, "[adversarial-review") {
+				continue
+			}
+			if strings.TrimSpace(m.Content) != "" {
+				return m.Content
+			}
+		}
+	}
+	return "Review the current uncommitted changes on their own merits."
+}
+
+// dirtyFiles lists every dirty path in the snapshot (tracked modifications
+// and untracked files alike), as absolute sorted paths.
+func (s worktreeSnapshot) dirtyFiles() []string {
+	if s.root == "" || len(s.entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.entries))
+	for p := range s.entries {
+		out = append(out, filepath.Join(s.root, p))
+	}
+	sort.Strings(out)
+	return out
 }
 
 func writeIssueList(b *strings.Builder, issues []agent.Issue) {

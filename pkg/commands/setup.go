@@ -62,6 +62,22 @@ type Config struct {
 	// Always read it through resolveRefineInterval, never directly.
 	MemoryRefineInterval int `yaml:"memory_refine_interval,omitempty"`
 
+	// ReviewAfterEdit enables the adversarial post-edit review gate
+	// (docs/ADVERSARIAL_REVIEW_DESIGN.md): after a turn that edited files,
+	// an independent correctness-reviewer subagent reviews the changes and
+	// failing verdicts are fed back for bounded fix rounds. Default off —
+	// the gate blocks the turn synchronously and spends reviewer tokens, so
+	// it stays an explicit opt-in until the detection-rate baseline
+	// justifies flipping the default (design §八-1).
+	ReviewAfterEdit bool `yaml:"review_after_edit,omitempty"`
+	// ReviewTokenBudget caps each review subagent's total tokens. 0 (or
+	// absent) means the 30k default; a negative value means unlimited.
+	// Always read through resolveReviewTokenBudget, never directly.
+	ReviewTokenBudget int `yaml:"review_token_budget,omitempty"`
+	// ReviewTimeoutMinutes bounds one review subagent run, in minutes
+	// (matching RequestTimeout's unit). 0 or absent = 5-minute default.
+	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
+
 	// Models defines multiple named model entries for multi-model support.
 	// Each entry binds an alias to a provider+model pair. When non-empty, the
 	// /model command can switch between them and subagents can select per-task.

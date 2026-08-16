@@ -407,3 +407,98 @@ func TestRunGitNoIndexDiffExitCodeOne(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// --- /review command (Phase 4) ---
+
+func TestReviewCommandToggleAndStatus(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.cfg.ReviewAfterEdit = false
+
+	r.handleReviewCommand(context.Background(), "on")
+	if !r.cfg.ReviewAfterEdit {
+		t.Fatal("/review on did not enable the gate")
+	}
+	r.handleReviewCommand(context.Background(), "status")
+	if !strings.Contains(ui.lastInfo(), "auto on") {
+		t.Fatalf("status = %q, want auto on", ui.lastInfo())
+	}
+	r.handleReviewCommand(context.Background(), "off")
+	if r.cfg.ReviewAfterEdit {
+		t.Fatal("/review off did not disable the gate")
+	}
+	r.handleReviewCommand(context.Background(), "bogus")
+	if !strings.Contains(ui.lastInfo(), "Usage:") {
+		t.Fatalf("unknown arg reply = %q, want usage", ui.lastInfo())
+	}
+}
+
+// Manual /review works with the automatic gate disabled, and falls back to
+// the whole dirty worktree when no edits were recorded.
+func TestReviewCommandManualDirtyWorktreeFallback(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t) // userdirty.go is untracked → dirty
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, dir, fake)
+	r.cfg.ReviewAfterEdit = false
+
+	r.handleReviewCommand(context.Background(), "")
+	if fake.calls != 1 {
+		t.Fatalf("manual review dispatched %d reviews, want 1", fake.calls)
+	}
+	if !strings.Contains(ui.lastInfo(), "review: pass") {
+		t.Fatalf("lastInfo = %q, want pass", ui.lastInfo())
+	}
+}
+
+func TestReviewCommandManualNothingToReview(t *testing.T) {
+	gitOrSkip(t)
+	dir := t.TempDir()
+	runGitOrFatal(t, dir, "init", "-q")
+	writeFileOrFatal(t, filepath.Join(dir, "a.go"), "package a\n")
+	runGitOrFatal(t, dir, "add", ".")
+	runGitOrFatal(t, dir, "commit", "-q", "-m", "init") // clean tree
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, dir, fake)
+
+	r.handleReviewCommand(context.Background(), "")
+	if fake.calls != 0 {
+		t.Fatalf("clean tree dispatched %d reviews, want 0", fake.calls)
+	}
+	if !strings.Contains(ui.lastInfo(), "nothing to review") {
+		t.Fatalf("lastInfo = %q, want nothing-to-review", ui.lastInfo())
+	}
+}
+
+// A failing manual review presents issues — it never starts fix rounds.
+func TestReviewCommandManualFailPresentsIssues(t *testing.T) {
+	fake := &fakeTaskTool{content: failVerdictJSON()}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	seedEditedFile(t, r, "a.go", "package a\n")
+
+	r.handleReviewCommand(context.Background(), "")
+	if !strings.Contains(ui.lastInfo(), "issue(s) found") || !strings.Contains(ui.lastInfo(), "nil deref") {
+		t.Fatalf("lastInfo = %q, want issue presentation", ui.lastInfo())
+	}
+	if r.carry.EditedFiles() == nil {
+		t.Fatal("a failing manual review must not clear the slate")
+	}
+}
+
+func TestLastUserRequestSkipsFixMessages(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _ := newReviewRepl(t, t.TempDir(), fake)
+	r.sess = &models.Session{Messages: []models.Message{
+		{Role: models.RoleHuman, Content: "implement feature X"},
+		{Role: models.RoleAI, Content: "done"},
+		{Role: models.RoleHuman, Content: "[adversarial-review round 1/2] fix these"},
+		{Role: models.RoleAI, Content: "fixed"},
+	}}
+	if got := r.lastUserRequest(); got != "implement feature X" {
+		t.Fatalf("lastUserRequest = %q, want the genuine request", got)
+	}
+	r.sess = nil
+	if got := r.lastUserRequest(); !strings.Contains(got, "own merits") {
+		t.Fatalf("empty-session fallback = %q", got)
+	}
+}

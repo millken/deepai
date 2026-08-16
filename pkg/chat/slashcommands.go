@@ -18,6 +18,7 @@ var slashCommands = []slashCmd{
 	{"undo", "Undo last turn"},
 	{"compact", "Compact context now"},
 	{"refine", "Refine memory now (/refine [undo|rollback <id>|list|status|on|off])"},
+	{"review", "Adversarially review recent edits (/review [on|off|status])"},
 	{"plan", "Enter plan mode (read-only, explore before coding)"},
 	{"run", "Exit plan mode (full tool access)"},
 	{"model", "Show or switch model (/model <name>, /model ? for picker)"},
