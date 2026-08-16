@@ -76,13 +76,25 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req ChatRequest) (<-chan
 			}
 			delay := streamRetryDelay(attempt)
 			slog.Debug("retrying stream", "provider", p.provider, "attempt", attempt+1, "delay", delay)
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
+			// Both the backoff and NewStreaming block, and NewStreaming blocks
+			// for as long as the server withholds response headers — which is
+			// exactly as long as it keeps the request queued. Heartbeat through
+			// the whole span or the agent's idle watchdog kills this stream
+			// while it is legitimately reconnecting.
+			var cancelled bool
+			heartbeatDuring(ch, req.Model, func() {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					cancelled = true
+					return
+				}
+				stream = p.client.Messages.NewStreaming(ctx, params, option.WithMaxRetries(0))
+			})
+			if cancelled {
 				ch <- StreamChunk{Err: ctx.Err(), Done: true}
 				return
 			}
-			stream = p.client.Messages.NewStreaming(ctx, params, option.WithMaxRetries(0))
 		}
 	}()
 	return ch, nil

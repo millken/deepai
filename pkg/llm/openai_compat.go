@@ -86,13 +86,23 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req ChatRequest) (<-c
 			}
 			delay := streamRetryDelay(attempt)
 			slog.Debug("retrying stream", "provider", p.provider, "attempt", attempt+1, "delay", delay)
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
+			// See the matching comment in the Anthropic provider: the backoff
+			// and the re-issued request both block on a channel the agent is
+			// already watching for idleness.
+			var cancelled bool
+			heartbeatDuring(ch, req.Model, func() {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					cancelled = true
+					return
+				}
+				stream = p.client.Chat.Completions.NewStreaming(ctx, params, option.WithMaxRetries(0))
+			})
+			if cancelled {
 				ch <- StreamChunk{Err: ctx.Err(), Done: true}
 				return
 			}
-			stream = p.client.Chat.Completions.NewStreaming(ctx, params, option.WithMaxRetries(0))
 		}
 	}()
 	return ch, nil
@@ -124,6 +134,36 @@ func (p *OpenAICompatProvider) buildParams(req ChatRequest) openai.ChatCompletio
 	return params
 }
 
+// reasoningDeltaFields are the delta keys that reasoning models use for their
+// thinking stream on OpenAI-compatible endpoints. None is part of the official
+// OpenAI schema, so the SDK leaves them in ExtraFields rather than exposing a
+// typed field. "reasoning_content" is DeepSeek's name, adopted by Qwen, GLM and
+// Kimi; "reasoning" is what OpenRouter and several gateways emit.
+var reasoningDeltaFields = []string{"reasoning_content", "reasoning"}
+
+// reasoningDelta returns the thinking text carried by an untyped reasoning
+// field, or "" when the delta carries none.
+//
+// Note respjson.Field.Valid() is deliberately NOT consulted: the SDK records
+// every extra field as status `invalid` ("couldn't be marshalled into an
+// expected type") precisely because it has no typed counterpart, so Valid() is
+// false for every reasoning delta ever sent. Raw() still returns the correct
+// JSON value, so decoding it is the real test — an omitted field yields "" and
+// fails to decode, and a null or non-string value decodes to the empty string.
+func reasoningDelta(delta openai.ChatCompletionChunkChoiceDelta) string {
+	for _, name := range reasoningDeltaFields {
+		field, ok := delta.JSON.ExtraFields[name]
+		if !ok {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal([]byte(field.Raw()), &text); err == nil && text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
 func (p *OpenAICompatProvider) consumeStream(
 	ctx context.Context,
 	ch chan<- StreamChunk,
@@ -146,6 +186,24 @@ func (p *OpenAICompatProvider) consumeStream(
 				emitted = true
 				ch <- StreamChunk{Model: model, Delta: choice.Delta.Content}
 				contentBuf.WriteString(choice.Delta.Content)
+			}
+			// Reasoning models (DeepSeek, Qwen, GLM — all OpenAI-compat, see
+			// registry.go) stream their entire thinking phase as
+			// reasoning_content deltas carrying no content and no tool calls.
+			// Without a signal here, pkg/agent's stream idle watchdog sees total
+			// silence for that whole phase and cancels a perfectly healthy
+			// request ("stream idle timeout: no data received after 2m0s") the
+			// moment a hard problem thinks for longer than the idle window. The
+			// Anthropic provider does the same for thinking_delta.
+			//
+			// emitted is set too, deliberately: a reasoning stream that dies
+			// mid-thought has already produced (and billed) output, so it must
+			// not be classified as "nothing was emitted" and transparently
+			// re-run. The text itself is NOT forwarded as a Delta — reasoning is
+			// a liveness signal, not assistant content.
+			if reasoningDelta(choice.Delta) != "" {
+				emitted = true
+				ch <- StreamChunk{Model: model, Progress: true}
 			}
 			for _, tc := range choice.Delta.ToolCalls {
 				emitted = true

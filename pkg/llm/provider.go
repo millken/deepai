@@ -5,9 +5,52 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/millken/deepai/pkg/models"
 )
+
+// reconnectHeartbeatInterval is how often a provider emits a Progress chunk
+// while it is backing off and re-establishing a failed stream. By that point
+// the channel has already been handed to the agent, whose stream-idle watchdog
+// (pkg/agent/streaming.go) cannot tell a reconnect apart from a dead stream —
+// so a silent reconnect that outlasts the idle window kills a perfectly
+// healthy request. Comfortably shorter than the agent's 2-minute default; a
+// var so tests can shrink it.
+var reconnectHeartbeatInterval = 15 * time.Second
+
+// heartbeatDuring runs fn while emitting Progress chunks on ch, so a blocking
+// reconnect never looks like a dead stream. It returns only after the
+// heartbeat goroutine has stopped, which is what makes it safe for a caller
+// that closes ch afterwards: no send can outlive this call.
+func heartbeatDuring(ch chan<- StreamChunk, model string, fn func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(reconnectHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				// Abandon the send if fn finished meanwhile — otherwise a full
+				// channel would pin this goroutine past close(ch).
+				select {
+				case ch <- StreamChunk{Model: model, Progress: true}:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	fn()
+	close(done)
+	wg.Wait()
+}
 
 // LLMProvider describes the minimal contract implemented by each model backend.
 type LLMProvider interface {
