@@ -229,22 +229,25 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// same emit() pattern as the original run, and blocks on <-eventsDone
 	// before returning — every attempt (initial and each retry) needs this
 	// identically, since Events() is per-Agent-instance.
+	// One progress accumulator for the whole task, not per attempt: a schema
+	// retry re-enters runOnce, and the tool/token totals the UI shows are the
+	// task's, not the attempt's.
+	progress := &subagentProgress{agentType: string(agentType)}
+
 	runOnce := func(msgs []models.Message, tokenBudget, toolCallBudget int) (*RunResult, error) {
 		runAgent := New(buildAgentConfig(tokenBudget, toolCallBudget))
 		eventsDone := make(chan struct{})
 		go func() {
 			defer close(eventsDone)
 			for evt := range runAgent.Events() {
-				message := subagentMessageFromAgentEvent(evt)
-				if strings.TrimSpace(message) == "" {
+				progressEvt, ok := progress.event(evt)
+				if !ok {
 					continue
 				}
-				emit(subagent.TaskEvent{
-					Type:        "task_running",
-					TaskID:      task.ID,
-					Description: task.Description,
-					Message:     message,
-				})
+				progressEvt.Type = "task_running"
+				progressEvt.TaskID = task.ID
+				progressEvt.Description = task.Description
+				emit(progressEvt)
 			}
 		}()
 		result, err := runAgent.Run(ctx, task.ID, msgs)
@@ -364,6 +367,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 					Type:        "task_running",
 					TaskID:      task.ID,
 					Description: task.Description,
+					AgentType:   string(agentType),
 					Message:     "retrying: output failed schema validation",
 				})
 				stats.SchemaRetries++
@@ -578,6 +582,71 @@ func filterTaskTool(tools []models.Tool) []models.Tool {
 		}
 	}
 	return out
+}
+
+// subagentProgress converts a subagent's own AgentEvents into structured
+// TaskEvents, carrying the running totals the parent UI needs. One instance
+// per subagent run; not safe for concurrent use (each run pumps its events on
+// a single goroutine).
+type subagentProgress struct {
+	agentType string
+	toolCalls int
+	tokens    int
+}
+
+// maxToolArgsSummary bounds ToolArgs: it renders on one status line next to
+// the tool name, so a whole write_file body must never reach the UI.
+const maxToolArgsSummary = 60
+
+// event returns the progress event for one AgentEvent, or ok=false when the
+// event carries nothing worth showing.
+func (p *subagentProgress) event(evt AgentEvent) (subagent.TaskEvent, bool) {
+	message := subagentMessageFromAgentEvent(evt)
+	if strings.TrimSpace(message) == "" {
+		return subagent.TaskEvent{}, false
+	}
+	// Usage is cumulative-to-date when present; a later event without it must
+	// not reset the total to zero.
+	if evt.Usage != nil && evt.Usage.TotalTokens > 0 {
+		p.tokens = evt.Usage.TotalTokens
+	}
+	out := subagent.TaskEvent{
+		Message:   message,
+		AgentType: p.agentType,
+		Tokens:    p.tokens,
+	}
+	if evt.ToolEvent != nil {
+		if evt.Type == AgentEventToolCallEnd {
+			p.toolCalls++
+		}
+		out.ToolName = evt.ToolEvent.Name
+		out.ToolArgs = summarizeToolArgs(evt.ToolEvent.ArgumentsText)
+		out.DurationMS = evt.ToolEvent.DurationMS
+		switch {
+		case evt.ToolEvent.Error != "":
+			out.ToolStatus = "error"
+		case evt.Type == AgentEventToolCallEnd:
+			out.ToolStatus = "ok"
+		default:
+			out.ToolStatus = "running"
+		}
+	}
+	out.ToolCalls = p.toolCalls
+	return out, true
+}
+
+// summarizeToolArgs flattens a tool's argument JSON into a short single-line
+// hint. Structure is not preserved — this is a glance, not a record.
+func summarizeToolArgs(args string) string {
+	s := strings.TrimSpace(args)
+	if s == "" {
+		return ""
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxToolArgsSummary {
+		s = string(r[:maxToolArgsSummary-1]) + "…"
+	}
+	return s
 }
 
 func subagentMessageFromAgentEvent(evt AgentEvent) string {
