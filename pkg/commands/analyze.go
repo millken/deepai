@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -31,29 +32,58 @@ import (
 //   - the main agent's own tool calls, to detect bash-side patterns (e.g.
 //     hand-rolled symbol outlines instead of code_map)
 
+// analyzeScope is the resolved answer to "which sessions am I looking at".
+type analyzeScope struct {
+	last     int           // most recent N sessions (default)
+	window   time.Duration // used only when useSince
+	useSince bool
+}
+
+// defaultAnalyzeLast is how many recent sessions a bare `deepai analyze`
+// covers. Scoping by session count rather than by calendar window is the
+// default because the usual question is "how are things NOW" — a time window
+// keeps mixing in the sessions from before whatever you just fixed.
+const defaultAnalyzeLast = 5
+
 // addAnalyze registers `deepai analyze`.
 func addAnalyze(topLevel *cobra.Command) {
 	var since, format string
+	var last int
 	cmd := &cobra.Command{
 		Use:   "analyze",
-		Short: "Analyze past sessions for delegation-efficiency problems",
+		Short: "Analyze recent sessions for delegation-efficiency problems",
 		Long: `Analyze persisted sessions and report workload problems:
 serial single-call delegation, budget exhaustion, long-running tasks,
 failure patterns, and bash usage that reimplements code_map.
 
+Findings are grouped per session, newest first, so a problem that stopped
+happening after a fix is visible as such. By default the most recent 5
+sessions are analyzed; --since switches to a calendar window instead.
+
 Findings are read-only diagnostics with suggestions — nothing is modified.`,
+		Example: "  deepai analyze\n  deepai analyze --last 3\n  deepai analyze --since 7d",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			window, err := parseSince(since)
-			if err != nil {
+			lastSet := cmd.Flags().Changed("last")
+			sinceSet := cmd.Flags().Changed("since")
+			if err := validateScopeFlags(last, since, lastSet, sinceSet); err != nil {
 				return err
 			}
 			if format != "text" && format != "json" {
 				return fmt.Errorf("--format must be 'text' or 'json', got %q", format)
 			}
-			return runAnalyze(cmd.Context(), window, format)
+			scope := analyzeScope{last: last}
+			if sinceSet {
+				window, err := parseSince(since)
+				if err != nil {
+					return err
+				}
+				scope = analyzeScope{window: window, useSince: true}
+			}
+			return runAnalyze(cmd.Context(), scope, format)
 		},
 	}
-	cmd.Flags().StringVar(&since, "since", "7d", "Look back this far: e.g. 48h, 7d, 30d")
+	cmd.Flags().IntVar(&last, "last", defaultAnalyzeLast, "Analyze the most recently active N sessions")
+	cmd.Flags().StringVar(&since, "since", "7d", "Analyze a calendar window instead: e.g. 48h, 7d, 30d (mutually exclusive with --last)")
 	cmd.Flags().StringVar(&format, "format", "text", "Output format: text (default) or json")
 	topLevel.AddCommand(cmd)
 }
@@ -96,24 +126,155 @@ type mainAgentUsage struct {
 	manualOutline []string // bash commands that hand-roll a symbol outline
 }
 
+// sessionRef identifies one analyzed session.
+type sessionRef struct {
+	id        string
+	title     string
+	updatedAt time.Time
+}
+
+// sessionRecords is one session's slice of the analysis inputs. Grouping by
+// session is what lets the report answer "is this still happening?" rather
+// than "did this ever happen in the window?" — a distinction that matters as
+// soon as a problem has been fixed, since a pooled window keeps reporting the
+// sessions from before the fix.
+type sessionRecords struct {
+	ref         sessionRef
+	delegations []taskDelegation
+	usage       mainAgentUsage
+}
+
+// recentSessions returns the n most recently ACTIVE sessions, newest first.
+// Ordering is by updated_at, not created_at: a long-running session started
+// days ago but picked back up today is recent in every sense that matters
+// here. Asking for more sessions than exist is not an error.
+func recentSessions(db *sql.DB, n int) ([]sessionRef, error) {
+	rows, err := db.Query(
+		`SELECT id, title, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var refs []sessionRef
+	for rows.Next() {
+		var id, title string
+		var updated float64
+		if err := rows.Scan(&id, &title, &updated); err != nil {
+			return nil, err
+		}
+		refs = append(refs, sessionRef{id: id, title: title, updatedAt: time.Unix(int64(updated), 0)})
+	}
+	return refs, rows.Err()
+}
+
+// sessionsSince returns every session active at or after the given time,
+// newest first. This backs --since, which stays available for the occasions
+// where a calendar window is what you actually mean.
+func sessionsSince(db *sql.DB, since time.Time) ([]sessionRef, error) {
+	rows, err := db.Query(
+		`SELECT id, title, updated_at FROM sessions WHERE updated_at >= ? ORDER BY updated_at DESC`,
+		float64(since.Unix()))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var refs []sessionRef
+	for rows.Next() {
+		var id, title string
+		var updated float64
+		if err := rows.Scan(&id, &title, &updated); err != nil {
+			return nil, err
+		}
+		refs = append(refs, sessionRef{id: id, title: title, updatedAt: time.Unix(int64(updated), 0)})
+	}
+	return refs, rows.Err()
+}
+
+// loadSessionRecords reads the given sessions' messages and returns one record
+// per ref, in the order the refs were given. Sessions with no messages still
+// get a record: "this session produced no findings" is the signal a fix took,
+// so it must not be silently dropped.
+func loadSessionRecords(db *sql.DB, refs []sessionRef) ([]sessionRecords, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(refs))
+	args := make([]any, len(refs))
+	for i, ref := range refs {
+		placeholders[i] = "?"
+		args[i] = ref.id
+	}
+	rows, err := db.Query(
+		`SELECT session_id, created_at, role, tool_calls, tool_result FROM messages
+		 WHERE session_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY created_at`,
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	bySession, err := groupMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]sessionRecords, 0, len(refs))
+	for _, ref := range refs {
+		rec := sessionRecords{ref: ref, usage: mainAgentUsage{byTool: map[string]int{}}}
+		if got, ok := bySession[ref.id]; ok {
+			rec.delegations = got.delegations
+			rec.usage = got.usage
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
 // loadAnalysisRecords reads the messages table into the two shapes the
-// analysis rules consume. Tool-result Data arrives as decoded JSON maps, so
-// subagent_stats/subagent_usage go through a second marshal/unmarshal to
-// reach their concrete types.
+// analysis rules consume, flattened across every session in the window. Kept
+// for the time-window path and its existing callers; session-scoped analysis
+// goes through loadSessionRecords instead.
 func loadAnalysisRecords(db *sql.DB, since time.Time) ([]taskDelegation, mainAgentUsage, error) {
 	rows, err := db.Query(
-		`SELECT created_at, role, tool_calls, tool_result FROM messages WHERE created_at >= ? ORDER BY created_at`,
+		`SELECT session_id, created_at, role, tool_calls, tool_result FROM messages WHERE created_at >= ? ORDER BY created_at`,
 		since.Unix())
 	if err != nil {
 		return nil, mainAgentUsage{}, err
 	}
 	defer rows.Close()
 
+	bySession, err := groupMessages(rows)
+	if err != nil {
+		return nil, mainAgentUsage{}, err
+	}
+
+	var delegations []taskDelegation
+	usage := mainAgentUsage{byTool: map[string]int{}}
+	for _, rec := range bySession {
+		delegations = append(delegations, rec.delegations...)
+		usage.totalCalls += rec.usage.totalCalls
+		usage.manualOutline = append(usage.manualOutline, rec.usage.manualOutline...)
+		for tool, n := range rec.usage.byTool {
+			usage.byTool[tool] += n
+		}
+	}
+	sort.Slice(delegations, func(i, j int) bool { return delegations[i].when.Before(delegations[j].when) })
+	return delegations, usage, nil
+}
+
+// groupMessages parses a message result set (session_id, created_at, role,
+// tool_calls, tool_result) into per-session records. Tool-result Data arrives
+// as decoded JSON maps, so subagent_stats/subagent_usage go through a second
+// marshal/unmarshal to reach their concrete types.
+func groupMessages(rows *sql.Rows) (map[string]*sessionRecords, error) {
 	// task results land as separate role=tool messages; index them by call_id
-	// in a FIRST pass so the second pass can join call → result — a single
+	// in a FIRST pass so the second pass can join call -> result — a single
 	// streaming pass would see every call before its (later-timestamped)
 	// result and join nothing.
 	type rawRow struct {
+		sessionID      string
 		when           time.Time
 		role           string
 		toolCallsJSON  string
@@ -122,14 +283,17 @@ func loadAnalysisRecords(db *sql.DB, since time.Time) ([]taskDelegation, mainAge
 	var all []rawRow
 	for rows.Next() {
 		var ts float64
-		var role, toolCallsJSON, toolResultJSON string
-		if err := rows.Scan(&ts, &role, &toolCallsJSON, &toolResultJSON); err != nil {
-			return nil, mainAgentUsage{}, err
+		var sessionID, role, toolCallsJSON, toolResultJSON string
+		if err := rows.Scan(&sessionID, &ts, &role, &toolCallsJSON, &toolResultJSON); err != nil {
+			return nil, err
 		}
-		all = append(all, rawRow{when: time.Unix(int64(ts), 0), role: role, toolCallsJSON: toolCallsJSON, toolResultJSON: toolResultJSON})
+		all = append(all, rawRow{
+			sessionID: sessionID, when: time.Unix(int64(ts), 0), role: role,
+			toolCallsJSON: toolCallsJSON, toolResultJSON: toolResultJSON,
+		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, mainAgentUsage{}, err
+		return nil, err
 	}
 
 	type rawResult struct {
@@ -153,12 +317,17 @@ func loadAnalysisRecords(db *sql.DB, since time.Time) ([]taskDelegation, mainAge
 		}
 	}
 
-	var delegations []taskDelegation
-	usage := mainAgentUsage{byTool: map[string]int{}}
+	bySession := map[string]*sessionRecords{}
+	recordFor := func(id string) *sessionRecords {
+		if rec, ok := bySession[id]; ok {
+			return rec
+		}
+		rec := &sessionRecords{ref: sessionRef{id: id}, usage: mainAgentUsage{byTool: map[string]int{}}}
+		bySession[id] = rec
+		return rec
+	}
 
 	for _, row := range all {
-		when := row.when
-
 		var calls []struct {
 			ID        string         `json:"id"`
 			Name      string         `json:"name"`
@@ -168,18 +337,19 @@ func loadAnalysisRecords(db *sql.DB, since time.Time) ([]taskDelegation, mainAge
 			continue
 		}
 		for _, c := range calls {
-			usage.totalCalls++
-			usage.byTool[c.Name]++
+			rec := recordFor(row.sessionID)
+			rec.usage.totalCalls++
+			rec.usage.byTool[c.Name]++
 			if c.Name != "task" {
 				if c.Name == "bash" || c.Name == "run_command" {
 					if cmd, _ := c.Arguments["command"].(string); isManualOutline(cmd) {
-						usage.manualOutline = append(usage.manualOutline, cmd)
+						rec.usage.manualOutline = append(rec.usage.manualOutline, cmd)
 					}
 				}
 				continue
 			}
 			d := taskDelegation{
-				when:        when,
+				when:        row.when,
 				callID:      c.ID,
 				agentType:   argString(c.Arguments["agent_type"]),
 				status:      "no-result",
@@ -201,10 +371,10 @@ func loadAnalysisRecords(db *sql.DB, since time.Time) ([]taskDelegation, mainAge
 				d.stats = decodeRunStats(r.data)
 				d.usage = decodeTokenUsage(r.data)
 			}
-			delegations = append(delegations, d)
+			rec.delegations = append(rec.delegations, d)
 		}
 	}
-	return delegations, usage, nil
+	return bySession, nil
 }
 
 // decodeRunStats pulls Data["subagent_stats"] through a second JSON round-trip
@@ -462,18 +632,133 @@ func fmtDuration(ms int64) string {
 	return fmt.Sprintf("%.0fm", d.Minutes())
 }
 
-// analysisReport is the --json payload: window, aggregate counts, findings.
-type analysisReport struct {
-	Window         string    `json:"window"`
-	TotalTasks     int       `json:"total_tasks"`
-	Completed      int       `json:"completed"`
-	Failed         int       `json:"failed"`
-	WithStats      int       `json:"with_stats"`
-	MainAgentCalls int       `json:"main_agent_calls"`
-	Findings       []Finding `json:"findings"`
+// sessionFindings is one session's slice of the report.
+type sessionFindings struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Tasks     int       `json:"tasks"`
+	Findings  []Finding `json:"findings"`
 }
 
-func runAnalyze(ctx context.Context, window time.Duration, format string) error {
+// analysisReport is the --json payload. Sessions carries the per-session
+// breakdown; the top-level aggregate fields (including the flattened Findings)
+// are kept so existing consumers keep working.
+type analysisReport struct {
+	Scope          string            `json:"scope"`
+	Window         string            `json:"window"`
+	TotalTasks     int               `json:"total_tasks"`
+	Completed      int               `json:"completed"`
+	Failed         int               `json:"failed"`
+	WithStats      int               `json:"with_stats"`
+	MainAgentCalls int               `json:"main_agent_calls"`
+	Findings       []Finding         `json:"findings"`
+	Sessions       []sessionFindings `json:"sessions"`
+}
+
+func scopeLabelLast(n int) string {
+	return fmt.Sprintf("最近 %d 个 session", n)
+}
+
+func scopeLabelSince(window time.Duration) string {
+	return fmt.Sprintf("近 %s", fmtDuration(int64(window/time.Millisecond)))
+}
+
+// validateScopeFlags rejects the combinations that would otherwise silently
+// pick one scope and drop the other.
+func validateScopeFlags(last int, since string, lastSet, sinceSet bool) error {
+	if lastSet && sinceSet {
+		return fmt.Errorf("--last and --since are mutually exclusive: pass one or the other")
+	}
+	if lastSet && last < 1 {
+		return fmt.Errorf("--last must be at least 1, got %d", last)
+	}
+	if sinceSet {
+		if _, err := parseSince(since); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildReport runs the analysis rules per session and assembles both views.
+// Running the rules per session rather than over a pooled window is the point
+// of the scoping work: patterns like serial single-call delegation only mean
+// something within one conversation, and a fixed problem should stop appearing
+// in the sessions that came after the fix.
+func buildReport(records []sessionRecords, scope string) analysisReport {
+	report := analysisReport{Scope: scope, Window: scope}
+	for _, rec := range records {
+		findings := append(analyzeDelegations(rec.delegations), analyzeMainAgent(rec.usage)...)
+		report.Sessions = append(report.Sessions, sessionFindings{
+			ID:        rec.ref.id,
+			Title:     rec.ref.title,
+			UpdatedAt: rec.ref.updatedAt,
+			Tasks:     len(rec.delegations),
+			Findings:  findings,
+		})
+		report.Findings = append(report.Findings, findings...)
+		report.TotalTasks += len(rec.delegations)
+		report.MainAgentCalls += rec.usage.totalCalls
+		for _, d := range rec.delegations {
+			switch d.status {
+			case "completed":
+				report.Completed++
+			case "failed":
+				report.Failed++
+			}
+			if d.stats != nil {
+				report.WithStats++
+			}
+		}
+	}
+	return report
+}
+
+// printReport renders the text view: newest session first, each with its own
+// findings, and clean sessions explicitly marked rather than omitted.
+func printReport(w io.Writer, report analysisReport) {
+	fmt.Fprintf(w, "deepai analyze — %s（task %d 个：完成 %d / 失败 %d / 带统计 %d；主 agent 调用 %d 次）\n",
+		report.Scope, report.TotalTasks, report.Completed, report.Failed, report.WithStats, report.MainAgentCalls)
+
+	if len(report.Sessions) == 0 {
+		fmt.Fprintf(w, "\n没有匹配的 session。\n")
+		return
+	}
+	if report.WithStats == 0 && report.TotalTasks > 0 {
+		fmt.Fprintf(w, "\n注意：这些 task 早于 subagent_stats 落库，委派规则无数据可用；升级后新会话才有统计。\n")
+	}
+
+	fmt.Fprintln(w)
+	for _, s := range report.Sessions {
+		title := s.Title
+		if strings.TrimSpace(title) == "" {
+			title = "(无标题)"
+		}
+		fmt.Fprintf(w, "%s  %s  task %d", s.ID, title, s.Tasks)
+		if len(s.Findings) == 0 {
+			fmt.Fprintf(w, "  ✓ 无问题\n")
+			continue
+		}
+		fmt.Fprintln(w)
+		for _, f := range s.Findings {
+			fmt.Fprintf(w, "  [%s] %s\n", f.Severity, f.Title)
+			fmt.Fprintf(w, "    依据: %s\n", f.Evidence)
+			fmt.Fprintf(w, "    建议: %s\n", f.Suggestion)
+		}
+	}
+
+	clean := 0
+	for _, s := range report.Sessions {
+		if len(s.Findings) == 0 {
+			clean++
+		}
+	}
+	fmt.Fprintf(w, "\n共 %d 个问题，分布在 %d/%d 个 session（%d 个无问题）。\n",
+		len(report.Findings), len(report.Sessions)-clean, len(report.Sessions), clean)
+}
+
+func runAnalyze(ctx context.Context, scope analyzeScope, format string) error {
 	dbPath := DBFile()
 	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
@@ -482,56 +767,30 @@ func runAnalyze(ctx context.Context, window time.Duration, format string) error 
 	}
 	defer db.Close()
 
-	since := time.Now().Add(-window)
-	delegations, usage, err := loadAnalysisRecords(db, since)
+	var refs []sessionRef
+	var label string
+	if scope.useSince {
+		refs, err = sessionsSince(db, time.Now().Add(-scope.window))
+		label = scopeLabelSince(scope.window)
+	} else {
+		refs, err = recentSessions(db, scope.last)
+		label = scopeLabelLast(scope.last)
+	}
 	if err != nil {
 		return fmt.Errorf("read sessions: %w", err)
 	}
 
-	findings := append(analyzeDelegations(delegations), analyzeMainAgent(usage)...)
-
-	completed, failed, withStats := 0, 0, 0
-	for _, d := range delegations {
-		if d.status == "completed" {
-			completed++
-		}
-		if d.status == "failed" {
-			failed++
-		}
-		if d.stats != nil {
-			withStats++
-		}
+	records, err := loadSessionRecords(db, refs)
+	if err != nil {
+		return fmt.Errorf("read sessions: %w", err)
 	}
-	report := analysisReport{
-		Window:         window.String(),
-		TotalTasks:     len(delegations),
-		Completed:      completed,
-		Failed:         failed,
-		WithStats:      withStats,
-		MainAgentCalls: usage.totalCalls,
-		Findings:       findings,
-	}
+	report := buildReport(records, label)
 
 	if format == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(report)
 	}
-
-	fmt.Fprintf(os.Stdout, "deepai analyze — 近 %s（task %d 个：完成 %d / 失败 %d / 带统计 %d；主 agent 调用 %d 次）\n",
-		fmtDuration(int64(window/time.Millisecond)), report.TotalTasks, completed, failed, withStats, usage.totalCalls)
-	if withStats == 0 && len(delegations) > 0 {
-		fmt.Fprintf(os.Stdout, "\n注意：这些 task 早于 subagent_stats 落库，委派规则无数据可用；升级后新会话才有统计。\n")
-	}
-	if len(findings) == 0 {
-		fmt.Fprintf(os.Stdout, "\n未发现问题模式。\n")
-		return nil
-	}
-	fmt.Fprintf(os.Stdout, "\n发现 %d 个问题：\n\n", len(findings))
-	for i, f := range findings {
-		fmt.Fprintf(os.Stdout, "%d. [%s] %s\n", i+1, f.Severity, f.Title)
-		fmt.Fprintf(os.Stdout, "   依据: %s\n", f.Evidence)
-		fmt.Fprintf(os.Stdout, "   建议: %s\n\n", f.Suggestion)
-	}
+	printReport(os.Stdout, report)
 	return nil
 }
