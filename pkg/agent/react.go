@@ -964,7 +964,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					// batch — a hint (RoleHuman) must never land between the
 					// assistant tool_calls message that started this batch
 					// and any of its tool results (M1-7).
-					batch.appendRemaining(results[i+1:])
+					batch.appendRemaining(toolCalls[i+1:], results[i+1:])
 					batch.flushPendingHints()
 					emit(AgentEvent{Type: AgentEventError, Err: obs.fatalErr.Error(), Error: obs.fatalAgentErr})
 					return newRunResult(batch.runMessages, ""), obs.fatalErr

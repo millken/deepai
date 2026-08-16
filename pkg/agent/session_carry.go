@@ -1,5 +1,12 @@
 package agent
 
+import (
+	"path/filepath"
+	"sort"
+
+	"github.com/millken/deepai/pkg/models"
+)
+
 // SessionCarry holds Agent state that must survive across the REPL's
 // per-turn Agent churn (Agent is single-use — see Run's a.started guard):
 //
@@ -40,6 +47,17 @@ type SessionCarry struct {
 	// bookkeeping (see maybeCompact's doc comment) across Runs.
 	compactionStalled   bool
 	compactionStalledAt int
+
+	// editedFiles accumulates the absolute paths of files successfully
+	// touched by edit_file/write_file since the set was last cleared. It is
+	// the primary attribution record for the adversarial-review gate
+	// (docs/ADVERSARIAL_REVIEW_DESIGN.md §4.1-B): the REPL reads it between
+	// turns to decide whether a review is due and which files to review,
+	// and clears it when a review passes, on new user input, and on /clear
+	// (the whole carry is replaced there). Written from the tool-result
+	// path on the Run goroutine — covered by the same single-goroutine
+	// contract as every other field on this struct.
+	editedFiles map[string]struct{}
 }
 
 // NewSessionCarry returns a zero-value SessionCarry, ready to be passed as
@@ -76,4 +94,64 @@ func (a *Agent) setCompactionStall(stalled bool, at int) {
 		a.session.compactionStalled = stalled
 		a.session.compactionStalledAt = at
 	}
+}
+
+// EditedFiles returns a sorted copy of the accumulated edited-file set.
+func (s *SessionCarry) EditedFiles() []string {
+	if s == nil || len(s.editedFiles) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(s.editedFiles))
+	for p := range s.editedFiles {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// ClearEditedFiles empties the edited-file set. Called by the REPL when a
+// review passes or when new user input arrives (the user has seen the
+// current state; the pending-review slate is wiped).
+func (s *SessionCarry) ClearEditedFiles() {
+	if s != nil {
+		s.editedFiles = nil
+	}
+}
+
+func (s *SessionCarry) recordEditedFile(path string) {
+	if s.editedFiles == nil {
+		s.editedFiles = make(map[string]struct{})
+	}
+	s.editedFiles[path] = struct{}{}
+}
+
+// recordEditedFile notes a successful edit_file/write_file target on the
+// carried session. Failed calls are skipped — a failed edit produced no
+// change. Both tool-execution paths must feed every executed (call, result)
+// pair through here (via handleResult, plus appendRemaining for a fatal
+// parallel batch's already-computed tail) or the review gate under-reports
+// this run's modifications.
+func (a *Agent) recordEditedFile(call models.ToolCall, result models.ToolResult) {
+	if a.session == nil || result.Status != models.CallStatusCompleted {
+		return
+	}
+	switch result.ToolName {
+	case "edit_file", "write_file":
+	default:
+		return
+	}
+	path, _ := call.Arguments["path"].(string)
+	if path == "" {
+		path, _ = call.Arguments["file_path"].(string)
+	}
+	if path == "" {
+		return
+	}
+	// Normalize against the process cwd — the same base the file tools
+	// resolve relative arguments against — so dedup and downstream git
+	// commands see one canonical form.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	a.session.recordEditedFile(path)
 }

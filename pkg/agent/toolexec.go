@@ -366,6 +366,12 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		ToolEvent: newToolEventFromResult(completed, result),
 	})
 
+	// Edited-file attribution for the adversarial-review gate — like the
+	// breaker below, both execution paths feed every executed pair through
+	// this one site (fatal parallel tails go through appendRemaining's
+	// mirror call).
+	b.a.recordEditedFile(call, result)
+
 	// Circuit-breaker bookkeeping — one implementation, both call sites feed
 	// every (call, result) pair through in batch order (see
 	// toolCallBreaker.observe for the combined repeat-call/validation logic).
@@ -387,11 +393,16 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 // results. Metrics/events are deliberately skipped for these, matching the
 // original inline tail loop's documented scope: only the tool_result
 // pairing invariant (every tool_use ID on the batch's assistant message
-// needs a matching tool_result) is required for correctness here.
-func (b *toolBatchState) appendRemaining(results []models.ToolResult) {
+// needs a matching tool_result) is required for correctness here — plus
+// edited-file attribution, because these edits really executed and the
+// review gate must not under-report them. calls[i] pairs with results[i].
+func (b *toolBatchState) appendRemaining(calls []models.ToolCall, results []models.ToolResult) {
 	for i := range results {
 		addSubagentUsage(b.usage, results[i])
 		b.a.offloadIfNeeded(&results[i], b.a.offloadDir)
+		if i < len(calls) {
+			b.a.recordEditedFile(calls[i], results[i])
+		}
 		b.runMessages = appendToolResultMessage(b.runMessages, b.sessionID, results[i])
 	}
 }
