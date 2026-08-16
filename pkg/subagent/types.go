@@ -79,6 +79,10 @@ type PoolConfig struct {
 
 // Task represents a subagent task.
 type Task struct {
+	// cancel stops just this task's run. Held so a single stuck subagent can
+	// be terminated without taking down the rest of a fan-out; nil once the
+	// task has finished.
+	cancel      context.CancelFunc
 	ID          string
 	RequestID   string
 	Type        SubagentType

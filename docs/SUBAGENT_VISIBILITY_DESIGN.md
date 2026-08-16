@@ -1,8 +1,8 @@
 # 子代理可见性与取消 — 设计
 
 - 日期：2026-08-16
-- 状态：已评审，待实现
-- 涉及：`pkg/subagent`、`pkg/agent`、`pkg/chat`
+- 状态：已实现
+- 涉及：`pkg/subagent`、`pkg/agent`、`pkg/chat`、`pkg/commands`
 
 ## 问题
 
@@ -107,7 +107,9 @@ func (p *Pool) CancelTask(taskID string) bool
 
 TUI 侧新增 `CancelTaskCh() <-chan string`，加入 `pkg/chat/repl.go` 的 ui 接口。
 
-**未决点**：repl 目前触达不到 agent 持有的 Pool。实现时先确认直连是否可行；不可行则退为进程内注册表（`StartTask` 时登记 `taskID → cancel`，`CancelTask` 查表）。此点在动工前确认并同步。
+**原未决点已解决，用直连，不需要进程内注册表**：pool 在 `pkg/commands/chat.go` 的 `registerChatTools` 里创建，而该函数在 `chat.NewRepl` **之前**调用——组合根同时持有两者。改为让 `registerChatTools` 返回 pool，经 `ReplConfig.TaskCanceller` 传入。该字段的类型是只含 `CancelTask(string) bool` 的窄接口，REPL 因此不依赖 pool 的具体类型，nil 时退化为「只有 Ctrl+C 整轮取消」。
+
+**单点取消不结束整轮**：repl 的信号监听 goroutine 从一次性 select 改为循环——收到 taskID 只调 `CancelTask`，只有 `interruptCh` 才 `turnCancel()`。丢掉卡死的那一个、让其余跑完，正是这个功能的全部意义。
 
 ## 测试
 
@@ -126,3 +128,15 @@ TUI 侧新增 `CancelTaskCh() <-chan string`，加入 `pkg/chat/repl.go` 的 ui 
 **完成行延迟提交改变 scrollback 时序**，可能与现有 `commitWithFlush` 重复输出。这是本设计里最容易出岔子的地方，用上表"scrollback 不重复"一条专门钉住。
 
 其余改动都是加法（新字段、新模式、新方法），旧路径在字段缺失时按原样降级。
+
+## 实现记录
+
+设计之外、实现时才发现的四点：
+
+**1. 自由文本渲染路径险些被丢掉。** 新渲染器全面改用结构化字段后，只填 `Message`、不填 `ToolName` 的事件不再显示任何进度——直接违背了本文「Message 保留，旧消费方渲染不变」的承诺。补 `lastMessage` 兜底字段修复，由 `TestHandleSubagentEvent_MultiTask_RunningUpdatesOnlyThatTask` 钉住。
+
+**2. 两处渲染缺陷只有跑真实渲染才看得出来**，读代码看不出来：最后一项的详情行在 `└─` 之后仍画竖线；已完成任务的详情行把自己的描述重复打印一遍。详情行改为接收树形前缀，已完成状态显示「完成」而非回显描述。
+
+**3. `Pool.Wait` 会回收任务条目**（有意为之：否则整份 transcript 保留到进程退出），所以 `Wait` 之后 `GetTask` 必然返回 false。对应的真实场景是「用户在任务刚好自己结束的瞬间按下 Ctrl+X」——`CancelTask` 对已回收的 ID 返回 false 而非 panic。
+
+**4. 四个既有 TUI 测试编码的是被本设计取代的旧行为**（终止事件立即提交并清除），按新语义更新了断言、保留其原本意图（任务间互不干扰）。其中超出显示上限的那条更严格了：断言「从未在实时区渲染过的任务，仍必须出现在轮次结束的块里」。

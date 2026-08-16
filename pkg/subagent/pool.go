@@ -117,6 +117,25 @@ func (p *Pool) Wait(ctx context.Context, taskID string) (*Task, error) {
 	}
 }
 
+// CancelTask stops a single running task, leaving every sibling untouched.
+// Reports whether a running task was actually cancelled: an unknown ID, or one
+// that has already finished, is a no-op rather than an error — the user can
+// press the key a moment after the task resolved on its own.
+func (p *Pool) CancelTask(taskID string) bool {
+	task, ok := p.getTask(taskID)
+	if !ok {
+		return false
+	}
+	task.mu.Lock()
+	cancel := task.cancel
+	task.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 // GetTask returns the current snapshot for taskID. Once the first successful
 // Wait for taskID has consumed (deleted) its entry, GetTask returns (nil, false)
 // even though the task did in fact run to completion.
@@ -166,6 +185,17 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		runCtx, cancel = context.WithCancel(parentCtx)
 	}
 	defer cancel()
+
+	// Publish the cancel so CancelTask can reach just this task. Cleared on
+	// the way out so a finished task cannot be "cancelled" into a wrong state.
+	task.mu.Lock()
+	task.cancel = cancel
+	task.mu.Unlock()
+	defer func() {
+		task.mu.Lock()
+		task.cancel = nil
+		task.mu.Unlock()
+	}()
 
 	result, err := p.executor.Execute(runCtx, task, func(evt TaskEvent) {
 		if evt.TaskID == "" {

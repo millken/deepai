@@ -84,6 +84,7 @@ func (m *mockUI) RenderEvent(_ agent.AgentEvent)           {}
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}
 func (m *mockUI) InterruptCh() <-chan struct{}             { return nil }
+func (m *mockUI) CancelTaskCh() <-chan string              { return nil }
 func (m *mockUI) LoadHistory(_ string)                     {}
 func (m *mockUI) SaveHistory()                             {}
 func (m *mockUI) Close()                                   {}

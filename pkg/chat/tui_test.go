@@ -173,9 +173,11 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 		{"lifecycle noise dropped", subagent.TaskEvent{Type: "task_running", Message: "task started"}, false},
 		{"empty message dropped", subagent.TaskEvent{Type: "task_running", Message: ""}, false},
 		{"started is live", subagent.TaskEvent{Type: "task_started", Description: "review"}, false},
-		{"completed renders check", subagent.TaskEvent{Type: "task_completed", Description: "implementing · round 1/4"}, true},
-		{"timeout renders", subagent.TaskEvent{Type: "task_timed_out", Error: "deadline"}, true},
-		{"cancelled renders", subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}, true},
+		// Terminal events resolve the entry in place; the whole fan-out block
+		// commits once at turn end, so none of these commit on their own.
+		{"completed does not commit", subagent.TaskEvent{Type: "task_completed", Description: "implementing · round 1/4"}, false},
+		{"timeout does not commit", subagent.TaskEvent{Type: "task_timed_out", Error: "deadline"}, false},
+		{"cancelled does not commit", subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}, false},
 	}
 	for _, c := range cases {
 		got := m.handleSubagentEvent(c.evt) != nil
@@ -185,13 +187,16 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 	}
 }
 
-func TestHandleSubagentEvent_CancelledClearsStatus(t *testing.T) {
-	m := &tuiModel{subagentTasks: []subagentTaskLine{{line: "  ↳ [subagent] working"}}}
-	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_cancelled", Error: "context canceled"}); cmd == nil {
-		t.Fatal("expected a scrollback commit command for task_cancelled")
+func TestHandleSubagentEvent_CancelledResolvesInPlace(t *testing.T) {
+	m := &tuiModel{subagentTasks: []subagentTaskLine{{taskID: "A", line: "  ↳ [subagent] working"}}}
+	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_cancelled", TaskID: "A", Error: "context canceled"}); cmd != nil {
+		t.Fatal("a terminal event must not commit on its own — the block commits at turn end")
 	}
-	if len(m.subagentTasks) != 0 {
-		t.Fatalf("subagentTasks = %+v, want empty", m.subagentTasks)
+	if len(m.subagentTasks) != 1 {
+		t.Fatalf("subagentTasks = %+v, want the entry kept until turn end", m.subagentTasks)
+	}
+	if m.subagentTasks[0].status != "cancelled" {
+		t.Fatalf("status = %q, want cancelled", m.subagentTasks[0].status)
 	}
 }
 
@@ -228,8 +233,10 @@ func TestHandleSubagentEvent_MultiTask_RunningUpdatesOnlyThatTask(t *testing.T) 
 	if !strings.Contains(view, "⚙ edit_file") {
 		t.Fatalf("expected A's line updated to running message, got %q", view)
 	}
-	if strings.Contains(view, "task A") {
-		t.Fatalf("expected A's started line replaced, got %q", view)
+	// The description stays on the entry's head line; activity renders on the
+	// detail line beneath it, so both are visible at once.
+	if !strings.Contains(view, "task A") {
+		t.Fatalf("expected A's description to remain visible, got %q", view)
 	}
 	if !strings.Contains(view, "task B") {
 		t.Fatalf("expected B's line untouched by A's update, got %q", view)
@@ -239,38 +246,40 @@ func TestHandleSubagentEvent_MultiTask_RunningUpdatesOnlyThatTask(t *testing.T) 
 // This is the core bug: today a terminal event for one task clears the
 // single shared status string, wiping out every other in-flight task's
 // line. It must only remove that task's own entry.
-func TestHandleSubagentEvent_MultiTask_TerminalClearsOnlyThatTask(t *testing.T) {
+func TestHandleSubagentEvent_MultiTask_TerminalResolvesOnlyThatTask(t *testing.T) {
 	m := &tuiModel{}
 	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
 	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
 
-	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"}); cmd == nil {
-		t.Fatal("expected a scrollback commit command for task_completed")
-	}
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"})
 
+	// Both stay visible: a finished task dropping out of the block is what made
+	// a fan-out of four look like one.
 	view := m.View().Content
-	if strings.Contains(view, "task A") {
-		t.Fatalf("expected A's live line removed after its terminal event, got %q", view)
+	if !strings.Contains(view, "task A") || !strings.Contains(view, "task B") {
+		t.Fatalf("both entries must remain, got %q", view)
 	}
-	if !strings.Contains(view, "task B") {
-		t.Fatalf("expected B's live line to survive A's terminal event, got %q", view)
+	if m.subagentTasks[0].status != "done" {
+		t.Fatalf("A status = %q, want done", m.subagentTasks[0].status)
+	}
+	if m.subagentTasks[1].status != "" {
+		t.Fatalf("B status = %q, want still running", m.subagentTasks[1].status)
 	}
 }
 
-func TestHandleSubagentEvent_MultiTask_TerminalStillCommitsScrollbackLine(t *testing.T) {
+func TestHandleSubagentEvent_MultiTask_TurnEndBlockRecordsEveryTask(t *testing.T) {
 	m := &tuiModel{}
 	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "A", Description: "task A"})
 	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_started", TaskID: "B", Description: "task B"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"})
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "B", Description: "task B"})
 
-	cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "task A"})
-	if cmd == nil {
-		t.Fatal("expected a scrollback commit command for task_completed")
-	}
-	got := fmt.Sprintf("%v", cmd())
-	got = strings.TrimSuffix(strings.TrimPrefix(got, "{"), "}")
-	want := m.styles.ToolResult.Render("  ↳ ✓ task A")
-	if got != want {
-		t.Fatalf("commit content = %q, want %q", got, want)
+	block := m.subagentSummaryBlock()
+	for _, want := range []string{"task A", "task B"} {
+		if strings.Count(block, want) != 1 {
+			t.Fatalf("%q appears %d times in the scrollback block, want exactly 1:\n%s",
+				want, strings.Count(block, want), block)
+		}
 	}
 }
 
@@ -310,15 +319,18 @@ func TestView_SubagentTasks_CapsRenderedLinesWithOverflowSummary(t *testing.T) {
 		t.Fatalf("subagentTasks = %d, want all 7 still tracked even though only 5 render", len(m.subagentTasks))
 	}
 
-	// A terminal event for a hidden task (T6, beyond the cap) must still work:
-	// removed from subagentTasks and still commits a scrollback line, just
-	// like a visible task's terminal event does.
-	cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "T6", Description: "task 6"})
-	if cmd == nil {
-		t.Fatal("expected a scrollback commit command for the hidden task's terminal event")
+	// A terminal event for a hidden task (T6, beyond the cap) must still be
+	// recorded: resolved in place like a visible one, and present in the
+	// turn-end block even though it never rendered live.
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "T6", Description: "task 6"})
+	if len(m.subagentTasks) != 7 {
+		t.Fatalf("subagentTasks = %d, want all 7 kept until turn end", len(m.subagentTasks))
 	}
-	if len(m.subagentTasks) != 6 {
-		t.Fatalf("subagentTasks after hidden task's completion = %d, want 6", len(m.subagentTasks))
+	if m.subagentTasks[6].status != "done" {
+		t.Fatalf("hidden task status = %q, want done", m.subagentTasks[6].status)
+	}
+	if !strings.Contains(m.subagentSummaryBlock(), "task 6") {
+		t.Fatalf("the turn-end block must record a task that was never rendered live:\n%s", m.subagentSummaryBlock())
 	}
 }
 

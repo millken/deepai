@@ -18,6 +18,7 @@ import (
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/skill"
+	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/tools/builtin"
 	"github.com/spf13/cobra"
@@ -206,7 +207,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	for _, a := range agentCatalog {
 		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})
 	}
-	registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, pluginAgentDirs, agentOpts)
+	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, pluginAgentDirs, agentOpts)
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -336,6 +337,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		MCPReport:            startupReport,
 		Commands:             commands,
 		AgentCatalog:         agentCatalog,
+		TaskCanceller:        subPool,
 	}
 
 	repl, err := chat.NewRepl(replCfg)
@@ -346,7 +348,10 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	return repl.Run(ctx)
 }
 
-func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) {
+// registerChatTools returns the subagent pool so the REPL can cancel a single
+// task from the UI; the pool is created here because this is where the tool
+// registry is assembled.
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
@@ -370,6 +375,7 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	for _, tool := range builtin.DocxTools() {
 		mustRegisterTool(registry, tool)
 	}
+	return subPool
 }
 
 // subagentMaxTokens returns a fresh pointer to agent.ResolveMaxOutputTokens()

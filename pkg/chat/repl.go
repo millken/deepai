@@ -43,10 +43,14 @@ type ReplConfig struct {
 	PreferenceExtractor memory.Extractor
 	SessionRepo         models.SessionRepository // injected from outside
 	InputHistoryFile    string                   // path for persisting input history (optional)
-	SandboxBaseDir      string                   // root for sandbox session dirs; must NOT be the user's workdir
-	MCPReport           string                   // one-line MCP load summary; printed after banner when non-empty
-	AgentCatalog        []agent.AgentInfo
-	Commands            map[string]Command // file-based slash commands; body injected as a user turn
+	// TaskCanceller stops a single running subagent by ID. Supplied by the
+	// composition root, which owns the pool. nil disables per-task
+	// cancellation (Ctrl+C still cancels the whole turn).
+	TaskCanceller  TaskCanceller
+	SandboxBaseDir string // root for sandbox session dirs; must NOT be the user's workdir
+	MCPReport      string // one-line MCP load summary; printed after banner when non-empty
+	AgentCatalog   []agent.AgentInfo
+	Commands       map[string]Command // file-based slash commands; body injected as a user turn
 
 	// MemoryAutoRefine enables the auto-refine review gate. When false the REPL
 	// falls back to unconditional extraction rather than skipping memory work.
@@ -109,9 +113,16 @@ type ReplUI interface {
 	RenderSubagentEvent(evt subagent.TaskEvent)
 	RenderInterrupted()
 	InterruptCh() <-chan struct{}
+	CancelTaskCh() <-chan string
 	LoadHistory(path string)
 	SaveHistory()
 	Close()
+}
+
+// TaskCanceller is the narrow slice of the subagent pool the REPL needs: stop
+// one task by ID. Kept minimal so the REPL does not depend on the pool type.
+type TaskCanceller interface {
+	CancelTask(taskID string) bool
 }
 
 // ChatRepl is the interactive chat REPL.
@@ -530,12 +541,23 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 	// sigFired is written by the watcher goroutine before turnCancel(); reading
 	// it after fn returns (which implies the context is done) is race-free.
 	sigFired := make(chan struct{}, 1)
+	cancelTasks := r.ui.CancelTaskCh()
 	go func() {
-		select {
-		case <-uiInterrupt:
-			sigFired <- struct{}{}
-			turnCancel()
-		case <-turnCtx.Done():
+		for {
+			select {
+			case <-uiInterrupt:
+				sigFired <- struct{}{}
+				turnCancel()
+				return
+			case taskID := <-cancelTasks:
+				// Per-task cancellation does NOT end the turn: the point is to
+				// drop one stuck subagent and let the rest finish.
+				if r.cfg.TaskCanceller != nil {
+					r.cfg.TaskCanceller.CancelTask(taskID)
+				}
+			case <-turnCtx.Done():
+				return
+			}
 		}
 	}()
 

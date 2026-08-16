@@ -77,6 +77,11 @@ func (t *TUI) Close() {
 // Ctrl+C while the agent is running. The REPL selects on this to cancel a turn.
 func (t *TUI) InterruptCh() <-chan struct{} { return t.model.interruptCh }
 
+// CancelTaskCh returns the channel carrying task IDs the user asked to cancel
+// from task mode (Ctrl+X). The REPL forwards each to the subagent pool, which
+// stops that one task and leaves its siblings running.
+func (t *TUI) CancelTaskCh() <-chan string { return t.model.cancelTaskCh }
+
 // --- output (rendering) ---
 
 // Banner commits the startup banner to scrollback.
@@ -281,10 +286,27 @@ type tuiModel struct {
 	// updates in place independently, keyed by TaskID. Order is insertion
 	// order (first-started first).
 	subagentTasks []subagentTaskLine
+
+	// taskMode is the subagent inspector, entered with Ctrl+T. It is a
+	// separate mode on purpose: up/down already drive completion candidates
+	// and input history, so capturing them whenever a subagent happens to be
+	// running would break ordinary typing for the length of a fan-out.
+	taskMode bool
+	taskSel  int
+	// cancelTaskCh carries the task ID the user asked to cancel. Buffered and
+	// non-blocking, like interruptCh — a UI keypress must never block on a
+	// consumer that is busy.
+	cancelTaskCh chan string
 }
 
-// subagentTaskLine is one entry in tuiModel.subagentTasks: the live status
-// line for a single in-flight subagent task.
+// taskSelectionMarker flags the selected entry in task mode.
+const taskSelectionMarker = "\u25c0"
+
+// subagentTaskLine is one entry in tuiModel.subagentTasks: the status of a
+// single subagent task. Entries survive their terminal event and are only
+// dropped when the turn ends — a task that vanishes the moment it finishes
+// makes a fan-out of four look like one, which is exactly how "4 dispatched,
+// 1 visible" happened.
 type subagentTaskLine struct {
 	taskID      string
 	line        string
@@ -292,7 +314,36 @@ type subagentTaskLine struct {
 	agentType   string // e.g., "coder", "tester", "bash"
 	startedAt   time.Time
 	spinnerIdx  int
+
+	// Live progress, from TaskEvent's structured fields.
+	currentTool string
+	toolArgs    string
+	toolCalls   int
+	tokens      int
+	// lastMessage is the free-text progress from TaskEvent.Message, shown when
+	// no structured tool info is available — an event source that only fills
+	// Message must still render.
+	lastMessage string
+	// status is "" while running, else "done" / "failed" / "cancelled".
+	status   string
+	endNote  string // error text or completion description
+	history  []subagentHistoryEntry
+	expanded bool
 }
+
+// subagentHistoryEntry is one tool the subagent ran.
+type subagentHistoryEntry struct {
+	tool       string
+	args       string
+	status     string // running / ok / error
+	durationMS int64
+}
+
+// maxSubagentHistory bounds the per-task activity ring. A subagent can run for
+// hours; without a bound its history grows for the whole session. Oldest
+// entries are dropped first — the recent ones are what answer "where is it
+// stuck right now".
+const maxSubagentHistory = 50
 
 // maxLiveSubagentLines caps how many subagent status lines View() renders in
 // the live region at once. Beyond the cap, the remainder collapses into a
@@ -326,6 +377,7 @@ func newTUIModel(status BannerInfo) *tuiModel {
 		histIdx:       -1,
 		model:         status.Model,
 		interruptCh:   make(chan struct{}, 1),
+		cancelTaskCh:  make(chan string, 8),
 		histStore:     newHistoryStore(),
 		renderMD:      true,
 		contextWindow: status.ContextWindow,
@@ -403,6 +455,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if f := m.flushPartial(); f != "" {
 			lines = append(lines, f)
 		}
+		// The fan-out block commits here, once, after the streamed text and
+		// before the stats line — terminal task events deliberately commit
+		// nothing of their own.
+		if block := m.subagentSummaryBlock(); block != "" {
+			lines = append(lines, block)
+		}
+		m.clearSubagentBlock()
 		lines = append(lines, m.statsLine())
 		return m, commit(strings.Join(lines, "\n"))
 
@@ -412,6 +471,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if f := m.flushPartial(); f != "" {
 			lines = append(lines, f)
 		}
+		// An interrupted turn still committed real subagent work — losing the
+		// block here would discard the record of what actually ran.
+		if block := m.subagentSummaryBlock(); block != "" {
+			lines = append(lines, block)
+		}
+		m.clearSubagentBlock()
 		lines = append(lines, m.styles.Dim.Render("  ⎿ Interrupted."))
 		return m, commit(strings.Join(lines, "\n"))
 
@@ -450,7 +515,22 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Task-mode keys are handled first, but ONLY while the mode is engaged, so
+	// every binding below behaves exactly as before outside it.
+	if m.taskMode {
+		if handled, model, cmd := m.handleTaskModeKey(msg); handled {
+			return model, cmd
+		}
+	}
 	switch msg.String() {
+	case "ctrl+t":
+		if len(m.subagentTasks) == 0 {
+			return m, nil
+		}
+		m.taskMode = !m.taskMode
+		m.taskSel = 0
+		return m, nil
+
 	case "ctrl+c":
 		switch {
 		case m.askActive:
@@ -805,18 +885,14 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if len([]rune(desc)) > 80 {
 			desc = string([]rune(desc)[:77]) + "..."
 		}
-		// Extract agent type from description if available
-		agentType := ""
-		if strings.Contains(desc, "[") && strings.Contains(desc, "]") {
-			start := strings.Index(desc, "[") + 1
-			end := strings.Index(desc[start:], "]")
-			if end > 0 {
-				agentType = desc[start : start+end]
-			}
-		}
-		m.setSubagentLineWithInfo(evt.TaskID, "  ↳ [subagent] "+desc, desc, agentType)
+		// AgentType arrives as its own field now. It used to be scraped out of
+		// the description by looking for "[...]", which mis-parsed any
+		// description that merely contained a bracket.
+		m.setSubagentLineWithInfo(evt.TaskID, "  \u21b3 [subagent] "+desc, desc, evt.AgentType)
 		return nil
+
 	case "task_running":
+		m.recordSubagentProgress(evt)
 		msg := strings.TrimSpace(evt.Message)
 		if msg == "" || msg == "task started" {
 			return nil
@@ -824,34 +900,272 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if d := strings.TrimSpace(evt.Description); d != "" {
 			msg = "[" + d + "] " + msg
 		}
-		m.updateSubagentLine(evt.TaskID, "  ↳ "+msg)
+		m.updateSubagentLine(evt.TaskID, "  \u21b3 "+msg)
+		m.setSubagentMessage(evt.TaskID, strings.TrimSpace(evt.Message))
 		return nil
+
+	// Terminal events resolve the entry in place and commit NOTHING: the whole
+	// block is committed once when the turn ends (see subagentSummaryBlock).
+	// Committing here as well would print every task twice.
 	case "task_completed":
-		m.clearSubagentLine(evt.TaskID)
 		desc := strings.TrimSpace(evt.Description)
 		if desc == "" {
 			desc = "done"
 		}
-		return m.commitWithFlush(m.styles.ToolResult.Render("  ↳ ✓ " + desc))
+		m.resolveSubagentLine(evt.TaskID, "done", desc)
+		return nil
 	case "task_timed_out":
-		m.clearSubagentLine(evt.TaskID)
-		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] timed out: " + evt.Error))
+		m.resolveSubagentLine(evt.TaskID, "failed", "timed out: "+evt.Error)
+		return nil
 	case "task_failed":
-		m.clearSubagentLine(evt.TaskID)
 		errMsg := evt.Error
 		if errMsg == "" {
 			errMsg = evt.Message
 		}
-		return m.commitWithFlush(m.styles.Error.Render("  ↳ [subagent] failed: " + errMsg))
+		m.resolveSubagentLine(evt.TaskID, "failed", errMsg)
+		return nil
 	case "task_cancelled":
-		m.clearSubagentLine(evt.TaskID)
 		errMsg := evt.Error
 		if errMsg == "" {
 			errMsg = evt.Message
 		}
-		return m.commitWithFlush(m.styles.Error.Render("  ↳ ⊘ [subagent] cancelled: " + errMsg))
+		m.resolveSubagentLine(evt.TaskID, "cancelled", errMsg)
+		return nil
 	}
 	return nil
+}
+
+// handleTaskModeKey consumes the inspector's bindings. The bool reports
+// whether the key was consumed; anything it does not recognise falls through
+// to the normal handler.
+func (m *tuiModel) handleTaskModeKey(msg tea.KeyPressMsg) (bool, tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+t":
+		m.taskMode = false
+		return true, m, nil
+	case "up":
+		if m.taskSel > 0 {
+			m.taskSel--
+		}
+		return true, m, nil
+	case "down":
+		if m.taskSel < len(m.subagentTasks)-1 {
+			m.taskSel++
+		}
+		return true, m, nil
+	case "enter":
+		if t := m.selectedTask(); t != nil {
+			t.expanded = !t.expanded
+		}
+		return true, m, nil
+	case "ctrl+x":
+		t := m.selectedTask()
+		// A finished task has nothing to cancel; sending anyway would race a
+		// result that has already been recorded.
+		if t == nil || t.status != "" {
+			return true, m, nil
+		}
+		select {
+		case m.cancelTaskCh <- t.taskID:
+		default:
+		}
+		return true, m, nil
+	}
+	return false, m, nil
+}
+
+// selectedTask returns the entry under the cursor, or nil when the selection
+// is stale (the block can be cleared while the mode is engaged).
+func (m *tuiModel) selectedTask() *subagentTaskLine {
+	if m.taskSel < 0 || m.taskSel >= len(m.subagentTasks) {
+		return nil
+	}
+	return &m.subagentTasks[m.taskSel]
+}
+
+// recordSubagentProgress folds a progress event's structured fields into the
+// task's live counters and activity ring.
+func (m *tuiModel) recordSubagentProgress(evt subagent.TaskEvent) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID != evt.TaskID {
+			continue
+		}
+		t := &m.subagentTasks[i]
+		if evt.AgentType != "" {
+			t.agentType = evt.AgentType
+		}
+		if evt.ToolCalls > 0 {
+			t.toolCalls = evt.ToolCalls
+		}
+		if evt.Tokens > 0 {
+			t.tokens = evt.Tokens
+		}
+		if evt.ToolName == "" {
+			return
+		}
+		t.currentTool = evt.ToolName
+		t.toolArgs = evt.ToolArgs
+		t.history = append(t.history, subagentHistoryEntry{
+			tool:       evt.ToolName,
+			args:       evt.ToolArgs,
+			status:     evt.ToolStatus,
+			durationMS: evt.DurationMS,
+		})
+		if len(t.history) > maxSubagentHistory {
+			// Drop the OLDEST: the recent entries answer "where is it now".
+			t.history = t.history[len(t.history)-maxSubagentHistory:]
+		}
+		return
+	}
+}
+
+// setSubagentMessage records the free-text progress line for the fallback
+// render path.
+func (m *tuiModel) setSubagentMessage(taskID, msg string) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks[i].lastMessage = msg
+			return
+		}
+	}
+}
+
+// resolveSubagentLine marks a task finished without removing it, so the whole
+// fan-out stays on screen until the turn ends.
+func (m *tuiModel) resolveSubagentLine(taskID, status, note string) {
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks[i].status = status
+			m.subagentTasks[i].endNote = note
+			m.subagentTasks[i].currentTool = ""
+			return
+		}
+	}
+}
+
+// subagentSummaryBlock renders the finished fan-out for scrollback. Returns ""
+// when there is nothing to report, so a turn without subagents commits nothing.
+func (m *tuiModel) subagentSummaryBlock() string {
+	if len(m.subagentTasks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, t := range m.subagentTasks {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(m.styles.Dim.Render(subagentSummaryLine(t, i == len(m.subagentTasks)-1)))
+	}
+	return b.String()
+}
+
+// clearSubagentBlock drops every entry. Called once the block has been
+// committed at turn end.
+func (m *tuiModel) clearSubagentBlock() {
+	m.subagentTasks = nil
+	// Nothing left to inspect: leaving the mode engaged would render a stale
+	// selection and swallow the arrow keys.
+	m.taskMode = false
+	m.taskSel = 0
+}
+
+func subagentSummaryLine(t subagentTaskLine, last bool) string {
+	branch := "\u251c\u2500"
+	if last {
+		branch = "\u2514\u2500"
+	}
+	mark := "\u2713"
+	switch t.status {
+	case "failed":
+		mark = "\u2717"
+	case "cancelled":
+		mark = "\u2298"
+	case "":
+		mark = "\u22ef"
+	}
+	desc := t.description
+	if t.agentType != "" {
+		desc = "[" + t.agentType + "] " + desc
+	}
+	line := fmt.Sprintf("  %s %s %s", branch, mark, desc)
+	if t.toolCalls > 0 {
+		line += fmt.Sprintf(" \u00b7 %d \u5de5\u5177", t.toolCalls)
+	}
+	if t.tokens > 0 {
+		line += fmt.Sprintf(" \u00b7 %s", formatTokenCount(t.tokens))
+	}
+	if t.endNote != "" && t.status != "done" {
+		line += " \u00b7 " + t.endNote
+	}
+	return line
+}
+
+// subagentDetailLine is the second line of a task entry: what it is doing now
+// (or how it ended) plus the running totals.
+func subagentDetailLine(t subagentTaskLine, elapsedSec int, gutter string) string {
+	var parts []string
+	switch {
+	case t.status == "done":
+		// endNote is the task's own description for a completed task; echoing
+		// it directly under the head line just prints it twice.
+		parts = append(parts, "\u5b8c\u6210")
+	case t.status != "" && t.endNote != "":
+		parts = append(parts, t.endNote)
+	case t.status != "":
+		parts = append(parts, t.status)
+	case t.currentTool != "":
+		cur := t.currentTool
+		if t.toolArgs != "" {
+			cur += " " + t.toolArgs
+		}
+		parts = append(parts, cur)
+	case t.lastMessage != "":
+		parts = append(parts, t.lastMessage)
+	default:
+		parts = append(parts, "\u542f\u52a8\u4e2d\u2026")
+	}
+	if t.toolCalls > 0 {
+		parts = append(parts, fmt.Sprintf("%d \u5de5\u5177", t.toolCalls))
+	}
+	if t.tokens > 0 {
+		parts = append(parts, formatTokenCount(t.tokens))
+	}
+	parts = append(parts, fmt.Sprintf("%ds", elapsedSec))
+	return gutter + "    " + strings.Join(parts, " \u00b7 ")
+}
+
+// subagentHistoryTail returns at most n most-recent entries.
+func subagentHistoryTail(h []subagentHistoryEntry, n int) []subagentHistoryEntry {
+	if len(h) <= n {
+		return h
+	}
+	return h[len(h)-n:]
+}
+
+func subagentHistoryLine(h subagentHistoryEntry) string {
+	mark := "\u2713"
+	switch h.status {
+	case "error":
+		mark = "\u2717"
+	case "running":
+		mark = "\u22ef"
+	}
+	line := mark + " " + h.tool
+	if h.args != "" {
+		line += " " + h.args
+	}
+	if h.durationMS > 0 {
+		line += fmt.Sprintf("  %dms", h.durationMS)
+	}
+	return line
+}
+
+// formatTokenCount keeps the status line narrow: 47000 -> "47k".
+func formatTokenCount(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%dk", n/1000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 // setSubagentLineWithInfo creates a new task entry with full metadata.
@@ -1078,30 +1392,55 @@ func (m *tuiModel) View() tea.View {
 		overflow = len(visible) - maxLiveSubagentLines
 		visible = visible[:maxLiveSubagentLines]
 	}
-	for _, task := range visible {
-		// Calculate elapsed time for this task
-		elapsed := time.Since(task.startedAt)
-		elapsedSec := int(elapsed.Seconds())
-
-		// Get spinner character for this task
-		spinChar := subagentSpinners[task.spinnerIdx]
-
-		// Build enhanced line with spinner, type, and duration
-		var line string
-		if task.agentType != "" {
-			line = fmt.Sprintf("  ↳ %s [%s] %s (%ds)", spinChar, task.agentType, task.description, elapsedSec)
-		} else if task.line != "" {
-			line = fmt.Sprintf("%s (%ds)", task.line, elapsedSec)
-		} else {
-			line = fmt.Sprintf("  ↳ %s %s (%ds)", spinChar, task.description, elapsedSec)
+	for i, task := range visible {
+		branch := "\u251c\u2500"
+		if i == len(visible)-1 && overflow == 0 {
+			branch = "\u2514\u2500"
 		}
-		b.WriteString(m.styles.Dim.Render(line))
+		elapsedSec := int(time.Since(task.startedAt).Seconds())
+
+		// Resolved tasks keep their slot with a terminal mark instead of a
+		// spinner: the whole fan-out stays legible until the turn ends.
+		mark := subagentSpinners[task.spinnerIdx]
+		switch task.status {
+		case "done":
+			mark = "\u2713"
+		case "failed":
+			mark = "\u2717"
+		case "cancelled":
+			mark = "\u2298"
+		}
+
+		head := fmt.Sprintf("  %s %s %s", branch, mark, task.description)
+		if task.agentType != "" {
+			head = fmt.Sprintf("  %s %s [%s] %s", branch, mark, task.agentType, task.description)
+		}
+		if m.taskMode && i == m.taskSel {
+			head += "  " + taskSelectionMarker
+		}
+		b.WriteString(m.styles.Dim.Render(head))
 		b.WriteString("\n")
+
+		gutter := "\u2502"
+		if branch == "\u2514\u2500" {
+			gutter = " " // the tree has closed; no bar below the last entry
+		}
+		b.WriteString(m.styles.Dim.Render("  " + subagentDetailLine(task, elapsedSec, gutter)))
+		b.WriteString("\n")
+
+		if task.expanded {
+			for _, h := range subagentHistoryTail(task.history, 8) {
+				b.WriteString(m.styles.Dim.Render("  " + gutter + "    " + subagentHistoryLine(h)))
+				b.WriteString("\n")
+			}
+		}
 	}
 	if overflow > 0 {
-		// Show summary with total count
-		totalTasks := len(m.subagentTasks)
-		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  ↳ … +%d more [total: %d tasks]", overflow, totalTasks)))
+		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  \u2514\u2500 \u2026 +%d more [total: %d tasks]", overflow, len(m.subagentTasks))))
+		b.WriteString("\n")
+	}
+	if m.taskMode {
+		b.WriteString(m.styles.Dim.Render("  [\u4efb\u52a1\u6a21\u5f0f \u00b7 \u2191\u2193 \u9009\u62e9 \u00b7 Enter \u5c55\u5f00 \u00b7 Ctrl+X \u53d6\u6d88 \u00b7 Esc \u9000\u51fa]"))
 		b.WriteString("\n")
 	}
 
