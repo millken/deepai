@@ -36,6 +36,21 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("read failed: %w", err)
 	}
 
+	// Binary content must never reach the model: this repo's own bin/deepai is
+	// 79 MB with no extension, and reading it would blow the context window on
+	// bytes that are useless as text. Reported as a normal result rather than
+	// an error — it is a complete, final answer about the file, so the model
+	// moves on instead of retrying.
+	if isBinaryContent(data) {
+		return models.ToolResult{
+			CallID:   call.ID,
+			ToolName: call.Name,
+			Content: fmt.Sprintf("[binary file: %d bytes, contents not shown. read_file only returns text; use bash with a suitable tool (file, xxd, strings) to inspect it.]",
+				len(data)),
+			Data: map[string]any{"binary": true, "bytes": len(data)},
+		}, nil
+	}
+
 	startLine, _ := args["start_line"].(float64)
 	endLine, _ := args["end_line"].(float64)
 	withLineNumbers, lineNumbersSet := args["line_numbers"].(bool)

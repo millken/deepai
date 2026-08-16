@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -160,7 +161,13 @@ func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPa
 		if !includeHidden && strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
+		// Extension is a cheap pre-filter; the content sniff below catches
+		// what it cannot — anything extensionless or unlisted (.bin, .class,
+		// .pyc, .jar, .ttf, .pack, a compiled binary named "deepai").
 		if isBinaryExt(filepath.Ext(d.Name())) {
+			return nil
+		}
+		if isBinaryFile(path) {
 			return nil
 		}
 
@@ -299,6 +306,51 @@ func readFileLines(path string) ([]string, error) {
 		return nil, err
 	}
 	return strings.Split(string(data), "\n"), nil
+}
+
+// binarySniffBytes is how much of a file's head is inspected for binary
+// content. Matches git's own heuristic window.
+const binarySniffBytes = 8000
+
+// isBinaryContent reports whether data looks like a binary blob rather than
+// text, using git's rule: a NUL byte within the sniffed head.
+//
+// Deliberately NOT "invalid UTF-8" or "many high bytes" — this codebase and
+// the files it edits are full of CJK comments and emoji, which are high-bit
+// UTF-8 and must never be misclassified. NUL is the discriminator that costs
+// no false positives on real text.
+//
+// The bound is a real limit, not an oversight: a file whose first NUL appears
+// past binarySniffBytes reads as text. That is the same trade git makes, and
+// it keeps the check O(1) on a multi-gigabyte file.
+func isBinaryContent(data []byte) bool {
+	head := data
+	if len(head) > binarySniffBytes {
+		head = head[:binarySniffBytes]
+	}
+	for _, b := range head {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isBinaryFile sniffs a file's head without reading the whole thing — the
+// point of the check is to avoid pulling a 79 MB executable into memory (and
+// then into the model's context) in the first place.
+func isBinaryFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, binarySniffBytes)
+	n, err := f.Read(buf)
+	if n <= 0 || (err != nil && err != io.EOF) {
+		return false
+	}
+	return isBinaryContent(buf[:n])
 }
 
 // isBinaryExt returns true for file extensions that should be skipped.

@@ -428,6 +428,12 @@ func readCodeMapFile(abs, rel string) codeMapFile {
 	if err != nil {
 		return f
 	}
+	// A source extension is no guarantee of source content (generated blobs,
+	// fixtures, a stray build artifact). Leaving content empty yields a file
+	// with no symbols rather than binary bytes in the map.
+	if isBinaryContent(data) {
+		return f
+	}
 	f.content = string(data)
 	f.lines = strings.Count(f.content, "\n") + 1
 	f.symbols = extractSymbols(f.content, filepath.Ext(abs))
