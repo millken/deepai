@@ -188,9 +188,16 @@ type ReviewResult struct {
 
 // Issue represents a single finding from a code review.
 type Issue struct {
-	Severity   string `json:"severity"`
-	File       string `json:"file"`
-	Line       int    `json:"line"`
-	Message    string `json:"message"`
-	Suggestion string `json:"suggestion"`
+	Severity string `json:"severity"`
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Message  string `json:"message"`
+	// Scenario is a reproducible failure scenario: specific input or state
+	// → specific wrong output or behavior. The correctness reviewer is
+	// required by its prompt to fill it (an issue without a scenario does
+	// not count); other reviewers may leave it empty — omitempty keeps the
+	// field out of Required for them (google/jsonschema-go infers Required
+	// from the absence of omitempty/omitzero).
+	Scenario   string `json:"scenario,omitempty"`
+	Suggestion string `json:"suggestion,omitempty"`
 }

@@ -15,6 +15,10 @@ const (
 	AgentTypeSecurityReviewer AgentType = "security-reviewer"
 	AgentTypeArchReviewer     AgentType = "arch-reviewer"
 	AgentTypePerfReviewer     AgentType = "perf-reviewer"
+	// AgentTypeCorrectnessReviewer is the adversarial reviewer behind the
+	// post-edit review gate (docs/ADVERSARIAL_REVIEW_DESIGN.md §4.3). It is
+	// also directly addressable via the task tool like any other type.
+	AgentTypeCorrectnessReviewer AgentType = "correctness-reviewer"
 	AgentTypeProductManager   AgentType = "product-manager"
 	AgentTypeArchitect        AgentType = "architect"
 	AgentTypeBash             AgentType = "bash"
@@ -61,6 +65,16 @@ const (
 	archReviewerSystemPrompt = "You are an independent architecture reviewer. You must make objective judgments based on the code you see.\n\nFocus on: design patterns, coupling and cohesion, extensibility, maintainability, error handling patterns, and API design.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. If the code looks fine, output verdict \"pass\" — do not invent issues.\n3. Output your findings as structured JSON matching the ReviewResult schema."
 	// perfReviewerSystemPrompt focuses on performance characteristics.
 	perfReviewerSystemPrompt = "You are an independent performance reviewer. You must make objective judgments based on the code you see.\n\nFocus on: algorithm complexity, memory allocations, I/O patterns, concurrency bottlenecks, and resource leaks.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. If the code looks fine, output verdict \"pass\" — do not invent issues.\n3. Output your findings as structured JSON matching the ReviewResult schema."
+	// correctnessReviewerSystemPrompt drives the adversarial post-edit
+	// review gate. Its load-bearing constraint is rule 2: an issue without
+	// a reproducible failure scenario does not count. That one rule
+	// suppresses both failure modes of an adversarial reviewer at once —
+	// inventing plausible-sounding issues to justify its existence (false
+	// positives), and vague concerns the implementer cannot act on. Rule 3
+	// permits bash for substantiation but forbids writes; the hard
+	// enforcement is the gate's before/after worktree snapshot (design
+	// §4.4), not this sentence.
+	correctnessReviewerSystemPrompt = "You are an independent adversarial correctness reviewer. Your job is to try to BREAK the change you are given, not to approve it.\n\nYou receive: the original task description, the diff of the change, and the changed files. You do NOT see the implementer's reasoning — judge only what the code actually does.\n\nFocus on: logic errors, unhandled edge cases (empty/nil/zero/boundary), off-by-one, error-path behavior, concurrency hazards introduced by the change, and whether the change actually satisfies the stated task.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. Every issue you report MUST include a concrete failure scenario in the \"scenario\" field: specific input or state → specific wrong output or behavior. An issue without a reproducible scenario does not count — do not report vague concerns.\n3. You may use bash to compile or run tests to substantiate an issue, but you MUST NOT modify, create, or delete any file in the project — you are a reviewer, not a fixer.\n4. If you cannot construct a failure scenario, output verdict \"pass\" — do not invent issues, and do not fail a change for style or taste.\n5. Output your findings as structured JSON matching the ReviewResult schema."
 	// productManagerSystemPrompt focuses on user needs and feature planning.
 	productManagerSystemPrompt = "You are a product manager. Focus on user needs, feature decomposition, priority assessment, and acceptance criteria. Ask for clarification with ask_clarification when requirements are ambiguous."
 	// architectSystemPrompt focuses on system design, module decomposition, and interface definition.
@@ -211,6 +225,19 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		MaxToolCalls: 0,
 		Temperature:  0.2,
 	},
+	AgentTypeCorrectnessReviewer: {
+		Type:         AgentTypeCorrectnessReviewer,
+		Name:         "Correctness Reviewer",
+		Description:  "Adversarially reviews code changes for logic errors, edge cases, and broken behavior.",
+		SystemPrompt: correctnessReviewerSystemPrompt,
+		// bash follows perf-reviewer's precedent: a failing test/build is
+		// the strongest possible substantiation of a correctness charge.
+		// bash is unsandboxed (ExecDirect), so the review gate's worktree
+		// snapshot is the only hard line against reviewer writes.
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
+		MaxToolCalls: 0,
+		Temperature:  0.2,
+	},
 	AgentTypeProductManager: {
 		Type:         AgentTypeProductManager,
 		Name:         "Product Manager",
@@ -284,7 +311,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 
 func init() {
 	reviewSchema := FromStruct[ReviewResult](WithStrict(true), WithMaxRetries(1))
-	for _, at := range []AgentType{AgentTypeSecurityReviewer, AgentTypeArchReviewer, AgentTypePerfReviewer} {
+	for _, at := range []AgentType{AgentTypeSecurityReviewer, AgentTypeArchReviewer, AgentTypePerfReviewer, AgentTypeCorrectnessReviewer} {
 		if cfg, ok := BuiltinAgentTypes[at]; ok {
 			cfg.OutputSchema = reviewSchema
 			BuiltinAgentTypes[at] = cfg
