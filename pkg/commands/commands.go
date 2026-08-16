@@ -10,4 +10,5 @@ func AddCommands(topLevel *cobra.Command) {
 	addPlugin(topLevel)
 	addKey(topLevel)
 	addAnalyze(topLevel)
+	addProbe(topLevel)
 }
