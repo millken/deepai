@@ -16,6 +16,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - [LLM 提供商](#llm-提供商)
 - [工具](#工具)
 - [子代理（Subagent）](#子代理subagent)
+- [对抗式自审](#对抗式自审)
 - [技能（Skill）](#技能skill)
 - [插件系统](#插件系统)
 - [MCP 集成](#mcp-集成)
@@ -34,7 +35,8 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 
 - **ReAct 智能体循环**：思考 → 工具调用 → 观察 → 再思考，支持并行与串行工具调用、流式输出、上下文压缩。
 - **多 LLM 提供商**：OpenAI、Anthropic、Qwen、DeepSeek、Gemini、Groq、GLM、Ollama、Bedrock、OpenAI 兼容网关，统一抽象。
-- **子代理编排**：通过 `task` 工具把任务委派给独立的专家代理（coder、researcher、security-reviewer 等 13 种内置类型），池化并发、超时控制、事件流回传。
+- **子代理编排**：通过 `task` 工具把任务委派给独立的专家代理（coder、researcher、security-reviewer 等 14 种内置类型），池化并发、超时控制、事件流回传。
+- **对抗式自审**：可选的编辑后审查闭环——独立上下文的 correctness-reviewer 对改动出具结构化裁决，不通过则有界回注修复（最多 2 轮），审查者写树即弃裁决。
 - **丰富的内置工具**：bash、文件读写编辑、代码地图、git 全家桶、web 搜索/抓取/图片搜索、图像查看、记忆等。
 - **技能系统**：用 `SKILL.md` + YAML frontmatter 定义可复用工作流，支持 hooks、动态注入、模型/effort 覆盖、fork 上下文。
 - **Claude 插件兼容**：发现并加载 Claude Code 风格的插件包（skills、agents、commands、MCP servers）。
@@ -141,6 +143,11 @@ mode: ""                            # "" 或 "interactive"（默认）；"autono
 # Token 效率（可选，默认关闭）
 token_metrics: ""                   # "1" 写入默认路径；或指定 JSONL 文件路径
 token_aging: false                  # true 启用 T1 工具结果老化
+
+# 对抗式自审（可选，默认关闭；详见 docs/ADVERSARIAL_REVIEW_DESIGN.md）
+review_after_edit: false            # true 启用编辑后自动对抗式审查
+review_token_budget: 0              # 单次审查 token 预算：0=默认 30000，负值=不限
+review_timeout: 0                   # 单次审查超时（分钟，0=默认 5 分钟）
 ```
 
 ### 3. 环境变量 `~/.deepai/.env`
@@ -314,6 +321,7 @@ deepai plugin remove <name>      # 移除插件
 | `/compact` | 立即压缩上下文 |
 | `/plan` | 进入计划模式（只读探索） |
 | `/run` | 退出计划模式（完整工具权限） |
+| `/review [on\|off\|status]` | 手动对抗式审查未提交改动；或切换本会话的自动审查开关 |
 | `/model [name]` | 查看/切换模型 |
 | `/status` | 显示已加载工具/插件与调用统计 |
 | `/exit` | 退出 REPL |
@@ -379,7 +387,7 @@ DeepAI 通过 `pkg/llm` 抽象所有提供商，统一为 `LLMProvider` 接口�
 4. 子代理独立运行，事件流回传给主 agent
 5. 主 agent 阻塞等待结果，把最终输出作为工具返回值
 
-### 内置 Agent 类型（13 种）
+### 内置 Agent 类型（14 种）
 
 | 类型 | 用途 | 默认工具集 |
 |------|------|-----------|
@@ -390,6 +398,7 @@ DeepAI 通过 `pkg/llm` 抽象所有提供商，统一为 `LLMProvider` 接口�
 | `security-reviewer` | 安全评审 | 只读+JSON OutputSchema |
 | `arch-reviewer` | 架构评审 | 只读+JSON OutputSchema |
 | `perf-reviewer` | 性能评审 | 只读+bash+JSON OutputSchema |
+| `correctness-reviewer` | 正确性对抗审查（自审 gate 使用） | 只读+bash+JSON OutputSchema |
 | `product-manager` | 产品规划 | 只读+ask_clarification |
 | `architect` | 系统设计 | 只读工具 |
 | `bash` | 命令执行 | 仅 bash |
@@ -422,6 +431,31 @@ temperature: 0.2
 解析优先级：**项目 YAML > 项目 MD > 插件 MD > 内置 > general 回退**。
 
 详见 [`pkg/subagent/README.md`](pkg/subagent/README.md) 与 [`docs/MULTI_AGENT.md`](docs/MULTI_AGENT.md)。
+
+---
+
+## 对抗式自审
+
+> 完整设计与决策记录见 [docs/ADVERSARIAL_REVIEW_DESIGN.md](docs/ADVERSARIAL_REVIEW_DESIGN.md)。默认关闭，`review_after_edit: true` 启用。
+
+agent 完成代码编辑后，REPL 自动触发一次**独立上下文的对抗式审查**，不通过则把问题回注给 agent 修复，直到通过或达到轮数上限：
+
+```
+用户请求 → agent 编辑代码 → gate（改了什么文件？）
+  → correctness-reviewer 子代理（只看需求+diff+文件，不看实现推理）
+  → pass：放行  |  fail：回注修复（最多 2 轮）→ 重审  |  仍 fail：交人工裁决
+```
+
+关键机制：
+
+- **触发是代码保证的**：改动归因 = `edit_file`/`write_file` 工具记录 ∪ turn 边界 `git status` 快照差集（后者捕获 `go fmt`、`sed -i` 等 bash 间接编辑）；不依赖模型自觉。
+- **审查是独立的**：reviewer 拿到的是原始需求 + 范围限定 diff（`git diff -- <改动文件>`，untracked 新文件以 `--no-index` 拼入）+ 文件全文，看不到实现者的推理轨迹。
+- **裁决是结构化的**：`ReviewResult` JSON schema 严格校验；每个 issue 必须附可复现失败场景（`scenario` 字段），给不出场景必须 pass——同时压制假阳性与空泛指控。
+- **循环是有界的**：修复轮上限 2（硬编码常量），仍不过则原样呈给用户，不自动回滚。
+- **失败是软着陆的**：审查超时/解析失败/改动过大，一律放行并明确警示"本次改动未经审查"，绝不阻断主流程。
+- **审查者不可写**：审查前后快照比对，reviewer 的 bash 一旦写了工作树（无论恶意还是脚本副作用），裁决即被丢弃并警示。
+
+手动入口：`/review` 立即审查未提交改动（自动开关关闭时也可用）；`/review on|off` 切换本会话的自动审查。
 
 ---
 

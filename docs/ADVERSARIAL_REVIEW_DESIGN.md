@@ -341,6 +341,30 @@ review_timeout: 5m           # 单次审查超时
 
 ---
 
+## 十一、实施状态与偏离记录(2026-08-16,Phase 1-5 完成)
+
+| 阶段 | 提交 | 内容 |
+|---|---|---|
+| 设计 | `f0a78bd` | 本文档 v3 |
+| Phase 1 | `0b59424` | editedFiles 归因 + turn 边界快照 |
+| Phase 2 | `9efdd7e` | `Issue.Scenario` + `correctness-reviewer` |
+| Phase 3 | `682468f` | episode 循环 + gate + 派发 + 防线 |
+| Phase 4 | `2cb5e20` | 配置接线 + `/review` 命令 |
+| Phase 5 | (本次提交) | README/设计文档更新、`-q` 评估关闭 |
+
+**实施对设计的偏离**(均已在代码注释中就地说明):
+
+1. **§4.5 `review_token_budget` 语义**:设计写"0 = 不限",但 YAML 缺省即 0,会让默认值变成不限、与示例的 30k 矛盾。实施改为:0/缺省 → 30k 默认,**负值 → 不限**(`resolveReviewTokenBudget`)。
+2. **§4.4 记录点补漏**:并行批次致命中断时尾部结果走 `appendRemaining` 而不经 `handleResult`,但那些编辑真实执行过。`appendRemaining` 签名扩为 `(calls, results)` 并同样记录,否则致命批次的编辑漏审。
+3. **episode 覆盖面大于设计**:除主输入循环外,续聊输入、启动 auto-continue、文件型 slash command 的 body 轮也路由进 episode——都是可能产生编辑的用户发起轮。
+4. **§4.5 `/review` 空范围回退**:设计写回退 `git diff --name-only HEAD` 文件集,实施改用快照 dirty 集(含 untracked)——HEAD diff 口径漏掉新建文件,与手动审查意图不符。
+5. **§4.6 UI**:渲染走现有 `ui.Info` 通道(全部警示路径已覆盖,含 "changes are unreviewed" 字样与修复轮播报);彩色专用渲染需扩 `ReplUI` 接口,未做。
+6. **裁决判定放宽**:`verdict=="pass"` **或 issues 为空**均按 pass——fail 却零 issue 的裁决无法指导修复。
+
+**决策点 7 关闭**:`-q` 单次模式在实施时已被上游整体废弃(`repl.go` 对 `Query != ""` 直接报错 "no longer supported"),不存在需要接入的路径。Gateway 路径维持 §六-6 的"本期不碰"。
+
+**遗留工作**(非代码):§十-3 对抗性评测基线(植入 bug 的 diff 集 + 检出率/假阳性率统计)需真实 LLM 离线跑,是 §八-1 翻默认开与 §七-1 多审投票阈值标定的前置条件,另行安排。
+
 ## 修订记录
 
 - **v3(2026-08-16,终审定稿)**:r2 终审修订 ——
