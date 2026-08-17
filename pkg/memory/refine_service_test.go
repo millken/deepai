@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -290,19 +289,14 @@ func TestRefineAndRecordFallsBackWhenBackendCannotStoreHistory(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := NewFileStore(filepath.Join(t.TempDir(), "mem"))
-	if err != nil {
-		t.Fatalf("NewFileStore() error = %v", err)
-	}
-	if err := store.AutoMigrate(ctx); err != nil {
-		t.Fatalf("AutoMigrate() error = %v", err)
-	}
+	// fakeStorage implements Storage but not RefinementStore.
+	store := &fakeStorage{}
 	svc := NewService(quietLogger(), store, nil)
 	t.Cleanup(func() { _ = svc.Close(ctx) })
 
 	// A backend without RefinementStore loses the history, not the extraction.
 	// Failing here would silently stop memory extraction on that backend.
-	_, _, err = svc.RefineAndRecord(ctx, "s1", refineMessages(), addFact("f1", "uses gofmt"), RefineMeta{Rationale: "manual"})
+	_, _, err := svc.RefineAndRecord(ctx, "s1", refineMessages(), addFact("f1", "uses gofmt"), RefineMeta{Rationale: "manual"})
 	if err != nil {
 		t.Fatalf("RefineAndRecord() must fall back, got error = %v", err)
 	}
@@ -369,10 +363,8 @@ func TestServiceRefinementAccessorsOnABackendWithoutHistory(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewFileStore() error = %v", err)
-	}
+	// fakeStorage implements Storage but not RefinementStore.
+	store := &fakeStorage{}
 	svc := NewService(quietLogger(), store, nil)
 	t.Cleanup(func() { _ = svc.Close(ctx) })
 

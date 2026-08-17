@@ -366,9 +366,13 @@ func (timeoutProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan 
 // system prompt must NOT contain the fact, and buildTurnInjection must.
 func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 	ctx := context.Background()
-	store, err := memory.NewFileStore(t.TempDir())
+	store, err := memory.NewSQLiteStore(ctx, filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
-		t.Fatalf("new file store: %v", err)
+		t.Fatalf("new sqlite store: %v", err)
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(ctx); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
 	}
 	svc := memory.NewService(slog.Default(), store, nil)
 	defer svc.Close(ctx)

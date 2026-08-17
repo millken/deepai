@@ -106,12 +106,9 @@ func TestHasRefinementStoreDetectsBackendCapability(t *testing.T) {
 		t.Fatal("SQLiteStore must implement RefinementStore (production path)")
 	}
 
-	fileStore, err := NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewFileStore() error = %v", err)
-	}
-	if HasRefinementStore(fileStore) {
-		t.Fatal("FileStore must not implement RefinementStore; it falls back to UpdateWith")
+	// fakeStorage implements Storage but not RefinementStore.
+	if HasRefinementStore(&fakeStorage{}) {
+		t.Fatal("a plain Storage must not implement RefinementStore; it falls back to UpdateWith")
 	}
 }
 

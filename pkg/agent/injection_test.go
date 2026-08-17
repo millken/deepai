@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -29,9 +30,13 @@ import (
 // longer reflects those changes at all.
 func newMemoryServiceWithFact(t *testing.T, sessionID, factContent string) *memory.Service {
 	t.Helper()
-	store, err := memory.NewFileStore(t.TempDir())
+	store, err := memory.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
 	}
 	svc := memory.NewService(slog.Default(), store, nil)
 	t.Cleanup(func() { svc.Close(context.Background()) })
@@ -250,9 +255,13 @@ func TestTurnInjection_OncePerRun(t *testing.T) {
 	sessionID := "sess-once-per-run"
 	uid := "user-once-per-run"
 
-	fileStore, err := memory.NewFileStore(t.TempDir())
+	fileStore, err := memory.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(fileStore.Close)
+	if err := fileStore.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
 	}
 	counting := newCountingStorage(fileStore)
 	svc := memory.NewService(slog.Default(), counting, nil)
@@ -330,9 +339,13 @@ func TestTurnInjection_OncePerRun(t *testing.T) {
 // context's cosine-similarity term.
 func TestTurnInjection_RecomputesFenceOnSkillLoadMidRun(t *testing.T) {
 	sessionID := "sess-skill-fence"
-	store, err := memory.NewFileStore(t.TempDir())
+	store, err := memory.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
 	}
 	svc := memory.NewService(slog.Default(), store, nil)
 	defer svc.Close(context.Background())

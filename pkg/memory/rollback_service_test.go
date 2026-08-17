@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -238,13 +237,8 @@ func TestRollbackRefinementFailsWhenBackendCannotStoreHistory(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := NewFileStore(filepath.Join(t.TempDir(), "mem"))
-	if err != nil {
-		t.Fatalf("NewFileStore() error = %v", err)
-	}
-	if err := store.AutoMigrate(ctx); err != nil {
-		t.Fatalf("AutoMigrate() error = %v", err)
-	}
+	// fakeStorage implements Storage but not RefinementStore.
+	store := &fakeStorage{}
 	svc := NewService(quietLogger(), store, nil)
 	t.Cleanup(func() { _ = svc.Close(ctx) })
 

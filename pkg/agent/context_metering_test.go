@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -320,9 +321,13 @@ func TestCompactionTrigger_StalledCompactionFiresOnce(t *testing.T) {
 		},
 	})
 
-	store, err := memory.NewFileStore(t.TempDir())
+	store, err := memory.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(context.Background()); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
 	}
 	extractor := &countingExtractor{}
 	memSvc := memory.NewService(slog.Default(), store, nil)
