@@ -154,12 +154,12 @@ func TestLoad_RegistersToolsAndReports(t *testing.T) {
 	if strings.Contains(report, "failed") {
 		t.Fatalf("report should have no failures: %q", report)
 	}
-	if reg.Get("mock.test-tool") == nil {
+	if reg.Get("mock__test-tool") == nil {
 		var names []string
 		for _, tl := range reg.List() {
 			names = append(names, tl.Name)
 		}
-		t.Fatalf("mock.test-tool not registered; have %v", names)
+		t.Fatalf("mock__test-tool not registered; have %v", names)
 	}
 }
 
@@ -226,11 +226,11 @@ func TestLoadWithServers_ConnectsExtra(t *testing.T) {
 	if !strings.Contains(report, "1 loaded") {
 		t.Fatalf("report should show 1 loaded: %q", report)
 	}
-	if reg.Get("mock.test-tool") == nil {
+	if reg.Get("mock__test-tool") == nil {
 		var names []string
 		for _, tl := range reg.List() {
 			names = append(names, tl.Name)
 		}
-		t.Fatalf("mock.test-tool not registered; have %v", names)
+		t.Fatalf("mock__test-tool not registered; have %v", names)
 	}
 }

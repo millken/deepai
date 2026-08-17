@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,6 +18,9 @@ type Client struct {
 	name   string
 	client *mcpclient.Client
 }
+
+// anthropic/openai reject tool names outside ^[a-zA-Z0-9_-]{1,128}$
+var toolNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 func ConnectStdio(ctx context.Context, name, command string, env []string, args ...string) (*Client, error) {
 	transport := mcptransport.NewStdio(command, env, args...)
@@ -121,8 +125,9 @@ func (c *Client) Tools(ctx context.Context) ([]models.Tool, error) {
 	for _, tool := range result.Tools {
 		toolName := tool.Name
 		if c.name != "" {
-			toolName = c.name + "." + toolName
+			toolName = c.name + "__" + toolName
 		}
+		toolName = toolNameSanitizer.ReplaceAllString(toolName, "_")
 		tools = append(tools, models.Tool{
 			Name:        toolName,
 			Description: strings.TrimSpace(tool.Description),
