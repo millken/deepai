@@ -101,7 +101,7 @@ func newKeyListCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := EnvFile()
 			names := make([]string, 0, len(providerInfo))
-			for n := range apiKeyVarNames() {
+			for n := range apiKeyVarNames(loadConfigQuiet()) {
 				names = append(names, n)
 			}
 			sort.Strings(names)
@@ -186,13 +186,32 @@ func newKeyCheckCmd() *cobra.Command {
 
 // apiKeyVarNames returns the environment variables that hold API keys and
 // may therefore be sealed. Base URLs and other settings are excluded --
-// sealing them would break config that is not secret.
-func apiKeyVarNames() map[string]bool {
+// sealing them would break config that is not secret. models[].api_key_env
+// entries from cfg are included: a custom variable holds a key just like a
+// provider-standard one, and skipping it left `key seal` walking past
+// plaintext it was asked to seal.
+func apiKeyVarNames(cfg Config) map[string]bool {
 	out := make(map[string]bool, len(providerInfo))
 	for _, info := range providerInfo {
 		out[info.envVar] = true
 	}
+	for _, m := range cfg.Models {
+		if v := strings.TrimSpace(m.APIKeyEnv); v != "" {
+			out[v] = true
+		}
+	}
 	return out
+}
+
+// loadConfigQuiet reads config.yaml for key operations; a missing or broken
+// file must not stop sealing the provider-standard keys that are still
+// identifiable without it.
+func loadConfigQuiet() Config {
+	cfg, err := LoadConfig(ConfigFile())
+	if err != nil {
+		return Config{}
+	}
+	return cfg
 }
 
 // envEntry is one line of a .env file. Key is empty for blank lines and
@@ -237,8 +256,15 @@ func sealEnvFile(path string) (int, error) {
 		return 0, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	sealable := apiKeyVarNames()
+	sealable := apiKeyVarNames(loadConfigQuiet())
 	entries := parseEnvFile(string(content))
+	return sealEntries(path, entries, sealable)
+}
+
+// sealEntries rewrites entries in place, sealing every plaintext value whose
+// key is in sealable. Split from sealEnvFile so tests can pass an explicit
+// sealable set instead of the real machine's config.yaml.
+func sealEntries(path string, entries []envEntry, sealable map[string]bool) (int, error) {
 	sealed := 0
 	for i, e := range entries {
 		if e.Key == "" || !sealable[e.Key] {

@@ -6,11 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/secret"
 )
 
 func TestApiKeyVarNamesCoversProviders(t *testing.T) {
-	names := apiKeyVarNames()
+	names := apiKeyVarNames(Config{})
 	for _, want := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"} {
 		if !names[want] {
 			t.Errorf("%s missing from the sealable set", want)
@@ -167,5 +168,43 @@ func TestSealEnvFileMissingFile(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("sealed %d entries, want 0", n)
+	}
+}
+
+func TestApiKeyVarNamesIncludesCustomAPIKeyEnv(t *testing.T) {
+	cfg := Config{Models: []llm.ModelDef{{
+		Name: "claude", Provider: "anthropic", Model: "claude-opus-4-8",
+		APIKeyEnv: "ANTHROPIC_RELAY_API_KEY",
+	}}}
+	if !apiKeyVarNames(cfg)["ANTHROPIC_RELAY_API_KEY"] {
+		t.Error("models[].api_key_env variable missing from the sealable set")
+	}
+}
+
+func TestSealEnvFileSealsCustomAPIKeyEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := "ANTHROPIC_RELAY_API_KEY=relay-plain\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := sealEntries(path, parseEnvFile(content), map[string]bool{"ANTHROPIC_RELAY_API_KEY": true})
+	if err != nil {
+		t.Fatalf("sealEntries: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("sealed %d entries, want 1", n)
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "relay-plain") {
+		t.Error("plaintext custom key survived in .env")
+	}
+	if plain, err := secret.Reveal(loadEnvValue(path, "ANTHROPIC_RELAY_API_KEY")); err != nil || plain != "relay-plain" {
+		t.Errorf("Reveal = %q, %v; want the original key", plain, err)
 	}
 }
