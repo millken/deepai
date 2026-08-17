@@ -139,19 +139,25 @@ v6 把 `storage.go` 标成"Storage interface 不动"是误标——那个文件�
 // RefinementRecord 记录一次 refine 操作，支持 rollback。
 // PreSnapshot 是操作前的整份 Fact 快照（内容字段 + ID）。
 // PostFactFingerprints 记录操作后各 Fact 的内容指纹，用于 rollback 冲突检测（§7.3）。
+// PreUser/PreHistory/PostNarrativeFingerprint 是叙事半区的对应物（v8，§7.13）。
 type RefinementRecord struct {
-    ID                   string            `json:"id"`                     // refine_<unix_ns>（纳秒，避免同毫秒撞主键）
-    PairID               string            `json:"pair_id"`                // 同一次 refine 的两条 scope 记录共享（§4.8 undo 成对回滚）
-    Rationale            string            `json:"rationale"`              // 见下方「Rationale 的取值」
-    SessionID            string            `json:"session_id"`             // 存储键（sessionID 或 UserScope.Key()）
-    PreSnapshot          []Fact            `json:"pre_snapshot"`           // 操作前整份快照（内容字段）
-    PostFactFingerprints map[string]string `json:"post_fact_fingerprints"` // 操作后 factID → 指纹
-    FactIDsChanged       []string          `json:"fact_ids_changed"`       // 本次变更的 Fact ID（信息性）
-    CreatedAt            time.Time         `json:"created_at"`
+    ID                       string            `json:"id"`                        // refine_<unix_ns>（纳秒，避免同毫秒撞主键）
+    PairID                   string            `json:"pair_id"`                   // 同一次 refine 的两条 scope 记录共享（§4.8 undo 成对回滚）
+    Rationale                string            `json:"rationale"`                 // 见下方「Rationale 的取值」
+    SessionID                string            `json:"session_id"`                // 存储键（sessionID 或 UserScope.Key()）
+    PreSnapshot              []Fact            `json:"pre_snapshot"`              // 操作前整份快照（内容字段）
+    PostFactFingerprints     map[string]string `json:"post_fact_fingerprints"`    // 操作后 factID → 指纹
+    FactIDsChanged           []string          `json:"fact_ids_changed"`          // 本次变更的 Fact ID（信息性）
+    PreUser                  *UserMemory       `json:"pre_user,omitempty"`        // 操作前叙事快照（v8）
+    PreHistory               *HistoryMemory    `json:"pre_history,omitempty"`     // 操作前历史快照（v8）
+    PostNarrativeFingerprint string            `json:"post_narrative_fingerprint,omitempty"` // 操作后叙事指纹（v8）
+    CreatedAt                time.Time         `json:"created_at"`
 }
 ```
 
 **ID 用纳秒**（v4 问题 C2）：同一 scope 同毫秒两次插入（rollback 记录 + 紧随的手动 refine）会撞主键 `(session_id, id)`。`refine_<unix_ns>` 用纳秒时间戳。
+
+**叙事快照必须是指针**（v8，§7.13）：`memory_refinements` 把记录存为 JSON TEXT，本变更之前写入的行**没有这三个键**，解码后为 `nil`。若用值类型，旧行解码成零值叙事，与"操作前叙事确实为空"不可区分——回滚旧行会把叙事**清空**，比拒绝回滚更糟。指针让 `nil`（未记录）与 `&UserMemory{}`（确实为空）可区分，旧记录的叙事回滚走拒绝路径。
 
 **PairID**（v6 问题 B1）：一次 refine 会在**两个分区**各写一条记录（`session_id = sessionID` 和 `session_id = UserScope(uid).Key()`）。`PairID` 由 `ScheduleRefine`/手动 `/refine` 一次生成、两条记录共用，`/refine undo` 据此成对回滚（§4.8）。auto 路径下 `PairID` 与传递 gate verdict 的 token 同值，省一个标识符。
 
@@ -464,6 +470,7 @@ func (s *Service) RefineAndRecord(
         return RefinementRecord{}, false, fmt.Errorf("load: %w", err)
     }
     preSnapshot := cloneFactsContent(current.Facts)
+    preUser, preHistory := current.User, current.History  // v8：叙事快照（值拷贝，全字符串结构体）
 
     // 2. flush-version 捕获（照抄 UpdateWith memory.go:269-275）
     captured := s.captureFlushVersion(sessionID)
@@ -484,22 +491,27 @@ func (s *Service) RefineAndRecord(
         return RefinementRecord{}, false, nil  // 不 Save，不记录
     }
 
-    // 5. diff（Save 前算，基于 pre vs merged）
+    // 5. diff（Save 前算，基于 pre vs merged）。fact 与叙事任一半有变化即为
+    //    真实写入，走同一条 SaveWithRefinement 路径（v8，§7.13）。
     changedIDs := diffFactIDs(preSnapshot, merged.Facts)
-    if len(changedIDs) == 0 {
+    narrativeMoved := preUser != merged.User || preHistory != merged.History
+    if len(changedIDs) == 0 && !narrativeMoved {
         return RefinementRecord{}, false, nil  // 提取了但无变化，不记录
     }
 
     // 6. post-fingerprints（锁内，Save 前。对归一化后的覆盖字段取 hash，§7.3）
     postFP := factFingerprints(merged.Facts)
     record := RefinementRecord{
-        ID:                   refineID(),  // refine_<unix_ns>
-        Rationale:            rationale,
-        SessionID:            sessionID,
-        PreSnapshot:          preSnapshot,
-        PostFactFingerprints: postFP,
-        FactIDsChanged:       changedIDs,
-        CreatedAt:            time.Now().UTC(),
+        ID:                       refineID(),  // refine_<unix_ns>
+        Rationale:                rationale,
+        SessionID:                sessionID,
+        PreSnapshot:              preSnapshot,
+        PostFactFingerprints:     postFP,
+        FactIDsChanged:           changedIDs,
+        PreUser:                  &preUser,
+        PreHistory:               &preHistory,
+        PostNarrativeFingerprint: narrativeFingerprint(merged.User, merged.History),
+        CreatedAt:                time.Now().UTC(),
     }
 
     // 7. Save + Insert 同一事务（§7.1 B1：避免 facts 变了记录失败）
@@ -510,7 +522,7 @@ func (s *Service) RefineAndRecord(
 }
 ```
 
-**三条静默 return 的处理**（§7.5）：`len(filteredMessages)==0`（锁外早退）、`isFlushStale`、`len(changedIDs)==0` 都返回 `saved=false`，不插入记录。
+**三条静默 return 的处理**（§7.5）：`len(filteredMessages)==0`（锁外早退）、`isFlushStale`、`len(changedIDs)==0 && !narrativeMoved` 都返回 `saved=false`，不插入记录。
 
 **fallback 路径的 saved 返回值**（v5 问题 B3）：`UpdateWith` 在"无消息"（`memory.go:261`）和"flush-stale"（`memory.go:286`）上返回 nil 且不 Save。fallback 路径无法区分，保守返回 `false`，避免 `/refine` 谎报"已提取"。
 
@@ -775,9 +787,11 @@ dedup、cancel、flushVersion 三套机制**全部按 scope key 分片**：
 
 v4 把 session 和 user scope bundle 进一个会话键的 job 违反了这条不变量：user scope 拿会话的版本号比 user-scope 计数器 → 恒判陈旧 → 永不保存；compaction 的 `CancelPendingUpdates(sessionID)` 连带取消 user scope 提取。v5+ 拆成两个 job，各用自己的 scope key，三套机制各自正确。
 
-### 7.5 三条静默 return 不产生幽灵记录
+### 7.5 静默 return 不产生幽灵记录
 
-`len(filteredMessages)==0`（锁外早退）、`isFlushStale`、`len(changedIDs)==0` 都返回 `saved=false`，不插入记录。flush-stale 正是 compaction 触发的——compaction 取消未完成 refine 的实际效果是：提取被跳过，不记录。
+`len(filteredMessages)==0`（锁外早退）、`isFlushStale`、`len(changedIDs)==0 && !narrativeMoved`（§7.13，v8 收紧）都返回 `saved=false`，不插入记录。flush-stale 正是 compaction 触发的——compaction 取消未完成 refine 的实际效果是：提取被跳过，不记录。
+
+v8 之后 `saved=true` 严格等价于"存在可回滚记录"：记录里必有一个非空的 pre 状态（facts 或叙事），rollback 必有可还原之物。v7 及之前叙事-only 写入返回 `saved=true` 却无记录，正是该不等式造成 `/refine` 显示层错配（bac1228 修显示、8a83fde 修根源）。
 
 ### 7.6 flushVersion ctx 注入不变量
 
@@ -815,6 +829,18 @@ rollback 记录必须填 `PostFactFingerprints`：回滚这条记录时判定表
 `verdictStore sync.Map[string]gateVerdict` 只有一个正常消费者（`jobRefineApproved` 的 `LoadAndDelete`），但有两条必然泄漏的路径：`jobRefineApproved` 被 dedup 顶掉（新一轮的 approved 替换 pending 的旧 approved，`queue.go:249-255`），或被 `CancelPendingUpdates(userScopeKey)` 取消。这两种情况下条目永远没人读、没人删，每个 refine 周期泄漏一条。
 
 两层处理：(1) 消费用 `LoadAndDelete` 而非 `Load`；(2) `gateVerdict` 带 `CreatedAt`，`ScheduleRefine` 每次插入前顺手清掉超过 10 分钟的条目——上界远大于 `defaultUpdateTimeout`（5 分钟，`memory.go:16`），不会误删在途的。不引入独立的清理 goroutine。
+
+### 7.13 叙事半区与 fact 半区对称回滚（v8）
+
+> **不变量**：凡 rollback 会覆盖的文档字段，记录里必须有 pre 快照 + post 指纹；无 pre 快照时必须拒绝回滚该半区，绝不回退到零值。
+
+v7 及之前只满足了一半：`RollbackRefinement` 重写 `doc.Facts` 却透传 `doc.User`/`doc.History`，而叙事并非低风险——`Merge` 对叙事是**非空覆盖**（一次错误写入永久留存，不会被下次提取修正），`buildInjection` 把它注入**每次系统提示**，且 A 批次清理删掉的 memory builtin 工具恰是唯一的人工修复入口。`/refine undo` 显示"已回滚"而叙事留在改后状态，是静默的部分正确。
+
+v8 补齐对称性：
+
+- **记录侧**：`PreUser`/`PreHistory`（指针，§4.3）+ `PostNarrativeFingerprint`（哈希 `Merge` 可覆盖的六个叙事字段——叙事没有时间戳，内容是唯一证据，与 §7.3 同理）。rollback 记录自身也带叙事快照，否则 §7.7"rollback 可逆"对叙事半区失效。
+- **写入侧**：`RefineAndRecord` 两条保存路径合一——facts 或叙事**任一半**有变化即走 `SaveWithRefinement` 单事务插记录。叙事-only 的 refine 从"无记录的裸写入"变为真实的回滚目标；只有"两半都没动"才 `saved=false`（§7.5）。
+- **回滚侧**：`rollbackNarrative` 镜像 fact 判定表的第三方规则——仅当当前叙事指纹仍等于 refine 落地时的 post 指纹才还原 pre；`nil` 快照（v8 之前的旧行）拒绝。返回 `narrativeRestored`，REPL 未还原时输出 `; context left as-is`，不让部分回滚伪装成完整回滚。
 
 ---
 
@@ -868,7 +894,11 @@ rollback 记录必须填 `PostFactFingerprints`：回滚这条记录时判定表
 
 ## 十、修订记录
 
-- **v7**（本版）：修正 v6 的 3 个阻断级问题：
+- **v8**（本版）：叙事上下文（User/History）纳入回滚，与 fact 半区对称（8a83fde 落地）：
+  - 根因：v7 的 `/refine undo` 只重写 `doc.Facts`、透传叙事，而叙事是**非空覆盖**（错误写入永久留存）、注入每次系统提示、且唯一人工修复入口（memory 工具）已在架构清理 A 批次中作为未注册死代码删除——undo 显示"已回滚"实为静默的部分正确。
+  - 修正：`RefinementRecord` 增 `PreUser`/`PreHistory`（指针，旧行解码为 nil 而非零值，§4.3）+ `PostNarrativeFingerprint`；`RefineAndRecord` 两条保存路径合一，叙事-only 的 refine 也是真实回滚目标，`saved=true` 从此严格等价于"存在可回滚记录"（§7.5）；`rollbackNarrative` 镜像第三方规则，nil 快照拒绝还原；rollback 记录自身也带叙事快照（§7.7 对叙事半区生效）；REPL 未还原叙事时输出 `; context left as-is`。新增 §7.13 不变量。
+  - 无 schema 迁移：记录为 JSON TEXT，旧行缺键解码为 nil 即拒绝路径。
+- **v7**：修正 v6 的 3 个阻断级问题：
   - A1 `MemoryRefineInterval` 缺省为 0 撞上 `interval > 0` 守卫 → 缺省配置下提取彻底停止。加 `resolveRefineInterval`（0→5，-1→禁用，照 `resolveRequestTimeout` 先例），补上"auto-refine 关闭 → 退回原两次 `ScheduleUpdateWith`"的分支（v6 只在 §5 声称、流程图里没有），`memoryExtractInterval` 改名保留而非删除
   - A2 compaction 的 `CancelPendingUpdates(sessionID)` 取消 `jobRefine` 后，`jobRefineApproved` 读不到 verdict 而跳过 → user scope 提取丢失（v4-A3 换路径重现）。verdict **缺失** fail-open、**存在且 false** 才跳过；新增 §7.11 不变量
   - A3 rollback 的 load-modify-save 在锁外，且 v6 把它编排在 `pkg/chat`（`getSessionLock` 未导出，结构上拿不到锁）→ 新增 `Service.RollbackRefinement` 锁内入口，`RollbackFacts` 保持纯函数
