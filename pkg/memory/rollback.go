@@ -223,7 +223,6 @@ func (s *Service) RollbackRefinement(ctx context.Context, sessionID, recordID, p
 		SessionID:                sessionID,
 		PreSnapshot:              cloneFacts(current.Facts),
 		PostFactFingerprints:     factFingerprints(facts),
-		FactIDsChanged:           diffFactIDs(current.Facts, facts),
 		PreUser:                  &preUser,
 		PreHistory:               &preHistory,
 		PostNarrativeFingerprint: narrativeFingerprint(user, history),

@@ -147,7 +147,7 @@ type RefinementRecord struct {
     SessionID                string            `json:"session_id"`                // 存储键（sessionID 或 UserScope.Key()）
     PreSnapshot              []Fact            `json:"pre_snapshot"`              // 操作前整份快照（内容字段）
     PostFactFingerprints     map[string]string `json:"post_fact_fingerprints"`    // 操作后 factID → 指纹
-    FactIDsChanged           []string          `json:"fact_ids_changed"`          // 本次变更的 Fact ID（信息性）
+
     PreUser                  *UserMemory       `json:"pre_user,omitempty"`        // 操作前叙事快照（v8）
     PreHistory               *HistoryMemory    `json:"pre_history,omitempty"`     // 操作前历史快照（v8）
     PostNarrativeFingerprint string            `json:"post_narrative_fingerprint,omitempty"` // 操作后叙事指纹（v8）
@@ -507,7 +507,6 @@ func (s *Service) RefineAndRecord(
         SessionID:                sessionID,
         PreSnapshot:              preSnapshot,
         PostFactFingerprints:     postFP,
-        FactIDsChanged:           changedIDs,
         PreUser:                  &preUser,
         PreHistory:               &preHistory,
         PostNarrativeFingerprint: narrativeFingerprint(merged.User, merged.History),
@@ -576,7 +575,6 @@ func (s *Service) RollbackRefinement(
         SessionID:            sessionID,
         PreSnapshot:          cloneFactsContent(current.Facts),  // rollback 前状态
         PostFactFingerprints: factFingerprints(facts),           // §7.7：必须填，否则不可再回滚
-        FactIDsChanged:       diffFactIDs(current.Facts, facts),
         CreatedAt:            now,
     }
     // 同一事务：Save doc + Insert rollbackRecord + Delete recordID

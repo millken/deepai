@@ -38,7 +38,6 @@ type RefinementRecord struct {
 
 	PreSnapshot          []Fact            `json:"pre_snapshot"`
 	PostFactFingerprints map[string]string `json:"post_fact_fingerprints"`
-	FactIDsChanged       []string          `json:"fact_ids_changed"`
 
 	PreUser                  *UserMemory    `json:"pre_user,omitempty"`
 	PreHistory               *HistoryMemory `json:"pre_history,omitempty"`
@@ -284,7 +283,6 @@ func (s *Service) RefineAndRecord(
 		SessionID:                sessionID,
 		PreSnapshot:              preSnapshot,
 		PostFactFingerprints:     factFingerprints(merged.Facts),
-		FactIDsChanged:           changed,
 		PreUser:                  &preUser,
 		PreHistory:               &preHistory,
 		PostNarrativeFingerprint: narrativeFingerprint(merged.User, merged.History),
@@ -373,7 +371,7 @@ func (s *Service) ScheduleRefine(sessionID, userScopeKey string, messages []mode
 
 	s.purgeStaleVerdicts()
 
-	pairID := refineID()
+	pairID := NewPairID()
 	prepared := prepareAsyncMessages(messages)
 
 	// Without a distinct user scope there is no second job to hand the verdict

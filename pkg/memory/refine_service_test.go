@@ -74,9 +74,6 @@ func TestRefineAndRecordSavesFactsAndRecordsThem(t *testing.T) {
 	if stored.Rationale != "manual" || stored.SessionID != "s1" {
 		t.Fatalf("record metadata = %+v", stored)
 	}
-	if len(stored.FactIDsChanged) != 1 || stored.FactIDsChanged[0] != "f1" {
-		t.Fatalf("FactIDsChanged = %v", stored.FactIDsChanged)
-	}
 	if len(stored.PreSnapshot) != 0 {
 		t.Fatalf("PreSnapshot must be the state BEFORE the refine (empty here), got %+v", stored.PreSnapshot)
 	}
@@ -437,9 +434,6 @@ func TestRefineAndRecordPersistsNarrativeMemoryWithoutFactChanges(t *testing.T) 
 	}
 	if records[0].PreUser == nil || records[0].PreUser.TopOfMind != "" {
 		t.Fatalf("record must snapshot the pre-refine narrative, got %+v", records[0].PreUser)
-	}
-	if len(records[0].FactIDsChanged) != 0 {
-		t.Fatalf("no fact moved, got FactIDsChanged=%v", records[0].FactIDsChanged)
 	}
 }
 

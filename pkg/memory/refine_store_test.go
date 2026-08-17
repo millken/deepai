@@ -44,7 +44,6 @@ func testRecord(id string, at time.Time) RefinementRecord {
 			{ID: "f1", Content: "uses tabs", Category: "style", Confidence: 0.9, CreatedAt: at, UpdatedAt: at},
 		},
 		PostFactFingerprints: map[string]string{"f1": "abc123", "f2": "def456"},
-		FactIDsChanged:       []string{"f2"},
 		CreatedAt:            at,
 	}
 }
@@ -74,9 +73,6 @@ func TestSQLiteRefinementRoundTrip(t *testing.T) {
 	}
 	if got.PostFactFingerprints["f1"] != "abc123" || got.PostFactFingerprints["f2"] != "def456" {
 		t.Fatalf("PostFactFingerprints lost: %v", got.PostFactFingerprints)
-	}
-	if len(got.FactIDsChanged) != 1 || got.FactIDsChanged[0] != "f2" {
-		t.Fatalf("FactIDsChanged lost: %v", got.FactIDsChanged)
 	}
 }
 
