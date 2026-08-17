@@ -31,7 +31,7 @@ func TestRollbackRefinementRestoresFactsAndReplacesTheRecord(t *testing.T) {
 
 	record := refineOnce(t, svc, "s1", "f1", "refined")
 
-	skipped, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
+	skipped, _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
 	if err != nil {
 		t.Fatalf("RollbackRefinement() error = %v", err)
 	}
@@ -77,7 +77,7 @@ func TestRollbackOfARollbackRestoresTheRefinedState(t *testing.T) {
 	seedDocument(t, store, "s1", Fact{ID: "f1", Content: "original", Category: "style", Confidence: 0.9})
 
 	record := refineOnce(t, svc, "s1", "f1", "refined")
-	if _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1"); err != nil {
+	if _, _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1"); err != nil {
 		t.Fatalf("first rollback error = %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestRollbackOfARollbackRestoresTheRefinedState(t *testing.T) {
 
 	// A mistaken rollback has to be undoable, which is the reason rollback is
 	// itself recorded as a refinement.
-	if _, err := svc.RollbackRefinement(ctx, "s1", rollbackRecord.ID, "pair-2"); err != nil {
+	if _, _, err := svc.RollbackRefinement(ctx, "s1", rollbackRecord.ID, "pair-2"); err != nil {
 		t.Fatalf("second rollback error = %v", err)
 	}
 	doc, err := store.Load(ctx, "s1")
@@ -128,7 +128,7 @@ func TestRollbackHandlesTheArchiveFactMergeCreatesOnRewrite(t *testing.T) {
 		t.Fatal("expected Merge to archive the rewritten fact; the rest of this test assumes it")
 	}
 
-	if _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1"); err != nil {
+	if _, _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1"); err != nil {
 		t.Fatalf("RollbackRefinement() error = %v", err)
 	}
 	afterRollback, err := store.Load(ctx, "s1")
@@ -163,7 +163,7 @@ func TestRollbackRefinementLeavesThirdPartyEditsAloneAndReportsThem(t *testing.T
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	skipped, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
+	skipped, _, err := svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
 	if err != nil {
 		t.Fatalf("RollbackRefinement() error = %v", err)
 	}
@@ -197,7 +197,7 @@ func TestRollbackRefinementAppliesOnceUnderConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
+			_, _, errs[i] = svc.RollbackRefinement(ctx, "s1", record.ID, "pair-1")
 		}(i)
 	}
 	wg.Wait()
@@ -227,7 +227,7 @@ func TestRollbackRefinementReportsAMissingRecord(t *testing.T) {
 	svc, store := newRefineService(t)
 	seedDocument(t, store, "s1")
 
-	_, err := svc.RollbackRefinement(context.Background(), "s1", "refine_nope", "pair-1")
+	_, _, err := svc.RollbackRefinement(context.Background(), "s1", "refine_nope", "pair-1")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
@@ -244,7 +244,7 @@ func TestRollbackRefinementFailsWhenBackendCannotStoreHistory(t *testing.T) {
 
 	// Unlike extraction, rollback has no degraded mode: without history there is
 	// nothing to roll back to, so this must fail loudly rather than fall back.
-	if _, err := svc.RollbackRefinement(ctx, "s1", "refine_1", "pair-1"); err == nil {
+	if _, _, err := svc.RollbackRefinement(ctx, "s1", "refine_1", "pair-1"); err == nil {
 		t.Fatal("want an error when the backend keeps no refinement history")
 	}
 }

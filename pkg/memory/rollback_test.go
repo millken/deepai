@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"encoding/json"
 	"sort"
 	"testing"
 	"time"
@@ -311,5 +312,110 @@ func TestRollbackFactsIsDeterministicAndDoesNotMutateInput(t *testing.T) {
 	}
 	if current[0].Content != "refined" {
 		t.Fatalf("input facts were mutated: %q", current[0].Content)
+	}
+}
+
+// --- narrative rollback -----------------------------------------------------
+//
+// rollbackNarrative decides the User/History half of the document. It mirrors
+// the fact table's third-party rule with the same fingerprint test, because
+// Merge never timestamps the narrative: content is the only evidence available.
+
+// narrativeRecord builds the record RefineAndRecord would write for a refine
+// that moved the narrative from pre to post.
+func narrativeRecord(pre, post Document) RefinementRecord {
+	preUser, preHistory := pre.User, pre.History
+	return RefinementRecord{
+		ID:                       "refine_1",
+		PreUser:                  &preUser,
+		PreHistory:               &preHistory,
+		PostNarrativeFingerprint: narrativeFingerprint(post.User, post.History),
+	}
+}
+
+func TestRollbackNarrativeRestoresAnUntouchedNarrative(t *testing.T) {
+	t.Parallel()
+
+	pre := Document{
+		User:    UserMemory{TopOfMind: "designing the gate", WorkContext: "deepai"},
+		History: HistoryMemory{LongTermBackground: "maintains deepai"},
+	}
+	post := Document{
+		User:    UserMemory{TopOfMind: "shipping the refine feature", WorkContext: "deepai"},
+		History: HistoryMemory{LongTermBackground: "maintains deepai"},
+	}
+
+	user, history, restored := rollbackNarrative(post, narrativeRecord(pre, post))
+	if !restored {
+		t.Fatal("a narrative still carrying the refine's fingerprint must roll back")
+	}
+	if user != pre.User {
+		t.Fatalf("user memory not restored: %+v", user)
+	}
+	if history != pre.History {
+		t.Fatalf("history memory not restored: %+v", history)
+	}
+}
+
+func TestRollbackNarrativeDeclinesAfterAThirdPartyEdit(t *testing.T) {
+	t.Parallel()
+
+	pre := Document{User: UserMemory{TopOfMind: "designing the gate"}}
+	post := Document{User: UserMemory{TopOfMind: "shipping the refine feature"}}
+	// Something rewrote the narrative after the refine landed, so the current
+	// state is nobody's to overwrite — the same principle that keeps third-party
+	// fact edits in RollbackFacts.
+	current := Document{User: UserMemory{TopOfMind: "hand-edited afterwards"}}
+
+	user, history, restored := rollbackNarrative(current, narrativeRecord(pre, post))
+	if restored {
+		t.Fatal("a narrative changed since the refine must be left alone")
+	}
+	if user != current.User || history != current.History {
+		t.Fatalf("the third-party edit was discarded: %+v %+v", user, history)
+	}
+}
+
+func TestRollbackNarrativeDeclinesForARecordWithoutASnapshot(t *testing.T) {
+	t.Parallel()
+
+	current := Document{
+		User:    UserMemory{TopOfMind: "shipping the refine feature"},
+		History: HistoryMemory{LongTermBackground: "maintains deepai"},
+	}
+	// A record written before narrative rollback existed carries no snapshot.
+	// Restoring the zero value would BLANK the narrative, which is strictly
+	// worse than leaving it, so such records decline.
+	legacy := RefinementRecord{ID: "refine_1", PostFactFingerprints: map[string]string{}}
+
+	user, history, restored := rollbackNarrative(current, legacy)
+	if restored {
+		t.Fatal("a record with no narrative snapshot has nothing to restore")
+	}
+	if user != current.User || history != current.History {
+		t.Fatalf("restoring a zero snapshot blanked the narrative: %+v %+v", user, history)
+	}
+}
+
+// TestRollbackNarrativeLegacyRecordUnmarshalsToNil pins the migration-safety
+// claim behind the pointer fields: memory_refinements stores the record as JSON
+// TEXT, so a row written before these fields existed simply lacks the keys. It
+// must decode to nil — a value type would decode to the zero narrative and be
+// indistinguishable from one that was genuinely empty.
+func TestRollbackNarrativeLegacyRecordUnmarshalsToNil(t *testing.T) {
+	t.Parallel()
+
+	stored := `{"id":"refine_1","pre_snapshot":[],"post_fact_fingerprints":{}}`
+	var legacy RefinementRecord
+	if err := json.Unmarshal([]byte(stored), &legacy); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if legacy.PreUser != nil || legacy.PreHistory != nil {
+		t.Fatalf("a legacy record must decode to nil, got %+v %+v", legacy.PreUser, legacy.PreHistory)
+	}
+
+	current := Document{User: UserMemory{TopOfMind: "keep me"}}
+	if _, _, restored := rollbackNarrative(current, legacy); restored {
+		t.Fatal("a legacy record must not roll the narrative back")
 	}
 }

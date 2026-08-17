@@ -426,13 +426,20 @@ func TestRefineAndRecordPersistsNarrativeMemoryWithoutFactChanges(t *testing.T) 
 		t.Fatalf("narrative update was discarded: %+v", doc.User)
 	}
 
-	// There is nothing fact-shaped to restore, so there is nothing to roll back.
+	// A narrative-only refine now IS a rollback target: the record carries the
+	// narrative snapshot, so there is something to restore.
 	records, err := store.ListRefinements(ctx, "s1", 50)
 	if err != nil {
 		t.Fatalf("ListRefinements() error = %v", err)
 	}
-	if len(records) != 0 {
-		t.Fatalf("a narrative-only update needs no rollback target, got %d records", len(records))
+	if len(records) != 1 {
+		t.Fatalf("a narrative-only update is rollbackable, got %d records", len(records))
+	}
+	if records[0].PreUser == nil || records[0].PreUser.TopOfMind != "" {
+		t.Fatalf("record must snapshot the pre-refine narrative, got %+v", records[0].PreUser)
+	}
+	if len(records[0].FactIDsChanged) != 0 {
+		t.Fatalf("no fact moved, got FactIDsChanged=%v", records[0].FactIDsChanged)
 	}
 }
 

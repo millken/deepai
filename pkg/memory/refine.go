@@ -23,6 +23,13 @@ import (
 // "differs from the pre-state" is true for exactly the facts rollback needs to
 // restore. Only "differs from the post-state" means a third party (the memory
 // builtin tool) edited the fact after the refine.
+//
+// PreUser/PreHistory carry the narrative half of the document, and
+// PostNarrativeFingerprint plays the same role for it that PostFactFingerprints
+// plays for facts. They are pointers so a record written before narrative
+// rollback existed — nil, absent from the stored JSON — stays distinguishable
+// from one whose narrative was genuinely empty: rolling the former back must
+// leave the narrative alone rather than blanking it.
 type RefinementRecord struct {
 	ID        string `json:"id"`         // refine_<unix_ns>
 	PairID    string `json:"pair_id"`    // shared by the session- and user-scope records of one refine
@@ -32,6 +39,10 @@ type RefinementRecord struct {
 	PreSnapshot          []Fact            `json:"pre_snapshot"`
 	PostFactFingerprints map[string]string `json:"post_fact_fingerprints"`
 	FactIDsChanged       []string          `json:"fact_ids_changed"`
+
+	PreUser                  *UserMemory    `json:"pre_user,omitempty"`
+	PreHistory               *HistoryMemory `json:"pre_history,omitempty"`
+	PostNarrativeFingerprint string         `json:"post_narrative_fingerprint,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -102,6 +113,23 @@ func factFingerprints(facts []Fact) map[string]string {
 		out[fact.ID] = factFingerprint(fact)
 	}
 	return out
+}
+
+// narrativeFingerprint hashes the six narrative fields Merge can overwrite. It
+// is the narrative counterpart of factFingerprint and exists for the same
+// reason: Merge does not timestamp the narrative at all, so content is the only
+// thing that can tell "the refine wrote this" apart from "someone else did".
+func narrativeFingerprint(user UserMemory, history HistoryMemory) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		strings.TrimSpace(user.WorkContext),
+		strings.TrimSpace(user.PersonalContext),
+		strings.TrimSpace(user.TopOfMind),
+		strings.TrimSpace(history.RecentMonths),
+		strings.TrimSpace(history.EarlierContext),
+		strings.TrimSpace(history.LongTermBackground),
+	)
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // clampConfidence mirrors the [0,1] clamp in prepareFact and Merge.
@@ -213,6 +241,9 @@ func (s *Service) RefineAndRecord(
 		return RefinementRecord{}, false, fmt.Errorf("load memory %q: %w", sessionID, err)
 	}
 	preSnapshot := cloneFacts(current.Facts)
+	// UserMemory and HistoryMemory are all-string structs, so a value copy is a
+	// real snapshot and == is a real comparison.
+	preUser, preHistory := current.User, current.History
 
 	// Capture the flush generation before the slow call, preferring the value
 	// captured when the job was queued (see withCapturedFlushVersion): a flush
@@ -234,33 +265,30 @@ func (s *Service) RefineAndRecord(
 		return RefinementRecord{}, false, nil
 	}
 
+	// Merge folds User/History narrative context into the document, and
+	// buildInjectionWithIDs injects it alongside facts. An extraction can
+	// refresh that without touching a single fact, so "no fact changed" is not
+	// "nothing changed": a narrative-only refine is a real write, and it gets a
+	// real record because the record now carries the narrative snapshot a
+	// rollback needs. Only "neither half moved" writes nothing at all.
 	changed := diffFactIDs(preSnapshot, merged.Facts)
-	if len(changed) == 0 {
-		// Merge folds User/History narrative context into the document, and
-		// buildInjectionWithIDs injects it alongside facts. An extraction can
-		// refresh that without touching a single fact, so "no fact changed" is
-		// not "nothing changed" — skipping the save here would silently drop it,
-		// which the unconditional UpdateWith path never did.
-		if current.User == merged.User && current.History == merged.History {
-			return RefinementRecord{}, false, nil
-		}
-		// Nothing fact-shaped moved, so there is nothing for a rollback to
-		// restore: persist the document, but record no refinement.
-		if err := s.storage.Save(ctx, merged); err != nil {
-			return RefinementRecord{}, false, err
-		}
-		return RefinementRecord{}, true, nil
+	narrativeMoved := preUser != merged.User || preHistory != merged.History
+	if len(changed) == 0 && !narrativeMoved {
+		return RefinementRecord{}, false, nil
 	}
 
 	record := RefinementRecord{
-		ID:                   refineID(),
-		PairID:               strings.TrimSpace(meta.PairID),
-		Rationale:            meta.Rationale,
-		SessionID:            sessionID,
-		PreSnapshot:          preSnapshot,
-		PostFactFingerprints: factFingerprints(merged.Facts),
-		FactIDsChanged:       changed,
-		CreatedAt:            time.Now().UTC(),
+		ID:                       refineID(),
+		PairID:                   strings.TrimSpace(meta.PairID),
+		Rationale:                meta.Rationale,
+		SessionID:                sessionID,
+		PreSnapshot:              preSnapshot,
+		PostFactFingerprints:     factFingerprints(merged.Facts),
+		FactIDsChanged:           changed,
+		PreUser:                  &preUser,
+		PreHistory:               &preHistory,
+		PostNarrativeFingerprint: narrativeFingerprint(merged.User, merged.History),
+		CreatedAt:                time.Now().UTC(),
 	}
 	if err := rs.SaveWithRefinement(ctx, merged, record); err != nil {
 		return RefinementRecord{}, false, err

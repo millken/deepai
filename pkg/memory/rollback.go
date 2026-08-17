@@ -117,6 +117,30 @@ func RollbackFacts(currentFacts []Fact, record RefinementRecord, now time.Time) 
 	return result, skipped
 }
 
+// rollbackNarrative decides what the narrative half of the document becomes.
+//
+// It mirrors the fact table's third-party rule with the same fingerprint test:
+// the pre-refine narrative is restored only while the current narrative still
+// looks the way the refine left it. Merge never timestamps the narrative, so
+// content is the only available evidence.
+//
+// A record written before narrative rollback existed has nil PreUser/PreHistory
+// — the JSON simply lacks the fields — and there is no pre-state to restore.
+// Restoring the zero value would blank the narrative instead, which is strictly
+// worse than leaving it, so such records decline.
+//
+// restored reports whether the narrative was actually rolled back, so callers
+// can say when it was left alone.
+func rollbackNarrative(current Document, record RefinementRecord) (user UserMemory, history HistoryMemory, restored bool) {
+	if record.PreUser == nil || record.PreHistory == nil {
+		return current.User, current.History, false
+	}
+	if narrativeFingerprint(current.User, current.History) != record.PostNarrativeFingerprint {
+		return current.User, current.History, false
+	}
+	return *record.PreUser, *record.PreHistory, true
+}
+
 // RollbackRefinement undoes one recorded refinement, under the session lock.
 //
 // Rollback is a read-modify-write of the whole fact set, so it belongs in the
@@ -132,29 +156,32 @@ func RollbackFacts(currentFacts []Fact, record RefinementRecord, now time.Time) 
 // "/refine undo" rolls back both halves of one refine.
 //
 // skipped lists the facts whose rollback was declined because something else
-// changed them after the refine; see RollbackFacts.
+// changed them after the refine; see RollbackFacts. narrativeRestored reports
+// whether the User/History half was rolled back too — it is declined for a
+// record predating narrative snapshots, and when a third party rewrote the
+// narrative after the refine; see rollbackNarrative.
 //
 // Unlike RefineAndRecord there is no degraded mode: a backend without
 // refinement history has nothing to roll back to, so this fails rather than
 // falling back.
-func (s *Service) RollbackRefinement(ctx context.Context, sessionID, recordID, pairID string) ([]string, error) {
+func (s *Service) RollbackRefinement(ctx context.Context, sessionID, recordID, pairID string) (skipped []string, narrativeRestored bool, err error) {
 	if s == nil {
-		return nil, errors.New("memory service is nil")
+		return nil, false, errors.New("memory service is nil")
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return nil, errors.New("session id is required")
+		return nil, false, errors.New("session id is required")
 	}
 	recordID = strings.TrimSpace(recordID)
 	if recordID == "" {
-		return nil, errors.New("refinement id is required")
+		return nil, false, errors.New("refinement id is required")
 	}
 	if s.storage == nil {
-		return nil, errors.New("memory storage is not configured")
+		return nil, false, errors.New("memory storage is not configured")
 	}
 	rs, ok := s.storage.(RefinementStore)
 	if !ok {
-		return nil, errors.New("rollback requires a storage backend with refinement history")
+		return nil, false, errors.New("rollback requires a storage backend with refinement history")
 	}
 
 	mu := s.getSessionLock(sessionID)
@@ -165,35 +192,45 @@ func (s *Service) RollbackRefinement(ctx context.Context, sessionID, recordID, p
 	// must not be able to read it before this one deletes it.
 	record, err := rs.GetRefinement(ctx, sessionID, recordID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	current, err := s.storage.Load(ctx, sessionID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, fmt.Errorf("load memory %q: %w", sessionID, err)
+		return nil, false, fmt.Errorf("load memory %q: %w", sessionID, err)
 	}
 
 	now := time.Now().UTC()
 	facts, skipped := RollbackFacts(current.Facts, record, now)
+	user, history, narrativeRestored := rollbackNarrative(current, record)
 
 	doc := current
 	// Load returns a zero Document for ErrNotFound, and prepareDocument rejects
 	// an empty session id.
 	doc.SessionID = sessionID
 	doc.Facts = facts
+	doc.User = user
+	doc.History = history
 	doc.UpdatedAt = now
 
+	// The rollback record carries its own narrative snapshot for the same reason
+	// it carries PostFactFingerprints: without it, rolling THIS rollback back
+	// would find no pre-state and decline, so the undo would not be reversible.
+	preUser, preHistory := current.User, current.History
 	rollbackRecord := RefinementRecord{
-		ID:                   refineID(),
-		PairID:               strings.TrimSpace(pairID),
-		Rationale:            "Rollback of " + recordID,
-		SessionID:            sessionID,
-		PreSnapshot:          cloneFacts(current.Facts),
-		PostFactFingerprints: factFingerprints(facts),
-		FactIDsChanged:       diffFactIDs(current.Facts, facts),
-		CreatedAt:            now,
+		ID:                       refineID(),
+		PairID:                   strings.TrimSpace(pairID),
+		Rationale:                "Rollback of " + recordID,
+		SessionID:                sessionID,
+		PreSnapshot:              cloneFacts(current.Facts),
+		PostFactFingerprints:     factFingerprints(facts),
+		FactIDsChanged:           diffFactIDs(current.Facts, facts),
+		PreUser:                  &preUser,
+		PreHistory:               &preHistory,
+		PostNarrativeFingerprint: narrativeFingerprint(user, history),
+		CreatedAt:                now,
 	}
 	if err := rs.SaveWithRollback(ctx, doc, rollbackRecord, recordID); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return skipped, nil
+	return skipped, narrativeRestored, nil
 }

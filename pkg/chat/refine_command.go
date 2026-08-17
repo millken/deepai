@@ -278,20 +278,18 @@ func (r *ChatRepl) runManualRefine(ctx context.Context) {
 			continue
 		}
 		record, saved, err := r.refineScopeNow(ctx, scope.key, pairID)
+		added, updated, removed := record.Summary()
 		switch {
 		case err != nil:
 			r.ui.Info(fmt.Sprintf("  %s scope: failed: %v", scope.label, err))
 		case !saved:
 			r.ui.Info(fmt.Sprintf("  %s scope: nothing new to remember", scope.label))
-		case record.ID == "":
-			// A write with no record: the merge moved no fact, only the
-			// User/History narrative, so RefineAndRecord deliberately recorded
-			// nothing a rollback could restore. Summarizing the zero record here
-			// would claim "+0 ~0 -0" against an empty id while something did in
-			// fact change.
-			r.ui.Info(fmt.Sprintf("  %s scope: context updated, no fact changes", scope.label))
+		case added == 0 && updated == 0 && removed == 0:
+			// A refine that moved only the User/History narrative. It is recorded
+			// and rollbackable, so report its id, but "+0 ~0 -0" alone would read
+			// as though nothing happened.
+			r.ui.Info(fmt.Sprintf("  %s scope: context updated, no fact changes  (%s)", scope.label, record.ID))
 		default:
-			added, updated, removed := record.Summary()
 			r.ui.Info(fmt.Sprintf("  %s scope: +%d ~%d -%d  (%s)", scope.label, added, updated, removed, record.ID))
 		}
 	}
@@ -373,16 +371,20 @@ func (r *ChatRepl) runRefineRollback(ctx context.Context, recordID string) {
 // reportRollback rolls one scope back and prints the outcome, reporting whether
 // it succeeded so callers do not follow a failure with advice that implies one.
 func (r *ChatRepl) reportRollback(ctx context.Context, label, storageKey, recordID, pairID string) bool {
-	skipped, err := r.cfg.MemoryService.RollbackRefinement(ctx, storageKey, recordID, pairID)
+	skipped, narrativeRestored, err := r.cfg.MemoryService.RollbackRefinement(ctx, storageKey, recordID, pairID)
 	if err != nil {
 		r.ui.Info(fmt.Sprintf("  %s scope: rollback failed: %v", label, err))
 		return false
 	}
-	if len(skipped) == 0 {
-		r.ui.Info(fmt.Sprintf("  %s scope: rolled back %s", label, recordID))
-		return true
+	msg := fmt.Sprintf("  %s scope: rolled back %s", label, recordID)
+	if len(skipped) > 0 {
+		msg += fmt.Sprintf("; left alone (changed since): %s", strings.Join(skipped, ", "))
 	}
-	r.ui.Info(fmt.Sprintf("  %s scope: rolled back %s; left alone (changed since): %s",
-		label, recordID, strings.Join(skipped, ", ")))
+	// Say so when the narrative was NOT restored: the fact half rolled back
+	// either way, so silence here would read as a full undo.
+	if !narrativeRestored {
+		msg += "; context left as-is"
+	}
+	r.ui.Info(msg)
 	return true
 }
