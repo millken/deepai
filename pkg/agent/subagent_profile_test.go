@@ -66,13 +66,11 @@ func requestToolNames(req llm.ChatRequest) []string {
 	return out
 }
 
-// TestSubagentExecutor_AppliesProfileTemperature is the RED test for the
-// dropped-temperature bug: buildAgentConfig never set AgentConfig.Temperature,
-// so New()'s ApplyAgentType saw an empty AgentType, fell back to
-// general-purpose, and every subagent ran at general-purpose's 0.2 — the
-// per-type Temperature in BuiltinAgentTypes (coder 0.1, bash 0.0, ...) reached
-// the provider for no type at all.
-func TestSubagentExecutor_AppliesProfileTemperature(t *testing.T) {
+// TestSubagentExecutor_NoTemperatureByDefault pins the opt-in semantics:
+// builtin profiles carry no temperature, so a subagent with no explicit
+// `temperature:` anywhere sends none — Claude 4.7+ rejects the parameter
+// outright, and silently defaulting one broke exactly those models.
+func TestSubagentExecutor_NoTemperatureByDefault(t *testing.T) {
 	for _, at := range []AgentType{AgentTypeCoder, AgentTypeBash, AgentTypeResearch, AgentTypeGeneral} {
 		t.Run(string(at), func(t *testing.T) {
 			exec, provider := profileTestExecutor(t)
@@ -81,15 +79,44 @@ func TestSubagentExecutor_AppliesProfileTemperature(t *testing.T) {
 				func(subagent.TaskEvent) {}); err != nil {
 				t.Fatalf("Execute() error = %v", err)
 			}
-			want := BuiltinAgentTypes[at].Temperature
-			got := provider.firstRequest().Temperature
-			if got == nil {
-				t.Fatalf("request Temperature = nil, want %v (the %s profile value)", want, at)
-			}
-			if *got != want {
-				t.Fatalf("request Temperature = %v, want %v (the %s profile value)", *got, want, at)
+			if got := provider.firstRequest().Temperature; got != nil {
+				t.Fatalf("request Temperature = %v, want nil (the %s builtin profile carries none)", *got, at)
 			}
 		})
+	}
+}
+
+// TestSubagentExecutor_ModelDefTemperature proves a models[].temperature entry
+// reaches the subagent request for the task's resolved alias, and that the
+// executor-level WithTemperature value is the fallback when the alias sets none.
+func TestSubagentExecutor_ModelDefTemperature(t *testing.T) {
+	aliasTemp := 0.4
+	globalTemp := 0.9
+	reg, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "default-model"},
+		{Name: "warm", Provider: "test", Model: "warm-model", Temperature: &aliasTemp},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	run := func(t *testing.T, modelAlias string) *float64 {
+		t.Helper()
+		provider := &captureProvider{}
+		reg.InjectProvider("test", "", "", provider)
+		exec := NewSubagentExecutor(reg, profileTestTools(t), nil).WithTemperature(&globalTemp)
+		if _, err := exec.Execute(context.Background(),
+			&subagent.Task{ID: "t", Prompt: "hi", Config: subagent.SubagentConfig{Model: modelAlias}},
+			func(subagent.TaskEvent) {}); err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		return provider.firstRequest().Temperature
+	}
+
+	if got := run(t, "warm"); got == nil || *got != aliasTemp {
+		t.Fatalf("request Temperature = %v, want %v from models[].temperature", got, aliasTemp)
+	}
+	if got := run(t, "default"); got == nil || *got != globalTemp {
+		t.Fatalf("request Temperature = %v, want %v from the WithTemperature fallback", got, globalTemp)
 	}
 }
 

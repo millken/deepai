@@ -24,6 +24,7 @@ type SubagentExecutor struct {
 	sandbox         *sandbox.Sandbox
 	contextWindow   int
 	maxTokens       *int
+	temperature     *float64
 	workDir         string
 	pluginAgentDirs []string
 }
@@ -61,6 +62,16 @@ func (e *SubagentExecutor) WithContextWindow(n int) *SubagentExecutor {
 func (e *SubagentExecutor) WithMaxTokens(n *int) *SubagentExecutor {
 	if e != nil {
 		e.maxTokens = n
+	}
+	return e
+}
+
+// WithTemperature sets the global fallback sampling temperature for
+// subagents. A models[].temperature entry for the task's resolved alias, or
+// an explicit agent-type `temperature:`, wins over it. nil sends none.
+func (e *SubagentExecutor) WithTemperature(t *float64) *SubagentExecutor {
+	if e != nil {
+		e.temperature = t
 	}
 	return e
 }
@@ -148,18 +159,18 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		return subagent.ExecutionResult{}, fmt.Errorf("resolve subagent model: %w", err)
 	}
 
-	// profileTemperature must be handed to the agent EXPLICITLY: New() runs
-	// ApplyAgentType(&cfg, cfg.AgentType), and the config below deliberately
-	// leaves AgentType unset (setting it would make ApplyAgentType re-resolve
-	// the profile WITHOUT e.workDir and then Restrict the already-selected
-	// registry against that wrong tool list — a project YAML that adds a tool
-	// the builtin profile lacks would lose it). With AgentType empty,
-	// ApplyAgentType filled in general-purpose's temperature for every
-	// subagent, so the per-type Temperature (coder 0.1, bash 0.0, ...) reached
-	// the provider for no type at all. Passing it explicitly wins because
-	// ApplyAgentType only defaults a nil Temperature. Read from the RESOLVED
-	// profile, so a project YAML's `temperature:` applies too.
-	profileTemperature := profileCfg.Temperature
+	// Temperature priority: the RESOLVED profile's explicit `temperature:`
+	// (builtin profiles carry none) > the task's resolved model alias's
+	// models[].temperature > the session-level fallback from WithTemperature.
+	// nil sends none — Claude 4.7+ rejects sampling parameters outright.
+	subTemperature := e.temperature
+	if def, ok := e.registry.Resolve(modelAlias); ok && def.Temperature != nil {
+		subTemperature = def.Temperature
+	}
+	if profileCfg.temperatureSet {
+		t := profileCfg.Temperature
+		subTemperature = &t
+	}
 
 	// buildAgentConfig is factored out so a schema-validation retry (below)
 	// constructs its fresh agent (agents are single-use, react.go's
@@ -178,7 +189,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 			MaxToolCalls: toolCallBudget,
 			Model:        modelName,
 			MaxTokens:    e.maxTokens,
-			Temperature:  &profileTemperature,
+			Temperature:  subTemperature,
 			Sandbox:      e.sandbox,
 			// runCtx (built by Pool.runTask) carries a deadline only when a
 			// task- or pool-level timeout is configured; with none, this value

@@ -30,7 +30,7 @@ func (stubProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm
 func TestRegisterChatTools_RegistersDocxTools(t *testing.T) {
 	registry := tools.NewRegistry()
 	modelRegistry := llm.NewSingleModelRegistry("test", "test-model", "")
-	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil)
+	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil)
 
 	read := registry.Get("docx_read")
 	if read == nil {

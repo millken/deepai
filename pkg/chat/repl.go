@@ -31,9 +31,10 @@ type ReplConfig struct {
 	ContextWindow       int
 	MaxToolCalls        int
 	RequestTimeout      time.Duration
-	Query               string // non-interactive single query
-	ResumeSession       string // session ID or title to resume
-	ContinueLast        bool   // resume most recent session
+	Temperature         *float64 // global fallback; models[].temperature wins per alias
+	Query               string   // non-interactive single query
+	ResumeSession       string   // session ID or title to resume
+	ContinueLast        bool     // resume most recent session
 	SystemPrompt        string
 	WorkDir             string
 	ToolRegistry        *tools.Registry
@@ -662,6 +663,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		// needs the same headroom. See agent.ResolveMaxOutputTokens and
 		// mainAgentMaxTokens below.
 		MaxTokens:       mainAgentMaxTokens(),
+		Temperature:     r.currentTemperature(),
 		RequestTimeout:  r.cfg.RequestTimeout,
 		UserInteraction: r.ui,
 		PlanMode:        r.planMode,
@@ -1174,6 +1176,19 @@ func (r *ChatRepl) currentReasoningEffort() string {
 		return r.currentEffort
 	}
 	return def.Effort
+}
+
+// currentTemperature returns the effective sampling temperature for the
+// current model: models[].temperature if set, else the global config value,
+// else nil — no temperature is sent at all (Claude 4.7+ rejects the
+// parameter, other modern models ignore it).
+func (r *ChatRepl) currentTemperature() *float64 {
+	if r.cfg.ModelRegistry != nil {
+		if def, ok := r.cfg.ModelRegistry.Resolve(r.currentModel); ok && def.Temperature != nil {
+			return def.Temperature
+		}
+	}
+	return r.cfg.Temperature
 }
 
 // currentImageDetail returns the vision detail level for image attachments.

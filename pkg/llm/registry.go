@@ -124,13 +124,14 @@ func buildProvider(name string, cfg resolvedConfig) (LLMProvider, error) {
 // human-friendly alias (Name) to a concrete provider + model pair, with
 // optional BaseURL and APIKeyEnv overrides.
 type ModelDef struct {
-	Name          string `yaml:"name" json:"name"`
-	Provider      string `yaml:"provider" json:"provider"`
-	Model         string `yaml:"model" json:"model"`
-	BaseURL       string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
-	APIKeyEnv     string `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
-	ContextWindow int    `yaml:"context_window,omitempty" json:"context_window,omitempty"` // 模型级别上下文覆盖，0 表示使用全局默认
-	Effort        string `yaml:"effort,omitempty" json:"effort,omitempty"`                 // 模型级别推理深度覆盖，如 "low", "medium", "high"，空表示使用全局默认
+	Name          string   `yaml:"name" json:"name"`
+	Provider      string   `yaml:"provider" json:"provider"`
+	Model         string   `yaml:"model" json:"model"`
+	BaseURL       string   `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	APIKeyEnv     string   `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
+	ContextWindow int      `yaml:"context_window,omitempty" json:"context_window,omitempty"` // 模型级别上下文覆盖，0 表示使用全局默认
+	Effort        string   `yaml:"effort,omitempty" json:"effort,omitempty"`                 // 模型级别推理深度覆盖，如 "low", "medium", "high"，空表示使用全局默认
+	Temperature   *float64 `yaml:"temperature,omitempty" json:"temperature,omitempty"`       // 模型级别采样温度覆盖，nil 表示不发送（Claude 4.7+ 拒绝该参数）
 }
 
 // ModelRegistry manages a set of named model definitions and lazily creates

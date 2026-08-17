@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -109,7 +110,7 @@ func (p *AnthropicProvider) buildParams(req ChatRequest) anthropic.MessageNewPar
 	} else {
 		params.MaxTokens = 8192
 	}
-	if req.Temperature != nil {
+	if req.Temperature != nil && acceptsTemperature(req.Model) {
 		params.Temperature = anthropic.Float(*req.Temperature)
 	}
 	if req.SystemPrompt != "" {
@@ -390,6 +391,15 @@ func mapToolsToAnthropic(tools []models.Tool) []anthropic.ToolUnionParam {
 		result = append(result, anthropic.ToolUnionParam{OfTool: &p})
 	}
 	return result
+}
+
+// Claude 4.7+ (and Fable/Mythos at any version) reject temperature with a
+// 400; only send it to models that still accept sampling parameters.
+var claudeNoSamplingRE = regexp.MustCompile(
+	`^claude-(?:opus|sonnet)-(?:[5-9]|4-[7-9])|^claude-(?:fable|mythos)`)
+
+func acceptsTemperature(model string) bool {
+	return !claudeNoSamplingRE.MatchString(strings.ToLower(model))
 }
 
 func mapThinkingConfig(effort string) anthropic.ThinkingConfigParamUnion {

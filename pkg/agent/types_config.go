@@ -154,7 +154,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		//
 		// NOTE: ApplyAgentType only restricts the registry for an agent that
 		// DECLARED a type. The main agent (REPL) declares none and normalizes to
-		// this profile for its prompt/temperature baseline; this list must not
+		// this profile for its prompt baseline; this list must not
 		// narrow it, since it can never name the task tool, the skill tool or
 		// MCP tools.
 		DefaultTools: []string{
@@ -163,7 +163,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 			"skill", "web_search", "web_fetch",
 		},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypeResearch: {
 		Type:         AgentTypeResearch,
@@ -172,7 +171,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: researcherSystemPrompt,
 		DefaultTools: []string{"read_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
 		MaxToolCalls: 0,
-		Temperature:  0.1,
 	},
 	AgentTypeCoder: {
 		Type:         AgentTypeCoder,
@@ -181,7 +179,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: coderSystemPrompt,
 		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "skill", "git_auto_commit"},
 		MaxToolCalls: 0,
-		Temperature:  0.1,
 	},
 	AgentTypeAnalyst: {
 		Type:         AgentTypeAnalyst,
@@ -190,7 +187,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: analystSystemPrompt,
 		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
 		MaxToolCalls: 0,
-		Temperature:  0.15,
 	},
 	// The three reviewer profiles deliberately set MaxToolCalls 0 (no cap —
 	// same rationale as the global default): a fixed cap cannot fit both a
@@ -205,7 +201,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: securityReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypeArchReviewer: {
 		Type:         AgentTypeArchReviewer,
@@ -214,7 +209,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: archReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypePerfReviewer: {
 		Type:         AgentTypePerfReviewer,
@@ -223,7 +217,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: perfReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypeCorrectnessReviewer: {
 		Type:         AgentTypeCorrectnessReviewer,
@@ -245,7 +238,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: productManagerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "ask_clarification"},
 		MaxToolCalls: 0,
-		Temperature:  0.15,
 	},
 	AgentTypeArchitect: {
 		Type:         AgentTypeArchitect,
@@ -254,7 +246,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: architectSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypeBash: {
 		Type:         AgentTypeBash,
@@ -263,7 +254,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: bashSystemPrompt,
 		DefaultTools: []string{"bash"},
 		MaxToolCalls: 3,
-		Temperature:  0.0,
 	},
 	AgentTypeFrontend: {
 		Type:         AgentTypeFrontend,
@@ -272,7 +262,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: frontendSystemPrompt,
 		DefaultTools: []string{"bash", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
 		MaxToolCalls: 0,
-		Temperature:  0.15,
 	},
 	AgentTypeUIDesigner: {
 		Type:         AgentTypeUIDesigner,
@@ -281,7 +270,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: uiDesignerSystemPrompt,
 		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification", "web_search", "web_fetch", "image_search"},
 		MaxToolCalls: 0,
-		Temperature:  0.2,
 	},
 	AgentTypeNews: {
 		Type:         AgentTypeNews,
@@ -290,7 +278,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		SystemPrompt: newsSystemPrompt,
 		DefaultTools: []string{"web_search", "web_fetch", "web_fetch_batch", "read_file", "present_file", "ask_clarification"},
 		MaxToolCalls: 0,
-		Temperature:  0.1,
 	},
 	AgentTypeDocEditor: {
 		Type:         AgentTypeDocEditor,
@@ -305,7 +292,6 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		// documents. On exhaustion the subagent wraps up gracefully rather
 		// than failing.
 		MaxToolCalls: 30,
-		Temperature:  0.2,
 	},
 }
 
@@ -331,7 +317,7 @@ func GetAgentTypeConfig(t AgentType) AgentTypeConfig {
 //
 // An empty t means the caller DECLARED NO TYPE (the REPL's shape — see
 // pkg/chat/repl.go). Such an agent still normalizes to general-purpose for its
-// baseline prompt and temperature, but its tool registry is left untouched: the
+// baseline prompt, but its tool registry is left untouched: the
 // tools it was handed are the tools it should have. Only a DECLARED type narrows
 // the registry to that profile's allowlist. Without this distinction, giving
 // general-purpose an explicit DefaultTools list would silently strip the main
@@ -353,7 +339,11 @@ func ApplyAgentType(cfg *AgentConfig, t AgentType) error {
 	if strings.TrimSpace(cfg.SystemPrompt) == "" {
 		cfg.SystemPrompt = profile.SystemPrompt
 	}
-	if cfg.Temperature == nil {
+	// Temperature is opt-in: only an explicitly declared profile temperature
+	// (YAML/MD `temperature:`) fills a nil cfg.Temperature. Builtin profiles
+	// carry none — Claude 4.7+ rejects sampling parameters outright, and other
+	// modern models ignore them, so nothing is sent unless someone asked.
+	if cfg.Temperature == nil && profile.temperatureSet {
 		temp := profile.Temperature
 		cfg.Temperature = &temp
 	}

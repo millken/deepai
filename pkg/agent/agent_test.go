@@ -259,8 +259,8 @@ func TestApplyAgentType(t *testing.T) {
 	if cfg.SystemPrompt == "" {
 		t.Fatal("ApplyAgentType() did not set system prompt")
 	}
-	if cfg.Temperature == nil {
-		t.Fatal("ApplyAgentType() did not set temperature")
+	if cfg.Temperature != nil {
+		t.Fatal("ApplyAgentType() set a temperature no profile declared")
 	}
 	if cfg.Tools.Get("bash") == nil {
 		t.Fatal("ApplyAgentType() removed allowed tool bash")
@@ -274,8 +274,8 @@ func TestApplyAgentType(t *testing.T) {
 // blast radius of giving general-purpose an explicit DefaultTools allowlist: the
 // REPL builds its AgentConfig WITHOUT an AgentType (pkg/chat/repl.go), so
 // ApplyAgentType normalizes the empty type to general-purpose. It must keep
-// using that profile as the baseline prompt/temperature — the REPL relies on
-// both — while leaving the tool registry ALONE. Restricting it would silently
+// using that profile as the baseline prompt — the REPL relies on it — while
+// leaving the tool registry ALONE. Restricting it would silently
 // strip the main agent's task tool, skill tool and every MCP tool, none of which
 // any agent-type allowlist can name.
 func TestApplyAgentType_NoDeclaredTypeKeepsFullToolset(t *testing.T) {
@@ -300,8 +300,8 @@ func TestApplyAgentType_NoDeclaredTypeKeepsFullToolset(t *testing.T) {
 	if cfg.SystemPrompt == "" {
 		t.Fatal("ApplyAgentType() did not set the baseline system prompt")
 	}
-	if cfg.Temperature == nil {
-		t.Fatal("ApplyAgentType() did not set the baseline temperature")
+	if cfg.Temperature != nil {
+		t.Fatal("ApplyAgentType() set a baseline temperature no profile declared")
 	}
 	for _, name := range []string{"read_file", "bash", "task", "skill", "some_mcp_tool", "git_auto_commit"} {
 		if cfg.Tools.Get(name) == nil {

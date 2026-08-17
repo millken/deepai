@@ -207,7 +207,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	for _, a := range agentCatalog {
 		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})
 	}
-	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, pluginAgentDirs, agentOpts)
+	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts)
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -319,6 +319,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		ContextWindow:        cfg.ContextWindow,
 		MaxToolCalls:         maxToolCalls,
 		RequestTimeout:       resolveRequestTimeout(cfg.RequestTimeout),
+		Temperature:          cfg.Temperature,
 		Query:                query,
 		ResumeSession:        resume,
 		ContinueLast:         continueLast,
@@ -354,7 +355,7 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 // registerChatTools returns the subagent pool so the REPL can cancel a single
 // task from the UI; the pool is created here because this is where the tool
 // registry is assembled.
-func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, pluginAgentDirs []string, agentOpts []tools.AgentOption) *subagent.Pool {
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
@@ -364,6 +365,7 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 		WithWorkDir(workDir).
 		WithContextWindow(contextWindow).
 		WithMaxTokens(subagentMaxTokens()).
+		WithTemperature(temperature).
 		WithPluginAgentDirs(pluginAgentDirs)
 	subPool := agent.NewSubagentPool(subExecutor, 0)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))

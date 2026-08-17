@@ -33,6 +33,11 @@ type Config struct {
 	// (e.g., Claude's "thinking" feature). Valid values: "low", "medium", "high", "disabled".
 	// Empty means provider default. Model-level config overrides this.
 	ReasoningEffort string `yaml:"reasoning_effort,omitempty"`
+	// Temperature optionally sets the sampling temperature for the main agent
+	// and subagents. nil (absent) sends no temperature at all — modern models
+	// (Claude 4.7+) reject the parameter outright. A models[].temperature
+	// entry overrides this per alias.
+	Temperature *float64 `yaml:"temperature,omitempty"`
 	// Mode controls whether the agent stops to ask clarifying questions.
 	// Empty or "interactive" (default): the agent may use ask_clarification to
 	// block on user input. "autonomous": ask_clarification short-circuits to a

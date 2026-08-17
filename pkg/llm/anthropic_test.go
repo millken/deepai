@@ -267,3 +267,29 @@ func TestNewAnthropicProvider_NoAPIKey(t *testing.T) {
 		t.Error("expected error for empty API key")
 	}
 }
+
+func TestBuildParams_TemperatureSuppressedForNoSamplingModels(t *testing.T) {
+	p := &AnthropicProvider{}
+	temp := 0.2
+
+	for _, model := range []string{
+		"claude-opus-4-7", "claude-opus-4-8", "claude-opus-4-8-20260101",
+		"claude-opus-5", "claude-opus-6", "claude-sonnet-5",
+		"claude-fable-5", "claude-mythos-5",
+	} {
+		params := p.buildParams(ChatRequest{Model: model, Temperature: &temp})
+		if params.Temperature.Valid() {
+			t.Errorf("%s: temperature should be suppressed, got sent", model)
+		}
+	}
+
+	for _, model := range []string{
+		"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
+		"glm-5.3", "claude-opus-4-1-20250805",
+	} {
+		params := p.buildParams(ChatRequest{Model: model, Temperature: &temp})
+		if !params.Temperature.Valid() {
+			t.Errorf("%s: temperature should be sent", model)
+		}
+	}
+}
