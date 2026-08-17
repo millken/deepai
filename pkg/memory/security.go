@@ -69,19 +69,3 @@ func ScanContent(content string) error {
 
 	return nil
 }
-
-// SanitizeContent removes invisible Unicode and control characters from content.
-// Used as a fallback when content passes threat checks but contains suspicious chars.
-func SanitizeContent(content string) string {
-	for _, pat := range invisibleUnicodePatterns {
-		content = pat.ReplaceAllString(content, "")
-	}
-	var b strings.Builder
-	for _, r := range content {
-		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}

@@ -161,22 +161,6 @@ func (s *Service) AutoMigrate(ctx context.Context) error {
 	return s.storage.AutoMigrate(ctx)
 }
 
-func (s *Service) Load(ctx context.Context, sessionID string) (Document, error) {
-	if s == nil || s.storage == nil {
-		return Document{}, errors.New("memory storage is not configured")
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		return Document{}, errors.New("session id is required")
-	}
-	return s.storage.Load(ctx, sessionID)
-}
-
-func (s *Service) LoadScope(ctx context.Context, scope Scope) (Document, error) {
-	return s.Load(ctx, scope.Key())
-}
-
-// Save persists a document directly (used by memory tool).
-// Acquires the session lock to avoid racing with async updates.
 func (s *Service) Save(ctx context.Context, doc Document) error {
 	if s == nil || s.storage == nil {
 		return errors.New("memory storage is not configured")
@@ -240,10 +224,6 @@ func (s *Service) Update(ctx context.Context, sessionID string, messages []model
 	return s.storage.Save(ctx, merged)
 }
 
-func (s *Service) UpdateScope(ctx context.Context, scope Scope, messages []models.Message) error {
-	return s.Update(ctx, scope.Key(), messages)
-}
-
 // UpdateWith performs a memory update using an externally provided extractor.
 // Unlike Update, it does not depend on the Service's own extractor field.
 func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []models.Message, ext Extractor) error {
@@ -289,11 +269,6 @@ func (s *Service) UpdateWith(ctx context.Context, sessionID string, messages []m
 		return nil
 	}
 	return s.storage.Save(ctx, merged)
-}
-
-// UpdateScopeWith is the scope variant of UpdateWith.
-func (s *Service) UpdateScopeWith(ctx context.Context, scope Scope, messages []models.Message, ext Extractor) error {
-	return s.UpdateWith(ctx, scope.Key(), messages, ext)
 }
 
 // UpdateWithFactSource is like UpdateWith but overrides the fact source
@@ -485,10 +460,6 @@ func (s *Service) RecordSkillUsage(ctx context.Context, sessionID string, skillN
 
 func (s *Service) Inject(ctx context.Context, sessionID string) string {
 	return s.InjectWithContext(ctx, sessionID, "", "")
-}
-
-func (s *Service) InjectScope(ctx context.Context, scope Scope) string {
-	return s.InjectScopeWithContext(ctx, scope, "", "")
 }
 
 func (s *Service) InjectWithContext(ctx context.Context, sessionID string, currentContext string, activeSource string) string {

@@ -50,10 +50,6 @@ func BuildMemoryUpdatePrompt(messages []models.Message, current Document) string
 	)
 }
 
-func BuildInjection(doc Document) string {
-	return BuildInjectionWithContext(doc, "", 0)
-}
-
 func BuildInjectionWithContext(doc Document, currentContext string, maxTokens int) string {
 	injection, _ := buildInjectionWithIDs(doc, currentContext, maxTokens, "")
 	return injection

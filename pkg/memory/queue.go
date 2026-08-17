@@ -403,36 +403,6 @@ func (s *Service) ScheduleUpdate(sessionID string, messages []models.Message) {
 	}
 }
 
-// ScheduleUpdateWithFactSource enqueues a background update with explicit fact source.
-func (s *Service) ScheduleUpdateWithFactSource(sessionID string, messages []models.Message, ext Extractor, factSource string) {
-	if s == nil || s.storage == nil || ext == nil || len(messages) == 0 {
-		return
-	}
-	if s.queue != nil {
-		s.queue.submit(updateJob{
-			typ:        jobUpdateWithFactSource,
-			sessionID:  sessionID,
-			messages:   prepareAsyncMessages(messages),
-			ext:        ext,
-			factSource: factSource,
-		})
-	}
-}
-
-// ScheduleRecordSkillUsage enqueues a skill usage recording.
-func (s *Service) ScheduleRecordSkillUsage(sessionID string, skillName string) {
-	if s == nil || s.storage == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(skillName) == "" {
-		return
-	}
-	if s.queue != nil {
-		s.queue.submit(updateJob{
-			typ:       jobRecordSkillUsage,
-			sessionID: sessionID,
-			skillName: skillName,
-		})
-	}
-}
-
 // scheduleRetrievalIncrement enqueues a retrieval count increment.
 func (s *Service) scheduleRetrievalIncrement(sessionID string, factIDs []string) {
 	if s == nil || s.storage == nil || len(factIDs) == 0 {
@@ -475,23 +445,6 @@ func (s *Service) ScheduleSuspectIncrement(sessionID string, turnID int, factIDs
 			sessionID: sessionID,
 			factIDs:   factIDs,
 			turnID:    turnID,
-		})
-	}
-}
-
-// ScheduleScopeUpdateWithSkill enqueues a user-scope update combined with skill usage.
-func (s *Service) ScheduleScopeUpdateWithSkill(scope Scope, messages []models.Message, ext Extractor, skillName string) {
-	if s == nil || s.storage == nil || len(messages) == 0 {
-		return
-	}
-	if s.queue != nil {
-		s.queue.submit(updateJob{
-			typ:       jobUpdateScopeWithSkill,
-			sessionID: scope.Key(),
-			messages:  prepareAsyncMessages(messages),
-			ext:       ext,
-			skillName: skillName,
-			scope:     scope,
 		})
 	}
 }
