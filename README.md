@@ -38,7 +38,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - **子代理编排**：通过 `task` 工具把任务委派给独立的专家代理（coder、researcher、security-reviewer 等 14 种内置类型），池化并发、超时控制、事件流回传。
 - **对抗式自审**：可选的编辑后审查闭环——独立上下文的 correctness-reviewer 对改动出具结构化裁决，不通过则有界回注修复（最多 2 轮），审查者写树即弃裁决。
 - **丰富的内置工具**：bash、文件读写编辑、代码地图、git 全家桶、web 搜索/抓取/图片搜索、图像查看、记忆等。
-- **技能系统**：用 `SKILL.md` + YAML frontmatter 定义可复用工作流，支持 hooks、动态注入、模型/effort 覆盖、fork 上下文。
+- **技能系统**：用 `SKILL.md` + YAML frontmatter 定义可复用工作流，支持动态注入、模型/effort 覆盖、路径匹配。
 - **Claude 插件兼容**：发现并加载 Claude Code 风格的插件包（skills、agents、commands、MCP servers）。
 - **MCP 集成**：通过 `.mcp.json` 连接任意外部 MCP 服务器（stdio / SSE / HTTP），自动注册为工具。
 - **会话持久化**：SQLite 存储会话历史，支持恢复、续聊、导出、重命名、清理、统计。
@@ -352,10 +352,8 @@ DeepAI 通过 `pkg/llm` 抽象所有提供商，统一为 `LLMProvider` 接口�
 |------|------|------|
 | **Shell** | `bash` | 执行 shell 命令，返回 stdout/stderr/exit_code |
 | **文件** | `read_file` `write_file` `edit_file` `list_dir` `glob` `grep` `find` `code_map` | 代码地图按符号签名索引，避免读全文 |
-| **Git** | `git_status` `git_diff` `git_log` `git_add` `git_commit` `git_reset` `git_auto_commit` `git_push` | git_auto_commit 支持 AI 生成提交信息 |
+| **Git** | `git_auto_commit` | AI 生成提交信息；其余 git 操作走 `bash` |
 | **Web** | `web_search` `web_fetch` `web_fetch_batch` `image_search` | DuckDuckGo 搜索，SSRF 防护 |
-| **图像** | `view_image` | 查看本地/远程图像 |
-| **记忆** | `memory` | 读写长期记忆 |
 | **展示** | `present_file` | 向用户展示文件内容 |
 | **代理** | `task` | 委派子代理（见下节） |
 | **交互** | `ask_clarification` | 向用户提问（autonomous 模式下走 best-judgment） |
@@ -475,14 +473,8 @@ user-invocable: true              # nil/true 允许用户调用
 allowed-tools: [Read, Grep, Bash] # 限制技能内可用工具
 model: claude-sonnet-4-20250514   # 覆盖模型
 effort: high                      # 推理强度
-context: fork                     # "" 继承；"fork" 复制上下文
-agent: coder                      # 指定 agent 类型
 max-turns: 10                     # DeepAI 扩展
 temperature: 0.1                  # DeepAI 扩展
-hooks:
-  - event: PreToolUse
-    command: "./check.sh"
-    on_error: abort
 paths:
   - "src/**/*.go"
 shell: bash
@@ -578,9 +570,8 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 - **注入**：相关记忆在下次对话时注入系统提示。
 - **作用域**：支持全局（`UserScope`）与项目级记忆。
 - **偏好调度**：`PreferenceScheduler` 管理偏好的应用与冲突解决。
-- **工具**：`memory` 工具让 agent 显式读写记忆。
 
-记忆与偏好存储复用同一个 SQLite/Postgres 数据库。
+记忆与偏好存储复用同一个 SQLite 数据库。
 
 详见 [`docs/PERSONALIZED_AGENT_ROADMAP.md`](docs/PERSONALIZED_AGENT_ROADMAP.md) 与 [`docs/hermes-agent-memory-analysis.md`](docs/hermes-agent-memory-analysis.md)。
 
@@ -650,7 +641,7 @@ deepai/
 │   ├── tools/               # 工具注册表、task 工具、present、git_auto_commit
 │   │   └── builtin/         # 内置工具（bash/file/git/web/...）
 │   ├── subagent/            # 子代理池、任务、事件、执行接口
-│   ├── skill/               # 技能注册表、解析、hooks、渲染
+│   ├── skill/               # 技能注册表、解析、渲染
 │   ├── plugin/              # 原生 .so 插件加载（实验性）
 │   ├── claudeplugin/        # Claude 插件发现与解析
 │   ├── mcp/                 # MCP 客户端与配置加载

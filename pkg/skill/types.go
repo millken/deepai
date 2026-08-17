@@ -28,9 +28,6 @@ type Frontmatter struct {
 	AllowedTools           StringList `yaml:"allowed-tools"`
 	Model                  string     `yaml:"model"`
 	Effort                 string     `yaml:"effort"`
-	Context                string     `yaml:"context"` // "" | "fork"
-	Agent                  string     `yaml:"agent"`
-	Hooks                  []Hook     `yaml:"hooks"`
 	Paths                  StringList `yaml:"paths"`
 	Shell                  string     `yaml:"shell"`
 
@@ -60,22 +57,6 @@ func (s *Skill) DisplayName() string {
 	}
 	return s.Dir
 }
-
-// Hook defines a skill-scoped hook.
-type Hook struct {
-	Event   string          `yaml:"event"` // PreToolUse, PostToolUse, etc.
-	Command string          `yaml:"command"`
-	OnError HookErrorPolicy `yaml:"on_error,omitempty"`
-	Timeout time.Duration   `yaml:"timeout,omitempty"`
-}
-
-// HookErrorPolicy controls behavior when a hook command fails.
-type HookErrorPolicy string
-
-const (
-	HookErrorContinue HookErrorPolicy = "continue" // log error, continue execution
-	HookErrorAbort    HookErrorPolicy = "abort"    // abort skill execution
-)
 
 // DynamicInjection represents a parsed !`command` block.
 type DynamicInjection struct {

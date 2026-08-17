@@ -2,7 +2,6 @@ package skill
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,14 @@ import (
 // ---------------------------------------------------------------------------
 // Execute: basic flows
 // ---------------------------------------------------------------------------
+
+func createSkillDirFull(t *testing.T, dir, content string) {
+	t.Helper()
+	os.MkdirAll(dir, 0755)
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestExecute_NotFound(t *testing.T) {
 	reg := NewRegistry()
@@ -118,130 +125,6 @@ func TestExecute_BuildConfig(t *testing.T) {
 	}
 	if cfg.Temperature == nil || *cfg.Temperature != 0.7 {
 		t.Errorf("Temperature = %v, want 0.7", cfg.Temperature)
-	}
-	if cfg.RunInSubagent {
-		t.Error("RunInSubagent should be false for non-fork skill")
-	}
-}
-
-func TestExecute_ForkSkill_BuildsSubagentConfig(t *testing.T) {
-	dir := t.TempDir()
-	createSkillDirFull(t, filepath.Join(dir, "fork-skill"),
-		"---\nname: fork-skill\ndescription: Fork\ncontext: fork\nagent: Explore\n---\n\nBody.\n")
-
-	reg := NewRegistry()
-	reg.LoadFromDir(dir)
-
-	mockRunner := &mockSubagentRunner{result: &SubagentResult{Output: "done"}}
-	exec := NewExecutor(reg).WithSubagentRunner(mockRunner)
-
-	cfg, err := exec.Execute(context.Background(), "fork-skill", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !cfg.RunInSubagent {
-		t.Error("RunInSubagent should be true for fork skill")
-	}
-	if cfg.AgentType != "Explore" {
-		t.Errorf("AgentType = %q, want %q", cfg.AgentType, "Explore")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// PreRun hooks
-// ---------------------------------------------------------------------------
-
-func TestExecute_PreRunAbort(t *testing.T) {
-	dir := t.TempDir()
-	createSkillDirFull(t, filepath.Join(dir, "abort-skill"),
-		"---\nname: abort-skill\ndescription: Abort test\nhooks:\n"+
-			"  - event: PreRun\n    command: 'false'\n    on_error: abort\n---\n\nBody.\n")
-
-	reg := NewRegistry()
-	reg.LoadFromDir(dir)
-
-	hr := NewHookRunner()
-	exec := NewExecutor(reg).WithHookRunner(hr)
-
-	_, err := exec.Execute(context.Background(), "abort-skill", "args")
-	if err == nil {
-		t.Fatal("expected error from aborted pre-run hook")
-	}
-	if !strings.Contains(err.Error(), "aborted by pre-run hook") {
-		t.Errorf("wrong error: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// PostRun hooks
-// ---------------------------------------------------------------------------
-
-func TestExecuteAndRun_PostRunOnSuccess(t *testing.T) {
-	dir := t.TempDir()
-	createSkillDirFull(t, filepath.Join(dir, "hook-skill"),
-		"---\nname: hook-skill\ndescription: Hook test\nhooks:\n"+
-			"  - event: PostRun\n    command: 'echo post-done'\n---\n\nBody.\n")
-
-	reg := NewRegistry()
-	reg.LoadFromDir(dir)
-
-	hr := NewHookRunner()
-	exec := NewExecutor(reg).WithHookRunner(hr)
-
-	var ran bool
-	err := exec.ExecuteAndRun(context.Background(), "hook-skill", "", func(ctx context.Context, cfg *AgentConfig) error {
-		ran = true
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ran {
-		t.Error("runFn should have been called")
-	}
-}
-
-func TestExecuteAndRun_PostRunOnError(t *testing.T) {
-	dir := t.TempDir()
-	createSkillDirFull(t, filepath.Join(dir, "hook-skill"),
-		"---\nname: hook-skill\ndescription: Hook test\nhooks:\n"+
-			"  - event: PostRun\n    command: 'echo post-called'\n---\n\nBody.\n")
-
-	reg := NewRegistry()
-	reg.LoadFromDir(dir)
-
-	hr := NewHookRunner()
-	exec := NewExecutor(reg).WithHookRunner(hr)
-
-	runErr := errors.New("run failed")
-	err := exec.ExecuteAndRun(context.Background(), "hook-skill", "", func(ctx context.Context, cfg *AgentConfig) error {
-		return runErr
-	})
-	if err != runErr {
-		t.Errorf("should return runFn error, got: %v", err)
-	}
-	// PostRun hook should still have executed (not panicking)
-}
-
-func TestExecuteFork_PostRunFires(t *testing.T) {
-	dir := t.TempDir()
-	createSkillDirFull(t, filepath.Join(dir, "fork-skill"),
-		"---\nname: fork-skill\ndescription: Fork\ncontext: fork\nagent: Explore\nhooks:\n"+
-			"  - event: PostRun\n    command: 'echo fork-done'\n---\n\nBody.\n")
-
-	reg := NewRegistry()
-	reg.LoadFromDir(dir)
-
-	mockRunner := &mockSubagentRunner{result: &SubagentResult{Output: "result"}}
-	hr := NewHookRunner()
-	exec := NewExecutor(reg).WithSubagentRunner(mockRunner).WithHookRunner(hr)
-
-	result, err := exec.ExecuteFork(context.Background(), "fork-skill", "args")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.Output != "result" {
-		t.Errorf("output = %q, want %q", result.Output, "result")
 	}
 }
 

@@ -150,31 +150,6 @@ func TestParseSkill_DescriptionTruncation(t *testing.T) {
 	}
 }
 
-func TestParseSkill_ContextFork(t *testing.T) {
-	dir := t.TempDir()
-	writeSKILL(t, dir, `---
-name: research
-description: Deep research
-context: fork
-agent: Explore
----
-
-Research $ARGUMENTS thoroughly.
-`)
-
-	skill, err := ParseSkill(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if skill.Meta.Context != "fork" {
-		t.Errorf("Context = %q, want %q", skill.Meta.Context, "fork")
-	}
-	if skill.Meta.Agent != "Explore" {
-		t.Errorf("Agent = %q, want %q", skill.Meta.Agent, "Explore")
-	}
-}
-
 func TestParseSkill_InvalidName(t *testing.T) {
 	tests := []struct {
 		name string

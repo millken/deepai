@@ -52,6 +52,19 @@ func toolMessageContent(result models.ToolResult) string {
 	return s
 }
 
+// appendToolResultMessage appends a tool result message to runMessages.
+// Returns the new slice (append may reallocate).
+func appendToolResultMessage(runMessages []models.Message, sessionID string, result models.ToolResult) []models.Message {
+	return append(runMessages, models.Message{
+		ID:         newMessageID("tool"),
+		SessionID:  sessionID,
+		Role:       models.RoleTool,
+		Content:    toolMessageContent(result),
+		ToolResult: &result,
+		CreatedAt:  time.Now().UTC(),
+	})
+}
+
 // offloadIfNeeded checks if a tool result exceeds the offload threshold.
 // If so, it writes the full content to a file under offloadDir and replaces
 // result.Content with a compact reference (path + first/last 50 lines).
