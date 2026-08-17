@@ -54,12 +54,6 @@ func (r *Registry) WithRefreshInterval(d time.Duration) *Registry {
 	return r
 }
 
-// WithNestedExpiry sets the nested discovery cache TTL.
-func (r *Registry) WithNestedExpiry(d time.Duration) *Registry {
-	r.nestedExpiry = d
-	return r
-}
-
 // ---------------------------------------------------------------------------
 // Feature 1: Description Refresh
 // ---------------------------------------------------------------------------

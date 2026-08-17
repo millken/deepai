@@ -38,18 +38,6 @@ type Session struct {
 	UpdatedAt time.Time         `json:"updated_at,omitempty"`
 }
 
-// NewSession constructs a new active session with initialized timestamps.
-func NewSession(id, userID string) Session {
-	now := time.Now().UTC()
-	return Session{
-		ID:        strings.TrimSpace(id),
-		UserID:    strings.TrimSpace(userID),
-		State:     SessionStateActive,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
-
 // Validate checks whether the session and all nested messages are valid.
 func (s Session) Validate() error {
 	if strings.TrimSpace(s.ID) == "" {

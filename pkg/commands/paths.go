@@ -36,11 +36,6 @@ func EnvFile() string {
 	return filepath.Join(Home(), ".env")
 }
 
-// SessionsDir returns the path to the sessions directory.
-func SessionsDir() string {
-	return filepath.Join(Home(), "sessions")
-}
-
 // SandboxDir returns the path to the sandbox session root (~/.deepai/sandbox).
 // Sandbox session directories are created here — outside the user's working
 // directory — so cleanup on exit can never touch project files.
@@ -56,23 +51,6 @@ func DBFile() string {
 // InputHistoryFile returns the path to the CLI input history file.
 func InputHistoryFile() string {
 	return filepath.Join(Home(), "input_history")
-}
-
-// LogsDir returns the path to the logs directory.
-func LogsDir() string {
-	return filepath.Join(Home(), "logs")
-}
-
-// MemoriesDir returns the path to the memories directory.
-func MemoriesDir() string {
-	return filepath.Join(Home(), "memories")
-}
-
-// OffloadDir returns the path to the offload directory (~/.deepai/offload).
-// Large tool results (>24KB) are written here so the full content is
-// recoverable while only a summary stays in the context window.
-func OffloadDir() string {
-	return filepath.Join(Home(), "offload")
 }
 
 // GlobalInstructions returns the path to the global DEEPAI.md.

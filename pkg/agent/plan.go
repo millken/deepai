@@ -78,11 +78,6 @@ func (a *Agent) IsPlanMode() bool {
 	return a.planMode.Load()
 }
 
-// PlanFile returns the path to the current plan file, or "" if not in plan mode.
-func (a *Agent) PlanFile() string {
-	return a.planFile
-}
-
 // initPlanFile creates the plan file path under .deepai/plans/.
 func (a *Agent) initPlanFile() {
 	dir := a.workDir

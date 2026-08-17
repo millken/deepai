@@ -269,14 +269,6 @@ func resolveAgentTypeConfigResolved(t AgentType, workDir string, pluginAgentDirs
 	return BuiltinAgentTypes[AgentTypeGeneral], problems, false
 }
 
-// loadAgentMDFile parses an agent .md if it exists; returns nil for missing or
-// unparseable. Use loadAgentMDFileReported to distinguish "missing" from
-// "unparseable".
-func loadAgentMDFile(path string) *AgentTypeConfig {
-	cfg, _ := loadAgentMDFileReported(path)
-	return cfg
-}
-
 // loadAgentMDFileReported parses an agent .md if it exists. Returns (nil, nil)
 // when the file does not exist (not an error — a source simply isn't present);
 // returns (nil, err) when the file exists but fails to parse.

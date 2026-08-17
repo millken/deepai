@@ -866,34 +866,6 @@ func firstNonEmptyString(values ...string) string {
 	return ""
 }
 
-func extractReadableContent(pageURL, body string, maxChars int) string {
-	title := ""
-	if match := titleTagRE.FindStringSubmatch(body); len(match) >= 2 {
-		title = cleanHTMLText(match[1])
-	}
-
-	text := markdownifyReadableHTML(pageURL, extractPrimaryContent(body))
-
-	var b strings.Builder
-	if title != "" {
-		b.WriteString("# ")
-		b.WriteString(title)
-		b.WriteString("\n\n")
-	}
-	b.WriteString("Source: ")
-	b.WriteString(pageURL)
-	if text != "" {
-		b.WriteString("\n\n")
-		b.WriteString(text)
-	}
-
-	content := strings.TrimSpace(b.String())
-	if maxChars > 0 && len(content) > maxChars {
-		content = strings.TrimSpace(string([]rune(content)[:min(maxChars, len([]rune(content)))]))
-	}
-	return content
-}
-
 func extractWithReadability(htmlContent string) (title, text string) {
 	article, err := readability.FromReader(strings.NewReader(htmlContent), nil)
 	if err != nil {

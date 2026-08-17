@@ -39,16 +39,3 @@ func newHTTPClient() *http.Client {
 		},
 	}
 }
-
-func maskKey(key string) string {
-	if key == "" {
-		return "(empty)"
-	}
-	if len(key) <= 2 {
-		return key + "****"
-	}
-	if len(key) <= 8 {
-		return key[:2] + "****"
-	}
-	return key[:3] + "****" + key[len(key)-4:]
-}

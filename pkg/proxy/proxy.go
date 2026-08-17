@@ -137,11 +137,6 @@ func (p *Proxy) getStore() EventStore {
 	return p.store
 }
 
-// Handler returns the http.Handler for embedding in another server.
-func (p *Proxy) Handler() http.Handler {
-	return p.routes()
-}
-
 // ListenAndServe starts the proxy server.
 func (p *Proxy) ListenAndServe() error {
 	if p == nil || p.httpServer == nil {

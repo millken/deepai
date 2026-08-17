@@ -192,23 +192,6 @@ func confineToRoot(root, suffix string) string {
 	return joined
 }
 
-func ResolveVirtualCommand(ctx context.Context, cmd string) string {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return cmd
-	}
-	if !strings.Contains(cmd, "/mnt/user-data/") && !strings.Contains(cmd, acpWorkspaceVirtualPath) {
-		return cmd
-	}
-	if root := threadDataRootFromThreadID(ThreadIDFromContext(ctx)); root != "" {
-		cmd = strings.ReplaceAll(cmd, "/mnt/user-data/", root+"/")
-	}
-	if acpRoot, err := ACPWorkspaceDir(ThreadIDFromContext(ctx)); err == nil {
-		cmd = strings.ReplaceAll(cmd, acpWorkspaceVirtualPath, acpRoot)
-	}
-	return cmd
-}
-
 func threadDataRootFromThreadID(threadID string) string {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {

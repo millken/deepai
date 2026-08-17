@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -87,22 +86,6 @@ func NewProvider(name string) LLMProvider {
 		return &UnavailableProvider{err: fmt.Errorf("init provider %q: %w", name, err)}
 	}
 	return p
-}
-
-// NewProviderFromConfig creates a provider using explicit config values.
-// Falls back to env vars for any field not provided.
-func NewProviderFromConfig(name string, cfg ProviderConfig) (LLMProvider, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	rc, err := resolveConfig(name, cfg)
-	if err != nil {
-		return nil, err
-	}
-	slog.Debug("provider config resolved",
-		"provider", name,
-		"api_key", maskKey(rc.apiKey),
-		"base_url", rc.baseURL,
-	)
-	return buildProvider(name, rc)
 }
 
 func buildProvider(name string, cfg resolvedConfig) (LLMProvider, error) {

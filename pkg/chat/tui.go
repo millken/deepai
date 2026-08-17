@@ -1192,41 +1192,6 @@ func (m *tuiModel) updateSubagentLine(taskID, line string) {
 	}
 }
 
-// setSubagentLine appends a new live status line for taskID, or updates it
-// in place if taskID already has an entry (order-preserving).
-func (m *tuiModel) setSubagentLine(taskID, line string) {
-	for i := range m.subagentTasks {
-		if m.subagentTasks[i].taskID == taskID {
-			m.subagentTasks[i].line = line
-			return
-		}
-	}
-	// New task: record start time and extract description from line
-	desc := line
-	if idx := strings.Index(line, "[subagent]"); idx >= 0 {
-		// Extract description after "[subagent] " prefix
-		desc = strings.TrimSpace(line[idx+len("[subagent]"):])
-	}
-	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{
-		taskID:      taskID,
-		line:        line,
-		description: desc,
-		startedAt:   time.Now(),
-		spinnerIdx:  len(m.subagentTasks) % 4, // Distribute spinner phases
-	})
-}
-
-// clearSubagentLine removes the live status line for taskID, if present,
-// leaving every other task's line untouched.
-func (m *tuiModel) clearSubagentLine(taskID string) {
-	for i := range m.subagentTasks {
-		if m.subagentTasks[i].taskID == taskID {
-			m.subagentTasks = append(m.subagentTasks[:i], m.subagentTasks[i+1:]...)
-			return
-		}
-	}
-}
-
 // commitWithFlush commits the trailing assistant partial (if any) before the
 // given line, preserving output order.
 func (m *tuiModel) commitWithFlush(line string) tea.Cmd {
