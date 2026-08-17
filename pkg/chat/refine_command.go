@@ -283,6 +283,13 @@ func (r *ChatRepl) runManualRefine(ctx context.Context) {
 			r.ui.Info(fmt.Sprintf("  %s scope: failed: %v", scope.label, err))
 		case !saved:
 			r.ui.Info(fmt.Sprintf("  %s scope: nothing new to remember", scope.label))
+		case record.ID == "":
+			// A write with no record: the merge moved no fact, only the
+			// User/History narrative, so RefineAndRecord deliberately recorded
+			// nothing a rollback could restore. Summarizing the zero record here
+			// would claim "+0 ~0 -0" against an empty id while something did in
+			// fact change.
+			r.ui.Info(fmt.Sprintf("  %s scope: context updated, no fact changes", scope.label))
 		default:
 			added, updated, removed := record.Summary()
 			r.ui.Info(fmt.Sprintf("  %s scope: +%d ~%d -%d  (%s)", scope.label, added, updated, removed, record.ID))
