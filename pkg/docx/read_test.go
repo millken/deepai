@@ -357,17 +357,115 @@ func TestRead_OversizedParagraphStillAdvances(t *testing.T) {
 	}
 }
 
-func TestRead_FullRefusesWhenOverBudget(t *testing.T) {
+// TestRead_FullOverBudgetFallsBackToChunk pins the 2026-08-19 contract change
+// recorded in docs/DOCX_TOOLS_DESIGN.md §5: a Full read that does not fit
+// the budget used to return a hard error pointing the model at outline +
+// start_para/end_para. In practice that trained the model to abandon
+// docx_read entirely and fall back to a bash + python script — the exact
+// failure mode the docx tools exist to prevent — because from the model's
+// side "the tool refused" looked like a dead end, not "there is more to
+// read". A first chunk plus a Notes entry plus a non-zero next_start_para is
+// the identical cursor contract a non-Full call already uses, so falling
+// back degrades no differently than an ordinary chunked read would; it is
+// not the kind of silent truncation §5.1 exists to prevent.
+func TestRead_FullOverBudgetFallsBackToChunk(t *testing.T) {
 	d, err := OpenDocument(outlineFixture)
 	if err != nil {
 		t.Fatalf("OpenDocument: %v", err)
 	}
-	_, err = d.Read(ReadOptions{Full: true, MaxChars: 100})
-	if err == nil {
-		t.Fatal("Full read over budget returned nil error, want a refusal")
+	const budget = 100
+	r, err := d.Read(ReadOptions{Full: true, MaxChars: budget})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	if !strings.Contains(err.Error(), "outline") {
-		t.Errorf("error = %q, want it to point the caller at outline + range", err)
+	if r.Markdown == "" {
+		t.Fatal("Markdown is empty, want the first in-budget chunk")
+	}
+	if len(r.Markdown) > budget {
+		t.Errorf("Markdown is %d chars, want it within the %d-char budget", len(r.Markdown), budget)
+	}
+	if r.NextStartPara <= 0 {
+		t.Errorf("NextStartPara = %d, want > 0 (more to read)", r.NextStartPara)
+	}
+
+	var found bool
+	for _, n := range r.Notes {
+		if strings.Contains(n, "full read") && strings.Contains(n, "over the") && strings.Contains(n, "next_start_para") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Notes = %v, want a note naming the over-budget size and next_start_para as the continuation", r.Notes)
+	}
+
+	// Full's degrade path must produce the exact same chunk a non-Full call
+	// at the same budget would — the only difference is the extra note.
+	chunked, err := d.Read(ReadOptions{MaxChars: budget})
+	if err != nil {
+		t.Fatalf("Read (chunked): %v", err)
+	}
+	if r.Markdown != chunked.Markdown {
+		t.Errorf("Full-degraded Markdown = %q, want it to match the chunked path's %q", r.Markdown, chunked.Markdown)
+	}
+	if r.NextStartPara != chunked.NextStartPara {
+		t.Errorf("Full-degraded NextStartPara = %d, want it to match the chunked path's %d", r.NextStartPara, chunked.NextStartPara)
+	}
+	if len(r.Notes) != len(chunked.Notes)+1 {
+		t.Errorf("Full-degraded Notes has %d entries, want exactly one more than the chunked path's %d", len(r.Notes), len(chunked.Notes))
+	}
+}
+
+// TestRead_FullOverBudgetSingleOversizedParagraphHasNoDanglingCursor is a
+// regression test for a bug caught in independent review of
+// TestRead_FullOverBudgetFallsBackToChunk's fix: a ONE-paragraph document
+// whose single paragraph alone renders bigger than budget hits
+// readChunkedResult's "this one paragraph alone is over budget, return it
+// whole" exception, which — because there is nothing after it — reports
+// NextStartPara 0, exactly like a fully-satisfied read. The Full branch's
+// pre-check had already decided the range was over budget (totalLen >
+// budget), so an earlier version of the fallback unconditionally appended
+// "returning the first chunk — continue with start_para=next_start_para".
+// With NextStartPara 0, "start_para=next_start_para" resolves through
+// resolveReadRange as start_para=0, i.e. "from the start" — the exact same
+// call, forever: an unbounded re-read loop that never terminates and never
+// tells the caller so. The fix only appends that note when
+// result.NextStartPara != 0; this pins the NextStartPara == 0 case getting
+// no such note (readChunkedResult's own per-paragraph overage note already
+// says everything there is to say).
+func TestRead_FullOverBudgetSingleOversizedParagraphHasNoDanglingCursor(t *testing.T) {
+	const budget = 100
+	d := bodyDoc(t, `<w:p><w:r><w:t>`+strings.Repeat("word ", 4000)+`</w:t></w:r></w:p>`)
+
+	r, err := d.Read(ReadOptions{Full: true, MaxChars: budget})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(r.Markdown) <= budget {
+		t.Fatalf("test premise stale: the single paragraph is only %d chars, want it bigger than the %d-char budget", len(r.Markdown), budget)
+	}
+	if r.NextStartPara != 0 {
+		t.Fatalf("NextStartPara = %d, want 0 (nothing follows the document's only paragraph)", r.NextStartPara)
+	}
+
+	for _, n := range r.Notes {
+		if strings.Contains(n, "start_para=next_start_para") {
+			t.Errorf("Notes = %v, want no note telling the caller to resume at start_para=next_start_para — "+
+				"next_start_para is 0 here, so that would resolve to start_para=0 (\"from the start\") and loop forever",
+				r.Notes)
+		}
+	}
+	// readChunkedResult's own oversized-paragraph note must still be present
+	// (see TestRead_OversizedParagraphStillAdvances), so the caller is told
+	// SOMETHING about the overage even without the redundant Full-specific
+	// note.
+	found := false
+	for _, n := range r.Notes {
+		if strings.HasPrefix(n, OversizedParagraphNotePrefix) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Notes = %v, want the oversized-paragraph note explaining the overage", r.Notes)
 	}
 }
 
@@ -835,7 +933,7 @@ func TestRead_TableStructureNoteIsAppended(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage gap: Full's happy path (only its over-budget refusal had a test).
+// Coverage gap: Full's happy path (only its over-budget fallback had a test).
 // ---------------------------------------------------------------------------
 
 // TestRead_FullReturnsWholeRangeWithinBudget pins what only Full can do:
@@ -856,10 +954,16 @@ func TestRead_TableStructureNoteIsAppended(t *testing.T) {
 // same MaxChars returns everything in one call under exactly that same
 // condition, producing identical Markdown/Paras/NextStartPara.
 //
-// Full's only DISTINCT behaviour is refusing rather than chunking when the
-// range is over budget, and that is pinned by
-// TestRead_FullRefusesWhenOverBudget. An earlier version of this test
-// asserted cap(r.Paras) to discriminate the branch (Full pre-sizes its
+// Full's only DISTINCT behaviour (as of the 2026-08-19 contract change) is
+// what happens when the range is over budget: it degrades to the same first
+// chunk a non-Full call would return, PLUS an explanatory Notes entry,
+// instead of refusing outright — pinned by
+// TestRead_FullOverBudgetFallsBackToChunk. At the tool layer, Full also
+// skips the outline-instead-of-body default that a bodyless, rangeless call
+// gets above docx.DocxOutlineParaThreshold paragraphs (see
+// shouldReturnOutline in pkg/tools/builtin/docx.go) — but that distinction
+// lives above this package, not in Read itself. An earlier version of this
+// test asserted cap(r.Paras) to discriminate the branch (Full pre-sizes its
 // slice, the chunked path appends). That was removed: slice capacity is an
 // implementation detail, so the assertion would break on a harmless
 // refactor while proving nothing about behaviour. A test that pins an

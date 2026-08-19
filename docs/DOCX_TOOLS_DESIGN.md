@@ -117,7 +117,8 @@ func DocxReadTool() models.Tool {
         ParallelSafe: true,
         Description: "Read a .docx as structured content. By default returns an outline " +
             "(heading tree + per-section paragraph count + word count). Pass heading or " +
-            "start_para/end_para for a specific section/range; full=true for the whole body as markdown.",
+            "start_para/end_para for a specific section/range; full=true to try for the whole " +
+            "body in one call — falls back to a chunked read when it does not fit, see below.",
         InputSchema: map[string]any{
             "type": "object",
             "properties": map[string]any{
@@ -125,7 +126,7 @@ func DocxReadTool() models.Tool {
                 "heading":    map[string]any{"type": "string", "description": "Restrict to a named heading section"},
                 "start_para": map[string]any{"type": "number", "description": "1-based inclusive paragraph index"},
                 "end_para":   map[string]any{"type": "number", "description": "1-based inclusive paragraph index"},
-                "full":       map[string]any{"type": "boolean", "description": "Return entire body as markdown (rejected when the body exceeds the chunk budget — read section by section instead)"},
+                "full":       map[string]any{"type": "boolean", "description": "Return the whole body in one call when it fits the budget; a larger body falls back to a chunked read (walk next_start_para) with an explanatory note"},
                 "runs":       map[string]any{"type": "boolean", "description": "Include per-run breakdown (run_index + text) for format-preserving edits"},
                 "max_chars":  map[string]any{"type": "number", "description": "Hard cap on returned body text; the range is cut at a paragraph boundary and next_start_para is returned for the next call"},
             },
@@ -152,7 +153,7 @@ func DocxReadTool() models.Tool {
 
 - **outline（默认，段落数 > 阈值时）**：标题树 + 每节段落数 / 字数。
 - **range / heading**：所选段落的 markdown，每段带 `para_index`（供 `docx_edit` 引用）；`runs=true` 时额外给出每段的 run 列表与 `run_index`。
-- **full**：整篇 markdown。**仅在正文小于分块预算时可用**——超出时直接报错并提示改用 outline + range，见 §5。
+- **full**：整篇 markdown。分块预算默认是 `DefaultReadBudget`（8192 字符，pkg/docx 内部默认，`full` 与否一样）；`docx_read` 工具层（`DocxReadHandler`）额外把 `full=true` 且未显式给 `max_chars` 时的起始预算提到 `fullReadInitialBudget`（16384 字符，见 §5），让中等大小的文档也能一次拿全。正文放得下这个预算时一次性整篇返回；**超出时不再报错**，退化为普通分块读——返回第一块，`next_start_para` 指向续读点，并在 `notes` 里说明超了多少、如何续读，见 §5（2026-08-19 更正）。
 
 每次返回都附带游标字段：`next_start_para`（若本次因 `max_chars` 截断则给出下一段索引，否则为 null）与 `total_paras`。分块由**工具侧确定性地切**，不要让 LLM 自己估算长度。
 
@@ -372,7 +373,17 @@ for _, tool := range builtin.DocxTools() {
 
    后果是：`docx_read(full)` 在大文档上**不会报错**，中间几百段被替换成一行省略标记，模型多半会照常继续润色它"看得见"的那部分。这是本设计里最危险的静默失败面。
 
-   → **`docx_read` 必须在构造上保证单次返回远低于 24KB**（建议正文预算 8KB，给 JSON 结构、run 明细、元数据留足余量）。`full=true` 在超预算时**直接报错**，不许降级返回。
+   → **`docx_read` 必须在构造上保证单次返回远低于 24KB**：默认分块预算是 8KB（`DefaultReadBudget`，给 JSON 结构、run 明细、元数据留足余量）；`full=true` 在工具层把起始预算提到 16KB（`fullReadInitialBudget`，仅未显式给 `max_chars` 时生效），`fitDocxReadResult` 仍以 20KB 的 JSON 硬上限兜底（见下方 2026-08-19 更正里的按比例回退）。
+
+   > **`full=true` 超预算的处理方式已更正（2026-08-19 用户实测）。** 最初的设计是"直接报错，不许降级返回"：让模型读一份 476 段的 .docx、调 `docx_read(full=true)`，超预算就报一句 Go 视角的错误（"read the outline (Document.Outline) and fetch a StartPara/EndPara range or Heading section instead"），逼它重新发起一次 outline/range 调用。实测结果是模型**没有重试**，而是放弃整个工具、退回 bash + python-docx 解析——这正是 §5 存在的全部理由要防止的路径，当时的"报错更安全"判断是错的。
+   >
+   > 复盘发现，当初的推理把这条硬约束防的两件事混为一谈了：本条 §5.1 真正要防的是**"harness 在模型无感知的情况下把结果中段替换成省略标记"**——即 24KB offload 那种静默丢内容。而"分块返回第一块 + 在 `notes` 里显式说明超了多少 + 非零 `next_start_para` 游标"，是模型**已经在正常分块读里天天走**的同一套契约，只是这次由 `full=true` 触发而非由默认路径触发——它不构成"模型无感知丢内容"，因为游标本身就是显式、可续读的信号。硬报错反而是把一个"正常继续读下一块"的场景，包装成了"这条路走不通"，这才是训练模型绕开工具的根源。
+   >
+   > 因此改为：`full=true` 超预算时不再报错，退化为普通分块——返回第一块，`next_start_para` 指向续读点，`notes` 里追加一条工具视角（而非 `Document.Outline`/`StartPara`/`EndPara` 这类 Go 标识符）的说明，措辞给出可直接行动的下一步，如 "full read: paragraphs 1-476 render to 48444 chars, over the 16384-char max_chars budget; returning the first chunk — continue with start_para=next_start_para (and this call's range_end as end_para)"。同时把 `DocxReadHandler` 里 `full=true` 且未显式给 `max_chars` 时的初始预算从 8192 提到 16384（常量 `fullReadInitialBudget`）。
+   >
+   > **这个提升起初没有兑现（同一天独立评审再次实测发现）。** `fitDocxReadResult` 原本靠对半砍预算重试来兜底 20KB 的 JSON 硬上限：在同一份 476 段、渲染出 48444 字符的文档上，`full=true` 对半砍一次就落回约 8192 字符——和 `full=false` 默认分块用的预算一样——所以起始预算提到 16384 完全没有换来更少的游标走读，`full=true` 和 `full=false` 都是 6 次。原因是这层 JSON 包装（`paragraphs` 索引、字符串转义、`notes`）会把字符预算按大致固定比例放大，对半砍不会跟着这个放大比例走，砍一次就直接砍穿了 16384 带来的余量。
+   >
+   > 修法：把对半砍换成**按实际观测到的超出比例回退**——`budget = budget * maxDocxResultBytes / len(payload) * 9 / 10`（`len(payload)` 就是这次调用 JSON 膨胀比例的实测值，再留 10% 余量）。同一份 476 段/48444 字符文档上实测：`full=true` 降到 **4 次**游标走读（见 `pkg/tools/builtin/docx_test.go` 的 `TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips`，该测试把这个数字钉死，防止它悄悄漂移）。
 
    附带记住这三层护栏的**触发顺序**，调试"内容去哪了"时需要：**(1) offload（24KB，`toolexec.go:320`）→ (2) 存入消息时 50KB 硬截断（`maxToolContentBytes = 50_000`，`toolMessageContent`，`toolexec.go:44-53`）→ (3) 发请求时的 aging 视图（`react.go:498`）**。第 (2) 层是 offload 失效（取不到 home 目录）时的兜底，同样带 `[truncated: N bytes total]` 标记。这与 `aging.go:19-22` 的 Layering note 一致。
 
@@ -382,7 +393,9 @@ for _, tool := range builtin.DocxTools() {
 
 3. **老化压缩（aging）—— 默认关闭，属于可选增强**。`buildPromptView` 按"年龄"压缩历史工具结果：不在 `defaultToolBudgetsByTool`（`pkg/agent/aging.go:23-31`）里的工具走 `default` 行 —— age 1 保 4096 字节、age 2 保 1024、age ≥3 只剩 300 字节。但 `cfg.Aging` **仅当 `DEEPAI_TOKEN_AGING` 为真值时才被构造**（`applyTokenEfficiencyDefaults`，`pkg/agent/config_env.go:52-68`，注释明写 "A no-op unless the env vars are truthy, so default behavior is unchanged"；也可由 config.yaml 的 `token_aging: true` 经 `setup.go:59-63` 桥接），且还要上下文压力超过 `defaultMinContextPressure = 0.4` 才生效。
 
-   → 因此这条**不能作为设计前提**，但**开启时会显著加重**约束 2 的效果。应对动作：把 `docx_read` 加进 `defaultToolBudgetsByTool`，给 `read_file` 同级或更高的预算（`{1: 8192, 2: 2048, 3: 300}`），这样用户打开 aging 时分块流程不会退化。
+   → 因此这条**不能作为设计前提**，但**开启时会显著加重**约束 2 的效果。应对动作：把 `docx_read` 加进 `defaultToolBudgetsByTool`，给 `read_file` 同级或更高的预算，这样用户打开 aging 时分块流程不会退化。
+   >
+   > **age-1 预算已从 `{1: 8192, ...}` 提到 `{1: 20480, ...}`（2026-08-19 更正）**：`full=true` 的降级修复（本节前文）让一次成功的 `docx_read` 结果可以合法地大到 `pkg/tools/builtin.maxDocxResultBytes`（20KB，`fitDocxReadResult` 自身的硬上限），而不再只是 `read_file` 那种几 KB 量级。如果 age-1 仍按 8192 字节裁剪，下一轮就会把模型刚花一次整篇调用换来的内容砍掉近一半——正好抵消提高 `fullReadInitialBudget` 的意义。所以 `docx_read` 现在的预算是 `{1: 20480, 2: 2048, 3: 300}`，与 `maxDocxResultBytes` 保持数值对齐（见 `pkg/agent/aging.go` 里 `docx_read` 那一行的注释）。
 
 > 三条叠加后的设计底线只有一句：**永远不要让任何一次 `docx_read` 的结果承担"跨多轮存活"的职责**。分块循环（§5.3）用完即弃，正是唯一同时满足这三条的形态。
 

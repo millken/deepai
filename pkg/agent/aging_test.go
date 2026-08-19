@@ -289,6 +289,12 @@ func TestToolResultBudget_PerToolDifferentiation(t *testing.T) {
 		{"write_file", 1, 300},
 		{"grep", 1, 4096},
 		{"web_fetch", 1, 8192},
+		// docx_read's age-1 budget is pkg/tools/builtin.maxDocxResultBytes
+		// (20 KB), not read_file's 8192 — see the map's own comment: since
+		// the 2026-08-19 full=true fallback fix, a successful docx_read
+		// result can legitimately be that large, and clipping it to 8192 on
+		// the very next turn would defeat the point of that fix.
+		{"docx_read", 1, 20480},
 		// Age progression for bash
 		{"bash", 2, 1024},
 		{"bash", 3, 300},

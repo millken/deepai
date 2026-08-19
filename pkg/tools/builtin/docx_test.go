@@ -161,8 +161,16 @@ func TestDocxRead_RunsIncludedOnlyWhenRequested(t *testing.T) {
 // only way to pin it.
 func TestDocxRead_FitResultShrinksUntilItFits(t *testing.T) {
 	var budgets []int
-	// Each call returns a payload proportional to the budget, so the loop has
-	// to halve twice before it fits.
+	// Each call returns a payload 6x the budget (a stand-in for this tool's
+	// JSON inflation ratio). At budget=8192 that is 49152 bytes, over the
+	// 20480-byte cap; the proportional rescale (budget*cap/len(payload)*9/10)
+	// converges in exactly one step for this stub: 8192*20480/49152*9/10 =
+	// 3072, and 3072*6=18432 fits under the cap on the very next attempt.
+	// Pinning the exact count (2, not "at least 2") is what would have
+	// caught this test's own bug when the rescale replaced a plain halving
+	// (that halving needed a second shrink to converge for this same stub;
+	// see the independent 2026-08-19 review that caught the stale comment
+	// this replaces).
 	read := func(budget int) (docxReadOutput, error) {
 		budgets = append(budgets, budget)
 		return docxReadOutput{Markdown: strings.Repeat("x", budget*6)}, nil
@@ -174,8 +182,9 @@ func TestDocxRead_FitResultShrinksUntilItFits(t *testing.T) {
 	if len(payload) > maxDocxResultBytes {
 		t.Fatalf("payload is %d bytes, over the %d cap", len(payload), maxDocxResultBytes)
 	}
-	if len(budgets) < 2 {
-		t.Fatalf("budgets tried = %v, want the loop to shrink at least once", budgets)
+	const wantAttempts = 2
+	if len(budgets) != wantAttempts {
+		t.Fatalf("budgets tried = %v (%d attempts), want exactly %d", budgets, len(budgets), wantAttempts)
 	}
 	for i := 1; i < len(budgets); i++ {
 		if budgets[i] >= budgets[i-1] {
@@ -237,7 +246,12 @@ func TestDocxRead_FitResultGivesUpRatherThanTruncating(t *testing.T) {
 // when runs was true, point at the one lever that actually shrinks the
 // payload.
 func TestDocxRead_FitResultErrorCarriesDiagnostic(t *testing.T) {
-	const diagnostic = "paragraph 7 is 99999 rendered chars, exceeding the 4096-char MaxChars budget; returned whole so the read cursor still advances"
+	// Built from docx.OversizedParagraphNotePrefix, the same constant
+	// hasOversizedParagraphNote matches against, rather than a hand-copied
+	// literal: if pkg/docx ever rewords this note, this stub (and therefore
+	// this test) must change in lockstep with the matcher, instead of both
+	// silently drifting out of sync with the real note pkg/docx produces.
+	diagnostic := docx.OversizedParagraphNotePrefix + "7 is 99999 rendered chars, exceeding the 4096-char max_chars budget; returned whole so the read cursor still advances"
 	read := func(budget int) (docxReadOutput, error) {
 		return docxReadOutput{
 			Markdown: strings.Repeat("x", maxDocxResultBytes*2),
@@ -254,6 +268,9 @@ func TestDocxRead_FitResultErrorCarriesDiagnostic(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "runs=true") {
 		t.Errorf("error = %q, mentions runs=true when runs was never set", err)
+	}
+	if !strings.Contains(err.Error(), "no max_chars value or narrower range fixes this") {
+		t.Errorf("error = %q, want the oversized-single-paragraph advice (hasOversizedParagraphNote branch)", err)
 	}
 
 	_, err = fitDocxReadResult(read, 8192, true)
@@ -447,6 +464,270 @@ func TestDocxRead_DeclaresPendingRevisions(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(joined), "revision") && !strings.Contains(strings.ToLower(joined), "tracked change") {
 		t.Errorf("notes = %q, want it to declare pending revisions", joined)
+	}
+}
+
+// wordsDocFixture writes a synthetic .docx of n plain paragraphs, each
+// containing w space-separated repetitions of "word", to a fresh file in
+// t.TempDir() via docx.WriteDocx. It exists so full=true's over-budget
+// fallback and the 8192-vs-16384 budget difference (below) can be exercised
+// against a document whose rendered size is under caller control, rather
+// than depending on a committed fixture happening to be the right size.
+func wordsDocFixture(t *testing.T, n, w int) string {
+	t.Helper()
+	var md strings.Builder
+	for i := 0; i < n; i++ {
+		md.WriteString(strings.Repeat("word ", w))
+		md.WriteString("\n\n")
+	}
+	path := filepath.Join(t.TempDir(), "words.docx")
+	if _, err := docx.WriteDocx(path, docx.WriteOptions{Markdown: md.String()}); err != nil {
+		t.Fatalf("WriteDocx: %v", err)
+	}
+	return path
+}
+
+// wholeMarkdownLen opens path and reads its entire rendered body (Full at an
+// effectively unlimited budget), so a test can assert its fixture actually
+// landed in the size bracket it needs instead of silently testing nothing
+// (the same "test premise stale" discipline pkg/docx/read_test.go's
+// TestRead_FullReturnsWholeRangeWithinBudget already follows).
+func wholeMarkdownLen(t *testing.T, path string) int {
+	t.Helper()
+	doc, err := docx.OpenDocument(path)
+	if err != nil {
+		t.Fatalf("OpenDocument: %v", err)
+	}
+	r, err := doc.Read(docx.ReadOptions{Full: true, MaxChars: 1 << 20})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	return len(r.Markdown)
+}
+
+// TestDocxRead_FullOverInitialBudgetFallsBackToChunk pins the handler-layer
+// half of the 2026-08-19 contract change (docs/DOCX_TOOLS_DESIGN.md §5):
+// full=true against a document whose rendered body exceeds
+// fullReadInitialBudget must come back completed — never an error — with
+// next_start_para pointing at the resume point and a note explaining why
+// only the first chunk came back. Before this change, this exact case
+// returned a hard error naming Go-side identifiers (Document.Outline,
+// StartPara/EndPara), which is what pushed a real model to abandon the tool
+// and fall back to a bash + python script instead of retrying with a range.
+func TestDocxRead_FullOverInitialBudgetFallsBackToChunk(t *testing.T) {
+	p := wordsDocFixture(t, 400, 8)
+	if whole := wholeMarkdownLen(t, p); whole <= fullReadInitialBudget {
+		t.Fatalf("test premise stale: whole body is %d chars, want > fullReadInitialBudget (%d)", whole, fullReadInitialBudget)
+	}
+
+	res, err := callDocxRead(t, map[string]any{"path": p, "full": true})
+	if err != nil {
+		t.Fatalf("callDocxRead: %v", err)
+	}
+	if res.Status != models.CallStatusCompleted {
+		t.Errorf("Status = %v, want completed", res.Status)
+	}
+	out := decodeRead(t, res)
+	next, _ := out["next_start_para"].(float64)
+	if next <= 0 {
+		t.Errorf("next_start_para = %v, want > 0 (more of the document to read)", out["next_start_para"])
+	}
+	notes, _ := out["notes"].([]any)
+	found := false
+	for _, n := range notes {
+		if s, ok := n.(string); ok && strings.Contains(s, "full read") && strings.Contains(s, "next_start_para") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want a note explaining the full-read fallback and pointing at next_start_para", notes)
+	}
+}
+
+// TestDocxRead_FullInitialBudgetIsBiggerThanChunkedBudget pins
+// fullReadInitialBudget (16384) actually taking effect, not just existing as
+// an unused constant: against a document whose rendered body sits strictly
+// between docx.DefaultReadBudget (8192, the chunked path's budget) and
+// fullReadInitialBudget (16384, full=true's), full=false must still chunk
+// (next_start_para > 0) while full=true returns everything in one call
+// (next_start_para == 0, AND the whole body actually came back). Both calls
+// omit max_chars, so this is exactly the caller-observable difference the
+// bigger initial budget exists to produce.
+//
+// Independent review (2026-08-19) caught two holes in an earlier version of
+// this test: (1) next_start_para == 0 on its own is vacuous — a typo'd
+// missing "path" key, or shouldReturnOutline's outline branch (which also
+// never sets next_start_para), would pass the same assertion for entirely
+// the wrong reason — so this version additionally asserts the paragraph
+// count and markdown length actually match the whole document. (2) the test
+// silently depended on 180 <= docx.DocxOutlineParaThreshold (if it were not,
+// the full=false call would hit shouldReturnOutline and return an outline
+// instead of a chunked read, invalidating "full=false must still chunk");
+// this version checks that premise explicitly instead of assuming it.
+func TestDocxRead_FullInitialBudgetIsBiggerThanChunkedBudget(t *testing.T) {
+	const n = 180
+	if n > docx.DocxOutlineParaThreshold {
+		t.Fatalf("test premise stale: n=%d must be <= docx.DocxOutlineParaThreshold (%d), or full=false hits the outline branch instead of chunking",
+			n, docx.DocxOutlineParaThreshold)
+	}
+	p := wordsDocFixture(t, n, 8)
+	whole := wholeMarkdownLen(t, p)
+	if whole <= docx.DefaultReadBudget || whole > fullReadInitialBudget {
+		t.Fatalf("test premise stale: whole body is %d chars, want strictly between DefaultReadBudget (%d) and fullReadInitialBudget (%d)",
+			whole, docx.DefaultReadBudget, fullReadInitialBudget)
+	}
+
+	chunkedRes, err := callDocxRead(t, map[string]any{"path": p})
+	if err != nil {
+		t.Fatalf("callDocxRead (chunked): %v", err)
+	}
+	chunked := decodeRead(t, chunkedRes)
+	if next, _ := chunked["next_start_para"].(float64); next <= 0 {
+		t.Errorf("full=false next_start_para = %v, want > 0 (body exceeds the %d-char chunked budget)", chunked["next_start_para"], docx.DefaultReadBudget)
+	}
+
+	fullRes, err := callDocxRead(t, map[string]any{"path": p, "full": true})
+	if err != nil {
+		t.Fatalf("callDocxRead (full): %v", err)
+	}
+	full := decodeRead(t, fullRes)
+	if next, _ := full["next_start_para"].(float64); next != 0 {
+		t.Errorf("full=true next_start_para = %v, want 0 (body fits within fullReadInitialBudget)", full["next_start_para"])
+	}
+	fullParas, _ := full["paragraphs"].([]any)
+	if len(fullParas) != n {
+		t.Errorf("full=true returned %d paragraphs, want all %d (next_start_para==0 alone does not prove the whole body came back)", len(fullParas), n)
+	}
+	fullMarkdown, _ := full["markdown"].(string)
+	if len(fullMarkdown) != whole {
+		t.Errorf("full=true markdown is %d chars, want the whole document's %d", len(fullMarkdown), whole)
+	}
+}
+
+// TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips measures the actual
+// round-trip count fitDocxReadResult's proportional rescale (finding 2 of
+// the independent 2026-08-19 review) produces on a fixture shaped like the
+// real incident that motivated this whole change (docs/DOCX_TOOLS_DESIGN.md
+// §5: 476 paragraphs, ~48 KB rendered). Before the rescale replaced a plain
+// budget-halving, that reviewer measured full=true taking the SAME number of
+// round trips on this shape as an ordinary chunked read at the 8192-char
+// default: fullReadInitialBudget's 16384-char starting point bought nothing,
+// because this tool's JSON wrapping inflates a character budget by roughly
+// 1.35x, so one halving (16384 -> 8192 chars) landed the very first retry
+// back below the 8192-char default it was supposed to improve on.
+//
+// This test pins the number actually observed after the fix (see the
+// comment on wantRoundTrips) so that number — also recorded in
+// fullReadInitialBudget's doc comment and DOCX_TOOLS_DESIGN.md §5 — cannot
+// silently drift out of date if a future change to the JSON shape or the
+// rescale formula changes how fast it converges.
+func TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips(t *testing.T) {
+	const incidentParas = 476
+	p := wordsDocFixture(t, incidentParas, 18)
+	whole := wholeMarkdownLen(t, p)
+	t.Logf("incident-shaped fixture: %d paragraphs render to %d chars", incidentParas, whole)
+
+	roundTrips := 0
+	startPara := 0
+	for {
+		roundTrips++
+		if roundTrips > 20 {
+			t.Fatalf("round trips did not converge to next_start_para==0 within 20 calls")
+		}
+		args := map[string]any{"path": p, "full": true}
+		if startPara > 0 {
+			args["start_para"] = float64(startPara)
+		}
+		res, err := callDocxRead(t, args)
+		if err != nil {
+			t.Fatalf("callDocxRead (round trip %d): %v", roundTrips, err)
+		}
+		out := decodeRead(t, res)
+		next, _ := out["next_start_para"].(float64)
+		if next == 0 {
+			break
+		}
+		startPara = int(next)
+	}
+
+	// Measured on this codebase after the finding-2 rescale fix; update this
+	// alongside fullReadInitialBudget's doc comment and
+	// DOCX_TOOLS_DESIGN.md §5 if it ever changes.
+	const wantRoundTrips = 4
+	if roundTrips != wantRoundTrips {
+		t.Errorf("round trips = %d, want %d (update this test and the doc comments it is cited from if the change is intentional)",
+			roundTrips, wantRoundTrips)
+	}
+}
+
+// TestDocxRead_SingleOversizedParagraphErrorAdvisesAgainstMaxCharsOrRange is
+// an end-to-end regression test for a hole a second independent review round
+// (2026-08-19) found in TestDocxRead_FitResultErrorCarriesDiagnostic: that
+// test only ever exercised fitDocxReadResult with a STUBBED note, so a
+// change to pkg/docx's real note wording (or to the DocxReadHandler/
+// pkg/docx wiring between them) could silently regress the
+// hasOversizedParagraphNote advice branch to the generic, wrong "retry with
+// a smaller max_chars" advice while every existing test kept passing. This
+// pushes one real oversized paragraph through the actual handler, with
+// runs=false, and pins the specific advice text that branch is supposed to
+// produce.
+func TestDocxRead_SingleOversizedParagraphErrorAdvisesAgainstMaxCharsOrRange(t *testing.T) {
+	// A single paragraph of 5000 repetitions of "word " (25000 chars) plus
+	// its "[para 1] "/"\n\n" framing renders to roughly 25010 chars — well
+	// over both docx.DefaultReadBudget (8192) and maxDocxResultBytes (20480
+	// bytes), and returned whole regardless of budget (see pkg/docx.
+	// readChunkedResult), so no max_chars or range narrows it.
+	p := wordsDocFixture(t, 1, 5000)
+	if whole := wholeMarkdownLen(t, p); whole <= maxDocxResultBytes {
+		t.Fatalf("test premise stale: the single paragraph is only %d chars, want it bigger than the %d-byte cap", whole, maxDocxResultBytes)
+	}
+
+	_, err := callDocxRead(t, map[string]any{"path": p, "runs": false})
+	if err == nil {
+		t.Fatal("a document with one paragraph over the result cap returned nil error")
+	}
+	if !strings.Contains(err.Error(), "no max_chars value or narrower range fixes this") {
+		t.Errorf("error = %q, want the oversized-single-paragraph advice, not the generic \"retry with a smaller max_chars\" one", err)
+	}
+	if strings.Contains(err.Error(), "retry with a smaller max_chars, or narrow the range") {
+		t.Errorf("error = %q, want it to NOT fall back to the generic (wrong, for this case) advice", err)
+	}
+}
+
+// TestDocxRead_HugeMaxCharsIsClampedToTheByteCap is finding 5 of the second
+// independent review round (2026-08-19): before fitDocxReadResult clamped
+// its incoming budget to maxDocxResultBytes, a caller-supplied max_chars far
+// bigger than the byte cap (e.g. 100000000, whether by mistake or an
+// attempt to force a whole-document read) made full=true's own over-budget
+// check (pkg/docx.Document.Read) never trip — the whole document rendered
+// well within such a huge character budget — so the ONLY thing that could
+// shrink the resulting oversized JSON payload was fitDocxReadResult's
+// rescale, starting from a budget so much bigger than the document that
+// every one of maxDocxFitAttempts rescales still left it bigger than the
+// document's actual size; the call hard-errored on a document a normal
+// chunked read walks in a handful of calls. Clamping the incoming budget
+// fixes this: the very first attempt is already at or under the byte cap,
+// so Full's own fallback (pkg/docx.Document.Read) trips immediately and the
+// call completes as an ordinary chunked read instead of erroring.
+func TestDocxRead_HugeMaxCharsIsClampedToTheByteCap(t *testing.T) {
+	p := wordsDocFixture(t, 476, 18) // the same incident-shaped fixture as TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips
+	if whole := wholeMarkdownLen(t, p); whole <= maxDocxResultBytes {
+		t.Fatalf("test premise stale: whole body is %d chars, want it bigger than the %d-byte cap", whole, maxDocxResultBytes)
+	}
+
+	res, err := callDocxRead(t, map[string]any{"path": p, "full": true, "max_chars": float64(100_000_000)})
+	if err != nil {
+		t.Fatalf("callDocxRead: %v (huge max_chars should clamp and chunk, not error)", err)
+	}
+	if res.Status != models.CallStatusCompleted {
+		t.Errorf("Status = %v, want completed", res.Status)
+	}
+	if len(res.Content) > maxDocxResultBytes {
+		t.Errorf("result is %d bytes, over the %d cap", len(res.Content), maxDocxResultBytes)
+	}
+	out := decodeRead(t, res)
+	if next, _ := out["next_start_para"].(float64); next <= 0 {
+		t.Errorf("next_start_para = %v, want > 0 (a document this large cannot come back in one call even with a huge max_chars)", out["next_start_para"])
 	}
 }
 

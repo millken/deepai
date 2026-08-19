@@ -28,7 +28,19 @@ var defaultToolBudgetsByTool = map[string]map[int]int{
 	"write_file": {1: 300, 2: 300, 3: 300},
 	"grep":       {1: 4096, 2: 1024, 3: 300}, // grep p99=168KB tail is eaten by L0 offload (24KB) first
 	"web_fetch":  {1: 8192, 2: 2048, 3: 300},
-	"docx_read":  {1: 8192, 2: 2048, 3: 300}, // same as read_file: re-reading a chunk is expensive
+	// docx_read's age-1 budget (20480) is deliberately NOT read_file's 8192:
+	// it matches pkg/tools/builtin.maxDocxResultBytes (20 KB, unexported —
+	// kept numerically in sync here by hand), the hard cap that package's
+	// own fitDocxReadResult shrink loop already enforces on every result.
+	// Since the 2026-08-19 full=true-over-budget fix (docs/
+	// DOCX_TOOLS_DESIGN.md §5), a successful docx_read can legitimately come
+	// back that large — full=true now starts at a 16384-char body budget
+	// (fullReadInitialBudget) specifically so a moderately large document
+	// comes back whole in one call. Clipping that result to 8192 bytes on
+	// the very next turn would silently throw away roughly half of a
+	// full=true read the model just spent an entire call earning, which
+	// defeats the reason fullReadInitialBudget was raised at all.
+	"docx_read": {1: 20480, 2: 2048, 3: 300},
 }
 
 // Default per-age byte budgets. See docs/spec/token-efficiency.md §T1.

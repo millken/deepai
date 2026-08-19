@@ -32,8 +32,44 @@ import (
 const maxDocxResultBytes = 20 << 10
 
 // maxDocxFitAttempts bounds fitDocxReadResult's shrink loop: the initial
-// attempt at the caller's budget, plus at most 4 halvings.
+// attempt at the caller's budget, plus at most 4 proportional rescales (see
+// fitDocxReadResult's doc comment for why rescaling replaced halving).
 const maxDocxFitAttempts = 5
+
+// fullReadInitialBudget is the rendered-body character BUDGET
+// DocxReadHandler starts a full=true call at when the caller left max_chars
+// unset — used only at this tool layer, in place of pkg/docx.
+// DefaultReadBudget (8192), which is what pkg/docx.Document.Read itself
+// falls back to whenever MaxChars is <= 0 (Full or not; see that constant's
+// own doc comment). It is double DefaultReadBudget because full=true's whole
+// point is fitting a whole-document read into one call rather than making
+// the model walk next_start_para: at DefaultReadBudget, a document that
+// renders to, say, 12 KB would need full=true to still hand back a chunk
+// plus a note (see pkg/docx.Document.Read's Full fallback), which is correct
+// but wastes the "one call, whole body" case full=true exists for on
+// documents that are only modestly bigger than 8192 chars. 16384 is safe
+// headroom under fitDocxReadResult's own hard limit, maxDocxResultBytes (20
+// KB of marshalled JSON): that function's shrink-retry loop still catches a
+// full=true result that comes out over the JSON cap even at this larger
+// starting budget, the same as it does for any chunked read, so raising the
+// starting point here does not reintroduce the silent-truncation risk design
+// §5.1 exists to prevent.
+//
+// Raising this constant alone was NOT enough to fix the incident that
+// motivated it (docs/DOCX_TOOLS_DESIGN.md §5, 2026-08-19: 476 paragraphs,
+// 48444 rendered chars): fitDocxReadResult's shrink loop used to halve the
+// budget on overage, and halving 16384 once landed the very next attempt
+// back down near the SAME 8192-char body budget an ordinary chunked read
+// already uses — full=true took the observed 6 round trips to walk the
+// whole document, identical to full=false, buying nothing (independent
+// review, 2026-08-19). Replacing the halving with fitDocxReadResult's
+// proportional rescale (see that function's own doc comment) is what
+// actually lets the bigger starting budget pay off: measured on that same
+// 476-paragraph/48444-char fixture, full=true now takes 4 round trips (see
+// TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips). Update that test,
+// this comment, and DOCX_TOOLS_DESIGN.md §5 together if either number ever
+// changes.
+const fullReadInitialBudget = 16384
 
 // docxReadArgs is docx_read's parsed arguments.
 type docxReadArgs struct {
@@ -103,9 +139,10 @@ func DocxReadTool() models.Tool {
 		ParallelSafe: true,
 		Description: "Read a .docx as structured content. Returns a heading outline by default for " +
 			"large documents; pass heading or start_para/end_para for a section or range, or full=true " +
-			"for the whole body. Large ranges are chunked: next_start_para is the cursor for the next " +
-			"call, and 0 means the range is exhausted. Headers, footers, footnotes and text boxes are " +
-			"not included and are declared in notes.",
+			"to try for the whole body in one call. Large ranges are chunked (full=true included, when it " +
+			"does not fit): next_start_para is the cursor for the next call, and 0 means the range is " +
+			"exhausted. Headers, footers, footnotes and text boxes are not included and are declared in " +
+			"notes.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -113,9 +150,13 @@ func DocxReadTool() models.Tool {
 				"heading":    map[string]any{"type": "string", "description": "Restrict to the section under this heading; mutually exclusive with start_para/end_para"},
 				"start_para": map[string]any{"type": "number", "description": "1-based inclusive first paragraph"},
 				"end_para":   map[string]any{"type": "number", "description": "1-based inclusive last paragraph"},
-				"full":       map[string]any{"type": "boolean", "description": "Return the whole body; errors instead of chunking when it exceeds the budget"},
-				"runs":       map[string]any{"type": "boolean", "description": "Include each paragraph's runs, needed to edit by run index"},
-				"max_chars":  map[string]any{"type": "number", "description": "Body character budget for this chunk"},
+				"full": map[string]any{
+					"type": "boolean",
+					"description": "Return the whole body in one call when it fits the budget; a larger body falls back to a " +
+						"chunked read (walk next_start_para) with an explanatory note",
+				},
+				"runs":      map[string]any{"type": "boolean", "description": "Include each paragraph's runs, needed to edit by run index"},
+				"max_chars": map[string]any{"type": "number", "description": "Body character budget for this chunk"},
 			},
 			"required": []any{"path"},
 		},
@@ -154,8 +195,22 @@ func DocxReadHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	initialBudget := args.MaxChars
 	if initialBudget <= 0 {
-		initialBudget = docx.DefaultReadBudget
+		if args.Full {
+			// See fullReadInitialBudget's doc comment: full=true gets a
+			// bigger starting budget than a chunked read so a moderately
+			// large document still comes back whole in one call, while
+			// fitDocxReadResult's shrink-retry loop below still bounds the
+			// marshalled result to maxDocxResultBytes regardless.
+			initialBudget = fullReadInitialBudget
+		} else {
+			initialBudget = docx.DefaultReadBudget
+		}
 	}
+	// A caller-supplied max_chars bigger than maxDocxResultBytes (e.g.
+	// max_chars=100000000, whether a mistake or an attempt to force a
+	// whole-document read) is clamped inside fitDocxReadResult itself, not
+	// here — see that function's doc comment for why the clamp lives there
+	// instead of being duplicated at every call site.
 
 	read := func(budget int) (docxReadOutput, error) {
 		rr, err := doc.Read(docx.ReadOptions{
@@ -365,42 +420,91 @@ func docxParaIndexFromView(pv docx.ParaView) docxParaIndex {
 }
 
 // fitDocxReadResult calls read at budget, marshals the result, and — if the
-// marshalled payload exceeds maxDocxResultBytes — halves the budget and
-// retries, up to maxDocxFitAttempts total attempts. It never truncates a
-// result to make it fit: a body that is still over the cap at the smallest
-// attempted budget is reported as an error instead, since silently
-// dropping content is exactly the failure design §5.1 exists to prevent.
-// Every attempt after the first appends a note to the result explaining
-// that it was shrunk, so the caller is told it received less than it
-// asked for.
+// marshalled payload exceeds maxDocxResultBytes — rescales the budget
+// proportionally to the observed overage and retries, up to
+// maxDocxFitAttempts total attempts. It never truncates a result to make it
+// fit: a body that is still over the cap at the smallest attempted budget is
+// reported as an error instead, since silently dropping content is exactly
+// the failure design §5.1 exists to prevent. Every attempt after the first
+// appends a note to the result explaining that it was shrunk, so the caller
+// is told it received less than it asked for.
+//
+// The rescale (below) replaced a plain halving after independent review
+// (2026-08-19) measured it doing nothing useful: on the docs/
+// DOCX_TOOLS_DESIGN.md §5 incident fixture (476 paragraphs, ~48 KB
+// rendered), full=true's 16384-char starting budget (fullReadInitialBudget)
+// still took as many round trips to walk the whole document as an ordinary
+// chunked read at the 8192-char default — because this tool's JSON wrapping
+// (the paragraphs index, string escaping, notes) inflates a budget's worth
+// of rendered body by a roughly constant ratio, halving 16384 landed the
+// very first retry back down near 8192 chars of body, discarding most of
+// the headroom fullReadInitialBudget exists to use. Rescaling by the
+// ACTUAL observed ratio (maxDocxResultBytes / len(payload)) corrects for
+// that inflation directly instead of guessing at it — see
+// TestDocxRead_FullWalksIncidentFixtureInFewRoundTrips for the measured
+// round-trip count this produces on that fixture.
 //
 // runs is args.Runs from the original call: the terminal error (finding 3
 // of the P1c review) can only fire when a single paragraph's rendered block
 // alone exceeds every attempted budget, in which case pkg/docx returns that
-// paragraph whole every time regardless of budget — halving budget again
+// paragraph whole every time regardless of budget — rescaling budget again
 // changes nothing, so "retry with a smaller max_chars" is not just
 // unhelpful there, it is actively wrong advice that a compliant caller
 // would loop forever on. Dropping runs=true is the one lever that actually
 // shrinks that paragraph's rendered size (each run's own JSON overhead), so
-// the error says that instead whenever runs was set.
+// the error says that instead whenever runs was set; when runs is already
+// false, hasOversizedParagraphNote below detects the same situation from
+// pkg/docx's own note and the error says plainly that neither max_chars nor
+// range narrows it.
+//
+// budget is clamped to maxDocxResultBytes before the loop starts (2026-08-19
+// independent review, finding 5): a body budget above the byte cap can never
+// fit, because the marshalled payload is always body-plus-JSON-framing and
+// therefore strictly bigger than the body alone — so an oversized budget
+// (whether fullReadInitialBudget-derived or a caller-supplied max_chars like
+// 100000000) would otherwise burn every one of maxDocxFitAttempts rescaling
+// down from a number nowhere near the actual document size, hard-erroring
+// on a document that a normal chunked read would have walked in a handful of
+// calls. Clamping up front also protects the rescale arithmetic below
+// (budget*maxDocxResultBytes) from overflowing int on a 32-bit build for a
+// large enough caller-supplied budget.
 func fitDocxReadResult(read func(budget int) (docxReadOutput, error), budget int, runs bool) ([]byte, error) {
 	if budget <= 0 {
 		budget = docx.DefaultReadBudget
 	}
+	if budget > maxDocxResultBytes {
+		budget = maxDocxResultBytes
+	}
 
-	var lastNotes []string
 	for attempt := 0; attempt < maxDocxFitAttempts; attempt++ {
 		out, err := read(budget)
 		if err != nil {
 			return nil, err
 		}
+		// diagNotes is out.Notes BEFORE the shrink note (below) is added:
+		// the terminal error's diagnostic must never quote the shrink note,
+		// since that note claims "kept under the cap", which is exactly
+		// false on the path that reaches the terminal error.
+		diagNotes := out.Notes
 		if attempt > 0 {
-			out.Notes = append(out.Notes, fmt.Sprintf(
-				"the result exceeded the %d-byte tool result cap and was shrunk to a %d-character body budget; "+
-					"pass a smaller max_chars or narrow the range to get the rest",
-				maxDocxResultBytes, budget))
+			// The real continuation lever after a shrink is next_start_para,
+			// not max_chars — this function already picked the budget it
+			// believed would fit, so "pass a smaller max_chars" is no more
+			// actionable than what just happened automatically. Guarded on
+			// NextStartPara != 0 for the same reason
+			// pkg/docx.Document.Read's Full fallback guards its equivalent
+			// note (see that doc comment): a shrunk read that still came
+			// back with NextStartPara 0 has no cursor to name, and naming
+			// one anyway (start_para=next_start_para resolving to
+			// start_para=0, i.e. "from the start") would send the caller
+			// into a repeat of the exact same call.
+			note := fmt.Sprintf("the body budget was reduced to %d chars to keep this result under the %d-byte cap",
+				budget, maxDocxResultBytes)
+			if out.NextStartPara != 0 {
+				note += "; continue with start_para=next_start_para"
+			}
+			out.Notes = append(out.Notes, note)
 		}
-		lastNotes = out.Notes
 
 		payload, err := json.Marshal(out)
 		if err != nil {
@@ -410,25 +514,61 @@ func fitDocxReadResult(read func(budget int) (docxReadOutput, error), budget int
 			return payload, nil
 		}
 		if attempt == maxDocxFitAttempts-1 {
-			advice := "retry with a smaller max_chars, or narrow the range with heading or start_para/end_para"
-			if runs {
-				advice = "retry without runs=true — that is the one lever that actually shrinks this payload; a smaller max_chars or a narrower range will not, since pkg/docx returns an over-budget paragraph whole regardless of budget"
-			}
 			diag := ""
-			if len(lastNotes) > 0 {
-				diag = fmt.Sprintf(" (pkg/docx reported: %s)", strings.Join(lastNotes, "; "))
+			if len(diagNotes) > 0 {
+				diag = fmt.Sprintf(" (details: %s)", strings.Join(diagNotes, "; "))
+			}
+			var advice string
+			switch {
+			case runs:
+				advice = "retry without runs=true — that is the one lever that actually shrinks this payload; a smaller max_chars or a narrower range will not, since pkg/docx returns an over-budget paragraph whole regardless of budget"
+			case hasOversizedParagraphNote(diagNotes):
+				// "above" refers to diag, which this format string always
+				// interpolates before advice (see the Errorf call below) —
+				// keep this pointer and that ordering in sync if either
+				// changes.
+				advice = "no max_chars value or narrower range fixes this: pkg/docx always returns a single over-budget paragraph whole (see the details above) so the read cursor still advances, and that one paragraph alone is too big for this tool's result cap"
+			default:
+				advice = "retry with a smaller max_chars, or narrow the range with heading or start_para/end_para"
 			}
 			return nil, fmt.Errorf(
 				"docx_read: result is %d bytes even at a %d-character body budget, over the %d-byte cap%s; %s",
 				len(payload), budget, maxDocxResultBytes, diag, advice)
 		}
-		budget /= 2
+		// Rescale proportionally to the observed overage rather than
+		// halving blindly: len(payload) is the ground truth for how much
+		// THIS call's JSON wrapping inflates a character budget, so
+		// budget*cap/len(payload) is the budget that would have landed
+		// almost exactly at the cap had that inflation ratio stayed
+		// constant. The extra *9/10 leaves a 10% margin, since notes and
+		// paragraph-count growth near a chunk boundary do not scale
+		// perfectly linearly with budget.
+		budget = budget * maxDocxResultBytes / len(payload) * 9 / 10
 		if budget < 1 {
 			budget = 1
 		}
 	}
 	// Unreachable: the loop above always returns on its last iteration.
 	return nil, fmt.Errorf("docx_read: shrink loop exhausted without resolving")
+}
+
+// hasOversizedParagraphNote reports whether notes contains pkg/docx's own
+// per-paragraph overage note (readChunkedResult in pkg/docx/read.go, whose
+// fixed prefix is exported as docx.OversizedParagraphNotePrefix precisely so
+// this check does not have to hand-copy a substring of wording that package
+// owns and could reword independently). Its presence means
+// fitDocxReadResult's terminal error is hitting the one case where neither
+// of its usual two levers (max_chars, range) can help — a single paragraph
+// alone is too big for the cap — so the error should say that plainly
+// instead of repeating advice that would send a compliant caller into a
+// retry loop that never converges.
+func hasOversizedParagraphNote(notes []string) bool {
+	for _, n := range notes {
+		if strings.HasPrefix(n, docx.OversizedParagraphNotePrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // docxIndexAdvice is appended to docxEditOutput.IndexAdvice whenever a batch

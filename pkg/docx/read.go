@@ -180,6 +180,21 @@ const DefaultReadBudget = 8192
 // cells for prose.
 const tableStructureNote = "tables are rendered cell-by-cell as individual paragraphs; table structure (rows and columns) is not reconstructed into markdown"
 
+// OversizedParagraphNotePrefix is the fixed prefix of the Notes entry
+// readChunkedResult appends when a single paragraph's own rendered block
+// alone exceeds the requested budget (see Read's doc comment: that
+// paragraph is returned whole, rather than producing an empty chunk, so the
+// read cursor still advances instead of getting stuck on the same
+// paragraph forever). It is exported so a caller — currently
+// pkg/tools/builtin's fitDocxReadResult — can reliably detect this exact
+// situation (independent review, 2026-08-19: "no max_chars value or
+// narrower range will fix this" is only correct advice in this specific
+// case) via strings.HasPrefix against this shared constant, instead of
+// hand-copying a substring of the note's wording that would silently stop
+// matching — falling back to generic, wrong advice — if this package ever
+// rewords the note.
+const OversizedParagraphNotePrefix = "paragraph "
+
 // ReadOptions selects what Read returns and how it is chunked. Heading is
 // mutually exclusive with StartPara/EndPara: combining them is an error
 // rather than a guess at which one wins.
@@ -189,7 +204,7 @@ type ReadOptions struct {
 	Heading   string // if non-empty, scopes the read to that section
 	Runs      bool   // include each paragraph's per-run breakdown
 	MaxChars  int    // rendered-body character budget; 0 = unlimited
-	Full      bool   // whole selection at once; errors instead of degrading over budget
+	Full      bool   // whole selection in one call when it fits budget; falls back to a chunked read (with a note) otherwise
 }
 
 // RunView is one paragraph's run, exposed only when ReadOptions.Runs is set.
@@ -267,15 +282,24 @@ type ReadResult struct {
 // text — because that rendered output is what a caller receives and what
 // risks tripping deepai's 24KB tool-result offload (design §5.1).
 //
-// Full changes the chunking behavior rather than skipping it: it renders
-// the whole selected range and, if that exceeds MaxChars (or
-// DefaultReadBudget when MaxChars is 0), returns an error instead of a
-// truncated result — silently dropping the back half of a document is
-// exactly what design §5.1 says this package must never do. A non-Full call
-// never errors on size; it just chunks. MaxChars <= 0 does NOT mean
-// unlimited on this path either: it defaults to DefaultReadBudget, same as
-// Full. Full is the only way to ask for the whole selection in one call
-// (and even then only within budget).
+// Full asks for the whole selected range in one call rather than chunking
+// it: it renders the whole range and, if that fits within MaxChars (or
+// DefaultReadBudget when MaxChars is 0), returns it all with NextStartPara
+// 0. If it does NOT fit, Full does not error — an earlier version of this
+// package refused outright, on the theory that degrading over budget was
+// exactly the silent-truncation risk design §5.1 exists to prevent, but a
+// 2026-08-19 incident showed that hard error trains a model to abandon the
+// tool entirely rather than retry with a range. §5.1's actual target is the
+// harness quietly offloading an oversized result with the middle replaced
+// and no visible warning; a first chunk plus an explicit Notes entry plus a
+// non-zero NextStartPara is the identical cursor contract a non-Full caller
+// already walks, so it carries none of that risk. Over budget, Full falls
+// back to the same paragraph-boundary chunking a non-Full call would have
+// done at that budget (the first chunk, with NextStartPara pointing at the
+// resume point) and appends a Notes entry naming the actual rendered size,
+// the budget, and how to continue. MaxChars <= 0 does NOT mean unlimited on
+// this path either: it defaults to DefaultReadBudget, same as the non-Full
+// path.
 //
 // Resuming a heading-scoped chunked read (ReadResult.NextStartPara != 0 from
 // a call with Heading set) must not simply repeat Heading — Heading and
@@ -287,7 +311,7 @@ type ReadResult struct {
 // of running open-ended into whatever follows it.
 func (d *Document) Read(opts ReadOptions) (ReadResult, error) {
 	if opts.Heading != "" && (opts.StartPara != 0 || opts.EndPara != 0) {
-		return ReadResult{}, fmt.Errorf("docx: Heading and StartPara/EndPara are mutually exclusive")
+		return ReadResult{}, fmt.Errorf("docx: heading and start_para/end_para are mutually exclusive")
 	}
 
 	total := d.TotalParas()
@@ -307,50 +331,102 @@ func (d *Document) Read(opts ReadOptions) (ReadResult, error) {
 
 	all := d.paras
 
+	budget := opts.MaxChars
+	if budget <= 0 {
+		budget = DefaultReadBudget
+	}
+
 	if opts.Full {
-		budget := opts.MaxChars
-		if budget <= 0 {
-			budget = DefaultReadBudget
-		}
+		// md/views accumulate only while the running total is still within
+		// budget: once it crosses over, the rest of this loop exists purely
+		// to keep summing totalLen (the note below reports the TRUE full
+		// size, so every paragraph through end must still be measured), not
+		// to hold onto a whole oversized document's worth of rendered
+		// strings/views that this function is about to throw away anyway —
+		// see the overBudget fallback below, which re-derives the actual
+		// first chunk from scratch via readChunkedResult.
 		var md strings.Builder
-		views := make([]ParaView, 0, end-start+1)
+		// views is deliberately NOT pre-sized to end-start+1: doing so would
+		// pre-allocate room for the whole requested range regardless of
+		// budget, which is exactly the "hold onto a whole oversized
+		// document's worth of views" cost the comment above says this loop
+		// avoids. Left to grow on its own, its backing array never exceeds
+		// what the in-budget case actually appends.
+		var views []ParaView
 		hasCell := false
+		totalLen := 0
+		overBudget := false
 		for i := start; i <= end; i++ {
 			pv, block := renderReadPara(all[i-1], opts.Runs)
+			totalLen += len(block)
+			if overBudget {
+				continue
+			}
+			if totalLen > budget {
+				overBudget = true
+				continue
+			}
 			md.WriteString(block)
 			views = append(views, pv)
 			if pv.Cell != nil {
 				hasCell = true
 			}
 		}
-		if md.Len() > budget {
-			return ReadResult{}, fmt.Errorf(
-				"docx: full read of paragraphs %d-%d is %d rendered chars, over the %d-char budget; "+
-					"read the outline (Document.Outline) and fetch a StartPara/EndPara range or Heading section instead",
-				start, end, md.Len(), budget)
+		if !overBudget {
+			if hasCell {
+				notes = append(notes, tableStructureNote)
+			}
+			return ReadResult{
+				Markdown:      md.String(),
+				Paras:         views,
+				NextStartPara: 0,
+				RangeStart:    start,
+				RangeEnd:      end,
+				TotalParas:    total,
+				Notes:         notes,
+			}, nil
 		}
-		if hasCell {
-			notes = append(notes, tableStructureNote)
+
+		// Over budget: fall back to the same paragraph-boundary chunking a
+		// non-Full call would do at this budget, rather than refusing (see
+		// the doc comment above for why that is safe). The whole-range
+		// render above is discarded; re-rendering the first chunk through
+		// readChunkedResult costs nothing that matters at the document sizes
+		// this package deals with, and keeps this one code path — the one
+		// readChunkedResult below also uses — as the single source of truth
+		// for chunk boundaries.
+		result := readChunkedResult(all, start, end, opts, budget, total, notes)
+		// Only add the fallback note when there is actually something left
+		// to continue to (result.NextStartPara != 0). The one exception
+		// readChunkedResult itself carves out — a single paragraph so large
+		// it alone exceeds budget — can legitimately return the WHOLE
+		// requested range in one call with NextStartPara 0 even though the
+		// pre-check above found totalLen over budget (e.g. a one-paragraph
+		// document whose single paragraph is bigger than budget). Appending
+		// "continue with start_para=next_start_para" there would tell the
+		// caller to resume at start_para=0, which resolveReadRange treats as
+		// "from the start" — an identical call that returns the identical
+		// result forever. readChunkedResult's own per-paragraph overage note
+		// already explains that case; this note would only be redundant, and
+		// wrong, on top of it.
+		if result.NextStartPara != 0 {
+			result.Notes = append(result.Notes, fmt.Sprintf(
+				"full read: paragraphs %d-%d render to %d chars, over the %d-char max_chars budget; returning the first chunk — "+
+					"continue with start_para=next_start_para (and this call's range_end as end_para)",
+				start, end, totalLen, budget))
 		}
-		return ReadResult{
-			Markdown:      md.String(),
-			Paras:         views,
-			NextStartPara: 0,
-			RangeStart:    start,
-			RangeEnd:      end,
-			TotalParas:    total,
-			Notes:         notes,
-		}, nil
+		return result, nil
 	}
 
-	// MaxChars <= 0 does not mean unlimited here either — only Full offers
-	// that escape hatch (and even then only within budget, or it refuses).
-	// A caller that passes max_chars straight through from a JSON tool
-	// schema and simply omits it must not get the entire document back.
-	budget := opts.MaxChars
-	if budget <= 0 {
-		budget = DefaultReadBudget
-	}
+	return readChunkedResult(all, start, end, opts, budget, total, notes), nil
+}
+
+// readChunkedResult is Read's non-Full chunking path, factored out so Full's
+// over-budget fallback (above) can reuse the identical boundary logic rather
+// than risk a second, subtly different implementation of where a chunk cuts
+// off. notes is the caller's accumulated Notes slice (e.g. from d.Notes())
+// to append to, not replace.
+func readChunkedResult(all []Para, start, end int, opts ReadOptions, budget, total int, notes []string) ReadResult {
 	var (
 		md      strings.Builder
 		views   []ParaView
@@ -370,7 +446,7 @@ func (d *Document) Read(opts ReadOptions) (ReadResult, error) {
 				// would be handed the very same StartPara), so take it
 				// whole and note the overage instead.
 				notes = append(notes, fmt.Sprintf(
-					"paragraph %d is %d rendered chars, exceeding the %d-char MaxChars budget; returned whole so the read cursor still advances",
+					OversizedParagraphNotePrefix+"%d is %d rendered chars, exceeding the %d-char max_chars budget; returned whole so the read cursor still advances",
 					p.Index, blockLen, budget))
 				md.WriteString(block)
 				views = append(views, pv)
@@ -407,7 +483,7 @@ func (d *Document) Read(opts ReadOptions) (ReadResult, error) {
 		RangeEnd:      end,
 		TotalParas:    total,
 		Notes:         notes,
-	}, nil
+	}
 }
 
 // resolveReadRange turns opts into a concrete 1-based inclusive [start, end]
@@ -444,10 +520,10 @@ func (d *Document) resolveReadRange(opts ReadOptions, total int) (start, end int
 	}
 
 	if opts.StartPara < 0 {
-		return 0, 0, fmt.Errorf("docx: StartPara must not be negative (got %d)", opts.StartPara)
+		return 0, 0, fmt.Errorf("docx: start_para must not be negative (got %d)", opts.StartPara)
 	}
 	if opts.EndPara < 0 {
-		return 0, 0, fmt.Errorf("docx: EndPara must not be negative (got %d)", opts.EndPara)
+		return 0, 0, fmt.Errorf("docx: end_para must not be negative (got %d)", opts.EndPara)
 	}
 
 	start = opts.StartPara
