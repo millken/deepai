@@ -134,6 +134,40 @@ func gitToplevel(dir string) (string, bool) {
 	return root, root != ""
 }
 
+// resolveWorktreePath canonicalizes a path the way git reports paths: with
+// symlinks evaluated. `git rev-parse --show-toplevel` always returns the REAL
+// path (on macOS a /var/... work dir comes back as /private/var/...), while
+// the REPL's WorkDir and the edit records carry whatever the user's cwd was —
+// possibly the symlinked form. Mixing the two forms breaks attribution
+// SILENTLY and in the worst direction: filepath.Rel(root, path) yields a
+// "../.." path that matches no snapshot entry, so isUntracked says "tracked"
+// for a brand-new file, and `git diff -- <new file>` reports nothing — the
+// reviewer would then be handed an EMPTY diff and pass a change it never saw.
+//
+// A path that no longer exists (a file the turn deleted) canonicalizes
+// through its parent directory instead.
+func resolveWorktreePath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	dir, base := filepath.Split(p)
+	if resolved, err := filepath.EvalSymlinks(filepath.Clean(dir)); err == nil {
+		return filepath.Join(resolved, base)
+	}
+	return p
+}
+
+func resolveWorktreePaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = resolveWorktreePath(p)
+	}
+	return out
+}
+
 func runGit(dir string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
 	defer cancel()
@@ -149,7 +183,7 @@ func (s worktreeSnapshot) isUntracked(absPath string) bool {
 	if s.root == "" {
 		return false
 	}
-	rel, err := filepath.Rel(s.root, absPath)
+	rel, err := filepath.Rel(s.root, resolveWorktreePath(absPath))
 	if err != nil {
 		return false
 	}
@@ -172,9 +206,36 @@ func (s worktreeSnapshot) isUntracked(absPath string) bool {
 // never rolled back.
 const maxReviewRounds = 2
 
-// defaultReviewTimeout bounds one reviewer run when ReplConfig.ReviewTimeout
-// is unset.
-const defaultReviewTimeout = 5 * time.Minute
+// DefaultReviewTimeout bounds one reviewer run when ReplConfig.ReviewTimeout
+// is unset. Exported because pkg/commands resolves config.yaml's
+// "0 = default" contract before building ReplConfig and used to carry its own
+// copy of the value — two constants that had to be kept in step by hand.
+//
+// It is a LAST-RESORT net, not the reviewer's workload bound: the
+// clock expiring kills the run and throws away everything it found, so the
+// real bound is reviewMaxToolCalls below, which degrades gracefully into a
+// verdict. Sized to be reached only by a genuinely stuck run — 5 minutes was
+// routinely hit by an honest reviewer on a reasoning model (minutes of
+// thinking per turn), which cost the whole review.
+const DefaultReviewTimeout = 10 * time.Minute
+
+// reviewMaxToolCalls bounds the reviewer's workload where exhaustion is
+// RECOVERABLE: react.go turns the last call into a forced tool-less wrap-up
+// that must still satisfy the Strict output schema, so the gate gets a real
+// verdict for the part of the change the reviewer did examine. The profile
+// itself stays uncapped (types_config.go) — a direct `task` call to this agent
+// type has no wall clock to race, only the gate does.
+//
+// 20 covers reading every hunk's surroundings plus a build/test to
+// substantiate a charge, for the change sizes rung (a) admits at all.
+//
+// Known trade-off: pkg/agent's schema-validation retry gives a retry only the
+// REMAINING tool-call budget and skips the retry entirely when none is left
+// (subagent.go), so a reviewer that both exhausts this cap AND then emits
+// invalid JSON gets no second attempt — it fail-softs as "verdict
+// unparseable". Accepted: that path needs two failures at once, against a
+// wall-clock expiry that loses the review every single time it happens.
+const reviewMaxToolCalls = 20
 
 // reviewDiffByteCap is degradation rung (c) of design §六-3: a diff bigger
 // than this is not reviewed at all — the user is told, loudly, instead of
@@ -205,6 +266,7 @@ func (r *ChatRepl) runEpisode(parentCtx context.Context, initialRequest string, 
 	// a previous (skipped or interrupted) episode must not leak into this
 	// one (design §4.4 clearing rules).
 	r.carry.ClearEditedFiles()
+	r.reviewPrev = nil
 
 	turn := firstTurn
 	for round := 0; ; round++ {
@@ -246,7 +308,11 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	// Attribution = tool records ∪ snapshot delta (design §4.1). The
 	// snapshot side catches bash-mediated edits (go fmt, sed -i, scripts);
 	// the tool side survives non-git directories and snapshot failures.
-	scope := unionSorted(r.carry.EditedFiles(), after.changedSince(before))
+	// Both sides must be in the same path form or the same file appears twice
+	// in the scope (once per form) and its untracked/tracked classification
+	// flips: changedSince already reports git-canonical paths, so the tool
+	// records are canonicalized to match.
+	scope := unionSorted(resolveWorktreePaths(r.carry.EditedFiles()), after.changedSince(before))
 	if len(scope) == 0 {
 		return ""
 	}
@@ -255,20 +321,28 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 		r.ui.Info("  review: not a git worktree — bash-side edits are invisible to attribution, and reviewer writes cannot be detected")
 	}
 
-	verdict, ok := r.dispatchReview(parentCtx, initialRequest, scope, after)
+	verdict, ok := r.dispatchReview(parentCtx, initialRequest, scope, after, r.reviewPrev)
 	if !ok {
+		r.reviewPrev = nil
 		return "" // fail-soft; dispatchReview already warned
 	}
 	if isPassVerdict(verdict) {
 		r.carry.ClearEditedFiles()
+		r.reviewPrev = nil
 		r.ui.Info("  review: pass — " + verdictSummary(verdict))
 		return ""
 	}
 	if round >= maxReviewRounds {
+		r.reviewPrev = nil
 		r.presentIssues(fmt.Sprintf(
 			"  review: STILL FAILING after %d fix rounds — human judgment needed. Unresolved issues:", maxReviewRounds), verdict)
 		return ""
 	}
+	// Carried into the next round's reviewer so it verifies these findings
+	// instead of re-deriving the whole review from scratch — and so a finding
+	// the implementer rebutted is judged on the rebuttal's merits rather than
+	// silently re-reported in different words.
+	r.reviewPrev = verdict
 	r.ui.Info(fmt.Sprintf("  review: %d issue(s) — entering fix round %d/%d", len(verdict.Issues), round+1, maxReviewRounds))
 	return synthesizeFixMessage(round+1, verdict)
 }
@@ -276,7 +350,7 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 // dispatchReview runs the degradation ladder and the reviewer for one scope.
 // Shared by the automatic gate and the manual /review command; ok=false is
 // always fail-soft and already warned.
-func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot) (*agent.ReviewResult, bool) {
+func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot, prev *agent.ReviewResult) (*agent.ReviewResult, bool) {
 	diff, oversized := buildReviewDiff(r.cfg.WorkDir, snap, scope)
 	if oversized {
 		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
@@ -289,7 +363,13 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 	if contextBundleBytes(scope) > reviewContextBundleCap {
 		contextFiles = nil
 	}
-	return r.runReview(parentCtx, initialRequest, diff, contextFiles, snap)
+	return r.runReview(parentCtx, reviewPromptInput{
+		initialRequest: initialRequest,
+		diff:           diff,
+		scope:          relToWorkDir(r.cfg.WorkDir, scope),
+		bundled:        contextFiles != nil,
+		prev:           prev,
+	}, contextFiles, snap)
 }
 
 func isPassVerdict(v *agent.ReviewResult) bool {
@@ -309,11 +389,24 @@ func verdictSummary(v *agent.ReviewResult) string {
 // the parsed verdict. ok=false is the fail-soft path: interrupted, timed
 // out, tool failure, tampered worktree, or unparseable output — all warned,
 // none fatal (design §六-1).
-func (r *ChatRepl) runReview(parentCtx context.Context, initialRequest, diff string, contextFiles []string, preReview worktreeSnapshot) (*agent.ReviewResult, bool) {
+func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, contextFiles []string, preReview worktreeSnapshot) (*agent.ReviewResult, bool) {
+	timeout := r.cfg.ReviewTimeout
+	if timeout <= 0 {
+		timeout = DefaultReviewTimeout
+	}
+	in.maxToolCalls = reviewMaxToolCalls
+	in.timeout = timeout
+
 	args := map[string]any{
 		"description": "Adversarial correctness review",
 		"agent_type":  string(agent.AgentTypeCorrectnessReviewer),
-		"prompt":      buildReviewPrompt(initialRequest, diff, contextFiles == nil),
+		"prompt":      buildReviewPrompt(in),
+		// The reviewer's profile is uncapped; the GATE caps it, because only
+		// the gate races a wall clock. Exhausting this cap forces a tool-less
+		// wrap-up that still has to satisfy the output schema, so a reviewer
+		// that would otherwise have been killed mid-browse still returns a
+		// verdict for what it examined.
+		"max_tool_calls": reviewMaxToolCalls,
 	}
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget
@@ -329,10 +422,6 @@ func (r *ChatRepl) runReview(parentCtx context.Context, initialRequest, diff str
 	var result models.ToolResult
 	var execErr error
 	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		timeout := r.cfg.ReviewTimeout
-		if timeout <= 0 {
-			timeout = defaultReviewTimeout
-		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
@@ -360,6 +449,16 @@ func (r *ChatRepl) runReview(parentCtx context.Context, initialRequest, diff str
 		return nil, false
 	}
 	if execErr != nil {
+		// The reviewer's own deadline is the most common failure here and the
+		// only one the user can act on, so name the window that ran out and
+		// where to widen it instead of reporting a bare
+		// "context deadline exceeded".
+		if errors.Is(execErr, context.DeadlineExceeded) {
+			r.ui.Info(fmt.Sprintf(
+				"  review: reviewer hit its %s deadline — changes are unreviewed (raise review_timeout in config.yaml, or narrow the change)",
+				timeout))
+			return nil, false
+		}
 		r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — changes are unreviewed", execErr))
 		return nil, false
 	}
@@ -373,20 +472,71 @@ func (r *ChatRepl) runReview(parentCtx context.Context, initialRequest, diff str
 	return verdict, true
 }
 
-// buildReviewPrompt assembles the reviewer's seed message: the episode's
-// initial user request (fixed anchor across all rounds — never a synthetic
-// fix message) and the scoped diff. Deliberately absent: the implementer's
-// reasoning and the session history (design §4.4 information isolation).
-func buildReviewPrompt(initialRequest, diff string, diffOnly bool) string {
+// reviewPromptInput is everything the reviewer's seed message is built from.
+// A struct rather than a parameter list because the fields are independent
+// switches (was the bundle attached? is this a re-review?) that read far
+// better named at the call site than as positional bools.
+type reviewPromptInput struct {
+	// initialRequest is the episode's original user request — the fixed
+	// anchor across all rounds, never a synthesized fix message.
+	initialRequest string
+	diff           string
+	// scope is the change set, workdir-relative, so the reviewer knows the
+	// full file list even when the diff is the only content it received.
+	scope []string
+	// bundled reports whether the changed files' full contents were attached
+	// as context_files (degradation rung (b) drops them on large changes).
+	bundled bool
+	// prev is the previous round's failing verdict; nil on a first review.
+	prev *agent.ReviewResult
+	// maxToolCalls/timeout are the reviewer's real operating budget. Told to
+	// it explicitly: a reviewer that does not know it is on a clock browses
+	// until the clock kills it, which loses the entire review.
+	maxToolCalls int
+	timeout      time.Duration
+}
+
+// buildReviewPrompt assembles the reviewer's seed message. Deliberately
+// absent: the implementer's reasoning and the session history (design §4.4
+// information isolation) — everything here is either the user's own words,
+// the change itself, or the review machinery's own previous output.
+func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
 	b.WriteString("Adversarially review the code changes below.\n\n")
 	b.WriteString("## Original task (verbatim user request)\n\n")
-	b.WriteString(initialRequest)
-	b.WriteString("\n\n## Changes\n\n```diff\n")
-	b.WriteString(diff)
+	b.WriteString(in.initialRequest)
+	if len(in.scope) > 0 {
+		b.WriteString("\n\n## Files changed\n\n")
+		for _, f := range in.scope {
+			b.WriteString("- " + f + "\n")
+		}
+	}
+	b.WriteString("\n## Changes\n\n```diff\n")
+	b.WriteString(in.diff)
 	b.WriteString("\n```\n")
-	if diffOnly {
-		b.WriteString("\n(File contents omitted for size — use read_file on any file you need.)\n")
+	if !in.bundled {
+		b.WriteString("\n(Full file contents are NOT attached — read what you need with read_file, preferring line ranges around the hunks above.)\n")
+	}
+	if in.prev != nil && len(in.prev.Issues) > 0 {
+		// A re-review's job is narrower than a first review: check the fixes.
+		// Without this the next reviewer starts from zero, which both wastes
+		// its budget re-deriving the same findings and lets it drift onto new
+		// nitpicks while the reported defect goes unverified.
+		b.WriteString("\n## Previously reported on this change (round now being re-reviewed)\n\n")
+		writeIssueList(&b, in.prev.Issues)
+		b.WriteString("\nThe implementer has since either fixed each of these or argued it is not a real problem. " +
+			"For each one, decide independently whether it still holds: report it again ONLY if you can still construct " +
+			"the failure scenario against the current code. Then look for defects the fixes themselves introduced.\n")
+	}
+	if in.maxToolCalls > 0 || in.timeout > 0 {
+		b.WriteString("\n## Your budget\n\n")
+		if in.maxToolCalls > 0 {
+			fmt.Fprintf(&b, "- At most %d tool calls. Past that you get one final turn with NO tools, in which you must still emit the verdict JSON.\n", in.maxToolCalls)
+		}
+		if in.timeout > 0 {
+			fmt.Fprintf(&b, "- %s of wall clock for the whole review. Running out kills the review and your findings are lost, so emit your verdict while you still have room.\n", in.timeout)
+		}
+		b.WriteString("- Reason from the diff first; spend tool calls only on questions the diff alone cannot settle.\n")
 	}
 	return b.String()
 }
@@ -518,7 +668,7 @@ func (r *ChatRepl) handleReviewCommand(parentCtx context.Context, args string) {
 		}
 		timeout := r.cfg.ReviewTimeout
 		if timeout <= 0 {
-			timeout = defaultReviewTimeout
+			timeout = DefaultReviewTimeout
 		}
 		r.ui.Info(fmt.Sprintf("  review: auto %s | budget %s | timeout %s | pending files %d",
 			state, budget, timeout, len(r.carry.EditedFiles())))
@@ -539,7 +689,7 @@ func (r *ChatRepl) runManualReview(parentCtx context.Context) {
 		r.ui.Info("  review: nothing to review — no recorded edits and a clean worktree")
 		return
 	}
-	verdict, ok := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap)
+	verdict, ok := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, nil)
 	if !ok {
 		return
 	}
@@ -621,8 +771,12 @@ func unionSorted(a, b []string) []string {
 // relToWorkDir renders paths relative to the working directory for display.
 func relToWorkDir(workDir string, paths []string) []string {
 	out := make([]string, len(paths))
+	// Same-form comparison as isUntracked: a symlinked WorkDir against a
+	// git-canonical path otherwise makes every path look outside the tree and
+	// renders as an absolute path.
+	root := resolveWorktreePath(workDir)
 	for i, p := range paths {
-		if rel, err := filepath.Rel(workDir, p); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel, err := filepath.Rel(root, resolveWorktreePath(p)); err == nil && !strings.HasPrefix(rel, "..") {
 			out[i] = rel
 		} else {
 			out[i] = p

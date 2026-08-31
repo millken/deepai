@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/models"
@@ -203,6 +204,25 @@ func TestReviewGateFailSoftOnToolError(t *testing.T) {
 	}
 }
 
+// "reviewer failed (context deadline exceeded)" told the user nothing they
+// could act on: the window that ran out is configurable, so name it.
+func TestReviewGateDeadlineNamesTheWindowAndKnob(t *testing.T) {
+	fake := &fakeTaskTool{err: context.DeadlineExceeded}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.cfg.ReviewTimeout = 90 * time.Second
+	seedEditedFile(t, r, "a.go", "package a\n")
+
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+		t.Fatalf("a reviewer deadline must fail soft, got %q", got)
+	}
+	info := ui.lastInfo()
+	for _, want := range []string{"1m30s", "review_timeout", "changes are unreviewed"} {
+		if !strings.Contains(info, want) {
+			t.Fatalf("lastInfo = %q, want it to mention %q", info, want)
+		}
+	}
+}
+
 func TestReviewGateFailSoftOnUnparseableVerdict(t *testing.T) {
 	fake := &fakeTaskTool{content: "I could not decide, sorry, no JSON here"}
 	r, ui := newReviewRepl(t, t.TempDir(), fake)
@@ -281,8 +301,13 @@ func TestReviewGateDiffOnlyDegradation(t *testing.T) {
 		t.Fatal("oversized bundle must degrade to diff-only (no context_files)")
 	}
 	prompt, _ := fake.args["prompt"].(string)
-	if !strings.Contains(prompt, "File contents omitted for size") {
-		t.Fatal("diff-only prompt must tell the reviewer to pull files itself")
+	if !strings.Contains(prompt, "NOT attached") || !strings.Contains(prompt, "read_file") {
+		t.Fatalf("diff-only prompt must tell the reviewer to pull files itself:\n%s", prompt)
+	}
+	// The file list is the reviewer's only complete view of the change set
+	// once the bundle is dropped — the diff hunks alone are easy to lose.
+	if !strings.Contains(prompt, "big0.txt") {
+		t.Fatalf("diff-only prompt must still name the changed files:\n%s", prompt)
 	}
 }
 
@@ -500,5 +525,56 @@ func TestLastUserRequestSkipsFixMessages(t *testing.T) {
 	r.sess = nil
 	if got := r.lastUserRequest(); !strings.Contains(got, "own merits") {
 		t.Fatalf("empty-session fallback = %q", got)
+	}
+}
+
+// git reports canonical paths (macOS: /var/... → /private/var/...) while the
+// REPL's WorkDir and edit records carry the path the user typed. When the two
+// forms disagree, an untracked file used to be misclassified as tracked — and
+// `git diff -- <untracked file>` prints NOTHING, so the reviewer was handed an
+// empty diff and passed a brand-new file it never saw.
+func TestReviewDiff_NewFileUnderSymlinkedWorkDir(t *testing.T) {
+	gitOrSkip(t)
+	real := initRepo(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _ := newReviewRepl(t, link, fake)
+	seedEditedFile(t, r, "brand_new.go", "package x\n\nfunc Boom() { panic(\"x\") }\n")
+
+	before := takeWorktreeSnapshot(link)
+	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+		t.Fatalf("want pass, got fix message %q", got)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1", fake.calls)
+	}
+	prompt, _ := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "func Boom()") {
+		t.Fatalf("a new file's contents must reach the reviewer's diff:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "brand_new.go") {
+		t.Fatalf("prompt must name the changed file:\n%s", prompt)
+	}
+}
+
+func TestIsUntracked_SymlinkedPathForm(t *testing.T) {
+	gitOrSkip(t)
+	real := initRepo(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	writeFileOrFatal(t, filepath.Join(real, "fresh.go"), "package x\n")
+
+	snap := takeWorktreeSnapshot(link)
+	if !snap.isUntracked(filepath.Join(link, "fresh.go")) {
+		t.Fatal("an untracked file addressed through a symlinked work dir must still be untracked")
+	}
+	if snap.isUntracked(filepath.Join(link, "committed.go")) {
+		t.Fatal("a committed file must not be reported untracked")
 	}
 }

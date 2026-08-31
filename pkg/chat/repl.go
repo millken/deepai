@@ -68,7 +68,7 @@ type ReplConfig struct {
 	ReviewAfterEdit bool
 	// ReviewTokenBudget caps each review subagent's total tokens; 0 = unlimited.
 	ReviewTokenBudget int
-	// ReviewTimeout bounds one review subagent run; 0 uses defaultReviewTimeout.
+	// ReviewTimeout bounds one review subagent run; 0 uses DefaultReviewTimeout.
 	ReviewTimeout time.Duration
 }
 
@@ -171,6 +171,14 @@ type ChatRepl struct {
 	// (degraded attribution, no reviewer-write detection) fire once per
 	// session instead of once per edited turn.
 	reviewNonGitWarned bool
+
+	// reviewPrev is the failing verdict from the previous review round of the
+	// CURRENT episode, replayed to the next round's reviewer so a re-review
+	// verifies those findings against the fixed code instead of starting from
+	// zero. Cleared when an episode starts and whenever one ends (pass, round
+	// cap, or fail-soft) — a stale verdict leaking into the next episode
+	// would have the reviewer chase findings about a different change.
+	reviewPrev *agent.ReviewResult
 
 	// orphanWait overrides the orphan-turn wait (see orphanWaitOrDefault)
 	// for tests. Zero (the field's default in every real ChatRepl, since

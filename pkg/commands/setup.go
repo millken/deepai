@@ -76,11 +76,12 @@ type Config struct {
 	// justifies flipping the default (design §八-1).
 	ReviewAfterEdit bool `yaml:"review_after_edit,omitempty"`
 	// ReviewTokenBudget caps each review subagent's total tokens. 0 (or
-	// absent) means the 30k default; a negative value means unlimited.
+	// absent) means defaultReviewTokenBudget; a negative value means
+	// unlimited.
 	// Always read through resolveReviewTokenBudget, never directly.
 	ReviewTokenBudget int `yaml:"review_token_budget,omitempty"`
 	// ReviewTimeoutMinutes bounds one review subagent run, in minutes
-	// (matching RequestTimeout's unit). 0 or absent = 5-minute default.
+	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
 
 	// Models defines multiple named model entries for multi-model support.
