@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -576,5 +577,82 @@ func TestIsUntracked_SymlinkedPathForm(t *testing.T) {
 	}
 	if snap.isUntracked(filepath.Join(link, "committed.go")) {
 		t.Fatal("a committed file must not be reported untracked")
+	}
+}
+
+// Real-world failure: a turn that created a new package died with
+// "context_files: could not read .../internal/notify: is a directory".
+// `git status --porcelain` without -uall collapses a wholly-new directory
+// into a single entry for the DIRECTORY, which then travelled through
+// attribution into context_files and failed the whole task — and the new
+// files inside were never listed individually either, so nothing in the new
+// package was reviewed on its own merits.
+func TestReviewGate_NewDirectoryIsExpandedToItsFiles(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+	before := takeWorktreeSnapshot(dir)
+
+	pkgDir := filepath.Join(dir, "internal", "notify")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileOrFatal(t, filepath.Join(pkgDir, "notify.go"), "package notify\n\nfunc Send() {}\n")
+	writeFileOrFatal(t, filepath.Join(pkgDir, "notify_test.go"), "package notify\n")
+
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, dir, fake)
+	// Attribution comes from the snapshot delta alone here — the files were
+	// created outside the tool-record channel (the bash-mediated shape).
+	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+		t.Fatalf("want pass, got %q (info: %s)", got, ui.lastInfo())
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1 — info: %s", fake.calls, ui.lastInfo())
+	}
+
+	files, _ := fake.args["context_files"].([]any)
+	var got []string
+	for _, f := range files {
+		s, _ := f.(string)
+		got = append(got, filepath.Base(s))
+		if s == pkgDir {
+			t.Fatalf("the directory itself must never be attached as a context file: %v", files)
+		}
+	}
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != "notify.go" || got[1] != "notify_test.go" {
+		t.Fatalf("context_files = %v, want both files of the new package", got)
+	}
+	prompt, _ := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "func Send()") && !strings.Contains(prompt, "notify.go") {
+		t.Fatalf("a new package's contents must reach the reviewer:\n%s", prompt)
+	}
+}
+
+// The other live instance of the same landmine: a deleted file is exactly the
+// kind of change review exists for, but its path cannot be read, and
+// buildContextFilesBlock fails the whole task on an unreadable path.
+func TestReviewGate_DeletedFileStaysInDiffNotContextFiles(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+	before := takeWorktreeSnapshot(dir)
+	if err := os.Remove(filepath.Join(dir, "committed.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, dir, fake)
+	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+		t.Fatalf("want pass, got %q (info: %s)", got, ui.lastInfo())
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1 — info: %s", fake.calls, ui.lastInfo())
+	}
+	if files, present := fake.args["context_files"]; present {
+		t.Fatalf("a deleted file must not be attached as content: %v", files)
+	}
+	prompt, _ := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "committed.go") {
+		t.Fatalf("the deletion must still reach the reviewer through the diff:\n%s", prompt)
 	}
 }

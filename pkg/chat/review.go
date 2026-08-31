@@ -64,17 +64,37 @@ func takeWorktreeSnapshot(dir string) worktreeSnapshot {
 	if !ok {
 		return worktreeSnapshot{}
 	}
-	out, err := runGit(dir, "status", "--porcelain", "-z")
+	// -uall is required, not an optimization: the default (-unormal) collapses
+	// a wholly-new directory into ONE entry for the directory itself
+	// ("?? internal/notify/"). That entry then travels through attribution
+	// into the review scope as if it were a file — pkg/agent's
+	// buildContextFilesBlock fails the whole task on it ("could not read ...:
+	// is a directory"), so a turn that created a new package could not be
+	// reviewed at all — and the new files inside it were never listed
+	// individually, so nothing in there was ever reviewed on its own merits.
+	// Cost: in a repo with a large untracked-but-unignored tree this lists
+	// every such file; .gitignore still applies, so the common case is
+	// unaffected.
+	out, err := runGit(dir, "status", "--porcelain", "-z", "-uall")
 	if err != nil {
 		return worktreeSnapshot{}
 	}
 	entries := make(map[string]fileStamp)
 	for _, e := range parsePorcelainZ(out) {
 		stamp := fileStamp{status: e.status}
-		if info, err := os.Stat(filepath.Join(root, e.path)); err == nil && !info.IsDir() {
+		if info, err := os.Stat(filepath.Join(root, e.path)); err == nil {
+			// Belt to -uall's braces: anything git still reports as a
+			// directory (a submodule, or a future porcelain shape) cannot be
+			// diffed or read, so it must never enter attribution.
+			if info.IsDir() {
+				continue
+			}
 			stamp.size = info.Size()
 			stamp.modTime = info.ModTime().UnixNano()
 		}
+		// A stat failure is NOT a skip: that is what a file the turn deleted
+		// looks like, and a deletion is exactly the kind of change review
+		// exists for.
 		entries[e.path] = stamp
 	}
 	return worktreeSnapshot{root: root, entries: entries}
@@ -356,11 +376,19 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
 		return nil, false
 	}
+	// context_files may only ever contain readable regular files.
+	// buildContextFilesBlock fails the WHOLE task on any path it cannot read
+	// — deliberately, since a model naming a wrong path should hear about it
+	// (see its doc) — so one unreadable entry in the scope costs the entire
+	// review. The scope legitimately contains such entries: every file the
+	// turn DELETED is in it. Those paths stay in the diff and in the file
+	// list, which is where a deletion belongs anyway; they just cannot be
+	// attached as content.
+	contextFiles := readableFiles(scope)
 	// Degradation rung (b): when the full-text bundle would blow the
 	// subagent context cap (a hard task failure, not a truncation), drop
 	// context_files and let the read-only reviewer pull what it needs.
-	contextFiles := scope
-	if contextBundleBytes(scope) > reviewContextBundleCap {
+	if contextBundleBytes(contextFiles) > reviewContextBundleCap {
 		contextFiles = nil
 	}
 	return r.runReview(parentCtx, reviewPromptInput{
@@ -599,6 +627,21 @@ func runGitNoIndexDiff(workDir, file string) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// readableFiles keeps only the paths that exist as regular files. Returns nil
+// (not an empty slice) when nothing qualifies, so `contextFiles != nil` still
+// answers "was a bundle attached".
+func readableFiles(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // contextBundleBytes estimates what the scope would cost inside a subagent
