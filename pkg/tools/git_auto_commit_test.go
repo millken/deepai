@@ -431,3 +431,87 @@ func TestToSet(t *testing.T) {
 		t.Fatal("expected a.go and b.go in set")
 	}
 }
+
+// git reports its root with symlinks evaluated (macOS: /var/... →
+// /private/var/...) while working_dir and the model's file paths carry the
+// form the caller used. Comparing the two forms rejected every requested file
+// as "outside repository root", so git_auto_commit with an explicit file list
+// failed outright from a symlinked work dir.
+func TestGitAutoCommit_SymlinkedWorkingDir(t *testing.T) {
+	real := initAutoCommitRepo(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "viasymlink.go"), []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := GitAutoCommitTool(&mockProvider{message: "feat: via symlink"})
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "call-symlink",
+		Name: "git_auto_commit",
+		Arguments: map[string]any{
+			"working_dir": link,
+			// Absolute, addressed through the symlink — the shape a model
+			// produces after reading files under the same working_dir.
+			"files": []interface{}{filepath.Join(link, "viasymlink.go")},
+		},
+	}); err != nil {
+		t.Fatalf("a file under a symlinked work dir must be stageable: %v", err)
+	}
+	if got := gitOutput(t, real, "log", "-1", "--pretty=%s"); got != "feat: via symlink" {
+		t.Fatalf("unexpected commit message: %q", got)
+	}
+	if got := gitOutput(t, real, "log", "-1", "--name-only", "--pretty="); got != "viasymlink.go" {
+		t.Fatalf("committed files = %q, want viasymlink.go", got)
+	}
+}
+
+// Canonicalization must not loosen the containment guard.
+func TestGitAutoCommit_RejectsPathOutsideRepo(t *testing.T) {
+	dir := initAutoCommitRepo(t)
+	outside := filepath.Join(t.TempDir(), "elsewhere.go")
+	if err := os.WriteFile(outside, []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := GitAutoCommitTool(&mockProvider{message: "feat: nope"})
+	_, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "call-outside",
+		Name:      "git_auto_commit",
+		Arguments: map[string]any{"working_dir": dir, "files": []interface{}{outside}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "outside repository root") {
+		t.Fatalf("err = %v, want an outside-repository-root rejection", err)
+	}
+}
+
+// A symlink that LIVES in the repo stays stageable: `git add` records the link
+// entry, never the target's contents, so resolving the final path component
+// would reject a legitimate file (a dotfiles checkout is all symlinks) without
+// preventing anything.
+func TestGitAutoCommit_SymlinkEntryInsideRepoIsStageable(t *testing.T) {
+	dir := initAutoCommitRepo(t)
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("outside content\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	tool := GitAutoCommitTool(&mockProvider{message: "feat: add link"})
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "call-link",
+		Name:      "git_auto_commit",
+		Arguments: map[string]any{"working_dir": dir, "files": []interface{}{link}},
+	}); err != nil {
+		t.Fatalf("a symlink inside the repo must stay stageable: %v", err)
+	}
+	// What landed is the link entry, not the target's bytes.
+	if mode := gitOutput(t, dir, "ls-files", "-s", "link.txt"); !strings.HasPrefix(mode, "120000") {
+		t.Fatalf("staged entry = %q, want a symlink (mode 120000)", mode)
+	}
+}

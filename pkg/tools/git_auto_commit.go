@@ -298,6 +298,42 @@ func gitRepoRoot(ctx context.Context, dir string) (string, error) {
 	return filepath.Abs(strings.TrimSpace(output))
 }
 
+// canonicalDir evaluates symlinks in a directory path, falling back to the
+// input when it cannot be resolved (e.g. it does not exist).
+func canonicalDir(dir string) string {
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return resolved
+	}
+	return dir
+}
+
+// canonicalFilePath canonicalizes a file path's DIRECTORY prefix only,
+// leaving the final component untouched.
+//
+// Why it is needed: `git rev-parse --show-toplevel` reports the root with
+// symlinks evaluated (on macOS a /var/... working_dir comes back as
+// /private/var/...), while working_dir and the model-supplied file paths carry
+// whatever form the caller used. Comparing the two forms made
+// normalizeGitPath reject perfectly valid files with "file %q is outside
+// repository root" — every git_auto_commit call from a symlinked work dir
+// failed.
+//
+// Why the final component is deliberately NOT resolved: `git add somelink`
+// stages the symlink entry itself, not its target. Resolving the last element
+// would change what this check is even about and would reject a symlink that
+// legitimately lives inside the repo (e.g. a dotfiles checkout).
+func canonicalFilePath(path string) string {
+	dir, base := filepath.Split(path)
+	if dir == "" {
+		return path
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return path
+	}
+	return filepath.Join(resolved, base)
+}
+
 func normalizeGitPath(repoRoot, baseDir, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -311,7 +347,10 @@ func normalizeGitPath(repoRoot, baseDir, raw string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve file path %q: %w", raw, err)
 	}
-	relPath, err := filepath.Rel(repoRoot, absPath)
+	// Both sides must be in the same path form before Rel can mean anything;
+	// see canonicalFilePath.
+	repoRoot = canonicalDir(repoRoot)
+	relPath, err := filepath.Rel(repoRoot, canonicalFilePath(absPath))
 	if err != nil {
 		return "", fmt.Errorf("normalize file path %q: %w", raw, err)
 	}
