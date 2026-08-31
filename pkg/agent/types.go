@@ -144,10 +144,20 @@ func (e *TimeoutError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if e.Message != "" {
-		return fmt.Sprintf("%s after %s", e.Message, e.Duration)
+	msg := e.Message
+	if msg == "" {
+		msg = "request timed out"
 	}
-	return fmt.Sprintf("request timed out after %s", e.Duration)
+	// Duration is zero when the deadline that fired was NOT this agent's own
+	// requestTimeout but an outer caller's — e.g. pkg/chat's review wraps the
+	// task tool in its own context.WithTimeout and leaves the subagent's
+	// per-request timeout unset, so normalizeRunError has nothing to report.
+	// "timed out after 0s" then reads as an instant failure after a run that
+	// actually took minutes; say nothing about the window instead.
+	if e.Duration <= 0 {
+		return msg
+	}
+	return fmt.Sprintf("%s after %s", msg, e.Duration)
 }
 
 // Unwrap exposes context.DeadlineExceeded as this error's cause for EVERY
@@ -202,6 +212,13 @@ const (
 	AgentEventEnd           AgentEventType = "end"
 	AgentEventError         AgentEventType = "error"
 	AgentEventCompact       AgentEventType = "compact"
+	// AgentEventProgress is a payload-free liveness ping: the model is
+	// working but has produced nothing renderable yet. Emitted (throttled)
+	// for llm.StreamChunk.Progress — extended-thinking deltas, which can run
+	// for minutes before the first text/tool token, and provider reconnect
+	// heartbeats. Consumers that ignore it lose nothing but the ability to
+	// say "still thinking" instead of showing a frozen last-tool line.
+	AgentEventProgress AgentEventType = "progress"
 )
 
 type ToolCallEvent struct {

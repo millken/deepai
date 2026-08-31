@@ -72,6 +72,10 @@ func (a *Agent) consumeStream(stream <-chan llm.StreamChunk, cancel context.Canc
 		toolCalls   []models.ToolCall
 		streamUsage *llm.Usage
 		stopReason  string
+		// lastProgress is the wall clock of the most recent
+		// AgentEventProgress this stream emitted; see the Progress branch
+		// below for why the ping is throttled.
+		lastProgress time.Time
 	)
 
 	for {
@@ -101,6 +105,21 @@ func (a *Agent) consumeStream(stream <-chan llm.StreamChunk, cancel context.Canc
 				}
 			}
 			idleTimer.Reset(idleTimeout)
+
+			// The watchdog above consumes a Progress chunk silently, which
+			// leaves a UI with nothing to show for the whole reasoning phase:
+			// the last finished tool call stays frozen on the status line for
+			// minutes and the run looks hung. Forward it as a payload-free
+			// liveness ping, throttled to progressPingInterval — thinking
+			// deltas arrive many times per second and emit() drops events once
+			// its buffer fills, so an unthrottled flood here would push out the
+			// tool and text events that actually carry content.
+			if chunk.Progress {
+				if now := time.Now(); now.Sub(lastProgress) >= progressPingInterval {
+					lastProgress = now
+					emit(AgentEvent{Type: AgentEventProgress, MessageID: aiMessageID})
+				}
+			}
 
 			if chunk.Err != nil {
 				cancel()
@@ -174,6 +193,12 @@ func (a *Agent) consumeStream(stream <-chan llm.StreamChunk, cancel context.Canc
 		}
 	}
 }
+
+// progressPingInterval bounds how often a stream forwards its Progress
+// chunks as AgentEventProgress. Fast enough that a UI phase clock looks live,
+// slow enough that a minutes-long thinking phase costs a handful of events
+// rather than thousands.
+const progressPingInterval = 2 * time.Second
 
 func resolveModel(model string) string {
 	if model = strings.TrimSpace(model); model != "" {

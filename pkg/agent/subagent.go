@@ -603,7 +603,16 @@ type subagentProgress struct {
 	agentType string
 	toolCalls int
 	tokens    int
+	// lastPing throttles the liveness events (thinking pings and text
+	// chunks). Tool events are NEVER throttled — they carry content.
+	lastPing time.Time
 }
+
+// subagentPingInterval bounds how often a subagent forwards a liveness ping
+// (AgentEventProgress / AgentEventTextChunk) to its parent. The parent redraws
+// its status block about once a second; anything faster is wasted work on a
+// channel whose overflow policy is to drop.
+const subagentPingInterval = time.Second
 
 // maxToolArgsSummary bounds ToolArgs: it renders on one status line next to
 // the tool name, so a whole write_file body must never reach the UI.
@@ -616,6 +625,18 @@ func (p *subagentProgress) event(evt AgentEvent) (subagent.TaskEvent, bool) {
 	if strings.TrimSpace(message) == "" {
 		return subagent.TaskEvent{}, false
 	}
+	// A liveness ping says only "the model is still working". It is what keeps
+	// the parent's status line moving through a minutes-long thinking phase,
+	// but it arrives far too often to forward every one.
+	switch subagentPhaseFromAgentEvent(evt) {
+	case subagent.PhaseThinking, subagent.PhaseGenerating:
+		now := time.Now()
+		if now.Sub(p.lastPing) < subagentPingInterval {
+			return subagent.TaskEvent{}, false
+		}
+		p.lastPing = now
+	}
+	// Everything else (tool events, errors) is content and always forwarded.
 	// Usage is cumulative-to-date when present; a later event without it must
 	// not reset the total to zero.
 	if evt.Usage != nil && evt.Usage.TotalTokens > 0 {
@@ -625,6 +646,7 @@ func (p *subagentProgress) event(evt AgentEvent) (subagent.TaskEvent, bool) {
 		Message:   message,
 		AgentType: p.agentType,
 		Tokens:    p.tokens,
+		Phase:     subagentPhaseFromAgentEvent(evt),
 	}
 	if evt.ToolEvent != nil {
 		if evt.Type == AgentEventToolCallEnd {
@@ -660,8 +682,33 @@ func summarizeToolArgs(args string) string {
 	return s
 }
 
+// subagentPhaseFromAgentEvent classifies one AgentEvent into the phase the
+// subagent is in while producing it.
+func subagentPhaseFromAgentEvent(evt AgentEvent) string {
+	switch evt.Type {
+	case AgentEventProgress:
+		return subagent.PhaseThinking
+	case AgentEventTextChunk:
+		return subagent.PhaseGenerating
+	case AgentEventToolCallStart, AgentEventToolCallEnd:
+		if evt.ToolEvent != nil {
+			return subagent.PhaseTool
+		}
+	}
+	return ""
+}
+
 func subagentMessageFromAgentEvent(evt AgentEvent) string {
 	switch evt.Type {
+	case AgentEventProgress:
+		return "⋯ thinking"
+	case AgentEventTextChunk:
+		// The text itself streams into the subagent's own transcript; the
+		// parent's one-line status only needs the fact that it is flowing.
+		if strings.TrimSpace(evt.Text) == "" {
+			return ""
+		}
+		return "⋯ generating"
 	case AgentEventToolCallStart:
 		if evt.ToolEvent != nil {
 			return "⚙ " + evt.ToolEvent.Name

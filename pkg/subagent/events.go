@@ -21,6 +21,14 @@ type TaskEvent struct {
 	// used to recover it by scraping "[...]" out of Description, which
 	// mis-parses any description that happens to contain a bracket.
 	AgentType string `json:"agent_type,omitempty"`
+	// Phase is what the subagent is doing at this instant: PhaseTool (a tool
+	// call is in flight), PhaseThinking (the model is reasoning — no output
+	// yet), or PhaseGenerating (the model is streaming its answer). Empty on
+	// events that carry no phase information, in which case a consumer keeps
+	// whatever phase it last saw. Added so a UI can show live activity during
+	// a long model turn instead of pinning the last finished tool call on
+	// screen for minutes.
+	Phase string `json:"phase,omitempty"`
 	// ToolName/ToolArgs/ToolStatus describe the tool this event is about.
 	// ToolStatus is "running", "ok" or "error".
 	ToolName   string `json:"tool_name,omitempty"`
@@ -32,6 +40,13 @@ type TaskEvent struct {
 	ToolCalls  int   `json:"tool_calls,omitempty"`
 	Tokens     int   `json:"tokens,omitempty"`
 }
+
+// Phase values for TaskEvent.Phase.
+const (
+	PhaseTool       = "tool"
+	PhaseThinking   = "thinking"
+	PhaseGenerating = "generating"
+)
 
 type eventSinkContextKey struct{}
 

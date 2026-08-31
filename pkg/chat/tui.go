@@ -309,11 +309,23 @@ const taskSelectionMarker = "\u25c0"
 // 1 visible" happened.
 type subagentTaskLine struct {
 	taskID      string
-	line        string
 	description string
 	agentType   string // e.g., "coder", "tester", "bash"
 	startedAt   time.Time
 	spinnerIdx  int
+	// finishedAt freezes the entry's clock when it resolves. Resolved tasks
+	// stay in the block until the turn ends, so without this a task that
+	// finished at 40s keeps counting up to whatever the slowest sibling
+	// reaches — the final summary then reports a duration it never took.
+	finishedAt time.Time
+	// phase / phaseSince are the current activity and when it started, so the
+	// detail line can show "思考中… 42s" while a model turn runs instead of
+	// pinning the last finished tool call there for minutes.
+	phase      string
+	phaseSince time.Time
+	// lastPing is when this task last proved it was alive (any progress
+	// event). A model turn that goes silent for subagentStallAfter says so.
+	lastPing time.Time
 
 	// Live progress, from TaskEvent's structured fields.
 	currentTool string
@@ -412,6 +424,15 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
+		// Step the subagent spinners on the same ~10fps clock as the main one.
+		// They used to advance on the 1s elapsed tick, which is slow enough
+		// that a fan-out reads as frozen rather than working.
+		for i := range m.subagentTasks {
+			if m.subagentTasks[i].status != "" {
+				continue // resolved: it shows a terminal mark, not a spinner
+			}
+			m.subagentTasks[i].spinnerIdx = (m.subagentTasks[i].spinnerIdx + 1) % len(subagentSpinners)
+		}
 		return m, cmd
 
 	case historyMsg:
@@ -421,10 +442,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case elapsedTickMsg:
 		if m.agentActive {
 			m.elapsed = time.Since(m.turnStart)
-			// Update spinner indices for all subagent tasks to create animation
-			for i := range m.subagentTasks {
-				m.subagentTasks[i].spinnerIdx = (m.subagentTasks[i].spinnerIdx + 1) % 4
-			}
+			// The subagent spinners step on the spinner tick (see
+			// spinner.TickMsg above); this tick only advances the clocks. It
+			// still has to fire once a second even when nothing else changes,
+			// because the elapsed/phase counters in the block are what prove
+			// the run is alive between events.
 			return m, m.elapsedTick()
 		}
 		return m, nil
@@ -888,20 +910,17 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		// AgentType arrives as its own field now. It used to be scraped out of
 		// the description by looking for "[...]", which mis-parsed any
 		// description that merely contained a bracket.
-		m.setSubagentLineWithInfo(evt.TaskID, "  \u21b3 [subagent] "+desc, desc, evt.AgentType)
+		m.setSubagentLineWithInfo(evt.TaskID, desc, evt.AgentType)
 		return nil
 
 	case "task_running":
 		m.recordSubagentProgress(evt)
-		msg := strings.TrimSpace(evt.Message)
-		if msg == "" || msg == "task started" {
-			return nil
+		// lastMessage is the fallback rendering for an event source that fills
+		// nothing but Message; "task started" is the pool's own placeholder and
+		// says less than the phase the recorder just derived.
+		if msg := strings.TrimSpace(evt.Message); msg != "" && msg != "task started" {
+			m.setSubagentMessage(evt.TaskID, msg)
 		}
-		if d := strings.TrimSpace(evt.Description); d != "" {
-			msg = "[" + d + "] " + msg
-		}
-		m.updateSubagentLine(evt.TaskID, "  \u21b3 "+msg)
-		m.setSubagentMessage(evt.TaskID, strings.TrimSpace(evt.Message))
 		return nil
 
 	// Terminal events resolve the entry in place and commit NOTHING: the whole
@@ -983,6 +1002,23 @@ func (m *tuiModel) selectedTask() *subagentTaskLine {
 	return &m.subagentTasks[m.taskSel]
 }
 
+// subagentStallAfter is how long a running task may go without a single
+// progress event before the detail line says so. Longer than the ping
+// interval on the emitting side (pkg/agent's subagentPingInterval) by a wide
+// margin, so ordinary jitter never trips it.
+const subagentStallAfter = 45 * time.Second
+
+// setPhase switches the task's activity, restarting the phase clock only on an
+// actual change — a ping for the phase already showing must not reset the "how
+// long has it been thinking" counter to zero every second.
+func (t *subagentTaskLine) setPhase(phase string) {
+	if t.phase == phase {
+		return
+	}
+	t.phase = phase
+	t.phaseSince = time.Now()
+}
+
 // recordSubagentProgress folds a progress event's structured fields into the
 // task's live counters and activity ring.
 func (m *tuiModel) recordSubagentProgress(evt subagent.TaskEvent) {
@@ -1000,11 +1036,34 @@ func (m *tuiModel) recordSubagentProgress(evt subagent.TaskEvent) {
 		if evt.Tokens > 0 {
 			t.tokens = evt.Tokens
 		}
+		// Any progress event at all proves the task is alive.
+		t.lastPing = time.Now()
+
+		switch evt.Phase {
+		case subagent.PhaseThinking, subagent.PhaseGenerating:
+			// A liveness ping carries no tool: whatever ran last has already
+			// finished, so drop it from the line instead of leaving a stale
+			// call on screen for the whole model turn.
+			t.setPhase(evt.Phase)
+			t.currentTool = ""
+			t.toolArgs = ""
+			return
+		}
+
 		if evt.ToolName == "" {
 			return
 		}
-		t.currentTool = evt.ToolName
-		t.toolArgs = evt.ToolArgs
+		if evt.ToolStatus == "running" {
+			t.setPhase(subagent.PhaseTool)
+			t.currentTool = evt.ToolName
+			t.toolArgs = evt.ToolArgs
+		} else {
+			// The call is done; the model is thinking about its result. The
+			// tool stays in the history below, just not on the status line.
+			t.setPhase(subagent.PhaseThinking)
+			t.currentTool = ""
+			t.toolArgs = ""
+		}
 		t.history = append(t.history, subagentHistoryEntry{
 			tool:       evt.ToolName,
 			args:       evt.ToolArgs,
@@ -1038,6 +1097,10 @@ func (m *tuiModel) resolveSubagentLine(taskID, status, note string) {
 			m.subagentTasks[i].status = status
 			m.subagentTasks[i].endNote = note
 			m.subagentTasks[i].currentTool = ""
+			m.subagentTasks[i].phase = ""
+			if m.subagentTasks[i].finishedAt.IsZero() {
+				m.subagentTasks[i].finishedAt = time.Now()
+			}
 			return
 		}
 	}
@@ -1094,6 +1157,9 @@ func subagentSummaryLine(t subagentTaskLine, last bool) string {
 	if t.tokens > 0 {
 		line += fmt.Sprintf(" \u00b7 %s", formatTokenCount(t.tokens))
 	}
+	if d := subagentTaskAge(t, time.Now()); d > 0 {
+		line += fmt.Sprintf(" \u00b7 %ds", int(d.Seconds()))
+	}
 	if t.endNote != "" && t.status != "done" {
 		line += " \u00b7 " + t.endNote
 	}
@@ -1101,8 +1167,9 @@ func subagentSummaryLine(t subagentTaskLine, last bool) string {
 }
 
 // subagentDetailLine is the second line of a task entry: what it is doing now
-// (or how it ended) plus the running totals.
-func subagentDetailLine(t subagentTaskLine, elapsedSec int, gutter string) string {
+// (or how it ended) plus the running totals. now is passed in rather than read
+// here so every entry in one frame shares a single clock.
+func subagentDetailLine(t subagentTaskLine, now time.Time, gutter string) string {
 	var parts []string
 	switch {
 	case t.status == "done":
@@ -1118,11 +1185,28 @@ func subagentDetailLine(t subagentTaskLine, elapsedSec int, gutter string) strin
 		if t.toolArgs != "" {
 			cur += " " + t.toolArgs
 		}
-		parts = append(parts, cur)
+		parts = append(parts, cur+subagentPhaseAge(t, now))
+	// A model turn is where a long task spends most of its time, and it used
+	// to render as the last finished tool call sitting there unchanged. Name
+	// the phase and clock it, so "not updating" is visibly distinct from
+	// "stuck".
+	case t.phase == subagent.PhaseThinking:
+		parts = append(parts, "\u601d\u8003\u4e2d"+subagentPhaseAge(t, now))
+	case t.phase == subagent.PhaseGenerating:
+		parts = append(parts, "\u751f\u6210\u4e2d"+subagentPhaseAge(t, now))
 	case t.lastMessage != "":
 		parts = append(parts, t.lastMessage)
 	default:
 		parts = append(parts, "\u542f\u52a8\u4e2d\u2026")
+	}
+	// Silence long enough to be suspicious: distinguishes a model that is
+	// still streaming from a provider that has stopped answering. Not applied
+	// during a tool call — a slow tool (bash, a big read) produces no pings by
+	// design, and its own phase clock above already shows how long it has run.
+	if t.status == "" && t.phase != subagent.PhaseTool && !t.lastPing.IsZero() {
+		if quiet := now.Sub(t.lastPing); quiet >= subagentStallAfter {
+			parts = append(parts, fmt.Sprintf("\u65e0\u54cd\u5e94 %ds", int(quiet.Seconds())))
+		}
 	}
 	if t.toolCalls > 0 {
 		parts = append(parts, fmt.Sprintf("%d \u5de5\u5177", t.toolCalls))
@@ -1130,8 +1214,28 @@ func subagentDetailLine(t subagentTaskLine, elapsedSec int, gutter string) strin
 	if t.tokens > 0 {
 		parts = append(parts, formatTokenCount(t.tokens))
 	}
-	parts = append(parts, fmt.Sprintf("%ds", elapsedSec))
+	parts = append(parts, fmt.Sprintf("%ds", int(subagentTaskAge(t, now).Seconds())))
 	return gutter + "    " + strings.Join(parts, " \u00b7 ")
+}
+
+// subagentTaskAge is the task's wall time: frozen at resolution for a finished
+// task, still running for a live one.
+func subagentTaskAge(t subagentTaskLine, now time.Time) time.Duration {
+	end := now
+	if !t.finishedAt.IsZero() {
+		end = t.finishedAt
+	}
+	return end.Sub(t.startedAt)
+}
+
+// subagentPhaseAge renders " 12s" for the current activity, or "" when the
+// phase clock has not started. Kept separate from the task total so the line
+// answers both "how long has this task run" and "how long has it been here".
+func subagentPhaseAge(t subagentTaskLine, now time.Time) string {
+	if t.phaseSince.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf(" %ds", int(now.Sub(t.phaseSince).Seconds()))
 }
 
 // subagentHistoryTail returns at most n most-recent entries.
@@ -1170,26 +1274,18 @@ func formatTokenCount(n int) string {
 
 // setSubagentLineWithInfo creates a new task entry with full metadata.
 // Called only when a task first starts (task_started event).
-func (m *tuiModel) setSubagentLineWithInfo(taskID, line, description, agentType string) {
+func (m *tuiModel) setSubagentLineWithInfo(taskID, description, agentType string) {
+	now := time.Now()
 	m.subagentTasks = append(m.subagentTasks, subagentTaskLine{
 		taskID:      taskID,
-		line:        line,
 		description: description,
 		agentType:   agentType,
-		startedAt:   time.Now(),
-		spinnerIdx:  len(m.subagentTasks) % 4, // Distribute spinner phases
+		startedAt:   now,
+		phaseSince:  now,
+		lastPing:    now,
+		// Distribute spinner phases so a fan-out doesn't pulse in lockstep.
+		spinnerIdx: len(m.subagentTasks) % len(subagentSpinners),
 	})
-}
-
-// updateSubagentLine updates an existing task's line text.
-// Called for task_running events to update progress.
-func (m *tuiModel) updateSubagentLine(taskID, line string) {
-	for i := range m.subagentTasks {
-		if m.subagentTasks[i].taskID == taskID {
-			m.subagentTasks[i].line = line
-			return
-		}
-	}
 }
 
 // commitWithFlush commits the trailing assistant partial (if any) before the
@@ -1357,12 +1453,12 @@ func (m *tuiModel) View() tea.View {
 		overflow = len(visible) - maxLiveSubagentLines
 		visible = visible[:maxLiveSubagentLines]
 	}
+	now := time.Now()
 	for i, task := range visible {
 		branch := "\u251c\u2500"
 		if i == len(visible)-1 && overflow == 0 {
 			branch = "\u2514\u2500"
 		}
-		elapsedSec := int(time.Since(task.startedAt).Seconds())
 
 		// Resolved tasks keep their slot with a terminal mark instead of a
 		// spinner: the whole fan-out stays legible until the turn ends.
@@ -1390,7 +1486,7 @@ func (m *tuiModel) View() tea.View {
 		if branch == "\u2514\u2500" {
 			gutter = " " // the tree has closed; no bar below the last entry
 		}
-		b.WriteString(m.styles.Dim.Render("  " + subagentDetailLine(task, elapsedSec, gutter)))
+		b.WriteString(m.styles.Dim.Render("  " + subagentDetailLine(task, now, gutter)))
 		b.WriteString("\n")
 
 		if task.expanded {

@@ -110,8 +110,12 @@ func TestSubagentProgress_FailedToolCarriesErrorStatus(t *testing.T) {
 
 func TestSubagentProgress_SkipsEventsWithNothingToShow(t *testing.T) {
 	p := &subagentProgress{}
-	if _, ok := p.event(AgentEvent{Type: AgentEventTextChunk, Text: "thinking"}); ok {
-		t.Fatal("a text chunk carries no subagent progress and must be skipped")
+	// An EMPTY text chunk carries nothing at all. A text chunk WITH content is
+	// now forwarded as a throttled "generating" liveness ping (see
+	// TestSubagentProgress_LivenessPhasesAndThrottle) — that is what keeps the
+	// parent's status line moving through a long model turn.
+	if _, ok := p.event(AgentEvent{Type: AgentEventTextChunk, Text: "   "}); ok {
+		t.Fatal("an empty text chunk must be skipped")
 	}
 	if _, ok := p.event(AgentEvent{Type: AgentEventToolCallStart}); ok {
 		t.Fatal("a tool event with no ToolEvent payload must be skipped")

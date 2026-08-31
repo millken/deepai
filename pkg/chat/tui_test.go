@@ -188,7 +188,7 @@ func TestHandleSubagentEvent_RendersRunningProgress(t *testing.T) {
 }
 
 func TestHandleSubagentEvent_CancelledResolvesInPlace(t *testing.T) {
-	m := &tuiModel{subagentTasks: []subagentTaskLine{{taskID: "A", line: "  ↳ [subagent] working"}}}
+	m := &tuiModel{subagentTasks: []subagentTaskLine{{taskID: "A", description: "working"}}}
 	if cmd := m.handleSubagentEvent(subagent.TaskEvent{Type: "task_cancelled", TaskID: "A", Error: "context canceled"}); cmd != nil {
 		t.Fatal("a terminal event must not commit on its own — the block commits at turn end")
 	}
