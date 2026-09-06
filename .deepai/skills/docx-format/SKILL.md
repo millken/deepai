@@ -1,7 +1,8 @@
 ---
 name: docx-format
 description: "Use when the user asks to format, restyle, or apply a template to a .docx Word document: changing fonts, font size, line spacing, alignment, margins, or collapsing extra blank lines, without changing the wording. Triggers on requests like '排版这个文档', '把字体改成微软雅黑', '调整行距', '设置页边距', '套用公司模板', 'format this docx', 'change the font', 'set line spacing', 'adjust the margins', 'apply the corporate template'."
-allowed-tools: [docx_read, docx_format, task, ask_clarification]
+allowed-tools: [docx_read, docx_format, ask_clarification]
+context: fork
 agent: document-editor
 ---
 
@@ -15,21 +16,15 @@ This workflow never rewrites or rephrases the body text — the `docx_format`
 tool it drives is built so that only its `normalize` rule is even allowed to
 touch paragraph count, and nothing it does ever touches a `<w:t>`'s content.
 
-## Step 0 — Delegate, don't format directly
+This skill runs inside the `document-editor` subagent (`context: fork`,
+`agent: document-editor` above) — the main agent invokes it via
+`task(agent_type="document-editor", skill="docx-format", prompt=...)`. The
+tools this workflow uses are `docx_read`, `docx_format`, and
+`ask_clarification`. Never fall back to formatting the document yourself
+from the main agent — always delegate through `task` so the work happens
+inside the subagent.
 
-**Do not call `docx_format` (or `docx_read`) from the main agent.** The
-`agent: document-editor` frontmatter above is a declaration of intent
-only — on the current wiring it does **not** restrict which tools are
-available to you; the actual restriction only takes effect inside a
-subagent. So the first tool call you make for this workflow is `task`:
-
-- `agent_type: document-editor`
-- Pass in the prompt: the resolved file path, and the formatting request in
-  the user's own words (template name, or the specific fonts/sizes/spacing/
-  margins they asked for).
-
-Everything below describes what happens **inside** the `document-editor`
-subagent (or is what you put in the delegation prompt).
+Everything below describes what happens inside that subagent run.
 
 **Never fall back to bash, Python, `python-docx`, or any other script to
 format the document, no matter how simple the request looks or how

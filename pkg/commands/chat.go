@@ -207,18 +207,22 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 	for _, a := range agentCatalog {
 		agentOpts = append(agentOpts, tools.AgentOption{Type: string(a.Type), Description: a.Description})
 	}
-	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts)
-	if cfg.IsAutonomous() {
-		slog.Info("autonomous mode enabled: ask_clarification will not block")
-	}
-
-	// Load skills (plugin roots included; LoadAllReported appends /skills itself).
-	// Warnings are surfaced below for plugin-source dirs.
+	// Load skills (plugin roots included; LoadAllReported appends /skills itself)
+	// BEFORE registerChatTools: the subagent executor needs the registry
+	// wired in (WithSkillRegistry) regardless of whether the skill TOOL ends
+	// up registered below — a role's `skills:` preload doesn't depend on the
+	// skill tool at all. Warnings are surfaced below for plugin-source dirs.
 	skillReg := skill.NewRegistry()
 	skillWarnings := skillReg.LoadAllReported(workDir, pluginRoots)
 	for _, w := range skillWarnings {
 		slog.Warn("skill load issue", "source", w.Source, "dir", w.Dir, "err", w.Msg)
 	}
+
+	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts, skillReg)
+	if cfg.IsAutonomous() {
+		slog.Info("autonomous mode enabled: ask_clarification will not block")
+	}
+
 	if skillReg.Count() > 0 {
 		if err := registry.Register(skill.SkillToolWithRegistry(skillReg)); err != nil {
 			slog.Warn("register skill tool failed", "err", err)
@@ -355,18 +359,22 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 // registerChatTools returns the subagent pool so the REPL can cancel a single
 // task from the UI; the pool is created here because this is where the tool
 // registry is assembled.
-func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption) *subagent.Pool {
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
 	// advertised agents resolve to the same source at execution time.
+	// WithSkillRegistry is unconditional — a role's `skills:` preload and a
+	// task's fork-skill (`skill` arg) don't depend on whether the skill TOOL
+	// itself got registered (that's gated on skillReg.Count() > 0, below).
 	subExecutor := agent.NewSubagentExecutor(modelRegistry, registry, nil).
 		WithWorkDir(workDir).
 		WithContextWindow(contextWindow).
 		WithMaxTokens(subagentMaxTokens()).
 		WithTemperature(temperature).
-		WithPluginAgentDirs(pluginAgentDirs)
+		WithPluginAgentDirs(pluginAgentDirs).
+		WithSkillRegistry(skillReg)
 	subPool := agent.NewSubagentPool(subExecutor, 0)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))

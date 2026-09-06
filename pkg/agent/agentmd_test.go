@@ -73,6 +73,51 @@ func TestParseAgentMarkdown_NameFallback(t *testing.T) {
 	}
 }
 
+// TestParseAgentMarkdown_Skills is the RED test for M5-1 §2.4: an agent MD's
+// `skills:` frontmatter key (a YAML list, aligned with Claude Code's own
+// `skills:` key name — unlike `tools:`, which stays the space/comma-separated
+// string style this file already uses) must load into
+// AgentTypeConfig.Skills.
+func TestParseAgentMarkdown_Skills(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "role-architect.md")
+	writeAgentMD(t, path, `---
+name: role-architect
+description: Architect with a playbook.
+skills:
+  - role-architect
+  - golang
+---
+You are an architect.`)
+	cfg, err := ParseAgentMarkdown(path)
+	if err != nil {
+		t.Fatalf("ParseAgentMarkdown: %v", err)
+	}
+	want := []string{"role-architect", "golang"}
+	if len(cfg.Skills) != len(want) {
+		t.Fatalf("Skills = %v, want %v", cfg.Skills, want)
+	}
+	for i, w := range want {
+		if cfg.Skills[i] != w {
+			t.Fatalf("Skills[%d] = %q, want %q", i, cfg.Skills[i], w)
+		}
+	}
+}
+
+// TestParseAgentMarkdown_NoSkillsIsNil ensures the common case (no `skills:`
+// key at all) leaves Skills nil rather than an empty-but-non-nil slice,
+// matching mergeConfig's "only a non-empty override wins" contract.
+func TestParseAgentMarkdown_NoSkillsIsNil(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plain.md")
+	writeAgentMD(t, path, "---\nname: plain\n---\nBody.")
+	cfg, err := ParseAgentMarkdown(path)
+	if err != nil {
+		t.Fatalf("ParseAgentMarkdown: %v", err)
+	}
+	if cfg.Skills != nil {
+		t.Fatalf("Skills = %v, want nil", cfg.Skills)
+	}
+}
+
 func TestMapClaudeTools_Passthrough(t *testing.T) {
 	// Unknown names pass through unchanged (allows already-deepai names).
 	got := mapClaudeTools("Read, bash, custom-tool")

@@ -56,6 +56,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				"subagent_type":  map[string]any{"type": "string", "description": "Deprecated: use agent_type instead"},
 				"agent_type":     map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
 				"model":          map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
+				"skill":          map[string]any{"type": "string", "description": "Optional skill to run inside this subagent. Use the exact name the skill tool told you to use."},
 				"max_tool_calls": map[string]any{"type": "integer", "description": "Optional cap on the number of tool calls this subagent may execute (0 = no cap). On exhaustion the subagent wraps up with a final answer instead of failing."},
 				"max_turns":      map[string]any{"type": "integer", "description": "Deprecated alias for max_tool_calls"},
 				"token_budget":   map[string]any{"type": "integer", "description": "Optional max total tokens for this subagent; 0 = unlimited"},
@@ -133,6 +134,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 			if agentType == "" {
 				agentType = strings.TrimSpace(stringArg(call.Arguments["subagent_type"]))
 			}
+			skillName := strings.TrimSpace(stringArg(call.Arguments["skill"]))
 
 			contextFiles, err := stringsFromArg(call.Arguments["context_files"])
 			if err != nil {
@@ -154,6 +156,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				Model:        strings.TrimSpace(model),
 				TokenBudget:  tokenBudget,
 				ContextFiles: contextFiles,
+				Skill:        skillName,
 			})
 			if err != nil {
 				return models.ToolResult{

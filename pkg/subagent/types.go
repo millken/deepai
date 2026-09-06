@@ -55,6 +55,12 @@ type SubagentConfig struct {
 	// The parent names files explicitly rather than context being shared
 	// automatically — see docs/ARCHITECTURE_REVIEW.md M2.4.
 	ContextFiles []string
+	// Skill optionally names a context:fork skill (pkg/skill) to run inside
+	// this subagent — the task tool's `skill` argument, verbatim. Validated
+	// and rendered by SubagentExecutor.Execute (whether the skill exists,
+	// and whether it is bound to THIS agent type), not here: this layer has
+	// no skill registry to check against, same as agent_type.
+	Skill string
 }
 
 // EffectiveAgentType returns the resolved agent type string.

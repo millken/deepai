@@ -27,6 +27,7 @@ type yamlAgentConfig struct {
 	LegacyMaxTurns   *int     `yaml:"max_turns"`
 	Temperature      *float64 `yaml:"temperature"`
 	Model            string   `yaml:"model"`
+	Skills           []string `yaml:"skills"`
 }
 
 // validateSafeName rejects names containing path separators or ".." to prevent path traversal.
@@ -67,6 +68,7 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 		SystemPrompt: yc.SystemPrompt,
 		DefaultTools: yc.DefaultTools,
 		Model:        yc.Model,
+		Skills:       yc.Skills,
 	}
 	if yc.MaxToolCalls != nil {
 		cfg.MaxToolCalls = *yc.MaxToolCalls
@@ -159,6 +161,13 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig, baseIsBuiltin 
 	}
 	if strings.TrimSpace(override.Model) != "" {
 		result.Model = override.Model
+	}
+	// Skills follows the exact same "non-empty override replaces wholesale"
+	// contract as DefaultTools above (a fresh slice, not an alias — the
+	// override's caller must not be able to mutate result.Skills's backing
+	// array through their own reference to it later).
+	if len(override.Skills) > 0 {
+		result.Skills = append([]string(nil), override.Skills...)
 	}
 
 	// A real builtin's nil/absent DefaultTools means "unrestricted" and must

@@ -197,6 +197,60 @@ Body.
 	}
 }
 
+// TestParseSkill_ForkContextAgent is the RED test for M5-1 §2.1: a
+// fork-bound skill's frontmatter must round-trip Context/Agent, and IsFork()
+// must report true for it.
+func TestParseSkill_ForkContextAgent(t *testing.T) {
+	dir := t.TempDir()
+	writeSKILL(t, dir, `---
+name: docx-polish
+description: Polish a docx file.
+context: fork
+agent: document-editor
+---
+
+Body.
+`)
+
+	sk, err := ParseSkill(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sk.Meta.Context != "fork" {
+		t.Errorf("Context = %q, want fork", sk.Meta.Context)
+	}
+	if sk.Meta.Agent != "document-editor" {
+		t.Errorf("Agent = %q, want document-editor", sk.Meta.Agent)
+	}
+	if !sk.Meta.IsFork() {
+		t.Error("IsFork() = false, want true")
+	}
+}
+
+// TestFrontmatter_IsFork covers IsFork()'s trim/case-insensitive matching and
+// the non-fork/empty defaults, independent of file parsing.
+func TestFrontmatter_IsFork(t *testing.T) {
+	cases := []struct {
+		name    string
+		context string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"fork lowercase", "fork", true},
+		{"fork uppercase", "FORK", true},
+		{"fork mixed case with whitespace", "  Fork  ", true},
+		{"other value", "inline", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := Frontmatter{Context: c.context}
+			if got := f.IsFork(); got != c.want {
+				t.Errorf("IsFork() with Context=%q = %v, want %v", c.context, got, c.want)
+			}
+		})
+	}
+}
+
 func writeSKILL(t *testing.T, dir string, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0644); err != nil {

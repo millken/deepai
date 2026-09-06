@@ -87,6 +87,33 @@ func TestRegistry_Descriptions(t *testing.T) {
 	}
 }
 
+// TestDescriptionsForAgent_EmptyAfterFilterReturnsEmptyString is the RED test
+// for the post-review low-priority fix: describeSkills always writes the
+// "Available skills:" header before checking whether any skill actually
+// passed the include filter, so DescriptionsForAgent could return a
+// header-only string with zero entries — which pkg/agent/subagent.go's `if
+// desc != ""` check can never catch (a non-empty header always passes),
+// injecting a useless "Available skills (use the matching skill when the
+// user request fits):" block with nothing under it. Descriptions() and
+// DescriptionsFiltered() keep their existing behavior (this fix is scoped to
+// DescriptionsForAgent only, which is new in M5-1).
+func TestDescriptionsForAgent_EmptyAfterFilterReturnsEmptyString(t *testing.T) {
+	reg := NewRegistry()
+	reg.skills = map[string]*Skill{
+		"other-fork": {Meta: Frontmatter{
+			Name:        "other-fork",
+			Description: "bound to a different agent",
+			Context:     "fork",
+			Agent:       "other-role",
+		}},
+	}
+
+	desc := reg.DescriptionsForAgent("custom-role")
+	if desc != "" {
+		t.Fatalf("DescriptionsForAgent() = %q, want \"\" (every skill was filtered out)", desc)
+	}
+}
+
 // TestDescriptionsFiltered_SanitizesBlankLinesInDescription is the RED test
 // for M4-3 review r2 F2-a: a SKILL.md YAML frontmatter description can be a
 // block scalar containing a blank line (e.g. a wrapped paragraph). Rendered
@@ -562,5 +589,73 @@ func TestLoadAllReported_MissingDirSilent(t *testing.T) {
 	warnings := reg.LoadAllReported("", []string{"/nonexistent/deepai-plugin"})
 	if len(warnings) != 0 {
 		t.Fatalf("missing dir should produce no warning, got %+v", warnings)
+	}
+}
+
+// TestLoadAllReported_ForkWithoutAgentWarns is the RED test for M5-1 §2.1's
+// load-time lint: `context: fork` with no `agent:` binding is a
+// misconfiguration (the routing in tool.go has nowhere to send the subagent)
+// and must surface as a SkillWarning, not be silently accepted.
+func TestLoadAllReported_ForkWithoutAgentWarns(t *testing.T) {
+	projectDir := t.TempDir()
+	skillDir := filepath.Join(projectDir, ".deepai", "skills", "orphan-fork")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: orphan-fork
+description: A fork skill with no agent binding.
+context: fork
+---
+
+Body.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := NewRegistry()
+	warnings := reg.LoadAllReported(projectDir, nil)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w.Msg, `fork skill "orphan-fork" has no agent: binding`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a warning about orphan-fork's missing agent binding, got %+v", warnings)
+	}
+}
+
+// TestLoadAllReported_AgentWithoutForkWarns is the RED test for the mirror
+// case: `agent:` set but `context` isn't "fork" — this was the docx-* skills'
+// actual state before M5-1 (§2.8 fixes them), and must warn so it can't
+// recur silently.
+func TestLoadAllReported_AgentWithoutForkWarns(t *testing.T) {
+	projectDir := t.TempDir()
+	skillDir := filepath.Join(projectDir, ".deepai", "skills", "stray-agent")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(`---
+name: stray-agent
+description: Has an agent binding but no fork context.
+agent: document-editor
+---
+
+Body.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := NewRegistry()
+	warnings := reg.LoadAllReported(projectDir, nil)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w.Msg, `stray-agent`) && strings.Contains(w.Msg, `document-editor`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a warning about stray-agent's agent binding without context: fork, got %+v", warnings)
 	}
 }

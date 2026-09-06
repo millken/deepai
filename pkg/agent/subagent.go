@@ -12,6 +12,7 @@ import (
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -27,6 +28,11 @@ type SubagentExecutor struct {
 	temperature     *float64
 	workDir         string
 	pluginAgentDirs []string
+	// skills is the skill registry used for role-carried Skills preload
+	// (profileCfg.Skills) and task.Config.Skill fork-skill resolution (M5-1
+	// §2.6). nil means neither feature is available; Execute hard-fails
+	// rather than silently ignoring a profile/task that asked for one.
+	skills *skill.Registry
 }
 
 func NewSubagentExecutor(registry *llm.ModelRegistry, toolReg *tools.Registry, sb *sandbox.Sandbox) *SubagentExecutor {
@@ -72,6 +78,16 @@ func (e *SubagentExecutor) WithMaxTokens(n *int) *SubagentExecutor {
 func (e *SubagentExecutor) WithTemperature(t *float64) *SubagentExecutor {
 	if e != nil {
 		e.temperature = t
+	}
+	return e
+}
+
+// WithSkillRegistry wires the skill registry used for a profile's Skills
+// preload and a task's fork-skill resolution (§2.6). nil-receiver safe, like
+// every other With* here, so a nil *SubagentExecutor chain doesn't panic.
+func (e *SubagentExecutor) WithSkillRegistry(r *skill.Registry) *SubagentExecutor {
+	if e != nil {
+		e.skills = r
 	}
 	return e
 }
@@ -126,31 +142,128 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		_ = registry.Register(tool)
 	}
 
-	// Determine system prompt: explicit > AgentType default
+	// Determine system prompt: explicit > AgentType default (L1,
+	// AGENT_CAPABILITY_DESIGN.md §1/§2.2).
 	systemPrompt := task.Config.SystemPrompt
 	if strings.TrimSpace(systemPrompt) == "" {
 		systemPrompt = profileCfg.SystemPrompt
 	}
 
-	// MaxToolCalls priority: caller-explicit (max_tool_calls arg) > agent type
-	// profile (builtin/YAML/MD). The pool contributes nothing here — it
-	// deliberately injects no per-type defaults (see Pool.resolveConfig), so a
-	// profile's value can never be shadowed. 0 (the common case) means NO
-	// workload cap by design: a fixed default cannot fit both small tasks and
-	// whole-project reviews, so the run is bounded by the parent context, the
-	// optional token budget, context compaction, and the repeat-call breaker
-	// instead — the same shape as Claude-style subagents. When a cap IS set,
-	// react.go counts executed tool calls (model-agnostic) and gracefully
-	// wraps up with a final no-tools answer on exhaustion.
-	maxToolCalls := resolveMaxToolCalls(task.Config.MaxToolCalls, profileCfg.MaxToolCalls)
+	// L2: role-carried skills preload (profileCfg.Skills). A profile
+	// declaring skills with no registry wired, or naming a skill the
+	// registry doesn't have, is a misconfiguration — same policy as an
+	// unknown agent_type (see the typeResolved check above): failing loudly
+	// beats silently running the role without the playbook it depends on.
+	// Order is profileCfg.Skills' own order, so the assembled prompt is
+	// deterministic across Runs (see the prefix-stability test).
+	if len(profileCfg.Skills) > 0 && e.skills == nil {
+		return subagent.ExecutionResult{}, fmt.Errorf("agent type %q declares skills but no skill registry is configured", agentType)
+	}
+	for _, name := range profileCfg.Skills {
+		body, err := e.skills.LoadBody(name)
+		if err != nil {
+			return subagent.ExecutionResult{}, fmt.Errorf("preload skill %q for agent type %q: %w", name, agentType, err)
+		}
+		systemPrompt += "\n\n" + body
+	}
 
-	// Inject OutputSchema prompt into system prompt when available
+	// §2.6 step 3: task.Config.Skill selects a context:fork skill to run
+	// inside THIS subagent (the task tool's `skill` argument — the first
+	// real consumer of Meta.Model/MaxTurns/Temperature since Phase 3). Model/
+	// MaxTurns/Temperature are captured here and consumed below, alongside
+	// the profile's own values and the model registry's, rather than
+	// applied immediately — see the priority-chain comments at each site.
+	var forkModelAlias string
+	var forkMaxTurns *int
+	var forkTemperature *float64
+	if forkName := strings.TrimSpace(task.Config.Skill); forkName != "" {
+		if e.skills == nil {
+			return subagent.ExecutionResult{}, fmt.Errorf("task requested skill %q but no skill registry is configured", forkName)
+		}
+		sk := e.skills.Get(forkName)
+		if sk == nil {
+			return subagent.ExecutionResult{}, fmt.Errorf("unknown skill %q", forkName)
+		}
+		if sk.Meta.Agent != "" && sk.Meta.Agent != string(agentType) {
+			return subagent.ExecutionResult{}, fmt.Errorf("skill %q is bound to agent %q, not %q", forkName, sk.Meta.Agent, agentType)
+		}
+		body, err := e.skills.LoadBody(forkName)
+		if err != nil {
+			return subagent.ExecutionResult{}, fmt.Errorf("load skill %q: %w", forkName, err)
+		}
+		// args = task.Prompt: the fork skill's $ARGUMENTS is the request the
+		// parent agent (or main agent) wrote for this delegation, exactly
+		// as if the user had typed "/skill-name <that request>".
+		rendered, err := skill.Render(ctx, body, task.Prompt, sk)
+		if err != nil {
+			return subagent.ExecutionResult{}, fmt.Errorf("render skill %q: %w", forkName, err)
+		}
+		systemPrompt += "\n\n" + rendered
+		forkModelAlias = strings.TrimSpace(sk.Meta.Model)
+		forkMaxTurns = sk.Meta.MaxTurns
+		forkTemperature = sk.Meta.Temperature
+	}
+
+	// §2.6 step 4: when the subagent's own tool set includes "skill",
+	// advertise the catalog it can actually act on — excluding a fork skill
+	// bound to a DIFFERENT agent type, which the tool call would succeed at
+	// reaching but the routing in pkg/skill/tool.go always refuses (see
+	// Registry.DescriptionsForAgent).
+	if e.skills != nil {
+		for _, t := range selectedTools {
+			if t.Name == "skill" {
+				if desc := e.skills.DescriptionsForAgent(string(agentType)); desc != "" {
+					systemPrompt += "\n\n" + desc
+				}
+				break
+			}
+		}
+	}
+
+	// MaxToolCalls priority: caller-explicit (task tool's max_tool_calls arg)
+	// > fork skill's max-turns > agent type profile (builtin/YAML/MD). The
+	// fork skill's value is folded into the "caller" argument passed to
+	// resolveMaxToolCalls — NOT a new priority tier inside that function —
+	// so the one PRODUCTION chain tests already pin
+	// (TestResolveMaxToolCalls_Priority) stays the single source of truth;
+	// when task.Config.MaxToolCalls is explicit (>0) it always wins, exactly
+	// as before this change. 0 (the common case, no skill and no explicit
+	// arg) means NO workload cap by design: a fixed default cannot fit both
+	// small tasks and whole-project reviews, so the run is bounded by the
+	// parent context, the optional token budget, context compaction, and the
+	// repeat-call breaker instead. When a cap IS set, react.go counts
+	// executed tool calls (model-agnostic) and gracefully wraps up with a
+	// final no-tools answer on exhaustion.
+	callerMaxToolCalls := task.Config.MaxToolCalls
+	if callerMaxToolCalls <= 0 && forkMaxTurns != nil {
+		callerMaxToolCalls = *forkMaxTurns
+	}
+	maxToolCalls := resolveMaxToolCalls(callerMaxToolCalls, profileCfg.MaxToolCalls)
+
+	// Inject OutputSchema prompt into system prompt when available (last,
+	// unchanged from before this change).
 	if profileCfg.OutputSchema != nil && profileCfg.OutputSchema.Prompt != "" {
 		systemPrompt += "\n\nOutput your response as JSON matching this schema:\n" + profileCfg.OutputSchema.Prompt
 	}
 
-	// Resolve model alias: task.Config.Model > agent type YAML model > registry default.
+	// Resolve model alias: task.Config.Model (caller-explicit) > fork
+	// skill's model: > agent type YAML model > registry default. The fork
+	// skill sits between the caller-explicit override and the profile's own
+	// default: it is more specific than "whatever this role normally runs
+	// on" (the skill was picked for THIS task) but must not silently
+	// override an explicit task-tool `model` argument. This resolution MUST
+	// run after the fork-skill block above (which is what determines
+	// forkModelAlias) and before e.registry.ProviderFor below — reordering
+	// choice for this M5-1 change: the model-resolution block (previously
+	// positioned right after the OutputSchema injection) was moved DOWN, to
+	// after system-prompt/fork-skill assembly, rather than moving fork-skill
+	// resolution up before tool selection — model resolution has no
+	// dependency on the selected tool set, so moving it down keeps the
+	// system-prompt-building code contiguous instead.
 	modelAlias := strings.TrimSpace(task.Config.Model)
+	if modelAlias == "" {
+		modelAlias = forkModelAlias
+	}
 	if modelAlias == "" {
 		modelAlias = strings.TrimSpace(profileCfg.Model)
 	}
@@ -160,12 +273,16 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	}
 
 	// Temperature priority: the RESOLVED profile's explicit `temperature:`
-	// (builtin profiles carry none) > the task's resolved model alias's
-	// models[].temperature > the session-level fallback from WithTemperature.
-	// nil sends none — Claude 4.7+ rejects sampling parameters outright.
+	// (builtin profiles carry none) > the fork skill's temperature: > the
+	// task's resolved model alias's models[].temperature > the
+	// session-level fallback from WithTemperature. nil sends none — Claude
+	// 4.7+ rejects sampling parameters outright.
 	subTemperature := e.temperature
 	if def, ok := e.registry.Resolve(modelAlias); ok && def.Temperature != nil {
 		subTemperature = def.Temperature
+	}
+	if forkTemperature != nil {
+		subTemperature = forkTemperature
 	}
 	if profileCfg.temperatureSet {
 		t := profileCfg.Temperature
@@ -210,6 +327,12 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// inherited UserInteraction so plan confirmations auto-approve and
 	// clarifications fall back to best-judgment instead of prompting.
 	ctx = tools.WithUserInteraction(ctx, nil)
+	// Stamp the resolved agent type as the "caller" identity for anything
+	// this subagent itself invokes — in particular the skill tool's fork
+	// routing (pkg/skill/tool.go), which needs to tell "I'm already running
+	// inside my bound agent" apart from "a different subagent" or "the main
+	// agent" (empty string).
+	ctx = skill.WithCallerAgentType(ctx, string(agentType))
 
 	// stats is the task's workload profile, returned on EVERY exit path below
 	// (including error/fail-soft ones — failed delegations are exactly the

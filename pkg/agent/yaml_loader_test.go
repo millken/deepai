@@ -260,6 +260,71 @@ system_prompt_file: ../../etc/passwd
 	})
 }
 
+// TestLoadAgentYAML_Skills is the RED test for M5-1 §2.4: a project agent
+// YAML's `skills:` list must load into AgentTypeConfig.Skills so the profile
+// can carry L2 playbooks (AGENT_CAPABILITY_DESIGN.md §1).
+func TestLoadAgentYAML_Skills(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := `type: role-architect
+skills:
+  - role-architect
+`
+	if err := os.WriteFile(filepath.Join(agentsDir, "role-architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadAgentYAML("role-architect", dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	if len(cfg.Skills) != 1 || cfg.Skills[0] != "role-architect" {
+		t.Errorf("Skills = %v, want [role-architect]", cfg.Skills)
+	}
+}
+
+// TestMergeConfig_Skills mirrors the DefaultTools merge contract (§2.4): a
+// non-empty override.Skills replaces the base's list wholesale (with its own
+// slice, not an alias); an EMPTY override.Skills must NOT clear a non-empty
+// base — mergeConfig has no way to distinguish "absent key" from "explicit
+// empty list" for a plain []string (unlike MaxToolCalls/Temperature's *Set
+// flags), so the merge policy is simply "only a non-empty override wins".
+func TestMergeConfig_Skills(t *testing.T) {
+	base := AgentTypeConfig{Type: AgentTypeArchitect, Skills: []string{"role-architect"}}
+
+	t.Run("non-empty override replaces base", func(t *testing.T) {
+		override := &AgentTypeConfig{Skills: []string{"golang"}}
+		result := mergeConfig(base, override, true)
+		if len(result.Skills) != 1 || result.Skills[0] != "golang" {
+			t.Errorf("Skills = %v, want [golang]", result.Skills)
+		}
+	})
+
+	t.Run("empty override keeps base", func(t *testing.T) {
+		override := &AgentTypeConfig{}
+		result := mergeConfig(base, override, true)
+		if len(result.Skills) != 1 || result.Skills[0] != "role-architect" {
+			t.Errorf("Skills = %v, want base's [role-architect] preserved", result.Skills)
+		}
+	})
+
+	t.Run("result.Skills is an independent copy, not an alias of override.Skills", func(t *testing.T) {
+		src := []string{"golang"}
+		override := &AgentTypeConfig{Skills: src}
+		result := mergeConfig(AgentTypeConfig{}, override, true)
+		result.Skills[0] = "mutated"
+		if src[0] != "golang" {
+			t.Fatalf("mergeConfig aliased override.Skills's backing array; src = %v", src)
+		}
+	})
+}
+
 // TestLoadAgentYAML_ExplicitZeroOverrides: an explicit `temperature: 0` (or
 // `max_turns: 0`) in project YAML must be distinguishable from the field being
 // absent — otherwise a reviewer agent wanting temperature 0 silently keeps

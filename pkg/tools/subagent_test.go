@@ -105,6 +105,68 @@ func TestTaskTool_SubagentTypeArgPassesThroughVerbatim(t *testing.T) {
 	}
 }
 
+// TestTaskTool_SkillArgPassesThrough is the RED test for M5-1 §2.5: the task
+// tool must accept an optional `skill` argument and pass it verbatim into
+// SubagentConfig.Skill. Validation (whether the skill exists, or is bound to
+// this agent type) deliberately happens in the executor, not here — this
+// layer has no skill registry to check against, the same reasoning already
+// applied to agent_type.
+func TestTaskTool_SkillArgPassesThrough(t *testing.T) {
+	var got string
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			got = cfg.Skill
+			return &subagent.Task{ID: "task-1"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:   "c",
+		Name: "task",
+		Arguments: map[string]any{
+			"description": "d", "prompt": "p",
+			"agent_type": "document-editor",
+			"skill":      "docx-polish",
+		},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+	if got != "docx-polish" {
+		t.Fatalf("cfg.Skill = %q, want docx-polish", got)
+	}
+}
+
+// TestTaskTool_SkillArgDefaultsEmpty ensures omitting `skill` leaves
+// SubagentConfig.Skill empty (no fork-skill run requested).
+func TestTaskTool_SkillArgDefaultsEmpty(t *testing.T) {
+	var got string
+	gotSet := false
+	tool := TaskTool(fakeTaskPool{
+		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {
+			got = cfg.Skill
+			gotSet = true
+			return &subagent.Task{ID: "task-1"}, nil
+		},
+		wait: func(ctx context.Context, taskID string) (*subagent.Task, error) {
+			return &subagent.Task{ID: taskID, Status: subagent.TaskStatusCompleted, Result: "ok"}, nil
+		},
+	}, nil)
+
+	if _, err := tool.Handler(context.Background(), models.ToolCall{
+		ID:        "c",
+		Name:      "task",
+		Arguments: map[string]any{"description": "d", "prompt": "p"},
+	}); err != nil {
+		t.Fatalf("Handler() error = %v", err)
+	}
+	if !gotSet || got != "" {
+		t.Fatalf("cfg.Skill = %q, want empty", got)
+	}
+}
+
 func TestTaskToolFailed(t *testing.T) {
 	tool := TaskTool(fakeTaskPool{
 		startTask: func(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error) {

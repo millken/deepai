@@ -38,6 +38,11 @@ type AgentTypeConfig struct {
 	Temperature  float64       `json:"temperature" yaml:"temperature"`
 	Model        string        `json:"model,omitempty" yaml:"model,omitempty"`
 	OutputSchema *OutputSchema `json:"-" yaml:"-"`
+	// Skills names role-carried L2 playbooks (AGENT_CAPABILITY_DESIGN.md §1)
+	// preloaded into the system prompt at subagent construction time — see
+	// SubagentExecutor.Execute. No builtin profile sets this (M5-1 keeps the
+	// baseline prompts untouched); a project YAML/MD can add it.
+	Skills []string `json:"skills,omitempty" yaml:"skills,omitempty"`
 
 	// maxToolCallsSet/temperatureSet mark MaxToolCalls/Temperature as an
 	// explicit override even when the value is the zero value (0). Only the

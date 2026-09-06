@@ -14,6 +14,7 @@ import (
 
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -1318,5 +1319,433 @@ func TestSubagentExecutor_RunStatsAggregation(t *testing.T) {
 	}
 	if stats.DurationMS < 0 {
 		t.Errorf("DurationMS = %d, want a non-negative elapsed time", stats.DurationMS)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M5-1 §2.6: skill ↔ agent binding wired into SubagentExecutor.Execute.
+// ---------------------------------------------------------------------------
+
+// skillCaptureProvider records every ChatRequest it is asked to Stream, so a test
+// can inspect exactly what SystemPrompt/Temperature Execute assembled —
+// unlike scriptedOutputProvider (used by the schema-retry tests above), it
+// always answers with a single plain-text turn (no tool calls), which is all
+// these injection-order tests need.
+type skillCaptureProvider struct {
+	mu       sync.Mutex
+	requests []llm.ChatRequest
+}
+
+func (p *skillCaptureProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *skillCaptureProvider) Stream(_ context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{Delta: "done", Stop: "stop", Done: true}
+	}()
+	return ch, nil
+}
+
+func (p *skillCaptureProvider) last() llm.ChatRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.requests[len(p.requests)-1]
+}
+
+// writeProjectAgentYAML writes workDir/.deepai/agents/<type>.yaml with the
+// given raw YAML body, creating directories as needed.
+func writeProjectAgentYAML(t *testing.T, workDir, agentType, yamlBody string) {
+	t.Helper()
+	dir := filepath.Join(workDir, ".deepai", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, agentType+".yaml"), []byte(yamlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeTestSkill writes <skillsDir>/<name>/SKILL.md with the given raw content.
+func writeTestSkill(t *testing.T, skillsDir, name, content string) {
+	t.Helper()
+	dir := filepath.Join(skillsDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSubagentExecutor_SkillsPreload_AppendsBodyAndIsPrefixStable is the RED
+// test for §2.6 step 2 (L2 preload) AND the prefix-stability invariant the
+// brief calls out as the most important regression point: two Execute calls
+// for the same agent type + same Skills list, with no fork skill, must
+// assemble byte-identical system prompts (subagent-side prefix caching).
+func TestSubagentExecutor_SkillsPreload_AppendsBodyAndIsPrefixStable(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\nskills:\n  - my-skill\n")
+
+	skillsDir := t.TempDir()
+	writeTestSkill(t, skillsDir, "my-skill", "---\nname: my-skill\ndescription: test skill\n---\n\nMY SKILL BODY\n")
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadFromDir(skillsDir); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	provider := &skillCaptureProvider{}
+	modelReg.InjectProvider("test", "", "", provider)
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	run := func(taskID string) string {
+		_, err := exec.Execute(context.Background(),
+			&subagent.Task{ID: taskID, Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "custom-role"}},
+			func(subagent.TaskEvent) {})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		return provider.last().SystemPrompt
+	}
+
+	sp1 := run("t1")
+	if !strings.Contains(sp1, "MY SKILL BODY") {
+		t.Fatalf("systemPrompt = %q, want it to contain the preloaded skill body", sp1)
+	}
+	sp2 := run("t2")
+	if sp1 != sp2 {
+		t.Fatalf("systemPrompt changed across Runs with no fork skill (prefix-stability broken):\n1: %q\n2: %q", sp1, sp2)
+	}
+}
+
+// TestSubagentExecutor_SkillsPreload_UnknownSkillHardFails: a profile
+// declaring a Skills entry the registry does not have is a misconfiguration —
+// same policy as an unknown agent_type — and must hard-fail, not silently
+// skip the missing skill.
+func TestSubagentExecutor_SkillsPreload_UnknownSkillHardFails(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\nskills:\n  - nonexistent-skill\n")
+
+	skillReg := skill.NewRegistry() // empty: "nonexistent-skill" is nowhere
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	modelReg.InjectProvider("test", "", "", &skillCaptureProvider{})
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "custom-role"}},
+		func(subagent.TaskEvent) {})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a hard failure for the unknown preloaded skill")
+	}
+	if !strings.Contains(err.Error(), "nonexistent-skill") {
+		t.Fatalf("Execute() error = %q, want it to name the missing skill", err.Error())
+	}
+}
+
+// TestSubagentExecutor_SkillsPreload_NilRegistryHardFails: a profile with a
+// non-empty Skills list but no skill.Registry wired into the executor must
+// also hard-fail (nothing to preload from), not silently run without it.
+func TestSubagentExecutor_SkillsPreload_NilRegistryHardFails(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\nskills:\n  - my-skill\n")
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	modelReg.InjectProvider("test", "", "", &skillCaptureProvider{})
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately no .WithSkillRegistry(...).
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir)
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "custom-role"}},
+		func(subagent.TaskEvent) {})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a hard failure: profile declares skills but no registry is wired")
+	}
+}
+
+// TestSubagentExecutor_ForkSkill_RendersArgumentsAndConsumesFields is the RED
+// test for §2.6 step 3: task.Config.Skill selects a context:fork skill bound
+// to the resolved agent type; its body is rendered with $ARGUMENTS =
+// task.Prompt and appended, and its Model/MaxTurns/Temperature override the
+// resolved model alias, the caller position of resolveMaxToolCalls, and
+// subTemperature respectively — the first real consumers of those three
+// fields since Phase 3.
+func TestSubagentExecutor_ForkSkill_RendersArgumentsAndConsumesFields(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n")
+
+	skillsDir := t.TempDir()
+	writeTestSkill(t, skillsDir, "docx-polish", "---\n"+
+		"name: docx-polish\n"+
+		"description: fork test skill\n"+
+		"context: fork\n"+
+		"agent: custom-role\n"+
+		"model: alt\n"+
+		"max-turns: 2\n"+
+		"temperature: 0.33\n"+
+		"---\n\nFORK BODY: $ARGUMENTS\n")
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadFromDir(skillsDir); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	modelReg, err := llm.NewModelRegistry([]llm.ModelDef{
+		{Name: "default", Provider: "test", Model: "m-default"},
+		{Name: "alt", Provider: "test", Model: "m-alt"},
+	}, "default")
+	if err != nil {
+		t.Fatalf("NewModelRegistry: %v", err)
+	}
+	provider := &skillCaptureProvider{}
+	modelReg.InjectProvider("test", "", "", provider)
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	execResult, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "polish this file", Config: subagent.SubagentConfig{
+			AgentType: "custom-role",
+			Skill:     "docx-polish",
+		}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	sp := provider.last().SystemPrompt
+	if !strings.Contains(sp, "FORK BODY: polish this file") {
+		t.Fatalf("systemPrompt = %q, want the fork skill body rendered with $ARGUMENTS = task.Prompt", sp)
+	}
+
+	if execResult.Stats == nil {
+		t.Fatal("Stats = nil")
+	}
+	if execResult.Stats.Model != "m-alt" {
+		t.Errorf("Stats.Model = %q, want m-alt (fork skill's model: override)", execResult.Stats.Model)
+	}
+	if execResult.Stats.MaxToolCalls != 2 {
+		t.Errorf("Stats.MaxToolCalls = %d, want 2 (fork skill's max-turns, no caller-explicit override)", execResult.Stats.MaxToolCalls)
+	}
+	gotTemp := provider.last().Temperature
+	if gotTemp == nil || *gotTemp != 0.33 {
+		t.Errorf("request Temperature = %v, want 0.33 (fork skill's temperature: override)", gotTemp)
+	}
+}
+
+// TestSubagentExecutor_ForkSkill_TaskExplicitMaxToolCallsWins: when the task
+// tool's own max_tool_calls arg is explicit, it outranks the fork skill's
+// max-turns — the skill's value only fills the "caller" position when the
+// task tool didn't set one.
+func TestSubagentExecutor_ForkSkill_TaskExplicitMaxToolCallsWins(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n")
+
+	skillsDir := t.TempDir()
+	writeTestSkill(t, skillsDir, "docx-polish", "---\n"+
+		"name: docx-polish\ndescription: fork test skill\ncontext: fork\nagent: custom-role\nmax-turns: 2\n"+
+		"---\n\nFORK BODY\n")
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadFromDir(skillsDir); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	modelReg.InjectProvider("test", "", "", &skillCaptureProvider{})
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	execResult, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{
+			AgentType:    "custom-role",
+			Skill:        "docx-polish",
+			MaxToolCalls: 9,
+		}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if execResult.Stats == nil || execResult.Stats.MaxToolCalls != 9 {
+		t.Fatalf("Stats.MaxToolCalls = %v, want 9 (task tool's explicit arg beats the skill's max-turns)", execResult.Stats)
+	}
+}
+
+// TestSubagentExecutor_ForkSkill_AgentMismatchFails: task.Config.Skill names
+// a fork skill bound to a DIFFERENT agent type than the one this task
+// resolved to — must fail rather than silently run the wrong skill's body
+// inside the wrong role.
+func TestSubagentExecutor_ForkSkill_AgentMismatchFails(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n")
+
+	skillsDir := t.TempDir()
+	writeTestSkill(t, skillsDir, "docx-polish", "---\nname: docx-polish\ndescription: d\ncontext: fork\nagent: document-editor\n---\n\nBody\n")
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadFromDir(skillsDir); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	modelReg.InjectProvider("test", "", "", &skillCaptureProvider{})
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{
+			AgentType: "custom-role",
+			Skill:     "docx-polish",
+		}},
+		func(subagent.TaskEvent) {})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a failure: skill is bound to a different agent type")
+	}
+	if !strings.Contains(err.Error(), "docx-polish") || !strings.Contains(err.Error(), "document-editor") {
+		t.Fatalf("Execute() error = %q, want it to name the skill and its bound agent", err.Error())
+	}
+}
+
+// TestSubagentExecutor_ForkSkill_UnknownSkillFails: task.Config.Skill names a
+// skill the registry doesn't have.
+func TestSubagentExecutor_ForkSkill_UnknownSkillFails(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n")
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	modelReg.InjectProvider("test", "", "", &skillCaptureProvider{})
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skill.NewRegistry())
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{
+			AgentType: "custom-role",
+			Skill:     "nonexistent-skill",
+		}},
+		func(subagent.TaskEvent) {})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a failure for the unknown fork skill")
+	}
+}
+
+// TestSubagentExecutor_SkillCatalog_InjectsFilteredDescriptions is the RED
+// test for §2.6 step 4: when the subagent's own selected tool set includes
+// the "skill" tool, Execute must append the skill catalog to the system
+// prompt, excluding a fork skill bound to a DIFFERENT agent type (it would
+// only ever hit the routing-refusal branch in pkg/skill/tool.go).
+func TestSubagentExecutor_SkillCatalog_InjectsFilteredDescriptions(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n  - skill\n")
+
+	skillsDir := t.TempDir()
+	writeTestSkill(t, skillsDir, "own-skill", "---\nname: own-skill\ndescription: an inline skill\n---\n\nBody\n")
+	writeTestSkill(t, skillsDir, "matching-fork", "---\nname: matching-fork\ndescription: bound to custom-role\ncontext: fork\nagent: custom-role\n---\n\nBody\n")
+	writeTestSkill(t, skillsDir, "other-fork", "---\nname: other-fork\ndescription: bound to a different agent\ncontext: fork\nagent: other-role\n---\n\nBody\n")
+	skillReg := skill.NewRegistry()
+	if err := skillReg.LoadFromDir(skillsDir); err != nil {
+		t.Fatalf("LoadFromDir: %v", err)
+	}
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	provider := &skillCaptureProvider{}
+	modelReg.InjectProvider("test", "", "", provider)
+	toolReg := tools.NewRegistry()
+	if err := toolReg.Register(noopTool()); err != nil {
+		t.Fatal(err)
+	}
+	if err := toolReg.Register(models.Tool{Name: "skill", Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) {
+		return models.ToolResult{}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skillReg)
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "custom-role"}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	sp := provider.last().SystemPrompt
+	if !strings.Contains(sp, "own-skill") {
+		t.Errorf("systemPrompt missing own-skill catalog entry: %q", sp)
+	}
+	if !strings.Contains(sp, "matching-fork") {
+		t.Errorf("systemPrompt missing matching-fork catalog entry: %q", sp)
+	}
+	if strings.Contains(sp, "other-fork") {
+		t.Errorf("systemPrompt should exclude other-fork (bound to a different agent type): %q", sp)
+	}
+}
+
+// TestSubagentExecutor_CallerAgentTypeInContext: Execute must set
+// skill.CallerAgentTypeFromContext to the resolved agent type for the
+// subagent's own run, alongside stripping UserInteraction — this is what lets
+// pkg/skill/tool.go's fork routing tell "already inside the target agent"
+// apart from "the main agent" or "some other subagent".
+func TestSubagentExecutor_CallerAgentTypeInContext(t *testing.T) {
+	workDir := t.TempDir()
+	writeProjectAgentYAML(t, workDir, "custom-role", "type: custom-role\ntools:\n  - noop\n")
+
+	modelReg := llm.NewSingleModelRegistry("test", "configured-model", "")
+	toolReg := tools.NewRegistry()
+	var sawCallerType string
+	var sawOK bool
+	if err := toolReg.Register(models.Tool{
+		Name: "noop",
+		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+			sawCallerType = skill.CallerAgentTypeFromContext(ctx)
+			sawOK = true
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Status: models.CallStatusCompleted, Content: "ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provider := &scriptedOutputProvider{
+		toolCalls: map[int][]models.ToolCall{0: {{ID: "c1", Name: "noop", Arguments: map[string]any{}}}},
+		outputs:   map[int]string{1: "done"},
+	}
+	modelReg.InjectProvider("test", "", "", provider)
+	exec := NewSubagentExecutor(modelReg, toolReg, nil).WithWorkDir(workDir).WithSkillRegistry(skill.NewRegistry())
+
+	_, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t1", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "custom-role"}},
+		func(subagent.TaskEvent) {})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !sawOK {
+		t.Fatal("noop tool handler never ran")
+	}
+	if sawCallerType != "custom-role" {
+		t.Fatalf("CallerAgentTypeFromContext() inside the subagent = %q, want custom-role", sawCallerType)
 	}
 }

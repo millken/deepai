@@ -30,6 +30,11 @@ type agentMDFrontmatter struct {
 	Description string `yaml:"description"`
 	Tools       string `yaml:"tools"`
 	Model       string `yaml:"model"`
+	// Skills is a YAML list (unlike Tools' space/comma-separated string
+	// style) — it matches Claude Code's own `skills:` key shape, and a role's
+	// preloaded skill list has no reason to support the CSV shorthand Tools
+	// does for compatibility with existing Claude agent files.
+	Skills []string `yaml:"skills"`
 }
 
 // ParseAgentMarkdown parses a Claude-style agent definition: a markdown file
@@ -70,6 +75,7 @@ func ParseAgentMarkdown(path string) (*AgentTypeConfig, error) {
 		SystemPrompt: strings.TrimSpace(body),
 		DefaultTools: mapClaudeTools(af.Tools),
 		Model:        strings.TrimSpace(af.Model),
+		Skills:       af.Skills,
 	}, nil
 }
 

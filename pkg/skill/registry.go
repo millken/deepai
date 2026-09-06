@@ -164,15 +164,38 @@ func (r *Registry) loadDirReported(dir string, source string) []SkillWarning {
 		return []SkillWarning{{Source: source, Dir: dir, Msg: err.Error()}}
 	}
 
-	// Tag skills that came from this dir
+	// Tag skills that came from this dir, and lint the fork/agent binding
+	// (M5-1 §2.1) while we already hold the lock and know which skills this
+	// directory just (re)loaded.
+	var warnings []SkillWarning
 	r.mu.Lock()
 	for name := range localNames {
 		if s, ok := r.skills[name]; ok {
 			s.Source = source
+			if msg := lintForkBinding(s.Meta); msg != "" {
+				warnings = append(warnings, SkillWarning{Source: source, Dir: s.Dir, Msg: msg})
+			}
 		}
 	}
 	r.mu.Unlock()
-	return nil
+	return warnings
+}
+
+// lintForkBinding checks context/agent frontmatter consistency for one
+// skill, returning a human-readable warning (empty string if the skill is
+// consistent). This is a warning, not a load failure — the skill still
+// loads and can be inspected/fixed — because a hard failure here would
+// remove an otherwise-usable skill entirely for one metadata mistake.
+func lintForkBinding(m Frontmatter) string {
+	hasAgent := strings.TrimSpace(m.Agent) != ""
+	switch {
+	case m.IsFork() && !hasAgent:
+		return fmt.Sprintf("fork skill %q has no agent: binding", m.Name)
+	case hasAgent && !m.IsFork():
+		return fmt.Sprintf("skill %q has agent: %q set but context is not \"fork\" (context=%q)", m.Name, m.Agent, m.Context)
+	default:
+		return ""
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +317,44 @@ func (r *Registry) MatchPaths(filePath string) []*Skill {
 // When filePath is empty, behaves like Descriptions().
 // When filePath is non-empty, includes only skills with empty Paths OR matching paths.
 func (r *Registry) DescriptionsFiltered(filePath string) string {
+	desc, _ := r.describeSkills(func(s *Skill) bool {
+		return filePath == "" || len(s.Meta.Paths) == 0 || matchSkillPaths(s.Meta.Paths, filePath)
+	})
+	return desc
+}
+
+// DescriptionsForAgent is Descriptions filtered for one subagent's own
+// catalog injection (M5-1 §2.6 step 4): it additionally excludes a fork
+// skill bound to a DIFFERENT agent type than agentType. Such a skill would
+// still be listed as callable, but pkg/skill/tool.go's caller routing always
+// refuses it for a mismatched subagent — advertising it just spends a tool
+// call on a call that can never succeed. A fork skill bound to agentType
+// itself, or an inline (non-fork) skill, is included exactly as in
+// Descriptions.
+//
+// Unlike Descriptions/DescriptionsFiltered, this returns "" (not just a
+// header) when every skill got filtered out: pkg/agent/subagent.go's
+// `if desc != ""` guard would otherwise never catch a header-only string
+// with zero entries, injecting a useless "Available skills:" block with
+// nothing under it.
+func (r *Registry) DescriptionsForAgent(agentType string) string {
+	desc, hasEntries := r.describeSkills(func(s *Skill) bool {
+		return !(s.Meta.IsFork() && s.Meta.Agent != agentType)
+	})
+	if !hasEntries {
+		return ""
+	}
+	return desc
+}
+
+// describeSkills is the shared rendering skeleton behind Descriptions,
+// DescriptionsFiltered, and DescriptionsForAgent: they differ only in which
+// skills `include` lets through, not in refresh/locking/sort/budget
+// behavior. The second return reports whether at least one skill line was
+// actually written (as opposed to just the header) — Descriptions/
+// DescriptionsFiltered ignore it (preserving their existing header-only-on-
+// empty behavior); DescriptionsForAgent uses it to collapse to "".
+func (r *Registry) describeSkills(include func(*Skill) bool) (string, bool) {
 	r.maybeRefreshDescriptions()
 
 	r.mu.RLock()
@@ -307,8 +368,7 @@ func (r *Registry) DescriptionsFiltered(filePath string) string {
 		if !s.Meta.IsAutoInvocable() {
 			continue
 		}
-		// If filePath given, filter by paths
-		if filePath != "" && len(s.Meta.Paths) > 0 && !matchSkillPaths(s.Meta.Paths, filePath) {
+		if !include(s) {
 			continue
 		}
 		skills = append(skills, s)
@@ -342,7 +402,7 @@ func (r *Registry) DescriptionsFiltered(filePath string) string {
 		total += len(line)
 	}
 
-	return buf.String()
+	return buf.String(), total > 0
 }
 
 // matchSkillPaths checks if any glob pattern matches the filePath.

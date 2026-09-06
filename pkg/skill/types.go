@@ -34,6 +34,22 @@ type Frontmatter struct {
 	// DeepAI extensions
 	MaxTurns    *int     `yaml:"max-turns,omitempty"`
 	Temperature *float64 `yaml:"temperature,omitempty"`
+
+	// Context and Agent bind a skill to a subagent role (M5-1,
+	// AGENT_CAPABILITY_DESIGN.md §2). Context is "" (inline — the current
+	// behavior: the body is returned directly to whichever agent invoked the
+	// skill tool) or "fork" (the body must only ever reach the agent type
+	// named by Agent; see pkg/skill/tool.go's caller-routed handler and
+	// pkg/agent/subagent.go's Execute for the two ends of that wire).
+	Context string `yaml:"context"`
+	Agent   string `yaml:"agent"`
+}
+
+// IsFork reports whether this skill is bound to run inside a subagent
+// (context: fork), matched case- and whitespace-insensitively so "Fork",
+// " fork ", etc. all count.
+func (f *Frontmatter) IsFork() bool {
+	return strings.EqualFold(strings.TrimSpace(f.Context), "fork")
 }
 
 // IsUserInvocable returns whether the skill can be invoked by users.

@@ -1,7 +1,8 @@
 ---
 name: docx-summarize
 description: "Use when the user asks to summarize, extract key points from, or produce a digest of a .docx Word document, especially a long one that won't fit in context. Triggers on requests like 'summarize this docx', 'give me the key points of this Word document', 'write a summary of file.docx'."
-allowed-tools: [docx_read, docx_write, write_file, task, ask_clarification]
+allowed-tools: [docx_read, docx_write, write_file, ask_clarification]
+context: fork
 agent: document-editor
 ---
 
@@ -12,26 +13,23 @@ Reading the source is **read-only**: this skill never calls `docx_edit` and
 never modifies the source document. The output, however, can be either
 Markdown (`write_file`) or a brand-new `.docx` (`docx_write`) — see Step 4.
 
-## Step 0 — Delegate, don't read directly from the main agent
+## Step 0 — One subagent per chunk when summarizing in parallel
 
-**Do not call `docx_read` from the main agent.** The `agent:
-document-editor` frontmatter above is a declaration of intent only — on the
-current wiring it does not restrict which tools you have; the restriction
-only takes effect inside a subagent. So your first tool call is `task`:
+This skill runs inside the `document-editor` subagent (`context: fork`,
+`agent: document-editor` above) — the main agent invokes it via
+`task(agent_type="document-editor", skill="docx-summarize", prompt=...)`.
+The tools this workflow uses are `docx_read`, `docx_write`, `write_file`,
+and `ask_clarification`.
 
-- `agent_type: document-editor`
-- Pass in the prompt: the resolved file path and the summarization brief
-  (desired length, focus areas, audience) in the user's own words.
-
-If the map step (Step 2) needs multiple chunks summarized independently,
-delegate multiple `task` calls — one per chunk or small batch of chunks —
-so each subagent has an isolated, independent context. This is the one
-place in the docx skills where parallel delegation is actually useful:
-summarizing one chunk has no side effect on any other chunk or on the file,
-so there is no write-ordering hazard to avoid. Never call `docx_edit` from
-any of these subagents; if a subagent's brief seems to call for editing the
-document, stop and ask the user — that request belongs to `docx-polish`,
-not here.
+If the map step (Step 2) needs multiple chunks summarized independently, the
+MAIN agent should issue multiple such `task` calls — one per chunk or small
+batch of chunks — so each subagent has an isolated, independent context.
+This is the one place in the docx skills where parallel delegation is
+actually useful: summarizing one chunk has no side effect on any other chunk
+or on the file, so there is no write-ordering hazard to avoid. Never call
+`docx_edit` from any of these subagents; if a subagent's brief seems to call
+for editing the document, stop and ask the user — that request belongs to
+`docx-polish`, not here.
 
 Everything below describes what happens inside the `document-editor`
 subagent(s), or what you put in each delegation prompt.

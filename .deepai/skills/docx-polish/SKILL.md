@@ -1,7 +1,8 @@
 ---
 name: docx-polish
 description: "Use when the user asks to polish, proofread, improve the fluency of, or fix the grammar/tone of a .docx Word document while preserving its formatting, layout, and existing runs (bold, links, fields). Triggers on requests like 'polish this docx', 'clean up the grammar in this Word doc', 'make this document sound more formal', 'improve the wording of this file.docx'."
-allowed-tools: [docx_read, docx_edit, task, ask_clarification]
+allowed-tools: [docx_read, docx_edit, ask_clarification]
+context: fork
 agent: document-editor
 ---
 
@@ -13,31 +14,19 @@ touch. The underlying model is "ground truth + narrow patch" — the original
 file is authoritative, and every edit is a small, targeted splice, not a
 rewrite.
 
-## Step 0 — Delegate, don't edit directly
+This skill runs inside the `document-editor` subagent (`context: fork`,
+`agent: document-editor` above) — the main agent invokes it via
+`task(agent_type="document-editor", skill="docx-polish", prompt=...)`. The
+tools this workflow uses are `docx_read`, `docx_edit`, `read_file`,
+`write_file`, and `ask_clarification`. Never fall back to editing the
+document yourself from the main agent — always delegate through `task` so
+the work happens inside the subagent. If the document is large enough to
+need more turns than one subagent's `MaxTurns` allows, delegate again in
+batches: have each subagent report back a short decision list (see Step 3)
+and hand that list to the next delegation so tone and terminology choices
+carry forward.
 
-**Do not call `docx_edit` (or `docx_read`) from the main agent.** The
-`agent: document-editor` frontmatter above is a declaration of intent only —
-on the current wiring it does **not** restrict which tools are available to
-you. The actual restriction only takes effect inside a subagent.
-
-So the first and only tool call you make for this workflow is `task`:
-
-- `agent_type: document-editor`
-- Pass in the prompt: the resolved file path, the task mode (see Step 1),
-  the protect list, and the polishing brief in the user's own words.
-
-The subagent runs the read/edit loop below with the `document-editor`
-profile's tool set — `docx_read`, `docx_edit`, `read_file`, `write_file`,
-and `ask_clarification`, not only the two docx tools. If the document is
-large enough to need more turns than one subagent's `MaxTurns` allows,
-delegate again in batches: have each subagent report back a short decision
-list (see Step 3) and hand that list to the next `task` call so tone and
-terminology choices carry forward. Never fall back to doing the edits
-yourself because delegation looks slower — a silently-unenforced allowlist
-is worse than none.
-
-Everything below this point describes what happens **inside** the
-`document-editor` subagent (or is what you put in the delegation prompt).
+Everything below describes what happens inside that subagent run.
 
 ## Step 0a — track_changes is on by default
 
