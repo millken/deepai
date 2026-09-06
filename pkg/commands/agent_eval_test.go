@@ -783,29 +783,6 @@ func TestRenderEvalCompare_RoundTripsThroughJSON(t *testing.T) {
 // dividing by 9 instead of 8).
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Golden test: recomputing the real 2026-09-06-glm-5.3 BEFORE baseline with
-// the new harness must reproduce docs/AGENT_CAPABILITY_DESIGN.md §8's "新口径
-// 基线(before)" table exactly, cell for cell. This is read-only (it never
-// writes eval/results/**) — the actual regeneration of summary.json/
-// summary.md is a one-time, separately-verified action per the M5-3
-// harness-changeover brief.
-//
-// The path below points at "...-before": the M5-3 after-run reuses the
-// original "2026-09-06-glm-5.3" directory name for its OWN output while it
-// is in flight, so that name no longer holds the frozen before data this
-// golden test needs — it holds a partial/different after run. Both the path
-// AND a record-count guard exist so that if a future rename/relayout ever
-// points this test at the wrong (or a truncated/in-progress) runs.jsonl
-// again, it skips with a clear reason instead of failing with confusing
-// "product-manager missing"/count-mismatch errors that look like a real
-// regression. The expected count (45) is 5 roles × 9 dispatch attempts each
-// (43 that actually dispatched + the 2 recorded timeouts — design §8's
-// "超时/已派发 2/43" — analyst 9, architect 9, product-manager 9, researcher
-// 9, tester 9), matching the archived eval/results/2026-09-06-glm-5.3-before
-// /runs.jsonl on disk.
-// ---------------------------------------------------------------------------
-
 func round(f float64) float64 {
 	if f < 0 {
 		return -round(-f)
@@ -928,8 +905,8 @@ func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *t
 			},
 		},
 		{
-			// A dispatch timeout, shaped exactly like the real
-			// eval/results/2026-09-06-glm-5.3/runs.jsonl records: a lone
+			// A dispatch timeout, shaped exactly like the real M5-2
+			// baseline records (docs/AGENT_CAPABILITY_DESIGN.md §8): a lone
 			// synthetic "dispatch" fail assertion, duration_ms=0, tokens=0.
 			Case: "c3", AgentType: "widget", Fingerprint: "fp1", Tokens: 0, DurationMS: 0,
 			Error:      "context deadline exceeded",

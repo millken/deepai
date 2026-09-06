@@ -198,7 +198,7 @@ eval/results/<date>-<model-alias>/
 |---|---|---|
 | P1 | harness:导出组装函数(决策点 1)、manifest loader、物化/chdir/快照/匹配/报告;**用 fake task tool 测 harness 全链路**(物化正确性、防污染、命中/near-miss/adjudication、指纹) | `pkg/commands/review_eval.go` 等 + 单测 |
 | P2 | 语料 32 case(§2.2 配额),每 case 过一遍"base 可编译、change 可编译、bug 确实存在(has-test 的跑测试证伪)"的自检脚本 | `eval/review-cases/` |
-| P3 | 真实模型首跑(runs=3),人工复核 near-miss/FP,adjudication 回写,summary 提交;更新 ADVERSARIAL_REVIEW_DESIGN.md §十一遗留项与 §八-1 状态 | `eval/results/<date>-<model>/` |
+| P3 | 真实模型首跑(runs=3),人工复核 near-miss/FP,adjudication 回写,**结论回写文档**(运行产物留在本地,`eval/results/` 不入库);更新 ADVERSARIAL_REVIEW_DESIGN.md §十一遗留项与 §八-1 状态 | `eval/results/<date>-<model>/`(本地) |
 
 ## 八、开放决策点(供评审拍板)
 

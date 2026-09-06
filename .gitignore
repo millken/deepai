@@ -9,9 +9,11 @@ deepai-debug.log
 .superpowers/
 .DS_Store
 
-# deepai eval agents (M5-2): per-run detail is large and contains full model
-# output; summary.md/summary.json are the committed baseline artifacts.
-eval/results/*/runs.jsonl
-
-# eval reruns (per-run detail, same rationale as eval/results)
-eval/results-recheck-*/*/runs.jsonl
+# deepai eval agents: run output is derived data, not source. runs.jsonl is
+# large and carries full model output; summary.{md,json} are views over it,
+# and with runs.jsonl out of the repo a committed summary is a number nobody
+# can trace back to a run. Conclusions worth keeping go in docs/, not here.
+# The eval's inputs (eval/agent-cases/) stay tracked and stay pinned: a
+# benchmark whose fixtures follow HEAD cannot attribute a delta to a change.
+eval/results/
+eval/results-recheck-*/

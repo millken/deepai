@@ -881,9 +881,10 @@ func resolveEvalSystemPrompt(agentType, repoRoot string) (string, []string, stri
 // unconditionally "" the way the M5-2 baseline comment here used to say —
 // resolveEvalSystemPrompt now resolves it per role (builtin mount, or a
 // project YAML's own output_schema: override) instead of this function
-// hardcoding it away. The M5-2-era before/after runs archived under
-// eval/results/ were computed with the OLD (schema-blind) formula; this fix
-// does not retroactively recompute or touch anything under eval/results/ —
+// hardcoding it away. The M5-2-era before/after runs (kept only on the
+// machine that ran them; eval/results/ is not tracked) were computed with
+// the OLD (schema-blind) formula; this fix does not retroactively recompute
+// them —
 // it protects fingerprints computed FROM HERE ON (M5-4 and later), so that a
 // schema change with the system prompt held byte-for-byte constant (e.g.
 // adding a field to a named schema, or wiring a role's output_schema) still
