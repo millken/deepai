@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-09-06T14:04:00Z",
+  "model": "glm-5.3",
+  "runs": 3,
+  "timeout": "5m",
+  "roles": [
+    {
+      "agent_type": "architect",
+      "fingerprint": "d8d5a5be",
+      "cases": 3,
+      "runs": 3,
+      "dispatched_runs": 9,
+      "contract_rate": 0.6666666666666666,
+      "assertion_pass_rate": 0.9358974358974359,
+      "assertion_fail_rate": 0.0641025641025641,
+      "assertion_skip_rate": 0.037037037037037035,
+      "schema_parse_rate": 0.6666666666666666,
+      "field_pass_rate": 1,
+      "mentions_hit_rate": 0.8888888888888888,
+      "mentions_hits": 16,
+      "mentions_total": 18,
+      "not_mentions_violation_rate": 0,
+      "guard_violations": 0,
+      "avg_tokens": 0,
+      "avg_duration_ms": 178096.22222222222,
+      "no_writes_violations": 0,
+      "dispatch_errors": 0
+    }
+  ]
+}

@@ -4,8 +4,6 @@ task: "分析 subagent.Pool 的任务生命周期（StartTask/Wait/finishTask）
 context_files: [pkg/subagent/pool.go]
 tags: [go, self-referential]
 expect:
-  - schema_parses: analysis
-  - field_min_count: {path: findings, n: 2}
   - mentions: [StartTask, finishTask]
   - not_mentions: [SubagentRunner, HookRunner]
   - tool_calls_max: 20

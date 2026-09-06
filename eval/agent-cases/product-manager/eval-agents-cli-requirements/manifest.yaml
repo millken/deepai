@@ -3,8 +3,6 @@ agent_type: product-manager
 task: "为 `deepai eval agents` 命令编写需求规格，覆盖 --runs 重复次数、--filter 按 agent_type 或 tag 过滤、以及产出 summary 报告这三部分的验收标准"
 tags: [go]
 expect:
-  - schema_parses: requirements
-  - field_min_count: {path: acceptance, n: 2}
   - mentions: [runs, filter]
   - not_mentions: [SubagentRunner, ExecuteFork]
   - tool_calls_max: 15

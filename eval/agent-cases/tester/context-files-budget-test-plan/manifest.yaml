@@ -4,7 +4,6 @@ task: "为 context_files 的单文件截断与总量上限逻辑设计测试计�
 context_files: [pkg/agent/subagent_context.go]
 tags: [go, self-referential, has-test]
 expect:
-  - schema_parses: test-report
   - mentions: [contextFilesTotalCap, contextFilePerFileCap]
   - not_mentions: [SubagentRunner, HookRunner]
   - tool_calls_max: 20

@@ -4,8 +4,6 @@ task: "为 task 工具的 context_files 参数编写需求规格（用户故事 
 context_files: [pkg/agent/subagent_context.go, pkg/tools/subagent.go]
 tags: [go, self-referential]
 expect:
-  - schema_parses: requirements
-  - field_min_count: {path: acceptance, n: 2}
   - mentions: [context_files, contextFilesTotalCap]
   - not_mentions: [SubagentRunner, ExecuteFork]
   - tool_calls_max: 20

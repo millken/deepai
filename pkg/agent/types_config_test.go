@@ -5,29 +5,24 @@ import (
 	"testing"
 )
 
-// TestBuiltinOutputSchemaMounting is the M5-3 wiring requirement (design
-// §3/§8 item 2): architect/product-manager/researcher/analyst each get a
-// non-Strict OutputSchema; the four reviewers keep their existing Strict
-// ReviewResult schema untouched; every other builtin profile (tester is not
-// even a builtin — it's project YAML, out of scope this period) has none.
+// TestBuiltinOutputSchemaMounting is the design §8 revision four (M5-4)
+// rollback requirement: the M5-3 non-Strict OutputSchema mounted on
+// architect/product-manager/researcher/analyst is gone — none of the five
+// contract types had a real program consumer, only the eval harness reading
+// its own invention, so all four now carry OutputSchema == nil, same as
+// every other non-reviewer builtin profile. The four reviewers keep their
+// existing Strict ReviewResult schema untouched — that one has a real
+// consumer (pkg/chat/review.go's review gate).
 func TestBuiltinOutputSchemaMounting(t *testing.T) {
-	nonStrictWant := map[AgentType]bool{
-		AgentTypeArchitect:      true,
-		AgentTypeProductManager: true,
-		AgentTypeResearch:       true,
-		AgentTypeAnalyst:        true,
+	noSchemaWant := []AgentType{
+		AgentTypeGeneral, AgentTypeCoder, AgentTypeBash, AgentTypeFrontend,
+		AgentTypeUIDesigner, AgentTypeNews, AgentTypeDocEditor,
+		AgentTypeArchitect, AgentTypeProductManager, AgentTypeResearch, AgentTypeAnalyst,
 	}
-	for at := range nonStrictWant {
+	for _, at := range noSchemaWant {
 		cfg := GetAgentTypeConfig(at)
-		if cfg.OutputSchema == nil {
-			t.Errorf("%s: OutputSchema = nil, want non-nil", at)
-			continue
-		}
-		if cfg.OutputSchema.Strict {
-			t.Errorf("%s: OutputSchema.Strict = true, want false (design §8 item 2: observe one period first)", at)
-		}
-		if cfg.OutputSchema.Prompt == "" {
-			t.Errorf("%s: OutputSchema.Prompt is empty", at)
+		if cfg.OutputSchema != nil {
+			t.Errorf("%s: OutputSchema = %+v, want nil (M5-4 rollback)", at, cfg.OutputSchema)
 		}
 	}
 
@@ -37,18 +32,7 @@ func TestBuiltinOutputSchemaMounting(t *testing.T) {
 	for _, at := range strictWant {
 		cfg := GetAgentTypeConfig(at)
 		if cfg.OutputSchema == nil || !cfg.OutputSchema.Strict {
-			t.Errorf("%s: OutputSchema must remain Strict (unchanged this period)", at)
-		}
-	}
-
-	noSchemaWant := []AgentType{
-		AgentTypeGeneral, AgentTypeCoder, AgentTypeBash, AgentTypeFrontend,
-		AgentTypeUIDesigner, AgentTypeNews, AgentTypeDocEditor,
-	}
-	for _, at := range noSchemaWant {
-		cfg := GetAgentTypeConfig(at)
-		if cfg.OutputSchema != nil {
-			t.Errorf("%s: OutputSchema = %+v, want nil", at, cfg.OutputSchema)
+			t.Errorf("%s: OutputSchema must remain Strict (untouched by the M5-4 rollback)", at)
 		}
 	}
 }
@@ -82,6 +66,26 @@ func TestBuiltinDescriptionsFollowSpec(t *testing.T) {
 		}
 		if !strings.Contains(desc, "Not for ") {
 			t.Errorf("%s: Description does not contain %q: %q", at, "Not for ", desc)
+		}
+	}
+}
+
+// TestFourRolesL1DropsJSONContract is the design §8 revision four (M5-4)
+// rollback requirement: architect/product-manager/researcher/analyst each
+// had an "Output: your entire final message is ONE JSON object..." paragraph
+// appended to their L1 constitution in M5-3; that paragraph (and only that
+// paragraph — Evidence/Executability-or-Verifiability/Budget stay) is gone.
+// The rest of each constitution is untouched content, so it must not
+// mention "JSON" anywhere else either — the assertion is a whole-prompt
+// substring check, not just "the last paragraph is gone".
+func TestFourRolesL1DropsJSONContract(t *testing.T) {
+	roles := []AgentType{
+		AgentTypeArchitect, AgentTypeProductManager, AgentTypeResearch, AgentTypeAnalyst,
+	}
+	for _, at := range roles {
+		prompt := GetAgentTypeConfig(at).SystemPrompt
+		if strings.Contains(prompt, "JSON") {
+			t.Errorf("%s: SystemPrompt still mentions JSON (want the Output contract paragraph gone): %q", at, prompt)
 		}
 	}
 }

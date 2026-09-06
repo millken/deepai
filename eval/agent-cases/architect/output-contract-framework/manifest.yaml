@@ -4,8 +4,6 @@ task: "设计一个跨角色复用的产出契约验证框架，说明它与现�
 context_files: [pkg/agent/output.go]
 tags: [go, self-referential]
 expect:
-  - schema_parses: design
-  - field_min_count: {path: decisions, n: 2}
   - mentions: [OutputSchema, ParseOutput]
   - not_mentions: [HookRunner, view_image]
   - tool_calls_max: 20

@@ -4,7 +4,6 @@ task: "为 SubagentExecutor.Execute 的技能预加载与 fork 技能校验逻�
 context_files: [pkg/agent/subagent.go]
 tags: [go, self-referential, has-test]
 expect:
-  - schema_parses: test-report
   - mentions: [WithSkillRegistry]
   - not_mentions: [SubagentRunner, ExecuteFork]
   - tool_calls_max: 20

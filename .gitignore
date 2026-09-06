@@ -12,3 +12,6 @@ deepai-debug.log
 # deepai eval agents (M5-2): per-run detail is large and contains full model
 # output; summary.md/summary.json are the committed baseline artifacts.
 eval/results/*/runs.jsonl
+
+# eval reruns (per-run detail, same rationale as eval/results)
+eval/results-recheck-*/*/runs.jsonl

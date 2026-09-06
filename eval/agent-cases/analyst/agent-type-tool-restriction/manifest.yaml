@@ -4,8 +4,6 @@ task: "分析 ApplyAgentType 如何用 profile.DefaultTools 限制一个角色�
 context_files: [pkg/agent/types_config.go]
 tags: [go, self-referential]
 expect:
-  - schema_parses: analysis
-  - field_min_count: {path: findings, n: 2}
   - mentions: [ApplyAgentType, DefaultTools]
   - not_mentions: [SubagentRunner, ExecuteFork]
   - tool_calls_max: 20

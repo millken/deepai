@@ -74,6 +74,11 @@
 
 L1 篇幅按字符计，分三档：无契约无有状态工具的角色 ≤ 900；携带 OutputSchema 的角色 ≤ 2000（correctness-reviewer 1929 是实测有效的上界，不是基准，超过它必须附 eval 数字）；绑定有状态工具或自动闸门的角色不设数字上限，但每段必须点名它保护的工具参数或闸门。docEditor 的 3811 属第三档。
 
+**修订（M5-4，2026-09-07）**：上面这条以"是否携带 OutputSchema"划分 A/B 档的判据**已失效**——M5-4 删掉四个角色的契约后它们都不再携带 OutputSchema，按原判据应落入 A 档（≤900），但实测是 architect 1573 / product-manager 1540 / researcher 1475 / analyst 1460，全部超出 560–670 字符。
+
+判据改为按**载荷性条款数**而非"有没有契约"：一条载荷性条款是"规则 + 违反后果"，英文里最紧凑约 55–70 词。角色需要几条就给几条的预算，上限仍是 2000 字符（correctness-reviewer 实测 1929 是唯一经语料验证有效的厚提示词尺寸，超过它必须附 eval 数字）。四个角色现在各四条（范围、证据、可执行性/验收/方法、预算），落在 1460–1573 属合规。绑定有状态工具或自动闸门的角色仍不设数字上限，但每段必须点名它保护的机制。
+
+
 为什么 L2 用 skill 而不是 `.deepai/agents/<type>.md` body：MD body 已经是 `SystemPrompt`（`ParseAgentMarkdown`），塞 playbook 就退化成 (a)；skill 有独立目录（可带 references）、有 Registry/热重载/描述目录、可被多个角色共享（`golang` 同时服务 coder/tester/perf-reviewer），且用户可用 `/role-architect` 直接查看。
 
 ## 2. skill ↔ 角色绑定
@@ -123,7 +128,12 @@ default:                                 → 其他子代理：CallStatusFailed 
 
 维持 SKILL_DESIGN 语义（免审批，不是限制）。子代理 `NonInteractive` 无审批环节，故在子代理内天然无操作；主 agent 侧在权限层落地前保持丢弃并在 `buildConfig` 注释注明。新增一条**加载期 lint**（`LoadAllReported` 的 `SkillWarning`）：fork skill 的 `allowed-tools` 若含目标 profile `DefaultTools` 以外的工具（`task/skill/ask_clarification` 除外）则告警——它是作者意图与实际权限脱节的唯一可静态发现点。`paths` 接线（repl 改调 `DescriptionsFiltered`）不属本轮，记为 M5-5 候选。
 
-## 3. 产出契约
+## 3. 产出契约 —— 已于 M5-4 撤销，本节仅作决策记录
+
+> **本节描述的五个契约已全部删除，代码里不存在**；现存的 `namedSchemas` 只有 `review`。
+> 撤销的理由、实测代价与行业依据见 §8 修订四。保留原文是为了让下一个想引入产出契约的人
+> 先看到我们付过的代价，而不是重新交一遍学费。**不要按本节内容实施任何东西。**
+
 
 | 角色 | 结构 | Strict | 理由 |
 |---|---|---|---|
@@ -201,7 +211,7 @@ YAML 角色接 schema：`OutputSchema` 是 `yaml:"-"`，新增 `output_schema: s
 | 角色 | 现状 | 改后 |
 |---|---|---|
 | researcher | Profile for research, reading, and synthesis tasks. | Use when a question needs evidence from code/docs first; delivers cited findings. Not for analysis. |
-| architect | Produces technical design documents… | Use when a change spans modules or needs interface decisions; delivers DesignDoc. Not for coding. |
+| architect | Produces technical design documents… | Use when a change spans modules or needs interface decisions; delivers a design. Not for coding. |
 | analyst | Profile for structured analysis… | Use when data/logs/metrics need interpreting; delivers method, findings, caveats. Not for research. |
 
 researcher 的 Description 定稿是 `Not for analysis.`，不是本节曾经的草案 `Not for edits.`：researcher 的 `DefaultTools` 没有写工具，"edits" 不是它会被误派去做的事；analyst 才是它最容易被混淆的邻角色（两者共用 `Finding` 结构、工具集几乎相同）。四角色 + 三个薄 reviewer（security/arch/perf-reviewer）的定稿见各自的 L1/Description 落地，全部 ≤100 rune，`Not for` 均落在第 79–82 字符处。
@@ -277,6 +287,10 @@ eval/agent-cases/<agent_type>/<case>/
    - 全部翻转的天花板 = (290+43+35)/(340+35) = 98.1%，最多 +12.8pt。
 
    **裁定：废弃"整体断言通过率 +Npt"作为达标线，改为逐指标门槛，按角色独立判定。**
+
+   > **注（M5-4）**：下面这张六条表里的第 1 条"契约达成率"已随契约一并删除，
+   > 逐角色门槛表的"契约达成率"列同样作废。现行达标线是五条，见修订四。
+   > 本表保留为当时的判断记录。
    每个门槛对应 M5-3 的一个设计意图，任一角色不达标只回退该角色的 L1（§8 第 3 条原则不变）。
    所有指标都能从现有 `runs.jsonl` 纯本地重算，不重跑模型。
 
@@ -381,6 +395,137 @@ eval/agent-cases/<agent_type>/<case>/
 4. **eval 语料首期 Go-only，以 deepai 自身代码做 fixture**。
    自指风险的缓解：`mentions` 锚点取自仓库真值（函数名/文件名），
    诱饵 `not_mentions` 取自"看似相关但实际不存在"的符号，模型的先验帮不上忙。
+
+   **修订三（2026-09-06，M5-3 实测后）**：五个角色跑完 before/after，
+   product-manager 与 analyst 各做了一轮复核，architect 改过 Output 段后重跑一轮。
+   全部同模型（glm-5.3）、同 `--timeout 5m`、同 runs=3、同 case 集。
+
+   | 角色/轮次 | 契约达成率 | 超时 | 写盘 | 均耗时 | 倍数 |
+   |---|---|---|---|---|---|
+   | architect / before | 0/9 = 0.0% | 0 | 0 | 200.2s | 1.00× |
+   | architect / after | 5/9 = 55.6% | 0 | 0 | 199.5s | 1.00× |
+   | architect / 重跑（改 Output 段） | 6/9 = 66.7% | 0 | 0 | 178.1s | 0.89× |
+   | product-manager / before | 0/9 = 0.0% | 0 | 0 | 115.5s | 1.00× |
+   | product-manager / after | 9/9 = 100.0% | 0 | 0 | 184.4s | 1.60× |
+   | product-manager / 复核 | 6/9 = 66.7% | 0 | 0 | 155.6s | 1.35× |
+   | **product-manager / 合并 18 次** | **15/18 = 83.3%** | | | | |
+   | researcher / after | 9/9 = 100.0% | 0 | 0 | 163.9s | 1.31× |
+   | analyst / after | 5/6 = 83.3% | 3 | 0 | 196.3s | 1.28× |
+   | analyst / 复核 | 4/5 = 80.0% | 4 | **1** | 220.2s | 1.44× |
+   | **analyst / 合并 18 次** | **9/11 = 81.8%** | **7/18** | | | |
+   | tester（对照组） / after | 0/9 = 0.0% | 0 | 0 | 208.2s | 1.06× |
+
+   **成立的结论**：产出契约从全线 0% 变为 62%–100%，是本期唯一确凿的收益；
+   五角色合计 mentions 从 93.75% 升到 97.44%，基线里 architect/product-manager
+   漏掉的那 5 个上下文预算标识符**全部回收**（证据条款命中了它瞄准的形态）；
+   对照组 tester 提示词一字未动，契约仍 0%、耗时 1.06×、指纹未变，
+   因此上述变化可归因于本期改动而非模型漂移。
+
+   ### 缺陷一：n=9 分辨不出 80% 与 100%，单轮契约达成率不可作判据
+
+   product-manager 在**完全相同的提示词、配置与模型**下，两轮分别是 9/9 和 6/9，
+   相差 33 个百分点。真值 p≈0.85 时 n=9 的观测标准差约 12pt，两倍标准差 ±24pt——
+   这两个观测来自同一真值不需要任何额外解释。因此：
+   after 轮里 researcher 的 100%、product-manager 的 100%、analyst 的 83.3%
+   都不足以单独支撑"达标"，architect 的 55.6% 与 66.7% 同样可能是同一真值。
+
+   **裁定：契约达成率的判定改为合并至少两轮（n ≥ 18 已派发 run）的估计**，
+   单轮数字只作诊断。合并前提是两轮的指纹相同——不同提示词的轮次不得合并
+   （architect 的两轮因此不可合并）。这与 §8 修订二废弃"整体通过率 +Npt"是
+   同一类毛病的另一面：那次是分母被护栏钉死导致不灵敏，这次是分子样本太少导致不稳定。
+
+   ### 缺陷二：出错的 run 被排除出全部分母，写盘违规因此不可见
+
+   修订二规定 `error != ""` 的 run 从指标 1–5 的分母中剔除。analyst 复核轮里
+   `output-schema-strict-retry` r2 **写了文件之后才超时**，`write_violation=true`，
+   但因为它是出错 run，护栏违规统计为 0，`compare` 输出 `[PASS] guard violations: 0 -> 0`。
+
+   写盘是**已经发生的事实**，与该 run 是否跑完无关。剔除规则对"没有输出就无法评分"的
+   指标（契约、mentions）是对的，对护栏是错的。
+
+   **裁定：`write_violation` 与护栏违规的计数独立于 dispatch 状态**，
+   出错 run 的写盘照常计入。`buildEvalSummary` 需相应修改（M5-4 前置）。
+
+   ### analyst：不是"不见效"，是被超时挡住了
+
+   analyst 两轮合计超时 7/18（基线 1/9），两轮均因已派发 < 7 判为**不可判定**。
+   原因是耗时：基线 152.9s，两轮 196.3s / 220.2s，而单次上限是 300s——
+   均值推到 220s 时，分布右尾大量越过上限。它的契约达成率（合并 81.8%）与
+   mentions（100%）本身并不差。
+
+   **裁定：analyst 的 L1 需要缩短而不是加码**（当时 1759 字符；修订四删掉 Output 段后
+   已降到 1460，本条部分兑现），目标是把均耗时压回 1.3× 以内。不通过放宽 `--timeout` 解决——
+   放宽会让本轮与后续轮次不可比，而可比性是这套基线唯一的价值。
+
+   ### architect：改 Output 段有效但不足，转 Strict
+
+   改 Output 段（禁裸双引号、宁少勿多、写不完就交更小的合法对象）后：
+   契约 55.6% → 66.7%，均耗时 199.5s → 178.1s（0.89×），输出均长 9427 → 7437 字符，
+   mentions 保持 88.9%。**上一轮"中文文本里夹裸双引号"的失败形态消失**。
+
+   剩余失败三种，全部不是 schema 设计问题：数组闭合后多一个引号、
+   多写一个 schema 之外的键（`rationale_missing`）并在闭合后多出 `]}`、
+   以及一次跑满 248s 后输出为空。
+
+   §8 第 2 条"非 Strict 先观测一期"的观测目的就是判断重试值不值。观测结论：
+   **失败集中在 JSON 语法错误、多余键、空输出——这三种恰是把解析错误回喂后
+   重试一次能修的**；修订二第 5 条担心的两种（extractJSON 取错对象、字段名大小写）
+   一次都没出现。
+
+   ~~裁定：architect 单独转 Strict，其余三个角色维持非 Strict 继续观测；
+   architect 当前耗时是基线的 0.89×，有承担一次重试的余量。~~
+   **已被修订四作废：契约本身已删除，无 Strict 可转。** 这条裁定的证据仍然成立
+   （失败集中在语法错误、多余键、空输出，都是重试能修的），只是前提没了——
+   如果将来重新引入某个确有程序消费者的契约，这条推理可以直接复用。
+
+   **修订四（2026-09-07，撤销强制 JSON 产出契约）**：删除 architect /
+   product-manager / researcher / analyst 四个角色的产出契约与全部五个契约类型
+   （`DesignDoc`/`RequirementsSpec`/`ResearchFindings`/`AnalysisReport`/`TestReport`），
+   四段 L1 的 `Output:` 段一并删除。`namedSchemas` 只剩 `review`。
+
+   **三条依据，缺一不足以撤：**
+
+   1. **实测代价**：四个非 Strict 契约的达成率 62%–100%，即最好情况下每三次交付
+      有一次被整份丢弃。失败**全部是手写大型嵌套 JSON 的语法失手**——未转义的双引号、
+      多闭合的方括号、schema 之外的多余键、输出为空——**没有一次是 schema 设计问题**。
+      architect 专门改过 Output 段（禁裸双引号、宁少勿多、写不完交更小的合法对象），
+      达成率从 55.6% 只升到 66.7%，说明提示词层面已到天花板。
+   2. **无程序消费者**：全仓 `ParseOutput[T]` 的真实调用点只有
+      `pkg/chat/review.go` 的 `ReviewResult`（review gate 用它决定放行还是回注修复）。
+      其余五个契约类型**只被评测自己引用**——它们存在的唯一理由是让评测去量它们。
+      四个角色的产出消费者是父模型，而父模型读文本没有问题。
+   3. **行业无一家这么做**：调研 Aider / Cline / Roo Code / OpenHands / Cursor /
+      Copilot / Codex CLI / Gemini CLI / Amp / Devin，**没有任何一家强制子代理的
+      最终消息必须是合法 JSON**。Aider 明确拒绝用 JSON 或工具调用包裹代码返回，
+      理由是这会让模型写出更差的代码；Cognition 主张传完整 trace 而不是压缩成 schema。
+
+   **判据（下次想加契约时用这一条判）：有程序在读的才配有 schema，
+   另一个模型在读的不算。**
+
+   **达标线随之收敛为五条**（修订二那张六条的表、以及其中"契约达成率 ≥80%"
+   的逐角色门槛列，**已被本条取代，不再是现行标准**）：
+
+   | # | 指标 | 门槛 |
+   |---|---|---|
+   | 1 | mentions 命中率 | ≥ 基线 − 8pt，且五角色合计 ≥ 基线 |
+   | 2 | not_mentions 违规率 | ≤ 基线 |
+   | 3 | 护栏违规数 | = 0 |
+   | 4 | 均耗时（仅已派发 run） | ≤ 1.5×，超标先复核重跑 |
+   | 5 | dispatch 超时数 | ≤ 基线 + 1；已派发 < 7/9 视为不可判定 |
+
+   **修订三里"architect 单独转 Strict"的裁定同时作废**——那条裁定的前提是契约存在。
+   同理，修订二第 (iv) 条关于 tester 对照组 `contract_rate` 不可比的限定也不再适用，
+   因为该指标已不存在；tester 作为漂移对照仍只对 mentions、耗时、超时三项有效。
+
+   **M5-3 实际留下什么**：证据条款有效并保留——五角色合计 mentions 从 93.75% 升到
+   97.44%，基线里 architect 与 product-manager 漏掉的 5 个上下文预算标识符全部回收。
+   范围、可执行性/验收/方法、预算三段一并保留，措辞从"字段指涉"改写为"内容要求"，
+   要求本身逐条未变。
+
+   **既有 eval 结果的处置**：`eval/results/2026-09-06-glm-5.3-{before,after}` 与
+   两份复核结果保留为历史记录，但本期删除了四段 Output、指纹已变，
+   **它们与今后的轮次不可比**，下一轮必须重建基线。指纹机制存在的理由正是防止
+   拿旧基线给新提示词背书，这条不能自己破例。
 
 ## 9. 实施顺序注记
 

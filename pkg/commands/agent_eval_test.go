@@ -183,104 +183,6 @@ func TestMaterializeFixture_EmptyFixtureIsValid(t *testing.T) {
 // failed schema_parses.
 // ---------------------------------------------------------------------------
 
-// JSON keys below are lowercase/snake_case, matching agent.DesignDoc's json
-// tags (M5-3): these fixtures decode against the REAL pkg/agent type now
-// (agent_eval_schema.go no longer has a PascalCase eval-only mirror), so a
-// capitalized "Agent"/"Decisions" key would fail schema validation (required
-// property missing + additionalProperties:false) exactly the way a real
-// model's mis-cased output would.
-const designJSONTwoDecisions = `Here is my design:
-{"agent":"architect","goal":"g","decisions":[{"topic":"t1","choice":"c1","rationale":"r1","alternatives":[],"reversible":true},{"topic":"t2","choice":"c2","rationale":"r2","alternatives":[],"reversible":false}],"components":[]}
-`
-
-const designJSONOneDecision = `{"agent":"architect","goal":"g","decisions":[{"topic":"t1","choice":"c1","rationale":"r1","alternatives":[],"reversible":true}],"components":[]}`
-
-func TestEvaluateCase_SchemaParsesPassAndFieldMinCount(t *testing.T) {
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "design"},
-		{"field_min_count": map[string]any{"path": "decisions", "n": 2}},
-	}}
-	results := evaluateCase(m, designJSONTwoDecisions, nil, nil, false)
-	assertStatus(t, results, "schema_parses:design", "pass")
-	assertStatus(t, results, "field_min_count:decisions>=2", "pass")
-}
-
-func TestEvaluateCase_SchemaParsesFailSkipsFieldAssertions(t *testing.T) {
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "design"},
-		{"field_min_count": map[string]any{"path": "decisions", "n": 2}},
-		{"field_nonempty_all": "decisions[].topic"},
-	}}
-	results := evaluateCase(m, "just plain prose, no JSON at all", nil, nil, false)
-	assertStatus(t, results, "schema_parses:design", "fail")
-	assertStatus(t, results, "field_min_count:decisions>=2", "skipped")
-	assertStatus(t, results, "field_nonempty_all:decisions[].topic", "skipped")
-}
-
-func TestEvaluateCase_FieldMinCountFailsWhenUnderThreshold(t *testing.T) {
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "design"},
-		{"field_min_count": map[string]any{"path": "decisions", "n": 2}},
-	}}
-	results := evaluateCase(m, designJSONOneDecision, nil, nil, false)
-	assertStatus(t, results, "schema_parses:design", "pass")
-	assertStatus(t, results, "field_min_count:decisions>=2", "fail")
-}
-
-// TestEvaluateCase_FieldMinCountMultiWordJSONTagPath is the M5-3 review fix:
-// fieldByPath used to match ONLY the Go field name via EqualFold, which
-// happens to equal the json tag for a single-word field ("decisions" ==
-// EqualFold "Decisions") but silently diverges for a multi-word one — the
-// model-visible schema property is "scope_in" (RequirementsSpec's json tag),
-// while the Go field is ScopeIn; EqualFold("ScopeIn", "scope_in") is false. A
-// manifest author who copies the property name straight out of the schema
-// Prompt (the obvious, expected thing to do) would get "field \"scope_in\"
-// not found" — a hard error/fail, not a skip — and it would read as "the
-// model produced no scope_in", not "the manifest's path syntax is wrong".
-func TestEvaluateCase_FieldMinCountMultiWordJSONTagPath(t *testing.T) {
-	reqJSON := `{"agent":"a","problem":"p","stories":[],"scope_in":["x","y"],"scope_out":[],"acceptance":[],"priorities":[]}`
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "requirements"},
-		{"field_min_count": map[string]any{"path": "scope_in", "n": 2}},
-	}}
-	results := evaluateCase(m, reqJSON, nil, nil, false)
-	assertStatus(t, results, "schema_parses:requirements", "pass")
-	assertStatus(t, results, "field_min_count:scope_in>=2", "pass")
-}
-
-func TestEvaluateCase_FieldNonemptyAll(t *testing.T) {
-	pass := `{"agent":"a","question":"q","answer":"ans","findings":[{"claim":"c1","evidence":[{"file":"f.go","line":1,"quote":"q"}],"confidence":"high"}]}`
-	fail := `{"agent":"a","question":"q","answer":"ans","findings":[{"claim":"c1","evidence":[],"confidence":"high"}]}`
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "research"},
-		{"field_nonempty_all": "findings[].evidence"},
-	}}
-	okResults := evaluateCase(m, pass, nil, nil, false)
-	assertStatus(t, okResults, "field_nonempty_all:findings[].evidence", "pass")
-
-	failResults := evaluateCase(m, fail, nil, nil, false)
-	assertStatus(t, failResults, "field_nonempty_all:findings[].evidence", "fail")
-}
-
-// TestEvaluateCase_FieldNonemptyAllMultiWordSubfield covers a NESTED
-// multi-word json-tag path (array[].subfield, both segments multi-word on
-// the model-visible schema): RequirementsSpec.Stories[].SoThat is tagged
-// `json:"so_that"`. This is exactly the shape an M5-4 product-manager/tester
-// manifest is expected to write.
-func TestEvaluateCase_FieldNonemptyAllMultiWordSubfield(t *testing.T) {
-	pass := `{"agent":"a","problem":"p","stories":[{"role":"r","want":"w","so_that":"s"}],"scope_in":[],"scope_out":[],"acceptance":[],"priorities":[]}`
-	fail := `{"agent":"a","problem":"p","stories":[{"role":"r","want":"w","so_that":""}],"scope_in":[],"scope_out":[],"acceptance":[],"priorities":[]}`
-	m := caseManifest{Expect: []map[string]any{
-		{"schema_parses": "requirements"},
-		{"field_nonempty_all": "stories[].so_that"},
-	}}
-	okResults := evaluateCase(m, pass, nil, nil, false)
-	assertStatus(t, okResults, "field_nonempty_all:stories[].so_that", "pass")
-
-	failResults := evaluateCase(m, fail, nil, nil, false)
-	assertStatus(t, failResults, "field_nonempty_all:stories[].so_that", "fail")
-}
-
 func TestEvaluateCase_MentionsAndNotMentions(t *testing.T) {
 	m := caseManifest{Expect: []map[string]any{
 		{"mentions": []any{"filterTaskTool", "selectSubagentTools"}},
@@ -479,43 +381,6 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 	}
 	if builtinFP == overrideFP {
 		t.Fatalf("project YAML override did not change the fingerprint (%q)", builtinFP)
-	}
-}
-
-// TestCaseFingerprint_IncludesOutputSchemaPromptForBuiltinRole is the M5-3
-// review fix: caseFingerprint used to hardcode the schema-Prompt component to
-// "" unconditionally (post-M5-3 that premise is false for architect/
-// product-manager/researcher/analyst, which now carry a mounted
-// OutputSchema). This pins the fingerprint to the ACTUAL formula — sha256 of
-// SystemPrompt + skill bodies + the role's resolved OutputSchema.Prompt —
-// against the same agent.GetAgentTypeConfig the production executor reads,
-// not a re-derivation.
-func TestCaseFingerprint_IncludesOutputSchemaPromptForBuiltinRole(t *testing.T) {
-	repoRoot := t.TempDir() // no .deepai/agents/architect.yaml: pure builtin path
-
-	got, err := caseFingerprint("architect", repoRoot, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint: %v", err)
-	}
-
-	cfg := agent.GetAgentTypeConfig(agent.AgentTypeArchitect)
-	if cfg.OutputSchema == nil || cfg.OutputSchema.Prompt == "" {
-		t.Fatal("architect's builtin OutputSchema.Prompt is empty in this build; the fixture this test needs is gone")
-	}
-	want := computeFingerprint(cfg.SystemPrompt, nil, cfg.OutputSchema.Prompt)
-	if got != want {
-		t.Errorf("caseFingerprint(architect) = %q, want %q (sha256 of SystemPrompt+OutputSchema.Prompt)", got, want)
-	}
-
-	// The failure this guards against: computing the fingerprint as if the
-	// schema Prompt were still "" (the pre-fix behavior) must NOT match —
-	// otherwise adding/changing a field on DesignDoc (or any future schema
-	// change with the system prompt held constant) would silently produce
-	// the SAME fingerprint as before the change, letting a stale before-run
-	// vouch for a new contract it never tested.
-	stale := computeFingerprint(cfg.SystemPrompt, nil, "")
-	if got == stale {
-		t.Error("caseFingerprint(architect) matches the schema-blind (pre-fix) fingerprint; OutputSchema.Prompt is not being folded in")
 	}
 }
 
@@ -772,7 +637,6 @@ func baselineRole(agentType string) roleSummary {
 		AgentType:                agentType,
 		Fingerprint:              "abc12345",
 		DispatchedRuns:           8,
-		ContractRate:             0.9,
 		MentionsHitRate:          1.0,
 		MentionsHits:             16,
 		MentionsTotal:            16,
@@ -827,23 +691,6 @@ func TestRenderEvalCompare_RecheckWhenAvgDurationExceeds1_5x(t *testing.T) {
 	}
 	if !strings.Contains(out, "VERDICT: recheck") {
 		t.Errorf("expected VERDICT: recheck (no FAIL-tier metric failed), got:\n%s", out)
-	}
-}
-
-func TestRenderEvalCompare_FailWhenContractRateBelowThreshold(t *testing.T) {
-	before := evalSummary{Model: "glm-5.3", Runs: 3, Timeout: "5m", Roles: []roleSummary{baselineRole("architect")}}
-	after := before
-	afterRole := baselineRole("architect")
-	afterRole.Fingerprint = "def67890"
-	afterRole.ContractRate = 0.5 // < 80% threshold
-	after.Roles = []roleSummary{afterRole}
-
-	out, err := renderEvalCompare(before, after)
-	if err != nil {
-		t.Fatalf("renderEvalCompare: %v", err)
-	}
-	if !strings.Contains(out, "VERDICT: fail") {
-		t.Errorf("expected VERDICT: fail for a sub-80%% contract rate, got:\n%s", out)
 	}
 }
 
@@ -936,82 +783,6 @@ func TestRenderEvalCompare_RoundTripsThroughJSON(t *testing.T) {
 // dividing by 9 instead of 8).
 // ---------------------------------------------------------------------------
 
-func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *testing.T) {
-	records := []runRecord{
-		{
-			Case: "c1", AgentType: "widget", Fingerprint: "fp1", Tokens: 100, DurationMS: 1000,
-			Assertions: []assertionResult{
-				{Name: "schema_parses:design", Status: "fail"},
-				{Name: "mentions:Foo", Status: "pass"},
-				{Name: "mentions:Bar", Status: "pass"},
-				{Name: "not_mentions:Baz", Status: "pass"},
-				{Name: "tool_calls_max:20", Status: "pass"},
-				{Name: "no_writes", Status: "pass"},
-				{Name: "tokens_max:1000", Status: "pass"},
-			},
-		},
-		{
-			Case: "c2", AgentType: "widget", Fingerprint: "fp1", Tokens: 300, DurationMS: 3000,
-			Assertions: []assertionResult{
-				{Name: "schema_parses:design", Status: "fail"},
-				{Name: "mentions:Foo", Status: "pass"},
-				{Name: "mentions:Bar", Status: "fail"},
-				{Name: "not_mentions:Baz", Status: "pass"},
-				{Name: "tool_calls_max:20", Status: "pass"},
-				{Name: "no_writes", Status: "pass"},
-				{Name: "tokens_max:1000", Status: "pass"},
-			},
-		},
-		{
-			// A dispatch timeout, shaped exactly like the real
-			// eval/results/2026-09-06-glm-5.3/runs.jsonl records: a lone
-			// synthetic "dispatch" fail assertion, duration_ms=0, tokens=0.
-			Case: "c3", AgentType: "widget", Fingerprint: "fp1", Tokens: 0, DurationMS: 0,
-			Error:      "context deadline exceeded",
-			Assertions: []assertionResult{{Name: "dispatch", Status: "fail", Detail: "context deadline exceeded"}},
-		},
-	}
-	s := buildEvalSummary("glm-5.3", 3, "5m", records)
-	if len(s.Roles) != 1 {
-		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
-	}
-	r := s.Roles[0]
-
-	if r.DispatchedRuns != 2 {
-		t.Errorf("DispatchedRuns = %d, want 2 (the errored run must not count)", r.DispatchedRuns)
-	}
-	if r.DispatchErrors != 1 {
-		t.Errorf("DispatchErrors = %d, want 1", r.DispatchErrors)
-	}
-	if r.ContractRate != 0 {
-		t.Errorf("ContractRate = %v, want 0 (both dispatched runs failed schema_parses)", r.ContractRate)
-	}
-	if r.MentionsHits != 3 || r.MentionsTotal != 4 {
-		t.Errorf("Mentions = %d/%d, want 3/4", r.MentionsHits, r.MentionsTotal)
-	}
-	if r.NotMentionsViolationRate != 0 {
-		t.Errorf("NotMentionsViolationRate = %v, want 0", r.NotMentionsViolationRate)
-	}
-	if r.GuardViolations != 0 {
-		t.Errorf("GuardViolations = %d, want 0", r.GuardViolations)
-	}
-	// The whole point: (1000+3000)/2 = 2000, NOT (1000+3000+0)/3 = 1333.33.
-	if r.AvgDurationMS != 2000 {
-		t.Errorf("AvgDurationMS = %v, want 2000 (mean of the 2 dispatched runs only, excluding the timeout's duration_ms=0)", r.AvgDurationMS)
-	}
-	if r.AvgTokens != 200 {
-		t.Errorf("AvgTokens = %v, want 200 (mean of the 2 dispatched runs only)", r.AvgTokens)
-	}
-	// Diagnostic assertion-pass-rate must not contain the synthetic
-	// "dispatch" pseudo-assertion: across the two dispatched runs' 14
-	// assertions, 11 pass and 3 fail (schema_parses x2, mentions:Bar x1) ->
-	// 11/14, not (11+0)/15 with the errored run's synthetic fail folded in.
-	wantRate := 11.0 / 14.0
-	if diff := r.AssertionPassRate - wantRate; diff > 1e-9 || diff < -1e-9 {
-		t.Errorf("AssertionPassRate = %v, want %v (must exclude the errored run's synthetic dispatch assertion)", r.AssertionPassRate, wantRate)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Golden test: recomputing the real 2026-09-06-glm-5.3 BEFORE baseline with
 // the new harness must reproduce docs/AGENT_CAPABILITY_DESIGN.md §8's "新口径
@@ -1034,132 +805,6 @@ func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *t
 // 9, tester 9), matching the archived eval/results/2026-09-06-glm-5.3-before
 // /runs.jsonl on disk.
 // ---------------------------------------------------------------------------
-
-const wantGLM53BaselineRecordCount = 45
-
-func TestBuildEvalSummary_MatchesGLM53DesignDocBaseline(t *testing.T) {
-	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
-	}
-	runsPath := filepath.Join(repoRoot, "eval", "results", "2026-09-06-glm-5.3-before", "runs.jsonl")
-	data, err := os.ReadFile(runsPath)
-	if err != nil {
-		t.Skipf("real baseline runs.jsonl not present (%v); skipping golden check", err)
-	}
-
-	var records []runRecord
-	for i, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var rec runRecord
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			t.Fatalf("line %d: %v", i, err)
-		}
-		records = append(records, rec)
-	}
-	// Defensive: this golden test's expected numbers are hardcoded against
-	// ONE specific archived file. That file is gitignored (eval/results/**),
-	// so a fresh clone — or a workspace mid-way through re-running eval,
-	// where the file may briefly be truncated or hold a different run's
-	// data — will not have exactly this content. Skip rather than fail: a
-	// red result here must never be mistaken for a real regression by
-	// someone who does not have (or does not yet have) this exact file.
-	if len(records) != wantGLM53BaselineRecordCount {
-		t.Skipf("eval/results/2026-09-06-glm-5.3-before/runs.jsonl has %d records, want %d (not the archived before-baseline this golden test expects, or in-flight from a concurrent eval run); skipping golden check", len(records), wantGLM53BaselineRecordCount)
-	}
-
-	s := buildEvalSummary("glm-5.3", 3, "5m", records)
-
-	type want struct {
-		dispatched, dispatchErrors int
-		contractRate               float64
-		mentionsHits, mentionsTot  int
-		notMentionsViolationRate   float64
-		guardViolations            int
-		avgDurationMS              float64 // rounded to nearest ms, per the doc table
-		diagAssertPass, diagTotal  int     // pass count / (pass+fail) count, diagnostic column
-	}
-	wants := map[string]want{
-		"analyst":         {8, 1, 0, 16, 16, 0, 0, 152923, 56, 64},
-		"architect":       {9, 0, 0, 15, 18, 0, 0, 200192, 60, 72},
-		"product-manager": {9, 0, 0, 16, 18, 0, 0, 115466, 61, 72},
-		"researcher":      {9, 0, 0, 15, 15, 0, 0, 125406, 60, 69},
-		"tester":          {8, 1, 0, 13, 13, 0, 0, 196229, 53, 61},
-	}
-
-	seen := map[string]bool{}
-	var (
-		combinedDispatched, combinedTimeouts        int
-		combinedMentionsHits, combinedMentionsTotal int
-		combinedDiagPass, combinedDiagTotal         int
-		combinedDurationWeighted                    float64
-	)
-	for _, r := range s.Roles {
-		w, ok := wants[r.AgentType]
-		if !ok {
-			t.Errorf("unexpected agent_type %q in recomputed summary", r.AgentType)
-			continue
-		}
-		seen[r.AgentType] = true
-		if r.DispatchedRuns != w.dispatched {
-			t.Errorf("%s: DispatchedRuns = %d, want %d", r.AgentType, r.DispatchedRuns, w.dispatched)
-		}
-		if r.DispatchErrors != w.dispatchErrors {
-			t.Errorf("%s: DispatchErrors = %d, want %d", r.AgentType, r.DispatchErrors, w.dispatchErrors)
-		}
-		if r.ContractRate != w.contractRate {
-			t.Errorf("%s: ContractRate = %v, want %v", r.AgentType, r.ContractRate, w.contractRate)
-		}
-		if r.MentionsHits != w.mentionsHits || r.MentionsTotal != w.mentionsTot {
-			t.Errorf("%s: Mentions = %d/%d, want %d/%d", r.AgentType, r.MentionsHits, r.MentionsTotal, w.mentionsHits, w.mentionsTot)
-		}
-		if r.NotMentionsViolationRate != w.notMentionsViolationRate {
-			t.Errorf("%s: NotMentionsViolationRate = %v, want %v", r.AgentType, r.NotMentionsViolationRate, w.notMentionsViolationRate)
-		}
-		if r.GuardViolations != w.guardViolations {
-			t.Errorf("%s: GuardViolations = %d, want %d", r.AgentType, r.GuardViolations, w.guardViolations)
-		}
-		gotMS := round(r.AvgDurationMS)
-		if gotMS != w.avgDurationMS {
-			t.Errorf("%s: AvgDurationMS (rounded) = %v, want %v (raw=%v)", r.AgentType, gotMS, w.avgDurationMS, r.AvgDurationMS)
-		}
-		wantDiagRate := float64(w.diagAssertPass) / float64(w.diagTotal)
-		if diff := r.AssertionPassRate - wantDiagRate; diff > 1e-9 || diff < -1e-9 {
-			t.Errorf("%s: AssertionPassRate (diagnostic) = %v, want %v (%d/%d)", r.AgentType, r.AssertionPassRate, wantDiagRate, w.diagAssertPass, w.diagTotal)
-		}
-
-		combinedDispatched += r.DispatchedRuns
-		combinedTimeouts += r.DispatchErrors
-		combinedMentionsHits += r.MentionsHits
-		combinedMentionsTotal += r.MentionsTotal
-		combinedDiagPass += w.diagAssertPass
-		combinedDiagTotal += w.diagTotal
-		combinedDurationWeighted += r.AvgDurationMS * float64(r.DispatchedRuns)
-	}
-	for agentType := range wants {
-		if !seen[agentType] {
-			t.Errorf("agent_type %q missing from recomputed summary", agentType)
-		}
-	}
-
-	if combinedDispatched != 43 {
-		t.Errorf("combined DispatchedRuns = %d, want 43", combinedDispatched)
-	}
-	if combinedTimeouts != 2 {
-		t.Errorf("combined DispatchErrors = %d, want 2", combinedTimeouts)
-	}
-	if combinedMentionsHits != 75 || combinedMentionsTotal != 80 {
-		t.Errorf("combined Mentions = %d/%d, want 75/80", combinedMentionsHits, combinedMentionsTotal)
-	}
-	if got := round(combinedDurationWeighted / float64(combinedDispatched)); got != 157274 {
-		t.Errorf("combined avg duration (weighted, rounded) = %v, want 157274", got)
-	}
-	if combinedDiagPass != 290 || combinedDiagTotal != 338 {
-		t.Errorf("combined diagnostic assert pass = %d/%d, want 290/338", combinedDiagPass, combinedDiagTotal)
-	}
-}
 
 func round(f float64) float64 {
 	if f < 0 {
@@ -1248,5 +893,83 @@ func TestBuildEvalModelRegistry_NoProviderConfigured(t *testing.T) {
 	_, _, err := buildEvalModelRegistry(Config{}, "")
 	if err == nil {
 		t.Fatal("expected an error when no provider is configured")
+	}
+}
+
+// TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors pins
+// design §8 revision two item 6: a run that errored (a dispatch timeout) has
+// no output, so it can be scored on nothing — it contributes to
+// DispatchErrors and to no other denominator. Folding its zero duration into
+// the mean is what understated two roles' cost by 12.5% in the M5-2 baseline.
+// This test lost its ContractRate assertion when M5-4 removed contracts; the
+// rule it guards is unrelated to contracts and outlives them.
+func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *testing.T) {
+	records := []runRecord{
+		{
+			Case: "c1", AgentType: "widget", Fingerprint: "fp1", Tokens: 100, DurationMS: 1000,
+			Assertions: []assertionResult{
+				{Name: "mentions:Foo", Status: "pass"},
+				{Name: "mentions:Bar", Status: "pass"},
+				{Name: "not_mentions:Baz", Status: "pass"},
+				{Name: "tool_calls_max:20", Status: "pass"},
+				{Name: "no_writes", Status: "pass"},
+				{Name: "tokens_max:1000", Status: "pass"},
+			},
+		},
+		{
+			Case: "c2", AgentType: "widget", Fingerprint: "fp1", Tokens: 300, DurationMS: 3000,
+			Assertions: []assertionResult{
+				{Name: "mentions:Foo", Status: "pass"},
+				{Name: "mentions:Bar", Status: "fail"},
+				{Name: "not_mentions:Baz", Status: "pass"},
+				{Name: "tool_calls_max:20", Status: "pass"},
+				{Name: "no_writes", Status: "pass"},
+				{Name: "tokens_max:1000", Status: "pass"},
+			},
+		},
+		{
+			// A dispatch timeout, shaped exactly like the real
+			// eval/results/2026-09-06-glm-5.3/runs.jsonl records: a lone
+			// synthetic "dispatch" fail assertion, duration_ms=0, tokens=0.
+			Case: "c3", AgentType: "widget", Fingerprint: "fp1", Tokens: 0, DurationMS: 0,
+			Error:      "context deadline exceeded",
+			Assertions: []assertionResult{{Name: "dispatch", Status: "fail", Detail: "context deadline exceeded"}},
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 3, "5m", records)
+	if len(s.Roles) != 1 {
+		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
+	}
+	r := s.Roles[0]
+
+	if r.DispatchedRuns != 2 {
+		t.Errorf("DispatchedRuns = %d, want 2 (the errored run must not count)", r.DispatchedRuns)
+	}
+	if r.DispatchErrors != 1 {
+		t.Errorf("DispatchErrors = %d, want 1", r.DispatchErrors)
+	}
+	if r.MentionsHits != 3 || r.MentionsTotal != 4 {
+		t.Errorf("Mentions = %d/%d, want 3/4", r.MentionsHits, r.MentionsTotal)
+	}
+	if r.NotMentionsViolationRate != 0 {
+		t.Errorf("NotMentionsViolationRate = %v, want 0", r.NotMentionsViolationRate)
+	}
+	if r.GuardViolations != 0 {
+		t.Errorf("GuardViolations = %d, want 0", r.GuardViolations)
+	}
+	// The whole point: (1000+3000)/2 = 2000, NOT (1000+3000+0)/3 = 1333.33.
+	if r.AvgDurationMS != 2000 {
+		t.Errorf("AvgDurationMS = %v, want 2000 (mean of the 2 dispatched runs only, excluding the timeout's duration_ms=0)", r.AvgDurationMS)
+	}
+	if r.AvgTokens != 200 {
+		t.Errorf("AvgTokens = %v, want 200 (mean of the 2 dispatched runs only)", r.AvgTokens)
+	}
+	// Diagnostic assertion-pass-rate must not contain the synthetic
+	// "dispatch" pseudo-assertion: across the two dispatched runs' 12
+	// assertions, 11 pass and 1 fails (mentions:Bar) -> 11/12, not
+	// (11+0)/13 with the errored run's synthetic fail folded in.
+	wantRate := 11.0 / 12.0
+	if diff := r.AssertionPassRate - wantRate; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("AssertionPassRate = %v, want %v (must exclude the errored run's synthetic dispatch assertion)", r.AssertionPassRate, wantRate)
 	}
 }

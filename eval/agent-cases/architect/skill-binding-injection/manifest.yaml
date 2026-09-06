@@ -4,8 +4,6 @@ task: "设计 skill 与 agent 类型的绑定机制，说明注入时机与递�
 context_files: [pkg/agent/subagent.go, pkg/skill/tool.go]
 tags: [go, self-referential]
 expect:
-  - schema_parses: design
-  - field_min_count: {path: decisions, n: 2}
   - mentions: [filterTaskTool, selectSubagentTools]
   - not_mentions: [SubagentRunner, ExecuteFork]
   - tool_calls_max: 20

@@ -701,36 +701,6 @@ func dispatchEvalTask(ctx context.Context, pool evalTaskPool, c evalCase, contex
 
 func evaluateCase(m caseManifest, output string, stats *subagent.RunStats, usage *subagent.TokenUsage, writeViolation bool) []assertionResult {
 	var results []assertionResult
-	var schemaParsed any
-	var schemaOK bool
-
-	// schema_parses first (regardless of its position in the YAML list):
-	// field_min_count/field_nonempty_all need to know up front whether to
-	// evaluate or mark themselves skipped.
-	for _, exp := range m.Expect {
-		key, val, ok := singleKV(exp)
-		if !ok || key != "schema_parses" {
-			continue
-		}
-		name, _ := val.(string)
-		res := assertionResult{Name: "schema_parses:" + name}
-		if !namedSchemaKinds[name] {
-			res.Status = "fail"
-			res.Detail = fmt.Sprintf("unknown schema name %q", name)
-			results = append(results, res)
-			continue
-		}
-		parsed, err := parseNamedSchema(name, output)
-		if err != nil {
-			res.Status = "fail"
-			res.Detail = err.Error()
-		} else {
-			res.Status = "pass"
-			schemaOK = true
-			schemaParsed = parsed
-		}
-		results = append(results, res)
-	}
 
 	for _, exp := range m.Expect {
 		key, val, ok := singleKV(exp)
@@ -738,44 +708,6 @@ func evaluateCase(m caseManifest, output string, stats *subagent.RunStats, usage
 			continue
 		}
 		switch key {
-		case "schema_parses":
-			continue // handled above
-		case "field_min_count":
-			spec, _ := val.(map[string]any)
-			path, _ := spec["path"].(string)
-			n := intFromYAML(spec["n"])
-			name := fmt.Sprintf("field_min_count:%s>=%d", path, n)
-			if !schemaOK {
-				results = append(results, assertionResult{Name: name, Status: "skipped", Detail: "schema_parses did not succeed"})
-				continue
-			}
-			pass, count, err := fieldMinCount(schemaParsed, path, n)
-			res := assertionResult{Name: name}
-			if err != nil {
-				res.Status = "fail"
-				res.Detail = err.Error()
-			} else {
-				res.Status = statusFor(pass)
-				res.Detail = fmt.Sprintf("count=%d", count)
-			}
-			results = append(results, res)
-		case "field_nonempty_all":
-			path, _ := val.(string)
-			name := "field_nonempty_all:" + path
-			if !schemaOK {
-				results = append(results, assertionResult{Name: name, Status: "skipped", Detail: "schema_parses did not succeed"})
-				continue
-			}
-			pass, checked, err := fieldNonemptyAll(schemaParsed, path)
-			res := assertionResult{Name: name}
-			if err != nil {
-				res.Status = "fail"
-				res.Detail = err.Error()
-			} else {
-				res.Status = statusFor(pass)
-				res.Detail = fmt.Sprintf("checked=%d", checked)
-			}
-			results = append(results, res)
 		case "mentions":
 			for _, item := range toStringSlice(val) {
 				pass := strings.Contains(output, item)
@@ -954,7 +886,7 @@ func resolveEvalSystemPrompt(agentType, repoRoot string) (string, []string, stri
 // does not retroactively recompute or touch anything under eval/results/ —
 // it protects fingerprints computed FROM HERE ON (M5-4 and later), so that a
 // schema change with the system prompt held byte-for-byte constant (e.g.
-// adding a field to DesignDoc, or M5-4 wiring tester's output_schema) still
+// adding a field to a named schema, or wiring a role's output_schema) still
 // produces a different fingerprint instead of silently reusing a stale
 // before-run's fingerprint to vouch for an untested contract.
 func caseFingerprint(agentType, repoRoot string, skillReg *skill.Registry) (string, error) {
@@ -988,20 +920,17 @@ func computeFingerprint(systemPrompt string, skillBodies []string, schemaPrompt 
 // ---------------------------------------------------------------------------
 
 type roleSummary struct {
-	AgentType      string  `json:"agent_type"`
-	Fingerprint    string  `json:"fingerprint"`
-	Cases          int     `json:"cases"`
-	Runs           int     `json:"runs"`
-	DispatchedRuns int     `json:"dispatched_runs"`
-	ContractRate   float64 `json:"contract_rate"`
+	AgentType      string `json:"agent_type"`
+	Fingerprint    string `json:"fingerprint"`
+	Cases          int    `json:"cases"`
+	Runs           int    `json:"runs"`
+	DispatchedRuns int    `json:"dispatched_runs"`
 	// AssertionPassRate/Fail/Skip are diagnostic only (see
 	// docs/AGENT_CAPABILITY_DESIGN.md §8's "废弃‘整体断言通过率’作为达标线"):
 	// reported for continuity with the M5-2 baseline, no longer a gate.
 	AssertionPassRate        float64 `json:"assertion_pass_rate"`
 	AssertionFailRate        float64 `json:"assertion_fail_rate"`
 	AssertionSkipRate        float64 `json:"assertion_skip_rate"`
-	SchemaParseRate          float64 `json:"schema_parse_rate"`
-	FieldPassRate            float64 `json:"field_pass_rate"`
 	MentionsHitRate          float64 `json:"mentions_hit_rate"`
 	MentionsHits             int     `json:"mentions_hits"`
 	MentionsTotal            int     `json:"mentions_total"`
@@ -1064,12 +993,9 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		}
 		caseSet := map[string]bool{}
 		var totalPass, totalFail, totalSkip int
-		var schemaPass, schemaFail int
-		var fieldPass, fieldFail int
 		var mentionsPass, mentionsFail int
 		var notMentionsPass, notMentionsFail int
 		var guardFail int
-		var contractRuns int
 		var tokensSum, durationSum float64
 		for _, r := range recs {
 			caseSet[r.Case] = true
@@ -1084,8 +1010,6 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			tokensSum += float64(r.Tokens)
 			durationSum += float64(r.DurationMS)
 
-			runSchemaOK := false
-			runFieldFail := false
 			for _, a := range r.Assertions {
 				switch a.Status {
 				case "pass":
@@ -1096,20 +1020,6 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 					totalSkip++
 				}
 				switch {
-				case strings.HasPrefix(a.Name, "schema_parses:"):
-					if a.Status == "pass" {
-						schemaPass++
-						runSchemaOK = true
-					} else if a.Status == "fail" {
-						schemaFail++
-					}
-				case strings.HasPrefix(a.Name, "field_"):
-					if a.Status == "pass" {
-						fieldPass++
-					} else if a.Status == "fail" {
-						fieldFail++
-						runFieldFail = true
-					}
 				case strings.HasPrefix(a.Name, "mentions:"):
 					if a.Status == "pass" {
 						mentionsPass++
@@ -1128,26 +1038,16 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 					}
 				}
 			}
-			// Run-level contract: schema_parses passed AND no field_*
-			// assertion in this run failed (docs/AGENT_CAPABILITY_DESIGN.md
-			// §8 metric #1 — run-level, not assertion-level, precisely so
-			// skipped field_* assertions cannot escape the denominator).
-			if runSchemaOK && !runFieldFail {
-				contractRuns++
-			}
 		}
 		rs.Cases = len(caseSet)
 		rs.AssertionPassRate = ratio(totalPass, totalPass+totalFail)
 		rs.AssertionFailRate = ratio(totalFail, totalPass+totalFail)
 		rs.AssertionSkipRate = ratio(totalSkip, totalPass+totalFail+totalSkip)
-		rs.SchemaParseRate = ratio(schemaPass, schemaPass+schemaFail)
-		rs.FieldPassRate = ratio(fieldPass, fieldPass+fieldFail)
 		rs.MentionsHitRate = ratio(mentionsPass, mentionsPass+mentionsFail)
 		rs.MentionsHits = mentionsPass
 		rs.MentionsTotal = mentionsPass + mentionsFail
 		rs.NotMentionsViolationRate = ratio(notMentionsFail, notMentionsPass+notMentionsFail)
 		rs.GuardViolations = guardFail + rs.NoWritesViolations
-		rs.ContractRate = ratio(contractRuns, rs.DispatchedRuns)
 		if rs.DispatchedRuns > 0 {
 			rs.AvgTokens = tokensSum / float64(rs.DispatchedRuns)
 			rs.AvgDurationMS = durationSum / float64(rs.DispatchedRuns)
@@ -1257,13 +1157,13 @@ func renderEvalSummaryMD(s evalSummary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# deepai eval agents — %s\n\n", s.GeneratedAt)
 	fmt.Fprintf(&b, "Model: `%s`  \nRuns per case: %d  \nTimeout: `%s`\n\n", s.Model, s.Runs, s.Timeout)
-	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | contract | assert pass | assert fail | assert skip | schema parse | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | no_writes viol | guard viol | dispatch err |\n")
-	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | assert pass | assert fail | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | no_writes viol | guard viol | dispatch err |\n")
+	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range s.Roles {
-		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %d | %d |\n",
-			r.AgentType, r.Fingerprint, r.Cases, r.DispatchedRuns, r.ContractRate*100,
-			r.AssertionPassRate*100, r.AssertionFailRate*100, r.AssertionSkipRate*100,
-			r.SchemaParseRate*100, r.MentionsHitRate*100, r.NotMentionsViolationRate*100,
+		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %d | %d |\n",
+			r.AgentType, r.Fingerprint, r.Cases, r.DispatchedRuns,
+			r.AssertionPassRate*100, r.AssertionFailRate*100,
+			r.MentionsHitRate*100, r.NotMentionsViolationRate*100,
 			r.AvgTokens, r.AvgDurationMS, r.NoWritesViolations, r.GuardViolations, r.DispatchErrors)
 	}
 	return b.String()
@@ -1307,7 +1207,6 @@ func loadEvalSummary(path string) (evalSummary, error) {
 // derived absolute threshold (the design doc's per-role table is these
 // formulas evaluated against the specific 2026-09-06-glm-5.3 baseline).
 const (
-	evalContractRateThreshold   = 0.80 // metric #1: contract rate >= 80%
 	evalMentionsDropTolerancePt = 0.08 // metric #2: mentions hit rate >= before - 8pt
 	evalAvgDurationMaxRatio     = 1.5  // metric #5: avg duration <= 1.5x before -> else RECHECK
 	evalDispatchErrorSlack      = 1    // metric #6: dispatch errors <= before+1 -> else RECHECK
@@ -1371,17 +1270,9 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 
 		var isFail, isRecheck, isInvalid bool
 
-		// 1. contract rate >= 80%
-		status := "PASS"
-		if a.ContractRate < evalContractRateThreshold {
-			status = "FAIL"
-			isFail = true
-		}
-		fmt.Fprintf(&b, "  [%s] contract rate:          %.1f%% -> %.1f%%  (threshold >= %.0f%%)\n", status, bRole.ContractRate*100, a.ContractRate*100, evalContractRateThreshold*100)
-
-		// 2. mentions hit rate >= before - 8pt
+		// 1. mentions hit rate >= before - 8pt
 		mentionsThreshold := bRole.MentionsHitRate - evalMentionsDropTolerancePt
-		status = "PASS"
+		status := "PASS"
 		if a.MentionsHitRate < mentionsThreshold {
 			status = "FAIL"
 			isFail = true

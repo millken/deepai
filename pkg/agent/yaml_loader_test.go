@@ -299,7 +299,7 @@ func TestLoadAgentYAML_OutputSchema(t *testing.T) {
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	yamlContent := "type: custom-tester\noutput_schema: test-report\n"
+	yamlContent := "type: custom-reviewer\noutput_schema: review\n"
 	if err := os.WriteFile(filepath.Join(agentsDir, "custom-tester.yaml"), []byte(yamlContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -312,10 +312,13 @@ func TestLoadAgentYAML_OutputSchema(t *testing.T) {
 		t.Fatal("expected config, got nil")
 	}
 	if cfg.OutputSchema == nil {
-		t.Fatal("OutputSchema = nil, want the test-report schema")
+		t.Fatal("OutputSchema = nil, want the review schema")
 	}
-	if cfg.OutputSchema.Strict {
-		t.Error("OutputSchema.Strict = true, want false (test-report is non-Strict)")
+	// review is the one surviving named schema (M5-4) and it IS Strict —
+	// it is the only contract with a real program consumer
+	// (pkg/chat/review.go parses it to drive the gate).
+	if !cfg.OutputSchema.Strict {
+		t.Error("OutputSchema.Strict = false, want true (review is Strict)")
 	}
 }
 
@@ -347,8 +350,11 @@ func TestLoadAgentYAML_OutputSchemaUnknownNameErrors(t *testing.T) {
 // base's wholesale, mirroring the Skills/DefaultTools merge contract.
 func TestMergeConfig_OutputSchema(t *testing.T) {
 	reviewSchema := namedSchemas["review"]
-	designSchema := namedSchemas["design"]
-	base := AgentTypeConfig{Type: AgentTypeArchitect, OutputSchema: designSchema}
+	// A DIFFERENT instance on purpose: base and override must be
+	// distinguishable pointers, or "override replaces base" cannot fail
+	// even when mergeConfig stops honoring the override at all.
+	otherSchema := FromStruct[Issue]()
+	base := AgentTypeConfig{Type: AgentTypeArchitect, OutputSchema: otherSchema}
 
 	t.Run("non-nil override replaces base", func(t *testing.T) {
 		override := &AgentTypeConfig{OutputSchema: reviewSchema}
@@ -361,8 +367,8 @@ func TestMergeConfig_OutputSchema(t *testing.T) {
 	t.Run("nil override keeps base", func(t *testing.T) {
 		override := &AgentTypeConfig{}
 		result := mergeConfig(base, override, true)
-		if result.OutputSchema != designSchema {
-			t.Errorf("OutputSchema = %p, want base's design schema %p preserved", result.OutputSchema, designSchema)
+		if result.OutputSchema != otherSchema {
+			t.Errorf("OutputSchema = %p, want base's own schema %p preserved", result.OutputSchema, otherSchema)
 		}
 	})
 }
