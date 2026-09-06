@@ -1,0 +1,13 @@
+id: agent-type-tool-restriction
+agent_type: analyst
+task: "分析 ApplyAgentType 如何用 profile.DefaultTools 限制一个角色可用的工具集，梳理其与 task 工具递归防护之间的关系"
+context_files: [pkg/agent/types_config.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: analysis
+  - field_min_count: {path: findings, n: 2}
+  - mentions: [ApplyAgentType, DefaultTools]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

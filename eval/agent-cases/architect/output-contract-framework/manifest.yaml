@@ -1,0 +1,13 @@
+id: output-contract-framework
+agent_type: architect
+task: "设计一个跨角色复用的产出契约验证框架，说明它与现有 OutputSchema/ParseOutput 机制以及 review gate 的关系，以及非 Strict 角色的失败降级策略"
+context_files: [pkg/agent/output.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: design
+  - field_min_count: {path: decisions, n: 2}
+  - mentions: [OutputSchema, ParseOutput]
+  - not_mentions: [HookRunner, view_image]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

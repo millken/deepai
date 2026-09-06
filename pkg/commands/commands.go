@@ -11,4 +11,5 @@ func AddCommands(topLevel *cobra.Command) {
 	addKey(topLevel)
 	addAnalyze(topLevel)
 	addProbe(topLevel)
+	addEval(topLevel)
 }

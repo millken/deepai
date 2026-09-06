@@ -1,0 +1,13 @@
+id: review-gate-worktree-snapshot
+agent_type: researcher
+task: "研究 review gate 的 worktree 快照写盘检测机制是如何工作的，给出证据定位（文件与行号引用）"
+context_files: [pkg/chat/review.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: research
+  - field_nonempty_all: findings[].evidence
+  - mentions: [takeWorktreeSnapshot, changedSince]
+  - not_mentions: [SubagentRunner, HookRunner]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

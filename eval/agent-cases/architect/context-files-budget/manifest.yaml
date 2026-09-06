@@ -1,0 +1,13 @@
+id: context-files-budget
+agent_type: architect
+task: "设计 task 工具 context_files 参数的容量与截断策略的改进方案，并说明其与 subagent workDir 解析之间的耦合风险"
+context_files: [pkg/agent/subagent_context.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: design
+  - field_min_count: {path: decisions, n: 2}
+  - mentions: [contextFilesTotalCap, contextFilePerFileCap]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

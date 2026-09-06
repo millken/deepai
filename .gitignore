@@ -8,3 +8,7 @@ deepai-debug.log
 .deepai/plans/
 .superpowers/
 .DS_Store
+
+# deepai eval agents (M5-2): per-run detail is large and contains full model
+# output; summary.md/summary.json are the committed baseline artifacts.
+eval/results/*/runs.jsonl

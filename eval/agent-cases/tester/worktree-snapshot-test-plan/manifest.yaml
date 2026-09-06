@@ -1,0 +1,12 @@
+id: worktree-snapshot-test-plan
+agent_type: tester
+task: "为 worktree 快照写盘检测（takeWorktreeSnapshot/changedSince）设计测试计划，覆盖用户已有脏文件与子代理新增脏文件两种场景（只产出计划，不要写文件）"
+context_files: [pkg/chat/review.go]
+tags: [go, self-referential, has-test]
+expect:
+  - schema_parses: test-report
+  - mentions: [takeWorktreeSnapshot, changedSince]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

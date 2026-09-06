@@ -1,0 +1,13 @@
+id: output-schema-strict-retry
+agent_type: analyst
+task: "分析 OutputSchema 的 Strict 与非 Strict 两种模式在解析失败时的处理差异"
+context_files: [pkg/agent/output.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: analysis
+  - field_min_count: {path: findings, n: 2}
+  - mentions: [ParseOutput, ValidateOutput]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

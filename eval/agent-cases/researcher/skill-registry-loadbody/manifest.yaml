@@ -1,0 +1,13 @@
+id: skill-registry-loadbody
+agent_type: researcher
+task: "研究 skill 包如何加载与渲染一个技能的正文内容，重点说明 LoadBody 与 fork 类技能的关系，给出证据定位"
+context_files: [pkg/skill/registry.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: research
+  - field_nonempty_all: findings[].evidence
+  - mentions: [LoadBody]
+  - not_mentions: [SubagentRunner, view_image]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

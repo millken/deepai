@@ -229,6 +229,106 @@ eval/agent-cases/<agent_type>/<case>/
    注意代理指标的局限：耗时受网络与中转排队影响，噪声显著大于 token，
    因此耗时超标时**不直接判定不达标**，而是先重跑该角色一轮复核；
    若 provider 后续开始回传 usage，立即改回 token 判据。
+
+   **修订二（2026-09-06，基线实测后）**：M5-2 基线（`eval/results/2026-09-06-glm-5.3/`，
+   15 case × 3 run，`--timeout 5m`）整体断言 pass=290 fail=50 skip=35，通过率 85.3%。
+   "+15pt"在数学上不可达，原因是分母结构，不是模型：
+
+   - 340 条参与计算的断言里，`no_writes`/`tool_calls_max`/`tokens_max` 129 条 +
+     `not_mentions` 86 条 = 215 条（63%）全部满分且结构性不可失败（`tokens_max`
+     在 usage 缺失时恒 pass），把分母钉死；
+   - 50 条失败里 43 条是 `schema_parses`，M5-3 加产出契约后本来就会翻转，这不是
+     能力信号，是交付物本身；
+   - 35 条 `field_*` 全部 skipped 且**不进分母**，after 一旦 schema 通过它们就进入
+     分母——before/after 的"整体通过率"分母不同，本来就不是同口径；
+   - 全部翻转的天花板 = (290+43+35)/(340+35) = 98.1%，最多 +12.8pt。
+
+   **裁定：废弃"整体断言通过率 +Npt"作为达标线，改为逐指标门槛，按角色独立判定。**
+   每个门槛对应 M5-3 的一个设计意图，任一角色不达标只回退该角色的 L1（§8 第 3 条原则不变）。
+   所有指标都能从现有 `runs.jsonl` 纯本地重算，不重跑模型。
+
+   | # | 指标 | 计算口径 | 门槛 | 数字由来 |
+   |---|---|---|---|---|
+   | 1 | **契约达成率** | run 级：`schema_parses` pass **且**该 run 无任一 `field_*` fail ÷ 已派发 run 数 | **≥ 80%** | §3 契约是 M5-3 的主交付。每角色 9（或剔除超时后 8）个样本，80% 即"至多 1 次未达成"（8/9=88.9%、7/9=77.8%；7/8=87.5%）。按 §8 第 2 条非 Strict 先观测一期，留 1 次容错；M5-4 tester ≥90% 是下一档。用 run 级而非断言级，是为了让 `field_*` 不能靠 skipped 逃出分母，也让 tester（无 field 断言）与其他角色同一口径 |
+   | 2 | **mentions 命中率** | 断言级：`mentions:*` pass ÷ (pass+fail) | **≥ 基线 − 8pt**，且**五角色合计 ≥ 93.75%**（基线 75/80） | 每角色样本 13–18 条，一条断言权重 5.6–7.7pt，零容忍会被单次噪声打穿，故容 1 条（8pt ≥ 1/13）。合计零容忍，防止五个角色各花掉一次容错叠成真实倒退。合计不达标而各角色均达标时，回退 mentions 绝对下降最大的角色，直到合计达标。这是唯一有区分度的信号，不并入任何复合分 |
+   | 3 | **not_mentions 违规率** | 断言级：`not_mentions:*` fail ÷ (pass+fail) | **≤ 基线**（基线全 0 ⇒ 必须为 0） | 沿用原达标线"违规不升"。编造零容忍 |
+   | 4 | **护栏违规数** | 计数：`no_writes`/`tool_calls_max:*`/`tokens_max:*` 的 fail + `write_violation` | **= 0**（== 基线） | 护栏从比率里拿出来单列计数，不再稀释能力信号；它是安全底线不是能力分。`tokens_max` 在 usage 缺失期间是空判据，报出但不计 |
+   | 5 | **平均耗时** | 仅**已派发** run 的 `duration_ms` 均值 | **≤ 1.5× 基线** | 沿用修订一。超标不直接判负，先重跑该角色一轮复核；复核仍超 → 不达标 |
+   | 6 | **dispatch 超时数** | 计数：`error != ""` 的 run；这些 run **从 1–5 的全部分母剔除** | **≤ 基线 + 1**（analyst/tester ≤ 2，其余 ≤ 1）；已派发 run 必须 **≥ 7/9** 否则本轮不可判定 | 超时 run 无输出，其 10 条断言一条都没评估；老口径把它折成 1 个 `dispatch` fail，既压低该角色通过率、又让分母随机变化（analyst 64 vs 72），不是同口径。剔除后单列计数，并给一个"基线+1"的上限：超时是成本倒退的另一种表现（L1 更长 → 更多工具调用 → 更易撞 5m），超出与耗时同样处理——先重跑复核，复核仍超 → 不达标 |
+
+   **判定规则**：1–4 任一不满足 → 该角色不达标，L1 回退；仅 5/6 不满足 → 该角色"待复核"，
+   重跑一轮后按同规则再判，不阻塞其他角色。整体断言通过率继续在 summary 报出，
+   但只作诊断列，不再是门槛。**可比性前提**：同模型（glm-5.3）、同 `--timeout 5m`、
+   同 runs=3、同 case 集；`compare` 必须校验前两项一致（见下方前置任务）。
+
+   **否决 (a)"能力分 + 护栏拆分"**：拆分方向是对的（本修订采纳了护栏单列），但把
+   schema+field+mentions 折成一个"能力分"不行——before 分母里 schema 43 条全败、field
+   35 条不参与，after schema 翻转的同时 field 35 条进入分母，"能力分"从 47.5%
+   （75/158，skip 计失败）或 61.0%（75/123，skip 不计）跳到 90% 以上是契约交付的
+   必然结果，与角色能力无关；而 mentions 在能力分里权重约一半，漏 5 条只值 −3pt，
+   会被 +30pt 的顺风淹没。它把最有区分度的信号稀释在最没区分度的翻转里。
+
+   **否决 (b)"整体门槛降到 +10pt"**：+10 只是把天花板从 13 挪到 10，仪器没变——
+   护栏仍占分母 63%，每个真实信号的灵敏度被砍掉三分之二；mentions 只占 21%，漏 5 条
+   只值 −1.3pt，完全不可见；field 进入分母导致前后分母不同口径；一次超时就让分母
+   随机少 10 条。它是一个"不能告诉你哪里动了"的复合数字，达标或不达标都无法归因到
+   某一角色的某一条 L1 规则，与 §9"归因"的要求相悖。
+
+   **新口径基线（before，从 `runs.jsonl` 重算；M5-3 `compare` 对照此表）**：
+
+   | 角色 | 超时/已派发 | 契约达成率 | schema 解析率 | mentions 命中率（漏） | not_mentions 违规 | 护栏违规 | 均耗时（已派发） | 旧口径断言通过率（诊断） |
+   |---|---|---|---|---|---|---|---|---|
+   | analyst | 1 / 8 | 0/8 = 0.0% | 0/8 = 0.0% | 16/16 = 100.0%（0） | 0/16 = 0% | 0/24 | 152,923 ms | 56/64 = 87.5% |
+   | architect | 0 / 9 | 0/9 = 0.0% | 0/9 = 0.0% | 15/18 = 83.3%（3） | 0/18 = 0% | 0/27 | 200,192 ms | 60/72 = 83.3% |
+   | product-manager | 0 / 9 | 0/9 = 0.0% | 0/9 = 0.0% | 16/18 = 88.9%（2） | 0/18 = 0% | 0/27 | 115,466 ms | 61/72 = 84.7% |
+   | researcher | 0 / 9 | 0/9 = 0.0% | 0/9 = 0.0% | 15/15 = 100.0%（0） | 0/18 = 0% | 0/27 | 125,406 ms | 60/69 = 87.0% |
+   | tester | 1 / 8 | 0/8 = 0.0% | 0/8 = 0.0% | 13/13 = 100.0%（0） | 0/16 = 0% | 0/24 | 196,229 ms | 53/61 = 86.9% |
+   | **合计** | 2 / 43 | 0/43 = 0.0% | 0/43 = 0.0% | **75/80 = 93.75%（5）** | 0/86 = 0% | 0/129 | 157,274 ms | 290/338 = 85.8% |
+
+   注：(i) analyst/tester 的均耗时高于 `summary.md` 的 135,931 / 174,426——旧
+   `buildEvalSummary` 把超时 run 的 `duration_ms=0` 也算进了均值，会让 after/before
+   的耗时比虚高 12.5%，这是必须先修的 harness 缺陷；(ii) 旧口径"诊断"列剔除了
+   `dispatch` 伪断言，故 analyst 87.5% ≠ summary.md 的 86.2%；(iii) 5 条 mentions 漏项全
+   是上下文预算常量（architect `contextFilePerFileCap`×2、`contextFilesTotalCap`×1，
+   product-manager `contextFilesTotalCap`×2），M5-3 L1 的"证据"条款应当直接命中它们，
+   `compare` 时单独核对这两个角色是否回收。
+
+   **M5-3 逐角色门槛（由上表代入）**：
+
+   | 角色 | 契约达成率 | mentions 命中率 | not_mentions | 护栏违规 | 均耗时上限（1.5×） | 超时上限 |
+   |---|---|---|---|---|---|---|
+   | analyst | ≥ 80% | ≥ 92.0% | 0 | 0 | ≤ 229,384 ms | ≤ 2 |
+   | architect | ≥ 80% | ≥ 75.3% | 0 | 0 | ≤ 300,288 ms | ≤ 1 |
+   | product-manager | ≥ 80% | ≥ 80.9% | 0 | 0 | ≤ 173,198 ms | ≤ 1 |
+   | researcher | ≥ 80% | ≥ 92.0% | 0 | 0 | ≤ 188,109 ms | ≤ 1 |
+   | tester | ≥ 80% | ≥ 92.0% | 0 | 0 | ≤ 294,343 ms | ≤ 2 |
+   | 合计 | — | ≥ 93.75% | 0 | 0 | — | — |
+
+   **M5-3 前置任务：harness 统计口径改造（`pkg/commands/agent_eval.go`，本修订不改代码）**
+
+   1. `roleSummary`：新增 `DispatchedRuns int`（`dispatched_runs`）、`ContractRate float64`
+      （`contract_rate`）、`FieldPassRate float64`（`field_pass_rate`，诊断）、
+      `MentionsHits/MentionsTotal int`、`GuardViolations int`（`guard_violations`，
+      = `no_writes`/`tool_calls_max`/`tokens_max` fail 数 + `write_violation`）。
+      `evalSummary` 新增 `Timeout string`（写入 `--timeout` 原值）供 compare 校验。
+   2. `buildEvalSummary`：`r.Error != ""` 的记录只累加 `DispatchErrors`，**跳过**其余全部
+      累加（断言计数、族计数、`durationSum`）；`AvgDurationMS`/`AvgTokens` 的分母改为
+      `DispatchedRuns`。新增 run 级契约判定：该 run 存在 `schema_parses:*` pass 且无
+      `field_*` fail → `contract++`。`AssertionPassRate` 保留但不再含 `dispatch` 伪断言。
+   3. `renderEvalSummaryMD`：新增列 `dispatched`、`contract`、`guard viol`；`avg ms` 改名
+      `avg ms (dispatched)`。
+   4. `renderEvalCompare`：每角色输出六行并逐行给出 `PASS`/`FAIL`/`RECHECK`：
+      契约达成率（≥80%）、mentions 命中率（≥ before−8pt）、not_mentions 违规率（≤ before）、
+      护栏违规数（=0）、均耗时比（≤1.5× → 否则 `RECHECK`）、超时数（≤ before+1 → 否则
+      `RECHECK`；已派发 <7 → `INVALID`）；末尾输出五角色合计 mentions 命中率（≥ before）
+      与每角色 `VERDICT: pass | fail | recheck | invalid`。开头校验 `Model`、`Runs`、
+      `Timeout` 三者一致，不一致直接报错退出（不可比）。保留指纹未变的 WARNING。
+      `avg tokens` 行在 before/after 均为 0 时改为一行 `usage unavailable`。
+   5. `agent_eval_test.go`：用一份含一条 `error` 记录的 fixture 给 `buildEvalSummary`
+      加 golden 单测，期望值即上方"新口径基线"表（契约 0/8、mentions 16/16、均耗时
+      仅计已派发 run）；`renderEvalCompare` 加一条 RECHECK 路径和一条 Model 不一致报错的用例。
+   6. 改造完成后用新 harness 对**同一份** `runs.jsonl` 重新生成 summary（不重跑模型），
+      核对与上表逐格一致，再以该 summary.json 作为 M5-3 `compare` 的 before 输入。
 4. **eval 语料首期 Go-only，以 deepai 自身代码做 fixture**。
    自指风险的缓解：`mentions` 锚点取自仓库真值（函数名/文件名），
    诱饵 `not_mentions` 取自"看似相关但实际不存在"的符号，模型的先验帮不上忙。

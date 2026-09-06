@@ -1,0 +1,12 @@
+id: subagent-executor-test-plan
+agent_type: tester
+task: "为 SubagentExecutor.Execute 的技能预加载与 fork 技能校验逻辑设计测试计划，列出关键测试用例（只产出计划，不需要真正编写或运行测试文件）"
+context_files: [pkg/agent/subagent.go]
+tags: [go, self-referential, has-test]
+expect:
+  - schema_parses: test-report
+  - mentions: [WithSkillRegistry]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

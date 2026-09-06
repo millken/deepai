@@ -1,0 +1,13 @@
+id: task-tool-usage-accounting
+agent_type: researcher
+task: "研究 task 工具如何把子代理的 token 用量与工作量统计透传给父 agent，给出证据定位"
+context_files: [pkg/tools/subagent.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: research
+  - field_nonempty_all: findings[].evidence
+  - mentions: [subagent_usage, subagent_stats]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

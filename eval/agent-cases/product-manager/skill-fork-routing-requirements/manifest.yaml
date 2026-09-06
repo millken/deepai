@@ -1,0 +1,13 @@
+id: skill-fork-routing-requirements
+agent_type: product-manager
+task: "为 context: fork 技能的路由行为编写需求规格，覆盖目标角色内联执行、主 agent 得到路由指令、其他子代理被拒绝这三种场景的验收标准"
+context_files: [pkg/skill/tool.go, pkg/skill/context.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: requirements
+  - field_min_count: {path: acceptance, n: 2}
+  - mentions: [CallerAgentTypeFromContext, WithCallerAgentType]
+  - not_mentions: [SubagentRunner, HookRunner]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000

@@ -1,0 +1,13 @@
+id: context-files-requirements
+agent_type: product-manager
+task: "为 task 工具的 context_files 参数编写需求规格（用户故事 + Given/When/Then 验收标准），覆盖相对路径解析、单文件截断与总量上限三种场景"
+context_files: [pkg/agent/subagent_context.go, pkg/tools/subagent.go]
+tags: [go, self-referential]
+expect:
+  - schema_parses: requirements
+  - field_min_count: {path: acceptance, n: 2}
+  - mentions: [context_files, contextFilesTotalCap]
+  - not_mentions: [SubagentRunner, ExecuteFork]
+  - tool_calls_max: 20
+  - no_writes: true
+  - tokens_max: 60000
