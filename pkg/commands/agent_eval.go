@@ -878,55 +878,87 @@ type projectAgentYAMLMinimal struct {
 	SystemPrompt     string   `yaml:"system_prompt"`
 	SystemPromptFile string   `yaml:"system_prompt_file"`
 	Skills           []string `yaml:"skills"`
+	// OutputSchema mirrors yamlAgentConfig.OutputSchema (pkg/agent/
+	// yaml_loader.go) — a name into agent.NamedSchema, not inline JSON
+	// Schema. Absent (""), the role's OutputSchema for fingerprint purposes
+	// falls back to the builtin's mounted schema (mergeConfig's "nil
+	// override keeps base" semantics), matching production.
+	OutputSchema string `yaml:"output_schema"`
 }
 
-// resolveEvalSystemPrompt returns the effective system prompt and Skills list
-// for agentType exactly as SubagentExecutor.Execute would resolve them: a
-// project .deepai/agents/<type>.yaml, if present, wins outright (matches
-// mergeConfig's "override present -> replace" semantics for a non-builtin
-// type); otherwise the builtin table (agent.GetAgentTypeConfig).
+// resolveEvalSystemPrompt returns the effective system prompt, Skills list,
+// and OutputSchema.Prompt for agentType exactly as SubagentExecutor.Execute
+// would resolve them: a project .deepai/agents/<type>.yaml, if present, wins
+// outright for SystemPrompt/Skills (matches mergeConfig's "override present
+// -> replace" semantics for a non-builtin type); the schema Prompt follows
+// mergeConfig's OutputSchema rule specifically — a project YAML's own
+// output_schema: key replaces the base's, but an ABSENT key keeps the base
+// (builtin) schema rather than clearing it, which is why the builtin lookup
+// runs unconditionally below rather than only in the no-project-YAML branch.
 //
 // Known gap: this does not consider a project .deepai/agents/<type>.md
 // override — none of the five M5-2 baseline types (architect,
 // product-manager, researcher, analyst, tester) has one, only tester.yaml,
 // so the gap is inert for this corpus but would need closing before a
 // project MD-based role joins the eval corpus.
-func resolveEvalSystemPrompt(agentType, repoRoot string) (string, []string, error) {
+func resolveEvalSystemPrompt(agentType, repoRoot string) (string, []string, string, error) {
+	builtinCfg := agent.GetAgentTypeConfig(agent.AgentType(agentType))
+	baseSchemaPrompt := ""
+	if builtinCfg.OutputSchema != nil {
+		baseSchemaPrompt = builtinCfg.OutputSchema.Prompt
+	}
+
 	path := filepath.Join(repoRoot, ".deepai", "agents", agentType+".yaml")
 	data, err := os.ReadFile(path)
 	switch {
 	case err == nil:
 		var y projectAgentYAMLMinimal
 		if yerr := yaml.Unmarshal(data, &y); yerr != nil {
-			return "", nil, fmt.Errorf("parse %s: %w", path, yerr)
+			return "", nil, "", fmt.Errorf("parse %s: %w", path, yerr)
 		}
 		prompt := y.SystemPrompt
 		if prompt == "" && y.SystemPromptFile != "" {
 			fdata, ferr := os.ReadFile(filepath.Join(repoRoot, ".deepai", "agents", y.SystemPromptFile))
 			if ferr != nil {
-				return "", nil, fmt.Errorf("read system_prompt_file for %s: %w", agentType, ferr)
+				return "", nil, "", fmt.Errorf("read system_prompt_file for %s: %w", agentType, ferr)
 			}
 			prompt = string(fdata)
 		}
-		return prompt, y.Skills, nil
+		schemaPrompt := baseSchemaPrompt
+		if y.OutputSchema != "" {
+			schema, ok := agent.NamedSchema(y.OutputSchema)
+			if !ok {
+				return "", nil, "", fmt.Errorf("%s: unknown output_schema %q", path, y.OutputSchema)
+			}
+			schemaPrompt = schema.Prompt
+		}
+		return prompt, y.Skills, schemaPrompt, nil
 	case os.IsNotExist(err):
-		builtinCfg := agent.GetAgentTypeConfig(agent.AgentType(agentType))
-		return builtinCfg.SystemPrompt, builtinCfg.Skills, nil
+		return builtinCfg.SystemPrompt, builtinCfg.Skills, baseSchemaPrompt, nil
 	default:
-		return "", nil, fmt.Errorf("read %s: %w", path, err)
+		return "", nil, "", fmt.Errorf("read %s: %w", path, err)
 	}
 }
 
 // caseFingerprint = sha256(resolved SystemPrompt + preloaded skill bodies,
 // concatenated in Skills order + OutputSchema.Prompt)[:8], hex-encoded — the
-// M5-2 brief's fingerprint definition. It is empty-string for
-// OutputSchema.Prompt for all five tested types today (none has one wired in
-// production; that is M5-3's job), so in this baseline the fingerprint is
-// effectively sha256(system prompt), which is exactly the point: it changes
-// the moment M5-3 rewrites a role's prompt, invalidating stale before/after
-// comparisons.
+// M5-2 brief's fingerprint definition.
+//
+// M5-3 mounted a non-Strict OutputSchema on architect/product-manager/
+// researcher/analyst, so the schema-Prompt component is no longer
+// unconditionally "" the way the M5-2 baseline comment here used to say —
+// resolveEvalSystemPrompt now resolves it per role (builtin mount, or a
+// project YAML's own output_schema: override) instead of this function
+// hardcoding it away. The M5-2-era before/after runs archived under
+// eval/results/ were computed with the OLD (schema-blind) formula; this fix
+// does not retroactively recompute or touch anything under eval/results/ —
+// it protects fingerprints computed FROM HERE ON (M5-4 and later), so that a
+// schema change with the system prompt held byte-for-byte constant (e.g.
+// adding a field to DesignDoc, or M5-4 wiring tester's output_schema) still
+// produces a different fingerprint instead of silently reusing a stale
+// before-run's fingerprint to vouch for an untested contract.
 func caseFingerprint(agentType, repoRoot string, skillReg *skill.Registry) (string, error) {
-	systemPrompt, skillNames, err := resolveEvalSystemPrompt(agentType, repoRoot)
+	systemPrompt, skillNames, schemaPrompt, err := resolveEvalSystemPrompt(agentType, repoRoot)
 	if err != nil {
 		return "", err
 	}
@@ -938,7 +970,7 @@ func caseFingerprint(agentType, repoRoot string, skillReg *skill.Registry) (stri
 		}
 		bodies = append(bodies, body)
 	}
-	return computeFingerprint(systemPrompt, bodies, ""), nil
+	return computeFingerprint(systemPrompt, bodies, schemaPrompt), nil
 }
 
 func computeFingerprint(systemPrompt string, skillBodies []string, schemaPrompt string) string {

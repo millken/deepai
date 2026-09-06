@@ -201,3 +201,177 @@ type Issue struct {
 	Scenario   string `json:"scenario,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
 }
+
+// ---------------------------------------------------------------------------
+// M5-3 output contracts (docs/AGENT_CAPABILITY_DESIGN.md §3).
+//
+// Every field below carries an explicit lowercase json tag, matching
+// ReviewResult/Issue's existing precedent above. This is a deliberate call
+// (design §3 revision, item 2), not an oversight: the schema Prompt these
+// types produce (FromStruct's MarshalJSON of the inferred JSON Schema) is
+// JSON Schema text, and a model asked to match it writes lowercase
+// snake_case property names by instinct — PascalCase is the counter-instinct
+// choice, and every place a prompt asks for the counter-instinct is a place
+// parsing quietly fails. The eval harness (pkg/commands/agent_eval_schema.go)
+// decodes against these SAME types, not a mirror, so the scored contract and
+// the contract the role is told about cannot drift apart.
+// ---------------------------------------------------------------------------
+
+// DesignDoc is the structured output contract for the architect agent type.
+// Decisions/Components are required (no omitempty): a DesignDoc with neither
+// is not a design. Risks/OpenQuestions/Milestones are optional.
+type DesignDoc struct {
+	Agent         string      `json:"agent" jsonschema:"the agent type that produced this, e.g. architect"`
+	Goal          string      `json:"goal"`
+	Decisions     []Decision  `json:"decisions"`
+	Components    []Component `json:"components"`
+	Risks         []Risk      `json:"risks,omitempty"`
+	OpenQuestions []string    `json:"open_questions,omitempty"`
+	Milestones    []string    `json:"milestones,omitempty"`
+}
+
+// Decision is one design decision: what was chosen, why, what was rejected,
+// and whether it can still be undone.
+type Decision struct {
+	Topic        string   `json:"topic"`
+	Choice       string   `json:"choice"`
+	Rationale    string   `json:"rationale"`
+	Alternatives []string `json:"alternatives"`
+	Reversible   bool     `json:"reversible"`
+}
+
+// Component is one piece of the design: its responsibility, the files it
+// touches, and the interfaces it defines or changes.
+type Component struct {
+	Name           string   `json:"name"`
+	Responsibility string   `json:"responsibility"`
+	Files          []string `json:"files"`
+	Interfaces     []string `json:"interfaces"`
+}
+
+// Risk is a design risk and its mitigation.
+type Risk struct {
+	Description string `json:"description"`
+	Mitigation  string `json:"mitigation"`
+}
+
+// RequirementsSpec is the structured output contract for the
+// product-manager agent type.
+type RequirementsSpec struct {
+	Agent         string      `json:"agent" jsonschema:"the agent type that produced this, e.g. product-manager"`
+	Problem       string      `json:"problem"`
+	Stories       []UserStory `json:"stories"`
+	ScopeIn       []string    `json:"scope_in"`
+	ScopeOut      []string    `json:"scope_out"`
+	Acceptance    []Criterion `json:"acceptance"`
+	Priorities    []Priority  `json:"priorities"`
+	OpenQuestions []string    `json:"open_questions,omitempty"`
+}
+
+// UserStory is one Role/Want/SoThat story.
+type UserStory struct {
+	Role   string `json:"role"`
+	Want   string `json:"want"`
+	SoThat string `json:"so_that"`
+}
+
+// Criterion is one Given/When/Then acceptance criterion. Verifiable=false is
+// the honest exit for a criterion only human judgment can settle — see
+// productManagerSystemPrompt's Verifiability paragraph.
+type Criterion struct {
+	ID         string `json:"id"`
+	Given      string `json:"given"`
+	When       string `json:"when"`
+	Then       string `json:"then"`
+	Verifiable bool   `json:"verifiable"`
+}
+
+// Priority ranks one item P0..P3. Level has no schema-ENFORCED enum: see the
+// package-level note above Finding.Confidence — jsonschema-go v0.4.3 has no
+// struct-tag mechanism for a JSON Schema "enum" keyword (confirmed:
+// TestEnumTagIsRejectedByJSONSchemaGo in output_test.go), so the jsonschema
+// tag below is a description-only fallback, not a validated constraint.
+type Priority struct {
+	Item   string `json:"item"`
+	Level  string `json:"level" jsonschema:"one of exactly: P0, P1, P2, or P3"`
+	Reason string `json:"reason"`
+}
+
+// ResearchFindings is the structured output contract for the researcher
+// agent type.
+type ResearchFindings struct {
+	Agent    string    `json:"agent" jsonschema:"the agent type that produced this, e.g. researcher"`
+	Question string    `json:"question"`
+	Answer   string    `json:"answer"`
+	Findings []Finding `json:"findings"`
+	Gaps     []string  `json:"gaps,omitempty"`
+}
+
+// Finding is shared by ResearchFindings and AnalysisReport (design §3): a
+// researcher hands over what it read, an analyst hands over what it means —
+// the deliverable differs, the evidence shape does not.
+type Finding struct {
+	Claim    string     `json:"claim"`
+	Evidence []Evidence `json:"evidence"`
+	// Confidence has NO schema-enforced enum — see Priority.Level's comment
+	// above; same jsonschema-go limitation, same description-only fallback.
+	Confidence string `json:"confidence" jsonschema:"one of exactly: high, medium, or low"`
+}
+
+// Evidence anchors a Claim to source: File + Line (+ optional EndLine for a
+// multi-line citation) + a verbatim Quote.
+//
+// Line/EndLine are int, NOT a "21-24" range string or "file:line" text — a
+// deliberate deviation from the §3 draft's single `Line` field (design §3
+// revision, item 3). A model citing a multi-line quote is the common case;
+// letting Line be a permissive string would let a range or "file:line" text
+// pass json.Unmarshal for that one field while silently meaning something
+// no int-typed consumer can use. Worse, a STRICT int field rejects such a
+// value at the json.Unmarshal stage for the WHOLE enclosing struct — every
+// field_* assertion on that output is skipped, not merely wrong, for one
+// mis-shaped field. EndLine is omitempty: a single-line citation needs only
+// Line.
+type Evidence struct {
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	EndLine int    `json:"end_line,omitempty"`
+	Quote   string `json:"quote"`
+	URL     string `json:"url,omitempty"`
+}
+
+// AnalysisReport is the structured output contract for the analyst agent
+// type. Method is required and comes before Findings in the struct (and in
+// the schema's PropertyOrder) because analystSystemPrompt's load-bearing
+// rule is "method before results".
+type AnalysisReport struct {
+	Agent     string    `json:"agent" jsonschema:"the agent type that produced this, e.g. analyst"`
+	Objective string    `json:"objective"`
+	Method    string    `json:"method"`
+	Findings  []Finding `json:"findings"`
+	Caveats   []string  `json:"caveats,omitempty"`
+	Artifacts []string  `json:"artifacts,omitempty"`
+}
+
+// TestReport is the structured output contract for the tester role (a
+// project YAML profile, not a builtin AgentType). It is defined here now
+// because the eval harness needs a real type to decode and score
+// `schema_parses: test-report` against, but it is deliberately NOT mounted
+// onto any AgentTypeConfig.OutputSchema this period — tester stays
+// unmodified as M5-3's control group (see types_config.go's init()).
+type TestReport struct {
+	Agent    string        `json:"agent"`
+	Command  string        `json:"command"`
+	Passed   int           `json:"passed"`
+	Failed   int           `json:"failed"`
+	Skipped  int           `json:"skipped"`
+	Failures []TestFailure `json:"failures"`
+	Coverage string        `json:"coverage,omitempty"`
+}
+
+// TestFailure is one failing test: its name, where it failed, and why.
+type TestFailure struct {
+	Name    string `json:"name"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Message string `json:"message"`
+}

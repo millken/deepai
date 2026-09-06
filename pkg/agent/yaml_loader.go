@@ -28,6 +28,13 @@ type yamlAgentConfig struct {
 	Temperature      *float64 `yaml:"temperature"`
 	Model            string   `yaml:"model"`
 	Skills           []string `yaml:"skills"`
+	// OutputSchema names an entry in namedSchemas (types_config.go) — NOT an
+	// inline JSON Schema. AgentTypeConfig.OutputSchema stays `yaml:"-"`
+	// (types_config.go): a YAML role opts into a schema by name so the Go
+	// struct FromStruct[T] built it from remains the single anchor both
+	// ParseOutput and the eval harness's field_* assertions read against
+	// (design §3).
+	OutputSchema string `yaml:"output_schema"`
 }
 
 // validateSafeName rejects names containing path separators or ".." to prevent path traversal.
@@ -80,6 +87,13 @@ func loadAgentYAML(t AgentType, workDir string) (*AgentTypeConfig, error) {
 	if yc.Temperature != nil {
 		cfg.Temperature = *yc.Temperature
 		cfg.temperatureSet = true
+	}
+	if yc.OutputSchema != "" {
+		schema, ok := namedSchemas[yc.OutputSchema]
+		if !ok {
+			return nil, fmt.Errorf("agent yaml %s: unknown output_schema %q", path, yc.OutputSchema)
+		}
+		cfg.OutputSchema = schema
 	}
 
 	if yc.SystemPromptFile != "" {
@@ -168,6 +182,15 @@ func mergeConfig(base AgentTypeConfig, override *AgentTypeConfig, baseIsBuiltin 
 	// array through their own reference to it later).
 	if len(override.Skills) > 0 {
 		result.Skills = append([]string(nil), override.Skills...)
+	}
+	// OutputSchema: a non-nil override replaces the base's wholesale, same
+	// "non-empty/non-nil override wins" contract as Skills/DefaultTools
+	// above. There is no "explicit empty" state to preserve here (unlike
+	// MaxToolCalls/Temperature's *Set flags) — override.OutputSchema is
+	// either a real *OutputSchema from a resolved output_schema: name, or
+	// nil because the YAML/MD source did not set the key at all.
+	if override.OutputSchema != nil {
+		result.OutputSchema = override.OutputSchema
 	}
 
 	// A real builtin's nil/absent DefaultTools means "unrestricted" and must

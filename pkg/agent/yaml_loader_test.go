@@ -289,6 +289,84 @@ skills:
 	}
 }
 
+// TestLoadAgentYAML_OutputSchema is the M5-3 YAML-wiring requirement (design
+// §3): `output_schema: <name>` resolves through the closed namedSchemas
+// table, not an inline JSON Schema — the Go type stays the sole anchor for
+// both ParseOutput and the eval harness's field assertions.
+func TestLoadAgentYAML_OutputSchema(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "type: custom-tester\noutput_schema: test-report\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "custom-tester.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadAgentYAML("custom-tester", dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	if cfg.OutputSchema == nil {
+		t.Fatal("OutputSchema = nil, want the test-report schema")
+	}
+	if cfg.OutputSchema.Strict {
+		t.Error("OutputSchema.Strict = true, want false (test-report is non-Strict)")
+	}
+}
+
+// TestLoadAgentYAML_OutputSchemaUnknownNameErrors: an unknown output_schema
+// name is a hard load-time error — the same policy already applied to an
+// unknown agent_type (yaml_loader.go/subagent.go comments) — not a silent
+// no-schema fallback.
+func TestLoadAgentYAML_OutputSchemaUnknownNameErrors(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlContent := "type: custom-tester\noutput_schema: not-a-real-schema\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "custom-tester.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadAgentYAML("custom-tester", dir)
+	if err == nil {
+		t.Fatal("expected error for unknown output_schema name, got nil")
+	}
+	if !strings.Contains(err.Error(), "not-a-real-schema") {
+		t.Errorf("error = %v, want it to name the unknown schema %q", err, "not-a-real-schema")
+	}
+}
+
+// TestMergeConfig_OutputSchema: a non-nil override.OutputSchema replaces the
+// base's wholesale, mirroring the Skills/DefaultTools merge contract.
+func TestMergeConfig_OutputSchema(t *testing.T) {
+	reviewSchema := namedSchemas["review"]
+	designSchema := namedSchemas["design"]
+	base := AgentTypeConfig{Type: AgentTypeArchitect, OutputSchema: designSchema}
+
+	t.Run("non-nil override replaces base", func(t *testing.T) {
+		override := &AgentTypeConfig{OutputSchema: reviewSchema}
+		result := mergeConfig(base, override, true)
+		if result.OutputSchema != reviewSchema {
+			t.Errorf("OutputSchema = %p, want the review schema %p", result.OutputSchema, reviewSchema)
+		}
+	})
+
+	t.Run("nil override keeps base", func(t *testing.T) {
+		override := &AgentTypeConfig{}
+		result := mergeConfig(base, override, true)
+		if result.OutputSchema != designSchema {
+			t.Errorf("OutputSchema = %p, want base's design schema %p preserved", result.OutputSchema, designSchema)
+		}
+	})
+}
+
 // TestMergeConfig_Skills mirrors the DefaultTools merge contract (§2.4): a
 // non-empty override.Skills replaces the base's list wholesale (with its own
 // slice, not an alias); an EMPTY override.Skills must NOT clear a non-empty

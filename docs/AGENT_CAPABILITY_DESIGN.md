@@ -70,7 +70,9 @@
 | L1 宪法 | `SystemPrompt`（内置常量 / YAML `system_prompt(_file)` / MD body） | 子代理构造期 | 满足任一：违反后**不可恢复**（docEditor 的 NEVER insert）；**每次任务都成立**的产出格式与预算纪律（correctness 规则 5）；与工具语义绑定的**跨调用不变量**（protect/author 每次都传）；已知失效模式的处置流程 |
 | L2 playbook | `.deepai/skills/role-<type>/SKILL.md`（+references/） | 角色 `skills:` 预加载 → 构造期；或运行期 `skill` 工具 | 检查表、方法论、模板、领域名词表——**读一次就能照做、不读也不会造成不可恢复损害**的知识 |
 
-判据一句话：**"漏了会出事故的放 L1，漏了只是做得差的放 L2"**。L1 上限 900 字（英文约 350 词）：docEditor 的 2000 字是因为它绑定了 4 个有状态工具，是上界不是基准。
+判据一句话：**"漏了会出事故的放 L1，漏了只是做得差的放 L2"**。
+
+L1 篇幅按字符计，分三档：无契约无有状态工具的角色 ≤ 900；携带 OutputSchema 的角色 ≤ 2000（correctness-reviewer 1929 是实测有效的上界，不是基准，超过它必须附 eval 数字）；绑定有状态工具或自动闸门的角色不设数字上限，但每段必须点名它保护的工具参数或闸门。docEditor 的 3811 属第三档。
 
 为什么 L2 用 skill 而不是 `.deepai/agents/<type>.md` body：MD body 已经是 `SystemPrompt`（`ParseAgentMarkdown`），塞 playbook 就退化成 (a)；skill 有独立目录（可带 references）、有 Registry/热重载/描述目录、可被多个角色共享（`golang` 同时服务 coder/tester/perf-reviewer），且用户可用 `/role-architect` 直接查看。
 
@@ -135,32 +137,61 @@ default:                                 → 其他子代理：CallStatusFailed 
 
 非 Strict 在 `Execute` 里只贡献提示后缀、不校验不重试（L3 门控已存在），fail-soft 不需重造。eval 用 `ParseOutput` 事后解析，解析失败单列 invalid-run。
 
+**M5-3 实现裁定（已落地，字段名见 pkg/agent/output.go）**：
+
+1. **全部字段加小写 json tag**（裁定 (a)，见下方修订项 2）——`Decisions`→`decisions`、`Reversible`→`reversible` 等，与 `ReviewResult`/`Issue` 的既有写法一致。
+2. **`Evidence.Line` 是 `int`，另加 `EndLine int` `json:"end_line,omitempty"`**（不是 `Line string` 或 `"21-24"` 区间字符串）——见下方修订项 3。
+3. **`Finding.Confidence`（high/medium/low）与 `Priority.Level`（P0..P3）没有 schema 强制的 `enum`**：jsonschema-go v0.4.3 的 `jsonschema` 结构体 tag 只能设置 `Description`，没有任何 tag 语法能设置 JSON Schema 的 `enum` 关键字；写 `jsonschema:"enum=high,enum=medium,enum=low"` 会让 `FromStruct` 直接 panic（tag 以 `WORD=` 开头是库保留前缀，见 `jsonschema-go/jsonschema/infer.go` 的 `disallowedPrefixRegexp`）。两个字段改用 `jsonschema:"one of exactly: ..."` 纯文字 description 作为退路——它会出现在 schema Prompt 的 `"description"` 字段里，但不是校验约束，模型不遵守也不会解析失败。`pkg/agent/output_test.go` 的 `TestEnumTagIsRejectedByJSONSchemaGo` 把这条库限制钉成回归测试：库若未来支持了，这条测试会变红，提示重新评估。
+
 ```go
 type DesignDoc struct {
-	Agent, Goal string
-	Decisions  []Decision   // Topic, Choice, Rationale, Alternatives []string, Reversible bool
-	Components []Component  // Name, Responsibility, Files []string, Interfaces []string
-	Risks      []Risk       `json:",omitempty"` // Description, Mitigation
-	OpenQuestions, Milestones []string `json:",omitempty"`
+	Agent         string      `json:"agent"`
+	Goal          string      `json:"goal"`
+	Decisions     []Decision  `json:"decisions"`
+	Components    []Component `json:"components"`
+	Risks         []Risk      `json:"risks,omitempty"`
+	OpenQuestions []string    `json:"open_questions,omitempty"`
+	Milestones    []string    `json:"milestones,omitempty"`
 }
 type RequirementsSpec struct {
-	Agent, Problem string
-	Stories  []UserStory  // Role, Want, SoThat
-	ScopeIn, ScopeOut []string
-	Acceptance []Criterion // ID, Given, When, Then, Verifiable bool
-	Priorities []Priority  // Item, Level "P0".."P3", Reason
-	OpenQuestions []string `json:",omitempty"`
+	Agent         string      `json:"agent"`
+	Problem       string      `json:"problem"`
+	Stories       []UserStory `json:"stories"`
+	ScopeIn       []string    `json:"scope_in"`
+	ScopeOut      []string    `json:"scope_out"`
+	Acceptance    []Criterion `json:"acceptance"`
+	Priorities    []Priority  `json:"priorities"`
+	OpenQuestions []string    `json:"open_questions,omitempty"`
 }
 type ResearchFindings struct {
-	Agent, Question, Answer string
-	Findings []Finding // Claim, Evidence []Evidence{File, Line, Quote, URL}, Confidence "high|medium|low"
-	Gaps []string `json:",omitempty"`
+	Agent    string    `json:"agent"`
+	Question string    `json:"question"`
+	Answer   string    `json:"answer"`
+	Findings []Finding `json:"findings"` // Claim, Evidence []Evidence{File, Line int, EndLine int omitempty, Quote, URL}, Confidence "high|medium|low" (description-only, not enum-enforced)
+	Gaps     []string  `json:"gaps,omitempty"`
 }
-type AnalysisReport struct { Agent, Objective, Method string; Findings []Finding; Caveats, Artifacts []string `json:",omitempty"` }
-type TestReport struct { Agent, Command string; Passed, Failed, Skipped int; Failures []TestFailure /*Name, File, Line, Message*/; Coverage string `json:",omitempty"` }
+type AnalysisReport struct {
+	Agent     string    `json:"agent"`
+	Objective string    `json:"objective"`
+	Method    string    `json:"method"`
+	Findings  []Finding `json:"findings"`
+	Caveats   []string  `json:"caveats,omitempty"`
+	Artifacts []string  `json:"artifacts,omitempty"`
+}
+type TestReport struct {
+	Agent    string        `json:"agent"`
+	Command  string        `json:"command"`
+	Passed   int           `json:"passed"`
+	Failed   int           `json:"failed"`
+	Skipped  int           `json:"skipped"`
+	Failures []TestFailure `json:"failures"` // Name, File, Line int, Message
+	Coverage string        `json:"coverage,omitempty"`
+}
 ```
 
 YAML 角色接 schema：`OutputSchema` 是 `yaml:"-"`，新增 `output_schema: string` 键映射到 `namedSchemas map[string]*OutputSchema{"review","design","requirements","research","analysis","test-report"}`，未知名字加载报错。不允许 YAML 内写 JSON Schema：`FromStruct` 的 Go 类型是 `ParseOutput[T]` 与 eval 断言的共同锚点。
+
+**非 Strict 观测期结束判据**：契约达成率 ≥80% 连续两轮即维持非 Strict；<80% 且失败主因是 `extractJSON` 取到了错误对象（文本里配平括号的最后一个 `{…}` 不是模型的输出对象）或字段名大小写不匹配，先修本节第 1、2 条（tag/字段形态）再考虑升级 Strict——这两类失败靠 Strict 重试也救不了几次，只会烧 1.5× 预算。
 
 ## 4. Description 规范
 
@@ -169,11 +200,13 @@ YAML 角色接 schema：`OutputSchema` 是 `yaml:"-"`，新增 `output_schema: s
 
 | 角色 | 现状 | 改后 |
 |---|---|---|
-| researcher | Profile for research, reading, and synthesis tasks. | Use when a question needs evidence from code/docs before deciding; delivers cited findings. Not for edits. |
+| researcher | Profile for research, reading, and synthesis tasks. | Use when a question needs evidence from code/docs first; delivers cited findings. Not for analysis. |
 | architect | Produces technical design documents… | Use when a change spans modules or needs interface decisions; delivers DesignDoc. Not for coding. |
-| analyst | Profile for structured analysis… | Use when data/logs/metrics need structured interpretation; delivers findings+caveats. Not for research. |
+| analyst | Profile for structured analysis… | Use when data/logs/metrics need interpreting; delivers method, findings, caveats. Not for research. |
 
-加单测 `TestBuiltinDescriptionsFollowSpec`：每条 ≤100 rune、以 `Use when` 开头、含 `Not for`。
+researcher 的 Description 定稿是 `Not for analysis.`，不是本节曾经的草案 `Not for edits.`：researcher 的 `DefaultTools` 没有写工具，"edits" 不是它会被误派去做的事；analyst 才是它最容易被混淆的邻角色（两者共用 `Finding` 结构、工具集几乎相同）。四角色 + 三个薄 reviewer（security/arch/perf-reviewer）的定稿见各自的 L1/Description 落地，全部 ≤100 rune，`Not for` 均落在第 79–82 字符处。
+
+加单测 `TestBuiltinDescriptionsFollowSpec`：每条 ≤100 rune、以 `Use when` 开头、含 `Not for`。**范围仅本期改写的七个角色**（architect/product-manager/researcher/analyst + security/arch/perf-reviewer）——correctness-reviewer、coder、frontend 等未改写的角色仍是旧 Description，不满足这个模板，若把它们也纳入断言范围测试会立刻报红；测试用白名单限定范围，下一期扩大改写面时再一并扩大白名单。
 
 ## 5. 验收/度量：`deepai eval agents`
 
@@ -198,7 +231,7 @@ eval/agent-cases/<agent_type>/<case>/
 |---|---|---|---|
 | **M5-1 绑定机制** | §2 全部：Frontmatter `context/agent`、`Skills` 字段（YAML/MD）、task `skill` 参数、`WithAgentType`、fork 路由、Execute 四步注入、allowed-tools lint；`docx-*` 删 Step 0 散文改依赖机制 | 单测：主 agent 得路由 stub 且 Data 无 body；匹配子代理 inline；其他子代理失败；未知 skill 硬失败；`Skills` 预加载后系统提示跨 Run 字节相同（前缀稳定）；`selectSubagentTools` 仍剔除 task。手工：`/docx-polish x.docx` 一次 task 到位 | 纯增量，无字段默认值变化；回滚 = revert 单提交 |
 | **M5-2 eval 基线** | `deepai eval agents` + `compare`；15 case；用**当前薄 prompt**跑出 before | fake task tool 全链路单测；真实模型 runs=3 的 summary 入库 | 只加 `pkg/commands/agent_eval.go` 与 `eval/`，零生产改动 |
-| **M5-3 五角色宪法+契约+描述** | architect/PM/researcher/analyst 的 L1（≤900 字，仿 correctness 七条：范围、证据、预算、产出、失效模式）、§3 四个 schema、§4 描述；三个薄 reviewer 补规则 2/3/5 | `compare`：断言通过率 +15pt、`not_mentions` 违规不升、成本 ≤1.5×；reviewer 沿用 REVIEW_EVAL 达标线 | 逐角色一个常量，可单独 revert；指纹保证不会拿旧基线背书 |
+| **M5-3 五角色宪法+契约+描述** | architect/PM/researcher/analyst 的 L1（≤2000 字符（B 档），五条必备：范围、证据（标识符逐字 + 字面值 + 位置）、契约、预算、角色特有失效模式）、§3 四个 schema、§4 描述；三个薄 reviewer 补规则 2/3/5 | `compare`：断言通过率 +15pt、`not_mentions` 违规不升、成本 ≤1.5×；reviewer 沿用 REVIEW_EVAL 达标线 | 逐角色一个常量，可单独 revert；指纹保证不会拿旧基线背书 |
 | **M5-4 L2 playbook 与项目角色** | `role-architect/role-researcher/role-tester` 三个 skill（检查表+模板）；tester/devops/database/technical-writer YAML 改写为"宪法 + `skills:` + `output_schema:`"；`namedSchemas` | 同 M5-3 的 compare；tester `TestReport` 解析率 ≥90% | skill 目录可删；YAML 可回退 |
 | M5-5（可选） | `paths` 接线、frontend/ui-designer/news 宪法、`--judge` 主观评分 | 视 M5-3/4 数字决定 | — |
 
@@ -291,7 +324,23 @@ eval/agent-cases/<agent_type>/<case>/
    `dispatch` 伪断言，故 analyst 87.5% ≠ summary.md 的 86.2%；(iii) 5 条 mentions 漏项全
    是上下文预算常量（architect `contextFilePerFileCap`×2、`contextFilesTotalCap`×1，
    product-manager `contextFilesTotalCap`×2），M5-3 L1 的"证据"条款应当直接命中它们，
-   `compare` 时单独核对这两个角色是否回收。
+   `compare` 时单独核对这两个角色是否回收。漏项的具体形态是**值对、行号对、标识符被
+   改写**（例如 `PerFileCap`/`TotalCap`/"the per-file cap"，而不是完全没读到值）——
+   详见 M5-3 文案第 0 节的逐 run 复核；`compare` 时若这两个角色回收了漏项而其他
+   mentions 出现新漏，优先检查新漏是否同一形态（值对但标识符被翻译/改写/缩短）。
+
+   (iv) **tester 作为对照组的适用范围收窄**：tester 提示词本期一字未动
+   （M5-4 才改），但 M5-3 把评测侧 `schema_parses`/`field_*` 的解码类型从
+   `pkg/commands` 内的镜像结构体（无 json tag）换成了 `pkg/agent` 的真类型
+   （`agent.TestReport`，有小写 json tag）——**给它打分的尺子换了**，即使被打分
+   的输出一个字节没变。同一份 tester 输出，旧镜像可能因大小写不匹配
+   `unexpected additional properties` 判 fail，新真类型判 pass。因此
+   **tester 只在 mentions 命中率、均耗时、超时数三项上充当模型/中转漂移的对照**；
+   它的 `contract_rate`（`schema_parse_rate` 同理）在本轮 before/after 之间不
+   可比，即使数字上移也不能归因为"tester 变好了"或用来反推"漂移"——那是解码
+   尺子变了，不是被评测对象变了。`namedSchemaKinds`/`evalSchemas` 换回真类型
+   见本文第 3 节修订项 2；下一次真正靠 `contract_rate` 判断 tester 是 M5-4
+   给它挂 `output_schema: test-report` 之后，那时前后用的是同一把尺子。
 
    **M5-3 逐角色门槛（由上表代入）**：
 

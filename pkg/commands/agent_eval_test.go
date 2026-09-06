@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/subagent"
 )
 
@@ -182,11 +183,17 @@ func TestMaterializeFixture_EmptyFixtureIsValid(t *testing.T) {
 // failed schema_parses.
 // ---------------------------------------------------------------------------
 
+// JSON keys below are lowercase/snake_case, matching agent.DesignDoc's json
+// tags (M5-3): these fixtures decode against the REAL pkg/agent type now
+// (agent_eval_schema.go no longer has a PascalCase eval-only mirror), so a
+// capitalized "Agent"/"Decisions" key would fail schema validation (required
+// property missing + additionalProperties:false) exactly the way a real
+// model's mis-cased output would.
 const designJSONTwoDecisions = `Here is my design:
-{"Agent":"architect","Goal":"g","Decisions":[{"Topic":"t1","Choice":"c1","Rationale":"r1","Alternatives":[],"Reversible":true},{"Topic":"t2","Choice":"c2","Rationale":"r2","Alternatives":[],"Reversible":false}],"Components":[]}
+{"agent":"architect","goal":"g","decisions":[{"topic":"t1","choice":"c1","rationale":"r1","alternatives":[],"reversible":true},{"topic":"t2","choice":"c2","rationale":"r2","alternatives":[],"reversible":false}],"components":[]}
 `
 
-const designJSONOneDecision = `{"Agent":"architect","Goal":"g","Decisions":[{"Topic":"t1","Choice":"c1","Rationale":"r1","Alternatives":[],"Reversible":true}],"Components":[]}`
+const designJSONOneDecision = `{"agent":"architect","goal":"g","decisions":[{"topic":"t1","choice":"c1","rationale":"r1","alternatives":[],"reversible":true}],"components":[]}`
 
 func TestEvaluateCase_SchemaParsesPassAndFieldMinCount(t *testing.T) {
 	m := caseManifest{Expect: []map[string]any{
@@ -220,9 +227,30 @@ func TestEvaluateCase_FieldMinCountFailsWhenUnderThreshold(t *testing.T) {
 	assertStatus(t, results, "field_min_count:decisions>=2", "fail")
 }
 
+// TestEvaluateCase_FieldMinCountMultiWordJSONTagPath is the M5-3 review fix:
+// fieldByPath used to match ONLY the Go field name via EqualFold, which
+// happens to equal the json tag for a single-word field ("decisions" ==
+// EqualFold "Decisions") but silently diverges for a multi-word one — the
+// model-visible schema property is "scope_in" (RequirementsSpec's json tag),
+// while the Go field is ScopeIn; EqualFold("ScopeIn", "scope_in") is false. A
+// manifest author who copies the property name straight out of the schema
+// Prompt (the obvious, expected thing to do) would get "field \"scope_in\"
+// not found" — a hard error/fail, not a skip — and it would read as "the
+// model produced no scope_in", not "the manifest's path syntax is wrong".
+func TestEvaluateCase_FieldMinCountMultiWordJSONTagPath(t *testing.T) {
+	reqJSON := `{"agent":"a","problem":"p","stories":[],"scope_in":["x","y"],"scope_out":[],"acceptance":[],"priorities":[]}`
+	m := caseManifest{Expect: []map[string]any{
+		{"schema_parses": "requirements"},
+		{"field_min_count": map[string]any{"path": "scope_in", "n": 2}},
+	}}
+	results := evaluateCase(m, reqJSON, nil, nil, false)
+	assertStatus(t, results, "schema_parses:requirements", "pass")
+	assertStatus(t, results, "field_min_count:scope_in>=2", "pass")
+}
+
 func TestEvaluateCase_FieldNonemptyAll(t *testing.T) {
-	pass := `{"Agent":"a","Question":"q","Answer":"ans","Findings":[{"Claim":"c1","Evidence":[{"File":"f.go","Line":1,"Quote":"q","URL":""}],"Confidence":"high"}]}`
-	fail := `{"Agent":"a","Question":"q","Answer":"ans","Findings":[{"Claim":"c1","Evidence":[],"Confidence":"high"}]}`
+	pass := `{"agent":"a","question":"q","answer":"ans","findings":[{"claim":"c1","evidence":[{"file":"f.go","line":1,"quote":"q"}],"confidence":"high"}]}`
+	fail := `{"agent":"a","question":"q","answer":"ans","findings":[{"claim":"c1","evidence":[],"confidence":"high"}]}`
 	m := caseManifest{Expect: []map[string]any{
 		{"schema_parses": "research"},
 		{"field_nonempty_all": "findings[].evidence"},
@@ -232,6 +260,25 @@ func TestEvaluateCase_FieldNonemptyAll(t *testing.T) {
 
 	failResults := evaluateCase(m, fail, nil, nil, false)
 	assertStatus(t, failResults, "field_nonempty_all:findings[].evidence", "fail")
+}
+
+// TestEvaluateCase_FieldNonemptyAllMultiWordSubfield covers a NESTED
+// multi-word json-tag path (array[].subfield, both segments multi-word on
+// the model-visible schema): RequirementsSpec.Stories[].SoThat is tagged
+// `json:"so_that"`. This is exactly the shape an M5-4 product-manager/tester
+// manifest is expected to write.
+func TestEvaluateCase_FieldNonemptyAllMultiWordSubfield(t *testing.T) {
+	pass := `{"agent":"a","problem":"p","stories":[{"role":"r","want":"w","so_that":"s"}],"scope_in":[],"scope_out":[],"acceptance":[],"priorities":[]}`
+	fail := `{"agent":"a","problem":"p","stories":[{"role":"r","want":"w","so_that":""}],"scope_in":[],"scope_out":[],"acceptance":[],"priorities":[]}`
+	m := caseManifest{Expect: []map[string]any{
+		{"schema_parses": "requirements"},
+		{"field_nonempty_all": "stories[].so_that"},
+	}}
+	okResults := evaluateCase(m, pass, nil, nil, false)
+	assertStatus(t, okResults, "field_nonempty_all:stories[].so_that", "pass")
+
+	failResults := evaluateCase(m, fail, nil, nil, false)
+	assertStatus(t, failResults, "field_nonempty_all:stories[].so_that", "fail")
 }
 
 func TestEvaluateCase_MentionsAndNotMentions(t *testing.T) {
@@ -432,6 +479,97 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 	}
 	if builtinFP == overrideFP {
 		t.Fatalf("project YAML override did not change the fingerprint (%q)", builtinFP)
+	}
+}
+
+// TestCaseFingerprint_IncludesOutputSchemaPromptForBuiltinRole is the M5-3
+// review fix: caseFingerprint used to hardcode the schema-Prompt component to
+// "" unconditionally (post-M5-3 that premise is false for architect/
+// product-manager/researcher/analyst, which now carry a mounted
+// OutputSchema). This pins the fingerprint to the ACTUAL formula — sha256 of
+// SystemPrompt + skill bodies + the role's resolved OutputSchema.Prompt —
+// against the same agent.GetAgentTypeConfig the production executor reads,
+// not a re-derivation.
+func TestCaseFingerprint_IncludesOutputSchemaPromptForBuiltinRole(t *testing.T) {
+	repoRoot := t.TempDir() // no .deepai/agents/architect.yaml: pure builtin path
+
+	got, err := caseFingerprint("architect", repoRoot, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint: %v", err)
+	}
+
+	cfg := agent.GetAgentTypeConfig(agent.AgentTypeArchitect)
+	if cfg.OutputSchema == nil || cfg.OutputSchema.Prompt == "" {
+		t.Fatal("architect's builtin OutputSchema.Prompt is empty in this build; the fixture this test needs is gone")
+	}
+	want := computeFingerprint(cfg.SystemPrompt, nil, cfg.OutputSchema.Prompt)
+	if got != want {
+		t.Errorf("caseFingerprint(architect) = %q, want %q (sha256 of SystemPrompt+OutputSchema.Prompt)", got, want)
+	}
+
+	// The failure this guards against: computing the fingerprint as if the
+	// schema Prompt were still "" (the pre-fix behavior) must NOT match —
+	// otherwise adding/changing a field on DesignDoc (or any future schema
+	// change with the system prompt held constant) would silently produce
+	// the SAME fingerprint as before the change, letting a stale before-run
+	// vouch for a new contract it never tested.
+	stale := computeFingerprint(cfg.SystemPrompt, nil, "")
+	if got == stale {
+		t.Error("caseFingerprint(architect) matches the schema-blind (pre-fix) fingerprint; OutputSchema.Prompt is not being folded in")
+	}
+}
+
+// TestCaseFingerprint_ProjectYAMLOutputSchemaOverride: a project YAML's own
+// `output_schema:` key must override the builtin's mounted schema for
+// fingerprint purposes too, resolved through the same closed namedSchemas
+// table production uses (agent.NamedSchema) — not silently defaulting back
+// to "" or to the builtin schema.
+func TestCaseFingerprint_ProjectYAMLOutputSchemaOverride(t *testing.T) {
+	repoRoot := t.TempDir()
+	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// architect's builtin schema is "design"; override this project's
+	// architect role to point at "review" instead (an arbitrary different
+	// named schema — the point is only that it differs from "design").
+	yamlContent := "system_prompt: |\n  a totally different constitution\noutput_schema: review\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write override yaml: %v", err)
+	}
+
+	got, err := caseFingerprint("architect", repoRoot, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint: %v", err)
+	}
+	reviewSchema, ok := agent.NamedSchema("review")
+	if !ok {
+		t.Fatal("namedSchemas[\"review\"] missing")
+	}
+	want := computeFingerprint("a totally different constitution\n", nil, reviewSchema.Prompt)
+	if got != want {
+		t.Errorf("caseFingerprint = %q, want %q (project output_schema: review must be folded in)", got, want)
+	}
+}
+
+// TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors: an unknown
+// output_schema name in a project YAML must be a hard error at fingerprint
+// time too, the same policy loadAgentYAML enforces for actual execution —
+// silently falling back to "" would hide a typo'd manifest as a passing,
+// schema-blind fingerprint.
+func TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors(t *testing.T) {
+	repoRoot := t.TempDir()
+	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	yamlContent := "system_prompt: |\n  x\noutput_schema: not-a-real-schema\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	if _, err := caseFingerprint("architect", repoRoot, nil); err == nil {
+		t.Fatal("expected error for unknown output_schema name, got nil")
 	}
 }
 
@@ -875,19 +1013,36 @@ func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *t
 }
 
 // ---------------------------------------------------------------------------
-// Golden test: recomputing the real 2026-09-06-glm-5.3 baseline with the new
-// harness must reproduce docs/AGENT_CAPABILITY_DESIGN.md §8's "新口径基线
-// (before)" table exactly, cell for cell. This is read-only (it never writes
-// eval/results/**) — the actual regeneration of summary.json/summary.md is a
-// one-time, separately-verified action per the M5-3 harness-changeover brief.
+// Golden test: recomputing the real 2026-09-06-glm-5.3 BEFORE baseline with
+// the new harness must reproduce docs/AGENT_CAPABILITY_DESIGN.md §8's "新口径
+// 基线(before)" table exactly, cell for cell. This is read-only (it never
+// writes eval/results/**) — the actual regeneration of summary.json/
+// summary.md is a one-time, separately-verified action per the M5-3
+// harness-changeover brief.
+//
+// The path below points at "...-before": the M5-3 after-run reuses the
+// original "2026-09-06-glm-5.3" directory name for its OWN output while it
+// is in flight, so that name no longer holds the frozen before data this
+// golden test needs — it holds a partial/different after run. Both the path
+// AND a record-count guard exist so that if a future rename/relayout ever
+// points this test at the wrong (or a truncated/in-progress) runs.jsonl
+// again, it skips with a clear reason instead of failing with confusing
+// "product-manager missing"/count-mismatch errors that look like a real
+// regression. The expected count (45) is 5 roles × 9 dispatch attempts each
+// (43 that actually dispatched + the 2 recorded timeouts — design §8's
+// "超时/已派发 2/43" — analyst 9, architect 9, product-manager 9, researcher
+// 9, tester 9), matching the archived eval/results/2026-09-06-glm-5.3-before
+// /runs.jsonl on disk.
 // ---------------------------------------------------------------------------
+
+const wantGLM53BaselineRecordCount = 45
 
 func TestBuildEvalSummary_MatchesGLM53DesignDocBaseline(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("resolve repo root: %v", err)
 	}
-	runsPath := filepath.Join(repoRoot, "eval", "results", "2026-09-06-glm-5.3", "runs.jsonl")
+	runsPath := filepath.Join(repoRoot, "eval", "results", "2026-09-06-glm-5.3-before", "runs.jsonl")
 	data, err := os.ReadFile(runsPath)
 	if err != nil {
 		t.Skipf("real baseline runs.jsonl not present (%v); skipping golden check", err)
@@ -903,6 +1058,16 @@ func TestBuildEvalSummary_MatchesGLM53DesignDocBaseline(t *testing.T) {
 			t.Fatalf("line %d: %v", i, err)
 		}
 		records = append(records, rec)
+	}
+	// Defensive: this golden test's expected numbers are hardcoded against
+	// ONE specific archived file. That file is gitignored (eval/results/**),
+	// so a fresh clone — or a workspace mid-way through re-running eval,
+	// where the file may briefly be truncated or hold a different run's
+	// data — will not have exactly this content. Skip rather than fail: a
+	// red result here must never be mistaken for a real regression by
+	// someone who does not have (or does not yet have) this exact file.
+	if len(records) != wantGLM53BaselineRecordCount {
+		t.Skipf("eval/results/2026-09-06-glm-5.3-before/runs.jsonl has %d records, want %d (not the archived before-baseline this golden test expects, or in-flight from a concurrent eval run); skipping golden check", len(records), wantGLM53BaselineRecordCount)
 	}
 
 	s := buildEvalSummary("glm-5.3", 3, "5m", records)
