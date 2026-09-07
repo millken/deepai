@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1358,5 +1359,181 @@ func TestRenderEvalSummaryMD_IncludesToolCallBudgetColumns(t *testing.T) {
 	}
 	if !strings.Contains(row, "| 7 | 4.5 | 20 | 2 |") {
 		t.Errorf("summary.md row does not render stats_runs=7 immediately before tool_calls p50/max/budget_exhausted:\n%s", row)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// prepareEvalResultDir must never silently reuse an existing result
+// directory: a same-day, same-model rerun (a routine workflow — re-running a
+// role for review) must land in a fresh, suffixed directory rather than
+// letting newRunWriter's os.Create truncate a previous run's runs.jsonl,
+// which holds the only record of real, unrecoverable model spend.
+// ---------------------------------------------------------------------------
+
+func TestPrepareEvalResultDir_FreshDirUsesPlainName(t *testing.T) {
+	outRoot := t.TempDir()
+	dir, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err != nil {
+		t.Fatalf("prepareEvalResultDir: %v", err)
+	}
+	dateStr := time.Now().UTC().Format("2006-01-02")
+	want := filepath.Join(outRoot, dateStr+"-glm-5.3")
+	if dir != want {
+		t.Fatalf("dir = %q, want %q", dir, want)
+	}
+}
+
+func TestPrepareEvalResultDir_ExistingDirGetsSuffix2(t *testing.T) {
+	outRoot := t.TempDir()
+	dateStr := time.Now().UTC().Format("2006-01-02")
+	base := filepath.Join(outRoot, dateStr+"-glm-5.3")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("seed existing dir: %v", err)
+	}
+
+	dir, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err != nil {
+		t.Fatalf("prepareEvalResultDir: %v", err)
+	}
+	want := base + "-2"
+	if dir != want {
+		t.Fatalf("dir = %q, want %q", dir, want)
+	}
+}
+
+func TestPrepareEvalResultDir_TwoExistingDirsGetSuffix3(t *testing.T) {
+	outRoot := t.TempDir()
+	dateStr := time.Now().UTC().Format("2006-01-02")
+	base := filepath.Join(outRoot, dateStr+"-glm-5.3")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("seed existing dir: %v", err)
+	}
+	if err := os.MkdirAll(base+"-2", 0o755); err != nil {
+		t.Fatalf("seed existing -2 dir: %v", err)
+	}
+
+	dir, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err != nil {
+		t.Fatalf("prepareEvalResultDir: %v", err)
+	}
+	want := base + "-3"
+	if dir != want {
+		t.Fatalf("dir = %q, want %q", dir, want)
+	}
+}
+
+func TestPrepareEvalResultDir_SuffixExhaustionReturnsError(t *testing.T) {
+	outRoot := t.TempDir()
+	dateStr := time.Now().UTC().Format("2006-01-02")
+	base := filepath.Join(outRoot, dateStr+"-glm-5.3")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("seed existing dir: %v", err)
+	}
+	for i := 2; i <= 100; i++ {
+		if err := os.MkdirAll(fmt.Sprintf("%s-%d", base, i), 0o755); err != nil {
+			t.Fatalf("seed existing -%d dir: %v", i, err)
+		}
+	}
+
+	_, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err == nil {
+		t.Fatal("expected an error once the suffix budget is exhausted, got nil")
+	}
+}
+
+// TestPrepareEvalResultDirAndRunWriter_RerunNeverTruncatesPriorRunsJSONL is
+// the direct regression test for the reported defect: prepare a result dir,
+// write a run record, then simulate a same-day same-model rerun by calling
+// prepareEvalResultDir + newRunWriter a second time. The first run's
+// runs.jsonl — real, unrecoverable model spend — must be byte-for-byte
+// intact afterward.
+func TestPrepareEvalResultDirAndRunWriter_RerunNeverTruncatesPriorRunsJSONL(t *testing.T) {
+	outRoot := t.TempDir()
+
+	dir1, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err != nil {
+		t.Fatalf("prepareEvalResultDir (first run): %v", err)
+	}
+	runsPath1 := filepath.Join(dir1, "runs.jsonl")
+	w1, err := newRunWriter(runsPath1)
+	if err != nil {
+		t.Fatalf("newRunWriter (first run): %v", err)
+	}
+	if err := w1.Write(runRecord{Case: "expensive-case", Run: 1, Tokens: 123456}); err != nil {
+		t.Fatalf("Write (first run): %v", err)
+	}
+	if err := w1.Close(); err != nil {
+		t.Fatalf("Close (first run): %v", err)
+	}
+
+	before, err := os.ReadFile(runsPath1)
+	if err != nil {
+		t.Fatalf("read runs.jsonl after first run: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatal("first run's runs.jsonl is empty before the rerun — test setup is broken")
+	}
+
+	// Simulate a same-day, same-model rerun (a routine "re-run this role for
+	// review" workflow).
+	dir2, err := prepareEvalResultDir(outRoot, "glm-5.3")
+	if err != nil {
+		t.Fatalf("prepareEvalResultDir (second run): %v", err)
+	}
+	if dir2 == dir1 {
+		t.Fatalf("second prepareEvalResultDir call returned the SAME directory as the first (%s) — this is the defect: it will truncate the prior run's runs.jsonl", dir1)
+	}
+	runsPath2 := filepath.Join(dir2, "runs.jsonl")
+	w2, err := newRunWriter(runsPath2)
+	if err != nil {
+		t.Fatalf("newRunWriter (second run): %v", err)
+	}
+	if err := w2.Write(runRecord{Case: "expensive-case", Run: 1, Tokens: 789}); err != nil {
+		t.Fatalf("Write (second run): %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Close (second run): %v", err)
+	}
+
+	after, err := os.ReadFile(runsPath1)
+	if err != nil {
+		t.Fatalf("read first run's runs.jsonl after rerun: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("first run's runs.jsonl was modified by the rerun!\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestNewRunWriter_RefusesToOverwriteExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runs.jsonl")
+
+	w1, err := newRunWriter(path)
+	if err != nil {
+		t.Fatalf("newRunWriter (first): %v", err)
+	}
+	if err := w1.Write(runRecord{Case: "c1", Run: 1, Tokens: 42}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	_, err = newRunWriter(path)
+	if err == nil {
+		t.Fatal("expected newRunWriter to refuse to open an existing runs.jsonl, got nil error")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s after rejected reopen: %v", path, err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("existing runs.jsonl was modified by a rejected newRunWriter call!\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }

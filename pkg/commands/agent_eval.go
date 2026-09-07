@@ -1274,19 +1274,65 @@ func medianInt(vals []int) float64 {
 	return float64(sorted[mid-1]+sorted[mid]) / 2
 }
 
-// prepareEvalResultDir resolves and creates
-// eval/results/<date>-<model-alias>/, without writing anything into it yet.
+// maxEvalResultDirSuffix bounds the "-<n>" search in prepareEvalResultDir.
+// 100 same-day same-model reruns in one session is already an absurd
+// number; beyond that something is wrong (e.g. a caller looping without
+// checking errors) and we should fail loudly rather than spin forever.
+const maxEvalResultDirSuffix = 100
+
+// prepareEvalResultDir resolves and creates a fresh
+// eval/results/<date>-<model-alias>[-<n>]/ directory, without writing
+// anything into it yet.
+//
+// If the plain <date>-<model-alias> name is already taken, it tries -2, -3,
+// … up to maxEvalResultDirSuffix, and creates the first name that does not
+// yet exist. This is a deliberate choice over rejecting the run outright:
+// the scenario that triggers a collision — re-running the same role,
+// same day, for review — is routine here, not exceptional, and a real
+// `deepai eval agents` invocation can run for over an hour. Making the
+// caller stop and manually rename the previous directory (which is how
+// this was worked around before) just reintroduces the failure mode this
+// fix exists to close: someone in a hurry skips the rename and the new run
+// silently clobbers the old one's runs.jsonl. An automatic suffix costs
+// nothing and can never lose data, so there is no tradeoff to make here.
+//
+// The directory is created with os.Mkdir (not os.MkdirAll) in the
+// collision-search loop: os.Mkdir fails atomically if the name already
+// exists, whereas os.MkdirAll happily returns nil for an existing
+// directory — that MkdirAll behavior is exactly how the original bug let
+// two runs share one directory. Using Mkdir here also makes the
+// "does this name exist" check and the "claim this name" step a single
+// atomic syscall, so two `deepai eval agents` processes starting at
+// nearly the same moment cannot both win the same directory name.
 func prepareEvalResultDir(outRoot, model string) (string, error) {
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", outRoot, err)
+	}
+
 	dateStr := time.Now().UTC().Format("2006-01-02")
 	safeModel := strings.NewReplacer("/", "-", " ", "-").Replace(model)
 	if safeModel == "" {
 		safeModel = "default"
 	}
-	dir := filepath.Join(outRoot, fmt.Sprintf("%s-%s", dateStr, safeModel))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("mkdir %s: %w", dir, err)
+	base := filepath.Join(outRoot, fmt.Sprintf("%s-%s", dateStr, safeModel))
+
+	for n := 1; n <= maxEvalResultDirSuffix; n++ {
+		dir := base
+		if n > 1 {
+			dir = fmt.Sprintf("%s-%d", base, n)
+		}
+		err := os.Mkdir(dir, 0o755)
+		if err == nil {
+			if n > 1 {
+				fmt.Fprintf(os.Stderr, "eval agents: %s already exists, writing results to %s instead\n", base, dir)
+			}
+			return dir, nil
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("mkdir %s: %w", dir, err)
+		}
 	}
-	return dir, nil
+	return "", fmt.Errorf("prepareEvalResultDir: all of %s through %s-%d already exist", base, base, maxEvalResultDirSuffix)
 }
 
 // runWriter appends runRecord values to runs.jsonl one at a time, fsyncing
@@ -1309,9 +1355,22 @@ type runWriter struct {
 	enc *json.Encoder
 }
 
+// newRunWriter opens path with O_EXCL, refusing to reuse a runs.jsonl that
+// already exists rather than truncating it (os.Create's behavior). This is
+// a second, independent line of defense against the same failure mode
+// prepareEvalResultDir's directory-suffix search guards against: (1) should
+// never happen, because prepareEvalResultDir always hands back a directory
+// it just created, so runs.jsonl inside it cannot already exist; O_EXCL
+// turns "should never happen" into "cannot happen even if that invariant is
+// ever violated" — by a future refactor, a caller that builds the path by
+// hand instead of going through prepareEvalResultDir, or a bug — without
+// relying on the directory-naming logic alone being correct forever.
 func newRunWriter(path string) (*runWriter, error) {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("refusing to overwrite existing results at %s: %w", path, err)
+		}
 		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
 	return &runWriter{f: f, enc: json.NewEncoder(f)}, nil
