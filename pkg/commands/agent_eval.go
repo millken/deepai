@@ -97,6 +97,11 @@ func addEval(topLevel *cobra.Command) {
 	}
 	evalCmd.AddCommand(compareCmd)
 
+	// `eval summarize` lives in agent_eval_summarize.go — a separate file so
+	// it can be read/reviewed/reverted independently of the `agents`/
+	// `compare` wiring above, which it does not modify.
+	addEvalSummarize(evalCmd)
+
 	topLevel.AddCommand(evalCmd)
 }
 
