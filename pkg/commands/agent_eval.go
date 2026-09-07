@@ -8,11 +8,20 @@
 // tester) against deterministic, schema/anchor-based assertions — see
 // docs/AGENT_CAPABILITY_DESIGN.md §5.
 //
-// Zero production behavior changes ship with this file. The one production
-// change this period is the additive export in pkg/chat/review.go
-// (WorktreeSnapshot/TakeWorktreeSnapshot/ChangedSince) so the `no_writes`
-// assertion below reuses the exact dirty-worktree detection the review gate
-// uses, instead of a second copy that could silently diverge from it.
+// Zero production BEHAVIOR changes ship with this file. Production code
+// does gain a small set of additive exports this file depends on: the
+// pkg/chat/review.go WorktreeSnapshot/TakeWorktreeSnapshot/ChangedSince (so
+// the `no_writes` assertion below reuses the exact dirty-worktree detection
+// the review gate uses, instead of a second copy that could silently
+// diverge from it), and — M6 latency, fingerprint-coverage fix —
+// pkg/agent's AssembleSystemPrompt/SelectSubagentTools/
+// PreloadSkillsProfile/AppendOutputSchemaPrompt/ResolveAgentTypeConfig, so
+// caseFingerprint (below) can compute the SAME bytes a real dispatched
+// subagent's BuildSystemPrompt() produces, by calling the exact functions
+// that produce them, rather than re-deriving that assembly independently.
+// Every one of these exports is a pure refactor of existing logic into a
+// reusable shape — see each export's doc comment in pkg/agent for the
+// before/after proof — not new behavior.
 package commands
 
 import (
@@ -35,6 +44,7 @@ import (
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
@@ -135,7 +145,7 @@ func runEvalAgentsCmd(ctx context.Context, out io.Writer) error {
 		return err
 	}
 
-	pool, skillReg, err := buildEvalStack(modelRegistry, repoRoot, cfg)
+	pool, skillReg, evalTools, _, err := buildEvalStack(modelRegistry, repoRoot, cfg)
 	if err != nil {
 		return err
 	}
@@ -169,7 +179,7 @@ func runEvalAgentsCmd(ctx context.Context, out io.Writer) error {
 
 	fmt.Fprintf(out, "deepai eval agents: %d case(s), %d run(s) each, model=%s\n", len(cases), opts.Runs, modelAlias)
 	fmt.Fprintf(out, "writing incrementally to %s\n", runsPath)
-	records, runErr := runEvalCases(ctx, pool, repoRoot, skillReg, cases, opts, func(rec runRecord) error {
+	records, runErr := runEvalCases(ctx, pool, repoRoot, evalTools, skillReg, cases, opts, func(rec runRecord) error {
 		if err := writer.Write(rec); err != nil {
 			return err
 		}
@@ -251,13 +261,24 @@ type evalTaskPool interface {
 // web_* or git_auto_commit tools — none of the five tested profiles list
 // them, and REVIEW_EVAL's established convention keeps write-capable network
 // tools out of an eval registry on principle.
-func buildEvalStack(modelRegistry *llm.ModelRegistry, repoRoot string, cfg Config) (evalTaskPool, *skill.Registry, error) {
-	registry := tools.NewRegistry()
-	mustRegisterTool(registry, builtin.BashTool())
-	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(cfg.IsAutonomous()))
-	for _, t := range builtin.FileTools() {
-		mustRegisterTool(registry, t)
-	}
+//
+// M6 review: returns the *tools.Registry it actually wires into the
+// dispatch pool (via subExecutor/TaskTool below), NOT just the evalTools
+// slice, so a test can assert the two never silently diverge. Before this,
+// the equivalence test's "production-side" registry was rebuilt FROM
+// evalToolCandidates a second time (see TestCaseFingerprint_
+// EquivalentToRealDispatchedSubagentSystemPrompt in agent_eval_test.go),
+// which only proves "given the same candidate list, both sides hash the
+// same bytes" — it can never catch buildEvalStack registering a tool
+// evalToolCandidates doesn't know about (or vice versa), because that test
+// never looks at what buildEvalStack itself actually registered. Returning
+// the real registry closes that gap:
+// TestBuildEvalStack_RegistryMatchesEvalToolCandidatesPlusTask below
+// compares registry.List()'s name set directly against
+// evalToolCandidates(cfg) ∪ {"task"}.
+func buildEvalStack(modelRegistry *llm.ModelRegistry, repoRoot string, cfg Config) (evalTaskPool, *skill.Registry, []models.Tool, *tools.Registry, error) {
+	registry := newEvalToolRegistry(cfg)
+	evalTools := evalToolCandidates(cfg)
 
 	skillReg := skill.NewRegistry()
 	// Best-effort: a skill load problem must not block the harness (none of
@@ -289,7 +310,39 @@ func buildEvalStack(modelRegistry *llm.ModelRegistry, repoRoot string, cfg Confi
 	pool := agent.NewSubagentPool(subExecutor, 0)
 	mustRegisterTool(registry, tools.TaskTool(pool, agentOpts))
 
-	return pool, skillReg, nil
+	return pool, skillReg, evalTools, registry, nil
+}
+
+// newEvalToolRegistry builds a fresh *tools.Registry containing exactly
+// evalToolCandidates(cfg) — nothing more, nothing less, and (deliberately)
+// no "task" tool, since task can only be registered once its pool exists
+// (see buildEvalStack). Factored out of buildEvalStack so there is exactly
+// ONE place that turns evalToolCandidates into a registry: buildEvalStack
+// calls it to build its real dispatch registry, and
+// TestBuildEvalStack_RegistryMatchesEvalToolCandidatesPlusTask calls it (via
+// buildEvalStack's returned registry) to assert the two can never silently
+// diverge — see buildEvalStack's doc comment for the defect this closes.
+func newEvalToolRegistry(cfg Config) *tools.Registry {
+	registry := tools.NewRegistry()
+	for _, t := range evalToolCandidates(cfg) {
+		mustRegisterTool(registry, t)
+	}
+	return registry
+}
+
+// evalToolCandidates returns the exact tool set buildEvalStack registers
+// (minus the task tool, which is added separately once the pool exists,
+// and which SelectSubagentTools always strips from its candidate list
+// regardless of whether it's present — see its own doc comment): bash,
+// ask_clarification, and the eight builtin.FileTools(). Shared between
+// buildEvalStack (which actually registers these into the dispatch
+// registry) and caseFingerprint (which needs the SAME candidate list to
+// compute the restricted tool set a real dispatched subagent would get —
+// see resolveEvalSubagentPrompt) so the two can never silently diverge on
+// what a case's agent_type has to select from.
+func evalToolCandidates(cfg Config) []models.Tool {
+	out := []models.Tool{builtin.BashTool(), clarification.AskClarificationToolWithMode(cfg.IsAutonomous())}
+	return append(out, builtin.FileTools()...)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,10 +640,10 @@ type runRecord struct {
 // on disk. A caller must never buffer records and defer writing them until
 // this function returns: that reintroduces exactly the all-or-nothing loss
 // this design exists to prevent.
-func runEvalCases(ctx context.Context, pool evalTaskPool, repoRoot string, skillReg *skill.Registry, cases []evalCase, opts evalOptions, onRun func(runRecord) error) ([]runRecord, error) {
+func runEvalCases(ctx context.Context, pool evalTaskPool, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry, cases []evalCase, opts evalOptions, onRun func(runRecord) error) ([]runRecord, error) {
 	var records []runRecord
 	for _, c := range cases {
-		fingerprint, err := caseFingerprint(c.Manifest.AgentType, repoRoot, skillReg)
+		fingerprint, err := caseFingerprint(c.Manifest.AgentType, repoRoot, evalTools, skillReg)
 		if err != nil {
 			return records, fmt.Errorf("case %s/%s: fingerprint: %w", c.AgentType, c.ID, err)
 		}
@@ -940,118 +993,133 @@ func toStringSlice(v any) []string {
 // Fingerprint
 // ---------------------------------------------------------------------------
 
-// projectAgentYAMLMinimal reads just enough of a project .deepai/agents/<t>.yaml
-// to compute a fingerprint — the same file loadAgentYAML (pkg/agent/yaml_loader.go)
-// parses in full for actual execution. Parsing it a second time here (rather
-// than exporting a helper from pkg/agent) is deliberate: this period allows
-// no production exports beyond the pkg/chat snapshot wrapper.
-type projectAgentYAMLMinimal struct {
-	SystemPrompt     string   `yaml:"system_prompt"`
-	SystemPromptFile string   `yaml:"system_prompt_file"`
-	Skills           []string `yaml:"skills"`
-	// OutputSchema mirrors yamlAgentConfig.OutputSchema (pkg/agent/
-	// yaml_loader.go) — a name into agent.NamedSchema, not inline JSON
-	// Schema. Absent (""), the role's OutputSchema for fingerprint purposes
-	// falls back to the builtin's mounted schema (mergeConfig's "nil
-	// override keeps base" semantics), matching production.
-	OutputSchema string `yaml:"output_schema"`
-}
-
-// resolveEvalSystemPrompt returns the effective system prompt, Skills list,
-// and OutputSchema.Prompt for agentType exactly as SubagentExecutor.Execute
-// would resolve them: a project .deepai/agents/<type>.yaml, if present, wins
-// outright for SystemPrompt/Skills (matches mergeConfig's "override present
-// -> replace" semantics for a non-builtin type); the schema Prompt follows
-// mergeConfig's OutputSchema rule specifically — a project YAML's own
-// output_schema: key replaces the base's, but an ABSENT key keeps the base
-// (builtin) schema rather than clearing it, which is why the builtin lookup
-// runs unconditionally below rather than only in the no-project-YAML branch.
+// resolveEvalSubagentPrompt computes the EXACT system prompt bytes
+// SubagentExecutor.Execute would assemble into a dispatched subagent's
+// a.systemPrompt for agentType, given no task.Config.SystemPrompt/Skill
+// override — which is what every eval case dispatches with (agent_type +
+// prompt only, see dispatchEvalTask) — and then feeds through
+// AssembleSystemPrompt against the RESTRICTED tool set Execute
+// would actually hand that subagent, exactly as BuildSystemPrompt does.
+// This is the fix for caseFingerprint's defect (see its doc comment): the
+// fingerprint must cover what actually reaches the model, not just the
+// role's bare base prompt.
 //
-// Known gap: this does not consider a project .deepai/agents/<type>.md
-// override — none of the five M5-2 baseline types (architect,
-// product-manager, researcher, analyst, tester) has one, only tester.yaml,
-// so the gap is inert for this corpus but would need closing before a
-// project MD-based role joins the eval corpus.
-func resolveEvalSystemPrompt(agentType, repoRoot string) (string, []string, string, error) {
-	builtinCfg := agent.GetAgentTypeConfig(agent.AgentType(agentType))
-	baseSchemaPrompt := ""
-	if builtinCfg.OutputSchema != nil {
-		baseSchemaPrompt = builtinCfg.OutputSchema.Prompt
+// Every step below calls an exported pkg/agent function that IS the
+// production logic (ResolveAgentTypeConfig wraps the same resolver Execute
+// calls; PreloadSkillsProfile/AppendOutputSchemaPrompt are the exact blocks
+// Execute runs, factored out; SelectSubagentTools is Execute's own tool
+// selector; AssembleSystemPrompt is BuildSystemPrompt's own section
+// assembly, already joined) — never a re-derivation of any of their formatting or merge
+// rules. That is deliberate: a second implementation of any of this is
+// exactly the bug pattern that made the OLD fingerprint (pre-M6) silently
+// blind to BuildSystemPrompt's gated sections, and this codebase has hit
+// that same "two copies quietly drift apart" failure before (a fixture
+// diverging from its source file, a comment diverging from the code it
+// describes). Extracting shared functions from pkg/agent — used by both
+// production and this harness — is the only way to make that class of bug
+// structurally impossible here, rather than merely reviewed-away once.
+//
+// evalTools is the harness's full tool candidate list (evalToolCandidates) —
+// the SAME list buildEvalStack registers into the real dispatch registry —
+// so SelectSubagentTools below sees the identical candidate set
+// SubagentExecutor.Execute's e.tools.List() would.
+//
+// Any problem surfaced while resolving the project YAML/MD (a parse error,
+// an unknown output_schema: name, ...) is a HARD error here even though
+// production (Execute, via ResolveAgentTypeConfig) only WARNS and silently
+// falls back to the builtin profile for a type that still resolves to one —
+// deliberately stricter than production, matching this eval harness's
+// pre-existing policy (see the M5-2/M5-3 history) of never letting a broken
+// project override in the corpus silently fingerprint the wrong (fallback)
+// prompt.
+func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry) (string, error) {
+	at := agent.AgentType(agentType)
+	profileCfg, problems, typeResolved := agent.ResolveAgentTypeConfig(at, repoRoot, nil)
+	if !typeResolved {
+		return "", fmt.Errorf("agent type %q not resolved to any source (problems: %s)", agentType, strings.Join(problems, "; "))
+	}
+	if len(problems) > 0 {
+		return "", fmt.Errorf("agent type %q: %s", agentType, strings.Join(problems, "; "))
 	}
 
-	path := filepath.Join(repoRoot, ".deepai", "agents", agentType+".yaml")
-	data, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		var y projectAgentYAMLMinimal
-		if yerr := yaml.Unmarshal(data, &y); yerr != nil {
-			return "", nil, "", fmt.Errorf("parse %s: %w", path, yerr)
-		}
-		prompt := y.SystemPrompt
-		if prompt == "" && y.SystemPromptFile != "" {
-			fdata, ferr := os.ReadFile(filepath.Join(repoRoot, ".deepai", "agents", y.SystemPromptFile))
-			if ferr != nil {
-				return "", nil, "", fmt.Errorf("read system_prompt_file for %s: %w", agentType, ferr)
-			}
-			prompt = string(fdata)
-		}
-		schemaPrompt := baseSchemaPrompt
-		if y.OutputSchema != "" {
-			schema, ok := agent.NamedSchema(y.OutputSchema)
-			if !ok {
-				return "", nil, "", fmt.Errorf("%s: unknown output_schema %q", path, y.OutputSchema)
-			}
-			schemaPrompt = schema.Prompt
-		}
-		return prompt, y.Skills, schemaPrompt, nil
-	case os.IsNotExist(err):
-		return builtinCfg.SystemPrompt, builtinCfg.Skills, baseSchemaPrompt, nil
-	default:
-		return "", nil, "", fmt.Errorf("read %s: %w", path, err)
-	}
-}
-
-// caseFingerprint = sha256(resolved SystemPrompt + preloaded skill bodies,
-// concatenated in Skills order + OutputSchema.Prompt)[:8], hex-encoded — the
-// M5-2 brief's fingerprint definition.
-//
-// M5-3 mounted a non-Strict OutputSchema on architect/product-manager/
-// researcher/analyst, so the schema-Prompt component is no longer
-// unconditionally "" the way the M5-2 baseline comment here used to say —
-// resolveEvalSystemPrompt now resolves it per role (builtin mount, or a
-// project YAML's own output_schema: override) instead of this function
-// hardcoding it away. The M5-2-era before/after runs (kept only on the
-// machine that ran them; eval/results/ is not tracked) were computed with
-// the OLD (schema-blind) formula; this fix does not retroactively recompute
-// them —
-// it protects fingerprints computed FROM HERE ON (M5-4 and later), so that a
-// schema change with the system prompt held byte-for-byte constant (e.g.
-// adding a field to a named schema, or wiring a role's output_schema) still
-// produces a different fingerprint instead of silently reusing a stale
-// before-run's fingerprint to vouch for an untested contract.
-func caseFingerprint(agentType, repoRoot string, skillReg *skill.Registry) (string, error) {
-	systemPrompt, skillNames, schemaPrompt, err := resolveEvalSystemPrompt(agentType, repoRoot)
+	base, err := agent.PreloadSkillsProfile(profileCfg.SystemPrompt, profileCfg.Type, profileCfg.Skills, skillReg)
 	if err != nil {
 		return "", err
 	}
-	var bodies []string
-	for _, name := range skillNames {
-		body, err := skillReg.LoadBody(name)
-		if err != nil {
-			return "", fmt.Errorf("skill %q: %w", name, err)
-		}
-		bodies = append(bodies, body)
+	base = agent.AppendOutputSchemaPrompt(base, profileCfg.OutputSchema)
+
+	selected, err := agent.SelectSubagentTools(evalTools, profileCfg.DefaultTools)
+	if err != nil {
+		return "", err
 	}
-	return computeFingerprint(systemPrompt, bodies, schemaPrompt), nil
+	restricted := tools.NewRegistry()
+	for _, t := range selected {
+		mustRegisterTool(restricted, t)
+	}
+
+	// nonInteractive=true, agentCatalog=nil: matches every subagent Execute
+	// constructs (AgentConfig.NonInteractive is always true; AgentCatalog is
+	// never set — see subagent.go's buildAgentConfig). Plan mode is not
+	// replicated here because it is unconditionally inert for a subagent —
+	// see AssembleSystemPrompt's doc comment (pkg/agent/
+	// promptbuild.go) for why: Execute never sets AgentConfig.PlanMode, and
+	// New() only ever honors it when !NonInteractive.
+	return agent.AssembleSystemPrompt(base, restricted, true, nil), nil
 }
 
-func computeFingerprint(systemPrompt string, skillBodies []string, schemaPrompt string) string {
+// caseFingerprint = sha256(resolveEvalSubagentPrompt's full assembled system
+// prompt)[:8], hex-encoded.
+//
+// This fingerprint's whole stated purpose (design docs/AGENT_CAPABILITY_
+// DESIGN.md §5, and `deepai eval compare`'s "fingerprint unchanged" gate) is
+// to catch a stale before-run vouching for a system prompt it never actually
+// saw. That only holds if the hashed bytes ARE the bytes the model actually
+// receives. Before this fix, caseFingerprint hashed resolveEvalSystemPrompt's
+// bare role SystemPrompt + skill bodies + OutputSchema.Prompt — but the
+// REAL system prompt a dispatched subagent gets is
+// (*agent.Agent).BuildSystemPrompt()'s output, which additionally appends,
+// gated on the subagent's RESTRICTED tool set: the file-operation rule
+// (hasAnyFileTool), search-tool recommendations (hasSearchTools), the
+// M6-latency batch-tool-calls guidance (hasMultipleParallelSafeTools /
+// batchToolCallsPrompt), and todo-tool guidance (hasTodoTool). The M6
+// period added batchToolCallsPrompt (~1.1KB) to the system prompt of all
+// five tested roles, and the old fingerprint formula did not move a single
+// byte — every role's fingerprint stayed identical across a real prompt
+// change, which is precisely the case `eval compare`'s "fingerprint
+// unchanged" WARNING exists to catch, and which docs/AGENT_CAPABILITY_
+// DESIGN.md §5 (and later, `eval summarize`'s hard-refusal gate) relied on
+// as evidence a role's prompt was untouched.
+//
+// The fix hashes resolveEvalSubagentPrompt's fully assembled string instead
+// — see that function's doc comment for how it reconstructs the exact
+// bytes Execute+BuildSystemPrompt produce, via shared pkg/agent exports
+// rather than a second implementation.
+//
+// All five tested roles' fingerprints change once, here, as an intentional
+// one-time cost: the only extant before-run (eval/results/2026-09-07-
+// glm-5.3-merged/, disk-local, not tracked) is invalidated at the hash
+// level regardless of whether its underlying prompts changed, because it
+// was computed with the OLD (incomplete) formula. There is deliberately no
+// compatibility shim or fingerprint version tag to keep the old value
+// matching — see this function's own doc comment above for why: an
+// approximate fingerprint is worse than an honestly-narrow one that changes
+// when it should.
+func caseFingerprint(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry) (string, error) {
+	prompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg)
+	if err != nil {
+		return "", err
+	}
+	return computeFingerprint(prompt), nil
+}
+
+// computeFingerprint hashes the FULL assembled system prompt string (see
+// caseFingerprint's doc comment) — not its separate components — because
+// the fingerprint's job is to detect any change in what actually reaches
+// the model, and the only way to guarantee that is to hash the exact bytes
+// BuildSystemPrompt would produce, already joined in the same order.
+func computeFingerprint(systemPrompt string) string {
 	h := sha256.New()
 	h.Write([]byte(systemPrompt))
-	for _, b := range skillBodies {
-		h.Write([]byte(b))
-	}
-	h.Write([]byte(schemaPrompt))
 	return hex.EncodeToString(h.Sum(nil))[:8]
 }
 

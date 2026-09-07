@@ -301,6 +301,22 @@ func resolveAgentTypeConfigResolved(t AgentType, workDir string, pluginAgentDirs
 	return BuiltinAgentTypes[AgentTypeGeneral], problems, false
 }
 
+// ResolveAgentTypeConfig is the exported form of
+// resolveAgentTypeConfigResolved — the SAME resolution
+// SubagentExecutor.Execute uses (project YAML > project MD > plugin MD >
+// builtin > general fallback) — for a caller outside this package that
+// needs a role's EFFECTIVE profile without dispatching a task. Its one
+// caller today is the eval harness's caseFingerprint (pkg/commands/
+// agent_eval.go), which used to hand-roll a partial YAML parse (SystemPrompt/
+// Skills/OutputSchema only — no tools:, no .md override, no plugin agents)
+// that could silently diverge from this function's real merge semantics —
+// see mergeConfig's doc comment for the rules a hand-rolled parse would
+// have to keep re-deriving correctly forever. Exporting this instead lets
+// the harness resolve a role exactly as production does, by construction.
+func ResolveAgentTypeConfig(t AgentType, workDir string, pluginAgentDirs []string) (AgentTypeConfig, []string, bool) {
+	return resolveAgentTypeConfigResolved(t, workDir, pluginAgentDirs)
+}
+
 // loadAgentMDFileReported parses an agent .md if it exists. Returns (nil, nil)
 // when the file does not exist (not an error — a source simply isn't present);
 // returns (nil, err) when the file exists but fails to parse.

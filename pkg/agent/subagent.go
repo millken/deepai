@@ -155,16 +155,13 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// unknown agent_type (see the typeResolved check above): failing loudly
 	// beats silently running the role without the playbook it depends on.
 	// Order is profileCfg.Skills' own order, so the assembled prompt is
-	// deterministic across Runs (see the prefix-stability test).
-	if len(profileCfg.Skills) > 0 && e.skills == nil {
-		return subagent.ExecutionResult{}, fmt.Errorf("agent type %q declares skills but no skill registry is configured", agentType)
-	}
-	for _, name := range profileCfg.Skills {
-		body, err := e.skills.LoadBody(name)
-		if err != nil {
-			return subagent.ExecutionResult{}, fmt.Errorf("preload skill %q for agent type %q: %w", name, agentType, err)
-		}
-		systemPrompt += "\n\n" + body
+	// deterministic across Runs (see the prefix-stability test). Factored
+	// into PreloadSkillsProfile (below) so the eval harness's caseFingerprint
+	// (pkg/commands/agent_eval.go) computes this step's exact bytes instead
+	// of re-deriving the "\n\n"-separator rule independently.
+	systemPrompt, err = PreloadSkillsProfile(systemPrompt, agentType, profileCfg.Skills, e.skills)
+	if err != nil {
+		return subagent.ExecutionResult{}, err
 	}
 
 	// §2.6 step 3: task.Config.Skill selects a context:fork skill to run
@@ -241,10 +238,10 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	maxToolCalls := resolveMaxToolCalls(callerMaxToolCalls, profileCfg.MaxToolCalls)
 
 	// Inject OutputSchema prompt into system prompt when available (last,
-	// unchanged from before this change).
-	if profileCfg.OutputSchema != nil && profileCfg.OutputSchema.Prompt != "" {
-		systemPrompt += "\n\nOutput your response as JSON matching this schema:\n" + profileCfg.OutputSchema.Prompt
-	}
+	// unchanged from before this change). Factored into
+	// AppendOutputSchemaPrompt (below) for the same reason as
+	// PreloadSkillsProfile above.
+	systemPrompt = AppendOutputSchemaPrompt(systemPrompt, profileCfg.OutputSchema)
 
 	// Resolve model alias: task.Config.Model (caller-explicit) > fork
 	// skill's model: > agent type YAML model > registry default. The fork
@@ -651,6 +648,62 @@ func NewSubagentPool(executor *SubagentExecutor, timeout time.Duration) *subagen
 	return subagent.NewPool(executor, subagent.PoolConfig{
 		Timeout: timeout,
 	})
+}
+
+// SelectSubagentTools is the exported form of selectSubagentTools —
+// SubagentExecutor.Execute's own tool-selection rule (name-or-group match,
+// "task" always stripped from the candidate set, empty selectors keeps
+// everything but "task", and a selector list that matches nothing is a hard
+// error rather than silently widening to "no restriction"). Exported so a
+// caller that needs the EXACT tool set a dispatched subagent would get —
+// currently only the eval harness's caseFingerprint (pkg/commands/
+// agent_eval.go), computing the restricted registry it feeds to
+// AssembleSystemPrompt — derives it via this function instead of
+// re-implementing the name/group/empty/no-match rules a second time.
+func SelectSubagentTools(all []models.Tool, selectors []string) ([]models.Tool, error) {
+	return selectSubagentTools(all, selectors)
+}
+
+// PreloadSkillsProfile appends each named skill's body (in profileSkills'
+// own order), separated by a blank line, onto base — the exact formatting
+// SubagentExecutor.Execute applies for a role's Skills preload (L2,
+// AGENT_CAPABILITY_DESIGN.md §1). len(profileSkills) == 0 is a no-op
+// regardless of skillReg (including a nil one), matching Execute exactly —
+// a role that declares no Skills never requires a skill registry to be
+// wired. Exported for the same reason as SelectSubagentTools above: this
+// step's separator rule and its "skills declared but no registry configured"
+// failure mode must not be re-derived independently by a caller outside
+// this package.
+func PreloadSkillsProfile(base string, agentType AgentType, profileSkills []string, skillReg *skill.Registry) (string, error) {
+	if len(profileSkills) == 0 {
+		return base, nil
+	}
+	if skillReg == nil {
+		return "", fmt.Errorf("agent type %q declares skills but no skill registry is configured", agentType)
+	}
+	out := base
+	for _, name := range profileSkills {
+		body, err := skillReg.LoadBody(name)
+		if err != nil {
+			return "", fmt.Errorf("preload skill %q for agent type %q: %w", name, agentType, err)
+		}
+		out += "\n\n" + body
+	}
+	return out, nil
+}
+
+// AppendOutputSchemaPrompt appends the "Output your response as JSON..."
+// wrapper SubagentExecutor.Execute injects when a role's OutputSchema is
+// set and carries a non-empty Prompt (the last step of Execute's
+// system-prompt assembly). schema == nil (no schema mounted) or an empty
+// Prompt is a no-op, returning base unchanged. Exported for the same reason
+// as PreloadSkillsProfile above: the wrapper text itself must not be
+// re-derived independently by a caller outside this package.
+func AppendOutputSchemaPrompt(base string, schema *OutputSchema) string {
+	if schema != nil && schema.Prompt != "" {
+		return base + "\n\nOutput your response as JSON matching this schema:\n" + schema.Prompt
+	}
+	return base
 }
 
 func selectSubagentTools(all []models.Tool, selectors []string) ([]models.Tool, error) {

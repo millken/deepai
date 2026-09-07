@@ -12,7 +12,11 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // ---------------------------------------------------------------------------
@@ -578,8 +582,8 @@ func TestRecoverTimedOutStats_TaskNotFoundReturnsImmediately(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestComputeFingerprint_SameInputSameFingerprint(t *testing.T) {
-	a := computeFingerprint("system prompt", []string{"skill body"}, "")
-	b := computeFingerprint("system prompt", []string{"skill body"}, "")
+	a := computeFingerprint("a full assembled system prompt")
+	b := computeFingerprint("a full assembled system prompt")
 	if a != b {
 		t.Fatalf("same input produced different fingerprints: %q vs %q", a, b)
 	}
@@ -589,8 +593,8 @@ func TestComputeFingerprint_SameInputSameFingerprint(t *testing.T) {
 }
 
 func TestComputeFingerprint_OneByteChangeChangesFingerprint(t *testing.T) {
-	a := computeFingerprint("system promptX", nil, "")
-	b := computeFingerprint("system promptY", nil, "")
+	a := computeFingerprint("system promptX")
+	b := computeFingerprint("system promptY")
 	if a == b {
 		t.Fatalf("changing one byte of the system prompt did not change the fingerprint (%q)", a)
 	}
@@ -598,7 +602,8 @@ func TestComputeFingerprint_OneByteChangeChangesFingerprint(t *testing.T) {
 
 func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing.T) {
 	repoRoot := t.TempDir()
-	builtinFP, err := caseFingerprint("architect", repoRoot, nil)
+	evalTools := evalToolCandidates(Config{})
+	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (builtin): %v", err)
 	}
@@ -610,7 +615,7 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte("system_prompt: |\n  a totally different constitution\n"), 0o644); err != nil {
 		t.Fatalf("write override yaml: %v", err)
 	}
-	overrideFP, err := caseFingerprint("architect", repoRoot, nil)
+	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (override): %v", err)
 	}
@@ -619,44 +624,95 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 	}
 }
 
+// TestCaseFingerprint_ProjectMDOverrideWinsAndChangesFingerprint: the
+// project .md override path (.deepai/agents/<type>.md, used when no
+// <type>.yaml exists — resolveAgentTypeConfigResolved's second priority
+// tier) was exercised manually last period but had zero test coverage.
+// Mirrors TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint
+// above, just for the .md source instead of .yaml.
+func TestCaseFingerprint_ProjectMDOverrideWinsAndChangesFingerprint(t *testing.T) {
+	repoRoot := t.TempDir()
+	evalTools := evalToolCandidates(Config{})
+	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (builtin): %v", err)
+	}
+
+	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	mdContent := "---\nname: architect\ndescription: overridden via markdown\n---\nA totally different constitution, from a .md override.\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.md"), []byte(mdContent), 0o644); err != nil {
+		t.Fatalf("write override md: %v", err)
+	}
+	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (override): %v", err)
+	}
+	if builtinFP == overrideFP {
+		t.Fatalf("project .md override did not change the fingerprint (%q)", builtinFP)
+	}
+
+	profileCfg, problems, ok := agent.ResolveAgentTypeConfig(agent.AgentType("architect"), repoRoot, nil)
+	if !ok || len(problems) > 0 {
+		t.Fatalf("resolve architect type from .md override: ok=%v problems=%v", ok, problems)
+	}
+	if profileCfg.Type != "architect" {
+		t.Errorf("profileCfg.Type = %q, want %q (the .md override must resolve to the SAME type it overrides)", profileCfg.Type, "architect")
+	}
+}
+
 // TestCaseFingerprint_ProjectYAMLOutputSchemaOverride: a project YAML's own
 // `output_schema:` key must override the builtin's mounted schema for
 // fingerprint purposes too, resolved through the same closed namedSchemas
 // table production uses (agent.NamedSchema) — not silently defaulting back
-// to "" or to the builtin schema.
+// to "" or to the builtin schema. Asserted as a DELTA (schema key present vs
+// absent, system_prompt held identical) rather than a hand-reconstructed
+// exact hash: caseFingerprint now covers the full BuildSystemPrompt output
+// (see its doc comment), and hand-reconstructing that string here would
+// re-derive AssembleSystemPrompt's join order a second time —
+// exactly the duplicate-implementation risk this fix exists to eliminate.
 func TestCaseFingerprint_ProjectYAMLOutputSchemaOverride(t *testing.T) {
 	repoRoot := t.TempDir()
 	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// architect's builtin schema is "design"; override this project's
-	// architect role to point at "review" instead (an arbitrary different
-	// named schema — the point is only that it differs from "design").
-	yamlContent := "system_prompt: |\n  a totally different constitution\noutput_schema: review\n"
-	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+	evalTools := evalToolCandidates(Config{})
+	// architect's builtin schema is unset (M5-4 removed the four non-Strict
+	// role contracts); override this project's architect role to point at
+	// "review" instead (an arbitrary named schema — the point is only that
+	// it differs from "none").
+	withSchema := "system_prompt: |\n  a totally different constitution\noutput_schema: review\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(withSchema), 0o644); err != nil {
 		t.Fatalf("write override yaml: %v", err)
 	}
-
-	got, err := caseFingerprint("architect", repoRoot, nil)
+	withSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
 	if err != nil {
-		t.Fatalf("caseFingerprint: %v", err)
+		t.Fatalf("caseFingerprint (with schema): %v", err)
 	}
-	reviewSchema, ok := agent.NamedSchema("review")
-	if !ok {
-		t.Fatal("namedSchemas[\"review\"] missing")
+
+	withoutSchema := "system_prompt: |\n  a totally different constitution\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(withoutSchema), 0o644); err != nil {
+		t.Fatalf("write override yaml: %v", err)
 	}
-	want := computeFingerprint("a totally different constitution\n", nil, reviewSchema.Prompt)
-	if got != want {
-		t.Errorf("caseFingerprint = %q, want %q (project output_schema: review must be folded in)", got, want)
+	withoutSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (without schema): %v", err)
+	}
+
+	if withSchemaFP == withoutSchemaFP {
+		t.Errorf("project output_schema: review must change the fingerprint versus no output_schema at all (both %q), with system_prompt held identical", withSchemaFP)
 	}
 }
 
 // TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors: an unknown
 // output_schema name in a project YAML must be a hard error at fingerprint
-// time too, the same policy loadAgentYAML enforces for actual execution —
-// silently falling back to "" would hide a typo'd manifest as a passing,
-// schema-blind fingerprint.
+// time too — deliberately stricter than production's Execute (which only
+// warns and falls back to the builtin profile), matching this harness's
+// pre-existing policy of never letting a broken project override silently
+// fingerprint the wrong (fallback) prompt.
 func TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors(t *testing.T) {
 	repoRoot := t.TempDir()
 	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
@@ -668,8 +724,413 @@ func TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors(t *testing.T) {
 		t.Fatalf("write yaml: %v", err)
 	}
 
-	if _, err := caseFingerprint("architect", repoRoot, nil); err == nil {
+	if _, err := caseFingerprint("architect", repoRoot, evalToolCandidates(Config{}), nil); err == nil {
 		t.Fatal("expected error for unknown output_schema name, got nil")
+	}
+}
+
+// TestCaseFingerprint_ProjectSkillBodyChangeMovesFingerprint: none of the
+// five builtin roles this harness tests declares `skills:`
+// (docs/AGENT_CAPABILITY_DESIGN.md §5's five-role corpus), so
+// TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt never
+// exercises PreloadSkillsProfile's production codepath at all — the
+// equivalence test is silent on whether a skill's BODY (not just its name)
+// is actually reflected in the fingerprint. This is not a regression (the
+// pre-M6 fingerprint didn't cover it either), but computeFingerprint
+// dropped skillBodies as an explicit parameter to caseFingerprint in this
+// same refactor, turning "skill body changes move the fingerprint" from an
+// explicit contract into an implicit one — worth a direct test.
+//
+// Declares a project role (architect) with skills: [probe-skill], writes a
+// project skill body, fingerprints it, edits ONLY the skill body (system
+// prompt untouched), and asserts the fingerprint moves.
+func TestCaseFingerprint_ProjectSkillBodyChangeMovesFingerprint(t *testing.T) {
+	repoRoot := t.TempDir()
+	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	yamlContent := "system_prompt: |\n  a role that preloads a skill\nskills:\n  - probe-skill\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write role yaml: %v", err)
+	}
+
+	skillDir := filepath.Join(repoRoot, ".deepai", "skills", "probe-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("mkdir skill dir: %v", err)
+	}
+	writeSkill := func(body string) {
+		content := "---\nname: probe-skill\ndescription: a probe skill for the fingerprint test\n---\n" + body
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644); err != nil {
+			t.Fatalf("write SKILL.md: %v", err)
+		}
+	}
+
+	evalTools := evalToolCandidates(Config{})
+
+	writeSkill("Original skill body instructions.")
+	skillRegBefore := skill.NewRegistry()
+	if warnings := skillRegBefore.LoadAllReported(repoRoot, nil); len(warnings) > 0 {
+		t.Logf("skill load warnings (before): %v", warnings)
+	}
+	fpBefore, err := caseFingerprint("architect", repoRoot, evalTools, skillRegBefore)
+	if err != nil {
+		t.Fatalf("caseFingerprint (before): %v", err)
+	}
+
+	writeSkill("Completely different skill body instructions, same role, same system_prompt.")
+	skillRegAfter := skill.NewRegistry()
+	if warnings := skillRegAfter.LoadAllReported(repoRoot, nil); len(warnings) > 0 {
+		t.Logf("skill load warnings (after): %v", warnings)
+	}
+	fpAfter, err := caseFingerprint("architect", repoRoot, evalTools, skillRegAfter)
+	if err != nil {
+		t.Fatalf("caseFingerprint (after): %v", err)
+	}
+
+	if fpBefore == fpAfter {
+		t.Errorf("editing a preloaded skill's body (system_prompt held identical) did not move the fingerprint (both %q)", fpBefore)
+	}
+}
+
+// noopEvalTool builds a minimal registerable models.Tool for fingerprint
+// gate tests — a stand-in for a real builtin tool that lets the test control
+// ParallelSafe directly, without needing the real builtin constructors.
+func noopEvalTool(name string, parallelSafe bool) models.Tool {
+	return models.Tool{
+		Name:         name,
+		ParallelSafe: parallelSafe,
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{}, nil
+		},
+	}
+}
+
+// TestCaseFingerprint_SensitiveToBatchToolCallsPromptGate is the RED test
+// for the caseFingerprint defect this period fixes: the OLD formula (hash of
+// resolveEvalSystemPrompt's bare role prompt + skill bodies + schema prompt)
+// never moved when BuildSystemPrompt's gated sections changed — in
+// particular, this period's own batchToolCallsPrompt addition (~1.1KB,
+// gated on 2+ ParallelSafe tools in the subagent's RESTRICTED tool set)
+// left all five tested roles' fingerprints byte-identical despite a real
+// ~1KB system-prompt change. Reproduces that gate directly: the same
+// architect agent_type, project-YAML-free, dispatched against two
+// candidate tool lists that differ ONLY in ParallelSafe — one crossing the
+// hasMultipleParallelSafeTools threshold (2+), one staying under it (0) —
+// so SelectSubagentTools resolves the identical NAMES (architect's
+// DefaultTools) both times and only the gate's answer differs. A
+// fingerprint that covers the real BuildSystemPrompt output must change
+// here; the pre-fix formula would not (it never even looked at the tool
+// set).
+func TestCaseFingerprint_SensitiveToBatchToolCallsPromptGate(t *testing.T) {
+	repoRoot := t.TempDir()
+	// architect's builtin DefaultTools: read_file, grep, glob, list_dir,
+	// find, code_map (pkg/agent/types_config.go).
+	names := []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"}
+
+	withoutBatch := make([]models.Tool, len(names))
+	for i, n := range names {
+		withoutBatch[i] = noopEvalTool(n, false)
+	}
+	withBatch := make([]models.Tool, len(names))
+	for i, n := range names {
+		withBatch[i] = noopEvalTool(n, true)
+	}
+
+	fpWithout, err := caseFingerprint("architect", repoRoot, withoutBatch, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (0 ParallelSafe tools): %v", err)
+	}
+	fpWith, err := caseFingerprint("architect", repoRoot, withBatch, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (6 ParallelSafe tools): %v", err)
+	}
+
+	if fpWithout == fpWith {
+		t.Fatalf("caseFingerprint did not change when the restricted tool set crossed the hasMultipleParallelSafeTools threshold (both %q) — the fingerprint is not covering batchToolCallsPrompt's gated section", fpWithout)
+	}
+}
+
+// TestCaseFingerprint_SensitiveToUnderTwoParallelSafeTools is the "role has
+// fewer than 2 parallel-safe tools" variant the task brief calls out
+// explicitly: exactly ONE ParallelSafe tool must produce the SAME
+// fingerprint as zero (batchToolCallsPrompt absent both times — see
+// hasMultipleParallelSafeTools' >=2 threshold), while crossing to two must
+// differ from both.
+func TestCaseFingerprint_SensitiveToUnderTwoParallelSafeTools(t *testing.T) {
+	repoRoot := t.TempDir()
+	names := []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"}
+
+	zero := make([]models.Tool, len(names))
+	one := make([]models.Tool, len(names))
+	two := make([]models.Tool, len(names))
+	for i, n := range names {
+		zero[i] = noopEvalTool(n, false)
+		one[i] = noopEvalTool(n, i == 0)
+		two[i] = noopEvalTool(n, i < 2)
+	}
+
+	fpZero, err := caseFingerprint("architect", repoRoot, zero, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (0 ParallelSafe): %v", err)
+	}
+	fpOne, err := caseFingerprint("architect", repoRoot, one, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (1 ParallelSafe): %v", err)
+	}
+	fpTwo, err := caseFingerprint("architect", repoRoot, two, nil)
+	if err != nil {
+		t.Fatalf("caseFingerprint (2 ParallelSafe): %v", err)
+	}
+
+	if fpZero != fpOne {
+		t.Errorf("caseFingerprint differs between 0 and 1 ParallelSafe tools (%q vs %q) — batchToolCallsPrompt needs >=2 to earn its place, so both should be absent and the fingerprint identical", fpZero, fpOne)
+	}
+	if fpTwo == fpOne {
+		t.Errorf("caseFingerprint did not change crossing from 1 to 2 ParallelSafe tools (%q) — batchToolCallsPrompt should now be present", fpTwo)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Equivalence: the harness's fingerprint input must be byte-identical to
+// what a REAL dispatched subagent's BuildSystemPrompt() produces.
+// ---------------------------------------------------------------------------
+
+// captureSystemPromptProvider is a minimal llm.LLMProvider fake that records
+// the first Stream request's SystemPrompt — i.e. exactly
+// (*agent.Agent).BuildSystemPrompt()'s output, see pkg/agent/react.go's
+// "systemPrompt := a.BuildSystemPrompt()" / "SystemPrompt: reqSystemPrompt"
+// — then ends the run immediately with a plain final answer. This lets the
+// test dispatch a task through the REAL, unmodified
+// agent.SubagentExecutor.Execute (the exact code path pkg/tools' task tool
+// uses in production) without ever reaching a real model, so "the harness
+// matches the real subagent" is proven against production code, not a
+// second hand-built approximation of it.
+type captureSystemPromptProvider struct {
+	mu           sync.Mutex
+	systemPrompt string
+	captured     bool
+}
+
+func (p *captureSystemPromptProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *captureSystemPromptProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.mu.Lock()
+	if !p.captured {
+		p.systemPrompt = req.SystemPrompt
+		p.captured = true
+	}
+	p.mu.Unlock()
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		ch <- llm.StreamChunk{Message: &models.Message{Role: models.RoleAI, Content: "done"}, Done: true}
+	}()
+	return ch, nil
+}
+
+func (p *captureSystemPromptProvider) firstSystemPrompt() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.systemPrompt
+}
+
+// TestBuildEvalStack_RegistryMatchesEvalToolCandidatesPlusTask closes the
+// gap the equivalence test below cannot: that test's "production-side"
+// registry is rebuilt FROM evalToolCandidates a second time
+// (registry := tools.NewRegistry(); for _, tl := range evalTools {
+// mustRegisterTool(registry, tl) }), so it only ever proves "given the same
+// candidate list, both formulas hash the same bytes" — it can never observe
+// buildEvalStack registering a tool evalToolCandidates doesn't know about
+// (or the reverse), because it never looks at what buildEvalStack itself
+// actually wired into the dispatch registry.
+//
+// This test does look: it calls the REAL buildEvalStack and asserts the
+// name set of the *tools.Registry it returns equals
+// evalToolCandidates(cfg)'s names plus "task" (added once the pool exists —
+// see buildEvalStack's own doc comment). A tool registered directly inside
+// buildEvalStack but absent from evalToolCandidates — the exact mutation
+// this test's own doc comment on buildEvalStack describes reproducing —
+// makes this test fail: extra name present in the registry, absent from
+// the want set.
+func TestBuildEvalStack_RegistryMatchesEvalToolCandidatesPlusTask(t *testing.T) {
+	repoRoot := t.TempDir()
+	cfg := Config{}
+	modelRegistry := llm.NewSingleModelRegistry("test", "m", "")
+
+	_, _, evalTools, registry, err := buildEvalStack(modelRegistry, repoRoot, cfg)
+	if err != nil {
+		t.Fatalf("buildEvalStack: %v", err)
+	}
+	if registry == nil {
+		t.Fatal("buildEvalStack returned a nil registry")
+	}
+
+	want := map[string]bool{"task": true}
+	for _, tl := range evalTools {
+		want[tl.Name] = true
+	}
+
+	got := map[string]bool{}
+	for _, tl := range registry.List() {
+		got[tl.Name] = true
+	}
+
+	for name := range want {
+		if !got[name] {
+			t.Errorf("buildEvalStack's dispatch registry is missing tool %q, present in evalToolCandidates(cfg) ∪ {task}", name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("buildEvalStack's dispatch registry has tool %q that evalToolCandidates(cfg) ∪ {task} does not — a dispatched subagent could select tools resolveEvalSubagentPrompt/caseFingerprint never sees, silently under-fingerprinting the real prompt", name)
+		}
+	}
+}
+
+// TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt is the
+// task brief's hard equivalence requirement: for each of five tested roles
+// (exceeding the required >=3), dispatch a REAL task through
+// agent.SubagentExecutor.Execute — the same production path the task tool
+// uses — against THIS repo (so tester's real .deepai/agents/tester.yaml
+// project override is exercised, not just the four pure-builtin roles), and
+// assert the harness's resolveEvalSubagentPrompt computes a BYTE-IDENTICAL
+// string to the real subagent's captured system prompt.
+//
+// Both sides are built from the SAME evalToolCandidates(cfg) tool list —
+// the one buildEvalStack actually registers into the eval dispatch registry
+// in production — so SelectSubagentTools (called on both the harness side,
+// inside resolveEvalSubagentPrompt, and the production side, inside
+// Execute) resolves the identical restricted tool set from the identical
+// candidate list. That is what makes this test possible without dispatching
+// a real model: the harness never needs to GUESS at the subagent's tool
+// set, because both sides derive it from the one list buildEvalStack itself
+// uses.
+func TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+
+	cfg := Config{}
+	evalTools := evalToolCandidates(cfg)
+	skillReg := skill.NewRegistry()
+	if warnings := skillReg.LoadAllReported(repoRoot, nil); len(warnings) > 0 {
+		t.Logf("skill load warnings (best-effort, matching buildEvalStack): %v", warnings)
+	}
+
+	for _, agentType := range []string{"architect", "researcher", "analyst", "product-manager", "tester"} {
+		t.Run(agentType, func(t *testing.T) {
+			harnessPrompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg)
+			if err != nil {
+				t.Fatalf("resolveEvalSubagentPrompt: %v", err)
+			}
+
+			registry := tools.NewRegistry()
+			for _, tl := range evalTools {
+				mustRegisterTool(registry, tl)
+			}
+			modelReg := llm.NewSingleModelRegistry("test", "m", "")
+			provider := &captureSystemPromptProvider{}
+			modelReg.InjectProvider("test", "", "", provider)
+			exec := agent.NewSubagentExecutor(modelReg, registry, nil).
+				WithWorkDir(repoRoot).
+				WithSkillRegistry(skillReg)
+
+			if _, err := exec.Execute(context.Background(),
+				&subagent.Task{ID: "t", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: agentType}},
+				func(subagent.TaskEvent) {}); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			realPrompt := provider.firstSystemPrompt()
+			if harnessPrompt != realPrompt {
+				t.Errorf("harness-computed system prompt differs from the REAL dispatched subagent's BuildSystemPrompt() output for agent_type %q:\n\n--- harness (resolveEvalSubagentPrompt) ---\n%s\n\n--- real (SubagentExecutor.Execute -> BuildSystemPrompt) ---\n%s", agentType, harnessPrompt, realPrompt)
+			}
+		})
+	}
+}
+
+// TestCaseFingerprint_ToolRestrictionAppliesToTheAssembledPrompt is the RED
+// test for the M3 defect: on the five roles above, the restricted tool set
+// SelectSubagentTools computes and the full evalTools candidate list answer
+// AssembleSystemPrompt's four gates (hasAnyFileTool/hasSearchTools/
+// hasMultipleParallelSafeTools/hasTodoTool) identically — every one of them
+// has file tools, has grep, has >=2 ParallelSafe tools, and none has
+// todo_write — so a mutant resolveEvalSubagentPrompt that skips
+// SelectSubagentTools entirely and hands AssembleSystemPrompt the
+// UNRESTRICTED evalTools instead produces byte-identical output on that
+// corpus. The equivalence test's strength was riding corpus luck, not an
+// actual assertion that restriction is applied.
+//
+// This manufactures a role whose restricted set genuinely differs: a
+// project override pinning architect to tools: [bash] only (no file tools,
+// no grep) via .deepai/agents/architect.yaml. With restriction correctly
+// applied, hasAnyFileTool is false and the file-operation-rule section must
+// be absent; without it (the mutant), evalToolCandidates' file tools are
+// still in play and the section would still appear.
+func TestCaseFingerprint_ToolRestrictionAppliesToTheAssembledPrompt(t *testing.T) {
+	repoRoot := t.TempDir()
+	agentsDir := filepath.Join(repoRoot, ".deepai", "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	yamlContent := "system_prompt: |\n  x\ntools:\n  - bash\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("write override yaml: %v", err)
+	}
+
+	evalTools := evalToolCandidates(Config{})
+
+	restrictedPrompt, err := resolveEvalSubagentPrompt("architect", repoRoot, evalTools, nil)
+	if err != nil {
+		t.Fatalf("resolveEvalSubagentPrompt: %v", err)
+	}
+	if strings.Contains(restrictedPrompt, "File-operation rule") {
+		t.Errorf("resolveEvalSubagentPrompt included the file-operation-rule section for a role restricted to tools: [bash] — SelectSubagentTools does not appear to have been applied before AssembleSystemPrompt")
+	}
+
+	// The delta the task calls for directly: assembling against the FULL,
+	// unrestricted evalTools (what a mutant skipping SelectSubagentTools
+	// would effectively do) must NOT produce the same bytes as the
+	// correctly restricted prompt above.
+	profileCfg, problems, ok := agent.ResolveAgentTypeConfig(agent.AgentType("architect"), repoRoot, nil)
+	if !ok || len(problems) > 0 {
+		t.Fatalf("resolve architect type: ok=%v problems=%v", ok, problems)
+	}
+	unrestrictedReg := tools.NewRegistry()
+	for _, tl := range evalTools {
+		mustRegisterTool(unrestrictedReg, tl)
+	}
+	unrestrictedPrompt := agent.AssembleSystemPrompt(profileCfg.SystemPrompt, unrestrictedReg, true, nil)
+
+	if restrictedPrompt == unrestrictedPrompt {
+		t.Fatalf("restricted (tools: [bash]) and unrestricted (full evalTools) assembled prompts are byte-identical (%d bytes) — tool restriction has no observable effect on the assembled prompt, which is what this test exists to catch", len(restrictedPrompt))
+	}
+
+	// End to end: the harness's prompt must ALSO match a REAL dispatched
+	// subagent's BuildSystemPrompt() output for this same restricted role —
+	// same shape as TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt
+	// above, but for a role whose restricted set actually differs from the
+	// candidate list.
+	registry := tools.NewRegistry()
+	for _, tl := range evalTools {
+		mustRegisterTool(registry, tl)
+	}
+	modelReg := llm.NewSingleModelRegistry("test", "m", "")
+	provider := &captureSystemPromptProvider{}
+	modelReg.InjectProvider("test", "", "", provider)
+	exec := agent.NewSubagentExecutor(modelReg, registry, nil).WithWorkDir(repoRoot)
+	if _, err := exec.Execute(context.Background(),
+		&subagent.Task{ID: "t", Prompt: "hi", Config: subagent.SubagentConfig{AgentType: "architect"}},
+		func(subagent.TaskEvent) {}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	realPrompt := provider.firstSystemPrompt()
+	if restrictedPrompt != realPrompt {
+		t.Errorf("harness-computed system prompt differs from the REAL dispatched subagent's BuildSystemPrompt() output for a tools:[bash]-restricted architect:\n\n--- harness (resolveEvalSubagentPrompt) ---\n%s\n\n--- real (SubagentExecutor.Execute -> BuildSystemPrompt) ---\n%s", restrictedPrompt, realPrompt)
 	}
 }
 
@@ -733,7 +1194,7 @@ func TestRunEvalCases_MultiCaseMultiRunSerial(t *testing.T) {
 	}}
 
 	repoRoot := t.TempDir()
-	records, err := runEvalCases(context.Background(), pool, repoRoot, nil, cases, evalOptions{Runs: 2}, nil)
+	records, err := runEvalCases(context.Background(), pool, repoRoot, evalToolCandidates(Config{}), nil, cases, evalOptions{Runs: 2}, nil)
 	if err != nil {
 		t.Fatalf("runEvalCases: %v", err)
 	}
@@ -819,7 +1280,7 @@ func TestRunEvalCases_InterruptionPreservesAlreadyWrittenRecords(t *testing.T) {
 
 	completed := 0
 	simulatedInterruption := errString("simulated interruption after 2 completed runs")
-	_, runErr := runEvalCases(context.Background(), pool, repoRoot, nil, cases, evalOptions{Runs: 1}, func(rec runRecord) error {
+	_, runErr := runEvalCases(context.Background(), pool, repoRoot, evalToolCandidates(Config{}), nil, cases, evalOptions{Runs: 1}, func(rec runRecord) error {
 		if err := writer.Write(rec); err != nil {
 			return err
 		}

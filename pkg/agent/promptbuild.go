@@ -8,6 +8,7 @@ import (
 
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
@@ -48,19 +49,100 @@ func recentConversationContext(messages []models.Message) string {
 // message history, or ctx anymore — buildTurnInjection is the new home for
 // everything that did.
 func (a *Agent) BuildSystemPrompt() string {
-	sections := []string{strings.TrimSpace(a.systemPrompt)}
+	sections := assembleSystemPromptSections(a.systemPrompt, a.tools, a.nonInteractive, a.agentCatalog)
+	sections = a.appendPlanModePrompt(sections)
+	return strings.Join(sections, "\n\n")
+}
+
+// AssembleSystemPrompt computes and joins the ordered, session-stable
+// system prompt BuildSystemPrompt assembles: the base role prompt, then
+// each gated section in registration order (file-op rule, search-tool
+// recommendations, batch-tool-calls guidance, todo-tool guidance,
+// delegation) — everything BuildSystemPrompt produces EXCEPT the plan-mode
+// tail (appendPlanModePrompt), which needs live *Agent state (a.planMode,
+// a.planFile) with no meaning outside a running agent, and is
+// unconditionally a no-op for a NonInteractive one anyway: New() only ever
+// registers plan tools and honors AgentConfig.PlanMode when
+// !cfg.NonInteractive, and SubagentExecutor.Execute (subagent.go) never sets
+// AgentConfig.PlanMode at all. So for every subagent, BuildSystemPrompt's
+// output is fully covered by this function alone.
+//
+// Exported, and taking exactly the inputs the gates below read — a base
+// string and a *tools.Registry, not an *Agent — so a caller with no live
+// Agent to construct can compute the IDENTICAL bytes a real dispatched
+// subagent's BuildSystemPrompt() would produce. Its one caller outside this
+// package is the eval harness's resolveEvalSubagentPrompt (pkg/commands/
+// agent_eval.go), which feeds caseFingerprint: caseFingerprint's whole
+// stated purpose is guaranteeing a stale before-run's fingerprint can never
+// vouch for a system prompt it never actually saw, which means it has to
+// hash what actually reaches the model. Hashing only the role's base prompt
+// (the pre-fix bug this function exists to close) silently missed every
+// section below, including this same period's own batchToolCallsPrompt
+// addition — five roles' fingerprints stayed byte-identical while their
+// real system prompt gained ~1KB.
+//
+// The fix is this ONE shared function, called from both BuildSystemPrompt
+// and the eval harness, not a second hand-rolled copy of the gate logic
+// inside pkg/commands: two implementations of "which sections does the
+// model actually see" would drift the next time a gate changes here and
+// nobody remembers to mirror it there — the exact fixture/comment-vs-code
+// drift pattern this codebase has already hit more than once (see the
+// caseFingerprint doc comment in pkg/commands/agent_eval.go for the fuller
+// writeup).
+//
+// Returns the fully joined string ("\n\n"-separated) rather than the
+// section slice: an earlier version of this refactor exported the slice
+// (AssembleSystemPromptSections) and left every caller to know the "\n\n"
+// join rule itself — resolveEvalSubagentPrompt duplicated it
+// (strings.Join(sections, "\n\n")), which is exactly the kind of second
+// derivation of BuildSystemPrompt's assembly rule this whole refactor
+// exists to eliminate (see the doc comment above). Narrowing the exported
+// surface to "a base string and a *tools.Registry in, one string out"
+// removes the join convention from the public contract entirely: nothing
+// outside this file needs to know sections are joined with "\n\n", only
+// that they ARE joined. The section-returning form now stays unexported
+// (assembleSystemPromptSections) since BuildSystemPrompt still needs the
+// slice shape to splice in the plan-mode tail before its own join.
+func AssembleSystemPrompt(base string, toolReg *tools.Registry, nonInteractive bool, agentCatalog []AgentInfo) string {
+	return strings.Join(assembleSystemPromptSections(base, toolReg, nonInteractive, agentCatalog), "\n\n")
+}
+
+// assembleSystemPromptSections is AssembleSystemPrompt's unexported,
+// section-slice-returning core — see that function's doc comment for the
+// full rationale. BuildSystemPrompt calls this directly (not
+// AssembleSystemPrompt) because it still needs the slice shape to append
+// the plan-mode tail (appendPlanModePrompt) before its own final join.
+func assembleSystemPromptSections(base string, toolReg *tools.Registry, nonInteractive bool, agentCatalog []AgentInfo) []string {
+	sections := []string{strings.TrimSpace(base)}
 
 	// T5c: only carry the file-operation routing rule when the agent has ANY of
 	// the dedicated file tools it references — an agent with edit_file but not
 	// read_file still needs "use edit_file, not sed -i". Only a truly file-tool-
 	// less agent (e.g. bash-only) omits the ~400-char rule.
-	if a.hasAnyFileTool() {
-		sections = append(sections, "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools.")
+	if hasAnyFileTool(toolReg) {
+		sections = append(sections, fileOperationRulePrompt)
 	}
 
 	// M2.2+: Smart tool selection guidance for search operations
-	if a.hasSearchTools() {
+	if hasSearchTools(toolReg) {
 		sections = append(sections, builtin.GetToolRecommendations())
+	}
+
+	// M6 latency: the real-world eval (glm-5.3, 45 runs) found per-turn
+	// latency dominated by model generation (46-48s median) while tool
+	// execution itself is millisecond-cheap, and median tool-calls-per-turn
+	// was 1.50, never exceeding 2.00 across 45 runs — the harness
+	// (partitionToolCalls, toolexec.go) already supports an unbounded number
+	// of parallel-safe calls in one assistant message, but nothing in the
+	// system prompt ever told the model that was allowed, let alone why it
+	// matters. Gated on 2+ ParallelSafe tools: with 0 or 1, there is nothing
+	// to batch and the text would be pure noise (mirrors hasAnyFileTool/
+	// hasSearchTools/hasTodoTool above). This is STATIC — whether to batch
+	// never varies turn to turn — so it belongs in the stable system prompt,
+	// never buildTurnInjection (see that function's doc comment on why mixing
+	// stable and volatile content there breaks the M4-2 prefix cache).
+	if hasMultipleParallelSafeTools(toolReg) {
+		sections = append(sections, batchToolCallsPrompt)
 	}
 
 	// M5 todo tool: this guidance is STATIC (when to build/update a plan
@@ -70,7 +152,7 @@ func (a *Agent) BuildSystemPrompt() string {
 	// would break prefix caching). Gated on tool presence like
 	// hasAnyFileTool/hasSearchTools above, so an agent type that never gets
 	// todo_write registered doesn't carry dead instructions.
-	if a.hasTodoTool() {
+	if hasTodoTool(toolReg) {
 		sections = append(sections, todoUsagePrompt)
 	}
 
@@ -81,48 +163,75 @@ func (a *Agent) BuildSystemPrompt() string {
 	// Note: plan mode replaces a.tools (enterPlanMode), removing the task tool,
 	// so this block is naturally skipped — that prevents using sub-agents to
 	// bypass plan-mode file restrictions.
-	if !a.nonInteractive && a.tools.Get("task") != nil && len(a.agentCatalog) > 0 {
-		sections = append(sections, renderDelegationPrompt(a.agentCatalog))
+	if !nonInteractive && toolReg.Get("task") != nil && len(agentCatalog) > 0 {
+		sections = append(sections, renderDelegationPrompt(agentCatalog))
 	}
 
-	sections = a.appendPlanModePrompt(sections)
-	return strings.Join(sections, "\n\n")
+	return sections
 }
 
+// fileOperationRulePrompt is T5c's authoritative file-operation routing
+// rule, gated by hasAnyFileTool. Named as a constant (rather than an inline
+// literal at the assembleSystemPromptSections call site) purely as a
+// structural extraction — its text is unchanged from before this refactor.
+const fileOperationRulePrompt = "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools."
+
 // hasAnyFileTool reports whether any of the dedicated file tools named by the
-// file-operation rule is registered.
-func (a *Agent) hasAnyFileTool() bool {
-	if a == nil || a.tools == nil {
+// file-operation rule is registered in toolReg.
+func hasAnyFileTool(toolReg *tools.Registry) bool {
+	if toolReg == nil {
 		return false
 	}
 	for _, name := range []string{"read_file", "edit_file", "write_file", "list_dir", "find", "grep"} {
-		if a.tools.Get(name) != nil {
+		if toolReg.Get(name) != nil {
 			return true
 		}
 	}
 	return false
 }
 
-// hasSearchTools reports whether search-related tools are registered
-func (a *Agent) hasSearchTools() bool {
-	if a == nil || a.tools == nil {
+// hasSearchTools reports whether search-related tools are registered in toolReg.
+func hasSearchTools(toolReg *tools.Registry) bool {
+	if toolReg == nil {
 		return false
 	}
 	// Check for grep and bash (bash can be used for file searches and git operations)
 	for _, name := range []string{"grep", "bash"} {
-		if a.tools.Get(name) != nil {
+		if toolReg.Get(name) != nil {
 			return true
 		}
 	}
 	return false
 }
 
-// hasTodoTool reports whether the todo_write tool is registered.
-func (a *Agent) hasTodoTool() bool {
-	if a == nil || a.tools == nil {
+// hasTodoTool reports whether the todo_write tool is registered in toolReg.
+func hasTodoTool(toolReg *tools.Registry) bool {
+	if toolReg == nil {
 		return false
 	}
-	return a.tools.Get("todo_write") != nil
+	return toolReg.Get("todo_write") != nil
+}
+
+// hasMultipleParallelSafeTools reports whether at least two of toolReg's
+// currently registered tools (read AFTER any plan-mode restriction, so it
+// reflects the tool set actually in play) declare ParallelSafe.
+// batchToolCallsPrompt only pays for itself when there are at least two such
+// tools to batch together; with 0 or 1 there is nothing to combine and the
+// guidance would just be dead weight in the prompt.
+func hasMultipleParallelSafeTools(toolReg *tools.Registry) bool {
+	if toolReg == nil {
+		return false
+	}
+	n := 0
+	for _, tool := range toolReg.List() {
+		if tool.ParallelSafe {
+			n++
+			if n >= 2 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // todoUsagePrompt is deliberately NOT a mandate ("you must call todo_write
@@ -153,6 +262,69 @@ const todoUsagePrompt = "Task planning: before starting a multi-step task (anyth
 	"When every item is finished, call it once more with every item marked done — do not clear the list to signal " +
 	"completion; a cleared list looks identical to a task that was never planned. Skip it for a quick single-step " +
 	"request."
+
+// batchToolCallsPrompt is the M6-latency guidance teaching the model that
+// independent tool calls can and should be issued together in one assistant
+// message. See hasMultipleParallelSafeTools for the gate; see this file's
+// BuildSystemPrompt call site for why it must stay static (system prompt,
+// not buildTurnInjection).
+//
+// Written for a weak (GLM-class, not Claude) model: it states the permission
+// explicitly rather than assuming the model already knows batching is legal,
+// gives concrete same-shape examples for the merge case (so the model
+// pattern-matches instead of reasoning from a principle), and spells out the
+// dependency case that a weak model most often gets wrong — chaining a
+// read/edit or a grep/read pair into one message before the first call's
+// result is known, which sends the second call with stale or guessed
+// arguments (e.g. an edit_file old_string it never actually confirmed, or a
+// read_file line range it never actually located).
+//
+// Review hardening: the first draft only gave read/grep examples and its
+// sole edit-shaped example was the negative (dependent) case, which a weak
+// model could easily over-read as "never batch edits" — exactly backwards,
+// since partitionToolCalls (toolexec.go) already runs every unsafe call
+// (edit_file, write_file, bash, ...) sequentially within the SAME turn, so
+// batching them costs one round trip instead of several and is safe because
+// each one sees the previous one's effect before it runs. The wording also
+// used to claim the whole batch "will run together, not one at a time",
+// which is only true of the parallel-safe calls; it now says explicitly that
+// reads run concurrently and mutations run in order, so it no longer
+// mispromises concurrency it can't deliver for edits. Finally, it now warns
+// against speculative batching: a model that internalizes "batch when
+// independent" too eagerly can guess a large batch of maybe-relevant reads,
+// trading fewer turns for wasted context — the fix is to say "batch only
+// once you already know what you need" and route the not-sure case through
+// a single grep/glob first (itself a dependent, unbatched call) before
+// batching the reads it turns up.
+//
+// Second review hardening: the "independent mutating calls (edit_file,
+// write_file, bash, ...)" parenthetical classifies tools by a read-only-vs-
+// mutating axis that is NOT the axis the harness actually schedules on
+// (ParallelSafe, see hasMultipleParallelSafeTools). task is
+// ParallelSafe: true (pkg/tools/subagent.go) even though it obviously
+// mutates — a delegated sub-agent edits files and runs git — so by this
+// sentence's own read-only-vs-mutating logic a model would naturally bucket
+// task under "mutating calls ... run one at a time", concluding two batched
+// task calls run serially and the second sees the first's on-disk effect.
+// They do not: react.go's partitionToolCalls fuses consecutive ParallelSafe
+// calls, task included, into one concurrent segment (react.go:845-853).
+// That false belief also collides with this same system prompt's
+// "## Parallel delegation" section, which requires serial task calls when
+// one depends on another's result. Closing the "..." into a fixed list
+// would not fix this: the mismatch is the classification axis itself, not
+// which tools are named, so task must be excepted by name.
+const batchToolCallsPrompt = "Batching independent tool calls: you can put multiple tool calls in a single message " +
+	"instead of one call per message. Independent read-only calls (read_file, grep, ...) run concurrently; " +
+	"independent mutating calls (edit_file, write_file, bash, ...; task is the exception — see Parallel delegation) " +
+	"run one at a time in the order you sent them, so " +
+	"a later one sees an earlier one's effect on disk — either way, the whole batch is one round trip instead of " +
+	"several. Batch whenever you already know what you need: reading several files, grepping for several symbols, " +
+	"editing several different files, or making several known edits to one file you've already read. Do NOT batch " +
+	"when a later call needs an earlier call's result to know what to do — for example: grep to find a line " +
+	"number, then read_file that range; or read_file to see the current text, then edit_file it with an old_string " +
+	"you haven't actually confirmed yet. In that case, send the first call alone, wait for its result, then send " +
+	"the next. And don't batch on a guess: if you're not sure which files are relevant, find them first with one " +
+	"grep or glob, then batch reading exactly those files."
 
 // dateNoteFormat is shared by buildTurnInjection and its tests: the
 // system-note-style date line appended to every turn injection, mirroring
@@ -254,7 +426,7 @@ func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMes
 	var b strings.Builder
 	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))
 
-	if note := formatTodoNote(a.hasTodoTool(), a.todos); note != "" {
+	if note := formatTodoNote(hasTodoTool(a.tools), a.todos); note != "" {
 		b.WriteString("\n\n")
 		b.WriteString(note)
 	}
