@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -543,6 +544,23 @@ type runRecord struct {
 	DurationMS     int64             `json:"duration_ms"`
 	WriteViolation bool              `json:"write_violation"`
 	Error          string            `json:"error,omitempty"`
+	// ToolCalls/LLMTurns/MaxToolCalls/BudgetExhausted are the run's workload
+	// profile, copied from task.Stats (see subagent.RunStats) so a later
+	// tool-call budget can be sized from real distributions instead of
+	// guesswork — this period only collects and summarizes them, see
+	// buildEvalSummary's ToolCallsP50/ToolCallsMax.
+	ToolCalls       int  `json:"tool_calls"`
+	LLMTurns        int  `json:"llm_turns"`
+	MaxToolCalls    int  `json:"max_tool_calls"`
+	BudgetExhausted bool `json:"budget_exhausted"`
+	// HasStats records whether task.Stats was actually available for this
+	// run, distinguishing a genuine zero (a run that made no tool calls)
+	// from "we never got Stats at all" (e.g. a dispatch timeout whose
+	// post-timeout stats poll — see dispatchEvalTask — didn't land in time).
+	// buildEvalSummary uses this, not r.Error, to decide which records feed
+	// the tool-call distribution: unlike duration/tokens, a timed-out run
+	// with recovered stats DOES count there.
+	HasStats bool `json:"has_stats"`
 }
 
 // runEvalCases runs every case × opts.Runs sequentially — cases and runs
@@ -654,6 +672,14 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	if dispatchErr != nil {
 		rec.Error = dispatchErr.Error()
 		rec.Assertions = []assertionResult{{Name: "dispatch", Status: "fail", Detail: dispatchErr.Error()}}
+		// task may still carry Stats here: dispatchEvalTask's post-timeout
+		// poll recovers them when the pool supports it. Error/Assertions
+		// above are unconditional on dispatchErr — a recovered task must
+		// never change what a timeout run "means", only add to what it
+		// tells us about workload.
+		if task != nil {
+			applyRunStats(&rec, task.Stats)
+		}
 		return rec, nil
 	}
 
@@ -661,12 +687,30 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	if task.Usage != nil {
 		rec.Tokens = task.Usage.TotalTokens
 	}
-	if task.Stats != nil {
-		rec.DurationMS = task.Stats.DurationMS
-		rec.Model = task.Stats.Model
-	}
+	applyRunStats(&rec, task.Stats)
 	rec.Assertions = evaluateCase(c.Manifest, task.Result, task.Stats, task.Usage, rec.WriteViolation)
 	return rec, nil
+}
+
+// applyRunStats copies a task's workload profile onto rec and records that
+// real stats were available (rec.HasStats) — the signal buildEvalSummary
+// uses to decide whether a run belongs in the tool-call distribution,
+// because a zero ToolCalls is ambiguous on its own (a genuinely quiet run
+// vs. stats that were never recovered). DurationMS/Model are folded in here
+// too (rather than each call site re-checking stats != nil on its own) since
+// they're gated by the exact same nil check as everything else this
+// function copies.
+func applyRunStats(rec *runRecord, stats *subagent.RunStats) {
+	if stats == nil {
+		return
+	}
+	rec.HasStats = true
+	rec.DurationMS = stats.DurationMS
+	rec.Model = stats.Model
+	rec.ToolCalls = stats.ToolCalls
+	rec.LLMTurns = stats.LLMTurns
+	rec.MaxToolCalls = stats.MaxToolCalls
+	rec.BudgetExhausted = stats.BudgetExhausted
 }
 
 // dispatchEvalTask calls pool.StartTask+Wait, recovering any panic from
@@ -690,9 +734,99 @@ func dispatchEvalTask(ctx context.Context, pool evalTaskPool, c evalCase, contex
 	}
 	completed, waitErr := pool.Wait(ctx, started.ID)
 	if waitErr != nil {
+		// Wait bailed on its own ctx (opts.Timeout in runOneCase), not
+		// because the task reached a terminal state — per Pool.Wait's
+		// contract the task entry is deliberately left in the pool so it
+		// can keep running (Pool.runTask's runCtx derives from the same ctx
+		// StartTask received, so the subagent is already unwinding from
+		// cancellation, just not done unwinding yet). Recover its Stats if
+		// the pool can still give them to us; this is the run.jsonl's
+		// right-tail sample for a tool-call budget, so it's worth a short,
+		// bounded wait rather than losing it outright.
+		if recovered := recoverTimedOutStats(pool, started.ID); recovered != nil {
+			return recovered, waitErr
+		}
 		return completed, waitErr
 	}
 	return completed, nil
+}
+
+// evalTaskPoolStats is an optional capability an evalTaskPool may
+// additionally satisfy, checked via type assertion rather than added to
+// evalTaskPool itself so existing test fakes that only implement
+// StartTask/Wait keep compiling unchanged. *subagent.Pool already exposes
+// GetTask for other callers (task_list, cancel), so it satisfies this for
+// free.
+type evalTaskPoolStats interface {
+	GetTask(id string) (*subagent.Task, bool)
+}
+
+// statsPollInterval/statsPollBudget bound recoverTimedOutStats: a timed-out
+// subagent has already been cancelled and just needs to unwind (write a few
+// struct fields under a mutex in finishTask) before Stats is non-nil, so a
+// couple seconds is generous headroom without risking turning one slow
+// dispatch timeout into a meaningfully slower eval run overall (a full
+// harness invocation runs many cases, each already bounded by opts.Timeout,
+// which is normally minutes).
+//
+// statsPollBudget is a var, not a const, so a test can shrink it (with
+// t.Cleanup restoring the original) to exercise the "pool supports GetTask
+// but Stats never lands" path in milliseconds instead of the full 2s.
+var (
+	statsPollInterval = 20 * time.Millisecond
+	statsPollBudget   = 2 * time.Second
+)
+
+// recoverTimedOutStats polls pool.GetTask(taskID) for up to statsPollBudget,
+// returning the first snapshot whose Stats has landed. Returns nil (no
+// error, nothing logged) if the pool doesn't support GetTask at all, if the
+// task is no longer found (see below), or if Stats still hasn't landed once
+// the budget is spent — either way the caller falls back to the pre-existing
+// behavior of a stats-less timeout record, exactly as it did before this
+// poll existed.
+//
+// !ok (task not found) returns immediately rather than polling out the full
+// budget: StartTask always Stores the entry before this is ever called, so
+// !ok cannot mean "not there yet" — it means some other successful Wait
+// already consumed (deleted) it (Pool.Wait's doc comment), a state that by
+// construction never reverses. Treating it as "keep polling, might still
+// appear" would burn the entire statsPollBudget on every dispatchErr that
+// ISN'T a ctx-timeout race (e.g. Pool.Wait's own "task %q not found" error,
+// pool.go:99) for no possible benefit.
+//
+// Side effect worth flagging for whoever next reads a `no_writes viol` count
+// and wonders why it moved: this poll runs INSIDE dispatchEvalTask, and
+// runOneCase's `after := chat.TakeWorktreeSnapshot(worktree)` happens after
+// dispatchEvalTask returns — so a timed-out run's "after" snapshot is now
+// taken up to statsPollBudget later than it would have been taken before
+// this poll existed, i.e. only once the subagent has actually finished
+// unwinding from cancellation (or the poll budget is exhausted, whichever
+// comes first). Writes the subagent makes DURING that unwind window, which
+// the pre-poll code would never have seen, can now show up as a
+// write_violation on a timed-out run. This is intentional (it makes
+// no_writes strictly more accurate, not less), but it is a real, visible
+// behavior change on timeout runs specifically — if a `no_writes viol` count
+// shifts after this period, look here first, not at the model or the guard
+// logic.
+func recoverTimedOutStats(pool evalTaskPool, taskID string) *subagent.Task {
+	getter, ok := pool.(evalTaskPoolStats)
+	if !ok {
+		return nil
+	}
+	deadline := time.Now().Add(statsPollBudget)
+	for {
+		snap, found := getter.GetTask(taskID)
+		if !found {
+			return nil
+		}
+		if snap.Stats != nil {
+			return snap
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(statsPollInterval)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +1084,24 @@ type roleSummary struct {
 	AvgDurationMS      float64 `json:"avg_duration_ms"`
 	NoWritesViolations int     `json:"no_writes_violations"`
 	DispatchErrors     int     `json:"dispatch_errors"`
+	// ToolCallsP50/ToolCallsMax/BudgetExhaustedRuns profile tool-call
+	// workload, not correctness — collected this period so a later subagent
+	// tool-call budget can be sized from a real distribution instead of a
+	// guess. Denominator note: unlike every field above (dispatched runs
+	// only, see the doc comment on buildEvalSummary), these three are
+	// computed over every record with r.HasStats — including a dispatch
+	// timeout whose stats were recovered — because a timeout is the
+	// right-tail sample a budget most needs to see, not noise to exclude.
+	//
+	// StatsRuns is that denominator, made explicit: len(recs with
+	// r.HasStats). Without it, a reader of summary.md sees
+	// "dispatched=0, budget exhausted=3" and cannot tell whether that's 3/3
+	// or 3/30 — DispatchedRuns is the wrong denominator for these three
+	// fields (see above), so it has to be reported separately.
+	StatsRuns           int     `json:"stats_runs"`
+	ToolCallsP50        float64 `json:"tool_calls_p50"`
+	ToolCallsMax        int     `json:"tool_calls_max"`
+	BudgetExhaustedRuns int     `json:"budget_exhausted_runs"`
 }
 
 type evalSummary struct {
@@ -974,6 +1126,19 @@ type evalSummary struct {
 // this is the fix for the bug the M5-3 harness-changeover brief called out
 // against the real 2026-09-06-glm-5.3 baseline (analyst's true dispatched-only
 // mean duration is 152,923ms; the old code reported 135,931ms — 12.5% low).
+//
+// ToolCallsP50/ToolCallsMax/BudgetExhaustedRuns are the one deliberate
+// exception to "a dispatch-errored record contributes nothing but
+// DispatchErrors" above: they are computed over every record with
+// r.HasStats, timeouts included. duration_ms/tokens exclude a timeout
+// because it has no real duration/token figure to average in (it never
+// finished, so 0 would just be wrong) — but a timeout that DID recover
+// tool-call stats (see dispatchEvalTask's post-timeout GetTask poll) has a
+// perfectly real tool_calls count, and it's the run that most needs to be in
+// this particular distribution: a subagent that got cut off mid-work after
+// running the tool-call counter way up is exactly the right-tail sample a
+// tool-call budget is being collected to size against. Excluding it here
+// would hide the one case the whole feature exists to catch.
 func buildEvalSummary(model string, runs int, timeout string, records []runRecord) evalSummary {
 	byRole := map[string][]runRecord{}
 	var order []string
@@ -998,8 +1163,20 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		var notMentionsPass, notMentionsFail int
 		var guardFail int
 		var tokensSum, durationSum float64
+		var toolCallsSamples []int
+		var budgetExhaustedRuns int
 		for _, r := range recs {
 			caseSet[r.Case] = true
+			// Collected unconditionally on r.HasStats, ahead of the
+			// dispatch-error continue below — see the function doc for why
+			// the tool-call distribution deliberately does NOT exclude a
+			// timeout the way duration/tokens/assertions do.
+			if r.HasStats {
+				toolCallsSamples = append(toolCallsSamples, r.ToolCalls)
+				if r.BudgetExhausted {
+					budgetExhaustedRuns++
+				}
+			}
 			if r.Error != "" {
 				rs.DispatchErrors++
 				continue // see the function doc: a timeout contributes nothing else
@@ -1053,6 +1230,12 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			rs.AvgTokens = tokensSum / float64(rs.DispatchedRuns)
 			rs.AvgDurationMS = durationSum / float64(rs.DispatchedRuns)
 		}
+		rs.StatsRuns = len(toolCallsSamples)
+		rs.ToolCallsP50 = medianInt(toolCallsSamples)
+		if len(toolCallsSamples) > 0 {
+			rs.ToolCallsMax = slices.Max(toolCallsSamples)
+		}
+		rs.BudgetExhaustedRuns = budgetExhaustedRuns
 		roles = append(roles, rs)
 	}
 
@@ -1070,6 +1253,25 @@ func ratio(n, d int) float64 {
 		return 0
 	}
 	return float64(n) / float64(d)
+}
+
+// medianInt returns the p50 of vals (the standard even-count average of the
+// two middle values — a budget-sizing read wants "half the runs are at or
+// below this many calls", which the interpolated median gives directly,
+// unlike picking one of the two middle samples arbitrarily). 0 on an empty
+// input (no run in this role had recoverable stats) rather than a panic or
+// NaN, since a bare 0 reads correctly here: "no data yet", not "0 calls".
+func medianInt(vals []int) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := append([]int(nil), vals...)
+	sort.Ints(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return float64(sorted[mid])
+	}
+	return float64(sorted[mid-1]+sorted[mid]) / 2
 }
 
 // prepareEvalResultDir resolves and creates
@@ -1158,14 +1360,23 @@ func renderEvalSummaryMD(s evalSummary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# deepai eval agents — %s\n\n", s.GeneratedAt)
 	fmt.Fprintf(&b, "Model: `%s`  \nRuns per case: %d  \nTimeout: `%s`\n\n", s.Model, s.Runs, s.Timeout)
-	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | assert pass | assert fail | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | no_writes viol | guard viol | dispatch err |\n")
-	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	// tool_calls p50/max and budget exhausted are the columns a later
+	// tool-call budget gets sized from — see roleSummary's doc comment for
+	// why their population (every run with recovered stats) differs from
+	// every other column here (dispatched runs only). "stats runs" is their
+	// denominator (len(recs with r.HasStats)), reported explicitly so
+	// "budget exhausted" can be read as a proportion instead of a bare count
+	// against the wrong (dispatched-only) denominator.
+	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | assert pass | assert fail | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | stats runs | tool_calls p50 | tool_calls max | budget exhausted | no_writes viol | guard viol | dispatch err |\n")
+	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range s.Roles {
-		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %d | %d |\n",
+		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %.1f | %d | %d | %d | %d | %d |\n",
 			r.AgentType, r.Fingerprint, r.Cases, r.DispatchedRuns,
 			r.AssertionPassRate*100, r.AssertionFailRate*100,
 			r.MentionsHitRate*100, r.NotMentionsViolationRate*100,
-			r.AvgTokens, r.AvgDurationMS, r.NoWritesViolations, r.GuardViolations, r.DispatchErrors)
+			r.AvgTokens, r.AvgDurationMS,
+			r.StatsRuns, r.ToolCallsP50, r.ToolCallsMax, r.BudgetExhaustedRuns,
+			r.NoWritesViolations, r.GuardViolations, r.DispatchErrors)
 	}
 	return b.String()
 }

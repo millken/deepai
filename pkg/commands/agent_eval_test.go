@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/subagent"
@@ -64,6 +66,52 @@ func (f *fakePool) Wait(ctx context.Context, taskID string) (*subagent.Task, err
 		return nil, f.waitErr
 	}
 	return f.newTask(taskID), nil
+}
+
+// fakeStatsPool wraps fakePool with a GetTask that becomes available only
+// after a configurable delay — simulating the real Pool.Wait/GetTask split:
+// Wait can bail on ctx while the task itself keeps running in the
+// background and only later finishes and populates Stats (Pool.runTask's
+// defer close(task.done) plus finishTask). Used to exercise
+// dispatchEvalTask's short bounded poll for recovering a timed-out run's
+// workload stats.
+type fakeStatsPool struct {
+	fakePool
+	availableAfter time.Duration
+	stats          *subagent.RunStats
+
+	mu    sync.Mutex
+	start time.Time
+}
+
+func (f *fakeStatsPool) GetTask(id string) (*subagent.Task, bool) {
+	f.mu.Lock()
+	if f.start.IsZero() {
+		f.start = time.Now()
+	}
+	elapsed := time.Since(f.start)
+	f.mu.Unlock()
+
+	if elapsed < f.availableAfter {
+		return &subagent.Task{ID: id, Status: subagent.TaskStatusRunning}, true
+	}
+	return &subagent.Task{ID: id, Status: subagent.TaskStatusTimedOut, Stats: f.stats}, true
+}
+
+// fakeNotFoundStatsPool's GetTask always reports the task missing — the
+// state a real Pool.GetTask is in once some OTHER successful Wait has
+// already consumed (deleted) the entry (see Pool.Wait's doc comment: "a
+// later Wait or GetTask for the same taskID returns not-found"). Since
+// StartTask always Stores the entry before dispatchEvalTask can ever reach
+// recoverTimedOutStats, and a deleted entry never reappears, !ok here can
+// never flip to ok no matter how long recoverTimedOutStats waits — so it
+// must return immediately instead of burning the full statsPollBudget.
+type fakeNotFoundStatsPool struct {
+	fakePool
+}
+
+func (f *fakeNotFoundStatsPool) GetTask(id string) (*subagent.Task, bool) {
+	return nil, false
 }
 
 func mustGetwd(t *testing.T) string {
@@ -337,6 +385,192 @@ func TestRunOneCase_ChdirRestoredOnDispatchError(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// ---------------------------------------------------------------------------
+// Workload stats (tool_calls/llm_turns/budget_exhausted/max_tool_calls):
+// A. a normal completed run must persist them from task.Stats.
+// B. a run whose Wait bails on ctx (dispatch timeout) must still recover
+//    them from a short bounded GetTask poll when the pool supports it, and
+//    must degrade to the pre-existing zero-value behavior (no hang, no
+//    error) when it doesn't.
+// ---------------------------------------------------------------------------
+
+func TestRunOneCase_RecordsToolCallWorkloadStats(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "stats-case",
+		"id: stats-case\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	pool := &fakePool{task: fakeTaskResult{
+		Status: subagent.TaskStatusCompleted,
+		Result: "done",
+		Stats: &subagent.RunStats{
+			ToolCalls:       7,
+			LLMTurns:        4,
+			MaxToolCalls:    20,
+			BudgetExhausted: true,
+			DurationMS:      1234,
+			Model:           "glm-5.3",
+		},
+	}}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if !rec.HasStats {
+		t.Error("HasStats = false, want true (stats were available from task.Stats)")
+	}
+	if rec.ToolCalls != 7 {
+		t.Errorf("ToolCalls = %d, want 7", rec.ToolCalls)
+	}
+	if rec.LLMTurns != 4 {
+		t.Errorf("LLMTurns = %d, want 4", rec.LLMTurns)
+	}
+	if rec.MaxToolCalls != 20 {
+		t.Errorf("MaxToolCalls = %d, want 20", rec.MaxToolCalls)
+	}
+	if !rec.BudgetExhausted {
+		t.Error("BudgetExhausted = false, want true")
+	}
+}
+
+// TestRunOneCase_ToSummary_HasStatsWiresToolCallDistribution is the end-to-end
+// test the review demanded: runOneCase's real output fed directly into
+// buildEvalSummary, so a producer/consumer seam (rec.HasStats set by
+// applyRunStats, read by buildEvalSummary) that every other test in this file
+// exercises only from hand-built runRecord{HasStats: true} literals is
+// actually connected at least once. Deleting `rec.HasStats = true` from
+// applyRunStats must turn this test red (verified manually — see the fix
+// report) even though every summary-only test with hand-set HasStats stays
+// green.
+func TestRunOneCase_ToSummary_HasStatsWiresToolCallDistribution(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "stats-case",
+		"id: stats-case\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	pool := &fakePool{task: fakeTaskResult{
+		Status: subagent.TaskStatusCompleted,
+		Result: "done",
+		Stats: &subagent.RunStats{
+			ToolCalls:       7,
+			LLMTurns:        4,
+			MaxToolCalls:    20,
+			BudgetExhausted: true,
+			DurationMS:      1234,
+			Model:           "glm-5.3",
+		},
+	}}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+
+	s := buildEvalSummary("glm-5.3", 1, "5m", []runRecord{rec})
+	if len(s.Roles) != 1 {
+		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
+	}
+	r := s.Roles[0]
+	if r.ToolCallsP50 != 7 {
+		t.Errorf("ToolCallsP50 = %v, want 7 (a real runOneCase record must feed the tool-call distribution)", r.ToolCallsP50)
+	}
+	if r.ToolCallsMax != 7 {
+		t.Errorf("ToolCallsMax = %d, want 7", r.ToolCallsMax)
+	}
+	if r.BudgetExhaustedRuns != 1 {
+		t.Errorf("BudgetExhaustedRuns = %d, want 1", r.BudgetExhaustedRuns)
+	}
+}
+
+func TestDispatchEvalTask_RecoversToolCallStatsAfterTimeout(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "timeout-case",
+		"id: timeout-case\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	pool := &fakeStatsPool{
+		fakePool:       fakePool{waitErr: context.DeadlineExceeded},
+		availableAfter: 40 * time.Millisecond,
+		stats: &subagent.RunStats{
+			ToolCalls: 12,
+			LLMTurns:  5,
+		},
+	}
+
+	started := time.Now()
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("runOneCase took %v, want well under the 2s poll budget", elapsed)
+	}
+	if rec.Error == "" {
+		t.Error("expected rec.Error to still be set for a dispatch timeout")
+	}
+	assertStatus(t, rec.Assertions, "dispatch", "fail")
+	if rec.ToolCalls != 12 {
+		t.Errorf("ToolCalls = %d, want 12 (recovered via the short post-timeout GetTask poll)", rec.ToolCalls)
+	}
+	if rec.LLMTurns != 5 {
+		t.Errorf("LLMTurns = %d, want 5", rec.LLMTurns)
+	}
+}
+
+func TestDispatchEvalTask_TimeoutDegradesGracefullyWithoutGetTask(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "timeout-nogettask",
+		"id: timeout-nogettask\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	// Plain fakePool has no GetTask method at all, exercising the pool that
+	// doesn't satisfy evalTaskPoolStats (mirrors any evalTaskPool test fake
+	// that never grew the capability).
+	pool := &fakePool{waitErr: context.DeadlineExceeded}
+
+	started := time.Now()
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("runOneCase took %v, want near-instant when the pool can't provide GetTask", elapsed)
+	}
+	if rec.Error == "" {
+		t.Error("expected rec.Error to be set for a dispatch timeout")
+	}
+	if rec.ToolCalls != 0 || rec.LLMTurns != 0 || rec.MaxToolCalls != 0 || rec.BudgetExhausted {
+		t.Errorf("expected zero-value workload stats when no stats could be recovered, got %+v", rec)
+	}
+}
+
+// TestRecoverTimedOutStats_TaskNotFoundReturnsImmediately covers the case
+// the review flagged: GetTask reporting !ok must not poll out the full
+// statsPollBudget, because a deleted pool entry never comes back. The var
+// (not const) statsPollBudget/statsPollInterval from item 5 lets this run
+// with a shrunk budget so a regression back to "poll for the full budget"
+// fails fast instead of needing a real 2s timeout to notice.
+func TestRecoverTimedOutStats_TaskNotFoundReturnsImmediately(t *testing.T) {
+	origInterval, origBudget := statsPollInterval, statsPollBudget
+	statsPollInterval = time.Millisecond
+	statsPollBudget = 2 * time.Second // deliberately left "real-sized": the assertion below is what proves we don't wait it out
+	t.Cleanup(func() {
+		statsPollInterval = origInterval
+		statsPollBudget = origBudget
+	})
+
+	pool := &fakeNotFoundStatsPool{}
+	started := time.Now()
+	got := recoverTimedOutStats(pool, "missing-task")
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("recoverTimedOutStats took %v, want near-instant when GetTask reports the task not found (it can never reappear)", elapsed)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil", got)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Fingerprint
@@ -948,5 +1182,181 @@ func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *t
 	wantRate := 11.0 / 12.0
 	if diff := r.AssertionPassRate - wantRate; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("AssertionPassRate = %v, want %v (must exclude the errored run's synthetic dispatch assertion)", r.AssertionPassRate, wantRate)
+	}
+}
+
+// TestBuildEvalSummary_ToolCallsMaxPicksMaxFromTheMiddle guards against the
+// review-flagged gap: every pre-existing ToolCallsMax fixture in this file
+// happens to put the largest value LAST ([2,4,20], [9,15]), so a mutated
+// maxInt body that unconditionally does `max = v` (dropping the `if v >
+// max` guard entirely) would still pass every one of them — the last
+// iteration's assignment happens to equal the true max by coincidence of
+// fixture ordering, not because the comparison ran. This fixture puts the
+// max in the middle ([2, 20, 4]) so that mutation is caught.
+func TestBuildEvalSummary_ToolCallsMaxPicksMaxFromTheMiddle(t *testing.T) {
+	records := []runRecord{
+		{Case: "c1", AgentType: "widget", Fingerprint: "fp1", HasStats: true, ToolCalls: 2},
+		{Case: "c2", AgentType: "widget", Fingerprint: "fp1", HasStats: true, ToolCalls: 20},
+		{Case: "c3", AgentType: "widget", Fingerprint: "fp1", HasStats: true, ToolCalls: 4},
+	}
+	s := buildEvalSummary("glm-5.3", 3, "5m", records)
+	r := s.Roles[0]
+	if r.ToolCallsMax != 20 {
+		t.Errorf("ToolCallsMax = %d, want 20 (the middle sample, not the last)", r.ToolCallsMax)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Summary: tool-call distribution (p50/max) and budget_exhausted count.
+//
+// Unlike duration_ms/tokens (which the existing convention excludes for a
+// dispatch-errored record — see buildEvalSummary's doc comment), tool_calls
+// stats are drawn from every record that HAS them (rec.HasStats), including
+// a dispatch-timeout record recovered via the post-timeout GetTask poll.
+// That is the whole point of this feature: a timeout is exactly the
+// right-tail sample a tool-call budget most needs to see.
+// ---------------------------------------------------------------------------
+
+func TestBuildEvalSummary_ToolCallsP50MaxAndBudgetExhaustedAcrossDispatchedAndTimeoutRuns(t *testing.T) {
+	records := []runRecord{
+		{Case: "c1", AgentType: "widget", Fingerprint: "fp1", HasStats: true, ToolCalls: 2},
+		{Case: "c2", AgentType: "widget", Fingerprint: "fp1", HasStats: true, ToolCalls: 4},
+		{
+			// A dispatch timeout whose stats were nonetheless recovered: it
+			// must count toward the tool_calls distribution even though it
+			// contributes 0 to DispatchedRuns/AvgDurationMS/AvgTokens.
+			Case: "c3", AgentType: "widget", Fingerprint: "fp1",
+			Error:           "context deadline exceeded",
+			Assertions:      []assertionResult{{Name: "dispatch", Status: "fail"}},
+			HasStats:        true,
+			ToolCalls:       20,
+			BudgetExhausted: true,
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 3, "5m", records)
+	if len(s.Roles) != 1 {
+		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
+	}
+	r := s.Roles[0]
+	if r.StatsRuns != 3 {
+		t.Errorf("StatsRuns = %d, want 3 (the denominator for p50/max/budget_exhausted: every record with HasStats)", r.StatsRuns)
+	}
+	if r.ToolCallsMax != 20 {
+		t.Errorf("ToolCallsMax = %d, want 20 (the recovered timeout run's count)", r.ToolCallsMax)
+	}
+	if r.ToolCallsP50 != 4 {
+		t.Errorf("ToolCallsP50 = %v, want 4 (median of [2,4,20])", r.ToolCallsP50)
+	}
+	if r.BudgetExhaustedRuns != 1 {
+		t.Errorf("BudgetExhaustedRuns = %d, want 1", r.BudgetExhaustedRuns)
+	}
+	// Sanity: the timeout record still must not leak into the
+	// dispatched-only aggregates.
+	if r.DispatchedRuns != 2 {
+		t.Errorf("DispatchedRuns = %d, want 2", r.DispatchedRuns)
+	}
+}
+
+func TestBuildEvalSummary_ToolCallsFromTimeoutRunsOnly(t *testing.T) {
+	records := []runRecord{
+		{
+			Case: "c1", AgentType: "widget", Fingerprint: "fp1",
+			Error: "context deadline exceeded", Assertions: []assertionResult{{Name: "dispatch", Status: "fail"}},
+			HasStats: true, ToolCalls: 9,
+		},
+		{
+			Case: "c2", AgentType: "widget", Fingerprint: "fp1",
+			Error: "context deadline exceeded", Assertions: []assertionResult{{Name: "dispatch", Status: "fail"}},
+			HasStats: true, ToolCalls: 15,
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 2, "5m", records)
+	r := s.Roles[0]
+	if r.DispatchedRuns != 0 {
+		t.Errorf("DispatchedRuns = %d, want 0 (every run in this fixture timed out)", r.DispatchedRuns)
+	}
+	if r.ToolCallsMax != 15 {
+		t.Errorf("ToolCallsMax = %d, want 15", r.ToolCallsMax)
+	}
+	if r.ToolCallsP50 != 12 {
+		t.Errorf("ToolCallsP50 = %v, want 12 (median of [9,15])", r.ToolCallsP50)
+	}
+}
+
+func TestBuildEvalSummary_ToolCallsAllMissingStatsIsZeroNotPanic(t *testing.T) {
+	records := []runRecord{
+		{Case: "c1", AgentType: "widget", Fingerprint: "fp1"},
+		{
+			Case: "c2", AgentType: "widget", Fingerprint: "fp1",
+			Error: "boom", Assertions: []assertionResult{{Name: "dispatch", Status: "fail"}},
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 2, "5m", records)
+	r := s.Roles[0]
+	if r.StatsRuns != 0 {
+		t.Errorf("StatsRuns = %d, want 0", r.StatsRuns)
+	}
+	if r.ToolCallsMax != 0 {
+		t.Errorf("ToolCallsMax = %d, want 0", r.ToolCallsMax)
+	}
+	if r.ToolCallsP50 != 0 {
+		t.Errorf("ToolCallsP50 = %v, want 0", r.ToolCallsP50)
+	}
+	if r.BudgetExhaustedRuns != 0 {
+		t.Errorf("BudgetExhaustedRuns = %d, want 0", r.BudgetExhaustedRuns)
+	}
+}
+
+func TestRenderEvalSummaryMD_IncludesToolCallBudgetColumns(t *testing.T) {
+	s := evalSummary{
+		GeneratedAt: "2026-09-07T00:00:00Z",
+		Model:       "glm-5.3",
+		Runs:        3,
+		Timeout:     "5m",
+		Roles: []roleSummary{
+			{
+				AgentType:           "analyst",
+				Fingerprint:         "deadbeef",
+				Cases:               2,
+				DispatchedRuns:      5,
+				StatsRuns:           7,
+				ToolCallsP50:        4.5,
+				ToolCallsMax:        20,
+				BudgetExhaustedRuns: 2,
+			},
+		},
+	}
+	md := renderEvalSummaryMD(s)
+	if !strings.Contains(md, "tool_calls p50") {
+		t.Errorf("summary.md missing a tool_calls p50 column/header:\n%s", md)
+	}
+	if !strings.Contains(md, "tool_calls max") {
+		t.Errorf("summary.md missing a tool_calls max column/header:\n%s", md)
+	}
+	if !strings.Contains(md, "budget exhausted") {
+		t.Errorf("summary.md missing a budget exhausted column/header:\n%s", md)
+	}
+	if !strings.Contains(md, "stats runs") {
+		t.Errorf("summary.md missing a stats runs column/header (the denominator for tool_calls/budget_exhausted):\n%s", md)
+	}
+	if !strings.Contains(md, "4.5") {
+		t.Errorf("summary.md does not render ToolCallsP50=4.5:\n%s", md)
+	}
+	if !strings.Contains(md, "20") {
+		t.Errorf("summary.md does not render ToolCallsMax=20:\n%s", md)
+	}
+	// StatsRuns=7 must actually be the rendered cell value, not merely
+	// present somewhere by coincidence (Cases=2, DispatchedRuns=5, etc. are
+	// all small ints too) — assert the exact row.
+	if !strings.Contains(md, "| analyst | deadbeef | 2 | 5 | ") {
+		t.Fatalf("summary.md row prefix unexpected:\n%s", md)
+	}
+	rowStart := strings.Index(md, "| analyst | deadbeef | 2 | 5 | ")
+	row := md[rowStart:]
+	if idx := strings.Index(row, "\n"); idx >= 0 {
+		row = row[:idx]
+	}
+	if !strings.Contains(row, "| 7 | 4.5 | 20 | 2 |") {
+		t.Errorf("summary.md row does not render stats_runs=7 immediately before tool_calls p50/max/budget_exhausted:\n%s", row)
 	}
 }
