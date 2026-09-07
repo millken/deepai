@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -134,7 +135,7 @@ func TestEditedFilesNilCarry(t *testing.T) {
 // the review gate.
 func TestAppendRemainingRecordsEditedFiles(t *testing.T) {
 	a := &Agent{session: NewSessionCarry()}
-	batch := newToolBatchState(a, "sess", 1, newToolCallBreaker(), &Usage{}, func(AgentEvent) {}, nil)
+	batch := newToolBatchState(context.Background(), a, "sess", 1, newToolCallBreaker(), &Usage{}, func(AgentEvent) {}, nil)
 
 	calls := []models.ToolCall{
 		editToolCall("write_file", "path", "/tmp/tail.go"),

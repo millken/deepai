@@ -52,6 +52,31 @@ func TestRegisterChatTools_RegistersDocxTools(t *testing.T) {
 	}
 }
 
+// TestRegisterChatTools_RegistersTodoWrite is the RED test for M5's todo/plan
+// tool: it must reach the main interactive agent via the SAME registration
+// path as every other builtin tool (registerChatTools), rather than only
+// existing in some role's DefaultTools list — the main REPL agent never
+// declares an AgentType (see pkg/agent/types_config.go's ApplyAgentType:
+// DefaultTools only restricts an agent that DECLARED a type), so DefaultTools
+// entries are invisible to it. Also pins ParallelSafe == false: it mutates
+// the agent's shared todo-list state and must not run in a parallel batch.
+func TestRegisterChatTools_RegistersTodoWrite(t *testing.T) {
+	registry := tools.NewRegistry()
+	modelRegistry := llm.NewSingleModelRegistry("test", "test-model", "")
+	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil)
+
+	todoWrite := registry.Get("todo_write")
+	if todoWrite == nil {
+		t.Fatal("registry.Get(todo_write) = nil, want the tool registered by registerChatTools")
+	}
+	if todoWrite.Handler == nil {
+		t.Error("todo_write registered with a nil Handler")
+	}
+	if todoWrite.ParallelSafe {
+		t.Error("todo_write.ParallelSafe = true, want false: it mutates shared agent state")
+	}
+}
+
 // TestSubagentMaxTokens_UsesSharedConstant pins that the subagent wiring
 // reads its MaxTokens from agent.ResolveMaxOutputTokens rather than a
 // literal of its own. This is the anti-drift guard the P2c5 brief asks for:

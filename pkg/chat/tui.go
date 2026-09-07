@@ -1376,7 +1376,9 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	if te.DurationMS > 0 {
 		detail = fmt.Sprintf(" (%.1fs)", float64(te.DurationMS)/1000)
 	}
-	// For file edits, show a colored +/- diff instead of an opaque preview.
+	// For file edits (and, since M5, todo_write), show a colored rendering
+	// instead of an opaque preview — renderToolDiff dispatches by tool name
+	// and returns "" for anything else, falling through to ResultPreview.
 	diff := ""
 	if !useErr {
 		var data map[string]any

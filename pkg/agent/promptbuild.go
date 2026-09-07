@@ -63,6 +63,17 @@ func (a *Agent) BuildSystemPrompt() string {
 		sections = append(sections, builtin.GetToolRecommendations())
 	}
 
+	// M5 todo tool: this guidance is STATIC (when to build/update a plan
+	// never changes turn to turn), unlike the todo LIST itself (which
+	// changes every todo_write call and therefore lives in buildTurnInjection
+	// instead — see formatTodoNote's doc comment for why mixing the two up
+	// would break prefix caching). Gated on tool presence like
+	// hasAnyFileTool/hasSearchTools above, so an agent type that never gets
+	// todo_write registered doesn't carry dead instructions.
+	if a.hasTodoTool() {
+		sections = append(sections, todoUsagePrompt)
+	}
+
 	// Team awareness: when the agent can spawn sub-agents (has the task tool),
 	// inject delegation guidance so it knows when to delegate vs do itself.
 	// Skipped for non-interactive agents (sub-agents) to avoid recursion, and
@@ -106,11 +117,102 @@ func (a *Agent) hasSearchTools() bool {
 	return false
 }
 
+// hasTodoTool reports whether the todo_write tool is registered.
+func (a *Agent) hasTodoTool() bool {
+	if a == nil || a.tools == nil {
+		return false
+	}
+	return a.tools.Get("todo_write") != nil
+}
+
+// todoUsagePrompt is deliberately NOT a mandate ("you must call todo_write
+// before any tool use") — the M5 todo-tool design explicitly rejects
+// enforcing that (no gate blocking other tools until a plan exists). It only
+// tells the model WHEN a plan is worth writing and that every call replaces
+// the whole list, leaving the judgment call itself to the model.
+//
+// Review hardening (weak-model, e.g. GLM-class): the original wording left
+// three things for the model to guess at, and a weak model reliably guessed
+// wrong —
+//   - the FIRST call's status: the in_progress rule only appeared in the
+//     "after finishing each step" sentence, so a weak model tended to write
+//     everything "pending" and never mark anything in_progress until the
+//     first step was already done;
+//   - granularity: no guidance invited either a single mega-item or a
+//     30-item list that then gets resent whole on every single write;
+//   - completion: nothing said what to do with a finished plan, so a model
+//     would sometimes pass an empty list on its last step to mean "done" —
+//     indistinguishable from "never planned at all" once rendered (an empty
+//     list and a cleared list both format to ""), losing the completion
+//     record for no reason.
+const todoUsagePrompt = "Task planning: before starting a multi-step task (anything that will take several tool calls " +
+	"to finish), call todo_write with your full plan — mark the FIRST item in_progress and every other item pending. " +
+	"Aim for roughly 3-7 items: too few loses the benefit of writing a plan down at all, too many is expensive to " +
+	"resend in full on every single update. After finishing each step, call it again with the FULL list — never just " +
+	"the changed item — moving that step to done and, if there's a next one, marking exactly ONE item in_progress. " +
+	"When every item is finished, call it once more with every item marked done — do not clear the list to signal " +
+	"completion; a cleared list looks identical to a task that was never planned. Skip it for a quick single-step " +
+	"request."
+
 // dateNoteFormat is shared by buildTurnInjection and its tests: the
 // system-note-style date line appended to every turn injection, mirroring
 // the "[System note: ...]" framing pkg/memory/prompt.go already uses for its
 // own memory-context wrapper (see buildInjectionWithIDs).
 const dateNoteFormat = "[System note: Today's date is %s.]"
+
+// todoNoteHeader introduces the rendered task list inside the turn
+// injection. Framed as a "[System note: ...]" the same way dateNoteFormat
+// and pkg/memory/prompt.go's memory wrapper are, so the model recognizes it
+// as the same family of injected, non-conversational context.
+//
+// Review hardening: this header re-asserts the plan on EVERY single request
+// (unlike todoUsagePrompt, which the model only reads once, in the system
+// prompt) — it is the single strongest anti-drift lever this feature has,
+// but originally only said HOW to change the list, never WHEN. The added
+// reconciliation sentence turns it from a passive status display into an
+// actual drift-catching mechanism: if the model's current action doesn't
+// match the item marked in_progress, this is the prompt that should make it
+// notice and fix the list before doing anything else.
+const todoNoteHeader = "[System note: Current task list (call todo_write with the FULL list to change it). " +
+	"If what you are doing right now doesn't match the item marked [~] in_progress, update the list with " +
+	"todo_write before continuing:]"
+
+// formatTodoNote renders the agent's current todo list (see
+// pkg/tools/builtin/todo.go's TodoItem/RenderTodoList) for the turn
+// injection. This is the load-bearing design decision of the M5 todo tool:
+// the list is a full-table replace on every todo_write call, so its bytes
+// change on every single write — baking it into BuildSystemPrompt (position
+// 0 of every request) would invalidate the OpenAI-compat automatic
+// prefix-cache (DeepSeek/Qwen/GLM: any byte change at position N invalidates
+// the cache from N on) on every plan update, undoing exactly what M4-2
+// fought to stabilize. Riding the trailing, once-per-Run-rebuilt turn
+// injection instead (like date/memory) keeps the prefix — system prompt +
+// tool schemas + full message history — byte-stable, while still surfacing
+// the CURRENT list on every subsequent request, including after compaction
+// has dropped the original todo_write tool_result out of the visible
+// history window. Returns "" when there is no list yet (nothing to show —
+// same as the pre-todo-tool baseline, and also what a cleared plan, i.e. an
+// explicit empty todo_write call, looks like), and ALSO when hasTodoTool is
+// false: plan mode (plan.go's enterPlanMode) swaps a.tools for a fixed
+// read-only allowlist that never includes todo_write, but does NOT clear
+// a.todos — a plan written before plan mode was entered (or carried across a
+// Run boundary via SessionCarry, primed at New()) would otherwise keep
+// asserting a list the model has no legal way to update or clear (the tool
+// isn't callable, so the "call todo_write with the FULL list to change it"
+// instruction in todoNoteHeader can't be followed) — directly contradicting
+// TestPlanMode_ExcludesTodoWrite's intent that plan mode excludes this
+// feature entirely, not just its static usage guidance in the system
+// prompt.
+func formatTodoNote(hasTodoTool bool, todos []builtin.TodoItem) string {
+	if !hasTodoTool || len(todos) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(todoNoteHeader)
+	b.WriteString("\n")
+	b.WriteString(builtin.RenderTodoList(todos))
+	return b.String()
+}
 
 // buildTurnInjection assembles the per-Run volatile-content injection: the
 // current date plus (when a memory service is configured) the user- and
@@ -151,6 +253,11 @@ const dateNoteFormat = "[System note: Today's date is %s.]"
 func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMessages []models.Message) models.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))
+
+	if note := formatTodoNote(a.hasTodoTool(), a.todos); note != "" {
+		b.WriteString("\n\n")
+		b.WriteString(note)
+	}
 
 	if a.memoryService != nil {
 		activeSource := ""

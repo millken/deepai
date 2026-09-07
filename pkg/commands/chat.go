@@ -388,6 +388,24 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	for _, tool := range builtin.DocxTools() {
 		mustRegisterTool(registry, tool)
 	}
+	// todo_write reaches the main interactive agent through this registry,
+	// not through any AgentTypeConfig.DefaultTools entry: the main REPL
+	// agent never declares an AgentType (see pkg/chat/repl.go's
+	// agent.AgentConfig literal), so ApplyAgentType's DefaultTools
+	// restriction — which only applies to a DECLARED type — never even
+	// consults it for this agent. DefaultTools is the subagent-restriction
+	// mechanism instead (pkg/agent/subagent.go): a role with an explicit
+	// `tools:` selector that omits todo_write does not get it, but this is
+	// NOT a blanket guarantee that every subagent is denied the tool — a
+	// project/plugin agent .md with no `tools:` frontmatter at all maps to a
+	// nil selector (mapClaudeTools("") in agentmd.go), which
+	// selectSubagentTools reads as "no restriction", handing that subagent
+	// every registered tool, todo_write included. This is harmless in
+	// practice (M5 design): a subagent has no SessionCarry, so a todo_write
+	// call there only affects that one already-one-shot Run's own turn
+	// injection and is never carried anywhere or aggregated into the
+	// parent's view.
+	mustRegisterTool(registry, builtin.TodoWriteTool())
 	return subPool
 }
 

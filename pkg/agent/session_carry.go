@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/millken/deepai/pkg/models"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 // SessionCarry holds Agent state that must survive across the REPL's
@@ -37,6 +38,15 @@ type SessionCarry struct {
 	// skill catalog re-shown and the loaded skill forgotten.
 	activeSkill string
 	skillPrompt string
+
+	// todos carries the M5 todo_write task list across Runs, exactly like
+	// activeSkill/skillPrompt above: without this, a plan written in turn N
+	// (a full-table replace — see pkg/tools/builtin/todo.go) would vanish
+	// from the trailing turn injection in turn N+1's fresh, single-use
+	// Agent. Mirrored from Agent.todos whenever a "todo_write" tool result
+	// is processed (react.go, alongside the "skill" case) and read back by
+	// New() at the start of the next Run sharing this carry.
+	todos []builtin.TodoItem
 
 	// lastInputTokens/lastTokenCountMsgs mirror Agent's own token-count
 	// anchor (see estimateContextTokens's doc comment) across Runs.

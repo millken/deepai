@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 const maxDiffLines = 16
@@ -35,8 +36,76 @@ func (m *tuiModel) renderToolDiff(name string, args, data map[string]any) string
 			ops = append(ops, diffOp{'+', l})
 		}
 		return m.diffBlock(path, ops, startLine)
+	case "todo_write":
+		// Unlike edit_file/write_file, todo_write's result is never "" here:
+		// an opaque ResultPreview (raw JSON of the todos slice) would be
+		// exactly the unreadable rendering this tool was supposed to avoid,
+		// so even an empty list gets a real (if terse) message instead of
+		// falling through to toolEndLine's generic preview path.
+		return m.renderTodoList(data)
 	}
 	return ""
+}
+
+// renderTodoList renders the todo_write result's Data["todos"] as a
+// checklist with the three statuses visually distinguished — the TUI
+// analogue of pkg/tools/builtin/todo.go's RenderTodoList, which renders the
+// same list as plain text for the model's own transcript.
+func (m *tuiModel) renderTodoList(data map[string]any) string {
+	todos := todosFromResultData(data)
+	if len(todos) == 0 {
+		return "      " + m.styles.Dim.Render("(plan cleared — no todos)")
+	}
+	var b strings.Builder
+	for i, t := range todos {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		marker := builtin.TodoMarker(t.Status)
+		line := fmt.Sprintf("%s %s", marker, t.Content)
+		b.WriteString("      ")
+		switch t.Status {
+		case builtin.TodoDone:
+			b.WriteString(m.styles.DiffAdd.Render(line))
+		case builtin.TodoInProgress:
+			b.WriteString(m.styles.Highlight.Render(line))
+		default:
+			b.WriteString(m.styles.Dim.Render(line))
+		}
+	}
+	return b.String()
+}
+
+// todosFromResultData reads Data["todos"] as a []builtin.TodoItem. The
+// direct type assertion is the normal case: the TUI's AgentEvent arrives
+// in-process (cloneToolResult in pkg/agent/toolexec.go does a shallow map
+// copy, not a JSON round-trip), so the concrete Go type TodoWriteHandler
+// constructed survives all the way here. The []any fallback additionally
+// covers any path that DOES serialize the event to JSON first (a
+// hypothetical remote/gateway consumer of the same rendering code), where a
+// decoded array becomes []any of map[string]any instead.
+func todosFromResultData(data map[string]any) []builtin.TodoItem {
+	if data == nil {
+		return nil
+	}
+	switch v := data["todos"].(type) {
+	case []builtin.TodoItem:
+		return v
+	case []any:
+		out := make([]builtin.TodoItem, 0, len(v))
+		for _, raw := range v {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, _ := m["content"].(string)
+			status, _ := m["status"].(string)
+			out = append(out, builtin.TodoItem{Content: content, Status: status})
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func dataInt(data map[string]any, key string) int {

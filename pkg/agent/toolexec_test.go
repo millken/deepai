@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/millken/deepai/pkg/models"
@@ -13,7 +14,7 @@ import (
 // calls flushPendingHints) would duplicate every hint message in
 // runMessages.
 func TestFlushPendingHints_Idempotent(t *testing.T) {
-	b := newToolBatchState(&Agent{}, "sess", 0, nil, &Usage{}, func(AgentEvent) {}, nil)
+	b := newToolBatchState(context.Background(), &Agent{}, "sess", 0, nil, &Usage{}, func(AgentEvent) {}, nil)
 	b.pendingHints = []models.Message{
 		{ID: "hint_1", SessionID: "sess", Role: models.RoleHuman, Content: "hint"},
 	}

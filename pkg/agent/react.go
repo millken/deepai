@@ -19,6 +19,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/tools"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 // defaultStreamIdleTimeout bounds the max silence BETWEEN chunks of a single
@@ -140,6 +141,21 @@ type Agent struct {
 
 	// Skill tracking for memory source tagging
 	activeSkill atomic.Value // stores string
+
+	// todos is the agent's current task list, written wholesale by the
+	// todo_write tool (full-table replace — see pkg/tools/builtin/todo.go).
+	// It rides the trailing turn injection (buildTurnInjection in
+	// promptbuild.go), NEVER the system prompt: the list's bytes change on
+	// every todo_write call, and the system prompt is the stable prefix
+	// M4-2 made byte-identical across a whole session for OpenAI-compat
+	// providers' automatic prefix caching (DeepSeek/Qwen/GLM). Set from the
+	// carried session at construction time (see New(), mirroring
+	// lastInputTokens/compactionStalled — unlike activeSkill it has no
+	// systemPrompt-append ordering constraint, so it doesn't need to wait
+	// for Run()) and mirrored back onto a.session.todos whenever a
+	// "todo_write" tool result is processed (see the tool-result handling
+	// below, alongside the "skill" case).
+	todos []builtin.TodoItem
 
 	// appliedSkillPrompt is the exact skill-body string last appended to
 	// a.systemPrompt via AppendSystemPrompt (set alongside every such
@@ -269,6 +285,12 @@ func New(cfg AgentConfig) *Agent {
 		a.lastTokenCountMsgs = cfg.Session.lastTokenCountMsgs
 		a.compactionStalled = cfg.Session.compactionStalled
 		a.compactionStalledAt = cfg.Session.compactionStalledAt
+		// Unlike activeSkill/skillPrompt (primed in Run(), below), todos
+		// carries with no ordering constraint on the caller's post-New()
+		// AppendSystemPrompt calls — it never touches the system prompt at
+		// all — so it can be primed here, at construction time, before the
+		// first buildTurnInjection call in Run() ever runs.
+		a.todos = cfg.Session.todos
 	}
 
 	// Register plan mode tools (agent self-references via closures). Skipped for
@@ -945,7 +967,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// the serial path below — run through the shared helper, in
 			// batch order, so both paths enforce identical limits and
 			// invariants from one implementation. See toolBatchState.
-			batch := newToolBatchState(a, sessionID, turn, breaker, usage, emit, runMessages)
+			batch := newToolBatchState(ctx, a, sessionID, turn, breaker, usage, emit, runMessages)
 			for i, call := range toolCalls {
 				obs := batch.handleResult(call, results[i], runningCalls[i])
 				if obs.fatalErr != nil {
@@ -982,7 +1004,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 		// Per-result bookkeeping mirrors the parallel path above — see
 		// toolBatchState.
-		batch := newToolBatchState(a, sessionID, turn, breaker, usage, emit, runMessages)
+		batch := newToolBatchState(ctx, a, sessionID, turn, breaker, usage, emit, runMessages)
 		for idx, call := range toolCalls {
 			emit(AgentEvent{
 				Type:      AgentEventToolCall,
@@ -1010,43 +1032,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				result = a.runOneTool(dispatchCtx, sessionID, call)
 			}
 
-			// If a skill was loaded, inject its body into the system prompt
-			// so it doesn't need to be repeated in every turn's history.
-			if result.ToolName == "skill" {
-				skillName, _ := result.Data["skill_name"].(string)
-				loadedSkillPrompt, _ := result.Data["system_prompt"].(string)
-
-				// Dedup: skip re-applying the exact same skill body that's
-				// already in the system prompt (compared by exact equality
-				// against appliedSkillPrompt, not substring — a substring check
-				// can false-positive on short bodies that happen to appear in
-				// other assembled prompt sections).
-				bodyAlreadyApplied := loadedSkillPrompt != "" && skillName != "" && skillName == a.ActiveSkill() &&
-					loadedSkillPrompt == a.appliedSkillPrompt
-				if loadedSkillPrompt != "" && !bodyAlreadyApplied {
-					a.removeSkillDescriptions()
-					a.AppendSystemPrompt(loadedSkillPrompt)
-					a.appliedSkillPrompt = loadedSkillPrompt
-				}
-				if skillName != "" {
-					// Only recompute the turn injection when the active skill
-					// actually changes (not on a same-skill reload).
-					activeSourceChanged := skillName != a.ActiveSkill()
-					a.activeSkill.Store(skillName)
-					// Carry the loaded skill onto the session so the next
-					// Run's fresh Agent starts with it active.
-					if a.session != nil {
-						a.session.activeSkill = skillName
-						if loadedSkillPrompt != "" {
-							a.session.skillPrompt = loadedSkillPrompt
-						}
-					}
-					if activeSourceChanged {
-						a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
-					}
-				}
-			}
-
+			// A "skill" or "todo_write" result's cross-request side effects
+			// (system prompt / turn injection updates) are applied inside
+			// batch.handleResult below, not here — see its doc comment for
+			// why that single call site covers both this serial path and
+			// the parallel path's observation loop.
 			obs := batch.handleResult(call, result, runningCall)
 			if obs.fatalErr != nil {
 				// Invariant that matters here: every tool_use ID on the

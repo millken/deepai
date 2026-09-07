@@ -12,6 +12,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
+	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
 // addSubagentUsage rolls a completed subagent's token consumption into the
@@ -281,7 +282,9 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 // folding them into this struct would cost the simpler path the complexity
 // of the other for no shared benefit.
 type toolBatchState struct {
-	a         *Agent
+	a   *Agent
+	ctx context.Context
+
 	sessionID string
 	turn      int
 	breaker   *toolCallBreaker
@@ -311,10 +314,15 @@ type toolBatchState struct {
 
 // newToolBatchState starts a new batch's bookkeeping, seeded with the
 // canonical runMessages as of the top of this batch (a.k.a. Run's local
-// runMessages variable at the point the batch begins).
-func newToolBatchState(a *Agent, sessionID string, turn int, breaker *toolCallBreaker, usage *Usage, emit func(AgentEvent), runMessages []models.Message) *toolBatchState {
+// runMessages variable at the point the batch begins). ctx is Run's own
+// context (NOT the per-call dispatchCtx) — it is only ever used to rebuild
+// a.turnInjection (buildTurnInjection takes a ctx to thread into the memory
+// service), which must happen on the Run goroutine regardless of which
+// per-call ctx a tool itself executed under.
+func newToolBatchState(ctx context.Context, a *Agent, sessionID string, turn int, breaker *toolCallBreaker, usage *Usage, emit func(AgentEvent), runMessages []models.Message) *toolBatchState {
 	return &toolBatchState{
 		a:           a,
+		ctx:         ctx,
 		sessionID:   sessionID,
 		turn:        turn,
 		breaker:     breaker,
@@ -342,6 +350,33 @@ func newToolBatchState(a *Agent, sessionID string, turn int, breaker *toolCallBr
 // two shapes at this layer would cost the cheaper path the complexity of the
 // more expensive one for no benefit.
 func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolResult, runningCall models.ToolCall) breakerObservation {
+	// "skill" and "todo_write" mutate Agent-level state (active skill /
+	// system prompt, the todo list) that must survive to the model's NEXT
+	// request in this Run and, when a session is carried, to the NEXT Run
+	// too. This MUST live here rather than in either dispatch path
+	// individually: hasParallelRun (react.go) is decided for the WHOLE
+	// batch, and partitionToolCalls only carves a ParallelSafe=false call
+	// like todo_write into its own SERIAL SEGMENT inside that batch — it
+	// does not route the call through the serial dispatch path at all when
+	// any other segment of the same batch is parallel. Before this fix, the
+	// parallel dispatch path never even looked at result.ToolName, so a
+	// todo_write (or skill) call sharing a batch with 2+ consecutive
+	// parallel-safe calls (e.g. "mark step 2 done, then read these 3
+	// files") had its result silently discarded: a.todos was never updated,
+	// the write vanished with no error, and — worse, if a plan already
+	// existed — the turn injection kept asserting the STALE plan on every
+	// subsequent request. handleResult is the one place both the parallel
+	// observation loop and the serial loop feed every (call, result) pair
+	// through, in batch order, on the Run goroutine, so applying the side
+	// effect here fixes both dispatch paths from one call site instead of
+	// duplicating (and re-diverging) the logic in each.
+	switch result.ToolName {
+	case "skill":
+		b.a.applySkillResult(b.ctx, b.sessionID, result, b.runMessages)
+	case "todo_write":
+		b.a.applyTodoResult(b.ctx, b.sessionID, result, b.runMessages)
+	}
+
 	addSubagentUsage(b.usage, result)
 	offloaded := b.a.offloadIfNeeded(&result, b.a.offloadDir)
 	b.runMessages = appendToolResultMessage(b.runMessages, b.sessionID, result)
@@ -396,6 +431,75 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		b.batchClean = false
 	}
 	return obs
+}
+
+// applySkillResult applies a completed "skill" tool call's cross-request
+// side effects: fold the loaded skill's body into the system prompt (dedup'd
+// against the same skill already applied) and, if the active skill actually
+// changed, rebuild a.turnInjection immediately so the memory fence
+// (activeSource = "skill:"+name) applies starting with the very next
+// request. See handleResult's doc comment for why this is called from
+// there instead of being duplicated across the two dispatch paths.
+func (a *Agent) applySkillResult(ctx context.Context, sessionID string, result models.ToolResult, runMessages []models.Message) {
+	skillName, _ := result.Data["skill_name"].(string)
+	loadedSkillPrompt, _ := result.Data["system_prompt"].(string)
+
+	// Dedup: skip re-applying the exact same skill body that's already in
+	// the system prompt (compared by exact equality against
+	// appliedSkillPrompt, not substring — a substring check can
+	// false-positive on short bodies that happen to appear in other
+	// assembled prompt sections).
+	bodyAlreadyApplied := loadedSkillPrompt != "" && skillName != "" && skillName == a.ActiveSkill() &&
+		loadedSkillPrompt == a.appliedSkillPrompt
+	if loadedSkillPrompt != "" && !bodyAlreadyApplied {
+		a.removeSkillDescriptions()
+		a.AppendSystemPrompt(loadedSkillPrompt)
+		a.appliedSkillPrompt = loadedSkillPrompt
+	}
+	if skillName == "" {
+		return
+	}
+	// Only recompute the turn injection when the active skill actually
+	// changes (not on a same-skill reload).
+	activeSourceChanged := skillName != a.ActiveSkill()
+	a.activeSkill.Store(skillName)
+	// Carry the loaded skill onto the session so the next Run's fresh
+	// Agent starts with it active.
+	if a.session != nil {
+		a.session.activeSkill = skillName
+		if loadedSkillPrompt != "" {
+			a.session.skillPrompt = loadedSkillPrompt
+		}
+	}
+	if activeSourceChanged {
+		a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
+	}
+}
+
+// applyTodoResult applies a completed "todo_write" tool call's cross-request
+// side effect: todo_write is a full-table replace (see
+// pkg/tools/builtin/todo.go), so every SUCCESSFUL call fully replaces
+// a.todos — unlike applySkillResult above there is no "did anything actually
+// change" gate to check, because there is no cheaper no-op case to skip.
+// result.Data["todos"] is only present on success (TodoWriteHandler returns
+// no Data on a validation error, e.g. two in_progress items), so a rejected
+// call leaves a.todos — and the injection — exactly as they were. See
+// handleResult's doc comment for why this is called from there instead of
+// being duplicated across the two dispatch paths.
+func (a *Agent) applyTodoResult(ctx context.Context, sessionID string, result models.ToolResult, runMessages []models.Message) {
+	todos, ok := result.Data["todos"].([]builtin.TodoItem)
+	if !ok {
+		return
+	}
+	a.todos = todos
+	if a.session != nil {
+		a.session.todos = todos
+	}
+	// Rebuild NOW so the model sees the plan it just wrote on the very next
+	// request in THIS Run — otherwise it would only become visible at the
+	// next Run (next REPL turn), defeating the point of writing it down
+	// mid-task.
+	a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
 }
 
 // appendRemaining appends already-computed results for the rest of a fatal
