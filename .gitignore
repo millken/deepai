@@ -3,7 +3,12 @@ bin/
 bodies/
 *.so
 *.log
-deepai
+# Root-anchored: an ad-hoc `go build ./cmd/deepai` drops the binary here.
+# A bare `deepai` would also match the cmd/deepai/ SOURCE directory at any
+# depth, which silently swallowed every new file added under it — git add
+# refused them, git status hid them, and the tests still passed locally.
+# (`make` builds to bin/, already ignored on line 1.)
+/deepai
 deepai-debug.log
 .deepai/plans/
 .superpowers/
