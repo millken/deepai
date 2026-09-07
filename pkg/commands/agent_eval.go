@@ -411,6 +411,9 @@ func loadEvalCases(casesDir, filter string) ([]evalCase, error) {
 			if len(m.Expect) == 0 {
 				return nil, fmt.Errorf("manifest %s: expect must have at least one assertion", manifestPath)
 			}
+			if err := validateManifestExpect(m, manifestPath); err != nil {
+				return nil, err
+			}
 			if !matchesEvalFilter(m, filter) {
 				continue
 			}
@@ -445,6 +448,97 @@ func matchesEvalFilter(m caseManifest, filter string) bool {
 		}
 	}
 	return false
+}
+
+// knownExpectKeys is every expect key evaluateCase's switch actually
+// understands. validateManifestExpect uses it to reject a manifest that
+// misspells one (e.g. file_content, files_change) at load time — before
+// materialization, before a real model is ever dispatched against it —
+// rather than letting the misspelled key fall through evaluateCase's old
+// key-less switch as zero assertions and no warning.
+var knownExpectKeys = map[string]bool{
+	"mentions":          true,
+	"not_mentions":      true,
+	"tool_calls_max":    true,
+	"no_writes":         true,
+	"tokens_max":        true,
+	"files_changed":     true,
+	"file_contains":     true,
+	"file_not_contains": true,
+}
+
+// validateManifestExpect rejects, at load time, the manifest shapes that
+// would otherwise reach evaluateCase as a silent no-op or an always-true
+// assertion — see this file's package doc comment on the M6 "no assertion
+// can be un-failable" requirement:
+//
+//   - an expect entry with anything other than exactly one key (0: nothing
+//     to check; >1: singleKV would silently pick one and drop the rest —
+//     Go map iteration order is undefined, so which one is not even stable)
+//   - an unrecognized key (a manifest typo)
+//   - mentions/not_mentions/files_changed whose value isn't a list of
+//     non-blank strings
+//   - tool_calls_max/tokens_max whose value isn't an integer
+//   - no_writes whose value isn't a bool
+//   - file_contains/file_not_contains whose value isn't a list of
+//     {path, text} mappings, or whose path/text is blank (a blank text
+//     makes strings.Contains(x, "") — an assertion that can never fail)
+func validateManifestExpect(m caseManifest, manifestPath string) error {
+	for i, exp := range m.Expect {
+		if len(exp) != 1 {
+			return fmt.Errorf("manifest %s: expect[%d]: must have exactly one key, got %d", manifestPath, i, len(exp))
+		}
+		key, val, ok := singleKV(exp)
+		if !ok {
+			return fmt.Errorf("manifest %s: expect[%d]: must have exactly one key", manifestPath, i)
+		}
+		if !knownExpectKeys[key] {
+			return fmt.Errorf("manifest %s: expect[%d]: unrecognized expect key %q", manifestPath, i, key)
+		}
+		switch key {
+		case "mentions", "not_mentions", "files_changed":
+			items, ok := val.([]any)
+			if !ok {
+				return fmt.Errorf("manifest %s: expect[%d]: %q must be a list of strings", manifestPath, i, key)
+			}
+			for j, it := range items {
+				s, ok := it.(string)
+				if !ok || strings.TrimSpace(s) == "" {
+					return fmt.Errorf("manifest %s: expect[%d].%s[%d]: must be a non-empty string", manifestPath, i, key, j)
+				}
+			}
+		case "tool_calls_max", "tokens_max":
+			switch val.(type) {
+			case int, int64, float64:
+			default:
+				return fmt.Errorf("manifest %s: expect[%d]: %q must be an integer", manifestPath, i, key)
+			}
+		case "no_writes":
+			if _, ok := val.(bool); !ok {
+				return fmt.Errorf("manifest %s: expect[%d]: no_writes must be a bool", manifestPath, i)
+			}
+		case "file_contains", "file_not_contains":
+			items, ok := val.([]any)
+			if !ok {
+				return fmt.Errorf("manifest %s: expect[%d]: %q must be a list of {path, text} entries, got %T", manifestPath, i, key, val)
+			}
+			for j, it := range items {
+				fm, ok := it.(map[string]any)
+				if !ok {
+					return fmt.Errorf("manifest %s: expect[%d].%s[%d]: must be a {path, text} mapping, got %T", manifestPath, i, key, j, it)
+				}
+				path, _ := fm["path"].(string)
+				text, _ := fm["text"].(string)
+				if strings.TrimSpace(path) == "" {
+					return fmt.Errorf("manifest %s: expect[%d].%s[%d]: path must not be empty", manifestPath, i, key, j)
+				}
+				if text == "" {
+					return fmt.Errorf("manifest %s: expect[%d].%s[%d] (path=%s): text must not be empty", manifestPath, i, key, j, path)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +695,18 @@ type runRecord struct {
 	Tokens         int               `json:"tokens"`
 	DurationMS     int64             `json:"duration_ms"`
 	WriteViolation bool              `json:"write_violation"`
-	Error          string            `json:"error,omitempty"`
+	// NoWritesDeclared records whether THIS case's manifest actually
+	// declares `no_writes: true` — see manifestDeclaresNoWrites. It is what
+	// lets buildEvalSummary tell "a case that must not write, wrote anyway"
+	// (a real guard violation) apart from "a case whose whole job IS to
+	// write files, and did" (WriteViolation is unconditionally set from
+	// len(changed) > 0 in runOneCase, for every case, batch-editing corpora
+	// included — see WriteViolation's own doc comment on this struct's
+	// history vs. this field). Without this flag, NoWritesViolations would
+	// count every successful edit a writing case makes as a guard breach —
+	// exactly the M6 coder-corpus defect this field exists to fix.
+	NoWritesDeclared bool   `json:"no_writes_declared"`
+	Error            string `json:"error,omitempty"`
 	// ToolCalls/LLMTurns/MaxToolCalls/BudgetExhausted are the run's workload
 	// profile, copied from task.Stats (see subagent.RunStats) so a later
 	// tool-call budget can be sized from real distributions instead of
@@ -721,11 +826,12 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	restore()
 
 	rec := runRecord{
-		Case:           c.ID,
-		AgentType:      c.Manifest.AgentType,
-		Run:            run,
-		Fingerprint:    fingerprint,
-		WriteViolation: len(changed) > 0,
+		Case:             c.ID,
+		AgentType:        c.Manifest.AgentType,
+		Run:              run,
+		Fingerprint:      fingerprint,
+		WriteViolation:   len(changed) > 0,
+		NoWritesDeclared: manifestDeclaresNoWrites(c.Manifest),
 	}
 	if dispatchErr != nil {
 		rec.Error = dispatchErr.Error()
@@ -746,7 +852,7 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 		rec.Tokens = task.Usage.TotalTokens
 	}
 	applyRunStats(&rec, task.Stats)
-	rec.Assertions = evaluateCase(c.Manifest, task.Result, task.Stats, task.Usage, rec.WriteViolation)
+	rec.Assertions = evaluateCase(c.Manifest, task.Result, task.Stats, task.Usage, rec.WriteViolation, changed, worktree)
 	return rec, nil
 }
 
@@ -891,12 +997,56 @@ func recoverTimedOutStats(pool evalTaskPool, taskID string) *subagent.Task {
 // Assertions
 // ---------------------------------------------------------------------------
 
-func evaluateCase(m caseManifest, output string, stats *subagent.RunStats, usage *subagent.TokenUsage, writeViolation bool) []assertionResult {
+// manifestDeclaresNoWrites reports whether m's `expect` list contains a
+// `no_writes: true` entry. This is the ONLY thing that should gate
+// buildEvalSummary's NoWritesViolations counter: WriteViolation itself
+// (runOneCase, from the worktree snapshot diff) is set unconditionally for
+// EVERY case, including a batch-editing corpus (coder/*) whose whole task
+// is to write files. Folding an unconditional WriteViolation into a
+// "violations" counter would score a perfect, on-task edit as a guard
+// breach — see this file's package doc comment and NoWritesDeclared's doc
+// comment on runRecord for the M6 defect this exists to fix.
+func manifestDeclaresNoWrites(m caseManifest) bool {
+	for _, exp := range m.Expect {
+		key, val, ok := singleKV(exp)
+		if !ok || key != "no_writes" {
+			continue
+		}
+		want, _ := val.(bool)
+		if want {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluateCase scores one dispatched run against its manifest's `expect`
+// list. changed/worktree feed the "did the edit actually land" family
+// (files_changed/file_contains/file_not_contains, added this period so a
+// batch-editing corpus can assert on file CONTENT, not just text output —
+// see this file's package doc comment): changed is runOneCase's
+// chat.WorktreeSnapshot.ChangedSince(before) result, an ABSOLUTE path list
+// (root-joined, see pkg/chat/review.go's changedSince), and worktree is the
+// same root those paths were joined against, so this function can both
+// convert changed into worktree-relative paths comparable to a manifest's
+// repo-relative file lists, and open worktree-relative paths itself to
+// check file content. Every existing case (no_writes only, no
+// files_changed/file_contains/file_not_contains in its manifest) is
+// unaffected: changed/worktree are simply unused for it, exactly as before
+// this signature grew them.
+func evaluateCase(m caseManifest, output string, stats *subagent.RunStats, usage *subagent.TokenUsage, writeViolation bool, changed []string, worktree string) []assertionResult {
 	var results []assertionResult
 
 	for _, exp := range m.Expect {
 		key, val, ok := singleKV(exp)
 		if !ok {
+			// A manifest expect entry with zero keys (or, since singleKV
+			// picks an arbitrary key out of Go's undefined map iteration
+			// order, more than one) is a malformed manifest, not a no-op —
+			// see parseFileTextExpectations' doc comment on why this
+			// family refuses to let a bad manifest shape score as "nothing
+			// to check here".
+			results = append(results, assertionResult{Name: "expect:malformed", Status: "fail", Detail: fmt.Sprintf("expect entry must have exactly one key, got %v", exp)})
 			continue
 		}
 		switch key {
@@ -943,9 +1093,209 @@ func evaluateCase(m caseManifest, output string, stats *subagent.RunStats, usage
 				Status: statusFor(actual <= max),
 				Detail: fmt.Sprintf("actual=%d", actual),
 			})
+		case "files_changed":
+			results = append(results, evaluateFilesChanged(toStringSlice(val), changed, worktree))
+		case "file_contains":
+			items, problems := parseFileTextExpectations(val)
+			for _, p := range problems {
+				results = append(results, assertionResult{Name: "file_contains:malformed", Status: "fail", Detail: p})
+			}
+			for _, fe := range items {
+				results = append(results, evaluateFileContains(fe, worktree, true))
+			}
+		case "file_not_contains":
+			items, problems := parseFileTextExpectations(val)
+			for _, p := range problems {
+				results = append(results, assertionResult{Name: "file_not_contains:malformed", Status: "fail", Detail: p})
+			}
+			for _, fe := range items {
+				results = append(results, evaluateFileContains(fe, worktree, false))
+			}
+		default:
+			// An unrecognized expect key (a typo like file_content or
+			// files_change) used to silently produce zero assertions —
+			// exactly the "quietest possible failure" this assertion
+			// family exists to rule out. loadEvalCases rejects this at
+			// manifest-load time for the real corpus (validateManifestExpect);
+			// this default case is the same guarantee for any manifest that
+			// reaches evaluateCase without going through loadEvalCases.
+			results = append(results, assertionResult{Name: "expect:unknown_key:" + key, Status: "fail", Detail: fmt.Sprintf("unrecognized expect key %q", key)})
 		}
 	}
 	return results
+}
+
+// evaluateFilesChanged is the `files_changed` assertion: the set of files
+// actually touched (changed, converted to worktree-relative paths) must be
+// EXACTLY the manifest's declared set — not "at least", not "a subset".
+// Exact-set matching (rather than "every declared path was among the
+// changed ones") is deliberate: a case whose task names 3 files and gets an
+// unrelated 4th file edited alongside them ("fixed something else while I
+// was in there") is exactly the kind of scope creep this assertion exists to
+// catch, and "contains" would let it through silently.
+func evaluateFilesChanged(want []string, changed []string, worktree string) assertionResult {
+	actual := relativeChangedPaths(changed, worktree)
+	wantSet := map[string]bool{}
+	for _, w := range want {
+		wantSet[filepath.ToSlash(w)] = true
+	}
+	actualSet := map[string]bool{}
+	for _, a := range actual {
+		actualSet[a] = true
+	}
+	var missing, extra []string
+	for w := range wantSet {
+		if !actualSet[w] {
+			missing = append(missing, w)
+		}
+	}
+	for a := range actualSet {
+		if !wantSet[a] {
+			extra = append(extra, a)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	pass := len(missing) == 0 && len(extra) == 0
+	res := assertionResult{Name: "files_changed", Status: statusFor(pass)}
+	if !pass {
+		sortedActual := append([]string(nil), actual...)
+		sort.Strings(sortedActual)
+		res.Detail = fmt.Sprintf("missing=%v extra=%v actual=%v", missing, extra, sortedActual)
+	}
+	return res
+}
+
+// relativeChangedPaths converts changed (absolute paths, joined against
+// chat.WorktreeSnapshot's OWN idea of the worktree root — gitToplevel's
+// `git rev-parse --show-toplevel`, see pkg/chat/review.go's changedSince)
+// into worktree-relative, forward-slash-normalized paths comparable to a
+// manifest's repo-relative file lists (the same convention context_files
+// already uses).
+//
+// worktree here is runOneCase's os.MkdirTemp(...) result — the path BEFORE
+// materializeFixture's `git init` resolves it. On macOS (and anywhere
+// os.TempDir() is itself a symlink, e.g. /tmp -> /private/tmp) those two
+// strings differ only in a resolved-symlink prefix, so a plain
+// filepath.Rel(worktree, p) fails (p isn't under the literal, unresolved
+// worktree string) and would silently produce garbage ("../../../..."
+// relative paths) rather than a clean case-relative one. The fallback
+// retries filepath.Rel against filepath.EvalSymlinks(worktree) — the same
+// resolution git itself already applied to produce p's prefix — before
+// giving up and leaving the absolute path as-is (still usable in a failure
+// detail, just not case-relative).
+func relativeChangedPaths(changed []string, worktree string) []string {
+	var resolvedWorktree string
+	out := make([]string, 0, len(changed))
+	for _, p := range changed {
+		rel := p
+		switch {
+		case worktree == "":
+			// no-op: rel stays the absolute path.
+		default:
+			if r, err := filepath.Rel(worktree, p); err == nil && !strings.HasPrefix(r, ".."+string(filepath.Separator)) && r != ".." {
+				rel = r
+				break
+			}
+			if resolvedWorktree == "" {
+				if r, err := filepath.EvalSymlinks(worktree); err == nil {
+					resolvedWorktree = r
+				} else {
+					resolvedWorktree = worktree
+				}
+			}
+			if r, err := filepath.Rel(resolvedWorktree, p); err == nil && !strings.HasPrefix(r, ".."+string(filepath.Separator)) && r != ".." {
+				rel = r
+			}
+		}
+		out = append(out, filepath.ToSlash(rel))
+	}
+	return out
+}
+
+// fileTextExpectation is one `file_contains`/`file_not_contains` list entry:
+// {path, text}, both required to mean anything — parseFileTextExpectations
+// below refuses to build one with either blank, precisely because a blank
+// text makes strings.Contains(x, "") an assertion that can never fail
+// (always "pass"), and a blank path makes the read a no-op. Neither may
+// reach evaluateFileContains silently: see parseFileTextExpectations' doc
+// comment for where the fail this problem deserves is added instead.
+type fileTextExpectation struct {
+	Path string
+	Text string
+}
+
+// parseFileTextExpectations decodes one `file_contains`/`file_not_contains`
+// manifest value into the {path,text} entries to actually check, and a
+// separate `problems` list describing every entry the manifest got wrong —
+// v not a list at all (a manifest author wrote a map instead of a list),
+// a list item that isn't a {path,text} mapping, or a mapping with a blank
+// path/text.
+//
+// The split return (rather than silently skipping bad entries, which is
+// what this function used to do under the name toFileTextExpectations) is
+// the fix for the M6 defect where three shapes of malformed manifest —
+// blank text (an assertion that can never fail), file_contains written as
+// a map instead of a list, and an unrecognized expect key entirely — were
+// all silently accepted as "0 assertions, no warning" instead of the loud
+// failure this whole assertion family exists to guarantee (see
+// roleSummary.FileEditAssertionFailures' doc comment: "failure is never
+// invisible"). evaluateCase turns each problem into its own "...:malformed"
+// fail assertionResult rather than dropping it.
+func parseFileTextExpectations(v any) (valid []fileTextExpectation, problems []string) {
+	items, ok := v.([]any)
+	if !ok {
+		return nil, []string{fmt.Sprintf("expected a list of {path, text} entries, got %T", v)}
+	}
+	for i, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			problems = append(problems, fmt.Sprintf("entry %d: expected a {path, text} mapping, got %T", i, it))
+			continue
+		}
+		path, _ := m["path"].(string)
+		text, _ := m["text"].(string)
+		if strings.TrimSpace(path) == "" {
+			problems = append(problems, fmt.Sprintf("entry %d: path must not be empty", i))
+			continue
+		}
+		if text == "" {
+			problems = append(problems, fmt.Sprintf("entry %d (path=%s): text must not be empty", i, path))
+			continue
+		}
+		valid = append(valid, fileTextExpectation{Path: path, Text: text})
+	}
+	return valid, problems
+}
+
+// evaluateFileContains backs both file_contains (wantPresent=true) and
+// file_not_contains (wantPresent=false): read worktree/fe.Path and check
+// whether fe.Text is a substring. A file that cannot be read (most often:
+// the case never touched it at all) is ALWAYS a clean fail with a detail
+// naming the read error — never a panic, and never a silent pass for
+// file_not_contains (an untouched file is not evidence the old text was
+// removed; it is evidence the edit never happened).
+func evaluateFileContains(fe fileTextExpectation, worktree string, wantPresent bool) assertionResult {
+	verb := "file_contains"
+	if !wantPresent {
+		verb = "file_not_contains"
+	}
+	name := fmt.Sprintf("%s:%s:%s", verb, fe.Path, fe.Text)
+	data, err := os.ReadFile(filepath.Join(worktree, fe.Path))
+	if err != nil {
+		return assertionResult{Name: name, Status: "fail", Detail: fmt.Sprintf("read %s: %v", fe.Path, err)}
+	}
+	present := strings.Contains(string(data), fe.Text)
+	pass := present == wantPresent
+	res := assertionResult{Name: name, Status: statusFor(pass)}
+	if !pass {
+		if wantPresent {
+			res.Detail = fmt.Sprintf("expected text not found in %s", fe.Path)
+		} else {
+			res.Detail = fmt.Sprintf("old text still present in %s", fe.Path)
+		}
+	}
+	return res
 }
 
 func statusFor(pass bool) string {
@@ -1157,6 +1507,23 @@ type roleSummary struct {
 	AvgDurationMS      float64 `json:"avg_duration_ms"`
 	NoWritesViolations int     `json:"no_writes_violations"`
 	DispatchErrors     int     `json:"dispatch_errors"`
+	// FileEditAssertionFailures counts fail statuses across the
+	// files_changed/file_contains/file_not_contains assertion family — the
+	// "did the edit actually land" checks added for the M6 batch-editing
+	// corpus (this file's package doc comment). Deliberately NOT folded
+	// into GuardViolations: a guard violation means a safety-floor rule was
+	// broken (no_writes/tool_calls_max/tokens_max — see GuardViolations'
+	// doc comment above), whereas a files_changed/file_contains/
+	// file_not_contains failure means the requested work was not done
+	// correctly — a quality signal, not a guardrail breach, and mixing the
+	// two would let "the model just did less work" hide inside a count
+	// whose whole job is "== 0 means nothing unsafe happened". This field
+	// exists specifically so that failure is never invisible: it must
+	// never disappear into AssertionPassRate alone (diagnostic-only, not a
+	// gate — see that field's doc comment), because a run that skipped the
+	// edits entirely would still look fast and clean by every other
+	// column.
+	FileEditAssertionFailures int `json:"file_edit_assertion_failures"`
 	// ToolCallsP50/ToolCallsMax/BudgetExhaustedRuns profile tool-call
 	// workload, not correctness — collected this period so a later subagent
 	// tool-call budget can be sized from a real distribution instead of a
@@ -1235,6 +1602,7 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		var mentionsPass, mentionsFail int
 		var notMentionsPass, notMentionsFail int
 		var guardFail int
+		var fileEditFail int
 		var tokensSum, durationSum float64
 		var toolCallsSamples []int
 		var budgetExhaustedRuns int
@@ -1255,7 +1623,13 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 				continue // see the function doc: a timeout contributes nothing else
 			}
 			rs.DispatchedRuns++
-			if r.WriteViolation {
+			// Gated on r.NoWritesDeclared: a write_violation only counts as
+			// a no_writes VIOLATION for a case whose manifest actually
+			// declares no_writes: true. A batch-editing case (coder/*) sets
+			// WriteViolation unconditionally too (see runOneCase) but never
+			// declares no_writes, so it must never land here — see
+			// manifestDeclaresNoWrites' doc comment.
+			if r.NoWritesDeclared && r.WriteViolation {
 				rs.NoWritesViolations++
 			}
 			tokensSum += float64(r.Tokens)
@@ -1287,6 +1661,10 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 					if a.Status == "fail" {
 						guardFail++
 					}
+				case a.Name == "files_changed", strings.HasPrefix(a.Name, "file_contains:"), strings.HasPrefix(a.Name, "file_not_contains:"):
+					if a.Status == "fail" {
+						fileEditFail++
+					}
 				}
 			}
 		}
@@ -1299,6 +1677,7 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		rs.MentionsTotal = mentionsPass + mentionsFail
 		rs.NotMentionsViolationRate = ratio(notMentionsFail, notMentionsPass+notMentionsFail)
 		rs.GuardViolations = guardFail + rs.NoWritesViolations
+		rs.FileEditAssertionFailures = fileEditFail
 		if rs.DispatchedRuns > 0 {
 			rs.AvgTokens = tokensSum / float64(rs.DispatchedRuns)
 			rs.AvgDurationMS = durationSum / float64(rs.DispatchedRuns)
@@ -1499,16 +1878,23 @@ func renderEvalSummaryMD(s evalSummary) string {
 	// denominator (len(recs with r.HasStats)), reported explicitly so
 	// "budget exhausted" can be read as a proportion instead of a bare count
 	// against the wrong (dispatched-only) denominator.
-	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | assert pass | assert fail | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | stats runs | tool_calls p50 | tool_calls max | budget exhausted | no_writes viol | guard viol | dispatch err |\n")
-	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	// "file edit assert fail" is the files_changed/file_contains/
+	// file_not_contains failure count (FileEditAssertionFailures) — see its
+	// doc comment on roleSummary for why it is reported here, visibly, and
+	// NOT folded into guard viol: a guard violation is a safety-floor
+	// breach, this is "the requested edit did not land", and a lazy run
+	// that skips the edits must not be able to hide behind a clean-looking
+	// guard/duration row.
+	fmt.Fprintf(&b, "| agent_type | fingerprint | cases | dispatched | assert pass | assert fail | mentions hit | not_mentions viol | avg tokens | avg ms (dispatched) | stats runs | tool_calls p50 | tool_calls max | budget exhausted | no_writes viol | guard viol | file edit assert fail | dispatch err |\n")
+	fmt.Fprintf(&b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range s.Roles {
-		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %.1f | %d | %d | %d | %d | %d |\n",
+		fmt.Fprintf(&b, "| %s | %s | %d | %d | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %.0f | %.0f | %d | %.1f | %d | %d | %d | %d | %d | %d |\n",
 			r.AgentType, r.Fingerprint, r.Cases, r.DispatchedRuns,
 			r.AssertionPassRate*100, r.AssertionFailRate*100,
 			r.MentionsHitRate*100, r.NotMentionsViolationRate*100,
 			r.AvgTokens, r.AvgDurationMS,
 			r.StatsRuns, r.ToolCallsP50, r.ToolCallsMax, r.BudgetExhaustedRuns,
-			r.NoWritesViolations, r.GuardViolations, r.DispatchErrors)
+			r.NoWritesViolations, r.GuardViolations, r.FileEditAssertionFailures, r.DispatchErrors)
 	}
 	return b.String()
 }
@@ -1558,7 +1944,10 @@ const (
 )
 
 // renderEvalCompare implements docs/AGENT_CAPABILITY_DESIGN.md §8's six
-// per-role gates plus the five-role combined mentions check. It returns an
+// per-role gates plus a combined mentions check across every role present
+// in both before and after (the heading reports that count — originally
+// fixed at 5, now computed, since the corpus has grown past the original
+// five roles — see combinedRoleCount below). It returns an
 // error (rather than merely warning) when Model or Runs differ between
 // before and after — those make the two summaries structurally
 // not-comparable, per the design doc's "compare 必须校验前两项一致".
@@ -1595,6 +1984,7 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 
 	var combinedHitsBefore, combinedTotalBefore int
 	var combinedHitsAfter, combinedTotalAfter int
+	var combinedRoleCount int
 
 	for _, a := range after.Roles {
 		bRole, ok := byRole[a.AgentType]
@@ -1603,6 +1993,7 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 			fmt.Fprintf(&b, "  (no before-baseline row for this agent_type)\n\n")
 			continue
 		}
+		combinedRoleCount++
 		combinedHitsBefore += bRole.MentionsHits
 		combinedTotalBefore += bRole.MentionsTotal
 		combinedHitsAfter += a.MentionsHits
@@ -1695,8 +2086,8 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 	if combinedAfterRate < combinedBeforeRate {
 		combinedStatus = "FAIL"
 	}
-	fmt.Fprintf(&b, "## combined (5 roles)\n  [%s] mentions hit rate: %.2f%% (%d/%d) -> %.2f%% (%d/%d)  (threshold >= before)\n",
-		combinedStatus, combinedBeforeRate*100, combinedHitsBefore, combinedTotalBefore, combinedAfterRate*100, combinedHitsAfter, combinedTotalAfter)
+	fmt.Fprintf(&b, "## combined (%d roles)\n  [%s] mentions hit rate: %.2f%% (%d/%d) -> %.2f%% (%d/%d)  (threshold >= before)\n",
+		combinedRoleCount, combinedStatus, combinedBeforeRate*100, combinedHitsBefore, combinedTotalBefore, combinedAfterRate*100, combinedHitsAfter, combinedTotalAfter)
 
 	return b.String(), nil
 }

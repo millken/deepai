@@ -1,0 +1,59 @@
+id: rename-include-hidden
+agent_type: coder
+task: >
+  在 pkg/tools/builtin/find.go、pkg/tools/builtin/codemap.go、
+  pkg/tools/builtin/grep.go 这三个文件中，把 Go 标识符 `includeHidden`
+  （局部变量/函数形参名）的所有出现都改名为 `showHidden`。不要改动用来从
+  args 里读取参数的字符串键 `"include_hidden"`（它是一个不同的字符串字面量，
+  不是目标标识符），也不要改变这三个文件里任何其它逻辑或非目标标识符。改完
+  之后这三个文件里都不应该再出现 `includeHidden` 这个标识符。
+context_files:
+  - pkg/tools/builtin/find.go
+  - pkg/tools/builtin/codemap.go
+  - pkg/tools/builtin/grep.go
+tags: [go, coder, batch-edit]
+expect:
+  - files_changed:
+      - pkg/tools/builtin/find.go
+      - pkg/tools/builtin/codemap.go
+      - pkg/tools/builtin/grep.go
+  - file_contains:
+      - path: pkg/tools/builtin/find.go
+        text: "showHidden"
+      - path: pkg/tools/builtin/codemap.go
+        text: "showHidden"
+      - path: pkg/tools/builtin/grep.go
+        text: "showHidden"
+      # Preservation: the string-literal arg key is a different lexeme
+      # from the `includeHidden` identifier and must survive the rename
+      # untouched (the task explicitly forbids touching it).
+      - path: pkg/tools/builtin/find.go
+        text: '"include_hidden"'
+      - path: pkg/tools/builtin/codemap.go
+        text: '"include_hidden"'
+      - path: pkg/tools/builtin/grep.go
+        text: '"include_hidden"'
+      # Preservation: structural anchors unrelated to the rename, so a
+      # "replace the file with a 3-line stub" cheat (which still contains
+      # `showHidden`/omits `includeHidden`, satisfying every assertion
+      # above) cannot pass.
+      - path: pkg/tools/builtin/find.go
+        text: "func FindTool() models.Tool"
+      - path: pkg/tools/builtin/find.go
+        text: "FindMaxResults"
+      - path: pkg/tools/builtin/codemap.go
+        text: "func CodeMapTool() models.Tool"
+      - path: pkg/tools/builtin/codemap.go
+        text: "codeMapFoldDirs"
+      - path: pkg/tools/builtin/grep.go
+        text: "func GrepTool() models.Tool"
+      - path: pkg/tools/builtin/grep.go
+        text: "isBinaryContent"
+  - file_not_contains:
+      - path: pkg/tools/builtin/find.go
+        text: "includeHidden"
+      - path: pkg/tools/builtin/codemap.go
+        text: "includeHidden"
+      - path: pkg/tools/builtin/grep.go
+        text: "includeHidden"
+  - tool_calls_max: 40

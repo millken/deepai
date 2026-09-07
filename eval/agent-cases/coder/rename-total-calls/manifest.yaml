@@ -1,0 +1,56 @@
+id: rename-total-calls
+agent_type: coder
+task: >
+  在 pkg/chat/repl.go、pkg/commands/analyze.go、pkg/memory/preference.go 这三个
+  文件中，把 Go 标识符 `totalCalls`（局部变量，或作为结构体字段/字段访问，例如
+  `usage.totalCalls`）的所有出现都改名为 `totalToolCalls`。不要改变这三个文件
+  里任何其它逻辑、格式或非目标标识符（例如 `maxToolCalls`、`MainAgentCalls`、
+  `failedCalls` 都不是目标，保持原样）。改完之后这三个文件里都不应该再出现
+  `totalCalls` 这个标识符。
+context_files:
+  - pkg/chat/repl.go
+  - pkg/commands/analyze.go
+  - pkg/memory/preference.go
+tags: [go, coder, batch-edit]
+expect:
+  - files_changed:
+      - pkg/chat/repl.go
+      - pkg/commands/analyze.go
+      - pkg/memory/preference.go
+  - file_contains:
+      - path: pkg/chat/repl.go
+        text: "totalToolCalls"
+      - path: pkg/commands/analyze.go
+        text: "totalToolCalls"
+      - path: pkg/memory/preference.go
+        text: "totalToolCalls"
+      # Preservation: identifiers the task explicitly forbids touching,
+      # even though they superficially resemble the rename target.
+      - path: pkg/chat/repl.go
+        text: "failedCalls"
+      - path: pkg/commands/analyze.go
+        text: "maxToolCalls"
+      - path: pkg/commands/analyze.go
+        text: "MainAgentCalls"
+      # Preservation: structural anchors unrelated to the rename, so a
+      # "keep one occurrence per file, delete the rest" cheat cannot pass.
+      - path: pkg/chat/repl.go
+        text: "func (r *ChatRepl) statusText() string {"
+      - path: pkg/chat/repl.go
+        text: "Most used tools:"
+      - path: pkg/commands/analyze.go
+        text: "func buildReport(records []sessionRecords, scope string) analysisReport {"
+      - path: pkg/commands/analyze.go
+        text: "func printReport(w io.Writer, report analysisReport) {"
+      - path: pkg/memory/preference.go
+        text: "func (ps *PreferenceScheduler) RecordToolCalls(calls []ToolCallInfo) {"
+      - path: pkg/memory/preference.go
+        text: "toolDistrib"
+  - file_not_contains:
+      - path: pkg/chat/repl.go
+        text: "totalCalls"
+      - path: pkg/commands/analyze.go
+        text: "totalCalls"
+      - path: pkg/memory/preference.go
+        text: "totalCalls"
+  - tool_calls_max: 45

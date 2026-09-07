@@ -242,7 +242,7 @@ func TestEvaluateCase_MentionsAndNotMentions(t *testing.T) {
 		{"not_mentions": []any{"SubagentRunner", "ExecuteFork"}},
 	}}
 	output := "the design touches filterTaskTool and invents a nonexistent SubagentRunner"
-	results := evaluateCase(m, output, nil, nil, false)
+	results := evaluateCase(m, output, nil, nil, false, nil, "")
 	assertStatus(t, results, "mentions:filterTaskTool", "pass")
 	assertStatus(t, results, "mentions:selectSubagentTools", "fail")
 	assertStatus(t, results, "not_mentions:SubagentRunner", "fail")
@@ -256,17 +256,344 @@ func TestEvaluateCase_ToolCallsMaxAndTokensMax(t *testing.T) {
 	}}
 	stats := &subagent.RunStats{ToolCalls: 6}
 	usage := &subagent.TokenUsage{TotalTokens: 50}
-	results := evaluateCase(m, "output", stats, usage, false)
+	results := evaluateCase(m, "output", stats, usage, false, nil, "")
 	assertStatus(t, results, "tool_calls_max:5", "fail")
 	assertStatus(t, results, "tokens_max:100", "pass")
 }
 
 func TestEvaluateCase_NoWrites(t *testing.T) {
 	m := caseManifest{Expect: []map[string]any{{"no_writes": true}}}
-	clean := evaluateCase(m, "output", nil, nil, false)
+	clean := evaluateCase(m, "output", nil, nil, false, nil, "")
 	assertStatus(t, clean, "no_writes", "pass")
-	dirty := evaluateCase(m, "output", nil, nil, true)
+	dirty := evaluateCase(m, "output", nil, nil, true, nil, "")
 	assertStatus(t, dirty, "no_writes", "fail")
+}
+
+// ---------------------------------------------------------------------------
+// Assertions: files_changed / file_contains / file_not_contains — the
+// "did the edit actually land" assertions the M6 batch-editing corpus needs
+// (see docs brief for this period). changed is always an ABSOLUTE path list
+// (chat.WorktreeSnapshot.ChangedSince's contract — root-joined, see
+// pkg/chat/review.go), exactly like runOneCase hands evaluateCase; worktree
+// is the same root those absolute paths were joined against, so evaluateCase
+// can convert changed -> worktree-relative paths comparable to the
+// manifest's repo-relative expectations, and can open file_contains/
+// file_not_contains's target files by joining worktree+path itself.
+// ---------------------------------------------------------------------------
+
+func TestEvaluateCase_FilesChangedExactMatch(t *testing.T) {
+	m := caseManifest{Expect: []map[string]any{
+		{"files_changed": []any{"a.go", "sub/b.go"}},
+	}}
+	worktree := t.TempDir()
+	changed := []string{
+		filepath.Join(worktree, "a.go"),
+		filepath.Join(worktree, "sub", "b.go"),
+	}
+	results := evaluateCase(m, "output", nil, nil, false, changed, worktree)
+	assertStatus(t, results, "files_changed", "pass")
+}
+
+func TestEvaluateCase_FilesChangedExtraFileFails(t *testing.T) {
+	m := caseManifest{Expect: []map[string]any{
+		{"files_changed": []any{"a.go"}},
+	}}
+	worktree := t.TempDir()
+	changed := []string{
+		filepath.Join(worktree, "a.go"),
+		filepath.Join(worktree, "oops.go"),
+	}
+	results := evaluateCase(m, "output", nil, nil, false, changed, worktree)
+	assertStatus(t, results, "files_changed", "fail")
+	detail := detailFor(t, results, "files_changed")
+	if !strings.Contains(detail, "oops.go") {
+		t.Errorf("detail %q does not name the unexpected extra file oops.go", detail)
+	}
+}
+
+func TestEvaluateCase_FilesChangedMissingFileFails(t *testing.T) {
+	m := caseManifest{Expect: []map[string]any{
+		{"files_changed": []any{"a.go", "b.go"}},
+	}}
+	worktree := t.TempDir()
+	changed := []string{filepath.Join(worktree, "a.go")}
+	results := evaluateCase(m, "output", nil, nil, false, changed, worktree)
+	assertStatus(t, results, "files_changed", "fail")
+	detail := detailFor(t, results, "files_changed")
+	if !strings.Contains(detail, "b.go") {
+		t.Errorf("detail %q does not name the missing file b.go", detail)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// relativeChangedPaths — portable symlinked-worktree regression coverage.
+//
+// materializeFixture's os.MkdirTemp result is the LITERAL path handed in as
+// worktree, but a changed path comes back from git (via
+// chat.WorktreeSnapshot) already resolved through any symlink in that
+// path's prefix — e.g. macOS's default TMPDIR (/var/folders/... which is
+// itself /private/var/folders/... via /var -> private/var). A plain
+// filepath.Rel(worktree, p) then fails (p isn't under the literal,
+// unresolved worktree string), and relativeChangedPaths falls back to
+// resolving worktree with filepath.EvalSymlinks before retrying Rel.
+//
+// os.Symlink here (rather than relying on the host's TMPDIR happening to be
+// a symlink, which is true on macOS but NOT on a typical Linux CI runner —
+// so a test relying on that accident never even exercises this branch
+// there) makes the fallback path itself portable and provable on any OS.
+func TestRelativeChangedPaths_ResolvesSymlinkedWorktreeToCleanRelativePath(t *testing.T) {
+	realDir := t.TempDir()
+	linkParent := t.TempDir()
+	linkPath := filepath.Join(linkParent, "link-to-real")
+	if err := os.Symlink(realDir, linkPath); err != nil {
+		t.Skipf("os.Symlink unsupported on this platform: %v", err)
+	}
+
+	// changed carries the RESOLVED path — exactly what chat.WorktreeSnapshot
+	// (backed by `git rev-parse --show-toplevel`) would hand back when the
+	// worktree is reached through linkPath, a symlink.
+	resolvedRoot, err := filepath.EvalSymlinks(linkPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(linkPath): %v", err)
+	}
+	changedAbs := filepath.Join(resolvedRoot, "pkg", "a.go")
+	if err := os.MkdirAll(filepath.Dir(changedAbs), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(changedAbs, []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got := relativeChangedPaths([]string{changedAbs}, linkPath)
+	want := []string{"pkg/a.go"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("relativeChangedPaths(%q, worktree=%q) = %v, want %v", changedAbs, linkPath, got, want)
+	}
+}
+
+// TestRelativeChangedPaths_PathOutsideWorktreeStaysAbsoluteNotDotDotGarbage
+// is the regression test for the review-flagged missing `..` guard on the
+// SECOND filepath.Rel call (the EvalSymlinks-resolved fallback): before the
+// fix, a changed path that isn't actually under the worktree (real or
+// resolved) produced a garbage "../../../../..." relative path instead of
+// falling back to the absolute path, as the function's own doc comment has
+// always claimed it does. No symlink is needed to reproduce this — any two
+// unrelated temp directories are enough, since filepath.Rel across them
+// still "succeeds" (err == nil) by climbing out with "..".
+func TestRelativeChangedPaths_PathOutsideWorktreeStaysAbsoluteNotDotDotGarbage(t *testing.T) {
+	worktree := t.TempDir()
+	unrelated := t.TempDir()
+	otherFile := filepath.Join(unrelated, "x.go")
+
+	got := relativeChangedPaths([]string{otherFile}, worktree)
+	if len(got) != 1 {
+		t.Fatalf("relativeChangedPaths returned %d entries, want 1", len(got))
+	}
+	if strings.HasPrefix(got[0], "..") {
+		t.Errorf("relativeChangedPaths(%q, worktree=%q) = %q — dot-dot garbage, want the absolute path preserved", otherFile, worktree, got[0])
+	}
+	want := filepath.ToSlash(otherFile)
+	if got[0] != want {
+		t.Errorf("relativeChangedPaths(%q, worktree=%q) = %q, want the absolute path %q unchanged", otherFile, worktree, got[0], want)
+	}
+}
+
+func TestEvaluateCase_FileContainsPassAndFail(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "a.go"), []byte("package a\n\nfunc NewName() {}\n"), 0o644); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	m := caseManifest{Expect: []map[string]any{
+		{"file_contains": []any{
+			map[string]any{"path": "a.go", "text": "NewName"},
+			map[string]any{"path": "a.go", "text": "DoesNotExist"},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	assertStatus(t, results, "file_contains:a.go:NewName", "pass")
+	assertStatus(t, results, "file_contains:a.go:DoesNotExist", "fail")
+}
+
+func TestEvaluateCase_FileContainsMissingFileFailsCleanly(t *testing.T) {
+	worktree := t.TempDir()
+	m := caseManifest{Expect: []map[string]any{
+		{"file_contains": []any{
+			map[string]any{"path": "nope.go", "text": "anything"},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	assertStatus(t, results, "file_contains:nope.go:anything", "fail")
+	detail := detailFor(t, results, "file_contains:nope.go:anything")
+	if detail == "" {
+		t.Fatal("expected a non-empty detail explaining the missing file, got none")
+	}
+}
+
+func TestEvaluateCase_FileNotContainsPassAndFail(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "a.go"), []byte("package a\n\nfunc NewName() {}\n"), 0o644); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	m := caseManifest{Expect: []map[string]any{
+		{"file_not_contains": []any{
+			map[string]any{"path": "a.go", "text": "OldName"},
+			map[string]any{"path": "a.go", "text": "NewName"},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	assertStatus(t, results, "file_not_contains:a.go:OldName", "pass")
+	assertStatus(t, results, "file_not_contains:a.go:NewName", "fail")
+}
+
+func TestEvaluateCase_FileNotContainsMissingFileDoesNotPanicAndFails(t *testing.T) {
+	worktree := t.TempDir()
+	m := caseManifest{Expect: []map[string]any{
+		{"file_not_contains": []any{
+			map[string]any{"path": "nope.go", "text": "anything"},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	assertStatus(t, results, "file_not_contains:nope.go:anything", "fail")
+}
+
+// ---------------------------------------------------------------------------
+// "cannot-fail" manifest shapes (M6 review defect #4): a file_contains with
+// blank text, a file_contains written as a map instead of a list, and an
+// unrecognized expect key all used to be silently accepted as ZERO
+// assertions (or, for blank text, one assertion that can never fail —
+// strings.Contains(x, "") is always true). FileEditAssertionFailures exists
+// specifically so a real failure can never go invisible; a manifest that
+// asserts nothing at all, without even a warning, is a sharper version of
+// exactly that same problem. evaluateCase must now turn each of these into
+// an explicit "fail" — never a silent no-op, never an always-true pass.
+// ---------------------------------------------------------------------------
+
+func TestEvaluateCase_FileContainsBlankTextFailsRatherThanAlwaysPassing(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	m := caseManifest{Expect: []map[string]any{
+		{"file_contains": []any{
+			map[string]any{"path": "a.go", "text": ""},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	if len(results) != 1 {
+		t.Fatalf("evaluateCase produced %d assertions, want exactly 1 (the malformed entry made explicit): %+v", len(results), results)
+	}
+	if results[0].Status != "fail" {
+		t.Errorf("blank-text file_contains status = %q, want %q (strings.Contains(x, \"\") is always true — this must never silently pass)", results[0].Status, "fail")
+	}
+}
+
+func TestEvaluateCase_FileContainsBlankPathFails(t *testing.T) {
+	worktree := t.TempDir()
+	m := caseManifest{Expect: []map[string]any{
+		{"file_not_contains": []any{
+			map[string]any{"path": "", "text": "OldName"},
+		}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	if len(results) != 1 || results[0].Status != "fail" {
+		t.Fatalf("blank-path file_not_contains = %+v, want exactly one fail assertion", results)
+	}
+}
+
+func TestEvaluateCase_FileContainsAsMapInsteadOfListProducesExplicitFail(t *testing.T) {
+	worktree := t.TempDir()
+	// A manifest typo: file_contains written as a single mapping instead of
+	// a list of mappings. Before the fix, toFileTextExpectations returned
+	// nil for a non-list value and evaluateCase's switch had no default —
+	// this expect entry produced ZERO assertions, with no warning anywhere.
+	m := caseManifest{Expect: []map[string]any{
+		{"file_contains": map[string]any{"path": "a.go", "text": "Foo"}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, worktree)
+	if len(results) != 1 {
+		t.Fatalf("evaluateCase produced %d assertions for a map-shaped file_contains, want exactly 1 (an explicit fail), got: %+v", len(results), results)
+	}
+	if results[0].Status != "fail" {
+		t.Errorf("status = %q, want %q", results[0].Status, "fail")
+	}
+}
+
+func TestEvaluateCase_UnknownExpectKeyProducesExplicitFailNotSilentSkip(t *testing.T) {
+	// A manifest typo: file_content / files_change instead of the real
+	// keys. Before the fix, evaluateCase's switch had no default case, so
+	// an unrecognized key silently contributed nothing at all.
+	m := caseManifest{Expect: []map[string]any{
+		{"file_content": []any{map[string]any{"path": "a.go", "text": "Foo"}}},
+	}}
+	results := evaluateCase(m, "output", nil, nil, false, nil, t.TempDir())
+	if len(results) != 1 {
+		t.Fatalf("evaluateCase produced %d assertions for an unknown expect key, want exactly 1 (an explicit fail), got: %+v", len(results), results)
+	}
+	if results[0].Status != "fail" {
+		t.Errorf("status = %q, want %q", results[0].Status, "fail")
+	}
+}
+
+// TestLoadEvalCases_RejectsMalformedExpectShapes is the load-time half of
+// the same fix: a real manifest with these defects must never even reach
+// materialization/dispatch — loadEvalCases (via validateManifestExpect)
+// rejects it outright, with a descriptive error naming the manifest.
+func TestLoadEvalCases_RejectsMalformedExpectShapes(t *testing.T) {
+	cases := []struct {
+		name         string
+		manifestYAML string
+	}{
+		{
+			name:         "unknown expect key",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - files_change: [a.go]\n",
+		},
+		{
+			name:         "file_contains as a map instead of a list",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - file_contains:\n      path: a.go\n      text: Foo\n",
+		},
+		{
+			name:         "file_contains blank text",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - file_contains:\n      - path: a.go\n        text: \"\"\n",
+		},
+		{
+			name:         "file_contains blank path",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - file_contains:\n      - path: \"\"\n        text: Foo\n",
+		},
+		{
+			name:         "no_writes not a bool",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - no_writes: \"true\"\n",
+		},
+		{
+			name:         "tool_calls_max not an integer",
+			manifestYAML: "id: bad\nagent_type: coder\ntask: \"x\"\nexpect:\n  - tool_calls_max: \"forty\"\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			caseDir := filepath.Join(root, "coder", "bad-case")
+			if err := os.MkdirAll(caseDir, 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(caseDir, "manifest.yaml"), []byte(tc.manifestYAML), 0o644); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+			if _, err := loadEvalCases(root, ""); err == nil {
+				t.Errorf("loadEvalCases: expected an error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func detailFor(t *testing.T, results []assertionResult, name string) string {
+	t.Helper()
+	for _, r := range results {
+		if r.Name == name {
+			return r.Detail
+		}
+	}
+	t.Fatalf("assertion %s not found in results: %+v", name, results)
+	return ""
 }
 
 func assertStatus(t *testing.T, results []assertionResult, name, want string) {
@@ -322,6 +649,44 @@ func TestRunOneCase_NoWritesViolationDetectedViaSnapshot(t *testing.T) {
 	if wd := mustGetwd(t); wd != prevWD {
 		t.Fatalf("cwd not restored: got %q, want %q", wd, prevWD)
 	}
+}
+
+// TestRunOneCase_FilesChangedAndFileContainsEndToEnd exercises the full
+// chdir/dispatch/snapshot/evaluate chain for the new "did the edit actually
+// land" assertion family (files_changed/file_contains/file_not_contains),
+// the same way TestRunOneCase_NoWritesViolationDetectedViaSnapshot exercises
+// no_writes: a fake subagent edits a.go exactly as the case demands, and the
+// resulting runRecord's assertions must all pass — proving the harness (not
+// just evaluateCase in isolation) wires changed/worktree through correctly.
+func TestRunOneCase_FilesChangedAndFileContainsEndToEnd(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "coder", "rename-case",
+		"id: rename-case\nagent_type: coder\ntask: \"rename OldName to NewName in a.go\"\nexpect:\n  - files_changed: [a.go]\n  - file_contains:\n      - path: a.go\n        text: NewName\n  - file_not_contains:\n      - path: a.go\n        text: OldName\n",
+		map[string]string{"a.go": "package a\n\nfunc OldName() {}\n"})
+
+	pool := &fakePool{
+		task: fakeTaskResult{Status: subagent.TaskStatusCompleted, Result: "done"},
+		sideEffect: func() {
+			wd, err := os.Getwd()
+			if err != nil {
+				t.Fatalf("getwd inside side effect: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(wd, "a.go"), []byte("package a\n\nfunc NewName() {}\n"), 0o644); err != nil {
+				t.Fatalf("side effect write: %v", err)
+			}
+		},
+	}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if !rec.WriteViolation {
+		t.Error("expected WriteViolation = true (a.go was edited), got false")
+	}
+	assertStatus(t, rec.Assertions, "files_changed", "pass")
+	assertStatus(t, rec.Assertions, "file_contains:a.go:NewName", "pass")
+	assertStatus(t, rec.Assertions, "file_not_contains:a.go:OldName", "pass")
 }
 
 func TestRunOneCase_CleanRunNoWritesPasses(t *testing.T) {
@@ -1021,7 +1386,14 @@ func TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt(t *testi
 		t.Logf("skill load warnings (best-effort, matching buildEvalStack): %v", warnings)
 	}
 
-	for _, agentType := range []string{"architect", "researcher", "analyst", "product-manager", "tester"} {
+	// "coder" is included alongside the original five: it is the sixth
+	// agent_type the eval corpus now covers (this period's coder/ cases,
+	// eval/agent-cases/coder/*), and this equivalence check is exactly what
+	// makes its fingerprint trustworthy — a fingerprint that silently
+	// diverged from what SubagentExecutor.Execute actually assembles would
+	// defeat the whole point of `eval compare`'s "fingerprint unchanged"
+	// gate for the new role.
+	for _, agentType := range []string{"architect", "researcher", "analyst", "product-manager", "tester", "coder"} {
 		t.Run(agentType, func(t *testing.T) {
 			harnessPrompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg)
 			if err != nil {
@@ -1370,6 +1742,47 @@ func TestRenderEvalCompare_WarnsWhenFingerprintUnchanged(t *testing.T) {
 	}
 }
 
+// TestRenderEvalCompare_CombinedHeadingReflectsActualRoleCountNotHardcoded5
+// pins the fix for the hardcoded "## combined (5 roles)" heading: the eval
+// corpus now covers six agent_types (architect, researcher, analyst,
+// product-manager, tester, coder — see this file's package doc comment and
+// TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt), so a
+// literal "5" is simply wrong on the current corpus, and would silently go
+// on being wrong again the next time a role is added. The heading must
+// report however many roles actually fed the combined mentions-hit
+// calculation — i.e. those present in BOTH before and after, not just
+// len(after.Roles) (a role with no before-baseline row is skipped before
+// it's added to the combined totals — see renderEvalCompare's `!ok`
+// continue).
+func TestRenderEvalCompare_CombinedHeadingReflectsActualRoleCountNotHardcoded5(t *testing.T) {
+	agentTypes := []string{"architect", "researcher", "analyst", "product-manager", "tester", "coder"}
+	var beforeRoles, afterRoles []roleSummary
+	for _, at := range agentTypes {
+		beforeRoles = append(beforeRoles, baselineRole(at))
+		afterRole := baselineRole(at)
+		afterRole.Fingerprint = "def67890" // a real before/after, not a no-op
+		afterRoles = append(afterRoles, afterRole)
+	}
+	// A seventh role with NO before-baseline row: must be excluded from the
+	// combined role count (renderEvalCompare's `!ok` branch), not just
+	// excluded from len(after.Roles) mattering.
+	afterRoles = append(afterRoles, baselineRole("no-baseline-role"))
+
+	before := evalSummary{Model: "glm-5.3", Runs: 8, Timeout: "5m", Roles: beforeRoles}
+	after := evalSummary{Model: "glm-5.3", Runs: 8, Timeout: "5m", Roles: afterRoles}
+
+	out, err := renderEvalCompare(before, after)
+	if err != nil {
+		t.Fatalf("renderEvalCompare: %v", err)
+	}
+	if strings.Contains(out, "## combined (5 roles)") {
+		t.Errorf("expected the combined heading to reflect the real 6-role count, not the old hardcoded 5, got:\n%s", out)
+	}
+	if !strings.Contains(out, "## combined (6 roles)") {
+		t.Errorf("expected \"## combined (6 roles)\" (6 roles have both a before and an after row; the 7th has no before row), got:\n%s", out)
+	}
+}
+
 func TestRenderEvalCompare_RecheckWhenAvgDurationExceeds1_5x(t *testing.T) {
 	before := evalSummary{Model: "glm-5.3", Runs: 3, Timeout: "5m", Roles: []roleSummary{baselineRole("architect")}}
 	after := before
@@ -1506,8 +1919,8 @@ func TestRealAgentCasesCorpus_LoadsAndMaterializesCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadEvalCases: %v", err)
 	}
-	if len(cases) != 15 {
-		t.Fatalf("len(cases) = %d, want 15 (5 agent types x 3 cases)", len(cases))
+	if len(cases) != 18 {
+		t.Fatalf("len(cases) = %d, want 18 (5 original agent types x 3 cases, plus coder x 3 added for the M6 batch-editing corpus)", len(cases))
 	}
 
 	wantAgentTypes := map[string]int{}
@@ -1540,11 +1953,346 @@ func TestRealAgentCasesCorpus_LoadsAndMaterializesCleanly(t *testing.T) {
 		}
 		cleanup()
 	}
-	for _, agentType := range []string{"architect", "product-manager", "researcher", "analyst", "tester"} {
+	for _, agentType := range []string{"architect", "product-manager", "researcher", "analyst", "tester", "coder"} {
 		if wantAgentTypes[agentType] != 3 {
 			t.Errorf("agent_type %s: %d cases, want 3", agentType, wantAgentTypes[agentType])
 		}
 	}
+}
+
+// TestRealAgentCasesCorpus_ExpectationsAreWellFormedAndFalsifiable is the
+// M6 review's corpus validator (review defect #5), run against the REAL,
+// pinned eval/agent-cases corpus. The review's original proposal — reject a
+// case if any file_contains text already exists in the pinned fixture —
+// was withdrawn: it would forbid exactly the preservation assertions Fix 2
+// adds (e.g. asserting `"include_hidden"` survives a rename, when it is
+// present in the fixture both before and after an honest edit). This test
+// enforces the adopted alternative instead:
+//
+//  1. loadEvalCases itself must succeed: validateManifestExpect already
+//     rejects an unknown expect key or a malformed shape at load time (see
+//     TestLoadEvalCases_RejectsMalformedExpectShapes for synthetic-manifest
+//     unit coverage); a non-nil error here means the REAL corpus itself is
+//     unsound.
+//  2. (folded into 1: a blank path/text is one of the shapes
+//     validateManifestExpect rejects.)
+//  3. Every file_not_contains text must actually be present in the case's
+//     PINNED fixture file — this holds unconditionally, with no legitimate
+//     counterexample: if the text was never there, "the text is gone" is
+//     true before any edit happens, and the assertion can never fail.
+//  4. Every case that uses file_contains at all must have AT LEAST ONE
+//     entry whose text is NOT present in the pinned fixture — proof the
+//     case can actually fail (falsifiable). This does not forbid a
+//     file_contains whose text already exists; it only requires that at
+//     least one entry per case is not one of those (the rest may
+//     legitimately be preservation assertions).
+func TestRealAgentCasesCorpus_ExpectationsAreWellFormedAndFalsifiable(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	casesDir := filepath.Join(repoRoot, "eval", "agent-cases")
+	if _, err := os.Stat(casesDir); err != nil {
+		t.Skipf("eval/agent-cases not present (%v); skipping real-corpus check", err)
+	}
+
+	// Rules 1/2: loadEvalCases (via validateManifestExpect) rejects an
+	// unknown key or a malformed/blank-path/blank-text shape at load time —
+	// a non-nil error here IS the corpus-validator failure.
+	cases, err := loadEvalCases(casesDir, "")
+	if err != nil {
+		t.Fatalf("loadEvalCases: %v (the real corpus must be well-formed)", err)
+	}
+
+	for _, c := range cases {
+		hasFileContains := false
+		falsifiable := false
+
+		for _, exp := range c.Manifest.Expect {
+			key, val, ok := singleKV(exp)
+			if !ok {
+				continue
+			}
+			switch key {
+			case "file_not_contains":
+				items, problems := parseFileTextExpectations(val)
+				if len(problems) > 0 {
+					t.Errorf("case %s/%s: malformed file_not_contains: %v", c.AgentType, c.ID, problems)
+				}
+				for _, fe := range items {
+					data, err := os.ReadFile(filepath.Join(c.FixtureDir, fe.Path))
+					if err != nil {
+						t.Errorf("case %s/%s: file_not_contains {path: %s}: read pinned fixture: %v", c.AgentType, c.ID, fe.Path, err)
+						continue
+					}
+					if !strings.Contains(string(data), fe.Text) {
+						t.Errorf("case %s/%s: file_not_contains {path: %s, text: %q}: text is NOT present in the pinned fixture — this assertion can never fail (rule 3)", c.AgentType, c.ID, fe.Path, fe.Text)
+					}
+				}
+			case "file_contains":
+				hasFileContains = true
+				items, problems := parseFileTextExpectations(val)
+				if len(problems) > 0 {
+					t.Errorf("case %s/%s: malformed file_contains: %v", c.AgentType, c.ID, problems)
+				}
+				for _, fe := range items {
+					data, err := os.ReadFile(filepath.Join(c.FixtureDir, fe.Path))
+					if err != nil {
+						// The path doesn't exist in the pinned fixture at
+						// all: the text is certainly not there either, so
+						// this entry is falsifiable by construction.
+						falsifiable = true
+						continue
+					}
+					if !strings.Contains(string(data), fe.Text) {
+						falsifiable = true
+					}
+				}
+			}
+		}
+
+		if hasFileContains && !falsifiable {
+			t.Errorf("case %s/%s: every file_contains text is ALREADY present in the pinned fixture — nothing proves this case can fail (rule 4)", c.AgentType, c.ID)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// coder corpus anti-cheat coverage (M6 review defect #2): the independent
+// review found that every one of the three coder cases' negative
+// constraints — "don't touch this protected string/identifier", "the
+// content must actually survive" — scored identically for an honest rename
+// and for a cheat/damage variant, because nothing in the manifest asserted
+// on them. The fix adds preservation file_contains entries to the three
+// manifests (see eval/agent-cases/coder/*/manifest.yaml); these tests prove
+// BOTH halves against the real, pinned fixtures: an honest rename passes
+// everything, and every cheat/damage shape the review identified fails at
+// least one assertion.
+// ---------------------------------------------------------------------------
+
+// loadRealCoderCase finds one real coder/<id> case from the pinned
+// eval/agent-cases corpus (never a synthetic manifest), so this test proves
+// something about the actual shipped manifests, not a stand-in.
+func loadRealCoderCase(t *testing.T, id string) evalCase {
+	t.Helper()
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	casesDir := filepath.Join(repoRoot, "eval", "agent-cases")
+	if _, err := os.Stat(casesDir); err != nil {
+		t.Skipf("eval/agent-cases not present (%v); skipping real-corpus check", err)
+	}
+	cases, err := loadEvalCases(casesDir, "coder")
+	if err != nil {
+		t.Fatalf("loadEvalCases: %v", err)
+	}
+	for _, c := range cases {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("coder case %q not found in the real corpus", id)
+	return evalCase{}
+}
+
+// materializeAndTransform copies c's pinned fixture into a fresh temp
+// worktree, runs transform against it (in place), and reports every one of
+// c's context_files as "changed" — every scenario below rewrites all of
+// them, exactly like a real coder run editing the files it was told about.
+func materializeAndTransform(t *testing.T, c evalCase, transform func(worktree string)) (worktree string, changed []string, cleanup func()) {
+	t.Helper()
+	worktree, cleanup, err := materializeFixture(c.FixtureDir)
+	if err != nil {
+		t.Fatalf("materializeFixture: %v", err)
+	}
+	transform(worktree)
+	for _, cf := range c.Manifest.ContextFiles {
+		changed = append(changed, filepath.Join(worktree, cf))
+	}
+	return worktree, changed, cleanup
+}
+
+func rewriteRel(t *testing.T, worktree, rel string, edit func(content string) string) {
+	t.Helper()
+	p := filepath.Join(worktree, rel)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	if err := os.WriteFile(p, []byte(edit(string(data))), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func writeRel(t *testing.T, worktree, rel, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(worktree, rel), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+func failedAssertionNames(results []assertionResult) []string {
+	var out []string
+	for _, r := range results {
+		if r.Status == "fail" {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
+func assertAllAssertionsPass(t *testing.T, results []assertionResult) {
+	t.Helper()
+	if failed := failedAssertionNames(results); len(failed) > 0 {
+		t.Errorf("expected every assertion to pass, but these failed: %v (full results: %+v)", failed, results)
+	}
+}
+
+func assertAtLeastOneAssertionFails(t *testing.T, results []assertionResult) {
+	t.Helper()
+	if failed := failedAssertionNames(results); len(failed) == 0 {
+		t.Errorf("expected at least one assertion to fail, but every one passed: %+v", results)
+	}
+}
+
+// --- rename-include-hidden (C1) ---
+
+func honestRenameIncludeHidden(t *testing.T, worktree string) {
+	for _, rel := range []string{"pkg/tools/builtin/find.go", "pkg/tools/builtin/codemap.go", "pkg/tools/builtin/grep.go"} {
+		rewriteRel(t, worktree, rel, func(s string) string {
+			return strings.ReplaceAll(s, "includeHidden", "showHidden")
+		})
+	}
+}
+
+func TestCoderCases_RenameIncludeHidden_HonestRenamePassesAllAssertions(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-include-hidden")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) { honestRenameIncludeHidden(t, wt) })
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAllAssertionsPass(t, results)
+}
+
+func TestCoderCases_RenameIncludeHidden_AlsoMangledProtectedStringFails(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-include-hidden")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) {
+		honestRenameIncludeHidden(t, wt)
+		// The cheat: also rename the protected string-literal arg key,
+		// which the task explicitly forbids touching.
+		for _, rel := range []string{"pkg/tools/builtin/find.go", "pkg/tools/builtin/codemap.go", "pkg/tools/builtin/grep.go"} {
+			rewriteRel(t, wt, rel, func(s string) string {
+				return strings.ReplaceAll(s, `"include_hidden"`, `"show_hidden"`)
+			})
+		}
+	})
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAtLeastOneAssertionFails(t, results)
+}
+
+func TestCoderCases_RenameIncludeHidden_StubbedFilesFail(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-include-hidden")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) {
+		// The cheat: gut each file down to a few lines. Every showHidden/
+		// includeHidden assertion the ORIGINAL manifest had still passes
+		// (showHidden present, includeHidden absent) — only the added
+		// structural-preservation assertions can catch this.
+		writeRel(t, wt, "pkg/tools/builtin/find.go", "package builtin\n\nvar showHidden bool\n")
+		writeRel(t, wt, "pkg/tools/builtin/codemap.go", "package builtin\n\nvar showHidden bool\n")
+		writeRel(t, wt, "pkg/tools/builtin/grep.go", "package builtin\n\nvar showHidden bool\n")
+	})
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAtLeastOneAssertionFails(t, results)
+}
+
+// --- rename-max-tool-calls-cap (C2) ---
+
+func honestRenameMaxToolCallsCap(t *testing.T, worktree string) {
+	for _, rel := range []string{"pkg/subagent/pool.go", "pkg/subagent/types.go"} {
+		rewriteRel(t, worktree, rel, func(s string) string {
+			return strings.ReplaceAll(s, "MaxToolCalls", "ToolCallCap")
+		})
+	}
+}
+
+func TestCoderCases_RenameMaxToolCallsCap_HonestRenamePassesAllAssertions(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-max-tool-calls-cap")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) { honestRenameMaxToolCallsCap(t, wt) })
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAllAssertionsPass(t, results)
+}
+
+func TestCoderCases_RenameMaxToolCallsCap_AlsoMangledJSONTagFails(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-max-tool-calls-cap")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) {
+		honestRenameMaxToolCallsCap(t, wt)
+		// The cheat: also rewrite the protected JSON struct tag, which the
+		// task explicitly forbids touching.
+		rewriteRel(t, wt, "pkg/subagent/types.go", func(s string) string {
+			return strings.ReplaceAll(s, `json:"max_tool_calls"`, `json:"tool_call_cap"`)
+		})
+	})
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAtLeastOneAssertionFails(t, results)
+}
+
+// --- rename-total-calls (C3) ---
+
+func honestRenameTotalCalls(t *testing.T, worktree string) {
+	for _, rel := range []string{"pkg/chat/repl.go", "pkg/commands/analyze.go", "pkg/memory/preference.go"} {
+		rewriteRel(t, worktree, rel, func(s string) string {
+			return strings.ReplaceAll(s, "totalCalls", "totalToolCalls")
+		})
+	}
+}
+
+func TestCoderCases_RenameTotalCalls_HonestRenamePassesAllAssertions(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-total-calls")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) { honestRenameTotalCalls(t, wt) })
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAllAssertionsPass(t, results)
+}
+
+func TestCoderCases_RenameTotalCalls_AlsoRenamedForbiddenIdentifiersFails(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-total-calls")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) {
+		honestRenameTotalCalls(t, wt)
+		// The cheat: also rename the identifiers the task explicitly says
+		// are NOT targets (failedCalls, maxToolCalls, MainAgentCalls).
+		rewriteRel(t, wt, "pkg/chat/repl.go", func(s string) string {
+			return strings.ReplaceAll(s, "failedCalls", "failedToolCalls")
+		})
+		rewriteRel(t, wt, "pkg/commands/analyze.go", func(s string) string {
+			s = strings.ReplaceAll(s, "maxToolCalls", "maxToolCallsCap")
+			s = strings.ReplaceAll(s, "MainAgentCalls", "MainAgentToolCalls")
+			return s
+		})
+	})
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAtLeastOneAssertionFails(t, results)
+}
+
+func TestCoderCases_RenameTotalCalls_OneOccurrenceKeptRestDeletedFails(t *testing.T) {
+	c := loadRealCoderCase(t, "rename-total-calls")
+	worktree, changed, cleanup := materializeAndTransform(t, c, func(wt string) {
+		// The cheat: each 400-2000 line file is gutted down to the one
+		// totalCalls occurrence renamed, everything else discarded. Every
+		// file_contains/file_not_contains assertion the ORIGINAL manifest
+		// had still passes — only the added structural-preservation
+		// assertions can catch this.
+		writeRel(t, wt, "pkg/chat/repl.go", "package chat\n\nvar totalToolCalls int\n")
+		writeRel(t, wt, "pkg/commands/analyze.go", "package commands\n\nvar totalToolCalls int\n")
+		writeRel(t, wt, "pkg/memory/preference.go", "package memory\n\nvar totalToolCalls int\n")
+	})
+	defer cleanup()
+	results := evaluateCase(c.Manifest, "", nil, nil, true, changed, worktree)
+	assertAtLeastOneAssertionFails(t, results)
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +2392,135 @@ func TestBuildEvalSummary_ErroredRunExcludedFromEverythingButDispatchErrors(t *t
 	wantRate := 11.0 / 12.0
 	if diff := r.AssertionPassRate - wantRate; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("AssertionPassRate = %v, want %v (must exclude the errored run's synthetic dispatch assertion)", r.AssertionPassRate, wantRate)
+	}
+}
+
+// TestBuildEvalSummary_FileEditAssertionFailuresCountedSeparatelyFromGuard
+// pins the M6 batch-editing corpus's core anti-cheat requirement (see this
+// file's package doc comment): a files_changed/file_contains/
+// file_not_contains failure must be visible (FileEditAssertionFailures) but
+// must NOT inflate GuardViolations or NoWritesViolations — those two are the
+// safety-floor tripwire ("nothing unsafe happened"), and a case with no
+// no_writes assertion at all (every coder case) must not silently borrow
+// that column to report "the edit didn't land".
+func TestBuildEvalSummary_FileEditAssertionFailuresCountedSeparatelyFromGuard(t *testing.T) {
+	records := []runRecord{
+		{
+			Case: "c1", AgentType: "coder", Fingerprint: "fp1", Tokens: 100, DurationMS: 1000,
+			Assertions: []assertionResult{
+				{Name: "files_changed", Status: "pass"},
+				{Name: "file_contains:a.go:Foo", Status: "pass"},
+				{Name: "file_not_contains:a.go:Bar", Status: "pass"},
+				{Name: "tool_calls_max:20", Status: "pass"},
+			},
+		},
+		{
+			Case: "c2", AgentType: "coder", Fingerprint: "fp1", Tokens: 100, DurationMS: 1000,
+			Assertions: []assertionResult{
+				{Name: "files_changed", Status: "fail", Detail: "missing=[b.go] extra=[] actual=[]"},
+				{Name: "file_contains:a.go:Foo", Status: "fail"},
+				{Name: "file_not_contains:a.go:Bar", Status: "pass"},
+				{Name: "tool_calls_max:20", Status: "pass"},
+			},
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 1, "5m", records)
+	if len(s.Roles) != 1 {
+		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
+	}
+	r := s.Roles[0]
+	if r.FileEditAssertionFailures != 2 {
+		t.Errorf("FileEditAssertionFailures = %d, want 2 (files_changed fail + file_contains fail on c2)", r.FileEditAssertionFailures)
+	}
+	if r.GuardViolations != 0 {
+		t.Errorf("GuardViolations = %d, want 0 (file-edit failures must not count as guard violations)", r.GuardViolations)
+	}
+	if r.NoWritesViolations != 0 {
+		t.Errorf("NoWritesViolations = %d, want 0 (no no_writes assertion in these records)", r.NoWritesViolations)
+	}
+}
+
+// TestBuildEvalSummary_HonestFileEditIsNotANoWritesViolation is the direct
+// reproduction of the M6 review's critical finding: a coder case's manifest
+// declares files_changed/file_contains/file_not_contains — never no_writes
+// — and every one of those assertions passed (the edit landed exactly as
+// asked). runOneCase's WriteViolation is nonetheless unconditionally true
+// here (len(changed) > 0 — see runOneCase's rec construction), because the
+// case's whole job is to edit files. Before the fix, buildEvalSummary's
+// `if r.WriteViolation { rs.NoWritesViolations++ }` counted this as a
+// no_writes violation regardless of whether the manifest ever declared
+// no_writes, which fed straight into GuardViolations (guardFail +
+// NoWritesViolations) and would fail renderEvalCompare's "guard violations
+// == 0" gate for a PERFECT run — see the reviewer's literal repro:
+// "honest rename-include-hidden fails=0/8 writeViolation=true ...
+// NoWritesViolations=3 GuardViolations=3 ... VERDICT: fail".
+func TestBuildEvalSummary_HonestFileEditIsNotANoWritesViolation(t *testing.T) {
+	records := []runRecord{
+		{
+			Case: "rename-include-hidden", AgentType: "coder", Fingerprint: "8d029d36",
+			Tokens: 100, DurationMS: 1000,
+			WriteViolation:   true,  // the fixture genuinely got edited
+			NoWritesDeclared: false, // and the manifest never asked for no_writes
+			Assertions: []assertionResult{
+				{Name: "files_changed", Status: "pass"},
+				{Name: "file_contains:pkg/tools/builtin/find.go:showHidden", Status: "pass"},
+				{Name: "file_contains:pkg/tools/builtin/codemap.go:showHidden", Status: "pass"},
+				{Name: "file_contains:pkg/tools/builtin/grep.go:showHidden", Status: "pass"},
+				{Name: "file_not_contains:pkg/tools/builtin/find.go:includeHidden", Status: "pass"},
+				{Name: "file_not_contains:pkg/tools/builtin/codemap.go:includeHidden", Status: "pass"},
+				{Name: "file_not_contains:pkg/tools/builtin/grep.go:includeHidden", Status: "pass"},
+				{Name: "tool_calls_max:40", Status: "pass"},
+			},
+		},
+	}
+	s := buildEvalSummary("glm-5.3", 1, "5m", records)
+	if len(s.Roles) != 1 {
+		t.Fatalf("len(Roles) = %d, want 1", len(s.Roles))
+	}
+	r := s.Roles[0]
+	if r.NoWritesViolations != 0 {
+		t.Errorf("NoWritesViolations = %d, want 0 — the manifest never declares no_writes, so an honest edit must not count as one", r.NoWritesViolations)
+	}
+	if r.GuardViolations != 0 {
+		t.Errorf("GuardViolations = %d, want 0 — a perfect, on-task file edit must not trip the safety-floor gate", r.GuardViolations)
+	}
+	if r.FileEditAssertionFailures != 0 {
+		t.Errorf("FileEditAssertionFailures = %d, want 0 (every file-edit assertion passed)", r.FileEditAssertionFailures)
+	}
+}
+
+// TestRenderEvalCompare_HonestCoderEditPassesTheGuardViolationsGate is the
+// compare-time consequence of the same defect: renderEvalCompare's
+// "guard violations == 0" verdict gate must PASS for a coder role whose
+// only "violation" is the unconditional WriteViolation flag on a
+// files-changed case with no no_writes assertion. Before the fix this
+// rendered "VERDICT: fail", exactly as the reviewer's repro showed.
+func TestRenderEvalCompare_HonestCoderEditPassesTheGuardViolationsGate(t *testing.T) {
+	var records []runRecord
+	// evalMinDispatchedForValid is 7 — 8 runs so the compare verdict is
+	// judged on the guard-violations gate itself, not short-circuited to
+	// "invalid" by undersampling.
+	for i := 0; i < 8; i++ {
+		records = append(records, runRecord{
+			Case: "rename-include-hidden", AgentType: "coder", Fingerprint: "8d029d36", WriteViolation: true, NoWritesDeclared: false,
+			Assertions: []assertionResult{{Name: "files_changed", Status: "pass"}},
+		})
+	}
+	after := buildEvalSummary("glm-5.3", 8, "5m", records)
+	before := after
+	beforeRole := after.Roles[0]
+	beforeRole.Fingerprint = "deadbeef" // a real before/after, not a no-op
+	before.Roles = []roleSummary{beforeRole}
+
+	out, err := renderEvalCompare(before, after)
+	if err != nil {
+		t.Fatalf("renderEvalCompare: %v", err)
+	}
+	if strings.Contains(out, "VERDICT: fail") {
+		t.Errorf("expected the honest coder edit to pass the guard-violations gate, got:\n%s", out)
+	}
+	if !strings.Contains(out, "guard violations:        0 -> 0") {
+		t.Errorf("expected guard violations 0 -> 0, got:\n%s", out)
 	}
 }
 
@@ -1820,6 +2697,50 @@ func TestRenderEvalSummaryMD_IncludesToolCallBudgetColumns(t *testing.T) {
 	}
 	if !strings.Contains(row, "| 7 | 4.5 | 20 | 2 |") {
 		t.Errorf("summary.md row does not render stats_runs=7 immediately before tool_calls p50/max/budget_exhausted:\n%s", row)
+	}
+}
+
+// TestRenderEvalSummaryMD_FileEditAssertionFailuresVisibleAndDistinctFromGuard
+// pins the M6 batch-editing corpus's visibility requirement head-on: a
+// files_changed/file_contains/file_not_contains failure count must render
+// in summary.md as its own column, not fold into "guard viol" — a reader
+// scanning the table must be able to see "the edits didn't land" separately
+// from "a safety-floor rule broke", even though both are integers sitting
+// next to each other in the same row.
+func TestRenderEvalSummaryMD_FileEditAssertionFailuresVisibleAndDistinctFromGuard(t *testing.T) {
+	s := evalSummary{
+		GeneratedAt: "2026-09-07T00:00:00Z",
+		Model:       "glm-5.3",
+		Runs:        3,
+		Timeout:     "5m",
+		Roles: []roleSummary{
+			{
+				AgentType:                 "coder",
+				Fingerprint:               "cafef00d",
+				Cases:                     3,
+				DispatchedRuns:            9,
+				GuardViolations:           0,
+				FileEditAssertionFailures: 4,
+			},
+		},
+	}
+	md := renderEvalSummaryMD(s)
+	if !strings.Contains(md, "file edit assert fail") {
+		t.Fatalf("summary.md missing a file-edit-assertion-failures column/header:\n%s", md)
+	}
+	rowStart := strings.Index(md, "| coder | cafef00d | 3 | 9 | ")
+	if rowStart < 0 {
+		t.Fatalf("summary.md row prefix unexpected:\n%s", md)
+	}
+	row := md[rowStart:]
+	if idx := strings.Index(row, "\n"); idx >= 0 {
+		row = row[:idx]
+	}
+	// GuardViolations=0 and FileEditAssertionFailures=4 must both be
+	// visible, as DIFFERENT cells — a reader must never see one number and
+	// have to guess which of the two it is.
+	if !strings.Contains(row, "| 0 | 4 |") {
+		t.Errorf("summary.md row does not render guard_violations=0 and file_edit_assertion_failures=4 as adjacent, distinct cells:\n%s", row)
 	}
 }
 

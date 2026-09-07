@@ -1,0 +1,34 @@
+id: rename-max-tool-calls-cap
+agent_type: coder
+task: >
+  在 pkg/subagent/pool.go 和 pkg/subagent/types.go 这两个文件中，把 Go 标识符
+  `MaxToolCalls` 的所有出现（包括代码引用和注释里的出现）都改名为 `ToolCallCap`。
+  不要改变 JSON struct tag 里的字符串 `json:"max_tool_calls"`（它是一个不同的
+  字符串字面量，不是目标标识符），也不要改变这两个文件里任何其它逻辑、格式或
+  非目标标识符。改完之后这两个文件里都不应该再出现 `MaxToolCalls` 这个词。
+context_files: [pkg/subagent/pool.go, pkg/subagent/types.go]
+tags: [go, coder, batch-edit]
+expect:
+  - files_changed: [pkg/subagent/pool.go, pkg/subagent/types.go]
+  - file_contains:
+      - path: pkg/subagent/pool.go
+        text: "ToolCallCap"
+      - path: pkg/subagent/types.go
+        text: "ToolCallCap"
+      # Preservation: the JSON struct tag is a different lexeme from the
+      # `MaxToolCalls` identifier and must survive the rename untouched
+      # (the task explicitly forbids touching it).
+      - path: pkg/subagent/types.go
+        text: 'json:"max_tool_calls"'
+      # Preservation: structural anchors unrelated to the rename, so a
+      # "replace the file with a stub" cheat cannot pass.
+      - path: pkg/subagent/types.go
+        text: "type SubagentConfig struct {"
+      - path: pkg/subagent/pool.go
+        text: "func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {"
+  - file_not_contains:
+      - path: pkg/subagent/pool.go
+        text: "MaxToolCalls"
+      - path: pkg/subagent/types.go
+        text: "MaxToolCalls"
+  - tool_calls_max: 30
