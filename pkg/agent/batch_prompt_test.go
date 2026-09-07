@@ -81,6 +81,44 @@ func TestBatchGuidance_WarnsAgainstSpeculativeBatching(t *testing.T) {
 	}
 }
 
+// TestBatchGuidance_ForbidsGrowingCallCountViaBatching: the M6 real-world
+// eval (glm-5.3, researcher role, 9 before/after runs each) found that after
+// batchToolCallsPrompt shipped, turns didn't drop (57 -> 58) while total
+// tool calls rose 94 -> 108 (+15%) — the model read "batch independent
+// calls" as license to speculatively fetch MORE things per turn, not as an
+// instruction to pack the SAME calls into fewer messages. The prior text
+// only taught how to find what to batch (a single grep/glob before
+// batching reads); it never said batching must not grow the total call
+// count, which is the precise failure the eval caught. The rule must be
+// concrete enough for a weak model to self-check against a specific call
+// it is about to add to a batch, not just an abstract principle — pin that
+// with a self-check phrase a model can apply per-call ("would I make this
+// call without batching? if not, don't add it").
+func TestBatchGuidance_ForbidsGrowingCallCountViaBatching(t *testing.T) {
+	if !strings.Contains(batchToolCallsPrompt, "call count") {
+		t.Errorf("batchToolCallsPrompt should say batching must not increase the total number of tool calls made:\n%s", batchToolCallsPrompt)
+	}
+	if !strings.Contains(batchToolCallsPrompt, "wouldn't make a call without batching") {
+		t.Errorf("batchToolCallsPrompt should give a concrete, per-call self-check (would I make this call without batching?) so a weak model can tell whether a call it's about to add belongs in the batch:\n%s", batchToolCallsPrompt)
+	}
+}
+
+// TestBatchGuidance_UnderWordBudget: every sentence added to this prompt
+// competes for the model's attention with every other sentence in it — the
+// M6 eval's own failure mode (batching read as "fetch more, not fewer
+// messages") was traced partly to the guidance already being dense enough
+// that a weak model could latch onto the wrong half of it. Cap it at 215
+// words so the fix for the missing "don't grow call count" rule is a
+// rewrite of the existing anti-speculation sentence, not a bolt-on that
+// makes the whole section harder to attend to.
+func TestBatchGuidance_UnderWordBudget(t *testing.T) {
+	const maxWords = 215
+	n := len(strings.Fields(batchToolCallsPrompt))
+	if n > maxWords {
+		t.Errorf("batchToolCallsPrompt is %d words, want <= %d:\n%s", n, maxWords, batchToolCallsPrompt)
+	}
+}
+
 // TestBatchGuidance_AbsentWithZeroParallelSafeTools: an agent with no
 // ParallelSafe tools at all (e.g. only bash, mutating) must not carry the
 // guidance — there is nothing to batch.

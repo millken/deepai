@@ -323,8 +323,9 @@ const batchToolCallsPrompt = "Batching independent tool calls: you can put multi
 	"when a later call needs an earlier call's result to know what to do — for example: grep to find a line " +
 	"number, then read_file that range; or read_file to see the current text, then edit_file it with an old_string " +
 	"you haven't actually confirmed yet. In that case, send the first call alone, wait for its result, then send " +
-	"the next. And don't batch on a guess: if you're not sure which files are relevant, find them first with one " +
-	"grep or glob, then batch reading exactly those files."
+	"the next. And don't batch on a guess — same rule for call count: if you wouldn't make a call without " +
+	"batching, don't make it just because you're batching. Unsure which files matter? Find them first with one " +
+	"grep or glob, then batch those."
 
 // dateNoteFormat is shared by buildTurnInjection and its tests: the
 // system-note-style date line appended to every turn injection, mirroring

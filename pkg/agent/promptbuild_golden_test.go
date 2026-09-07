@@ -119,8 +119,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "all_gates_on",
 			build:    buildGoldenAllGatesOn,
-			wantLen:  6722,
-			wantHash: "5dbe9b8f75396ff11f9653ec2b7557a798b23ad7144f52ef73285d5ef6636761",
+			wantLen:  6801,
+			wantHash: "f862dc352634875f08d996b73d31aabd3edd2f0a83472c41739acc516b2102e0",
 		},
 	}
 	for _, c := range cases {
