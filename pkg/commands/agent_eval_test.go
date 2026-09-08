@@ -31,6 +31,7 @@ import (
 type fakeTaskResult struct {
 	Status subagent.TaskStatus
 	Result string
+	Error  string
 	Usage  *subagent.TokenUsage
 	Stats  *subagent.RunStats
 }
@@ -48,6 +49,7 @@ func (f *fakePool) newTask(id string) *subagent.Task {
 		ID:     id,
 		Status: f.task.Status,
 		Result: f.task.Result,
+		Error:  f.task.Error,
 		Usage:  f.task.Usage,
 		Stats:  f.task.Stats,
 	}
@@ -831,6 +833,55 @@ func TestRunOneCase_WoundDownReason_DistinguishesDeadlineFromToolBudget(t *testi
 		if rec.WoundDownReason != reason {
 			t.Errorf("WoundDownReason = %q, want %q", rec.WoundDownReason, reason)
 		}
+	}
+}
+
+// TestRunOneCase_AgentLevelFailure_SurfacesAsRecordError is the RED test for
+// defect B (M6 latency-investigation brief): Pool.Wait returns (task, nil)
+// alike for EVERY terminal task.Status — Completed, Failed, TimedOut,
+// Cancelled — so a subagent whose Agent.Run itself returned a real error
+// (e.g. react.go's "final turn produced no tool calls and no output" guard,
+// defect A) reaches here with dispatchErr == nil, task.Status ==
+// TaskStatusFailed, and task.Error set to the agent's actual error message.
+// Before this fix, runOneCase only ever looked at dispatchErr — task.Status
+// and task.Error were never consulted — so rec.Error stayed "" and the run
+// was scored exactly like a clean success (rec.Output = task.Result,
+// assertions evaluated against it) with the real failure visible only
+// indirectly, if at all, through a mentions/not_mentions assertion failing
+// against garbage/empty output. This is the exact shape a real eval run
+// hit: runs.jsonl showed error="", output="", wound_down_reason="" for a
+// run that had, in fact, failed inside the agent.
+//
+// RED signature (today): rec.Error == "" despite task.Error being set.
+func TestRunOneCase_AgentLevelFailure_SurfacesAsRecordError(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "agent-failure-case",
+		"id: agent-failure-case\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - mentions: [\"analysis\"]\n",
+		nil)
+
+	const wantErr = "agent turn ended with no tool calls and no output"
+	pool := &fakePool{task: fakeTaskResult{
+		Status: subagent.TaskStatusFailed,
+		Result: "", // Execute's error path returns a zero-value ExecutionResult
+		Error:  wantErr,
+		Stats: &subagent.RunStats{
+			ToolCalls: 3,
+			LLMTurns:  2,
+		},
+	}}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if rec.Error != wantErr {
+		t.Fatalf("rec.Error = %q, want %q — an agent-level failure (task.Status=%q, task.Error set) must surface in the record, not be silently dropped", rec.Error, wantErr, subagent.TaskStatusFailed)
+	}
+	// Workload stats must still be recovered from task.Stats — an agent
+	// failure is not a dispatch timeout, so there's no recovery poll
+	// involved, but applyRunStats must still run.
+	if !rec.HasStats || rec.ToolCalls != 3 || rec.LLMTurns != 2 {
+		t.Errorf("workload stats not applied for a failed-but-terminal task: rec = %+v", rec)
 	}
 }
 

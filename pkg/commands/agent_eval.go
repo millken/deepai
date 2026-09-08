@@ -889,6 +889,54 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 		return rec, nil
 	}
 
+	// dispatchErr == nil only proves pool.Wait's <-task.done fired — the
+	// task reached SOME terminal state within the wait window. Per
+	// Pool.Wait's own contract (pkg/subagent/pool.go), that is true alike
+	// for TaskStatusCompleted, TaskStatusFailed, TaskStatusTimedOut, and
+	// TaskStatusCancelled: Wait never turns a Failed/TimedOut/Cancelled
+	// task.Status (or the task.Error a real Agent.Run error left behind —
+	// see pkg/subagent/pool.go's finishTask) into an error of its own. Every
+	// terminal status BUT Completed means the subagent itself did not
+	// produce a clean, validated result — most concretely, Agent.Run
+	// returning any error (react.go's "final turn produced no tool calls
+	// and no output" guard included) reaches here as task.Status=Failed,
+	// task.Result="" (Execute's error path returns a zero-value
+	// ExecutionResult — see pkg/agent/subagent.go), task.Error=<the real
+	// message>.
+	//
+	// Before this check, runOneCase only ever consulted dispatchErr, so an
+	// agent-level failure silently scored as a clean run: rec.Error stayed
+	// "", rec.Output took whatever empty/partial task.Result came back, and
+	// evaluateCase ran assertions against it — the real failure was visible
+	// only indirectly (if at all) through a mentions/not_mentions assertion
+	// failing against garbage output, exactly the shape a real eval run hit
+	// (error="", output="", wound_down_reason="" for a run that had, in
+	// fact, failed inside the agent).
+	//
+	// Treated identically to a dispatchErr above (same rec.Error/Assertions
+	// shape, same applyRunStats-then-return, no evaluateCase): there is no
+	// real, validated output to assert against here any more than there is
+	// for a dispatch timeout, and buildEvalSummary's existing r.Error != ""
+	// handling (a record contributes ONLY to DispatchErrors, skipping
+	// duration/token/assertion aggregation — see its doc comment) already
+	// exists precisely to keep "no usable result" runs out of those
+	// distributions. Reusing it here means every consumer of runs.jsonl
+	// that already understands r.Error != "" (eval summarize, f1e8dec)
+	// requires no change to recognize this new source of it.
+	if task.Status != subagent.TaskStatusCompleted || task.Error != "" {
+		rec.Error = task.Error
+		if rec.Error == "" {
+			// Defensive: a non-Completed status without an Error message
+			// would otherwise silently look like a clean run below (empty
+			// rec.Error) — shouldn't happen per Pool.finishTask's status
+			// mapping, but the record must never claim success by omission.
+			rec.Error = fmt.Sprintf("task ended with status %q and no error message", task.Status)
+		}
+		rec.Assertions = []assertionResult{{Name: "agent_error", Status: "fail", Detail: rec.Error}}
+		applyRunStats(&rec, task.Stats)
+		return rec, nil
+	}
+
 	rec.Output = task.Result
 	if task.Usage != nil {
 		rec.Tokens = task.Usage.TotalTokens

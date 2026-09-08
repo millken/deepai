@@ -629,7 +629,7 @@ func (p *repeatSuccessProvider) Stream(ctx context.Context, req llm.ChatRequest)
 	if p.callCount > 12 {
 		go func() {
 			defer close(ch)
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 		}()
 		return ch, nil
 	}
@@ -710,7 +710,7 @@ func (p *alternatingProvider) Stream(ctx context.Context, req llm.ChatRequest) (
 	if p.callCount > 20 {
 		go func() {
 			defer close(ch)
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 		}()
 		return ch, nil
 	}
@@ -1208,7 +1208,7 @@ func (p *parallelRepeatSuccessProvider) Stream(ctx context.Context, req llm.Chat
 	if p.callCount > 1 {
 		go func() {
 			defer close(ch)
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 		}()
 		return ch, nil
 	}
@@ -1286,7 +1286,7 @@ func (p *parallelRepeatSuccessProvider6) Stream(ctx context.Context, req llm.Cha
 	if p.callCount > 1 {
 		go func() {
 			defer close(ch)
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 		}()
 		return ch, nil
 	}
@@ -1377,7 +1377,7 @@ func (p *serialRepeatSuccessProvider) Stream(ctx context.Context, req llm.ChatRe
 	if p.callCount > 1 {
 		go func() {
 			defer close(ch)
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 		}()
 		return ch, nil
 	}
@@ -1713,7 +1713,7 @@ func (p *offloadTestProvider) Stream(ctx context.Context, req llm.ChatRequest) (
 	go func() {
 		defer close(ch)
 		if p.done {
-			ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+			ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 			return
 		}
 		p.done = true

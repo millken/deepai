@@ -83,7 +83,7 @@ func (p *budgetTaskCallProvider) Stream(ctx context.Context, req llm.ChatRequest
 	}
 	go func() {
 		defer close(ch)
-		ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 	}()
 	return ch, nil
 }
@@ -231,7 +231,7 @@ func (p *twoTaskCallBudgetProvider) Stream(ctx context.Context, req llm.ChatRequ
 	}
 	go func() {
 		defer close(ch)
-		ch <- llm.StreamChunk{Done: true, Stop: "stop"}
+		ch <- llm.StreamChunk{Delta: "done", Done: true, Stop: "stop"}
 	}()
 	return ch, nil
 }

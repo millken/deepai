@@ -166,7 +166,7 @@ func (p *budgetReportingProvider) Stream(ctx context.Context, req llm.ChatReques
 	}
 	go func() {
 		defer close(ch)
-		ch <- llm.StreamChunk{Usage: usage, Done: true, Stop: "stop"}
+		ch <- llm.StreamChunk{Delta: "done", Usage: usage, Done: true, Stop: "stop"}
 	}()
 	return ch, nil
 }

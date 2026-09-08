@@ -884,24 +884,43 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// output truncation, so just warn and end the run below.
 				a.logger.Warn("output truncated (max_tokens/length) and no tool calls; compaction cannot help output truncation", "turn", turn, "stop_reason", stopReason)
 			}
-			if wrapUp && strings.TrimSpace(assistantMessage.Content) == "" {
-				// The forced tool-less wrap-up turn produced NOTHING: every
-				// executed tool call's work would be silently discarded behind
-				// a "successful" run with an empty FinalOutput. Surface a loud
-				// error instead so the parent model can see the failure and
-				// react (retry, narrower delegation, ...). A normal empty
-				// final turn (no wrap-up) keeps its historical nil-error
-				// behavior — only wrap-up emptiness means work was lost.
+			if strings.TrimSpace(assistantMessage.Content) == "" {
+				// A turn that calls no tools AND produces no text is never a
+				// legitimate success, wrap-up or not: every consumer of
+				// FinalOutput (the task tool's caller, REPL rendering, eval
+				// assertions) treats "" as "nothing happened", never as a
+				// deliberate answer, and no role contract (.deepai/agents/
+				// *.yaml, none of which even sets output_schema today) records
+				// an empty final answer as valid. Before this guard moved out
+				// of `if wrapUp`, a PLAIN final turn (no wrap-up at all) that
+				// ended this way returned (assistantMessage.Content, nil) —
+				// success, with the caller only finding out something was
+				// wrong when its own downstream assertions failed on the
+				// empty string. That is the exact shape a real eval run hit:
+				// turn 0 called a tool, turn 1 ended the stream normally
+				// (Stop: "stop") with no text and no tool calls, well before
+				// any deadline or tool-call budget — Run reported success
+				// with FinalOutput="" and err==nil.
 				//
-				// F2: the message names the REAL trigger (see
-				// woundDownReason) — a wall-clock wrap-up has no tool call
-				// budget to speak of (a.maxToolCalls may be 0/unlimited),
-				// so that wording would be nonsensical here.
+				// Known gap (out of scope here): this guard only fires at a
+				// turn boundary. A single final turn that itself runs long
+				// (streaming for a while before ending empty, or stalling)
+				// isn't caught any sooner by this check — that needs watching
+				// the wall clock DURING generation, which collides with
+				// consumeStream's idle watchdog and belongs in its own pass.
+				//
+				// F2 (unchanged, 0d88bc5): a wrap-up's message names the REAL
+				// trigger via woundDownReason — a wall-clock wrap-up has no
+				// tool call budget to speak of (a.maxToolCalls may be
+				// 0/unlimited), so that wording would be nonsensical there.
 				var err error
-				if woundDownReason == WoundDownReasonDeadline {
+				switch {
+				case wrapUp && woundDownReason == WoundDownReasonDeadline:
 					err = errors.New("agent's wall-clock deadline forced a wrap-up and the wrap-up turn produced no output")
-				} else {
+				case wrapUp:
 					err = fmt.Errorf("agent exceeded tool call budget (%d) and the wrap-up turn produced no output", a.maxToolCalls)
+				default:
+					err = errors.New("agent turn ended with no tool calls and no output")
 				}
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return newRunResult(runMessages, ""), err
