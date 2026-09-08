@@ -1429,9 +1429,10 @@ func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.To
 // REAL system prompt a dispatched subagent gets is
 // (*agent.Agent).BuildSystemPrompt()'s output, which additionally appends,
 // gated on the subagent's RESTRICTED tool set: the file-operation rule
-// (hasAnyFileTool), search-tool recommendations (hasSearchTools), the
-// M6-latency batch-tool-calls guidance (hasMultipleParallelSafeTools /
-// batchToolCallsPrompt), and todo-tool guidance (hasTodoTool). The M6
+// (hasAnyFileTool), search-tool recommendations (hasSearchTools), and
+// todo-tool guidance (hasTodoTool). At the time this was written the M6
+// batch-tool-calls guidance was a fourth such section; it has since been
+// removed, but it is what exposed the defect described below. The M6
 // period added batchToolCallsPrompt (~1.1KB) to the system prompt of all
 // five tested roles, and the old fingerprint formula did not move a single
 // byte — every role's fingerprint stayed identical across a real prompt

@@ -57,8 +57,8 @@ func (a *Agent) BuildSystemPrompt() string {
 // AssembleSystemPrompt computes and joins the ordered, session-stable
 // system prompt BuildSystemPrompt assembles: the base role prompt, then
 // each gated section in registration order (file-op rule, search-tool
-// recommendations, batch-tool-calls guidance, todo-tool guidance,
-// delegation) — everything BuildSystemPrompt produces EXCEPT the plan-mode
+// recommendations, todo-tool guidance, delegation) — everything
+// BuildSystemPrompt produces EXCEPT the plan-mode
 // tail (appendPlanModePrompt), which needs live *Agent state (a.planMode,
 // a.planFile) with no meaning outside a running agent, and is
 // unconditionally a no-op for a NonInteractive one anyway: New() only ever
@@ -128,23 +128,6 @@ func assembleSystemPromptSections(base string, toolReg *tools.Registry, nonInter
 		sections = append(sections, builtin.GetToolRecommendations())
 	}
 
-	// M6 latency: the real-world eval (glm-5.3, 45 runs) found per-turn
-	// latency dominated by model generation (46-48s median) while tool
-	// execution itself is millisecond-cheap, and median tool-calls-per-turn
-	// was 1.50, never exceeding 2.00 across 45 runs — the harness
-	// (partitionToolCalls, toolexec.go) already supports an unbounded number
-	// of parallel-safe calls in one assistant message, but nothing in the
-	// system prompt ever told the model that was allowed, let alone why it
-	// matters. Gated on 2+ ParallelSafe tools: with 0 or 1, there is nothing
-	// to batch and the text would be pure noise (mirrors hasAnyFileTool/
-	// hasSearchTools/hasTodoTool above). This is STATIC — whether to batch
-	// never varies turn to turn — so it belongs in the stable system prompt,
-	// never buildTurnInjection (see that function's doc comment on why mixing
-	// stable and volatile content there breaks the M4-2 prefix cache).
-	if hasMultipleParallelSafeTools(toolReg) {
-		sections = append(sections, batchToolCallsPrompt)
-	}
-
 	// M5 todo tool: this guidance is STATIC (when to build/update a plan
 	// never changes turn to turn), unlike the todo LIST itself (which
 	// changes every todo_write call and therefore lives in buildTurnInjection
@@ -212,28 +195,6 @@ func hasTodoTool(toolReg *tools.Registry) bool {
 	return toolReg.Get("todo_write") != nil
 }
 
-// hasMultipleParallelSafeTools reports whether at least two of toolReg's
-// currently registered tools (read AFTER any plan-mode restriction, so it
-// reflects the tool set actually in play) declare ParallelSafe.
-// batchToolCallsPrompt only pays for itself when there are at least two such
-// tools to batch together; with 0 or 1 there is nothing to combine and the
-// guidance would just be dead weight in the prompt.
-func hasMultipleParallelSafeTools(toolReg *tools.Registry) bool {
-	if toolReg == nil {
-		return false
-	}
-	n := 0
-	for _, tool := range toolReg.List() {
-		if tool.ParallelSafe {
-			n++
-			if n >= 2 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // todoUsagePrompt is deliberately NOT a mandate ("you must call todo_write
 // before any tool use") — the M5 todo-tool design explicitly rejects
 // enforcing that (no gate blocking other tools until a plan exists). It only
@@ -262,70 +223,6 @@ const todoUsagePrompt = "Task planning: before starting a multi-step task (anyth
 	"When every item is finished, call it once more with every item marked done — do not clear the list to signal " +
 	"completion; a cleared list looks identical to a task that was never planned. Skip it for a quick single-step " +
 	"request."
-
-// batchToolCallsPrompt is the M6-latency guidance teaching the model that
-// independent tool calls can and should be issued together in one assistant
-// message. See hasMultipleParallelSafeTools for the gate; see this file's
-// BuildSystemPrompt call site for why it must stay static (system prompt,
-// not buildTurnInjection).
-//
-// Written for a weak (GLM-class, not Claude) model: it states the permission
-// explicitly rather than assuming the model already knows batching is legal,
-// gives concrete same-shape examples for the merge case (so the model
-// pattern-matches instead of reasoning from a principle), and spells out the
-// dependency case that a weak model most often gets wrong — chaining a
-// read/edit or a grep/read pair into one message before the first call's
-// result is known, which sends the second call with stale or guessed
-// arguments (e.g. an edit_file old_string it never actually confirmed, or a
-// read_file line range it never actually located).
-//
-// Review hardening: the first draft only gave read/grep examples and its
-// sole edit-shaped example was the negative (dependent) case, which a weak
-// model could easily over-read as "never batch edits" — exactly backwards,
-// since partitionToolCalls (toolexec.go) already runs every unsafe call
-// (edit_file, write_file, bash, ...) sequentially within the SAME turn, so
-// batching them costs one round trip instead of several and is safe because
-// each one sees the previous one's effect before it runs. The wording also
-// used to claim the whole batch "will run together, not one at a time",
-// which is only true of the parallel-safe calls; it now says explicitly that
-// reads run concurrently and mutations run in order, so it no longer
-// mispromises concurrency it can't deliver for edits. Finally, it now warns
-// against speculative batching: a model that internalizes "batch when
-// independent" too eagerly can guess a large batch of maybe-relevant reads,
-// trading fewer turns for wasted context — the fix is to say "batch only
-// once you already know what you need" and route the not-sure case through
-// a single grep/glob first (itself a dependent, unbatched call) before
-// batching the reads it turns up.
-//
-// Second review hardening: the "independent mutating calls (edit_file,
-// write_file, bash, ...)" parenthetical classifies tools by a read-only-vs-
-// mutating axis that is NOT the axis the harness actually schedules on
-// (ParallelSafe, see hasMultipleParallelSafeTools). task is
-// ParallelSafe: true (pkg/tools/subagent.go) even though it obviously
-// mutates — a delegated sub-agent edits files and runs git — so by this
-// sentence's own read-only-vs-mutating logic a model would naturally bucket
-// task under "mutating calls ... run one at a time", concluding two batched
-// task calls run serially and the second sees the first's on-disk effect.
-// They do not: react.go's partitionToolCalls fuses consecutive ParallelSafe
-// calls, task included, into one concurrent segment (react.go:845-853).
-// That false belief also collides with this same system prompt's
-// "## Parallel delegation" section, which requires serial task calls when
-// one depends on another's result. Closing the "..." into a fixed list
-// would not fix this: the mismatch is the classification axis itself, not
-// which tools are named, so task must be excepted by name.
-const batchToolCallsPrompt = "Batching independent tool calls: you can put multiple tool calls in a single message " +
-	"instead of one call per message. Independent read-only calls (read_file, grep, ...) run concurrently; " +
-	"independent mutating calls (edit_file, write_file, bash, ...; task is the exception — see Parallel delegation) " +
-	"run one at a time in the order you sent them, so " +
-	"a later one sees an earlier one's effect on disk — either way, the whole batch is one round trip instead of " +
-	"several. Batch whenever you already know what you need: reading several files, grepping for several symbols, " +
-	"editing several different files, or making several known edits to one file you've already read. Do NOT batch " +
-	"when a later call needs an earlier call's result to know what to do — for example: grep to find a line " +
-	"number, then read_file that range; or read_file to see the current text, then edit_file it with an old_string " +
-	"you haven't actually confirmed yet. In that case, send the first call alone, wait for its result, then send " +
-	"the next. And don't batch on a guess — same rule for call count: if you wouldn't make a call without " +
-	"batching, don't make it just because you're batching. Unsure which files matter? Find them first with one " +
-	"grep or glob, then batch those."
 
 // dateNoteFormat is shared by buildTurnInjection and its tests: the
 // system-note-style date line appended to every turn injection, mirroring

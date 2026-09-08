@@ -1158,103 +1158,19 @@ func TestCaseFingerprint_ProjectSkillBodyChangeMovesFingerprint(t *testing.T) {
 	}
 }
 
-// noopEvalTool builds a minimal registerable models.Tool for fingerprint
-// gate tests — a stand-in for a real builtin tool that lets the test control
-// ParallelSafe directly, without needing the real builtin constructors.
-func noopEvalTool(name string, parallelSafe bool) models.Tool {
-	return models.Tool{
-		Name:         name,
-		ParallelSafe: parallelSafe,
-		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
-			return models.ToolResult{}, nil
-		},
-	}
-}
-
-// TestCaseFingerprint_SensitiveToBatchToolCallsPromptGate is the RED test
-// for the caseFingerprint defect this period fixes: the OLD formula (hash of
-// resolveEvalSystemPrompt's bare role prompt + skill bodies + schema prompt)
-// never moved when BuildSystemPrompt's gated sections changed — in
-// particular, this period's own batchToolCallsPrompt addition (~1.1KB,
-// gated on 2+ ParallelSafe tools in the subagent's RESTRICTED tool set)
-// left all five tested roles' fingerprints byte-identical despite a real
-// ~1KB system-prompt change. Reproduces that gate directly: the same
-// architect agent_type, project-YAML-free, dispatched against two
-// candidate tool lists that differ ONLY in ParallelSafe — one crossing the
-// hasMultipleParallelSafeTools threshold (2+), one staying under it (0) —
-// so SelectSubagentTools resolves the identical NAMES (architect's
-// DefaultTools) both times and only the gate's answer differs. A
-// fingerprint that covers the real BuildSystemPrompt output must change
-// here; the pre-fix formula would not (it never even looked at the tool
-// set).
-func TestCaseFingerprint_SensitiveToBatchToolCallsPromptGate(t *testing.T) {
-	repoRoot := t.TempDir()
-	// architect's builtin DefaultTools: read_file, grep, glob, list_dir,
-	// find, code_map (pkg/agent/types_config.go).
-	names := []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"}
-
-	withoutBatch := make([]models.Tool, len(names))
-	for i, n := range names {
-		withoutBatch[i] = noopEvalTool(n, false)
-	}
-	withBatch := make([]models.Tool, len(names))
-	for i, n := range names {
-		withBatch[i] = noopEvalTool(n, true)
-	}
-
-	fpWithout, err := caseFingerprint("architect", repoRoot, withoutBatch, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint (0 ParallelSafe tools): %v", err)
-	}
-	fpWith, err := caseFingerprint("architect", repoRoot, withBatch, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint (6 ParallelSafe tools): %v", err)
-	}
-
-	if fpWithout == fpWith {
-		t.Fatalf("caseFingerprint did not change when the restricted tool set crossed the hasMultipleParallelSafeTools threshold (both %q) — the fingerprint is not covering batchToolCallsPrompt's gated section", fpWithout)
-	}
-}
-
-// TestCaseFingerprint_SensitiveToUnderTwoParallelSafeTools is the "role has
-// fewer than 2 parallel-safe tools" variant the task brief calls out
-// explicitly: exactly ONE ParallelSafe tool must produce the SAME
-// fingerprint as zero (batchToolCallsPrompt absent both times — see
-// hasMultipleParallelSafeTools' >=2 threshold), while crossing to two must
-// differ from both.
-func TestCaseFingerprint_SensitiveToUnderTwoParallelSafeTools(t *testing.T) {
-	repoRoot := t.TempDir()
-	names := []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"}
-
-	zero := make([]models.Tool, len(names))
-	one := make([]models.Tool, len(names))
-	two := make([]models.Tool, len(names))
-	for i, n := range names {
-		zero[i] = noopEvalTool(n, false)
-		one[i] = noopEvalTool(n, i == 0)
-		two[i] = noopEvalTool(n, i < 2)
-	}
-
-	fpZero, err := caseFingerprint("architect", repoRoot, zero, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint (0 ParallelSafe): %v", err)
-	}
-	fpOne, err := caseFingerprint("architect", repoRoot, one, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint (1 ParallelSafe): %v", err)
-	}
-	fpTwo, err := caseFingerprint("architect", repoRoot, two, nil)
-	if err != nil {
-		t.Fatalf("caseFingerprint (2 ParallelSafe): %v", err)
-	}
-
-	if fpZero != fpOne {
-		t.Errorf("caseFingerprint differs between 0 and 1 ParallelSafe tools (%q vs %q) — batchToolCallsPrompt needs >=2 to earn its place, so both should be absent and the fingerprint identical", fpZero, fpOne)
-	}
-	if fpTwo == fpOne {
-		t.Errorf("caseFingerprint did not change crossing from 1 to 2 ParallelSafe tools (%q) — batchToolCallsPrompt should now be present", fpTwo)
-	}
-}
+// TestCaseFingerprint_SensitiveToBatchToolCallsPromptGate and
+// TestCaseFingerprint_SensitiveToUnderTwoParallelSafeTools used to live here,
+// pinning that caseFingerprint moved when a role's restricted tool set
+// crossed hasMultipleParallelSafeTools' >=2-ParallelSafe threshold (the gate
+// for batchToolCallsPrompt, M6 latency). Both are removed along with
+// batchToolCallsPrompt itself: a real-world eval (glm-5.3) found the prompt
+// never reduced turn count on any of three task shapes it was tried against,
+// while adding ~15% more tool calls on one of them — see the
+// batchToolCallsPrompt removal commit for the measurement and
+// pkg/agent/promptbuild.go's git history for the removed gate/prompt. With
+// no gate left that reads a tool's ParallelSafe field, these two tests would
+// only assert that caseFingerprint changes when it no longer has any reason
+// to — keeping them would pin dead behavior, not catch a regression.
 
 // ---------------------------------------------------------------------------
 // Equivalence: the harness's fingerprint input must be byte-identical to

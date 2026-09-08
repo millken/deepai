@@ -36,8 +36,7 @@ import (
 // BuildSystemPrompt output is never byte-stable across two runs even
 // without any refactor — plan mode's behavior is instead pinned by the
 // extensive strings.Contains-based tests already in this package
-// (TestBatchGuidance_PresentInPlanMode and neighbors in batch_prompt_test.go,
-// TestTeamDelegation_OmittedInPlanMode and neighbors in systemprompt_test.go).
+// (TestTeamDelegation_OmittedInPlanMode and neighbors in systemprompt_test.go).
 
 func goldenNoopHandler(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
 	return models.ToolResult{}, nil
@@ -59,22 +58,28 @@ func buildGoldenInteractiveWithDelegation() string {
 	return a.BuildSystemPrompt()
 }
 
-// buildGoldenAllGatesOn turns EVERY assembleSystemPromptSections gate on at
-// once: file tools + grep (fileop + search), two ParallelSafe tools (batch),
-// todo_write (todo), and task + a non-empty catalog while interactive
-// (delegation). Unlike buildGoldenInteractiveWithDelegation above — which
-// only has ONE ParallelSafe tool (grep) and so never crosses
-// hasMultipleParallelSafeTools' >=2 threshold — read_file here is
-// registered ParallelSafe: true too, so batch actually fires.
+// buildGoldenAllGatesOn turns EVERY remaining assembleSystemPromptSections
+// gate on at once: file tools + grep (fileop + search), todo_write (todo),
+// and task + a non-empty catalog while interactive (delegation). Unlike
+// buildGoldenInteractiveWithDelegation above, which omits todo_write, this
+// case carries both the todo and delegation sections at once (read_file and
+// grep are still registered ParallelSafe: true — harmless now that no gate
+// reads ParallelSafe, kept only so this fixture still resembles a real file+
+// search-tool registry).
 //
 // This is the fix for a real, verified golden-test blind spot (M1 mutation:
-// swapping the batch and todo sections in assembleSystemPromptSections was
-// invisible to the pre-existing two cases, because NEITHER case ever
-// carried both sections at once — buildGoldenInteractiveWithDelegation
-// omits todo_write, and its single ParallelSafe tool (grep) means batch
-// itself is silently absent too; buildGoldenNonInteractiveBashOnly has
-// neither). One hash here pins the presence AND relative order of all five
-// section kinds (BASE, FILEOP, SEARCH, BATCH, TODO, DELEG) simultaneously.
+// swapping the (then also present) batch and todo sections in
+// assembleSystemPromptSections was invisible to the pre-existing two cases,
+// because NEITHER case ever carried both sections at once —
+// buildGoldenInteractiveWithDelegation omits todo_write; buildGoldenNon
+// InteractiveBashOnly has neither). One hash here pins the presence AND
+// relative order of all section kinds (BASE, FILEOP, SEARCH, TODO, DELEG)
+// simultaneously. batchToolCallsPrompt (M6 latency) was removed after a
+// real-world eval found it never reduced turn count on any of three task
+// shapes while adding ~15% more tool calls on one of them — see this
+// package's git history (the batchToolCallsPrompt removal commit) for the
+// measurement. This case's hash changed as a result; its coverage of the
+// TODO/DELEG ordering is unaffected and stays valuable.
 func buildGoldenAllGatesOn() string {
 	reg := tools.NewRegistry()
 	_ = reg.Register(models.Tool{Name: "read_file", ParallelSafe: true, Handler: goldenNoopHandler})
@@ -119,8 +124,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "all_gates_on",
 			build:    buildGoldenAllGatesOn,
-			wantLen:  6801,
-			wantHash: "f862dc352634875f08d996b73d31aabd3edd2f0a83472c41739acc516b2102e0",
+			wantLen:  5559,
+			wantHash: "b7135ca3ae6fc91e6df7000e45c87d895e14119eba0e53c2079978b78bd38eda",
 		},
 	}
 	for _, c := range cases {
