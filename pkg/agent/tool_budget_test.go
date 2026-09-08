@@ -123,6 +123,13 @@ func TestRun_ToolCallBudget_GracefulWrapUp(t *testing.T) {
 	if !result.BudgetExhausted {
 		t.Fatal("BudgetExhausted = false, want true after a wrap-up")
 	}
+	// M6: WoundDownReason must say WHY — the tool-call budget here, never
+	// the wall-clock deadline (Run was given no ctx deadline at all in this
+	// test) — so a caller (in particular the eval harness's runs.jsonl) can
+	// tell the two wrap-up triggers apart.
+	if result.WoundDownReason != WoundDownReasonToolBudget {
+		t.Fatalf("WoundDownReason = %q, want %q", result.WoundDownReason, WoundDownReasonToolBudget)
+	}
 }
 
 // emptyWrapUpProvider emits tool calls while tools are offered, and on the

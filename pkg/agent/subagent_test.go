@@ -19,6 +19,60 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
+// ---------------------------------------------------------------------------
+// mergeWoundDownReason: M7 (M6 review) — the guard that keeps a later
+// schema-retry attempt's EMPTY WoundDownReason from erasing an earlier
+// attempt's real one.
+// ---------------------------------------------------------------------------
+
+// TestMergeWoundDownReason is the RED test for M7: mergeWoundDownReason
+// doesn't exist yet, so this fails to compile until it's added (extracted,
+// behavior-preserving, from Execute's accumulateStats closure at
+// subagent.go's "if r.WoundDownReason != ..." guard).
+//
+// The scenario this exists to pin: a Strict-OutputSchema subagent whose
+// FIRST attempt wound down via the wall-clock deadline (BudgetExhausted=true,
+// WoundDownReason="deadline") but produced schema-invalid output, triggering
+// a retry — whose SECOND attempt completes normally (no wind-down at all,
+// WoundDownReason=""). accumulateStats ORs BudgetExhausted across every
+// attempt (so it stays true), but WoundDownReason must NOT go back to empty
+// just because the LATER attempt didn't wind down — that would leave
+// runs.jsonl with an internally-inconsistent budget_exhausted=true paired
+// with an empty wound_down_reason, exactly the defect the removed guard
+// would reintroduce.
+//
+// (An end-to-end test driving this through Execute with two REAL Agent.Run
+// attempts isn't feasible: both attempts share the exact same ctx, so a ctx
+// deadline tight enough to wind attempt 1 down via the wall-clock trigger
+// would almost certainly also still be expired by the time attempt 2 starts,
+// making a "the retry then completes NORMALLY" attempt-2 shape unreachable
+// in practice. Testing the extracted merge rule directly, at the exact
+// guarded line, is the precise and deterministic alternative.)
+func TestMergeWoundDownReason(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		attempt WoundDownReason
+		want    string
+	}{
+		{"first attempt sets it", "", WoundDownReasonDeadline, "deadline"},
+		{"a later attempt WITH a reason overwrites", "deadline", WoundDownReasonToolBudget, "tool_budget"},
+		{
+			"a later attempt with NO wind-down preserves the earlier reason — the exact guard M7 protects",
+			"deadline", "", "deadline",
+		},
+		{"no reason anywhere stays empty", "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := mergeWoundDownReason(c.current, c.attempt)
+			if got != c.want {
+				t.Fatalf("mergeWoundDownReason(%q, %q) = %q, want %q", c.current, c.attempt, got, c.want)
+			}
+		})
+	}
+}
+
 type fakeUI struct{ tools.UserInteraction }
 
 // A subagent strips inherited UserInteraction so delegated work never prompts

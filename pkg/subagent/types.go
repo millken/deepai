@@ -130,6 +130,14 @@ type RunStats struct {
 	SchemaRetries   int    `json:"schema_retries"`
 	MaxToolCalls    int    `json:"max_tool_calls"`
 	BudgetExhausted bool   `json:"budget_exhausted"`
+	// WoundDownReason says WHY BudgetExhausted is true, when it is: "deadline"
+	// (the wall-clock ctx deadline was close — M6) or "tool_budget"
+	// (MaxToolCalls was exhausted). Empty when BudgetExhausted is false.
+	// Plain string, not agent.WoundDownReason: pkg/agent already imports
+	// pkg/subagent, so this package importing agent back would cycle — see
+	// agent.WoundDownReason's doc comment for the canonical values this
+	// mirrors.
+	WoundDownReason string `json:"wound_down_reason,omitempty"`
 	DurationMS      int64  `json:"duration_ms"`
 }
 

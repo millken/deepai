@@ -716,6 +716,11 @@ type runRecord struct {
 	LLMTurns        int  `json:"llm_turns"`
 	MaxToolCalls    int  `json:"max_tool_calls"`
 	BudgetExhausted bool `json:"budget_exhausted"`
+	// WoundDownReason distinguishes WHY BudgetExhausted is true (M6): the
+	// wall-clock deadline ("deadline") or the tool-call budget ("tool_budget")
+	// — see subagent.RunStats.WoundDownReason. Without this, runs.jsonl could
+	// never confirm the wall-clock wrap-up path actually fired during an eval.
+	WoundDownReason string `json:"wound_down_reason,omitempty"`
 	// HasStats records whether task.Stats was actually available for this
 	// run, distinguishing a genuine zero (a run that made no tool calls)
 	// from "we never got Stats at all" (e.g. a dispatch timeout whose
@@ -810,14 +815,51 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 
 	before := chat.TakeWorktreeSnapshot(worktree)
 
+	// dispatchCtx bounds pool.StartTask — it's what the subagent itself sees
+	// as its ctx deadline (Pool.runTask derives runCtx from it when no
+	// task/pool-level Timeout is separately configured), so it must stay
+	// exactly opts.Timeout: that's the window react.go's wall-clock wrap-up
+	// (M6) sizes its own reserve against.
+	//
+	// waitCtx is DELIBERATELY wider (see evalWaitGrace): a subagent whose
+	// wall-clock wrap-up fires can legitimately keep running past
+	// dispatchCtx's deadline by up to its own reserve to produce a real
+	// final answer instead of being killed mid-generation. If Wait used
+	// dispatchCtx directly, it would give up and report a dispatch timeout
+	// at the exact moment the subagent is gracefully finishing — discarding
+	// the very output this feature exists to keep (see dispatchEvalTask's
+	// recoverTimedOutStats path for the pre-existing, narrower safety net
+	// this complements, not replaces: that poll is a short fixed budget for
+	// recovering STATS after a real timeout, not a substitute for waiting
+	// out an expected graceful wrap-up).
+	//
+	// The overshoot this must absorb is bounded to at most ONE reserve — not
+	// "half of dispatchCtx's window" on its own, and not per-request either.
+	// react.go's wrapUpReserve caps a SINGLE reserve to at most half of
+	// dispatchCtx's window, but a subagent's wrap-up phase can legitimately
+	// take more than one request (compaction retries re-entering it); before
+	// M6's F4 fix, EACH such request got handed a full fresh reserve again,
+	// so the cumulative overshoot across a whole Run was unbounded by
+	// construction (up to 4 full reserves observed possible, dwarfing the
+	// grace this constant provides). react.go's capCumulativeWrapUpBudget
+	// (wrapup_wallclock.go) now caps the ENTIRE wrap-up phase — every
+	// request in it combined — to at most that one reserve's worth of
+	// overshoot, which is what makes "at most half of dispatchCtx's window,
+	// full stop" true here.
 	dispatchCtx := ctx
-	var cancel context.CancelFunc
+	var dispatchCancel context.CancelFunc
+	waitCtx := ctx
+	var waitCancel context.CancelFunc
 	if opts.Timeout > 0 {
-		dispatchCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		dispatchCtx, dispatchCancel = context.WithTimeout(ctx, opts.Timeout)
+		waitCtx, waitCancel = context.WithTimeout(ctx, opts.Timeout+evalWaitGrace(opts.Timeout))
 	}
-	task, dispatchErr := dispatchEvalTask(dispatchCtx, pool, c, contextFiles, opts.Budget)
-	if cancel != nil {
-		cancel()
+	task, dispatchErr := dispatchEvalTask(dispatchCtx, waitCtx, pool, c, contextFiles, opts.Budget)
+	if dispatchCancel != nil {
+		dispatchCancel()
+	}
+	if waitCancel != nil {
+		waitCancel()
 	}
 
 	after := chat.TakeWorktreeSnapshot(worktree)
@@ -875,6 +917,43 @@ func applyRunStats(rec *runRecord, stats *subagent.RunStats) {
 	rec.LLMTurns = stats.LLMTurns
 	rec.MaxToolCalls = stats.MaxToolCalls
 	rec.BudgetExhausted = stats.BudgetExhausted
+	rec.WoundDownReason = stats.WoundDownReason
+}
+
+// evalWaitGraceCapFraction/evalWaitGraceSlop shape evalWaitGrace's extra
+// allowance for pool.Wait, on top of pool.StartTask's opts.Timeout — see
+// evalWaitGrace's doc comment for why Wait needs its own, wider budget.
+// half of opts.Timeout mirrors the exact cap react.go's wrapUpReserve
+// enforces on the subagent's own wall-clock reserve (never more than half of
+// ITS deadline, which IS opts.Timeout here — see dispatchEvalTask's doc
+// comment), so this is not a separate guess: it's sized to the worst case
+// the subagent side can actually produce. The fixed slop on top absorbs the
+// pool's own unwind bookkeeping (finishTask's mutex-guarded field writes,
+// channel close, this process's scheduler latency) rather than being tuned
+// against the wrap-up formula.
+const evalWaitGraceCapFraction = 0.5
+
+// evalWaitGraceSlop is a var, not a const, SPECIFICALLY so a test can shrink
+// it (save/restore around the test) to a value small enough that a fast test
+// can force evalWaitGraceCapFraction's PROPORTIONAL term to dominate the
+// grace window without waiting out a real multi-second slop — see
+// TestEvalWaitGrace_CapFractionContributesMeaningfully, the coverage gap the
+// M6 review found: with the real 5s slop and any Timeout small enough for a
+// fast test, the proportional term (capFraction*Timeout, milliseconds) is
+// completely swamped by the slop, so a test built that way can never
+// actually exercise capFraction at all — zeroing it out entirely left the
+// package green. The DEFAULT here (5s) is unchanged from before; only tests
+// override it.
+var evalWaitGraceSlop = 5 * time.Second
+
+// evalWaitGrace returns the extra time pool.Wait's ctx gets beyond
+// pool.StartTask's opts.Timeout (0 if timeout <= 0, matching "no timeout at
+// all" for both).
+func evalWaitGrace(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 0
+	}
+	return time.Duration(float64(timeout)*evalWaitGraceCapFraction) + evalWaitGraceSlop
 }
 
 // dispatchEvalTask calls pool.StartTask+Wait, recovering any panic from
@@ -882,13 +961,21 @@ func applyRunStats(rec *runRecord, stats *subagent.RunStats) {
 // subagent must not leak a bad cwd" provable in a test: the panic never
 // escapes this function, so the caller's chdir-restore always runs on the
 // normal return path, not by accident of unwinding.
-func dispatchEvalTask(ctx context.Context, pool evalTaskPool, c evalCase, contextFiles []string, budget int) (task *subagent.Task, err error) {
+//
+// startCtx and waitCtx are deliberately DIFFERENT contexts (see runOneCase's
+// doc comment on the call site): startCtx is what actually bounds the
+// dispatched subagent (handed to pool.StartTask, and from there to
+// Pool.runTask's runCtx), while waitCtx — handed only to pool.Wait — carries
+// the M6 wall-clock grace on top, so a subagent that gracefully wraps up a
+// little past startCtx's deadline is still waited out instead of being
+// reported as a dispatch timeout.
+func dispatchEvalTask(startCtx, waitCtx context.Context, pool evalTaskPool, c evalCase, contextFiles []string, budget int) (task *subagent.Task, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic dispatching case %s/%s: %v", c.AgentType, c.ID, r)
 		}
 	}()
-	started, startErr := pool.StartTask(ctx, "eval:"+c.AgentType+"/"+c.ID, c.Manifest.Task, subagent.SubagentConfig{
+	started, startErr := pool.StartTask(startCtx, "eval:"+c.AgentType+"/"+c.ID, c.Manifest.Task, subagent.SubagentConfig{
 		AgentType:    c.Manifest.AgentType,
 		ContextFiles: contextFiles,
 		TokenBudget:  budget,
@@ -896,17 +983,21 @@ func dispatchEvalTask(ctx context.Context, pool evalTaskPool, c evalCase, contex
 	if startErr != nil {
 		return nil, startErr
 	}
-	completed, waitErr := pool.Wait(ctx, started.ID)
+	completed, waitErr := pool.Wait(waitCtx, started.ID)
 	if waitErr != nil {
-		// Wait bailed on its own ctx (opts.Timeout in runOneCase), not
-		// because the task reached a terminal state — per Pool.Wait's
+		// Wait bailed on ITS OWN ctx (waitCtx: opts.Timeout + evalWaitGrace),
+		// not because the task reached a terminal state — per Pool.Wait's
 		// contract the task entry is deliberately left in the pool so it
-		// can keep running (Pool.runTask's runCtx derives from the same ctx
-		// StartTask received, so the subagent is already unwinding from
-		// cancellation, just not done unwinding yet). Recover its Stats if
-		// the pool can still give them to us; this is the run.jsonl's
-		// right-tail sample for a tool-call budget, so it's worth a short,
-		// bounded wait rather than losing it outright.
+		// can keep running (Pool.runTask's runCtx derives from startCtx, so
+		// the subagent is already unwinding from cancellation — its OWN
+		// deadline, opts.Timeout, is what fired — just not done unwinding
+		// yet). Recover its Stats if the pool can still give them to us;
+		// this is the run.jsonl's right-tail sample for a tool-call budget,
+		// so it's worth a short, bounded wait rather than losing it
+		// outright. Reaching this branch at all now means BOTH the
+		// subagent's wall-clock wrap-up (if it triggered) AND the extra
+		// wait grace were exhausted — a genuine, unrecovered timeout, not
+		// the expected-overshoot case evalWaitGrace exists to absorb.
 		if recovered := recoverTimedOutStats(pool, started.ID); recovered != nil {
 			return recovered, waitErr
 		}

@@ -33,7 +33,33 @@ type RunResult struct {
 	ToolCalls       int  `json:"tool_calls"`
 	LLMTurns        int  `json:"llm_turns"`
 	BudgetExhausted bool `json:"budget_exhausted"`
+	// WoundDownReason says WHY BudgetExhausted is true (empty when it is
+	// false): the wall-clock deadline coming due (WoundDownReasonDeadline) or
+	// the tool-call budget running out (WoundDownReasonToolBudget). Both
+	// trigger the identical graceful no-tools wrap-up in Run — this field is
+	// the only thing that lets a caller (in particular the eval harness's
+	// runs.jsonl, see pkg/commands/agent_eval.go) tell the two apart, which
+	// matters because only the deadline case needs the wrap-up request's own
+	// context detached from the parent's cancellation (see react.go's
+	// buildTurnRequestCtx) — without this field there is no way to verify,
+	// from persisted run data, whether that path ever actually fired.
+	WoundDownReason WoundDownReason `json:"wound_down_reason,omitempty"`
 }
+
+// WoundDownReason identifies why a Run's graceful wrap-up (no-tools, forced
+// final answer) was triggered. The empty value means "not wound down" (or,
+// on a run that ended some other way, simply doesn't apply).
+type WoundDownReason string
+
+const (
+	// WoundDownReasonDeadline: the wall-clock ctx deadline was close enough
+	// that another full turn risked being killed mid-generation (M6). See
+	// react.go's wall-clock trigger, near the top of the turn loop.
+	WoundDownReasonDeadline WoundDownReason = "deadline"
+	// WoundDownReasonToolBudget: AgentConfig.MaxToolCalls was exhausted (the
+	// pre-existing wrap-up trigger, unchanged by M6).
+	WoundDownReasonToolBudget WoundDownReason = "tool_budget"
+)
 
 // DefaultMaxOutputTokens is the fallback max output tokens applied to both
 // the main (interactive REPL) agent and every subagent's LLM calls, in place

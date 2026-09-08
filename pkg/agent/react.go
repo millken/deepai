@@ -76,6 +76,14 @@ type Agent struct {
 	// defaultMaxToolConcurrency, overridable via DEEPAI_MAX_TOOL_CONCURRENCY;
 	// tests in this package set the field directly.
 	maxToolConcurrency int
+	// wrapUpReserveFloor is the lower bound on the wall-clock reserve carved
+	// out of ctx's deadline for the forced final-answer wrap-up turn (M6),
+	// used whenever this Run has not yet observed a turn (turn 0) or its
+	// slowest observed turn so far, times the headroom multiplier, is
+	// smaller than this floor. Defaults to defaultWrapUpReserveFloor; tests
+	// in this package set the field directly to shrink it, mirroring
+	// streamIdleTimeout above.
+	wrapUpReserveFloor time.Duration
 	events             chan AgentEvent
 	runMu              sync.Mutex
 	eventsMu           sync.RWMutex
@@ -253,6 +261,7 @@ func New(cfg AgentConfig) *Agent {
 		requestTimeout:      requestTimeout,
 		streamIdleTimeout:   defaultStreamIdleTimeout,
 		maxToolConcurrency:  resolveMaxToolConcurrency(),
+		wrapUpReserveFloor:  defaultWrapUpReserveFloor,
 		events:              make(chan AgentEvent, 128),
 		contextWindow:       cfg.ContextWindow,
 		compactionThreshold: resolveCompactionThreshold(cfg.CompactionThreshold),
@@ -517,6 +526,43 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// FinalOutput empty — the last turn before the cap is always a
 	// tool-call turn — so the subagent's entire output was dropped).
 	wrapUp := false
+	// woundDownReason records WHY wrapUp flipped to true — set exactly once,
+	// at the transition, by whichever of the two triggers (the wall-clock
+	// check or the pre-existing tool-call-budget check, both below) gets
+	// there first; see WoundDownReason's doc comment.
+	var woundDownReason WoundDownReason
+	// wrapUpBudget is the wall-clock reserve computed at the moment the
+	// DEADLINE trigger (not the tool-budget one) flips wrapUp — zero
+	// otherwise. Reused as the bounded timeout for the wrap-up request's own
+	// detached context; see buildTurnRequestCtx.
+	var wrapUpBudget time.Duration
+	// wrapUpCumulativeDeadline is the absolute wall-clock instant beyond
+	// which the ENTIRE wall-clock wrap-up phase (the initial forced request
+	// PLUS any compaction retries that re-enter it) must not run — set ONCE,
+	// at the same moment wrapUpBudget is (the DEADLINE trigger only), to
+	// time.Now().Add(reserve). Zero otherwise (including for the tool-budget
+	// wrap-up path, which capCumulativeWrapUpBudget leaves untouched). See
+	// capCumulativeWrapUpBudget's doc comment (F4, M6 review) for why this
+	// exists: without it, each compaction-retry request during a deadline
+	// wrap-up got a FULL FRESH wrapUpBudget again, so a Run could string
+	// together several full reserves' worth of overshoot instead of one.
+	var wrapUpCumulativeDeadline time.Time
+	// turnDurations records the wall-clock time of every COMPLETED loop
+	// iteration (one LLM turn plus any tool execution it triggered), so the
+	// wall-clock wrap-up trigger below can size its reserve from THIS run's
+	// own observed pace — see wrapUpReserve's doc comment for why a fixed
+	// constant cannot fit every role (measured 22s-87s per turn).
+	var turnDurations []time.Duration
+	lastTurnStart := time.Now()
+	// totalBudget snapshots the run's wall-clock window ONCE, before the
+	// loop starts: time.Until(ctx.Deadline()) shrinks every turn, but the
+	// "never reserve more than half the total budget" cap (wrapUpReserve)
+	// must be relative to a FIXED total or the cap would shrink right along
+	// with the remaining time and stop being a meaningful ceiling.
+	var totalBudget time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		totalBudget = time.Until(deadline)
+	}
 	// llmTurns counts LLM round-trips actually issued (incremented at the
 	// Stream call, so compaction-retry `continue` paths count too — each one
 	// re-sends a real request). Loop state like the counters above: only
@@ -532,6 +578,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			FinalOutput:     finalOutput,
 			Usage:           usage,
 			ToolCalls:       toolCallsExecuted,
+			WoundDownReason: woundDownReason,
 			LLMTurns:        llmTurns,
 			BudgetExhausted: wrapUp,
 		}
@@ -539,11 +586,43 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 	for turn := 0; ; turn++ {
 		a.logger.Debug("turn start", "turn", turn, "model", a.model, "messages", len(runMessages))
+
+		// Record the PREVIOUS iteration's wall-clock duration (turn 0 has
+		// none yet — lastTurnStart was only just set, above the loop).
+		if turn > 0 {
+			turnDurations = append(turnDurations, time.Since(lastTurnStart))
+		}
+		lastTurnStart = time.Now()
+
+		// Wall-clock wrap-up trigger (M6): once the remaining time until
+		// ctx's deadline drops to or below the reserve this run's own
+		// observed turn pace requires, force the same graceful no-tools
+		// wrap-up the tool-call budget uses below — instead of letting the
+		// NEXT turn's request get killed mid-generation by the deadline,
+		// discarding whatever the model had already worked out. See
+		// shouldTriggerWallClockWrapUp's doc comment for why this is gated
+		// on ctx.Err() == nil: a context already cancelled or expired must
+		// never detour through a forced extra request, only stop.
+		if !wrapUp {
+			ctxErr := ctx.Err()
+			deadline, hasDeadline := ctx.Deadline()
+			reserve := a.wrapUpReserve(turnDurations, totalBudget)
+			if shouldTriggerWallClockWrapUp(ctxErr, deadline, hasDeadline, time.Until(deadline), reserve) {
+				wrapUp = true
+				woundDownReason = WoundDownReasonDeadline
+				wrapUpBudget = reserve
+				wrapUpCumulativeDeadline = time.Now().Add(reserve)
+				a.logger.Warn("wall clock deadline approaching, forcing final answer without tools",
+					"reserve", reserve, "remaining", time.Until(deadline), "turn", turn)
+			}
+		}
+
 		// Safety valve: tool-call cap (0 = unlimited). Compaction/context-
 		// overflow retries (the `continue` paths below) do not consume
 		// budget — only real tool executions do.
 		if a.maxToolCalls > 0 && toolCallsExecuted >= a.maxToolCalls && !wrapUp {
 			wrapUp = true
+			woundDownReason = WoundDownReasonToolBudget
 			a.logger.Warn("tool call budget exhausted, forcing final answer without tools",
 				"max_tool_calls", a.maxToolCalls, "executed", toolCallsExecuted, "turn", turn)
 		}
@@ -602,7 +681,20 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		reqSystemPrompt := systemPrompt
 		var reqTools []models.Tool
 		if wrapUp {
-			promptView = append(promptView, toolBudgetExhaustedNotice(sessionID, a.maxToolCalls))
+			// F2 (M6 review): which notice to inject depends on WHY this run
+			// is wrapping up — the tool-call-budget notice is a lie on the
+			// wall-clock path (doubly so when a.maxToolCalls is 0/unlimited,
+			// the eval harness's actual per-role configuration: the model
+			// would be told "you have used your tool call limit ... (0
+			// calls)" when no such limit exists at all, and the REAL
+			// constraint — time — is never mentioned). See
+			// deadlineWrapUpNotice's doc comment; the tool-budget notice
+			// itself (toolBudgetExhaustedNotice) is UNCHANGED.
+			if woundDownReason == WoundDownReasonDeadline {
+				promptView = append(promptView, deadlineWrapUpNotice(sessionID))
+			} else {
+				promptView = append(promptView, toolBudgetExhaustedNotice(sessionID, a.maxToolCalls))
+			}
 			reqSystemPrompt = a.wrapUpSystemPrompt()
 		} else {
 			reqTools = a.tools.List()
@@ -641,7 +733,39 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// per-request ctx is released on every exit path from this turn's
 		// stream consumption; on the early Stream()-error return here it is
 		// called explicitly instead, since consumeStream is never reached.
-		reqCtx, cancel := context.WithCancel(ctx)
+		//
+		// Normally a plain cancellable child of ctx — see
+		// buildTurnRequestCtx's doc comment for the ONE exception (a
+		// deadline-triggered wrap-up turn, M6), which detaches from ctx's
+		// cancellation but stays bounded by wrapUpBudget instead.
+		//
+		// F4 (M6 review): the budget actually handed to buildTurnRequestCtx
+		// is capCumulativeWrapUpBudget's answer, not the raw wrapUpBudget —
+		// a compaction retry re-entering this same wrap-up phase (the
+		// `continue` paths below) must NOT get a full fresh reserve again;
+		// it gets only whatever remains of the ONE cumulative allowance
+		// wrapUpCumulativeDeadline tracks. See that function's doc comment.
+		effectiveWrapUpBudget := capCumulativeWrapUpBudget(wrapUpBudget, wrapUpCumulativeDeadline, time.Now())
+		reqCtx, cancel := a.buildTurnRequestCtx(ctx, wrapUp, woundDownReason, effectiveWrapUpBudget)
+		// errNormalizeCtx is normally the parent ctx — normalizeRunError's
+		// "was THIS run's own deadline the cause?" check is meaningful
+		// against it in the common case. The one exception (F1, M6 review):
+		// a deadline-triggered wrap-up request runs on reqCtx, detached from
+		// the parent's cancellation (see buildTurnRequestCtx) SPECIFICALLY
+		// because the parent's deadline is expected to elapse while it is
+		// still in flight — that is the wrap-up feature's whole point, not
+		// an error. Normalizing against the parent ctx in that case means
+		// normalizeRunError sees ctx.Err()==DeadlineExceeded on EVERY
+		// wrap-up request that outlives the parent (the common case, not an
+		// edge case) and rewrites ANY error — a real provider 503, a
+		// connection failure, anything — into a generic *TimeoutError,
+		// discarding the actual cause. Using reqCtx instead only reports a
+		// timeout when THIS request's own wrapUpBudget is what actually
+		// expired.
+		errNormalizeCtx := ctx
+		if wrapUp && woundDownReason == WoundDownReasonDeadline {
+			errNormalizeCtx = reqCtx
+		}
 		llmTurns++
 		stream, err := a.llm.Stream(reqCtx, req)
 		if err != nil {
@@ -652,7 +776,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					continue
 				}
 			}
-			err = normalizeRunError(ctx, err, a.requestTimeout)
+			err = normalizeRunError(errNormalizeCtx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 			return newRunResult(runMessages, ""), err
 		}
@@ -675,11 +799,11 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 					continue
 				}
 			}
-			err := normalizeRunError(ctx, streamRes.err, a.requestTimeout)
+			err := normalizeRunError(errNormalizeCtx, streamRes.err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 			return newRunResult(runMessages, ""), err
 		}
-		if err := ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil && !deadlineWrapUpExpectedErr(wrapUp, woundDownReason, err) {
 			err = normalizeRunError(ctx, err, a.requestTimeout)
 			emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 			return newRunResult(runMessages, ""), err
@@ -764,11 +888,21 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				// The forced tool-less wrap-up turn produced NOTHING: every
 				// executed tool call's work would be silently discarded behind
 				// a "successful" run with an empty FinalOutput. Surface a loud
-				// budget error instead so the parent model can see the failure
-				// and react (retry, narrower delegation, ...). A normal empty
+				// error instead so the parent model can see the failure and
+				// react (retry, narrower delegation, ...). A normal empty
 				// final turn (no wrap-up) keeps its historical nil-error
 				// behavior — only wrap-up emptiness means work was lost.
-				err := fmt.Errorf("agent exceeded tool call budget (%d) and the wrap-up turn produced no output", a.maxToolCalls)
+				//
+				// F2: the message names the REAL trigger (see
+				// woundDownReason) — a wall-clock wrap-up has no tool call
+				// budget to speak of (a.maxToolCalls may be 0/unlimited),
+				// so that wording would be nonsensical here.
+				var err error
+				if woundDownReason == WoundDownReasonDeadline {
+					err = errors.New("agent's wall-clock deadline forced a wrap-up and the wrap-up turn produced no output")
+				} else {
+					err = fmt.Errorf("agent exceeded tool call budget (%d) and the wrap-up turn produced no output", a.maxToolCalls)
+				}
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return newRunResult(runMessages, ""), err
 			}
@@ -790,10 +924,21 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// replayable, so synthesize refusals, then end the run with
 			// whatever text came alongside them (graceful when there is any,
 			// error only when there is nothing at all to hand back).
-			runMessages = appendSynthesizedRefusals(runMessages, sessionID, toolCalls,
-				fmt.Sprintf("not executed: tool call budget (%d) exhausted", a.maxToolCalls))
+			// F2: same real-trigger naming as the empty-output branch above,
+			// for both the synthesized-refusal reason string and the hard
+			// error when there's no text alongside the refused calls either.
+			refusalReason := fmt.Sprintf("not executed: tool call budget (%d) exhausted", a.maxToolCalls)
+			if woundDownReason == WoundDownReasonDeadline {
+				refusalReason = "not executed: wall-clock deadline forced a wrap-up"
+			}
+			runMessages = appendSynthesizedRefusals(runMessages, sessionID, toolCalls, refusalReason)
 			if strings.TrimSpace(text) == "" {
-				err := fmt.Errorf("agent exceeded tool call budget (%d)", a.maxToolCalls)
+				var err error
+				if woundDownReason == WoundDownReasonDeadline {
+					err = errors.New("agent's wall-clock deadline forced a wrap-up before a final answer was produced")
+				} else {
+					err = fmt.Errorf("agent exceeded tool call budget (%d)", a.maxToolCalls)
+				}
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})
 				return newRunResult(runMessages, ""), err
 			}
@@ -1118,6 +1263,33 @@ func toolBudgetExhaustedNotice(sessionID string, maxToolCalls int) models.Messag
 				"still follow it): summarize what you accomplished, the key results "+
 				"or findings, and anything you did not get to complete.",
 			maxToolCalls),
+		CreatedAt: time.Now().UTC(),
+	}
+}
+
+// deadlineWrapUpNotice is deadline wrap-up's counterpart to
+// toolBudgetExhaustedNotice (F2, M6 review): same shape (prompt-VIEW-only
+// RoleHuman message, metaAgentInjected, "stop calling tools / give your
+// final answer now / the schema-compliance carve-out"), but naming the REAL
+// trigger — time, not a tool-call count that may not even exist
+// (a.maxToolCalls is commonly 0/unlimited, e.g. every eval-harness role
+// today, which made toolBudgetExhaustedNotice's "(0 calls)" wording read as
+// an already-exhausted budget that was never real). The final sentence
+// (schema-compliance carve-out + the summarize-what-you-accomplished ask) is
+// copied verbatim from toolBudgetExhaustedNotice on purpose — only the
+// opening sentence differs.
+func deadlineWrapUpNotice(sessionID string) models.Message {
+	return models.Message{
+		ID:        newMessageID("human"),
+		SessionID: sessionID,
+		Role:      models.RoleHuman,
+		Metadata:  map[string]string{metaAgentInjected: "true"},
+		Content: "You are almost out of time for this task. " +
+			"Do not attempt any further tool calls. Give your final answer now, " +
+			"in the exact output format your instructions specify (if a JSON " +
+			"schema or structured format was required, your final answer MUST " +
+			"still follow it): summarize what you accomplished, the key results " +
+			"or findings, and anything you did not get to complete.",
 		CreatedAt: time.Now().UTC(),
 	}
 }

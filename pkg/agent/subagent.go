@@ -103,6 +103,25 @@ func (e *SubagentExecutor) WithPluginAgentDirs(dirs []string) *SubagentExecutor 
 	return e
 }
 
+// mergeWoundDownReason folds one attempt's WoundDownReason into a task's
+// accumulated stats (M7, M6 review): a later attempt's non-empty reason wins
+// — it describes why the attempt whose output actually landed wound down,
+// which is the one worth telling apart in post-hoc analysis — but an
+// attempt that did NOT wind down at all (attempt == "", e.g. a schema retry
+// that completed normally on its own) must never erase an EARLIER attempt's
+// real reason. Without this guard, a schema-retry sequence where attempt 1
+// wound down via the wall-clock deadline (invalid output, forcing a retry)
+// and attempt 2 completed normally would leave BudgetExhausted=true
+// (accumulateStats ORs it across every attempt) paired with an EMPTY
+// WoundDownReason — an internally-inconsistent record no caller (in
+// particular the eval harness's runs.jsonl) can make sense of.
+func mergeWoundDownReason(current string, attempt WoundDownReason) string {
+	if attempt != "" {
+		return string(attempt)
+	}
+	return current
+}
+
 func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emit func(subagent.TaskEvent)) (subagent.ExecutionResult, error) {
 	if e == nil || e.registry == nil {
 		return subagent.ExecutionResult{}, fmt.Errorf("subagent model registry is required")
@@ -348,6 +367,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		stats.ToolCalls += r.ToolCalls
 		stats.LLMTurns += r.LLMTurns
 		stats.BudgetExhausted = stats.BudgetExhausted || r.BudgetExhausted
+		stats.WoundDownReason = mergeWoundDownReason(stats.WoundDownReason, r.WoundDownReason)
 	}
 	// execStats stamps the elapsed wall time and hands the accumulated stats
 	// to a return site — the single place DurationMS is written.

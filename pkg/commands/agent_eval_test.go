@@ -805,6 +805,35 @@ func TestRunOneCase_RecordsToolCallWorkloadStats(t *testing.T) {
 	}
 }
 
+// TestRunOneCase_WoundDownReason_DistinguishesDeadlineFromToolBudget pins
+// item E of the M6 brief: BudgetExhausted alone can't tell a wall-clock
+// wrap-up apart from a tool-call-budget wrap-up, so runs.jsonl must also
+// carry WoundDownReason, copied through from subagent.RunStats untouched.
+func TestRunOneCase_WoundDownReason_DistinguishesDeadlineFromToolBudget(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "analyst", "wound-down-case",
+		"id: wound-down-case\nagent_type: analyst\ntask: \"analyze\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	for _, reason := range []string{"deadline", "tool_budget"} {
+		pool := &fakePool{task: fakeTaskResult{
+			Status: subagent.TaskStatusCompleted,
+			Result: "done",
+			Stats: &subagent.RunStats{
+				BudgetExhausted: true,
+				WoundDownReason: reason,
+			},
+		}}
+		rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+		if err != nil {
+			t.Fatalf("runOneCase: %v", err)
+		}
+		if rec.WoundDownReason != reason {
+			t.Errorf("WoundDownReason = %q, want %q", rec.WoundDownReason, reason)
+		}
+	}
+}
+
 // TestRunOneCase_ToSummary_HasStatsWiresToolCallDistribution is the end-to-end
 // test the review demanded: runOneCase's real output fed directly into
 // buildEvalSummary, so a producer/consumer seam (rec.HasStats set by
@@ -913,6 +942,121 @@ func TestDispatchEvalTask_TimeoutDegradesGracefullyWithoutGetTask(t *testing.T) 
 	}
 	if rec.ToolCalls != 0 || rec.LLMTurns != 0 || rec.MaxToolCalls != 0 || rec.BudgetExhausted {
 		t.Errorf("expected zero-value workload stats when no stats could be recovered, got %+v", rec)
+	}
+}
+
+// fakeGracefulPool's Wait actually respects ctx (unlike fakePool.Wait, which
+// returns its canned waitErr unconditionally): it blocks until either
+// completeAfter elapses (the task "finishes", standing in for a subagent
+// whose wall-clock wrap-up produced a real answer a bit later than the
+// dispatch deadline) or ctx itself is done first. This is what makes it
+// possible to prove runOneCase's dispatch-vs-wait ctx split actually works:
+// a real *subagent.Pool.Wait blocks on the task's own done channel or ctx,
+// exactly like this.
+type fakeGracefulPool struct {
+	fakePool
+	completeAfter time.Duration
+}
+
+func (f *fakeGracefulPool) Wait(ctx context.Context, taskID string) (*subagent.Task, error) {
+	select {
+	case <-time.After(f.completeAfter):
+		return f.newTask(taskID), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestRunOneCase_WallClockGraceExtendsWaitPastDispatchTimeout is the RED test
+// for item D of the M6 brief: a subagent whose wall-clock wrap-up gracefully
+// finishes a little AFTER opts.Timeout (exactly what M6's react.go change
+// allows, bounded by its own reserve) must still show up in runs.jsonl as a
+// completed run with real output — not a "dispatch" failure — because
+// runOneCase's WAIT side must tolerate that bounded overshoot even though the
+// DISPATCH side (what bounds the subagent itself) keeps the original
+// opts.Timeout. Before this fix, pool.Wait shared the exact same
+// opts.Timeout-bounded ctx as pool.StartTask, so Wait gave up at the exact
+// moment the subagent was gracefully finishing.
+func TestRunOneCase_WallClockGraceExtendsWaitPastDispatchTimeout(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "tester", "graceful-case",
+		"id: graceful-case\nagent_type: tester\ntask: \"write a test\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	// The task "completes" 120ms after dispatch — well past a 50ms
+	// opts.Timeout, but well within the grace this fix must add to the WAIT
+	// side (opts.Timeout/2 + a fixed slop, see evalWaitGrace).
+	pool := &fakeGracefulPool{
+		fakePool: fakePool{task: fakeTaskResult{
+			Status: subagent.TaskStatusCompleted,
+			Result: "wound down: final answer preserved",
+		}},
+		completeAfter: 120 * time.Millisecond,
+	}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if rec.Error != "" {
+		t.Fatalf("rec.Error = %q, want empty — the wait side must tolerate the wrap-up's bounded overshoot past opts.Timeout", rec.Error)
+	}
+	if rec.Output != "wound down: final answer preserved" {
+		t.Fatalf("rec.Output = %q, want the subagent's real result, not a dispatch failure", rec.Output)
+	}
+}
+
+// TestEvalWaitGrace_CapFractionContributesMeaningfully is the RED test for
+// the M3b coverage gap the M6 review found: TestRunOneCase_WallClock-
+// GraceExtendsWaitPastDispatchTimeout (above) uses a 50ms opts.Timeout, so
+// evalWaitGraceCapFraction's contribution to the grace window is a fraction
+// of a millisecond — utterly swamped by the fixed 5s evalWaitGraceSlop. That
+// test passes identically whether evalWaitGraceCapFraction is 0.5 (the real
+// value) or 0.0 (a mutant that deletes the proportional term entirely) —
+// the whole package stays green either way, because nothing else exercises
+// that constant.
+//
+// This test shrinks evalWaitGraceSlop (a var specifically so tests can do
+// this — see its doc comment) to 20ms, so a moderate, still-fast 600ms
+// opts.Timeout makes the proportional term (0.5*600ms=300ms) the dominant
+// component of the grace window: with capFraction=0.5, grace=320ms (waitCtx
+// deadline 920ms), comfortably covering a task that completes 750ms in
+// (150ms past dispatchCtx's own 600ms timeout); with capFraction mutated to
+// 0.0, grace would collapse to the 20ms slop alone (waitCtx deadline 620ms),
+// which the 750ms completion overshoots by 130ms — Wait's ctx would expire
+// first and runOneCase would report a dispatch/wait failure instead of the
+// real result.
+func TestEvalWaitGrace_CapFractionContributesMeaningfully(t *testing.T) {
+	origSlop := evalWaitGraceSlop
+	evalWaitGraceSlop = 20 * time.Millisecond
+	t.Cleanup(func() { evalWaitGraceSlop = origSlop })
+
+	root := t.TempDir()
+	c := writeCase(t, root, "tester", "grace-cap-case",
+		"id: grace-cap-case\nagent_type: tester\ntask: \"write a test\"\nexpect:\n  - no_writes: true\n",
+		nil)
+
+	// The task "completes" 750ms after dispatch — 150ms past a 600ms
+	// opts.Timeout, well within the ~320ms combined grace (proportional
+	// term dominant) this fix must add to the WAIT side, but well past the
+	// 20ms-slop-alone grace a capFraction=0 mutant would leave.
+	pool := &fakeGracefulPool{
+		fakePool: fakePool{task: fakeTaskResult{
+			Status: subagent.TaskStatusCompleted,
+			Result: "wound down: final answer preserved",
+		}},
+		completeAfter: 750 * time.Millisecond,
+	}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{Timeout: 600 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if rec.Error != "" {
+		t.Fatalf("rec.Error = %q, want empty — the proportional half-of-Timeout term must contribute to the grace window, not just the fixed slop", rec.Error)
+	}
+	if rec.Output != "wound down: final answer preserved" {
+		t.Fatalf("rec.Output = %q, want the subagent's real result, not a dispatch/wait failure", rec.Output)
 	}
 }
 
