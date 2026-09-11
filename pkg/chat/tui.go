@@ -126,6 +126,12 @@ func (t *TUI) SetStatus(model string, planMode bool) {
 	t.p.Send(statusMsg{model: model, planMode: planMode})
 }
 
+// SetLockLost toggles the persistent session-lock-lost banner (D5, session-
+// lock review round 2) — see ReplUI.SetLockLost's doc comment.
+func (t *TUI) SetLockLost(lost bool) {
+	t.p.Send(lockLostMsg{lost: lost})
+}
+
 // --- input ---
 
 // ReadPrompt focuses the input box and blocks until the user submits a line,
@@ -221,6 +227,7 @@ type statusMsg struct {
 	model    string
 	planMode bool
 }
+type lockLostMsg struct{ lost bool }
 type requestInputMsg struct{ reply chan inputResult }
 type historyMsg struct{ items []string }
 type askQuestionMsg struct {
@@ -266,6 +273,13 @@ type tuiModel struct {
 	model         string
 	planMode      bool
 	contextWindow int
+	// lockLost is set by lockLostMsg (D5, session-lock review round 2):
+	// this process no longer owns its session lock, persistence is
+	// suspended, and View() must show that on EVERY frame — idle or mid-
+	// turn — until a later lockLostMsg{lost: false} (from a successful
+	// /new) clears it. Unlike a one-off Info() line, this survives
+	// scrollback and re-renders for as long as it stays true.
+	lockLost bool
 
 	// input history
 	history    []string
@@ -505,6 +519,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		m.model = msg.model
 		m.planMode = msg.planMode
+		return m, nil
+
+	case lockLostMsg:
+		m.lockLost = msg.lost
 		return m, nil
 
 	case requestInputMsg:
@@ -1428,6 +1446,23 @@ func (m *tuiModel) renderAskHeader(question string, options []string) string {
 
 func (m *tuiModel) View() tea.View {
 	var b strings.Builder
+
+	// D5 (session-lock review round 2): a persistent banner, rendered on
+	// EVERY frame — idle or mid-turn — for as long as m.lockLost is true.
+	// Deliberately placed first/unconditionally, unlike everything else
+	// below which is gated on agentActive/inputVisible: the whole point is
+	// that this must NOT depend on, or be hidden by, whatever else the
+	// live region is currently showing.
+	if m.lockLost {
+		// M-B (session-lock review round 3): recommend /fork FIRST — it is
+		// the remedy that preserves this run's content (including a turn
+		// whose output never reached the DB at all, dropped because writes
+		// were suspended (sessionLockState.isSuspended) — see appendMessage's
+		// doc comment); /new is the
+		// "discard it" alternative, not the primary suggestion.
+		b.WriteString(m.styles.Error.Render("  ⚠ 本会话锁已丢失，内容不会再被保存 — 运行 /fork 保存当前内容到新会话，或 /new 放弃并开始新会话"))
+		b.WriteString("\n")
+	}
 
 	// Live streamed assistant text (raw, not yet committed). Bounded to a tail
 	// so a long message doesn't blow up the live region; the full message is

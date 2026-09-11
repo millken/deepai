@@ -21,9 +21,17 @@ type mockLLMProvider struct {
 	response string
 	model    string // 服务端返回的模型名
 	err      error
+	// onChat, if set, runs synchronously INSIDE Chat before it returns —
+	// lets a test simulate a side effect (e.g. a session lock loss detected
+	// by the heartbeat goroutine) occurring while a "slow LLM call" like
+	// generateTitle's is in flight. See TestGenerateTitle_RechecksLockBeforePersisting.
+	onChat func()
 }
 
 func (m *mockLLMProvider) Chat(ctx context.Context, req llm.ChatRequest) (llm.ChatResponse, error) {
+	if m.onChat != nil {
+		m.onChat()
+	}
 	if m.err != nil {
 		return llm.ChatResponse{}, m.err
 	}
@@ -64,6 +72,7 @@ type mockUI struct {
 	askErr      error
 	statusModel string
 	statusPlan  bool
+	lockLost    bool
 }
 
 func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
@@ -71,7 +80,8 @@ func (m *mockUI) SetStatus(model string, planMode bool) {
 	m.statusModel = model
 	m.statusPlan = planMode
 }
-func (m *mockUI) Banner(_ BannerInfo) {}
+func (m *mockUI) SetLockLost(lost bool) { m.lockLost = lost }
+func (m *mockUI) Banner(_ BannerInfo)   {}
 func (m *mockUI) AskQuestion(_ context.Context, _ string, _ []string) (string, error) {
 	return m.askResult, m.askErr
 }
@@ -112,6 +122,7 @@ func TestGenerateTitle_Success(t *testing.T) {
 		currentModel: "default",
 		sessMgr:      store,
 	}
+	r.setLockedSession(sess.ID)
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
 
@@ -141,6 +152,7 @@ func TestGenerateTitle_LongTitle(t *testing.T) {
 		currentModel: "default",
 		sessMgr:      store,
 	}
+	r.setLockedSession(sess.ID)
 
 	r.generateTitle(sess.ID, "Hello")
 
@@ -170,6 +182,7 @@ func TestGenerateTitle_EmptyResponse(t *testing.T) {
 		currentModel: "default",
 		sessMgr:      store,
 	}
+	r.setLockedSession(sess.ID)
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
 
@@ -199,6 +212,7 @@ func TestGenerateTitle_LLMError(t *testing.T) {
 		currentModel: "default",
 		sessMgr:      store,
 	}
+	r.setLockedSession(sess.ID)
 
 	r.generateTitle(sess.ID, "Hello, this is a test message")
 
@@ -228,6 +242,7 @@ func TestGenerateTitle_ShortFallback(t *testing.T) {
 		currentModel: "default",
 		sessMgr:      store,
 	}
+	r.setLockedSession(sess.ID)
 
 	r.generateTitle(sess.ID, "Short")
 

@@ -33,7 +33,10 @@ func PickSession(repo models.SessionRepository) (*models.Session, error) {
 		return sess, nil
 	}
 
-	// Build option labels.
+	// Build option labels. The cwd column is what lets two sessions with the
+	// same (or no) title be told apart when they belong to different
+	// projects — without it there is no way to know which one a same-named
+	// entry actually resumes.
 	type sessionOption struct {
 		id    string
 		label string
@@ -45,7 +48,7 @@ func PickSession(repo models.SessionRepository) (*models.Session, error) {
 		if title == "" {
 			title = "(untitled)"
 		}
-		label := fmt.Sprintf("%-40s %3d msgs", Truncate(title, 40), m.MsgCount)
+		label := fmt.Sprintf("%-40s %3d msgs  %s", Truncate(title, 40), m.MsgCount, truncatePathHead(m.CWD, 32))
 		opts[i] = sessionOption{id: m.ID, label: label}
 		huhOpts[i] = huh.NewOption(label, m.ID)
 	}
@@ -80,6 +83,22 @@ func Truncate(s string, n int) string {
 		return s
 	}
 	return string([]rune(s)[:n]) + "..."
+}
+
+// truncatePathHead shortens a path to at most n runes, eliding the FRONT and
+// keeping the tail — unlike Truncate, which keeps the front. For a path,
+// the tail (.../myrepo, .../subdir) is what tells one project apart from
+// another; the leading /Users/name/github.com/... prefix is usually shared
+// across every session in the picker and tells the user nothing.
+func truncatePathHead(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 3 {
+		return string(r[len(r)-n:])
+	}
+	return "..." + string(r[len(r)-(n-3):])
 }
 
 // ShowDeletePicker shows an interactive picker for multiple matching sessions.

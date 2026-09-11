@@ -13,6 +13,7 @@ var slashCommands = []slashCmd{
 	{"history", "Show conversation history"},
 	{"sessions", "List recent sessions"},
 	{"new", "Start a new session"},
+	{"fork", "Fork this session (new session, same history; keeps unsaved content after a lock loss)"},
 	{"title", "Set session title"},
 	{"save", "Save session metadata"},
 	{"undo", "Undo last turn"},

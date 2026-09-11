@@ -30,6 +30,9 @@ var chatFlags struct {
 	Query        string
 	Resume       string
 	Continue     bool
+	ContinueAny  bool
+	Fork         bool
+	Force        bool
 	Model        string
 	MaxToolCalls int
 }
@@ -44,19 +47,31 @@ func registerResumeFlag(cmd *cobra.Command) {
 	}
 }
 
+// registerSessionLockFlags adds the session-lock conflict flags (see
+// models.ErrSessionLocked / pkg/chat's AcquireSessionLock): --fork and
+// --force are the two ways out when -c/-r resolves to a session another live
+// deepai process holds, and --continue-any widens -c from "latest session in
+// this directory" back to the old, unscoped "latest session anywhere".
+func registerSessionLockFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&chatFlags.ContinueAny, "continue-any", false, "With --continue, resume the most recent session from any directory (pre-fix, unscoped behavior)")
+	cmd.Flags().BoolVar(&chatFlags.Fork, "fork", false, "If the resolved session is locked by another deepai process, copy its history into a new session instead of failing")
+	cmd.Flags().BoolVar(&chatFlags.Force, "force", false, "Take over a session lock held by another deepai process (unsafe if that process is still running)")
+}
+
 func addChat(topLevel *cobra.Command) {
 	cmd := &cobra.Command{
 		Use:    "chat",
 		Short:  "Start an interactive chat session",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxToolCalls)
+			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.ContinueAny, chatFlags.Fork, chatFlags.Force, chatFlags.Model, chatFlags.MaxToolCalls)
 		},
 	}
 
 	cmd.Flags().StringVarP(&chatFlags.Query, "query", "q", "", "Single query (non-interactive mode)")
 	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
+	registerSessionLockFlags(cmd)
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
 	cmd.Flags().IntVar(&chatFlags.MaxToolCalls, "max-tool-calls", 0, "Max executed tool calls per run (0=unlimited)")
 	registerMaxTurnsAlias(cmd)
@@ -69,6 +84,7 @@ func RegisterChatFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVarP(&chatFlags.Query, "query", "q", "", "Single query (non-interactive mode)")
 	registerResumeFlag(cmd)
 	cmd.Flags().BoolVarP(&chatFlags.Continue, "continue", "c", false, "Continue most recent session")
+	registerSessionLockFlags(cmd)
 	cmd.Flags().StringVarP(&chatFlags.Model, "model", "m", "", "Override model from config")
 	cmd.Flags().IntVar(&chatFlags.MaxToolCalls, "max-tool-calls", 0, "Max executed tool calls per run (0=unlimited)")
 	registerMaxTurnsAlias(cmd)
@@ -81,7 +97,7 @@ func registerMaxTurnsAlias(cmd *cobra.Command) {
 	_ = cmd.Flags().MarkHidden("max-turns")
 }
 
-func runChat(ctx context.Context, query, resume string, continueLast bool, modelOverride string, maxToolCalls int) error {
+func runChat(ctx context.Context, query, resume string, continueLast, continueAny, forkSession, forceSession bool, modelOverride string, maxToolCalls int) error {
 	// Load config.
 	cfg, err := LoadConfig(ConfigFile())
 	if err != nil {
@@ -258,7 +274,12 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 
 	// Open unified SQLite database.
 	dbPath := DBFile()
-	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	// _txlock=immediate: see the matching DSN comment in
+	// pkg/chat/session.go NewSQLiteSessionStore — this is the production
+	// code path (the *sql.DB opened here is what chat.NewSQLiteSessionStoreFromDB
+	// wraps below), so it must carry the same fix or the fix only exists in
+	// tests and the migration-only helper, never in the shipped binary.
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -327,6 +348,9 @@ func runChat(ctx context.Context, query, resume string, continueLast bool, model
 		Query:                query,
 		ResumeSession:        resume,
 		ContinueLast:         continueLast,
+		ContinueAny:          continueAny,
+		ForkSession:          forkSession,
+		ForceSession:         forceSession,
 		SystemPrompt:         systemPrompt,
 		WorkDir:              workDir,
 		ToolRegistry:         registry,

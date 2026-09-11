@@ -56,7 +56,7 @@ func New() *cobra.Command {
 
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.Model, chatFlags.MaxToolCalls)
+			return runChat(cmd.Context(), chatFlags.Query, chatFlags.Resume, chatFlags.Continue, chatFlags.ContinueAny, chatFlags.Fork, chatFlags.Force, chatFlags.Model, chatFlags.MaxToolCalls)
 		},
 	}
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable debug logs")
