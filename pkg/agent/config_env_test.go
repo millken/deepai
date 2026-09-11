@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -42,6 +43,7 @@ func TestMain(m *testing.M) {
 	os.Unsetenv(envTokenMetrics)
 	os.Unsetenv(envTokenAging)
 	os.Unsetenv(EnvMaxOutputTokens)
+	os.Unsetenv(EnvStreamIdleTimeout)
 	os.Exit(m.Run())
 }
 
@@ -189,5 +191,72 @@ func TestTokenEfficiency_ExplicitConfigWinsOverEnv(t *testing.T) {
 	}
 	if a.aging != custom || a.aging.MinContextPressure != 0.9 {
 		t.Error("explicit Aging must not be overridden by env")
+	}
+}
+
+// TestResolveStreamIdleTimeout_Unset pins the fallback: with no override,
+// the effective idle window is defaultStreamIdleTimeout (2 minutes) — the
+// value every caller got before DEEPAI_STREAM_IDLE_TIMEOUT existed.
+func TestResolveStreamIdleTimeout_Unset(t *testing.T) {
+	t.Setenv(EnvStreamIdleTimeout, "")
+	os.Unsetenv(EnvStreamIdleTimeout)
+	if got := ResolveStreamIdleTimeout(); got != defaultStreamIdleTimeout {
+		t.Errorf("ResolveStreamIdleTimeout() = %v, want defaultStreamIdleTimeout (%v)", got, defaultStreamIdleTimeout)
+	}
+}
+
+// TestResolveStreamIdleTimeout_ValidValueWins pins that a user stuck with
+// "stream idle timeout: no data received after 2m0s" can raise the window
+// themselves without a rebuild — the whole point of exposing this.
+func TestResolveStreamIdleTimeout_ValidValueWins(t *testing.T) {
+	t.Setenv(EnvStreamIdleTimeout, "5m")
+	const want = 5 * time.Minute
+	if got := ResolveStreamIdleTimeout(); got != want {
+		t.Errorf("ResolveStreamIdleTimeout() = %v, want %v", got, want)
+	}
+	if want == defaultStreamIdleTimeout {
+		t.Fatal("test setup bug: chosen value must differ from the default to prove it was actually read")
+	}
+}
+
+// TestResolveStreamIdleTimeout_InvalidFallsBackToDefault: an unparseable or
+// non-positive duration must never reach the watchdog as-is. A negative or
+// unparseable value obviously has no sane meaning; 0 specifically must not
+// be allowed to pass through even though consumeStream (pkg/agent/streaming.go)
+// happens to also guard <= 0 itself — this resolver must not rely on that
+// second guard, since ResolveStreamIdleTimeout is the single source of truth
+// New() uses to populate Agent.streamIdleTimeout, and a silently-accepted 0
+// stored on the struct would be one guard away from every future caller of
+// that field.
+func TestResolveStreamIdleTimeout_InvalidFallsBackToDefault(t *testing.T) {
+	cases := map[string]string{
+		"non-duration": "not-a-duration",
+		"empty-string": "",
+		"zero":         "0s",
+		"negative":     "-5m",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(EnvStreamIdleTimeout, raw)
+			got := ResolveStreamIdleTimeout()
+			if got != defaultStreamIdleTimeout {
+				t.Errorf("ResolveStreamIdleTimeout() with %s (%q) = %v, want defaultStreamIdleTimeout (%v)", name, raw, got, defaultStreamIdleTimeout)
+			}
+			if got <= 0 {
+				t.Errorf("ResolveStreamIdleTimeout() with %s (%q) = %v; must never be <= 0", name, raw, got)
+			}
+		})
+	}
+}
+
+// TestNew_StreamIdleTimeoutFromEnv proves the env var actually reaches
+// Agent.streamIdleTimeout through New() — ResolveStreamIdleTimeout alone
+// isn't enough evidence since the field could still be wired to the bare
+// constant.
+func TestNew_StreamIdleTimeoutFromEnv(t *testing.T) {
+	t.Setenv(EnvStreamIdleTimeout, "7m")
+	a := newTestAgent(t, AgentConfig{})
+	if a.streamIdleTimeout != 7*time.Minute {
+		t.Errorf("a.streamIdleTimeout = %v, want 7m", a.streamIdleTimeout)
 	}
 }

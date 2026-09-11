@@ -15,6 +15,7 @@ import (
 	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/netutil"
 	"github.com/millken/deepai/pkg/secret"
+	"github.com/millken/deepai/pkg/ssewire"
 	"github.com/spf13/cobra"
 )
 
@@ -39,80 +40,37 @@ import (
 // It costs real API quota, so it only ever runs when invoked explicitly.
 
 // observation is what one request's response body did on the wire.
-type observation struct {
-	FirstByte  time.Duration // start -> first byte of body (any byte, including a ping)
-	FirstEvent time.Duration // start -> first non-ping SSE event
-	MaxGap     time.Duration // longest silence, counting the wait before the first byte
-	Bytes      int
-	Events     int
-	Pings      int
-}
+// It is an alias for ssewire.Observation: the classifier that used to live
+// here (and the extra fields it now carries, such as LastEventType) is
+// shared with pkg/llm's wire-trace transport rather than duplicated — see
+// pkg/ssewire's package doc for why.
+type observation = ssewire.Observation
 
-// sseObserver timestamps raw reads and classifies SSE lines as they stream past.
-// Classification tolerates reads that split lines, since TCP does not respect
-// line boundaries.
+// sseObserver timestamps raw reads and classifies SSE lines as they stream
+// past. It is a thin wrapper around ssewire.Observer, keeping this file's
+// (lowercase, package-private) method names stable so nothing else in this
+// file or its tests had to change when the classifier moved out.
 type sseObserver struct {
-	start    time.Time
-	lastRead time.Time
-	obs      observation
-	partial  []byte
+	inner *ssewire.Observer
 }
 
 func newSSEObserver(start time.Time) *sseObserver {
-	return &sseObserver{start: start, lastRead: start}
+	return &sseObserver{inner: ssewire.NewObserver(start)}
 }
 
 // observe records one non-empty read of the body at time at.
 func (o *sseObserver) observe(at time.Time, chunk []byte) {
-	if len(chunk) == 0 {
-		return
-	}
-	if gap := at.Sub(o.lastRead); gap > o.obs.MaxGap {
-		o.obs.MaxGap = gap
-	}
-	o.lastRead = at
-	if o.obs.Bytes == 0 {
-		o.obs.FirstByte = at.Sub(o.start)
-	}
-	o.obs.Bytes += len(chunk)
-
-	data := append(o.partial, chunk...)
-	for {
-		idx := bytes.IndexByte(data, '\n')
-		if idx < 0 {
-			break
-		}
-		o.classify(at, strings.TrimSpace(string(data[:idx])))
-		data = data[idx+1:]
-	}
-	o.partial = append(o.partial[:0], data...)
-}
-
-func (o *sseObserver) classify(at time.Time, line string) {
-	name, ok := strings.CutPrefix(line, "event:")
-	if !ok {
-		return
-	}
-	if strings.TrimSpace(name) == "ping" {
-		o.obs.Pings++
-		return
-	}
-	o.obs.Events++
-	if o.obs.FirstEvent == 0 {
-		o.obs.FirstEvent = at.Sub(o.start)
-	}
+	o.inner.Observe(at, chunk)
 }
 
 // finish folds in the silence between the last read and the end of the
 // request. Without it the stall a STALL row exists to describe — minutes of
 // nothing after the final byte — is never measured at all.
 func (o *sseObserver) finish(at time.Time) {
-	if gap := at.Sub(o.lastRead); gap > o.obs.MaxGap {
-		o.obs.MaxGap = gap
-	}
+	o.inner.Finish(at)
 }
 
-func (o *sseObserver) result() observation { return o.obs }
+func (o *sseObserver) result() observation { return o.inner.Result() }
 
 // probeResult is one request's outcome.
 type probeResult struct {

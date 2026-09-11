@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Token-efficiency features (T1 aging, Phase 0 metrics) ship disabled and are
@@ -76,6 +77,50 @@ func ResolveMaxOutputTokens() int {
 		return DefaultMaxOutputTokens
 	}
 	return n
+}
+
+// EnvStreamIdleTimeout overrides defaultStreamIdleTimeout (react.go): the max
+// silence allowed between chunks of a single streaming request before the
+// watchdog (pkg/agent/streaming.go's consumeStream) cancels it. Before this,
+// a user who hit "stream idle timeout: no data received after 2m0s" had no
+// way to raise the window themselves short of a rebuild — the field was
+// deliberately not on AgentConfig, only settable directly by this package's
+// own tests.
+//
+//	DEEPAI_STREAM_IDLE_TIMEOUT=5m   wait up to 5 minutes of silence instead of 2
+const EnvStreamIdleTimeout = "DEEPAI_STREAM_IDLE_TIMEOUT"
+
+// ResolveStreamIdleTimeout returns the effective stream-idle window:
+// EnvStreamIdleTimeout if it parses as a positive time.Duration, otherwise
+// defaultStreamIdleTimeout. New() is the only caller that should feed this
+// into Agent.streamIdleTimeout; this package's own tests continue to set
+// a.streamIdleTimeout directly afterward, which this does not affect.
+//
+// A zero or negative parsed value is rejected here, not passed through: it
+// must never reach Agent.streamIdleTimeout as 0, even though consumeStream
+// happens to ALSO guard `idleTimeout <= 0` by substituting
+// defaultStreamIdleTimeout (see streaming.go) — meaning a 0 that slipped
+// past this function would fall back to the 2-minute default there rather
+// than firing immediately or never firing, but this function is the single
+// source of truth for the field and must not depend on that second guard to
+// stay correct.
+func ResolveStreamIdleTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(EnvStreamIdleTimeout))
+	if raw == "" {
+		return defaultStreamIdleTimeout
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("ignoring invalid stream idle timeout: not a valid duration",
+			"env", EnvStreamIdleTimeout, "value", raw, "using", defaultStreamIdleTimeout)
+		return defaultStreamIdleTimeout
+	}
+	if d <= 0 {
+		slog.Warn("ignoring invalid stream idle timeout: must be positive",
+			"env", EnvStreamIdleTimeout, "value", raw, "using", defaultStreamIdleTimeout)
+		return defaultStreamIdleTimeout
+	}
+	return d
 }
 
 // tokenMetricsPath resolves DEEPAI_TOKEN_METRICS to a JSONL output path:

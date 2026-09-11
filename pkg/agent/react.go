@@ -65,9 +65,11 @@ type Agent struct {
 	// streaming request — NOT the total request time (that's requestTimeout).
 	// The HTTP client deliberately has no per-request timeout (pkg/llm/http.go),
 	// so without this a stream that emits nothing can hang until the outer
-	// deadline (or forever, if there is none). Defaults to
-	// defaultStreamIdleTimeout; not exposed via AgentConfig — tests in this
-	// package set the field directly.
+	// deadline (or forever, if there is none). New() sets this via
+	// ResolveStreamIdleTimeout (config_env.go), which defaults to
+	// defaultStreamIdleTimeout unless DEEPAI_STREAM_IDLE_TIMEOUT overrides
+	// it; not exposed via AgentConfig — tests in this package still set the
+	// field directly (after New() runs) to shrink it for fast tests.
 	streamIdleTimeout time.Duration
 	// maxToolConcurrency caps how many calls of one parallel segment run at
 	// once. Unbounded fan-out puts every call of a wide batch on the provider
@@ -259,7 +261,7 @@ func New(cfg AgentConfig) *Agent {
 		maxToolCalls:        maxToolCalls,
 		maxTokensBudget:     cfg.MaxTokensBudget,
 		requestTimeout:      requestTimeout,
-		streamIdleTimeout:   defaultStreamIdleTimeout,
+		streamIdleTimeout:   ResolveStreamIdleTimeout(),
 		maxToolConcurrency:  resolveMaxToolConcurrency(),
 		wrapUpReserveFloor:  defaultWrapUpReserveFloor,
 		events:              make(chan AgentEvent, 128),

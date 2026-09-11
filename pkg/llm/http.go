@@ -11,31 +11,35 @@ import (
 
 // newHTTPClient creates an *http.Client with HTTP/2, connection pooling, and sane timeouts.
 func newHTTPClient() *http.Client {
+	transport := &http.Transport{
+		// Honor HTTP_PROXY / HTTPS_PROXY / NO_PROXY. A hand-built Transport
+		// gets no proxy support unless this is set — only http.DefaultTransport
+		// comes with it — so without this line every model API call ignores the
+		// user's proxy. netutil.EnvProxyFunc rather than
+		// http.ProxyFromEnvironment because the stdlib version snapshots the
+		// environment process-wide on first use.
+		Proxy:             netutil.EnvProxyFunc,
+		ForceAttemptHTTP2: true,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     50,
+		IdleConnTimeout:     120 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 	return &http.Client{
 		// Do not set Client.Timeout for streaming LLM responses.
 		// A fixed client timeout aborts long reads with:
 		// "context deadline exceeded (Client.Timeout or context cancellation while reading body)".
 		// Run lifetime is bounded by the caller context (agent RequestTimeout / Ctrl+C).
 		Timeout: 0,
-		Transport: &http.Transport{
-			// Honor HTTP_PROXY / HTTPS_PROXY / NO_PROXY. A hand-built Transport
-			// gets no proxy support unless this is set — only http.DefaultTransport
-			// comes with it — so without this line every model API call ignores the
-			// user's proxy. netutil.EnvProxyFunc rather than
-			// http.ProxyFromEnvironment because the stdlib version snapshots the
-			// environment process-wide on first use.
-			Proxy:             netutil.EnvProxyFunc,
-			ForceAttemptHTTP2: true,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			MaxConnsPerHost:     50,
-			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		// newTracingHTTPTransport returns transport completely unwrapped when
+		// DEEPAI_STREAM_TRACE_FILE is unset (the default) — see
+		// stream_trace.go and TestNewHTTPClient_TraceDisabledByDefault.
+		Transport: newTracingHTTPTransport(transport),
 	}
 }
