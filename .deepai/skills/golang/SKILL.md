@@ -1,56 +1,26 @@
 ---
 name: golang
-description: "Use when writing, reviewing, refactoring, or debugging Go code. Covers naming conventions, error handling, concurrency patterns, interface design, and performance best practices."
+description: "Use when writing, reviewing, refactoring, or debugging Go code. Corrects stale pre-1.22 patterns from training data and maps them to modern stdlib (slices, maps, iter, errors.Join, context cause, testing.B.Loop) for Go 1.26; includes a build/vet/test verification loop."
 ---
 
 # Go Best Practices
 
-Guidelines based on [Effective Go](https://go.dev/doc/effective_go) for writing idiomatic, concise, and efficient Go code. Targets Go 1.25+.
+Targets Go 1.26. Effective Go basics — naming, small interfaces, multiple return values, table-driven tests — are assumed knowledge; this skill exists for what training data gets wrong: patterns that were correct before Go 1.21–1.23 but are wrong or unnecessary now, and modern stdlib the model under-uses.
 
-## When to Use
+## Stale Patterns and Modern Replacements
 
-Enable this skill when:
-- Writing new Go features or modules
-- Reviewing, refactoring, or improving Go code
-- Debugging performance, concurrency, or maintainability issues
+!`cat "$SKILL_DIR/references/stale-to-modern.md"`
 
-## Reference Materials
+## Verification Loop
 
-### Common Mistakes
+After any code change, run in order and stop at the first failure:
 
-!`cat "$SKILL_DIR/references/common-mistakes.md"`
+```bash
+gofmt -l .            # must print nothing; use goimports if imports changed
+go build ./...
+go vet ./...          # copylocks, printf misuse, unreachable code
+go test -race ./...   # fix races, never suppress them
+go mod tidy           # only when imports or dependencies changed
+```
 
-### Effective Go Essentials
-
-!`cat "$SKILL_DIR/references/effective-go.md"`
-
-## Key Rules
-
-- **Control structures**: Always use braces; avoid unnecessary `else`; initialize variables in `if`/`switch`.
-- **Functions**: Use multiple return values for results and errors; named returns for readability; `defer` for cleanup.
-- **Data structures**: Prefer slices and maps; understand the distinction between arrays, slices, and maps.
-- **Generics**: Use type assertions and type switches for interface dynamics; leverage generics for code reuse.
-- **Formatting**: Always use `gofmt` for consistent, automated style.
-- **Naming**: No underscores; exported identifiers use MixedCaps, unexported use mixedCaps; names should convey intent concisely.
-- **Error handling**: Always check and return errors; use `panic` only for unrecoverable precondition failures; preserve context with `fmt.Errorf("...: %w", err)`.
-- **Concurrency**: Communicate via channels, not shared mutable state; propagate cancellation via `context`; use buffered channels judiciously.
-- **Interface design**: Keep interfaces small and focused (1-3 methods ideal); program to interfaces, return concrete types.
-- **Comments**: Document all exported symbols with comments starting with the symbol name; explain why, not what.
-- **Code quality**: Reduce unnecessary code and complexity — know when to delete and simplify, not just add.
-
-## Practical Checklist
-
-- Make zero values useful; avoid requiring `New` constructors for basic usage.
-- Slice/map initialization: use `make` when capacity is known; avoid unnecessary `nil` guards.
-- Avoid over-allocation in loops: reuse buffers; confirm bottleneck before using `sync.Pool`.
-- Error variables: use `errors.Is/As` for semantic matching, not string comparison.
-- Logging: return errors to callers; log only at boundary layers (entry points, daemons); avoid duplicate logging.
-- Testing: prefer table-driven tests; use `t.Helper()` for test helpers; ensure parallel tests use independent data.
-- Performance: measure with `bench + pprof` before optimizing; avoid premature micro-optimization.
-- Modules: keep `go.mod`/`go.sum` clean, run `go mod tidy` regularly; limit public API surface to reduce breaking changes.
-
-## References
-
-- Official guide: https://go.dev/doc/effective_go
-- Code review comments: https://github.com/golang/go/wiki/CodeReviewComments
-- Standard library: the canonical reference for Go idioms
+If the repo configures golangci-lint or staticcheck, run it too. Never weaken a test to make it pass — if a test is genuinely wrong, change it explicitly and say why.
