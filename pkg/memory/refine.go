@@ -400,8 +400,14 @@ func (s *Service) ScheduleRefine(sessionID, userScopeKey string, messages []mode
 
 // runRefineGateJob runs the review gate and, if it approves, extracts this job's
 // scope. The verdict is published for the paired user-scope job.
+//
+// Exactly one GateVerdictRecord is written per call here — never per scope it
+// ends up authorizing — because the verdict is what gets shared with the
+// paired user-scope job, not recomputed for it. See the comment on
+// GateVerdictRecord.
 func (s *Service) runRefineGateJob(ctx context.Context, job updateJob) {
 	approved, rationale := true, autoRefineNoGateRationale
+	var verdictID string
 
 	if s.reviewer != nil {
 		current, err := s.storage.Load(ctx, job.sessionID)
@@ -412,14 +418,26 @@ func (s *Service) runRefineGateJob(ctx context.Context, job updateJob) {
 		// filterMessagesForMemory is what drops tool results and strips uploaded
 		// file blocks — the gate must not be the one path that leaks them to a
 		// provider.
+		gateStart := time.Now()
 		review, err := s.reviewer.ReviewRefine(ctx, current, filterMessagesForMemory(job.messages))
+		gateMS := time.Since(gateStart)
 		if err != nil {
-			// Fail open: an undecidable gate must not stop extraction.
+			// Fail open: an undecidable gate must not stop extraction. Recorded as
+			// its own outcome (GateOutcomeError), never folded into approve/reject
+			// — a gate that is erroring out must not be misread as "passing
+			// everything", which is exactly why it stays out of the rejection-rate
+			// denominator (see GateStats.RejectionRate).
 			s.logger.Warn("refine gate failed, extracting anyway", "session", job.sessionID, "err", err)
+			verdictID = s.recordGateVerdict(ctx, job, GateOutcomeError, err.Error(), gateMS)
 		} else {
 			approved, rationale = review.ShouldRefine, review.Rationale
 			s.logger.Debug("refine gate verdict",
 				"session", job.sessionID, "should_refine", approved, "rationale", rationale)
+			outcome := GateOutcomeReject
+			if approved {
+				outcome = GateOutcomeApprove
+			}
+			verdictID = s.recordGateVerdict(ctx, job, outcome, rationale, gateMS)
 		}
 	}
 
@@ -431,9 +449,11 @@ func (s *Service) runRefineGateJob(ctx context.Context, job updateJob) {
 		})
 	}
 	if !approved {
+		// Nothing was extracted for a rejection: ExtractMS/Saved stay NULL on
+		// this row, and there is no verdictID to backfill them onto anyway.
 		return
 	}
-	s.runRefineExtraction(ctx, job, rationale)
+	s.runRefineExtraction(ctx, job, rationale, verdictID)
 }
 
 // runRefineApprovedJob extracts this job's scope using the verdict published by
@@ -446,24 +466,39 @@ func (s *Service) runRefineApprovedJob(ctx context.Context, job updateJob) {
 		// a rejection: this scope's extraction would be dropped silently, and
 		// compaction's synchronous flush only covers the session scope.
 		s.logger.Debug("refine verdict missing, extracting anyway", "session", job.sessionID)
-		s.runRefineExtraction(ctx, job, autoRefineNoGateRationale)
+		// No verdictID: this scope's extraction is not the one the gate row
+		// tracks (that row belongs to the session-scope job; see
+		// runRefineGateJob), so there is nothing here to backfill.
+		s.runRefineExtraction(ctx, job, autoRefineNoGateRationale, "")
 		return
 	}
 	v, ok := value.(gateVerdict)
 	if !ok || !v.shouldRefine {
 		return
 	}
-	s.runRefineExtraction(ctx, job, v.rationale)
+	s.runRefineExtraction(ctx, job, v.rationale, "")
 }
 
-func (s *Service) runRefineExtraction(ctx context.Context, job updateJob, rationale string) {
+// runRefineExtraction runs the extraction and, if verdictID is non-empty,
+// backfills the gate verdict row it belongs to with how long extraction took
+// and whether it actually saved anything. verdictID is "" whenever this
+// extraction is not the one a gate row is tracking — see the two call sites
+// above.
+func (s *Service) runRefineExtraction(ctx context.Context, job updateJob, rationale, verdictID string) {
+	start := time.Now()
 	_, saved, err := s.RefineAndRecord(ctx, job.sessionID, job.messages, job.ext,
 		RefineMeta{PairID: job.pairID, Rationale: rationale})
+	extractMS := time.Since(start)
 	if err != nil {
 		s.logger.Warn("auto-refine failed", "session", job.sessionID, "err", err)
+		// The gate still authorized real work; that the extraction then failed is
+		// itself signal (saved=false) rather than a reason to leave the row
+		// unbackfilled forever.
+		s.recordGateExtraction(ctx, verdictID, extractMS, false)
 		return
 	}
 	s.logger.Debug("auto-refine finished", "session", job.sessionID, "saved", saved)
+	s.recordGateExtraction(ctx, verdictID, extractMS, saved)
 }
 
 // purgeStaleVerdicts drops verdicts nobody claimed. A verdict is normally

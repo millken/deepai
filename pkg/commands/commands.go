@@ -6,6 +6,7 @@ func AddCommands(topLevel *cobra.Command) {
 	addChat(topLevel)
 	addSetup(topLevel)
 	addSession(topLevel)
+	addMemory(topLevel)
 	addVersion(topLevel)
 	addPlugin(topLevel)
 	addKey(topLevel)

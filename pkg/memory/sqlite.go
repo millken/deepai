@@ -88,6 +88,24 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_memory_refinements_session
 			ON memory_refinements(session_id, created_at DESC)`,
+		// memory_gate_verdicts has no FK to memories(session_id): unlike a
+		// refinement (always written alongside its document, in the same
+		// transaction), a gate verdict is recorded before anything is known to
+		// have been extracted — the very first gate call for a brand-new scope
+		// runs before any memories row for it exists.
+		`CREATE TABLE IF NOT EXISTS memory_gate_verdicts (
+			id         TEXT PRIMARY KEY,
+			scope_key  TEXT NOT NULL,
+			decided_at REAL NOT NULL,
+			outcome    TEXT NOT NULL,
+			rationale  TEXT NOT NULL DEFAULT '',
+			gate_ms    INTEGER NOT NULL DEFAULT 0,
+			extract_ms INTEGER,
+			saved      INTEGER,
+			paired     INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_gate_verdicts_decided_at
+			ON memory_gate_verdicts(decided_at)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("create memory table: %w", err)
@@ -499,4 +517,89 @@ func (s *SQLiteStore) insertRefinementTx(ctx context.Context, tx *sql.Tx, sessio
 		return fmt.Errorf("trim refinements for %q: %w", sessionID, err)
 	}
 	return nil
+}
+
+// --- GateVerdictStore ---------------------------------------------------------
+
+// GateStatsQuerySQL is the exact query ListGateVerdicts runs. It is exported
+// so `deepai memory gate-stats` can print it verbatim: the numbers in that
+// report must be reproducible with `sqlite3 -readonly` alone, without this
+// binary.
+const GateStatsQuerySQL = `select id, scope_key, decided_at, outcome, rationale, gate_ms, extract_ms, saved, paired
+from memory_gate_verdicts
+order by decided_at asc`
+
+// No retention trim here, unlike memory_refinements: the gate fires roughly
+// once per five human turns (defaultRefineInterval), and four months of
+// production use produced on the order of 60 rows. This table will not need
+// pruning within the life of this feature; if that assumption stops holding,
+// it was wrong, not forgotten.
+func (s *SQLiteStore) InsertGateVerdict(ctx context.Context, record GateVerdictRecord) error {
+	_, err := s.db.ExecContext(ctx, `
+		insert into memory_gate_verdicts (id, scope_key, decided_at, outcome, rationale, gate_ms, extract_ms, saved, paired)
+		values (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+	`, record.ID, record.ScopeKey, formatDBTime(record.DecidedAt), record.Outcome, record.Rationale, record.GateMS, boolToInt(record.Paired))
+	if err != nil {
+		return fmt.Errorf("insert gate verdict %q: %w", record.ID, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) RecordGateExtraction(ctx context.Context, id string, extractMS int64, saved bool) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		update memory_gate_verdicts set extract_ms = ?, saved = ? where id = ?
+	`, extractMS, boolToInt(saved), id)
+	if err != nil {
+		return fmt.Errorf("record gate extraction outcome for %q: %w", id, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListGateVerdicts(ctx context.Context) ([]GateVerdictRecord, error) {
+	rows, err := s.db.QueryContext(ctx, GateStatsQuerySQL)
+	if err != nil {
+		return nil, fmt.Errorf("list gate verdicts: %w", err)
+	}
+	defer rows.Close()
+
+	var records []GateVerdictRecord
+	for rows.Next() {
+		var (
+			record    GateVerdictRecord
+			decidedAt float64
+			extractMS sql.NullInt64
+			saved     sql.NullInt64
+			paired    int
+		)
+		if err := rows.Scan(&record.ID, &record.ScopeKey, &decidedAt, &record.Outcome, &record.Rationale,
+			&record.GateMS, &extractMS, &saved, &paired); err != nil {
+			return nil, fmt.Errorf("scan gate verdict: %w", err)
+		}
+		record.DecidedAt = parseDBTime(decidedAt)
+		record.Paired = paired != 0
+		if extractMS.Valid {
+			v := extractMS.Int64
+			record.ExtractMS = &v
+		}
+		if saved.Valid {
+			v := saved.Int64 != 0
+			record.Saved = &v
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list gate verdicts: %w", err)
+	}
+	return records, nil
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
