@@ -307,10 +307,13 @@ func TestSessionCarry_CompactionStallCarriesAcrossRuns(t *testing.T) {
 // TestSessionCarry_SkillPersistsAcrossRuns is the RED test for P1-6: a skill
 // loaded in Run 1 (a fresh, single-use Agent) must still be active in Run 2
 // (a DIFFERENT fresh Agent sharing the same SessionCarry) — its body present
-// in the system prompt, the "Available skills" catalog no longer shown,
-// ActiveSkill() reporting the carried name, and (M4-2 interplay) the Run 2
-// turn injection's memory fence keyed off activeSource=="skill:<name>" from
-// the very first request of Run 2 (not just mid-Run, as the existing
+// in the system prompt, the "Available skills" catalog STILL shown (2026-09
+// fix: the catalog stays resident for the life of the session so the model
+// can switch to a different skill later — see removeAppliedSkillBody's doc
+// comment; only the previous skill's BODY is ever replaced), ActiveSkill()
+// reporting the carried name, and (M4-2 interplay) the Run 2 turn
+// injection's memory fence keyed off activeSource=="skill:<name>" from the
+// very first request of Run 2 (not just mid-Run, as the existing
 // TestTurnInjection_RecomputesFenceOnSkillLoadMidRun already guards within a
 // single Run).
 func TestSessionCarry_SkillPersistsAcrossRuns(t *testing.T) {
@@ -391,8 +394,9 @@ func TestSessionCarry_SkillPersistsAcrossRuns(t *testing.T) {
 	if !strings.Contains(prompt, "SKILL_BODY_TARGET") {
 		t.Fatalf("Run 2 system prompt missing the carried skill body, got: %q", prompt)
 	}
-	if strings.Contains(prompt, catalogMarker) {
-		t.Fatalf("Run 2 system prompt still shows the 'Available skills' catalog (should be stripped once a skill is carried active), got: %q", prompt)
+	if !strings.Contains(prompt, catalogMarker) {
+		t.Fatalf("Run 2 system prompt lost the 'Available skills' catalog (it must stay resident even "+
+			"once a skill is carried active, so the model can still switch skills — 2026-09 fix), got: %q", prompt)
 	}
 	if got := a2.ActiveSkill(); got != "target" {
 		t.Fatalf("Run 2 ActiveSkill() = %q, want %q", got, "target")
@@ -411,20 +415,32 @@ func TestSessionCarry_SkillPersistsAcrossRuns(t *testing.T) {
 	}
 }
 
-// TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt is the RED test
-// for review r1 F2: removeSkillDescriptions used to truncate a.systemPrompt
-// at the "Available skills" marker — a.systemPrompt[:idx] and nothing else —
-// which silently discarded whatever the caller appended AFTER the catalog.
-// The REPL appends the skill catalog and THEN the CLI/DEEPAI.md system
-// prompt (repl.go's runTurn: two AppendSystemPrompt calls right after
-// New()), so that trailing content sat exactly where the old truncation cut.
-// Before M4-3 this only lasted the remainder of the turn a skill loaded in
-// (a fresh Agent every turn meant the next turn's New() started from
-// cfg.SystemPrompt again); M4-3 carries the skill across Runs, so
-// removeSkillDescriptions now runs at the top of EVERY subsequent Run too —
-// making the loss permanent for the rest of the conversation instead of one
-// turn. Checked both in the SAME Run the skill loads (the pre-existing
-// single-turn variant of the bug) and after a carried second Run.
+// TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt guards against two
+// generations of the same class of bug around what sits BEFORE a loaded
+// skill's body in the system prompt.
+//
+// Originally (review r1 F2) this was the RED test for
+// removeSkillDescriptions truncating a.systemPrompt at the "Available
+// skills" marker — a.systemPrompt[:idx] and nothing else — which silently
+// discarded whatever the caller appended AFTER the catalog. The REPL appends
+// the skill catalog and THEN the CLI/DEEPAI.md system prompt (repl.go's
+// runTurn: two AppendSystemPrompt calls right after New()), so that trailing
+// content sat exactly where the old truncation cut.
+//
+// 2026-09 fix: removeSkillDescriptions is gone — the catalog is never
+// stripped now (it stays resident for the life of the session so the model
+// can switch skills; see removeAppliedSkillBody's doc comment), so the
+// specific truncation bug this test was written for is structurally
+// impossible. The test is kept and repurposed to guard the analogous risk
+// in the REPLACEMENT mechanism: removeAppliedSkillBody excises the
+// previously-applied skill body by exact suffix match before a new body (or
+// a carried one) is appended, and it must strip ONLY that suffix, leaving
+// everything appended before it — base prompt, catalog, and the
+// DEEPAI.md/CLI tail appended after the catalog — untouched. Checked both in
+// the SAME Run the skill loads and after a carried second Run, since the
+// carried-reapply path (react.go's Run()) and the mid-Run load path
+// (toolexec.go's applySkillResult) both call removeAppliedSkillBody
+// independently.
 func TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt(t *testing.T) {
 	const catalogMarker = "Available skills (use the matching skill when the user request fits):"
 	const deepaiMD = "DEEPAI_MD_PROJECT_INSTRUCTIONS: follow the house style."
@@ -463,8 +479,8 @@ func TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt(t *testing.T) {
 	if !strings.Contains(prompt1, "SKILL_BODY_X") {
 		t.Fatalf("Run 1: system prompt missing the loaded skill body, got: %q", prompt1)
 	}
-	if strings.Contains(prompt1, catalogMarker) {
-		t.Fatalf("Run 1: catalog still present, got: %q", prompt1)
+	if !strings.Contains(prompt1, catalogMarker) {
+		t.Fatalf("Run 1: catalog missing (2026-09 fix: it must stay resident, never stripped), got: %q", prompt1)
 	}
 	if !strings.Contains(prompt1, deepaiMD) {
 		t.Fatalf("Run 1 (review r1 F2, pre-existing single-turn variant): trailing DEEPAI.md/CLI system "+
@@ -490,8 +506,8 @@ func TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt(t *testing.T) {
 	if !strings.Contains(prompt2, "SKILL_BODY_X") {
 		t.Fatalf("Run 2: carried skill body missing, got: %q", prompt2)
 	}
-	if strings.Contains(prompt2, catalogMarker) {
-		t.Fatalf("Run 2: catalog still present, got: %q", prompt2)
+	if !strings.Contains(prompt2, catalogMarker) {
+		t.Fatalf("Run 2: catalog missing (2026-09 fix: it must stay resident, never stripped), got: %q", prompt2)
 	}
 	if !strings.Contains(prompt2, deepaiMD) {
 		t.Fatalf("Run 2 (review r1 F2): trailing DEEPAI.md/CLI system prompt content lost across a carried "+
@@ -502,9 +518,13 @@ func TestSessionCarry_SkillCarryPreservesTrailingSystemPrompt(t *testing.T) {
 // TestSessionCarry_SkillReloadSameSkillDoesNotDuplicateBody is the RED test
 // for review r1 F7: reloading a skill that is ALREADY active (the model
 // calls "skill" for the same name twice in one Run) used to duplicate the
-// body verbatim in the system prompt — removeSkillDescriptions is a no-op
-// once the catalog is already gone, so the second load just appended the
-// same body again on top of the first.
+// body verbatim in the system prompt — the second load just appended the
+// same body again on top of the first. Still guarded post-2026-09-fix by
+// applySkillResult's bodyAlreadyApplied short-circuit, which must skip the
+// remove-then-reappend cycle entirely for a genuine no-op reload (not just
+// avoid a NET duplicate via remove+reappend, which would needlessly churn
+// the system prompt and invalidate the provider's cached prefix for no
+// reason).
 func TestSessionCarry_SkillReloadSameSkillDoesNotDuplicateBody(t *testing.T) {
 	const catalogMarker = "Available skills (use the matching skill when the user request fits):"
 	reg := tools.NewRegistry()
@@ -624,13 +644,16 @@ func TestSessionCarry_EmptySkillBodyDoesNotClearCarriedBody(t *testing.T) {
 // activeSkill is written unconditionally, skillPrompt only when non-empty).
 // Run 2 (fresh Agent, same session) starts with a.ActiveSkill()=="target"
 // already (from session.activeSkill) but nothing reapplied (session.
-// skillPrompt is "", so react.go's Run()-start reapply is skipped) — the
-// catalog is still showing. Mid-Run, the model reloads "target" again, NOW
-// with a real, non-empty body. Keying the reapply guard on name alone
-// (skillName == a.ActiveSkill()) reports "already active" and skips the
-// reapply entirely — the real body is never applied, the catalog never
-// stripped. The fix must apply the body exactly once whenever it is not
-// already present, regardless of whether the NAME was already active.
+// skillPrompt is "", so react.go's Run()-start reapply is skipped). Mid-Run,
+// the model reloads "target" again, NOW with a real, non-empty body. Keying
+// the reapply guard on name alone (skillName == a.ActiveSkill()) reports
+// "already active" and skips the reapply entirely — the real body is never
+// applied. The fix must apply the body exactly once whenever it is not
+// already present, regardless of whether the NAME was already active. (The
+// skill catalog's presence is no longer meaningful bug evidence here —
+// 2026-09 fix: it stays resident throughout regardless of whether the body
+// applied correctly; the assertion below checks it only to confirm the fix
+// didn't accidentally regress that separate invariant.)
 func TestSessionCarry_RealBodyReloadAfterEmptyBodyIsApplied(t *testing.T) {
 	const catalogMarker = "Available skills (use the matching skill when the user request fits):"
 	session := NewSessionCarry()
@@ -699,8 +722,9 @@ func TestSessionCarry_RealBodyReloadAfterEmptyBodyIsApplied(t *testing.T) {
 			"following Run 1's empty-body load, want exactly 1 (review r2 F2-b) — 0 means the body was "+
 			"never applied (the bug), >1 means it duplicated, got prompt: %q", got, prompt2)
 	}
-	if strings.Contains(prompt2, catalogMarker) {
-		t.Fatalf("Run 2: catalog still present after the real body finally loaded, got: %q", prompt2)
+	if !strings.Contains(prompt2, catalogMarker) {
+		t.Fatalf("Run 2: catalog missing after the real body finally loaded (2026-09 fix: it must stay "+
+			"resident, never stripped), got: %q", prompt2)
 	}
 }
 
@@ -830,6 +854,227 @@ func TestSessionCarry_CarriedSkillThenSameSkillReloadDoesNotDuplicate(t *testing
 			"Run, want exactly 1 (review M4-final F-V1) — the Run-start reapply's appliedSkillPrompt "+
 			"write-back must make the mid-Run reload recognise the body as already applied, got prompt: %q",
 			got, prompt)
+	}
+}
+
+// TestApplySkillResult_SwitchingBackAndForthReplacesBody is the RED test for
+// the "skill body only appended, never removed" bug: applySkillResult used
+// to fold every loaded body into the system prompt via AppendSystemPrompt
+// alone, with no corresponding removal — appliedSkillPrompt only remembers
+// the LAST body applied, so switching A -> B -> A within a single Run/Agent
+// left TWO copies of A's body (the second A load didn't match
+// appliedSkillPrompt, which by then held B's body, so it re-appended A
+// instead of recognising anything). The fix (removeAppliedSkillBody) must
+// excise the previously-applied body before appending the new one, so at
+// most one skill's body is ever present at a time — while the skill catalog
+// (and anything the caller appended after it) stays untouched, since the
+// catalog must remain resident for the model to be able to switch skills at
+// all (2026-09 fix; see removeAppliedSkillBody's doc comment).
+func TestApplySkillResult_SwitchingBackAndForthReplacesBody(t *testing.T) {
+	const catalogMarker = "Available skills (use the matching skill when the user request fits):"
+	const tail = "DEEPAI_MD_TAIL: house style, follow it."
+
+	a := New(AgentConfig{SystemPrompt: "BASE"})
+	// Mirrors the REPL's real construction order: base prompt, then the
+	// skill catalog, then more content appended after it (repl.go's
+	// runTurn: catalog, then the CLI/DEEPAI.md system prompt).
+	a.AppendSystemPrompt(catalogMarker + "\n- a: does a\n- b: does b")
+	a.AppendSystemPrompt(tail)
+
+	ctx := context.Background()
+	loadSkill := func(name, body string) {
+		a.applySkillResult(ctx, "s1", models.ToolResult{
+			Content: "loaded",
+			Data:    map[string]any{"system_prompt": body, "skill_name": name},
+		}, nil)
+	}
+
+	// A -> B -> A, all within the same Agent (mirrors three mid-Run "skill"
+	// tool calls in one Run).
+	loadSkill("a", "SKILL_BODY_A")
+	loadSkill("b", "SKILL_BODY_B")
+	loadSkill("a", "SKILL_BODY_A")
+
+	prompt := a.BuildSystemPrompt()
+	if got := strings.Count(prompt, "SKILL_BODY_A"); got != 1 {
+		t.Fatalf("SKILL_BODY_A appears %d time(s) after A -> B -> A, want exactly 1 (switching back to A "+
+			"must not duplicate its body), got prompt: %q", got, prompt)
+	}
+	if got := strings.Count(prompt, "SKILL_BODY_B"); got != 0 {
+		t.Fatalf("SKILL_BODY_B appears %d time(s) after switching away from B back to A, want 0 (B's body "+
+			"must be removed when superseded, not just left behind), got prompt: %q", got, prompt)
+	}
+	if !strings.Contains(prompt, catalogMarker) {
+		t.Fatalf("skill catalog missing after switching skills twice — it must stay resident so the model "+
+			"can keep switching skills for the rest of the session, got: %q", prompt)
+	}
+	if !strings.Contains(prompt, tail) {
+		t.Fatalf("content the caller appended after the catalog (e.g. DEEPAI.md) was lost, got: %q", prompt)
+	}
+	if got := a.ActiveSkill(); got != "a" {
+		t.Fatalf("ActiveSkill() = %q, want %q (the last skill loaded)", got, "a")
+	}
+}
+
+// TestRemoveAppliedSkillBody_TailInvariantViolationLogsInsteadOfSilentlyDegrading
+// is the RED test for the final-review gap: removeAppliedSkillBody's whole
+// design rests on the invariant (documented on its own doc comment) that a
+// skill body, once appended, is always the LAST thing in a.systemPrompt —
+// but that invariant was only ever documented, never asserted. The original
+// fix cleared a.appliedSkillPrompt unconditionally even when the suffix
+// match failed, which would silently and permanently drop the only handle
+// pointing at the stale body still sitting in the prompt, with zero signal
+// anything went wrong — a quieter recurrence of exactly the "body left
+// behind forever" bug this whole fix targets. Exercises removeAppliedSkillBody
+// directly (constructing the Agent literal, same package, mirroring
+// compact_test.go's own log-capture pattern) so the invariant-violated case
+// can be driven precisely, independent of what either real call site does
+// with a.appliedSkillPrompt right afterward.
+func TestRemoveAppliedSkillBody_TailInvariantViolationLogsInsteadOfSilentlyDegrading(t *testing.T) {
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	const oldBody = "SKILL_BODY_STALE"
+	const interloper = "SOMETHING_APPENDED_AFTER_THE_BODY"
+
+	a := &Agent{
+		logger: logger,
+		// Simulates the tail invariant already broken: something appended
+		// AFTER the recorded skill body, so it's no longer the trailing
+		// suffix removeAppliedSkillBody expects.
+		systemPrompt:       "BASE\n\n" + oldBody + "\n\n" + interloper,
+		appliedSkillPrompt: oldBody,
+	}
+
+	a.removeAppliedSkillBody()
+
+	if !strings.Contains(logBuf.String(), "level=WARN") {
+		t.Fatalf("expected a Warn log when the skill body isn't found at the system prompt tail, got log: %q",
+			logBuf.String())
+	}
+	if got := strings.Count(a.systemPrompt, oldBody); got != 1 {
+		t.Fatalf("stale body count = %d after a failed removal, want exactly 1 — must not be guessed-removed "+
+			"from the wrong place, and must not silently vanish, got prompt: %q", got, a.systemPrompt)
+	}
+	if !strings.Contains(a.systemPrompt, interloper) {
+		t.Fatalf("content after the stale body was lost — a failed match must not touch a.systemPrompt at "+
+			"all, got: %q", a.systemPrompt)
+	}
+	if a.appliedSkillPrompt != oldBody {
+		t.Fatalf("appliedSkillPrompt = %q after a failed removal, want unchanged %q — clearing it here would "+
+			"claim nothing is applied even though the stale body is still sitting in the prompt", a.appliedSkillPrompt, oldBody)
+	}
+}
+
+// TestApplySkillResult_TailInvariantViolationWarnsAndDoesNotSilentlyDuplicate
+// drives the same invariant violation through the real call path
+// (applySkillResult), constructed the way the final review suggested: load
+// a skill normally, then manually AppendSystemPrompt more content —
+// something no real code path in this package does mid-Run (see
+// removeAppliedSkillBody's doc comment), simulating the invariant breaking
+// out from under it — and confirm loading a DIFFERENT skill afterward warns
+// rather than silently corrupting the prompt (duplicating or dropping
+// bodies).
+func TestApplySkillResult_TailInvariantViolationWarnsAndDoesNotSilentlyDuplicate(t *testing.T) {
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	a := New(AgentConfig{SystemPrompt: "BASE"})
+	a.logger = logger
+	a.AppendSystemPrompt("Available skills (use the matching skill when the user request fits):\n- a: does a\n- b: does b")
+
+	ctx := context.Background()
+	loadSkill := func(name, body string) {
+		a.applySkillResult(ctx, "s1", models.ToolResult{
+			Content: "loaded",
+			Data:    map[string]any{"system_prompt": body, "skill_name": name},
+		}, nil)
+	}
+
+	loadSkill("a", "SKILL_BODY_A")
+
+	// Break the invariant: something appends after the applied body.
+	a.AppendSystemPrompt("INTERLOPER_TEXT_AFTER_BODY")
+
+	loadSkill("b", "SKILL_BODY_B")
+
+	if !strings.Contains(logBuf.String(), "level=WARN") {
+		t.Fatalf("expected a Warn log once the tail invariant is violated, got log: %q", logBuf.String())
+	}
+	prompt := a.BuildSystemPrompt()
+	if got := strings.Count(prompt, "SKILL_BODY_A"); got != 1 {
+		t.Fatalf("SKILL_BODY_A appears %d time(s) after the invariant broke, want exactly 1 (left in place, "+
+			"neither duplicated nor silently dropped), got prompt: %q", got, prompt)
+	}
+	if !strings.Contains(prompt, "INTERLOPER_TEXT_AFTER_BODY") {
+		t.Fatalf("interloper content was lost, got: %q", prompt)
+	}
+	if got := strings.Count(prompt, "SKILL_BODY_B"); got != 1 {
+		t.Fatalf("SKILL_BODY_B appears %d time(s), want exactly 1, got prompt: %q", got, prompt)
+	}
+}
+
+// TestSessionCarry_CarriedSkillBodyStaysSingleCopyWithCatalogResident is the
+// RED test for the cross-Run half of the same fix: a skill loaded in Run 1
+// must still be active in Run 2 (a different, single-use Agent sharing the
+// same SessionCarry) with its body present exactly ONCE and the skill
+// catalog still resident — not just "not duplicated" (already covered,
+// within a single Run, by TestSessionCarry_SkillReloadSameSkillDoesNotDuplicateBody
+// and, across Runs with a mid-Run reload, by
+// TestSessionCarry_CarriedSkillThenSameSkillReloadDoesNotDuplicate) but also
+// "still switchable", which the old removeSkillDescriptions-based design
+// broke permanently the moment any skill first loaded.
+func TestSessionCarry_CarriedSkillBodyStaysSingleCopyWithCatalogResident(t *testing.T) {
+	const catalogMarker = "Available skills (use the matching skill when the user request fits):"
+	const body = "SKILL_BODY_CARRIED_RESIDENT"
+
+	session := NewSessionCarry()
+
+	// Run 1: loads skill "a".
+	reg1 := tools.NewRegistry()
+	if err := reg1.Register(models.Tool{
+		Name: "skill",
+		Handler: func(ctx context.Context, c models.ToolCall) (models.ToolResult, error) {
+			return models.ToolResult{
+				Content: "loaded",
+				Data:    map[string]any{"system_prompt": body, "skill_name": "a"},
+			}, nil
+		},
+	}); err != nil {
+		t.Fatalf("register skill tool (run 1): %v", err)
+	}
+	p1 := &multiTurnCaptureProvider{toolTurns: 1, toolName: "skill"}
+	a1 := New(AgentConfig{LLMProvider: p1, Tools: reg1, SystemPrompt: "BASE", Session: session})
+	a1.AppendSystemPrompt(catalogMarker + "\n- a: does a\n- b: does b")
+	if _, err := a1.Run(context.Background(), "s1", []models.Message{
+		{Role: models.RoleHuman, Content: "go"},
+	}); err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+
+	// Run 2: fresh Agent, same session, same REPL-mirroring construction
+	// order, NO mid-Run tool calls — this exercises ONLY the Run-start
+	// carried reapply (react.go's Run()), not the mid-Run skill-result path.
+	reg2 := tools.NewRegistry()
+	p2 := &multiTurnCaptureProvider{toolTurns: 0}
+	a2 := New(AgentConfig{LLMProvider: p2, Tools: reg2, SystemPrompt: "BASE", Session: session})
+	a2.AppendSystemPrompt(catalogMarker + "\n- a: does a\n- b: does b")
+	if _, err := a2.Run(context.Background(), "s1", []models.Message{
+		{Role: models.RoleHuman, Content: "go again"},
+	}); err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+
+	prompt := a2.BuildSystemPrompt()
+	if got := strings.Count(prompt, body); got != 1 {
+		t.Fatalf("carried skill body appears %d time(s) in Run 2, want exactly 1, got prompt: %q", got, prompt)
+	}
+	if !strings.Contains(prompt, catalogMarker) {
+		t.Fatalf("Run 2: skill catalog missing — it must stay resident across a carried skill so the "+
+			"model can switch to a different skill in this Run too, got: %q", prompt)
+	}
+	if got := a2.ActiveSkill(); got != "a" {
+		t.Fatalf("Run 2 ActiveSkill() = %q, want %q", got, "a")
 	}
 }
 

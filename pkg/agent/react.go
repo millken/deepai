@@ -170,14 +170,23 @@ type Agent struct {
 	// appliedSkillPrompt is the exact skill-body string last appended to
 	// a.systemPrompt via AppendSystemPrompt (set alongside every such
 	// append — Run()'s start-of-Run reapply from a carried session, and
-	// the mid-Run skill-result handling below). Review M4-final F-M4-7:
-	// used for an EXACT-EQUALITY check (bodyAlreadyApplied) instead of
-	// re-deriving "is this body already applied?" via
-	// strings.Contains(a.systemPrompt, loadedSkillPrompt), which could
-	// false-positive on a short/degenerate body that happens to already be
-	// a substring of the base prompt, the file-op rule, or other assembled
-	// text — reporting "already applied" for a body that was never
-	// actually appended, and silently dropping a genuine reload.
+	// the mid-Run skill-result handling below). It serves two purposes:
+	//
+	//   - Review M4-final F-M4-7: an EXACT-EQUALITY check (bodyAlreadyApplied)
+	//     instead of re-deriving "is this body already applied?" via
+	//     strings.Contains(a.systemPrompt, loadedSkillPrompt), which could
+	//     false-positive on a short/degenerate body that happens to already
+	//     be a substring of the base prompt, the file-op rule, or other
+	//     assembled text — reporting "already applied" for a body that was
+	//     never actually appended, and silently dropping a genuine reload.
+	//
+	//   - 2026-09 fix (only one active skill body at a time, skill catalog
+	//     always kept): removeAppliedSkillBody uses this same exact string
+	//     to excise the PREVIOUS body from a.systemPrompt, by exact suffix
+	//     match against the "\n\n"-joined text AppendSystemPrompt would have
+	//     produced, before a new body is appended in its place — again
+	//     exact-match rather than substring, for the same false-positive
+	//     reason.
 	appliedSkillPrompt string
 
 	// User interaction
@@ -286,11 +295,13 @@ func New(cfg AgentConfig) *Agent {
 	// session, if any, so this fresh Run's first estimate isn't blind to the
 	// previous Run's real provider-reported count (see estimateContextTokens
 	// and maybeCompact's doc comments). The active-skill/breaker carriage
-	// happens in Run() instead (see the comments there) since a skill's
-	// system-prompt append must happen AFTER the caller's own post-New()
-	// AppendSystemPrompt calls (e.g. the REPL appends the skill catalog
-	// after New() returns) for removeSkillDescriptions to find anything to
-	// strip.
+	// happens in Run() instead (see the comments there) since the carried
+	// skill body must be re-appended AFTER the caller's own post-New()
+	// AppendSystemPrompt calls (e.g. the REPL appends the skill catalog and
+	// the CLI/DEEPAI.md prompt after New() returns) so the skill body stays
+	// the LAST thing appended to the system prompt — that's what lets
+	// removeAppliedSkillBody (the inverse of AppendSystemPrompt) find and
+	// excise it as a trailing suffix the next time the active skill changes.
 	if cfg.Session != nil {
 		a.lastInputTokens = cfg.Session.lastInputTokens
 		a.lastTokenCountMsgs = cfg.Session.lastTokenCountMsgs
@@ -351,43 +362,81 @@ func (a *Agent) AppendSystemPrompt(extra string) {
 	}
 }
 
-// removeSkillDescriptions strips the "Available skills" section from system prompt.
-// Called after a skill is loaded since the descriptions are no longer needed.
-func (a *Agent) removeSkillDescriptions() {
-	const marker = "Available skills (use the matching skill when the user request fits):"
-	idx := strings.Index(a.systemPrompt, marker)
-	if idx <= 0 {
+// removeAppliedSkillBody undoes the LAST AppendSystemPrompt call that
+// applied a skill body (a.appliedSkillPrompt), so a new body can be appended
+// in its place without leaving the old one behind. This is the exact
+// inverse of AppendSystemPrompt's "\n\n"-join contract, not a generic
+// "remove this text" helper.
+//
+// 2026-09 fix (skill body: replace, not append; skill catalog: always kept):
+// the skill system used to (a) append every loaded body without ever
+// removing the previous one, so switching skills mid-session duplicated
+// bodies, and (b) strip the "Available skills" catalog out of the system
+// prompt entirely on first load, which permanently locked the session onto
+// whichever skill loaded first — with the catalog gone, the model never
+// sees another skill's description again and can't ask to switch. The fixed
+// invariant is: at any moment, the system prompt carries the catalog PLUS
+// the single active skill's body, and switching skills replaces the body
+// in place. Keeping the catalog resident costs nothing but the (small,
+// fixed) catalog text, and buys back both mid-session skill switching and a
+// stable prompt prefix for caching purposes — a body-swap at the tail
+// disturbs far less of the cached prefix than repeatedly carving a block out
+// of the middle of the prompt would.
+//
+// Precondition this relies on: after construction, a skill body is always
+// the LAST thing appended to a.systemPrompt. The only two call sites that
+// append one (this file's Run()-start carried-skill reapply, and
+// toolexec.go's applySkillResult) both call this function first, and no
+// other code path calls AppendSystemPrompt once a Run is underway (the
+// REPL's own catalog/DEEPAI.md appends happen once, synchronously, right
+// after New() and before Run() is ever called — see the comment in New()).
+// That invariant is what lets this match by exact suffix instead of
+// searching for the body inside the prompt: a substring search would risk
+// the same false-positive the appliedSkillPrompt doc comment already
+// explains for bodyAlreadyApplied (a short/degenerate body colliding with
+// unrelated text elsewhere in the assembled prompt).
+//
+// The precondition is asserted, not just assumed: if neither the
+// whole-prompt nor the suffix match, something outside this file's control
+// appended text after the recorded body (a violated invariant, not a normal
+// state), and silently doing nothing would leave that stale body sitting in
+// the system prompt forever with no signal — indistinguishable from the
+// original "body only ever appended, never removed" bug this function
+// exists to fix, just harder to notice. That case logs a Warn instead of
+// silently no-op'ing. It deliberately does NOT scrub a.systemPrompt on a
+// failed match — with no reliable anchor for where the stale body actually
+// is, guessing at a removal risks cutting unrelated text instead.
+//
+// appliedSkillPrompt is left UNCHANGED (not cleared to "") when the match
+// fails: clearing it would claim "nothing is applied", which is false — the
+// old body is presumably still in there somewhere, we just couldn't confirm
+// or excise it from the tail. Leaving the stale value in place at least
+// keeps bodyAlreadyApplied's dedup working if the SAME body loads again
+// right after (better to skip a re-append than to compound the mess with
+// another copy). Both real call sites overwrite a.appliedSkillPrompt
+// immediately after calling this anyway (with whatever body they just
+// appended), so this choice only matters for a future call site that
+// doesn't follow that pattern.
+func (a *Agent) removeAppliedSkillBody() {
+	if a.appliedSkillPrompt == "" {
 		return
 	}
-	before := strings.TrimSpace(a.systemPrompt[:idx])
-	// Review r1 F2: this used to truncate EVERYTHING after the marker
-	// (a.systemPrompt[:idx] and nothing else), which silently and
-	// permanently discarded whatever the caller appended AFTER the catalog
-	// — e.g. the REPL appends the skill catalog and THEN the CLI/DEEPAI.md
-	// system prompt (repl.go's runTurn, two AppendSystemPrompt calls right
-	// after New()). Since M4-3 carries a loaded skill across Runs (this
-	// function now runs at the top of every subsequent Run, not just once
-	// per turn), that loss became permanent for the rest of the
-	// conversation instead of lasting only the remainder of one turn.
-	// Excise ONLY the catalog block itself: AppendSystemPrompt always joins
-	// sections with exactly "\n\n", so the first such boundary after the
-	// marker is where the catalog ends and whatever was appended after it
-	// begins — preserve that tail. If no such boundary exists, the catalog
-	// was the last thing appended and there is nothing to preserve, which
-	// reduces to the original behavior for that case.
-	rest := a.systemPrompt[idx:]
-	after := ""
-	if sep := strings.Index(rest, "\n\n"); sep >= 0 {
-		after = strings.TrimSpace(rest[sep+2:])
+	if a.systemPrompt == a.appliedSkillPrompt {
+		// The body was the entirety of the system prompt (AppendSystemPrompt
+		// takes this branch when a.systemPrompt was empty at append time).
+		a.systemPrompt = ""
+		a.appliedSkillPrompt = ""
+		return
 	}
-	switch {
-	case before == "":
-		a.systemPrompt = after
-	case after == "":
-		a.systemPrompt = before
-	default:
-		a.systemPrompt = before + "\n\n" + after
+	suffix := "\n\n" + a.appliedSkillPrompt
+	if !strings.HasSuffix(a.systemPrompt, suffix) {
+		a.logger.Warn("skill body not found at system prompt tail; leaving it in place",
+			"applied_skill_body_len", len(a.appliedSkillPrompt),
+			"system_prompt_len", len(a.systemPrompt))
+		return
 	}
+	a.systemPrompt = a.systemPrompt[:len(a.systemPrompt)-len(suffix)]
+	a.appliedSkillPrompt = ""
 }
 
 func cloneRegistryWithPresentFileTool(base *tools.Registry, presentFiles *tools.PresentFileRegistry) *tools.Registry {
@@ -424,19 +473,23 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// M4-3: initialize skill tracking for this Run from the carried session
 	// instead of unconditionally resetting to "" — a skill loaded by a
 	// previous Run sharing this session (a different, single-use Agent
-	// instance) must stay active here too, or the "Available skills"
-	// catalog gets re-shown and M4-2's memory fence loses its cross-turn
-	// activeSource. Reapplying session.skillPrompt here (rather than in
-	// New()) is deliberate: it must run AFTER the caller's own post-New()
-	// AppendSystemPrompt calls (e.g. the REPL appends the skill catalog and
-	// its own system prompt after New() returns, before calling Run) so
-	// removeSkillDescriptions below actually finds the catalog marker to
-	// strip — calling this in New() would run before that marker exists.
+	// instance) must stay active here too, or M4-2's memory fence loses its
+	// cross-turn activeSource. The "Available skills" catalog is NOT
+	// touched here (2026-09 fix: it stays resident for the life of the
+	// session so the model can switch skills at any time — see
+	// removeAppliedSkillBody's doc comment). Reapplying session.skillPrompt
+	// here (rather than in New()) is still deliberate: it must run AFTER
+	// the caller's own post-New() AppendSystemPrompt calls (e.g. the REPL
+	// appends the skill catalog and its own system prompt after New()
+	// returns, before calling Run) so the reapplied body ends up as the
+	// LAST thing appended — the trailing-suffix precondition
+	// removeAppliedSkillBody depends on. Calling this in New() would append
+	// the body before that later content, breaking that invariant.
 	initialSkill := ""
 	if a.session != nil {
 		initialSkill = a.session.activeSkill
 		if a.session.skillPrompt != "" {
-			a.removeSkillDescriptions()
+			a.removeAppliedSkillBody()
 			a.AppendSystemPrompt(a.session.skillPrompt)
 			a.appliedSkillPrompt = a.session.skillPrompt
 		}

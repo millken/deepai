@@ -434,12 +434,23 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 }
 
 // applySkillResult applies a completed "skill" tool call's cross-request
-// side effects: fold the loaded skill's body into the system prompt (dedup'd
-// against the same skill already applied) and, if the active skill actually
-// changed, rebuild a.turnInjection immediately so the memory fence
-// (activeSource = "skill:"+name) applies starting with the very next
+// side effects: replace whatever skill body is currently in the system
+// prompt with the newly loaded one (dedup'd when it's the same skill's same
+// body already applied — see bodyAlreadyApplied below) and, if the active
+// skill actually changed, rebuild a.turnInjection immediately so the memory
+// fence (activeSource = "skill:"+name) applies starting with the very next
 // request. See handleResult's doc comment for why this is called from
 // there instead of being duplicated across the two dispatch paths.
+//
+// 2026-09 fix: this used to only ever APPEND (a.AppendSystemPrompt), never
+// remove, the previous body — so switching skills A -> B -> A within one
+// Run left two copies of A's body in the system prompt (appliedSkillPrompt
+// only remembers the LAST one applied, so the second A load didn't even
+// register as a dup). The system prompt must carry at most one active
+// skill's body at a time; removeAppliedSkillBody excises the previous one
+// (by exact suffix match, not substring — see its own doc comment) before
+// the new one is appended. The skill catalog itself is left untouched here
+// (see removeAppliedSkillBody's doc comment for why it now stays resident).
 func (a *Agent) applySkillResult(ctx context.Context, sessionID string, result models.ToolResult, runMessages []models.Message) {
 	skillName, _ := result.Data["skill_name"].(string)
 	loadedSkillPrompt, _ := result.Data["system_prompt"].(string)
@@ -452,7 +463,7 @@ func (a *Agent) applySkillResult(ctx context.Context, sessionID string, result m
 	bodyAlreadyApplied := loadedSkillPrompt != "" && skillName != "" && skillName == a.ActiveSkill() &&
 		loadedSkillPrompt == a.appliedSkillPrompt
 	if loadedSkillPrompt != "" && !bodyAlreadyApplied {
-		a.removeSkillDescriptions()
+		a.removeAppliedSkillBody()
 		a.AppendSystemPrompt(loadedSkillPrompt)
 		a.appliedSkillPrompt = loadedSkillPrompt
 	}

@@ -311,15 +311,18 @@ func formatTodoNote(hasTodoTool bool, todos []builtin.TodoItem) string {
 // already active when THIS Run's very first buildTurnInjection call happens,
 // so the fence applies from request one, not just from a mid-Run load
 // onward. Either way, "once per Run" is really "once per activeSource
-// segment", not a hard one-shot: react.go's skill-result handling calls this
-// AGAIN
-// immediately after a.activeSkill.Store(name) whenever a "skill" tool call
-// changes it mid-Run, so the injection IS re-fenced starting with the very
-// next request after a skill loads — see the call site there for why that
-// recompute is prefix-cache-free (AppendSystemPrompt already invalidated the
-// prefix that same turn). Only genuinely per-request recomputation (once per
-// REQUEST rather than once per activeSource change) is what this function
-// avoids.
+// segment", not a hard one-shot: toolexec.go's applySkillResult calls this
+// AGAIN immediately after a.activeSkill.Store(name) whenever a "skill" tool
+// call changes it mid-Run, so the injection IS re-fenced starting with the
+// very next request after a skill loads — see the call site there for why
+// that recompute is prefix-cache-free (removeAppliedSkillBody +
+// AppendSystemPrompt already invalidated the prefix that same turn, by
+// replacing the previous skill's body with the new one — see
+// removeAppliedSkillBody's doc comment for why the body is replaced in
+// place instead of the older, now-removed approach of stripping the skill
+// catalog out of the prompt on first load). Only genuinely per-request
+// recomputation (once per REQUEST rather than once per activeSource change)
+// is what this function avoids.
 func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMessages []models.Message) models.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))

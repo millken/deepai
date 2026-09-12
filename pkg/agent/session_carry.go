@@ -33,9 +33,15 @@ type SessionCarry struct {
 	// mirrors Agent.ActiveSkill(); skillPrompt is the skill body that was
 	// appended to the system prompt when it loaded (result.Data
 	// ["system_prompt"] from the "skill" tool). A fresh Run re-applies
-	// skillPrompt via the same removeSkillDescriptions + AppendSystemPrompt
-	// path a live mid-Run skill load uses, instead of starting with the
-	// skill catalog re-shown and the loaded skill forgotten.
+	// skillPrompt via the same removeAppliedSkillBody + AppendSystemPrompt
+	// path a live mid-Run skill load uses (react.go's Run(), and
+	// toolexec.go's applySkillResult), instead of starting with the loaded
+	// skill forgotten. The "Available skills" catalog is never touched by
+	// either path (2026-09 fix) — it is appended once by the caller (e.g.
+	// the REPL, right after New()) and stays in the system prompt for the
+	// life of the session, so the model can always see every skill's
+	// description and switch at any time; only the single active body is
+	// ever replaced.
 	activeSkill string
 	skillPrompt string
 
