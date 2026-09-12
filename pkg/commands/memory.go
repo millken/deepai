@@ -17,7 +17,239 @@ func addMemory(topLevel *cobra.Command) {
 		Short: "Inspect stored memory",
 	}
 	cmd.AddCommand(cmdMemoryGateStats())
+	cmd.AddCommand(cmdMemoryList())
+	cmd.AddCommand(cmdMemoryConsolidate())
 	topLevel.AddCommand(cmd)
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+func cmdMemoryList() *cobra.Command {
+	var category string
+	var minConfidence float64
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List stored memory facts across all scopes, filterable by category and confidence",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := listFactsReport(cmd.Context(), DBFile(), category, minConfidence, limit)
+			if err != nil {
+				return err
+			}
+			fmt.Fprint(os.Stdout, report)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&category, "category", "", "only facts with this category (e.g. preference)")
+	cmd.Flags().Float64Var(&minConfidence, "min-confidence", 0, "only facts with confidence >= this (0-1)")
+	cmd.Flags().IntVar(&limit, "limit", 100, "maximum facts to print (0 = all)")
+	return cmd
+}
+
+// listFactsReport mirrors gateStatsReport: takes a dbPath (not DBFile()) so
+// tests run against a t.TempDir() database, never the user's real store.
+func listFactsReport(ctx context.Context, dbPath, category string, minConfidence float64, limit int) (string, error) {
+	store, err := memory.NewSQLiteStore(ctx, dbPath)
+	if err != nil {
+		return "", err
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(ctx); err != nil {
+		return "", err
+	}
+	facts, err := store.ListAllFacts(ctx)
+	if err != nil {
+		return "", err
+	}
+	return renderFactList(facts, category, minConfidence, limit), nil
+}
+
+// renderFactList is a pure function of the fetched rows so the filter and
+// layout behaviours are unit-testable without a database.
+func renderFactList(facts []memory.ScopedFact, category string, minConfidence float64, limit int) string {
+	category = strings.TrimSpace(category)
+	filtered := make([]memory.ScopedFact, 0, len(facts))
+	for _, f := range facts {
+		if category != "" && f.Category != category {
+			continue
+		}
+		if f.Confidence < minConfidence {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Memory facts\n")
+	fmt.Fprintf(&b, "============\n\n")
+
+	if len(filtered) == 0 {
+		fmt.Fprintf(&b, "No memory facts recorded for this filter.\n")
+		fmt.Fprintf(&b, "\nFilters: category=%q, min-confidence=%.2f, limit=%d\n", category, minConfidence, limit)
+		fmt.Fprintf(&b, "\nSQL used:\n%s\n", memory.ListFactsQuerySQL)
+		return b.String()
+	}
+
+	shown := filtered
+	if limit > 0 && len(filtered) > limit {
+		shown = filtered[:limit]
+	}
+
+	fmt.Fprintf(&b, "%-24s %-28s %-12s %5s  %s\n", "scope", "id", "category", "conf", "content")
+	for _, f := range shown {
+		fmt.Fprintf(&b, "%-24s %-28s %-12s %5.2f  %s\n", shortScope(f.ScopeKey), truncate(f.ID, 28), truncate(f.Category, 12), f.Confidence, firstLine(f.Content))
+	}
+
+	if len(shown) < len(facts) {
+		fmt.Fprintf(&b, "\n(%d of %d facts shown; filters: category=%q, min-confidence=%.2f, limit=%d)\n", len(shown), len(facts), category, minConfidence, limit)
+	}
+	return b.String()
+}
+
+// shortScope renders a storage key as a compact scope label: bare session
+// ids become session:<first 8 chars>, __scope__:user:<id>: becomes user.
+func shortScope(scopeKey string) string {
+	scope := memory.ParseScopeKey(scopeKey)
+	switch scope.Type {
+	case memory.ScopeUser:
+		return "user"
+	case memory.ScopeAgent:
+		return "agent:" + scope.ID
+	case memory.ScopeGroup:
+		return "group:" + scope.ID
+	default:
+		id := scope.ID
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		if id == "" {
+			return "session"
+		}
+		return "session:" + id
+	}
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
+}
+
+// firstLine collapses a fact to its first line so multi-line content cannot
+// break the one-fact-per-row layout the skill's diff preview parses.
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// consolidate
+// ---------------------------------------------------------------------------
+
+func cmdMemoryConsolidate() *cobra.Command {
+	var category string
+	var threshold float64
+	var user string
+	var apply bool
+	cmd := &cobra.Command{
+		Use:   "consolidate",
+		Short: "Collapse near-duplicate memory facts across scopes (dry-run by default; --apply writes)",
+		Long: `Collapse near-duplicate facts of one category into a single survivor each.
+
+Preferences used to be learned per session, so the same preference re-emerged
+as a new fact under every session that expressed it. This command clusters
+those rows by content similarity, keeps the highest-confidence member, drops
+the rest, and moves survivors into the user-scope document the agent injects.
+
+Prints the plan without writing anything unless --apply is passed.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if user == "" {
+				cwd, err := os.Getwd()
+				if err != nil {
+					return fmt.Errorf("determine --user default from cwd: %w", err)
+				}
+				user = cwd
+			}
+			report, err := consolidateReport(cmd.Context(), DBFile(), category, threshold, user, apply)
+			if err != nil {
+				return err
+			}
+			fmt.Fprint(os.Stdout, report)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&category, "category", "preference", "category to consolidate")
+	cmd.Flags().Float64Var(&threshold, "threshold", 0.55, "cosine similarity above which two facts are duplicates (0-1)")
+	cmd.Flags().StringVar(&user, "user", "", "user scope id for survivors (default: current directory, matching the REPL's WorkDir scoping)")
+	cmd.Flags().BoolVar(&apply, "apply", false, "write the plan; without it nothing is modified")
+	return cmd
+}
+
+// consolidateReport is split from the cobra RunE for the same reason as
+// gateStatsReport/listFactsReport: it takes a dbPath so tests never touch
+// the user's real store.
+func consolidateReport(ctx context.Context, dbPath, category string, threshold float64, user string, apply bool) (string, error) {
+	store, err := memory.NewSQLiteStore(ctx, dbPath)
+	if err != nil {
+		return "", err
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(ctx); err != nil {
+		return "", err
+	}
+	facts, err := store.ListAllFacts(ctx)
+	if err != nil {
+		return "", err
+	}
+	targetKey := memory.UserScope(user).Key()
+	groups := memory.PlanConsolidation(facts, category, threshold)
+
+	if apply {
+		if _, err := store.ApplyConsolidation(ctx, groups, targetKey, time.Now().UTC()); err != nil {
+			return "", err
+		}
+	}
+	return renderConsolidationPlan(groups, targetKey, apply), nil
+}
+
+// renderConsolidationPlan is pure so grouping display and the dry-run marker
+// are unit-testable without a database.
+func renderConsolidationPlan(groups []memory.ConsolidationGroup, targetKey string, applied bool) string {
+	var b strings.Builder
+	if applied {
+		fmt.Fprintf(&b, "Consolidation applied\n")
+		fmt.Fprintf(&b, "====================\n\n")
+	} else {
+		fmt.Fprintf(&b, "Consolidation plan (dry run — pass --apply to write)\n")
+		fmt.Fprintf(&b, "====================================================\n\n")
+	}
+
+	dropTotal := 0
+	for _, g := range groups {
+		dropTotal += g.DroppedCount()
+	}
+	if len(groups) == 0 {
+		fmt.Fprintf(&b, "No near-duplicate groups found. Nothing to do.\n")
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "%d groups, %d facts dropped, survivors move to %s\n\n", len(groups), dropTotal, targetKey)
+	for i, g := range groups {
+		origin := "already in target"
+		if g.Survivor.ScopeKey != targetKey {
+			origin = "moves from " + shortScope(g.Survivor.ScopeKey)
+		}
+		fmt.Fprintf(&b, "group %d: keep %s (conf %.2f, %s)\n", i+1, g.Survivor.ID, g.Survivor.Confidence, origin)
+		for _, f := range g.Dropped {
+			fmt.Fprintf(&b, "  drop %-14s %-28s (conf %.2f) %s\n", shortScope(f.ScopeKey), truncate(f.ID, 28), f.Confidence, firstLine(f.Content))
+		}
+	}
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------

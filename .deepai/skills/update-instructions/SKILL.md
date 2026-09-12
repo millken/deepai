@@ -1,52 +1,43 @@
 ---
 name: update-instructions
-description: "Use when the user asks to review or update DEEPAI.md based on learned preferences. Generates a diff preview from preference facts, showing proposed changes with source confidence."
+description: "Use when the user asks to review or update DEEPAI.md based on learned preferences. Reads stored preference facts via `deepai memory list`, generates a diff preview with fact IDs and confidence, and applies changes only after explicit confirmation."
 ---
 
 # Update Instructions
 
-Analyze the user's stored preference facts and generate a diff preview for updating the DEEPAI.md instructions file.
+Turn stored preference facts into proposed edits to the global DEEPAI.md, with a confirm-before-write loop.
 
-## When to Use
+## 1. Read the facts
 
-Enable this skill when the user:
-- Asks to update or review their instructions/preferences
-- Says "update instructions" or "update DEEPAI.md"
-- Wants to see what the system has learned about them
+Run via the bash tool:
 
-## Instructions
+    deepai memory list --category preference --min-confidence 0.7
 
-1. **Read preference facts**: Use the memory tool to load the current user-scope document. Filter facts with `category: "preference"`.
+Each row: scope, fact id, category, confidence, content. The extractor scores 0.5 = guessed, 1.0 = explicitly stated; below 0.7 is not worth proposing. The same preference re-learned in different sessions appears as near-duplicate rows — collapse them into one instruction before proposing. When near-duplicates dominate the listing, suggest `deepai memory consolidate`: it prints a dry-run plan by default and writes only with --apply. Never pass --apply without showing the user the plan and getting confirmation.
 
-2. **Read current DEEPAI.md**: Read the file at `$HOME/.deepai/DEEPAI.md` if it exists.
+## 2. Read the current instructions
 
-3. **Generate diff preview**: For each preference fact with confidence >= 0.7:
-   - Show the proposed instruction line
-   - Show the source fact ID and confidence score
-   - Check if a similar instruction already exists in DEEPAI.md
+Read $HOME/.deepai/DEEPAI.md. If it does not exist, say so and ask whether to create it — never silently start one.
 
-4. **Present to user**: Show a structured diff preview:
-   ```
-   ## Proposed Changes
+## 3. Generate the diff preview
 
-   ### New
-   + [instruction] (source: <fact-id>, confidence: <score>)
+```
+## Proposed Changes
 
-   ### Already Exists
-   = [instruction] (source: <fact-id>, confidence: <score>)
+### New
++ [instruction] (source: <fact-id>, confidence: <score>)
 
-   ### Conflicts (existing vs proposed)
-   - [old instruction]
-   + [new instruction] (source: <fact-id>, confidence: <score>)
-   ```
+### Already Exists
+= [instruction] (source: <fact-id>, confidence: <score>)
 
-5. **Wait for confirmation**: Do NOT write to DEEPAI.md automatically. Ask the user to confirm before applying any changes.
+### Conflicts
+- [old instruction]
++ [new instruction] (source: <fact-id>, confidence: <score>)
+```
 
-6. **Apply changes**: Only after user confirmation, write the merged instructions to `$HOME/.deepai/DEEPAI.md`.
+Group related preferences into coherent sections. Preserve hand-written sections that do not conflict.
 
-## Constraints
+## 4. Confirm, then apply
 
-- Never modify DEEPAI.md without explicit user confirmation
-- Only include preferences with confidence >= 0.7
-- Group related preferences into coherent sections
-- Preserve any hand-written sections in DEEPAI.md that don't conflict
+- Never write to DEEPAI.md without explicit user confirmation.
+- After applying: if the user keeps a repo master for this file (dotfiles-style deployment), remind them to sync the change back — the edited file is the deployment copy.

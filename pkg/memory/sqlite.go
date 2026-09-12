@@ -328,6 +328,54 @@ func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, 
 	return facts, nil
 }
 
+// ListFactsQuerySQL is the cross-scope query behind `deepai memory list`.
+// Facts live under whichever storage key wrote them — bare session ids for
+// preference extraction, __scope__:user:<id>: keys for general user memory —
+// so "the user's facts" cannot be selected by one key; it is every key.
+const ListFactsQuerySQL = `
+	select session_id, id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at
+	from memory_facts
+	order by confidence desc, updated_at desc, id asc
+`
+
+// ScopedFact pairs a Fact with the storage key it lives under, so a
+// cross-scope listing can tell user-scope facts from session-scoped ones.
+type ScopedFact struct {
+	Fact
+	ScopeKey string
+}
+
+// ListAllFacts returns every stored fact across all scopes, highest
+// confidence first. Category, confidence and limit filtering belong to the
+// caller: the SQL stays static so the query it ran is reportable as-is.
+func (s *SQLiteStore) ListAllFacts(ctx context.Context) ([]ScopedFact, error) {
+	rows, err := s.db.QueryContext(ctx, ListFactsQuerySQL)
+	if err != nil {
+		return nil, fmt.Errorf("list all facts: %w", err)
+	}
+	defer rows.Close()
+
+	var facts []ScopedFact
+	for rows.Next() {
+		var (
+			fact      Fact
+			scopeKey  string
+			createdAt float64
+			updatedAt float64
+		)
+		if err := rows.Scan(&scopeKey, &fact.ID, &fact.Content, &fact.Category, &fact.Confidence, &fact.Source, &fact.RetrievalCount, &fact.HelpfulCount, &fact.SuspectCount, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan all facts: %w", err)
+		}
+		fact.CreatedAt = parseDBTime(createdAt)
+		fact.UpdatedAt = parseDBTime(updatedAt)
+		facts = append(facts, ScopedFact{Fact: fact, ScopeKey: scopeKey})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list all facts: %w", err)
+	}
+	return facts, nil
+}
+
 type sqliteScanner interface{ Scan(dest ...any) error }
 
 func scanSQLiteDocument(row sqliteScanner) (Document, error) {
