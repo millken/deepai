@@ -1470,11 +1470,12 @@ EventLoop:
 	// so nothing is lost between checkpoints. With auto-refine on, the gate
 	// decides whether a checkpoint is worth extracting at all; with it off, the
 	// unconditional extraction below is exactly the pre-gate behaviour.
+	userScopeKey := ""
+	if uid := strings.TrimSpace(r.cfg.WorkDir); uid != "" {
+		userScopeKey = memory.UserScope(uid).Key()
+	}
+
 	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
-		userScopeKey := ""
-		if uid := strings.TrimSpace(r.cfg.WorkDir); uid != "" {
-			userScopeKey = memory.UserScope(uid).Key()
-		}
 		switch memoryScheduleFor(r.turn, r.cfg.MemoryRefineInterval, r.autoRefineEnabled()) {
 		case memoryScheduleRefine:
 			// One gate call decides for both scopes; ScheduleRefine queues a job
@@ -1490,9 +1491,19 @@ EventLoop:
 	}
 
 	// Schedule preference extraction (throttle is handled internally).
+	// Preferences are user-scoped: writing them under the user-scope key —
+	// the same key the agent injects via MemoryUserID — is what makes the
+	// extractor's "update the existing preference instead of creating a new
+	// fact" rule work across sessions. Under the session key every new
+	// session started from an empty document and re-learned the same
+	// preferences as fresh facts with fresh ids.
 	if r.cfg.MemoryService != nil && r.cfg.PreferenceExtractor != nil {
+		prefScopeKey := userScopeKey
+		if prefScopeKey == "" {
+			prefScopeKey = r.sess.ID
+		}
 		r.cfg.MemoryService.SchedulePreferenceUpdate(
-			r.sess.ID, r.sess.Messages, r.cfg.PreferenceExtractor, r.prefSched,
+			prefScopeKey, r.sess.Messages, r.cfg.PreferenceExtractor, r.prefSched,
 		)
 	}
 
