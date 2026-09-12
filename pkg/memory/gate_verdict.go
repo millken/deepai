@@ -110,7 +110,14 @@ func (s *Service) recordGateVerdict(ctx context.Context, job updateJob, outcome,
 		GateMS:    gateMS.Milliseconds(),
 		Paired:    job.pairQueued && job.pairID != "",
 	}
-	if err := gs.InsertGateVerdict(ctx, record); err != nil {
+	// jobRefine shares one timeout ctx between the gate call this verdict
+	// describes and the extraction it authorizes (see queue.go). When the
+	// gate itself times out, that ctx is already expired by the time we get
+	// here — using it as-is would fail this insert for exactly the gate-error
+	// rows the audit log most needs to capture (GateOutcomeError), silently
+	// erasing them from every stat derived from ListGateVerdicts. Detach from
+	// the deadline/cancellation (not from values) so the write always lands.
+	if err := gs.InsertGateVerdict(context.WithoutCancel(ctx), record); err != nil {
 		s.logger.Warn("failed to record refine gate verdict", "session", job.sessionID, "err", err)
 		return ""
 	}
@@ -130,7 +137,13 @@ func (s *Service) recordGateExtraction(ctx context.Context, verdictID string, ex
 	if !ok {
 		return
 	}
-	if err := gs.RecordGateExtraction(ctx, verdictID, extractMS.Milliseconds(), saved); err != nil {
+	// Same reasoning as recordGateVerdict above: this backfill runs after the
+	// extraction it describes, on the same shared job ctx, so a slow
+	// extraction that finishes right at (or past) the deadline would have its
+	// timing and outcome discarded right when they are least representative
+	// — leaving ExtractMsP50/P90 sampled only from the extractions that were
+	// comfortably fast. Detach from the deadline/cancellation before writing.
+	if err := gs.RecordGateExtraction(context.WithoutCancel(ctx), verdictID, extractMS.Milliseconds(), saved); err != nil {
 		s.logger.Warn("failed to record refine gate extraction outcome", "id", verdictID, "err", err)
 	}
 }

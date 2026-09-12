@@ -481,3 +481,63 @@ func TestGateVerdictRecordingFailureDoesNotBreakFailOpenBehavior(t *testing.T) {
 		t.Fatalf("want no rows recorded when InsertGateVerdict fails, got %+v", got)
 	}
 }
+
+// --- ctx-independence: recording must survive the ctx that authorized it ------
+//
+// The gate call (ReviewRefine) and the extraction it authorizes share one
+// timeout-bounded ctx (see jobRefine in queue.go). When that ctx's deadline
+// is exactly what made ReviewRefine or the extraction fail, recording the
+// outcome with the same expired ctx would fail too — silently discarding
+// exactly the timeout/slow-extraction samples the whole audit log exists to
+// measure (see recordGateVerdict/recordGateExtraction in gate_verdict.go).
+// These tests pin down that recordGateVerdict/recordGateExtraction still
+// write to a real SQLiteStore even when handed an already-canceled ctx.
+
+func TestRecordGateVerdictSucceedsWithACanceledCtx(t *testing.T) {
+	t.Parallel()
+
+	svc, store := newRefineService(t)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	id := svc.recordGateVerdict(canceled, updateJob{sessionID: "s1"}, GateOutcomeError, "context deadline exceeded", 50*time.Millisecond)
+	if id == "" {
+		t.Fatal("recordGateVerdict() returned \"\" with a canceled ctx, want a non-empty ID (the row must still be written)")
+	}
+
+	got := gateVerdicts(t, store)
+	if len(got) != 1 {
+		t.Fatalf("gate verdicts = %d, want 1 (canceled ctx must not silently drop the insert)", len(got))
+	}
+	if got[0].ID != id || got[0].Outcome != GateOutcomeError {
+		t.Fatalf("recorded verdict = %+v, want ID=%s outcome=%s", got[0], id, GateOutcomeError)
+	}
+}
+
+func TestRecordGateExtractionSucceedsWithACanceledCtx(t *testing.T) {
+	t.Parallel()
+
+	svc, store := newRefineService(t)
+
+	id := svc.recordGateVerdict(context.Background(), updateJob{sessionID: "s1"}, GateOutcomeApprove, "worth keeping", 10*time.Millisecond)
+	if id == "" {
+		t.Fatal("recordGateVerdict() setup returned \"\"")
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	svc.recordGateExtraction(canceled, id, 9999*time.Millisecond, true)
+
+	got := gateVerdicts(t, store)
+	if len(got) != 1 {
+		t.Fatalf("gate verdicts = %d, want 1", len(got))
+	}
+	if got[0].ExtractMS == nil || *got[0].ExtractMS != 9999 {
+		t.Fatalf("ExtractMS not backfilled with a canceled ctx: %+v", got[0])
+	}
+	if got[0].Saved == nil || !*got[0].Saved {
+		t.Fatalf("Saved not backfilled with a canceled ctx: %+v", got[0])
+	}
+}
