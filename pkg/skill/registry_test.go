@@ -330,6 +330,12 @@ func TestLoadAll_ProjectOverridesGlobal(t *testing.T) {
 	createSkillDir(t, filepath.Join(globalDir, ".deepai", "skills", "my-skill"), "my-skill", "Global version")
 	createSkillDir(t, filepath.Join(projectDir, ".deepai", "skills", "my-skill"), "my-skill", "Project version")
 
+	// The global layer reads os.UserHomeDir() (i.e. $HOME on unix), so point
+	// it at globalDir itself — otherwise "Global version" is never loaded
+	// and the assertion below passes for the wrong reason (global simply
+	// wasn't read), proving nothing about project-over-global priority.
+	t.Setenv("HOME", globalDir)
+
 	reg := NewRegistry()
 	reg.LoadAll(projectDir, nil)
 
@@ -346,6 +352,7 @@ func TestLoadAll_ProjectOverridesGlobal(t *testing.T) {
 }
 
 func TestLoadAll_PluginOverridesProject(t *testing.T) {
+	isolateGlobalSkills(t)
 	projectDir := t.TempDir()
 	pluginDir := t.TempDir()
 	createSkillDir(t, filepath.Join(projectDir, ".deepai", "skills", "my-skill"), "my-skill", "Project version")
@@ -367,6 +374,7 @@ func TestLoadAll_PluginOverridesProject(t *testing.T) {
 }
 
 func TestLoadAll_NonexistentDirs(t *testing.T) {
+	isolateGlobalSkills(t)
 	reg := NewRegistry()
 	// Should not error on non-existent dirs
 	err := reg.LoadAll("/nonexistent/project", nil)
@@ -555,6 +563,19 @@ func createSkillDirWithPaths(t *testing.T, dir, name, desc string, paths ...stri
 	}
 }
 
+// isolateGlobalSkills points the global skill layer (LoadAll/LoadAllReported
+// read os.UserHomeDir(), i.e. $HOME on unix) at an empty, temporary HOME so
+// tests can't pick up whatever skills happen to be installed on the dev
+// machine under ~/.deepai/skills. It returns the temp dir in case a caller
+// wants to assert against it. Not usable with t.Parallel (t.Setenv forbids
+// it), but none of these tests are parallel.
+func isolateGlobalSkills(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	return home
+}
+
 func namesOf(skills []*Skill) []string {
 	names := make([]string, len(skills))
 	for i, s := range skills {
@@ -564,6 +585,7 @@ func namesOf(skills []*Skill) []string {
 }
 
 func TestLoadAllReported_ReadDirFailureWarns(t *testing.T) {
+	isolateGlobalSkills(t)
 	// <pluginRoot>/skills is a file (not a dir) → ReadDir fails → warning.
 	pluginRoot := t.TempDir()
 	skillsPath := filepath.Join(pluginRoot, "skills")
@@ -585,6 +607,7 @@ func TestLoadAllReported_ReadDirFailureWarns(t *testing.T) {
 }
 
 func TestLoadAllReported_MissingDirSilent(t *testing.T) {
+	isolateGlobalSkills(t)
 	reg := NewRegistry()
 	warnings := reg.LoadAllReported("", []string{"/nonexistent/deepai-plugin"})
 	if len(warnings) != 0 {
@@ -597,6 +620,7 @@ func TestLoadAllReported_MissingDirSilent(t *testing.T) {
 // misconfiguration (the routing in tool.go has nowhere to send the subagent)
 // and must surface as a SkillWarning, not be silently accepted.
 func TestLoadAllReported_ForkWithoutAgentWarns(t *testing.T) {
+	isolateGlobalSkills(t)
 	projectDir := t.TempDir()
 	skillDir := filepath.Join(projectDir, ".deepai", "skills", "orphan-fork")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
@@ -631,6 +655,7 @@ Body.
 // actual state before M5-1 (§2.8 fixes them), and must warn so it can't
 // recur silently.
 func TestLoadAllReported_AgentWithoutForkWarns(t *testing.T) {
+	isolateGlobalSkills(t)
 	projectDir := t.TempDir()
 	skillDir := filepath.Join(projectDir, ".deepai", "skills", "stray-agent")
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
