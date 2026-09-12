@@ -23,7 +23,13 @@ func NewSQLiteStore(ctx context.Context, path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, errors.New("sqlite path is required")
 	}
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	// busy_timeout(5000) and _txlock=immediate match the DSN pkg/commands/chat.go
+	// builds for the same database: without them, a CLI Save racing a chat
+	// session's write transaction returns SQLITE_BUSY immediately instead of
+	// waiting. _txlock=immediate takes the write lock at BeginTx (avoiding a
+	// read-then-upgrade deadlock against another writer); busy_timeout(5000)
+	// makes a concurrent writer's hold wait up to 5s instead of failing outright.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
@@ -123,8 +129,22 @@ func (s *SQLiteStore) AutoMigrate(ctx context.Context) error {
 	return nil
 }
 
+// querier is the read half of *sql.DB and *sql.Tx, so loadWith (and the
+// listFacts it drives) can run identically against either: outside a
+// transaction for the normal Load path, or inside one when a caller (e.g.
+// ApplyConsolidation) needs its reads and writes to see a single consistent
+// snapshot under the same lock.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func (s *SQLiteStore) Load(ctx context.Context, sessionID string) (Document, error) {
-	row := s.db.QueryRowContext(ctx, `
+	return s.loadWith(ctx, s.db, sessionID)
+}
+
+func (s *SQLiteStore) loadWith(ctx context.Context, q querier, sessionID string) (Document, error) {
+	row := q.QueryRowContext(ctx, `
 		select session_id, user_memory, history_memory, source, updated_at
 		from memories
 		where session_id = ?
@@ -133,7 +153,7 @@ func (s *SQLiteStore) Load(ctx context.Context, sessionID string) (Document, err
 	if err != nil {
 		return Document{}, fmt.Errorf("load memory %q: %w", sessionID, err)
 	}
-	facts, err := s.listFacts(ctx, sessionID)
+	facts, err := s.listFacts(ctx, q, sessionID)
 	if err != nil {
 		return Document{}, err
 	}
@@ -296,8 +316,8 @@ func (s *SQLiteStore) insertFact(ctx context.Context, execer interface {
 	return nil
 }
 
-func (s *SQLiteStore) listFacts(ctx context.Context, sessionID string) ([]Fact, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *SQLiteStore) listFacts(ctx context.Context, q querier, sessionID string) ([]Fact, error) {
+	rows, err := q.QueryContext(ctx, `
 		select id, content, category, confidence, source, retrieval_count, helpful_count, suspect_count, created_at, updated_at
 		from memory_facts
 		where session_id = ?

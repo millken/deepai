@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/memory"
+	"github.com/millken/deepai/pkg/models"
 )
 
 // gateStatsTestStore opens a fresh, migrated memory store at a temp path —
@@ -278,11 +280,13 @@ func TestShortScopeLabels(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]string{
-		"sess-abcdef123456":            "session:sess-abc",
-		memory.UserScope("/w").Key():   "user",
-		memory.AgentScope("coder").Key(): "agent:coder",
-		memory.GroupScope("team").Key(): "group:team",
-		"":                             "session",
+		"sess-abcdef123456":                   "session:sess-abc",
+		memory.UserScope("/w").Key():          "user:w",
+		memory.UserScope("/other/proj").Key(): "user:proj",
+		memory.UserScope("").Key():            "user",
+		memory.AgentScope("coder").Key():      "agent:coder",
+		memory.GroupScope("team").Key():       "group:team",
+		"":                                    "session",
 	}
 	for key, want := range cases {
 		if got := shortScope(key); got != want {
@@ -306,7 +310,7 @@ func TestConsolidateReportDryRunWritesNothing(t *testing.T) {
 	})
 	before := countFacts(t, store)
 
-	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", false)
+	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", false, false)
 	if err != nil {
 		t.Fatalf("consolidateReport() dry-run error = %v", err)
 	}
@@ -335,7 +339,7 @@ func TestConsolidateReportApplyCollapsesAndKeepsUnrelated(t *testing.T) {
 		},
 	})
 
-	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", true)
+	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", true, false)
 	if err != nil {
 		t.Fatalf("consolidateReport() apply error = %v", err)
 	}
@@ -359,6 +363,209 @@ func TestConsolidateReportApplyCollapsesAndKeepsUnrelated(t *testing.T) {
 	}
 	if len(facts) != 2 {
 		t.Fatalf("3 seeded facts must collapse to 2, got %d: %+v", len(facts), facts)
+	}
+}
+
+// TestConsolidateReportDefaultScopeExcludesOtherProjects covers item 5:
+// UserScope(WorkDir) makes "user scope" per-project, but ListAllFacts spans
+// the whole database, so without a CLI-side filter, running `consolidate
+// --apply` from project /w could move or delete project /other/proj's
+// user-scope preferences. By default, another project's user scope must not
+// even be visible to the planner.
+func TestConsolidateReportDefaultScopeExcludesOtherProjects(t *testing.T) {
+	t.Parallel()
+
+	store, dbPath := gateStatsTestStore(t)
+	otherKey := memory.UserScope("/other/proj").Key()
+	seedFacts(t, store, map[string][]memory.Fact{
+		otherKey: {
+			{ID: "pref-lang", Content: "Prefers responses in Chinese", Category: "preference", Confidence: 1.0},
+		},
+		"sess-1": {
+			{ID: "pref-lang-2", Content: "Prefers replies in Chinese", Category: "preference", Confidence: 0.9},
+		},
+	})
+
+	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", true, false)
+	if err != nil {
+		t.Fatalf("consolidateReport() error = %v", err)
+	}
+	if !strings.Contains(report, "No near-duplicate groups found") {
+		t.Fatalf("without --all-scopes, the other project's fact must not be visible to cluster against, got:\n%s", report)
+	}
+
+	otherDoc, err := store.Load(context.Background(), otherKey)
+	if err != nil {
+		t.Fatalf("Load(otherKey): %v", err)
+	}
+	if len(otherDoc.Facts) != 1 || otherDoc.Facts[0].ID != "pref-lang" {
+		t.Fatalf("another project's user scope must be untouched by default, got %+v", otherDoc.Facts)
+	}
+}
+
+// TestConsolidateReportAllScopesIncludesOtherProjects is the --all-scopes
+// counterpart: with the flag set, another project's user scope is fair game
+// again, matching the pre-fix (full-database) behavior deliberately.
+func TestConsolidateReportAllScopesIncludesOtherProjects(t *testing.T) {
+	t.Parallel()
+
+	store, dbPath := gateStatsTestStore(t)
+	otherKey := memory.UserScope("/other/proj").Key()
+	seedFacts(t, store, map[string][]memory.Fact{
+		otherKey: {
+			{ID: "pref-lang", Content: "Prefers responses in Chinese", Category: "preference", Confidence: 1.0},
+		},
+		"sess-1": {
+			{ID: "pref-lang-2", Content: "Prefers replies in Chinese", Category: "preference", Confidence: 0.9},
+		},
+	})
+
+	report, err := consolidateReport(context.Background(), dbPath, "preference", 0.55, "/w", true, true)
+	if err != nil {
+		t.Fatalf("consolidateReport() error = %v", err)
+	}
+	if !strings.Contains(report, "Consolidation applied") {
+		t.Fatalf("expected an applied report, got:\n%s", report)
+	}
+
+	otherDoc, err := store.Load(context.Background(), otherKey)
+	if err != nil {
+		t.Fatalf("Load(otherKey): %v", err)
+	}
+	if len(otherDoc.Facts) != 0 {
+		t.Fatalf("--all-scopes must let the other project's survivor move out, got %+v", otherDoc.Facts)
+	}
+
+	targetDoc, err := store.Load(context.Background(), memory.UserScope("/w").Key())
+	if err != nil {
+		t.Fatalf("Load(target): %v", err)
+	}
+	if len(targetDoc.Facts) != 1 || targetDoc.Facts[0].ID != "pref-lang" {
+		t.Fatalf("survivor must move into the target scope under --all-scopes, got %+v", targetDoc.Facts)
+	}
+}
+
+// TestConsolidateReportDefaultScopeExcludesOtherProjectSessions covers the
+// second half of item 5's scope filter: a bare session scope is not
+// "everyone's" any more than a user scope is — it belongs to whichever
+// project recorded it, discoverable via sessions.cwd in the same database
+// (pkg/chat/session.go). Without this, a session from /other/proj would
+// still be visible to a consolidate run in /w and could be moved/dropped by
+// it, defeating the point of the item 5 fix.
+func TestConsolidateReportDefaultScopeExcludesOtherProjectSessions(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	sessStore, err := chat.NewSQLiteSessionStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteSessionStore(): %v", err)
+	}
+	otherSess, err := sessStore.Create(models.CreateOpts{CWD: "/other/proj"})
+	if err != nil {
+		t.Fatalf("Create(other-project session): %v", err)
+	}
+	if err := sessStore.Close(); err != nil {
+		t.Fatalf("sessStore.Close(): %v", err)
+	}
+
+	ctx := context.Background()
+	store, err := memory.NewSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore(): %v", err)
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(ctx); err != nil {
+		t.Fatalf("AutoMigrate(): %v", err)
+	}
+	targetKey := memory.UserScope("/w").Key()
+	seedFacts(t, store, map[string][]memory.Fact{
+		targetKey: {
+			{ID: "pref-lang", Content: "Prefers responses in Chinese", Category: "preference", Confidence: 1.0},
+		},
+		otherSess.ID: {
+			{ID: "pref-lang-2", Content: "Prefers replies in Chinese", Category: "preference", Confidence: 0.9},
+		},
+	})
+
+	report, err := consolidateReport(ctx, dbPath, "preference", 0.55, "/w", true, false)
+	if err != nil {
+		t.Fatalf("consolidateReport() error = %v", err)
+	}
+	if !strings.Contains(report, "No near-duplicate groups found") {
+		t.Fatalf("a different project's session must not be visible to cluster against by default, got:\n%s", report)
+	}
+
+	otherDoc, err := store.Load(ctx, otherSess.ID)
+	if err != nil {
+		t.Fatalf("Load(otherSess): %v", err)
+	}
+	if len(otherDoc.Facts) != 1 {
+		t.Fatalf("another project's session must be untouched by default, got %+v", otherDoc.Facts)
+	}
+	targetDoc, err := store.Load(ctx, targetKey)
+	if err != nil {
+		t.Fatalf("Load(target): %v", err)
+	}
+	if len(targetDoc.Facts) != 1 {
+		t.Fatalf("target scope must be untouched when the only other candidate is filtered out, got %+v", targetDoc.Facts)
+	}
+}
+
+// TestConsolidateReportDefaultScopeKeepsSessionsWithUnknownCWD covers the
+// other side of the same filter: a session whose cwd is empty (the pre-
+// 8b1295e default for every row recorded before cwd tracking existed) is
+// exactly the per-session preference data this command exists to clean up,
+// so it must still be eligible for consolidation by default even though it
+// isn't provably "this project's".
+func TestConsolidateReportDefaultScopeKeepsSessionsWithUnknownCWD(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "memory.db")
+	sessStore, err := chat.NewSQLiteSessionStore(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteSessionStore(): %v", err)
+	}
+	histSess, err := sessStore.Create(models.CreateOpts{CWD: ""})
+	if err != nil {
+		t.Fatalf("Create(historical session): %v", err)
+	}
+	if err := sessStore.Close(); err != nil {
+		t.Fatalf("sessStore.Close(): %v", err)
+	}
+
+	ctx := context.Background()
+	store, err := memory.NewSQLiteStore(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore(): %v", err)
+	}
+	defer store.Close()
+	if err := store.AutoMigrate(ctx); err != nil {
+		t.Fatalf("AutoMigrate(): %v", err)
+	}
+	targetKey := memory.UserScope("/w").Key()
+	seedFacts(t, store, map[string][]memory.Fact{
+		targetKey: {
+			{ID: "pref-lang", Content: "Prefers responses in Chinese", Category: "preference", Confidence: 1.0},
+		},
+		histSess.ID: {
+			{ID: "pref-lang-2", Content: "Prefers replies in Chinese", Category: "preference", Confidence: 0.9},
+		},
+	})
+
+	report, err := consolidateReport(ctx, dbPath, "preference", 0.55, "/w", true, false)
+	if err != nil {
+		t.Fatalf("consolidateReport() error = %v", err)
+	}
+	if !strings.Contains(report, "Consolidation applied") {
+		t.Fatalf("a historical session with unknown cwd must still be eligible for consolidation by default, got:\n%s", report)
+	}
+
+	histDoc, err := store.Load(ctx, histSess.ID)
+	if err != nil {
+		t.Fatalf("Load(histSess): %v", err)
+	}
+	if len(histDoc.Facts) != 0 {
+		t.Fatalf("the historical session's duplicate fact must have moved out, got %+v", histDoc.Facts)
 	}
 }
 

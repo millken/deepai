@@ -2,8 +2,10 @@ package commands
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -99,7 +101,10 @@ func renderFactList(facts []memory.ScopedFact, category string, minConfidence fl
 
 	fmt.Fprintf(&b, "%-24s %-28s %-12s %5s  %s\n", "scope", "id", "category", "conf", "content")
 	for _, f := range shown {
-		fmt.Fprintf(&b, "%-24s %-28s %-12s %5.2f  %s\n", shortScope(f.ScopeKey), truncate(f.ID, 28), truncate(f.Category, 12), f.Confidence, firstLine(f.Content))
+		// The full fact ID is printed (not truncated): the update-instructions
+		// skill matches on it verbatim, so a truncated ID here would be
+		// unusable as a reference.
+		fmt.Fprintf(&b, "%-24s %-28s %-12s %5.2f  %s\n", shortScope(f.ScopeKey), f.ID, truncate(f.Category, 12), f.Confidence, firstLine(f.Content))
 	}
 
 	if len(shown) < len(facts) {
@@ -109,12 +114,18 @@ func renderFactList(facts []memory.ScopedFact, category string, minConfidence fl
 }
 
 // shortScope renders a storage key as a compact scope label: bare session
-// ids become session:<first 8 chars>, __scope__:user:<id>: becomes user.
+// ids become session:<first 8 chars>, __scope__:user:<id>: becomes
+// user:<last path segment of id> — user scope IDs are work directories
+// (UserScope(WorkDir)), so different projects' user scopes would otherwise
+// all render as the same indistinguishable "user" label.
 func shortScope(scopeKey string) string {
 	scope := memory.ParseScopeKey(scopeKey)
 	switch scope.Type {
 	case memory.ScopeUser:
-		return "user"
+		if scope.ID == "" {
+			return "user"
+		}
+		return "user:" + lastPathSegment(scope.ID)
 	case memory.ScopeAgent:
 		return "agent:" + scope.ID
 	case memory.ScopeGroup:
@@ -129,6 +140,17 @@ func shortScope(scopeKey string) string {
 		}
 		return "session:" + id
 	}
+}
+
+// lastPathSegment returns the final "/"-separated component of a path-like
+// scope ID (e.g. "/Users/x/proj" -> "proj"), so two different projects'
+// otherwise-identical "user" scope labels can be told apart at a glance.
+func lastPathSegment(id string) string {
+	id = strings.TrimRight(id, "/")
+	if idx := strings.LastIndexByte(id, '/'); idx >= 0 {
+		id = id[idx+1:]
+	}
+	return id
 }
 
 func truncate(s string, max int) string {
@@ -156,6 +178,7 @@ func cmdMemoryConsolidate() *cobra.Command {
 	var threshold float64
 	var user string
 	var apply bool
+	var allScopes bool
 	cmd := &cobra.Command{
 		Use:   "consolidate",
 		Short: "Collapse near-duplicate memory facts across scopes (dry-run by default; --apply writes)",
@@ -166,7 +189,19 @@ as a new fact under every session that expressed it. This command clusters
 those rows by content similarity, keeps the highest-confidence member, drops
 the rest, and moves survivors into the user-scope document the agent injects.
 
-Prints the plan without writing anything unless --apply is passed.`,
+Prints the plan without writing anything unless --apply is passed.
+
+By default only this project's user scope (--user, default: current
+directory) and this project's session scopes are considered — a session
+belongs to this project when its cwd matches --user, or when its cwd is
+unknown (unset, or the session row can't be found at all), since ownership
+can't be determined either way and excluding it would defeat the point of
+cleaning up the pre-existing per-session preferences this command exists
+for. Both "user scope" and "session scope" are really per-project data:
+ListAllFacts sees every project's memories, and without this restriction
+--apply here would move or delete another project's preferences. Pass
+--all-scopes to consolidate across every scope in the database, including
+other projects'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if user == "" {
 				cwd, err := os.Getwd()
@@ -175,7 +210,7 @@ Prints the plan without writing anything unless --apply is passed.`,
 				}
 				user = cwd
 			}
-			report, err := consolidateReport(cmd.Context(), DBFile(), category, threshold, user, apply)
+			report, err := consolidateReport(cmd.Context(), DBFile(), category, threshold, user, apply, allScopes)
 			if err != nil {
 				return err
 			}
@@ -187,13 +222,14 @@ Prints the plan without writing anything unless --apply is passed.`,
 	cmd.Flags().Float64Var(&threshold, "threshold", 0.55, "cosine similarity above which two facts are duplicates (0-1)")
 	cmd.Flags().StringVar(&user, "user", "", "user scope id for survivors (default: current directory, matching the REPL's WorkDir scoping)")
 	cmd.Flags().BoolVar(&apply, "apply", false, "write the plan; without it nothing is modified")
+	cmd.Flags().BoolVar(&allScopes, "all-scopes", false, "consolidate across every scope in the database, not just this project's user scope and this project's sessions — WARNING: with --apply this can move or delete another project's memories")
 	return cmd
 }
 
 // consolidateReport is split from the cobra RunE for the same reason as
 // gateStatsReport/listFactsReport: it takes a dbPath so tests never touch
 // the user's real store.
-func consolidateReport(ctx context.Context, dbPath, category string, threshold float64, user string, apply bool) (string, error) {
+func consolidateReport(ctx context.Context, dbPath, category string, threshold float64, user string, apply, allScopes bool) (string, error) {
 	store, err := memory.NewSQLiteStore(ctx, dbPath)
 	if err != nil {
 		return "", err
@@ -207,7 +243,13 @@ func consolidateReport(ctx context.Context, dbPath, category string, threshold f
 		return "", err
 	}
 	targetKey := memory.UserScope(user).Key()
-	groups := memory.PlanConsolidation(facts, category, threshold)
+	if !allScopes {
+		facts, err = restrictToProjectScopes(ctx, dbPath, facts, targetKey, user)
+		if err != nil {
+			return "", err
+		}
+	}
+	groups := memory.PlanConsolidation(facts, category, threshold, targetKey)
 
 	if apply {
 		if _, err := store.ApplyConsolidation(ctx, groups, targetKey, time.Now().UTC()); err != nil {
@@ -215,6 +257,111 @@ func consolidateReport(ctx context.Context, dbPath, category string, threshold f
 		}
 	}
 	return renderConsolidationPlan(groups, targetKey, apply), nil
+}
+
+// restrictToProjectScopes keeps only facts that belong to this project:
+// targetKey itself, and session scopes owned by this project (see
+// loadSessionCWDs / sessionBelongsToProject). Every other scope is dropped —
+// UserScope(WorkDir) makes "user scope" effectively per-project, and
+// ListAllFacts is whole-database, so without this filter a consolidate run
+// in project A can move or delete project B's memories, including project
+// B's own session-scoped ones (a bare session scope is not "everyone's" any
+// more than a user scope is — it belongs to whichever project it was
+// recorded under).
+func restrictToProjectScopes(ctx context.Context, dbPath string, facts []memory.ScopedFact, targetKey, user string) ([]memory.ScopedFact, error) {
+	cwds, haveSessions, err := loadSessionCWDs(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	targetNorm := normalizeCWDForScopeFilter(user)
+
+	out := make([]memory.ScopedFact, 0, len(facts))
+	for _, f := range facts {
+		if f.ScopeKey == targetKey {
+			out = append(out, f)
+			continue
+		}
+		if memory.ParseScopeKey(f.ScopeKey).Type != memory.ScopeSession {
+			continue // another project's user/agent/group scope: only --all-scopes includes these
+		}
+		if !haveSessions {
+			// No `sessions` table at all (a memory-only database, or one that
+			// predates the chat schema migration): session ownership can't be
+			// determined, so fall back to the pre-fix behavior of keeping
+			// every bare session scope rather than erroring or excluding data
+			// this command has no way to attribute.
+			out = append(out, f)
+			continue
+		}
+		cwd, known := cwds[f.ScopeKey]
+		// An empty cwd is a session that predates cwd tracking (see
+		// pkg/chat/session.go's `cwd TEXT DEFAULT ''`) — exactly the
+		// pre-8b1295e per-session preference rows this command exists to
+		// clean up, so excluding them by default would defeat the command's
+		// purpose. A session id with no row at all (deleted session, or a
+		// document written under a key that was never a real session) is
+		// the same "unknown owner" situation and is treated the same way.
+		if !known || cwd == "" || cwd == user || cwd == targetNorm {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+// loadSessionCWDs reads sessions.id -> cwd from the chat schema living in
+// the same database file, so restrictToProjectScopes can tell which project
+// a bare session scope belongs to. It opens its own short-lived connection
+// rather than reaching into memory.SQLiteStore's unexported *sql.DB (which
+// pkg/memory does not expose) — a second connection to the same WAL-mode
+// file alongside the store's own is a normal, cheap read.
+//
+// The second return value is false when the `sessions` table does not exist
+// at all (a memory-only database, or one that predates the chat schema
+// migration): the caller then falls back to keeping every bare session
+// scope, since ownership cannot be determined either way.
+func loadSessionCWDs(ctx context.Context, dbPath string) (map[string]string, bool, error) {
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, false, fmt.Errorf("open database for session scope filter: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(ctx, `select id, cwd from sessions`)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("list sessions for scope filter: %w", err)
+	}
+	defer rows.Close()
+
+	cwds := make(map[string]string)
+	for rows.Next() {
+		var id, cwd string
+		if err := rows.Scan(&id, &cwd); err != nil {
+			return nil, false, fmt.Errorf("scan session for scope filter: %w", err)
+		}
+		cwds[id] = cwd
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("list sessions for scope filter: %w", err)
+	}
+	return cwds, true, nil
+}
+
+// normalizeCWDForScopeFilter mirrors pkg/chat's unexported normalizeCWD
+// (EvalSymlinks + Clean): sessions.cwd is written through that function, but
+// the target project's directory here comes from a bare os.Getwd() (or
+// --user), so without normalizing both sides, a symlinked path (macOS
+// /tmp vs /private/tmp) would fail to match its own project's sessions.
+func normalizeCWDForScopeFilter(cwd string) string {
+	if cwd == "" {
+		return cwd
+	}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(cwd)
 }
 
 // renderConsolidationPlan is pure so grouping display and the dry-run marker
@@ -244,9 +391,15 @@ func renderConsolidationPlan(groups []memory.ConsolidationGroup, targetKey strin
 		if g.Survivor.ScopeKey != targetKey {
 			origin = "moves from " + shortScope(g.Survivor.ScopeKey)
 		}
-		fmt.Fprintf(&b, "group %d: keep %s (conf %.2f, %s)\n", i+1, g.Survivor.ID, g.Survivor.Confidence, origin)
+		rename := ""
+		if g.TargetID != "" {
+			rename = fmt.Sprintf(", renamed to %s in target", g.TargetID)
+		}
+		fmt.Fprintf(&b, "group %d: keep %s (conf %.2f, %s)%s\n", i+1, g.Survivor.ID, g.Survivor.Confidence, origin, rename)
 		for _, f := range g.Dropped {
-			fmt.Fprintf(&b, "  drop %-14s %-28s (conf %.2f) %s\n", shortScope(f.ScopeKey), truncate(f.ID, 28), f.Confidence, firstLine(f.Content))
+			// The full fact ID is printed (not truncated), same reasoning as
+			// renderFactList: the update-instructions skill matches on it verbatim.
+			fmt.Fprintf(&b, "  drop %-14s %-28s (conf %.2f) %s\n", shortScope(f.ScopeKey), f.ID, f.Confidence, firstLine(f.Content))
 		}
 	}
 	return b.String()
