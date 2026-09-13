@@ -76,6 +76,14 @@ func appendToolResultMessage(runMessages []models.Message, sessionID string, res
 // include_content), offloading would defeat the entire call; those handlers
 // enforce their own output budget instead.
 func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bool {
+	// Idempotent by design: each dispatch path offloads the instant its call
+	// returns, so the tool_call_end event it emits carries the reference
+	// header; handleResult then runs this again over the same result during
+	// its bookkeeping pass. Report the earlier offload instead of redoing the
+	// file write — or, worse, reporting "not offloaded" to the metrics.
+	if v, ok := result.Data[models.ToolDataOffloaded].(bool); ok && v {
+		return true
+	}
 	if offloadDir == "" || len(result.Content) <= offloadThresholdBytes {
 		return false
 	}
@@ -99,6 +107,10 @@ func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bo
 	}
 
 	result.Content = buildOffloadedContent(result.Content, result.ToolName, offloadPath)
+	if result.Data == nil {
+		result.Data = map[string]any{}
+	}
+	result.Data[models.ToolDataOffloaded] = true
 	return true
 }
 
@@ -334,9 +346,10 @@ func newToolBatchState(ctx context.Context, a *Agent, sessionID string, turn int
 }
 
 // handleResult applies the shared per-result bookkeeping for one (call,
-// result) pair. runningCall is the Status=Running snapshot previously
-// emitted for this call (parallel: runningCalls[i]; serial: runningCall);
-// handleResult derives the ToolCallEnd "completed" call from it.
+// result) pair. It deliberately does NOT report the call's completion to the
+// UI — that is emitToolCallEnd's job, called by each dispatch path as its own
+// call lands, because this runs in batch order and only after the whole batch
+// has finished.
 //
 // By the time this returns, the observation's hints are already folded into
 // b.pendingHints and b.batchClean is already updated — callers only need to
@@ -349,7 +362,7 @@ func newToolBatchState(ctx context.Context, a *Agent, sessionID string, turn int
 // serial path has none and must synthesize placeholders, and unifying those
 // two shapes at this layer would cost the cheaper path the complexity of the
 // more expensive one for no benefit.
-func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolResult, runningCall models.ToolCall) breakerObservation {
+func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolResult) breakerObservation {
 	// "skill" and "todo_write" mutate Agent-level state (active skill /
 	// system prompt, the todo list) that must survive to the model's NEXT
 	// request in this Run and, when a session is carried, to the NEXT Run
@@ -403,16 +416,8 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		Result:    &result,
 		ToolEvent: newToolEventFromResult(call, result),
 	})
-	completed := runningCall
-	completed.Status = result.Status
-	completed.CompletedAt = result.CompletedAt
-	b.emit(AgentEvent{
-		Type:      AgentEventToolCallEnd,
-		MessageID: toolMessage.ID,
-		ToolCall:  &completed,
-		Result:    &result,
-		ToolEvent: newToolEventFromResult(completed, result),
-	})
+	// AgentEventToolCallEnd is NOT emitted here: both dispatch paths emit it
+	// themselves the moment their call returns (see emitToolCallEnd).
 
 	// Edited-file attribution for the adversarial-review gate — like the
 	// breaker below, both execution paths feed every executed pair through
@@ -431,6 +436,37 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		b.batchClean = false
 	}
 	return obs
+}
+
+// emitToolCallEnd reports one finished tool call to the UI. Both dispatch
+// paths call it the instant their call returns instead of leaving it to
+// handleResult, because the parallel path's observation loop only starts
+// after the WHOLE segment has drained: a call that finished in seconds kept
+// rendering as "running" for as long as its slowest sibling took (an MCP call
+// that returned in 2s sat behind an 18-minute subagent in the same batch,
+// with nothing on screen to say otherwise). Everything order-sensitive —
+// message append, breaker, side effects — still happens in batch order in
+// handleResult; only this purely informational event moves.
+//
+// The event carries no MessageID, unlike the tool_result event handleResult
+// emits: at this point the tool message does not exist yet. No consumer reads
+// a MessageID off a tool_call_end.
+//
+// Callers MUST offload the result (offloadIfNeeded) before calling this, so
+// the rendered preview is the "[offloaded: … saved to <path>]" reference
+// rather than the head of a multi-megabyte payload. This event is the only
+// one the TUI renders per finished call — it has no AgentEventToolResult
+// case — so an offload notice that is not in here never reaches the screen.
+func emitToolCallEnd(emit func(AgentEvent), running models.ToolCall, result models.ToolResult) {
+	completed := running
+	completed.Status = result.Status
+	completed.CompletedAt = result.CompletedAt
+	emit(AgentEvent{
+		Type:      AgentEventToolCallEnd,
+		ToolCall:  &completed,
+		Result:    &result,
+		ToolEvent: newToolEventFromResult(completed, result),
+	})
 }
 
 // applySkillResult applies a completed "skill" tool call's cross-request

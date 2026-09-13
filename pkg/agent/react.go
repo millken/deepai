@@ -1143,6 +1143,22 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				}
 				return dispatchCtx
 			}
+			// runOne executes call i and reports its completion immediately,
+			// so the UI reflects completion order instead of being pinned to
+			// the slowest call in the segment — see emitToolCallEnd.
+			runOne := func(i int) {
+				if overCap[i] {
+					results[i] = synthesizeTaskCapResult(toolCalls[i])
+				} else {
+					results[i] = a.runOneTool(execFor(i, toolCalls[i]), sessionID, toolCalls[i])
+				}
+				// Offload BEFORE reporting: the event must carry the offload
+				// reference (path + head/tail), not the head of the raw
+				// payload. handleResult's own offloadIfNeeded below is a
+				// no-op once this one has run — see its doc comment.
+				a.offloadIfNeeded(&results[i], a.offloadDir)
+				emitToolCallEnd(emit, runningCalls[i], results[i])
+			}
 			// Segments run in batch order; only the parallel ones fan out.
 			// This preserves the relative order of every call while still
 			// overlapping the consecutive parallel-safe runs — a lone bash
@@ -1154,20 +1170,22 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			for _, seg := range segments {
 				if !seg.parallel || seg.end-seg.start == 1 {
 					for i := seg.start; i < seg.end; i++ {
-						if overCap[i] {
-							results[i] = synthesizeTaskCapResult(toolCalls[i])
-							continue
-						}
-						results[i] = a.runOneTool(execFor(i, toolCalls[i]), sessionID, toolCalls[i])
+						runOne(i)
 					}
 					continue
 				}
 				var wg sync.WaitGroup
 				sem := make(chan struct{}, limit)
 				for i := seg.start; i < seg.end; i++ {
-					i, call := i, toolCalls[i]
+					// A call refused by the fan-out cap does no work at all:
+					// runOne just synthesizes its refusal and reports it.
+					// Resolve those inline, never through the semaphore —
+					// queued behind admitted calls, a refusal that costs
+					// nothing waited out an 18-minute subagent before its
+					// tool_call_end was emitted, and the UI showed "⚙ task…"
+					// for it the whole time.
 					if overCap[i] {
-						results[i] = synthesizeTaskCapResult(call)
+						runOne(i)
 						continue
 					}
 					wg.Add(1)
@@ -1175,7 +1193,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 						defer wg.Done()
 						sem <- struct{}{}
 						defer func() { <-sem }()
-						results[i] = a.runOneTool(execFor(i, call), sessionID, call)
+						runOne(i)
 					}()
 				}
 				wg.Wait()
@@ -1188,7 +1206,7 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			// invariants from one implementation. See toolBatchState.
 			batch := newToolBatchState(ctx, a, sessionID, turn, breaker, usage, emit, runMessages)
 			for i, call := range toolCalls {
-				obs := batch.handleResult(call, results[i], runningCalls[i])
+				obs := batch.handleResult(call, results[i])
 				if obs.fatalErr != nil {
 					// Invariant that matters here: every tool_use ID on the
 					// assistant message that started this batch MUST have a
@@ -1251,12 +1269,16 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				result = a.runOneTool(dispatchCtx, sessionID, call)
 			}
 
+			// Offload before reporting — same reason as the parallel path.
+			a.offloadIfNeeded(&result, a.offloadDir)
+			emitToolCallEnd(emit, runningCall, result)
+
 			// A "skill" or "todo_write" result's cross-request side effects
 			// (system prompt / turn injection updates) are applied inside
 			// batch.handleResult below, not here — see its doc comment for
 			// why that single call site covers both this serial path and
 			// the parallel path's observation loop.
-			obs := batch.handleResult(call, result, runningCall)
+			obs := batch.handleResult(call, result)
 			if obs.fatalErr != nil {
 				// Invariant that matters here: every tool_use ID on the
 				// assistant message that started this batch MUST have a

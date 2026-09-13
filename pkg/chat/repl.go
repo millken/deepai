@@ -1318,6 +1318,37 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 	var lastUsage *agent.Usage
 	var turnErr error
 	var turnToolCalls []memory.ToolCallInfo
+
+	// renderDrained renders one event taken from the queue after Run has
+	// returned. cancelled says the turn is unwinding from a cancelled or
+	// expired context, which is the one case where an event must be
+	// dropped rather than shown: Run emits an AgentEventError carrying the
+	// very ctx.Err() that ended it (react.go's post-batch cancellation
+	// check), and that event is still queued when the drain runs. Rendering
+	// it printed a red "Error: context canceled" directly above the
+	// "⎿ Interrupted." notice on every single Ctrl+C — the REPL already
+	// reports the turn-level error once, from turnErr. Errors that are NOT
+	// this teardown's own reason still render.
+	renderDrained := func(evt agent.AgentEvent, cancelled bool) {
+		if cancelled && isCancellationErrorEvent(evt) {
+			return
+		}
+		if evt.Usage != nil {
+			lastUsage = evt.Usage
+		}
+		r.ui.RenderEvent(evt)
+	}
+	// drainQueuedEvents renders everything left in the channel until it
+	// closes. Safe to block on: Run closes its event channel (deferred in
+	// Run) before the outcome is sent, so the forwarder above closes ours.
+	drainQueuedEvents := func(cancelled bool) {
+		if events == nil {
+			return
+		}
+		for evt := range events {
+			renderDrained(evt, cancelled)
+		}
+	}
 EventLoop:
 	for {
 		select {
@@ -1343,15 +1374,7 @@ EventLoop:
 				}
 			}
 		case out := <-outcomes:
-			// Drain remaining events.
-			if events != nil {
-				for evt := range events {
-					if evt.Usage != nil {
-						lastUsage = evt.Usage
-					}
-					r.ui.RenderEvent(evt)
-				}
-			}
+			drainQueuedEvents(false)
 			if out.result != nil {
 				r.sess.Messages = out.result.Messages
 				if out.result.Usage != nil {
@@ -1370,6 +1393,26 @@ EventLoop:
 			turnErr = ctx.Err()
 			select {
 			case out := <-outcomes:
+				// Run has returned, so it closed its event channel and the
+				// forwarder will close ours: drain it exactly like the
+				// clean-exit branch above — drain FIRST, apply out.result
+				// after. Without this drain, every event still queued when
+				// the interrupt landed was discarded — including the
+				// tool_call_end of every call in the batch the user
+				// interrupted, leaving its "⚙ tool…" lines on screen with no
+				// outcome ever printed. That is what an interrupted fan-out
+				// looked like: a REPL back at the prompt under a screen that
+				// still read as work in flight.
+				//
+				// The order matters as much as the drain: out.result.Usage
+				// is the run's live cumulative total, while a drained
+				// event's Usage is a cloneUsage snapshot taken earlier in
+				// the run. Applying the result first and letting the drain
+				// overwrite it made an interrupted fan-out under-report its
+				// tokens — the subagent totals addSubagentUsage folds in
+				// during handleResult land after the last snapshot was
+				// emitted.
+				drainQueuedEvents(true)
 				if out.result != nil {
 					r.sess.Messages = out.result.Messages
 					if out.result.Usage != nil {
@@ -1396,6 +1439,22 @@ EventLoop:
 				// this orphaned turn's carried state — acceptable, since the
 				// turn itself was already abandoned.
 				r.carry = agent.NewSessionCarry()
+				// Same reason as the branch above, but the orphan keeps the
+				// channel open indefinitely, so take only what is already
+				// buffered instead of ranging to close.
+				for events != nil {
+					select {
+					case evt, ok := <-events:
+						if !ok {
+							events = nil
+							continue
+						}
+						renderDrained(evt, true)
+						continue
+					default:
+					}
+					break
+				}
 			}
 			break EventLoop
 		}
@@ -2773,4 +2832,17 @@ func parseImageReferences(input string, workDir string) (string, []models.Messag
 	}
 
 	return cleaned, images
+}
+
+// isCancellationErrorEvent reports whether evt is the error event an agent
+// Run emits for its own cancelled or expired context. The REPL surfaces that
+// outcome once at turn level (RenderInterrupted for a Ctrl+C, the "Error: …"
+// line otherwise), so echoing the queued event during an interrupt drain is
+// pure duplication. Matching on the error CODE, not the event type, keeps a
+// genuine failure that happened to be queued alongside it visible.
+func isCancellationErrorEvent(evt agent.AgentEvent) bool {
+	if evt.Type != agent.AgentEventError || evt.Error == nil {
+		return false
+	}
+	return evt.Error.Code == "context_canceled" || evt.Error.Code == "deadline_exceeded"
 }

@@ -87,6 +87,13 @@ func (c ToolCall) Validate() error {
 // relying on the offload threshold.
 const ToolDataNoOffload = "offload_exempt"
 
+// ToolDataOffloaded marks a result whose oversized Content has already been
+// written to the offload directory and replaced with a reference header.
+// Set by the agent, not by tool handlers: it makes the offload idempotent
+// across the dispatch path (which offloads as soon as a call returns, so the
+// UI event carries the reference) and the later bookkeeping pass.
+const ToolDataOffloaded = "offloaded"
+
 // ToolResult stores the normalized outcome of a tool execution.
 type ToolResult struct {
 	CallID      string         `json:"call_id"`

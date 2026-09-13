@@ -73,6 +73,7 @@ type mockUI struct {
 	statusModel string
 	statusPlan  bool
 	lockLost    bool
+	events      []agent.AgentEvent
 }
 
 func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
@@ -90,7 +91,7 @@ func (m *mockUI) ReadPrompt(_ context.Context) (string, []models.MessageImage, e
 }
 func (m *mockUI) TurnStart(_ int, _ string)                {}
 func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
-func (m *mockUI) RenderEvent(_ agent.AgentEvent)           {}
+func (m *mockUI) RenderEvent(evt agent.AgentEvent)         { m.events = append(m.events, evt) }
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}
 func (m *mockUI) InterruptCh() <-chan struct{}             { return nil }

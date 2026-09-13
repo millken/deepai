@@ -189,3 +189,27 @@ func TestSubagentBlock_CompletedDetailDoesNotEchoDescription(t *testing.T) {
 		t.Fatalf("description repeated on the detail line of a finished task:\n%s", view)
 	}
 }
+
+// TestSubagentBlock_UnresolvedTaskCommitsAsCancelled covers the Ctrl+C case:
+// the interrupted task's terminal event is emitted by the pool only as its
+// goroutine unwinds, which loses the race with turnEnd committing the block.
+// The entry is therefore still unresolved at commit time, and the old "⋯"
+// mark left the last thing on screen reading as a task that is still running
+// — under a REPL that was already back at its prompt.
+func TestSubagentBlock_UnresolvedTaskCommitsAsCancelled(t *testing.T) {
+	m := newTUIModel(BannerInfo{Model: "test"})
+	startTask(m, "A", "审查 core", "zi-core")
+	startTask(m, "B", "审查 ui", "ui-perf")
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "审查 core"})
+
+	block := m.subagentSummaryBlock()
+	if strings.Contains(block, "⋯") {
+		t.Fatalf("an unresolved task must not commit as still running:\n%s", block)
+	}
+	if !strings.Contains(block, "⊘") {
+		t.Fatalf("the interrupted task should be marked cancelled:\n%s", block)
+	}
+	if !strings.Contains(block, "✓") {
+		t.Fatalf("the completed task lost its mark:\n%s", block)
+	}
+}

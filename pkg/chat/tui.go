@@ -1159,10 +1159,13 @@ func subagentSummaryLine(t subagentTaskLine, last bool) string {
 	switch t.status {
 	case "failed":
 		mark = "\u2717"
-	case "cancelled":
+	case "cancelled", "":
+		// The block is only ever committed once the turn is over, so a task
+		// still unresolved here is one the turn was interrupted out from
+		// under: its terminal event either never fired or lost the race with
+		// turnEnd. Marking it cancelled says that; the ellipsis mark it used
+		// to get left the last thing on screen reading as a running task.
 		mark = "\u2298"
-	case "":
-		mark = "\u22ef"
 	}
 	desc := t.description
 	if t.agentType != "" {
