@@ -444,7 +444,9 @@ func TestServiceUpdateStripsUploadMentionsFromMemory(t *testing.T) {
 	if len(doc.Facts) != 1 || doc.Facts[0].Content != "User prefers dark mode" {
 		t.Fatalf("facts = %#v", doc.Facts)
 	}
-	if doc.History.LongTermBackground != "User values durable project context" {
+	// The surviving sentence keeps its own terminating period: the filter drops
+	// upload sentences, it does not strip punctuation from what it keeps.
+	if doc.History.LongTermBackground != "User values durable project context." {
 		t.Fatalf("long term background = %q", doc.History.LongTermBackground)
 	}
 }

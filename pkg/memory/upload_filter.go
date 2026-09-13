@@ -3,6 +3,7 @@ package memory
 import (
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/millken/deepai/pkg/models"
 )
@@ -78,6 +79,15 @@ func stripUploadSentences(text string) string {
 	if trimmed == "" {
 		return ""
 	}
+	// Nothing to strip: return the text byte-for-byte. Sentence splitting is
+	// lossy at the edges (it normalizes inter-sentence whitespace), and the
+	// overwhelming majority of memory text mentions no upload at all, so the
+	// filter must not touch it. The earlier unconditional split/rejoin is how
+	// every stored memory lost its sentence punctuation — "github.com" came
+	// back as "github com" and the model then fed that path to read_file.
+	if !uploadMentionRE.MatchString(trimmed) {
+		return trimmed
+	}
 
 	parts := splitIntoSentences(trimmed)
 	kept := make([]string, 0, len(parts))
@@ -91,13 +101,42 @@ func stripUploadSentences(text string) string {
 	return strings.Join(kept, " ")
 }
 
+// splitIntoSentences splits text at sentence boundaries, KEEPING each
+// sentence's terminating punctuation attached to the sentence it ends.
+// Dropping the terminators (strings.FieldsFunc) corrupted every surviving
+// sentence, and splitting on a bare '.' also cut inside file paths, domains
+// and versions ("HANDOFF.md", "github.com", "v1.2"), so an upload mention
+// anywhere in a sentence could take half a path with it.
+//
+// ASCII terminators therefore only end a sentence when the next rune is
+// whitespace or the text ends; CJK terminators are unambiguous and always
+// do. Newlines split but are not retained — the caller rejoins with a space.
 func splitIntoSentences(text string) []string {
-	return strings.FieldsFunc(text, func(r rune) bool {
-		switch r {
-		case '.', '!', '?', '\n', '\r', '。', '！', '？', ';', '；':
-			return true
-		default:
-			return false
+	runes := []rune(text)
+	parts := make([]string, 0, 8)
+	var current []rune
+	flush := func() {
+		if len(current) > 0 {
+			parts = append(parts, string(current))
+			current = current[:0]
 		}
-	})
+	}
+	for i, r := range runes {
+		switch r {
+		case '\n', '\r':
+			flush()
+		case '。', '！', '？', '；':
+			current = append(current, r)
+			flush()
+		case '.', '!', '?', ';':
+			current = append(current, r)
+			if i+1 >= len(runes) || unicode.IsSpace(runes[i+1]) {
+				flush()
+			}
+		default:
+			current = append(current, r)
+		}
+	}
+	flush()
+	return parts
 }
