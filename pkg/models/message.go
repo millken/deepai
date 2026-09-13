@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Role identifies the actor that produced a message in a session.
@@ -85,6 +86,30 @@ func (c ToolCall) Validate() error {
 // tool whose contract is "bring this content INTO context" (code_map with
 // include_content). Such handlers bound their own output size instead of
 // relying on the offload threshold.
+// TruncateBytes cuts s to at most n bytes without splitting a multi-byte
+// rune, backing up to the preceding rune boundary when n lands inside one.
+//
+// Every size cap in this codebase is a BYTE budget (provider limits, storage
+// caps, preview widths), but Go's string slicing is byte-indexed, so the
+// obvious s[:n] cuts a 3-byte CJK rune into fragments. Those fragments are
+// not valid UTF-8: they reach SQLite, the next provider request and the
+// terminal as replacement characters or, for a strict consumer, an outright
+// decode error. This project's own session database holds 15 such rows.
+// Callers that append a marker after the cut should append it to this
+// function's result.
+func TruncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 const ToolDataNoOffload = "offload_exempt"
 
 // ToolDataOffloaded marks a result whose oversized Content has already been

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
 )
@@ -105,13 +104,7 @@ func opensUserTurn(msg models.Message) bool {
 // UTF-8 rune (backing up to the nearest rune start). Slicing by raw byte index
 // would emit invalid UTF-8 for CJK content, which strict providers reject.
 func truncateRuneSafe(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
+	return models.TruncateBytes(s, n)
 }
 
 // budgetForAge returns the byte cap for the given age: the value of the largest

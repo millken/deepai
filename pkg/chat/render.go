@@ -28,7 +28,7 @@ func PrintHistory(w io.Writer, messages []models.Message) {
 			if msg.Content != "" {
 				content := msg.Content
 				if len(content) > 2000 {
-					content = content[:2000] + "... [truncated]"
+					content = models.TruncateBytes(content, 2000) + "... [truncated]"
 				}
 				fmt.Fprintf(w, "%s %s\n", styles.Assistant.Render("  AI:"), content)
 			}

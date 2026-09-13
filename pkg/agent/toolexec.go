@@ -48,7 +48,12 @@ func toolMessageContent(result models.ToolResult) string {
 		s = result.Error
 	}
 	if len(s) > maxToolContentBytes {
-		s = s[:maxToolContentBytes] + fmt.Sprintf("\n... [truncated: %d bytes total]", len(s))
+		// Rune-safe: this string goes into runMessages, the next provider
+		// request and the session database. A raw byte cut leaves a fragment
+		// of a multi-byte rune at the seam — the session store here holds
+		// rows that are not decodable UTF-8 because of exactly this line.
+		s = truncateRuneSafe(s, maxToolContentBytes) +
+			fmt.Sprintf("\n... [truncated: %d bytes total]", len(s))
 	}
 	return s
 }
@@ -223,7 +228,7 @@ func toolResultPreview(result models.ToolResult) string {
 	}
 	content = strings.ReplaceAll(content, "\n", " ")
 	if len(content) > 240 {
-		return content[:240] + "..."
+		return truncateRuneSafe(content, 240) + "..."
 	}
 	return content
 }

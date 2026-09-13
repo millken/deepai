@@ -384,7 +384,7 @@ func firstLine(s string) string {
 	}
 	s = strings.TrimSpace(s)
 	if len(s) > 200 {
-		return s[:200] + "…"
+		return truncateRuneSafe(s, 200) + "…"
 	}
 	return s
 }

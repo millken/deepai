@@ -227,7 +227,8 @@ func generateLLMCommitMessage(ctx context.Context, provider llm.LLMProvider, des
 
 	truncated := diff
 	if len(truncated) > maxDiffChars {
-		truncated = truncated[:maxDiffChars] + fmt.Sprintf("\n... [truncated: showing %d of %d bytes]", maxDiffChars, len(diff))
+		truncated = models.TruncateBytes(truncated, maxDiffChars) +
+			fmt.Sprintf("\n... [truncated: showing %d of %d bytes]", maxDiffChars, len(diff))
 	}
 
 	userPrompt := "Recent commits:\n" + log + "\n\nStaged files:\n" + strings.Join(stagedFiles, "\n") + "\n\nStats:\n" + stat + "\n\nDiff:\n" + truncated
