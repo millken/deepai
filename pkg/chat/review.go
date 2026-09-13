@@ -520,6 +520,12 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget
 	}
+	// Only set when configured: the task tool treats an absent `model` as
+	// "use the profile's, then the main model", and sending an empty string
+	// is not the same thing in every downstream resolver.
+	if m := strings.TrimSpace(r.cfg.ReviewModel); m != "" {
+		args["model"] = m
+	}
 	if len(contextFiles) > 0 {
 		files := make([]any, len(contextFiles))
 		for i, f := range contextFiles {
@@ -804,8 +810,8 @@ func (r *ChatRepl) handleReviewCommand(parentCtx context.Context, args string) {
 		if timeout <= 0 {
 			timeout = DefaultReviewTimeout
 		}
-		r.ui.Info(fmt.Sprintf("  review: auto %s | budget %s | timeout %s | pending files %d",
-			state, budget, timeout, len(r.carry.EditedFiles())))
+		r.ui.Info(fmt.Sprintf("  review: auto %s | budget %s | timeout %s | reviewer model %s | pending files %d",
+			state, budget, timeout, r.reviewModelLabel(), len(r.carry.EditedFiles())))
 	case "":
 		r.runManualReview(parentCtx)
 	default:
@@ -957,3 +963,39 @@ func renderCharterForReview(c *Charter, lockedPlan string) string {
 // block from crowding out the diff, which is what the reviewer is actually
 // there to read.
 const reviewCharterPlanCap = 24 << 10
+
+// validateReviewModel resolves the configured reviewer alias once, at
+// startup, and drops it if the registry does not know it.
+//
+// Dropping is the point. An unresolvable alias is not a quiet
+// misconfiguration: the subagent fails to resolve it, the task errors, and
+// the gate fail-softs — so EVERY review silently becomes "changes are
+// unreviewed", and a mission's design gate, whose fail-soft refuses to
+// implement, stops the mission outright. Falling back to the default model
+// with a loud warning keeps the reviews running, which is the outcome a
+// user who typed a wrong alias actually wants.
+func (r *ChatRepl) validateReviewModel() {
+	alias := strings.TrimSpace(r.cfg.ReviewModel)
+	if alias == "" {
+		return
+	}
+	if r.cfg.ModelRegistry != nil && r.cfg.ModelRegistry.Has(alias) {
+		r.cfg.ReviewModel = alias
+		return
+	}
+	r.cfg.ReviewModel = ""
+	r.ui.Info(fmt.Sprintf(
+		"  review: review_model %q is not a known model alias — ignoring it; reviews run on the main model (a reviewer on the implementer's own model shares its blind spots)",
+		alias))
+}
+
+// reviewModelLabel renders the reviewer model for status output. The unset
+// case is spelled out rather than shown as "default": "the same model as the
+// main agent" is the fact the reader needs, because it is also the
+// shared-blind-spot case.
+func (r *ChatRepl) reviewModelLabel() string {
+	if m := strings.TrimSpace(r.cfg.ReviewModel); m != "" {
+		return m
+	}
+	return "same model as the main agent"
+}
