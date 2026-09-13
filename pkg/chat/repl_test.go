@@ -74,6 +74,11 @@ type mockUI struct {
 	statusPlan  bool
 	lockLost    bool
 	events      []agent.AgentEvent
+	// interruptDuringTask makes InterruptCh return an ALREADY-SIGNALLED
+	// channel, so runTurnWithSignal's watcher cancels the turn as soon as it
+	// is scheduled. Pair it with fakeTaskTool.waitForCancel for a
+	// deterministic "the user pressed Ctrl+C while a subagent was running".
+	interruptDuringTask bool
 }
 
 func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
@@ -94,11 +99,18 @@ func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
 func (m *mockUI) RenderEvent(evt agent.AgentEvent)         { m.events = append(m.events, evt) }
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}
-func (m *mockUI) InterruptCh() <-chan struct{}             { return nil }
-func (m *mockUI) CancelTaskCh() <-chan string              { return nil }
-func (m *mockUI) LoadHistory(_ string)                     {}
-func (m *mockUI) SaveHistory()                             {}
-func (m *mockUI) Close()                                   {}
+func (m *mockUI) InterruptCh() <-chan struct{} {
+	if !m.interruptDuringTask {
+		return nil
+	}
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	return ch
+}
+func (m *mockUI) CancelTaskCh() <-chan string { return nil }
+func (m *mockUI) LoadHistory(_ string)        {}
+func (m *mockUI) SaveHistory()                {}
+func (m *mockUI) Close()                      {}
 
 // lastInfo returns the most recent Info message, or "" if none.
 func (m *mockUI) lastInfo() string {

@@ -151,3 +151,51 @@ func TestTurnInjection_CarriesTheMissionCharter(t *testing.T) {
 		t.Fatal("clearing the carried charter must stop the injection (R36)")
 	}
 }
+
+// The mission gate reads the plan FILE and nothing else, so an inline plan
+// handed to exit_plan_mode has to land there — otherwise the model is told
+// its plan was submitted while the reviewer looks at an empty file.
+func TestExitPlanMode_DeferredWritesAnInlinePlanToTheFile(t *testing.T) {
+	dir := t.TempDir()
+	planFile := filepath.Join(dir, "design.md")
+	a := New(AgentConfig{Tools: newTestRegistry(), WorkDir: dir, PlanMode: true,
+		PlanFile: planFile, DeferPlanApproval: true})
+
+	res, err := a.tools.Get("exit_plan_mode").Handler(context.Background(), models.ToolCall{
+		ID: "1", Name: "exit_plan_mode",
+		Arguments: map[string]any{"plan": "# inline plan\n- step one"},
+	})
+	if err != nil {
+		t.Fatalf("exit_plan_mode: %v", err)
+	}
+	if res.Status != models.CallStatusCompleted {
+		t.Fatalf("status = %v (%s)", res.Status, res.Error)
+	}
+	got, readErr := os.ReadFile(planFile)
+	if readErr != nil || !strings.Contains(string(got), "step one") {
+		t.Fatalf("plan file = %q, %v — the inline plan never reached the gate's file", got, readErr)
+	}
+}
+
+// An existing plan file always wins: the fallback must not overwrite the
+// plan write_plan already saved with a stale inline copy.
+func TestExitPlanMode_DeferredKeepsTheWrittenPlan(t *testing.T) {
+	dir := t.TempDir()
+	planFile := filepath.Join(dir, "design.md")
+	if err := os.WriteFile(planFile, []byte("# the real plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := New(AgentConfig{Tools: newTestRegistry(), WorkDir: dir, PlanMode: true,
+		PlanFile: planFile, DeferPlanApproval: true})
+
+	if _, err := a.tools.Get("exit_plan_mode").Handler(context.Background(), models.ToolCall{
+		ID: "1", Name: "exit_plan_mode",
+		Arguments: map[string]any{"plan": "# stale inline copy"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(planFile)
+	if string(got) != "# the real plan" {
+		t.Fatalf("plan file = %q, want the written plan untouched", got)
+	}
+}

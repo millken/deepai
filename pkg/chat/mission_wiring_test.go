@@ -292,3 +292,126 @@ func TestRunMission_EscalationReDesignsAndFinishes(t *testing.T) {
 		t.Errorf("escalated_design_round = %d, want 1 (its own budget)", got.state.EscalatedDesignRound)
 	}
 }
+
+// /new keeps the mission with the OLD session on disk (§5.5 — it is not
+// aborted), but this process must stop acting on it: the new session has a
+// fresh carry with no charter in its injection, so a still-attached mission
+// would force plan-mode phases and gate turns of a conversation that cannot
+// see what it is being held to.
+func TestStartNewSession_DetachesTheMissionWithoutAbortingIt(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	dir := t.TempDir()
+	owner := models.LockOwner{PID: 4242, Host: "h"}
+	old, err := store.Create(models.CreateOpts{CWD: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcquireSessionLock(old.ID, owner, false); err != nil {
+		t.Fatal(err)
+	}
+	ui := &mockUI{}
+	r := &ChatRepl{cfg: ReplConfig{WorkDir: dir}, sessMgr: store, ui: ui, sess: old,
+		lockOwner: owner, carry: agent.NewSessionCarry()}
+	r.setLockedSession(old.ID)
+
+	m, _ := createMission(dir, "b")
+	r.mission = m
+	r.setSessionMission(m.state.ID)
+	r.carry.SetMissionCharter("charter")
+	r.planMode, r.deferPlanApproval = true, true
+
+	r.startNewSession()
+
+	if r.mission != nil {
+		t.Error("/new must detach the mission from this process")
+	}
+	if r.planMode || r.deferPlanApproval || r.planFile != "" || r.disableEnterPlan {
+		t.Error("/new must clear the mission's plan-mode overrides")
+	}
+	if got := openOrFatal(t, dir, m.state.ID).state.Status; got != missionStatusActive {
+		t.Errorf("status = %q — /new must NOT abort the old session's mission", got)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "stays with the previous session") {
+		t.Errorf("the user must be told where the mission went: %v", ui.infoMsgs)
+	}
+}
+
+// /undo replaces the whole carry. The mission survives (same session, still
+// active), so its charter has to be put back on the fresh carry — otherwise
+// every later request loses the one thing keeping the task from drifting,
+// while the mission still believes it is enforcing it.
+func TestUndoLastTurn_KeepsTheCharterOnTheFreshCarry(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	dir := t.TempDir()
+	sess, err := store.Create(models.CreateOpts{CWD: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []models.Message{
+		{SessionID: sess.ID, Role: models.RoleHuman, Content: "do it"},
+		{SessionID: sess.ID, Role: models.RoleAI, Content: "done"},
+	} {
+		if err := store.AppendMessage(sess.ID, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := &ChatRepl{cfg: ReplConfig{WorkDir: dir}, sessMgr: store, ui: &mockUI{},
+		sess: sess, carry: agent.NewSessionCarry()}
+	r.setLockedSession(sess.ID)
+
+	m, _ := createMission(dir, "b")
+	writeFileOrFatal(t, m.designPath(), "plan")
+	_ = m.lockCharter(&Charter{ScopeFiles: []string{"a.go"}, Acceptance: []string{"Given a, when b, then c"}})
+	r.mission = m
+	r.carry.SetMissionCharter(renderCharter(m.charter))
+	oldCarry := r.carry
+
+	r.undoLastTurn()
+
+	if r.carry == oldCarry {
+		t.Fatal("undo must still replace the carry")
+	}
+	if r.mission == nil {
+		t.Fatal("undo must not end the mission — it is the same session")
+	}
+	if !strings.Contains(r.carry.MissionCharter(), "a.go") {
+		t.Fatalf("the charter did not survive onto the new carry: %q", r.carry.MissionCharter())
+	}
+}
+
+// The user's own message, typed while a mission is active, becomes that
+// phase's next turn input — the only way to correct a running mission — and
+// the phase gate still runs behind it.
+func TestMissionPendingInput_UsedByBothPhases(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
+	var seen []string
+	r.missionTurn = func(_ context.Context, input string) *turnError {
+		seen = append(seen, input)
+		writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
+		return nil
+	}
+	r.missionPendingInput = "also handle the empty case"
+
+	r.runImplementPhase(context.Background())
+
+	if len(seen) == 0 || seen[0] != "also handle the empty case" {
+		t.Fatalf("implement phase inputs = %#v, want the user's message first", seen)
+	}
+	if r.missionPendingInput != "" {
+		t.Error("the pending input must be consumed once")
+	}
+
+	// Same for the design phase.
+	fake2 := &fakeTaskTool{content: designPassJSON()}
+	r2, _, inputs := newDesignRepl(t, fake2, []string{"# plan"})
+	m2, _ := createMission(r2.cfg.WorkDir, "brief")
+	r2.mission = m2
+	r2.missionPendingInput = "the scope should also cover the gate"
+	r2.runDesignPhase(context.Background())
+	if len(*inputs) == 0 || (*inputs)[0] != "the scope should also cover the gate" {
+		t.Fatalf("design phase inputs = %#v, want the user's message first", *inputs)
+	}
+}

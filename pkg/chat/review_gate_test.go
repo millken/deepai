@@ -26,6 +26,11 @@ type fakeTaskTool struct {
 	// sideEffect runs inside the handler — used to simulate a reviewer
 	// writing the worktree during the review.
 	sideEffect func()
+	// waitForCancel makes the handler block until its context is cancelled,
+	// which is what a real subagent does when the turn is interrupted. With
+	// mockUI.interruptDuringTask it removes the race between the interrupt
+	// watcher and a handler that would otherwise return first.
+	waitForCancel bool
 }
 
 func (f *fakeTaskTool) registry(t *testing.T) *tools.Registry {
@@ -33,11 +38,15 @@ func (f *fakeTaskTool) registry(t *testing.T) *tools.Registry {
 	reg := tools.NewRegistry()
 	err := reg.Register(models.Tool{
 		Name: "task",
-		Handler: func(_ context.Context, call models.ToolCall) (models.ToolResult, error) {
+		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 			f.calls++
 			f.args = call.Arguments
 			if f.sideEffect != nil {
 				f.sideEffect()
+			}
+			if f.waitForCancel {
+				<-ctx.Done()
+				return models.ToolResult{}, ctx.Err()
 			}
 			if f.err != nil {
 				return models.ToolResult{}, f.err

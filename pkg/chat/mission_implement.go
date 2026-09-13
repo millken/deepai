@@ -48,13 +48,17 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
 		m.saveBaseline(takeWorktreeSnapshot(r.cfg.WorkDir))
-		if m.baseline.root == "" && !r.reviewNonGitWarned {
-			r.reviewNonGitWarned = true
-			r.ui.Info("  mission: not a git worktree — the charter's hard scope check is OFF and attribution falls back to tool records")
-		}
 	}
 
-	input := missionImplementMessage(m.charter)
+	// A user message that resumed the mission is this turn's input: it is
+	// the one channel for correcting a running mission (§5.7 leaves
+	// mid-turn steering out of scope), and the phase gate still runs behind
+	// it. Otherwise the phase opens with its own charter briefing.
+	input := r.missionPendingInput
+	r.missionPendingInput = ""
+	if input == "" {
+		input = missionImplementMessage(m.charter)
+	}
 	for {
 		round := m.state.ImplementRound
 		r.applyMissionTurnMode(missionPhaseImplement)
@@ -77,7 +81,7 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		// (R33): the charter is enforced against everything the phase has
 		// done, so a file the previous turn put out of scope stays a
 		// violation until it is actually reverted.
-		out := r.reviewGate(parentCtx, "", worktreeSnapshot{}, round)
+		out := r.missionReviewGate(parentCtx, round)
 
 		switch {
 		case out.escalate != "":
@@ -170,8 +174,10 @@ func (r *ChatRepl) missionEscalationDetail(signal string) string {
 // The mission's implementation gate
 // ---------------------------------------------------------------------------
 
-// missionReviewGate is reviewGate's mission branch. Compared with the
-// ordinary gate it adds three things and removes one:
+// missionReviewGate is the implementation phase's gate, called ONLY from
+// runImplementPhase (see reviewGate's doc for why it is not wired into the
+// ordinary path). Compared with the ordinary gate it adds three things and
+// removes one:
 //
 //   - the hard scope check, which costs no reviewer run at all;
 //   - the charter as the review's anchor instead of the latest user message;
@@ -181,12 +187,11 @@ func (r *ChatRepl) missionEscalationDetail(signal string) string {
 func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateResult {
 	m := r.mission
 	after := takeWorktreeSnapshot(r.cfg.WorkDir)
-	// The baseline is read from the MISSION, not from the caller's argument
-	// (R33). The phase loop passes the same snapshot anyway, but an ordinary
-	// turn taken while a mission is paused mid-implementation reaches this
-	// gate through runEpisode, whose per-turn baseline (or zero value, when
-	// review_after_edit is off) would quietly narrow the charter check to
-	// that one turn.
+	// The baseline is the MISSION's own S_impl, taken when the phase
+	// started and reloaded from implement.baseline on a resume (R33) —
+	// never a per-turn snapshot. The charter binds everything the phase has
+	// done, so a file an earlier turn put out of scope stays a violation
+	// until it is actually reverted.
 	before := m.baseline
 	gitOK := after.root != "" && before.root != ""
 
@@ -209,6 +214,14 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		// alternative (deriving the review scope from an empty snapshot
 		// delta) would silently review nothing at all.
 		reviewScope = resolveWorktreePaths(r.carry.EditedFiles())
+		// Warned from HERE rather than at the phase start: this is where
+		// the degradation actually takes effect, so it also fires for a
+		// worktree that stops being usable mid-mission (git removed, an
+		// index lock wedged) instead of only for one that never was.
+		if !r.reviewNonGitWarned {
+			r.reviewNonGitWarned = true
+			r.ui.Info("  mission: not a git worktree — the charter's hard scope check is OFF and attribution falls back to tool records")
+		}
 	}
 
 	r.missionScopeViolations = violations // stale violations must not end up in a later escalation's explanation
@@ -264,7 +277,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})
 
-	if isPassVerdict(verdict) {
+	if isMissionPassVerdict(verdict) {
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
 		r.ui.Info("  mission: implementation review pass — " + verdictSummary(verdict))
@@ -285,6 +298,16 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		if esc, ok := r.tryEscalate(escalateFaultLayer); ok {
 			return esc
 		}
+		// No escalation left. The design's answer to a second wrong plan is
+		// a human, not another fix round: the reviewer has just said the
+		// code is not where the problem is, so spending the remaining
+		// rounds on the code would be spending them on the wrong layer —
+		// the same exit S3 takes when it runs out.
+		r.presentIssues(fmt.Sprintf(
+			"  mission: the review blames the PLAN and no escalation is left (%d/%d used) — human judgment needed. Issues:",
+			m.state.Escalation, maxDesignEscalations), verdict)
+		r.reviewPrev = nil
+		return gateResult{}
 	}
 
 	if round >= maxReviewRounds {
@@ -322,6 +345,18 @@ func (r *ChatRepl) tryEscalate(signal string) (gateResult, bool) {
 		return gateResult{}, false
 	}
 	return gateResult{escalate: signal}, true
+}
+
+// isMissionPassVerdict is deliberately STRICTER than isPassVerdict, which
+// also treats "no issues" as a pass. That fallback is right for an ordinary
+// episode, where it only decides whether to spend a fix round; here it
+// decides whether a mission is recorded as reviewed and DONE, and a
+// reviewer that failed a change but returned an empty issues array — a
+// Strict schema makes that shape perfectly valid — would have the loop
+// report an unfixed change as passed. An explicit verdict is the one thing
+// both reviewer prompts actually promise ("output verdict \"pass\"").
+func isMissionPassVerdict(v *agent.ReviewResult) bool {
+	return v != nil && strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
 }
 
 // hasDesignFault is S1: any issue the reviewer marked as a fault in the

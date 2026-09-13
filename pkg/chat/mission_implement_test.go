@@ -82,6 +82,13 @@ func newImplementRepl(t *testing.T, fake *fakeTaskTool, scopeFiles []string) (*C
 	t.Helper()
 	dir := t.TempDir()
 	gitInit(t, dir)
+	return newImplementReplIn(t, dir, fake, scopeFiles)
+}
+
+// newImplementReplIn is the same without assuming a git worktree, so the
+// non-git degradation path can be exercised on a plain directory.
+func newImplementReplIn(t *testing.T, dir string, fake *fakeTaskTool, scopeFiles []string) (*ChatRepl, *mockUI, *mission) {
+	t.Helper()
 	r, ui := newMissionRepl(t, dir)
 	r.cfg.ToolRegistry = fake.registry(t)
 	m, err := createMission(dir, "the brief")
@@ -119,7 +126,7 @@ func TestMissionGate_OutOfScopeFileTakesAScopeRoundNotAReviewRound(t *testing.T)
 	r, ui, m := newImplementRepl(t, fake, []string{"in_scope.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "out_of_scope.go"), "package x")
 
-	got := r.reviewGate(context.Background(), "", m.baseline, 0)
+	got := r.missionReviewGate(context.Background(), 0)
 
 	if got.passed || got.escalate != "" {
 		t.Fatalf("got %+v, want a scope-fix round", got)
@@ -145,13 +152,13 @@ func TestMissionGate_OutOfScopeFileTakesAScopeRoundNotAReviewRound(t *testing.T)
 // spends the last scope round and escalates a mission that complied.
 func TestMissionGate_RevertedFileLeavesTheViolationSet(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
-	r, _, m := newImplementRepl(t, fake, []string{"in_scope.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"in_scope.go"})
 	stray := filepath.Join(r.cfg.WorkDir, "out_of_scope.go")
 	writeFileOrFatal(t, stray, "package x")
 	// The tool record survives the revert — that is the whole point.
 	r.carry.RecordEditedFile(stray)
 
-	if got := r.reviewGate(context.Background(), "", m.baseline, 0); got.next == "" {
+	if got := r.missionReviewGate(context.Background(), 0); got.next == "" {
 		t.Fatal("first pass must report the violation")
 	}
 	if err := os.Remove(stray); err != nil {
@@ -159,7 +166,7 @@ func TestMissionGate_RevertedFileLeavesTheViolationSet(t *testing.T) {
 	}
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "in_scope.go"), "package x // real work")
 
-	got := r.reviewGate(context.Background(), "", m.baseline, 0)
+	got := r.missionReviewGate(context.Background(), 0)
 	if strings.Contains(got.next, "out_of_scope.go") {
 		t.Fatalf("a reverted file is still reported as a violation: %q", got.next)
 	}
@@ -179,7 +186,7 @@ func TestMissionGate_NothingToReviewIsIdleNotDone(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, ui, m := newImplementRepl(t, fake, []string{"in_scope.go"})
 
-	got := r.reviewGate(context.Background(), "", m.baseline, 0)
+	got := r.missionReviewGate(context.Background(), 0)
 	if got.passed {
 		t.Fatal("a turn that changed nothing must never be reported as a passed review")
 	}
@@ -194,8 +201,8 @@ func TestMissionGate_NothingToReviewIsIdleNotDone(t *testing.T) {
 	}
 
 	// Idle rounds are bounded, and exhausting them hands over — not done.
-	r.reviewGate(context.Background(), "", m.baseline, 0)
-	last := r.reviewGate(context.Background(), "", m.baseline, 0)
+	r.missionReviewGate(context.Background(), 0)
+	last := r.missionReviewGate(context.Background(), 0)
 	if last.next != "" || last.passed {
 		t.Fatalf("after %d idle rounds the gate must stop without passing: %+v", maxIdleRounds, last)
 	}
@@ -209,10 +216,10 @@ func TestMissionGate_FaultLayerDesignEscalatesImmediately(t *testing.T) {
 	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail","summary":"plan is wrong",
 		"issues":[{"severity":"high","file":"in_scope.go","line":1,"message":"the charter's interface cannot express this",
 		"scenario":"as planned, the gate cannot return the third outcome","fault_layer":"design"}]}`}
-	r, _, m := newImplementRepl(t, fake, []string{"in_scope.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"in_scope.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "in_scope.go"), "package x")
 
-	got := r.reviewGate(context.Background(), "", m.baseline, 0)
+	got := r.missionReviewGate(context.Background(), 0)
 	if got.escalate != escalateFaultLayer {
 		t.Fatalf("got %+v, want an immediate fault_layer escalation", got)
 	}
@@ -222,12 +229,12 @@ func TestMissionGate_FaultLayerDesignEscalatesImmediately(t *testing.T) {
 // would otherwise be handed to a human.
 func TestMissionGate_RepeatedSameFileEscalatesAtTheRoundCap(t *testing.T) {
 	fake := &fakeTaskTool{content: failVerdictJSON()} // issue on a.go
-	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
 	r.reviewPrev = &agent.ReviewResult{Verdict: "fail",
 		Issues: []agent.Issue{{File: "a.go", Message: "same place last round"}}}
 
-	got := r.reviewGate(context.Background(), "", m.baseline, maxReviewRounds)
+	got := r.missionReviewGate(context.Background(), maxReviewRounds)
 	if got.escalate != escalateRepeatFile {
 		t.Fatalf("got %+v, want a repeat-file escalation", got)
 	}
@@ -235,12 +242,12 @@ func TestMissionGate_RepeatedSameFileEscalatesAtTheRoundCap(t *testing.T) {
 
 func TestMissionGate_DifferentFilesAtTheCapHandsOver(t *testing.T) {
 	fake := &fakeTaskTool{content: failVerdictJSON()} // issue on a.go
-	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	r, ui, _ := newImplementRepl(t, fake, []string{"a.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
 	r.reviewPrev = &agent.ReviewResult{Verdict: "fail",
 		Issues: []agent.Issue{{File: "somewhere_else.go", Message: "unrelated"}}}
 
-	got := r.reviewGate(context.Background(), "", m.baseline, maxReviewRounds)
+	got := r.missionReviewGate(context.Background(), maxReviewRounds)
 	if got.escalate != "" || got.next != "" || got.passed {
 		t.Fatalf("got %+v, want a plain hand-over", got)
 	}
@@ -257,7 +264,7 @@ func TestMissionGate_NoEscalationsLeftHandsOver(t *testing.T) {
 	m.state.Escalation = maxDesignEscalations
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "in_scope.go"), "package x")
 
-	got := r.reviewGate(context.Background(), "", m.baseline, maxReviewRounds)
+	got := r.missionReviewGate(context.Background(), maxReviewRounds)
 	if got.escalate != "" {
 		t.Fatalf("got %q, want no escalation left", got.escalate)
 	}
@@ -270,11 +277,11 @@ func TestMissionGate_NoEscalationsLeftHandsOver(t *testing.T) {
 // ordinary episode still does not.
 func TestMissionGate_IgnoresReviewAfterEditSwitch(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
-	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
 	r.cfg.ReviewAfterEdit = false
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
 
-	if got := r.reviewGate(context.Background(), "", m.baseline, 0); !got.passed {
+	if got := r.missionReviewGate(context.Background(), 0); !got.passed {
 		t.Fatalf("got %+v — a mission reviews regardless of the opt-in switch", got)
 	}
 
@@ -290,14 +297,39 @@ func TestMissionGate_IgnoresReviewAfterEditSwitch(t *testing.T) {
 	}
 }
 
+// The ordinary gate must NEVER become the mission gate, even while a mission
+// is active and in its implementation phase. runEpisode reads only the fix
+// message, so an escalation, a pass, or an idle round computed on that path
+// would be silently discarded — and the mission's own round counters would
+// be spent by ordinary conversation.
+func TestOrdinaryGate_NeverTakesTheMissionPath(t *testing.T) {
+	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail","summary":"plan is wrong",
+		"issues":[{"severity":"high","file":"a.go","line":1,"message":"m","scenario":"s","fault_layer":"design"}]}`}
+	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	r.cfg.ReviewAfterEdit = false // the ordinary gate's own switch, off
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
+
+	got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0)
+
+	if got != (gateResult{}) {
+		t.Fatalf("ordinary gate during an active mission = %+v, want the plain guard", got)
+	}
+	if fake.calls != 0 {
+		t.Error("the ordinary gate must not dispatch the mission's reviewer")
+	}
+	if m.state.IdleRound != 0 || m.state.ScopeRound != 0 || m.state.ImplementRound != 0 {
+		t.Errorf("ordinary conversation spent mission rounds: %+v", m.state)
+	}
+}
+
 // The correctness reviewer must be anchored on the charter, not on the last
 // thing anyone said — and told that fault_layer=design is available.
 func TestMissionGate_ReviewPromptCarriesTheCharter(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
-	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
 
-	r.reviewGate(context.Background(), "", m.baseline, 0)
+	r.missionReviewGate(context.Background(), 0)
 
 	prompt, _ := fake.args["prompt"].(string)
 	for _, want := range []string{"Locked charter", "the brief", "Given the gate", "# the plan", `fault_layer="design"`} {
@@ -458,12 +490,174 @@ func TestImplementPhase_TalkingOnlyHandsOverNotDone(t *testing.T) {
 // would otherwise look like a repeat once the escalation budget is spent.
 func TestMissionGate_RepeatFileNeedsTwoDistinctRounds(t *testing.T) {
 	fake := &fakeTaskTool{content: failVerdictJSON()} // issue on a.go
-	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
 	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
 	r.reviewPrev = nil // no previous round
 
-	got := r.reviewGate(context.Background(), "", m.baseline, maxReviewRounds)
+	got := r.missionReviewGate(context.Background(), maxReviewRounds)
 	if got.escalate != "" {
 		t.Fatalf("got %q — one failing round is not a repeat", got.escalate)
+	}
+}
+
+// R30: outside a git worktree the HARD parts degrade — the scope check and
+// its escalation — but the review itself must keep running off the tool
+// records, exactly as the ordinary gate does. Deriving the review scope from
+// an empty snapshot delta instead would silently review nothing at all.
+func TestMissionGate_NonGitKeepsReviewingAndDropsTheScopeCheck(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	dir := t.TempDir() // deliberately NOT a git worktree
+	r, ui, m := newImplementReplIn(t, dir, fake, []string{"in_scope.go"})
+	if m.baseline.root != "" {
+		t.Skip("temp dir is inside a git worktree; this case needs a non-repo directory")
+	}
+	// An edit the charter does NOT cover: with no snapshot there is no
+	// trustworthy current-state view, so it must not be called a violation.
+	stray := filepath.Join(dir, "out_of_scope.go")
+	writeFileOrFatal(t, stray, "package x")
+	r.carry.RecordEditedFile(stray)
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if !got.passed {
+		t.Fatalf("got %+v — the review must still run without git", got)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("reviewer runs = %d, want 1 (scope falls back to the tool records)", fake.calls)
+	}
+	if m.state.ScopeRound != 0 || got.escalate != "" {
+		t.Errorf("the hard scope check and S3 must be OFF without a baseline: scope=%d escalate=%q",
+			m.state.ScopeRound, got.escalate)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "not a git worktree") {
+		t.Error("the degradation must be stated once")
+	}
+}
+
+// R25 with the scope budget actually spent: after two revert rounds the
+// mission is one violation away from S3. Complying must take it OFF that
+// edge — the accumulated tool records, which still name the reverted file,
+// must not be what the check reads.
+func TestMissionGate_S3DoesNotFireAfterTheModelComplied(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, m := newImplementRepl(t, fake, []string{"in_scope.go"})
+	stray := filepath.Join(r.cfg.WorkDir, "out_of_scope.go")
+	writeFileOrFatal(t, stray, "package x")
+	r.carry.RecordEditedFile(stray) // survives the revert, by design
+
+	for i := 1; i <= maxScopeFixRounds; i++ {
+		got := r.missionReviewGate(context.Background(), 0)
+		if got.escalate != "" || got.next == "" {
+			t.Fatalf("round %d: got %+v, want a scope-fix round", i, got)
+		}
+	}
+	if m.state.ScopeRound != maxScopeFixRounds {
+		t.Fatalf("scope_round = %d, want the budget fully spent", m.state.ScopeRound)
+	}
+
+	// The model complies: the file leaves git's porcelain output entirely.
+	if err := os.Remove(stray); err != nil {
+		t.Fatal(err)
+	}
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "in_scope.go"), "package x // the real work")
+
+	got := r.missionReviewGate(context.Background(), 0)
+	if got.escalate != "" {
+		t.Fatalf("S3 fired after the model did exactly what it was told: %+v", got)
+	}
+	if !got.passed {
+		t.Fatalf("got %+v, want the in-scope work reviewed and passed", got)
+	}
+}
+
+// R31, the case the idle CAP test hides: reverting the out-of-scope files is
+// compliance, not completion. With nothing in scope changed, the gate must
+// report idle — never a pass, and never a mission that ends as done.
+func TestMissionGate_RevertingEverythingIsNotDone(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, m := newImplementRepl(t, fake, []string{"in_scope.go"})
+	stray := filepath.Join(r.cfg.WorkDir, "out_of_scope.go")
+	writeFileOrFatal(t, stray, "package x")
+
+	if got := r.missionReviewGate(context.Background(), 0); got.next == "" {
+		t.Fatal("the violation must be reported first")
+	}
+	if err := os.Remove(stray); err != nil {
+		t.Fatal(err)
+	}
+
+	got := r.missionReviewGate(context.Background(), 0)
+	if got.passed {
+		t.Fatal("reverting the only change is not a reviewed pass")
+	}
+	if !strings.Contains(got.next, "[mission-idle") {
+		t.Fatalf("next = %q, want an idle nudge", got.next)
+	}
+	if fake.calls != 0 {
+		t.Error("there is nothing in scope to review, so no reviewer should run")
+	}
+	if m.state.Reviewed {
+		t.Error("nothing was ever reviewed")
+	}
+}
+
+// One talking turn must leave the mission running — the idle counter bounds
+// the loop, it does not end it on the first quiet turn.
+func TestMissionGate_OneIdleTurnLeavesTheMissionActive(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, m := newImplementRepl(t, fake, []string{"in_scope.go"})
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if got.next == "" || got.passed {
+		t.Fatalf("got %+v, want an idle nudge that keeps the phase going", got)
+	}
+	if r.mission == nil {
+		t.Fatal("one quiet turn must not end the mission")
+	}
+	if st := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state; st.Status != missionStatusActive || st.IdleRound != 1 {
+		t.Fatalf("persisted state = %+v, want active with one idle round", st)
+	}
+}
+
+// S1 with the escalation budget spent must hand the mission to a human, not
+// spend another fix round: the reviewer has just said the code is not where
+// the problem is.
+func TestMissionGate_FaultLayerWithoutBudgetHandsOverInsteadOfFixing(t *testing.T) {
+	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail","summary":"plan is wrong",
+		"issues":[{"severity":"high","file":"a.go","line":1,"message":"the charter cannot express this",
+		"scenario":"as planned there is nowhere to return","fault_layer":"design"}]}`}
+	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	m.state.Escalation = maxDesignEscalations
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
+
+	got := r.missionReviewGate(context.Background(), 0) // round 0: fix rounds still available
+
+	if got.next != "" {
+		t.Fatalf("next = %q — another fix round spends the budget on the wrong layer", got.next)
+	}
+	if got.escalate != "" || got.passed {
+		t.Fatalf("got %+v, want a plain hand-over", got)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "blames the PLAN") {
+		t.Error("the user must be told why the mission stopped")
+	}
+}
+
+// M5: a reviewer that fails a change but returns an empty issues array — a
+// perfectly valid shape under the Strict schema — must not be recorded as a
+// reviewed pass. Only an explicit "pass" verdict ends a mission as done.
+func TestMissionGate_FailWithNoIssuesIsNotAPass(t *testing.T) {
+	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail","summary":"broken","issues":[]}`}
+	r, _, m := newImplementRepl(t, fake, []string{"a.go"})
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if got.passed {
+		t.Fatal("a fail verdict must never end the mission as done, however empty its issue list")
+	}
+	if m.state.Reviewed {
+		t.Error("Reviewed must stay false")
 	}
 }

@@ -310,6 +310,12 @@ type ChatRepl struct {
 	// message, which the implementation gate builds from findings the design
 	// phase never sees). Consumed once.
 	missionPendingInput string
+	// missionPendingImages are the images attached to missionPendingInput.
+	// Carried separately for the same reason the text is: a mission turn is
+	// synthesized by the loop, so without this an image the user pasted to
+	// steer a running mission would be dropped in silence.
+	missionPendingImages []models.MessageImage
+
 	// missionEscalationNote is the same escalation's explanation, handed to
 	// the DESIGN REVIEWER so it judges the new plan against what the old one
 	// could not do — a reviewer that only sees the brief again has no way to
@@ -766,6 +772,18 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// run the agent immediately without waiting for user input.
 		if autoContinue {
 			autoContinue = false
+			// An interrupted session that still owns an ACTIVE mission
+			// resumes the MISSION, not a bare continuation turn (§5.5).
+			// Through runEpisode the continuation would run with whatever
+			// plan-mode flags the interrupted phase left behind and its
+			// result would never reach a phase gate — a design turn would
+			// come back writable and unreviewed, an implementation turn
+			// would produce edits nothing ever gates.
+			if r.mission != nil {
+				r.ui.Info("  Resuming interrupted session into its active mission...")
+				r.runMission(parentCtx)
+				continue
+			}
 			r.ui.Info("  Resuming interrupted session...")
 			r.turn++
 			if err := r.runEpisode(parentCtx, "Continue from where you left off.", r.continueTurn); err != nil {
@@ -816,6 +834,20 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			if r.handleSlashCommand(parentCtx, cmd) {
 				break
 			}
+			continue
+		}
+
+		// An active mission owns the next input (§5.5: "the next user input
+		// resumes it by default"). The text becomes that turn's input — the
+		// user's one channel for correcting a running mission — and the
+		// phase gate still runs behind it. Routing this through runEpisode
+		// instead is what let a mission's gate decisions (escalate, passed,
+		// terminal status) be computed and then thrown away, since
+		// runEpisode reads only the fix message.
+		if r.mission != nil {
+			r.missionPendingInput = line
+			r.missionPendingImages = images
+			r.runMission(parentCtx)
 			continue
 		}
 
@@ -2243,6 +2275,19 @@ func (r *ChatRepl) startNewSession() {
 	// if writes are still suspended from a PRIOR loss on the OLD session —
 	// correctly so: we may no longer own it, and writing to it would risk
 	// stomping whoever does), and release its lock.
+	// The mission belongs to the OLD session (§5.5: /new does not abort it —
+	// it stays in that session's metadata for a later `deepai -r`). What
+	// must not survive is this process's in-memory attachment to it: the
+	// new session has a fresh carry with no charter injection, so a mission
+	// left attached here would keep forcing plan-mode phases and gating
+	// turns of a conversation that has no charter in front of it.
+	if r.mission != nil {
+		r.ui.Info(fmt.Sprintf("  mission: %s stays with the previous session (still active there) — this session starts without it",
+			r.mission.state.ID))
+		r.mission = nil
+		r.clearMissionTurnMode()
+	}
+
 	oldID := r.sess.ID
 	r.sess.State = models.SessionStateCompleted
 	r.saveSession()
@@ -2382,6 +2427,14 @@ func (r *ChatRepl) undoLastTurn() {
 	// skill/breaker state built up during the undone turn. Reset the whole
 	// carry rather than only its anchors, matching /clear and /new.
 	r.carry = agent.NewSessionCarry()
+	// The mission survives an /undo (unlike /clear, which aborts it): the
+	// session is still the same one and the mission is still active on
+	// disk. Its charter must be put back onto the FRESH carry, or the very
+	// thing that keeps a long task from drifting would be gone from every
+	// later request while the mission still believes it is enforcing it.
+	if r.mission != nil && r.mission.charter != nil {
+		r.carry.SetMissionCharter(renderCharter(r.mission.charter))
+	}
 
 	r.ui.Info(fmt.Sprintf("  Undone %d messages.", removed))
 }

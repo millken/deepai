@@ -58,10 +58,6 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 		r.ui.Info(fmt.Sprintf("  mission: design phase (%s %d/%d)", roundLabel(escalated), round, maxRounds))
 
 		turnErr := r.runMissionTurn(parentCtx, input)
-		m.setDesignRound(round)
-		if err := m.save(); err != nil {
-			r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
-		}
 		if turnErr != nil {
 			// An interrupted or errored turn leaves a half-written plan;
 			// reviewing it would burn a round on an artifact the author was
@@ -72,6 +68,15 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 				r.ui.Info(fmt.Sprintf("  mission: design turn failed (%v) — no design review ran", turnErr))
 			}
 			return false
+		}
+		// The round is spent only by a turn that actually completed —
+		// matching the implementation phase, where ImplementRound moves
+		// when a fix round is issued, not when a turn is interrupted. A
+		// Ctrl+C that already costs the user its work must not also cost
+		// the mission one of its three chances to get the plan right.
+		m.setDesignRound(round)
+		if err := m.save(); err != nil {
+			r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
 		}
 
 		plan := strings.TrimSpace(m.readDesign())
@@ -86,7 +91,16 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			continue
 		}
 
-		verdict, ok := r.dispatchDesignReview(parentCtx, m, plan, prev, round)
+		verdict, ok, cancelled := r.dispatchDesignReview(parentCtx, m, plan, prev, round)
+		if cancelled {
+			// Ctrl+C landed on the REVIEW, not on the plan. Nothing is
+			// wrong with the mission and nothing has been implemented, so
+			// it stays active and the user can simply resume — ending it
+			// here would throw away a finished plan because the user
+			// interrupted the thing reading it.
+			r.ui.Info("  mission: design review interrupted — the plan was NOT reviewed; your next message resumes the mission, /mission abort ends it")
+			return false
+		}
 		if !ok {
 			// Design-side fail-soft is the OPPOSITE of the implementation
 			// gate's (§六-1): there, the edits already exist and stopping
@@ -95,6 +109,7 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			// unreviewed plan through would skip the whole first half of the
 			// loop — so the mission stops and the plan goes to the user.
 			r.ui.Info("  mission: design review unavailable — NOT implementing; the plan is at " + m.designPath())
+			r.warnUnreviewedImplementation()
 			r.leaveMission(missionStatusHandedOver)
 			return false
 		}
@@ -109,6 +124,7 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			c := &Charter{ScopeFiles: scope, Acceptance: verdict.Acceptance}
 			if err := m.lockCharter(c); err != nil {
 				r.ui.Info(fmt.Sprintf("  mission: could not lock the charter (%v) — NOT implementing", err))
+				r.warnUnreviewedImplementation()
 				r.leaveMission(missionStatusHandedOver)
 				return false
 			}
@@ -179,11 +195,27 @@ func (r *ChatRepl) failDesign(v *agent.DesignReviewResult, maxRounds int) {
 		r.presentDesignIssues(fmt.Sprintf(
 			"  mission: design STILL FAILING after %d round(s) — human judgment needed. Unresolved issues:", maxRounds), v)
 	}
-	r.ui.Info(fmt.Sprintf("  mission: design_failed — the plan is at %s; nothing was implemented from it", planPath))
+	// design_failed covers two different situations and they must not be
+	// described with the same sentence (R37): before any escalation nothing
+	// has been built, but after one the worktree already holds edits made
+	// under the archived charter that no review ever passed.
 	if escalated {
-		r.ui.Info("  mission: NOTE — this mission had already implemented under an earlier charter. Those edits are still in the worktree and were NEVER passed by a review.")
+		r.ui.Info(fmt.Sprintf("  mission: design_failed after an escalation — the re-designed plan is at %s and was NOT implemented, but the edits made under the PREVIOUS charter are still in the worktree and were NEVER passed by a review.", planPath))
+	} else {
+		r.ui.Info(fmt.Sprintf("  mission: design_failed — the plan is at %s; nothing was implemented from it", planPath))
 	}
 	r.leaveMission(missionStatusDesignFailed)
+}
+
+// warnUnreviewedImplementation says the quiet part whenever a mission ends
+// from the design phase AFTER an escalation: the worktree is not clean, and
+// what is in it never passed a review. Every design-side exit that is not
+// failDesign (which words it itself) calls this.
+func (r *ChatRepl) warnUnreviewedImplementation() {
+	if r.mission == nil || r.mission.state.Escalation == 0 {
+		return
+	}
+	r.ui.Info("  mission: NOTE — edits made under the previous charter are still in the worktree and were NEVER passed by a review.")
 }
 
 func (r *ChatRepl) presentDesignIssues(header string, v *agent.DesignReviewResult) {
@@ -205,7 +237,15 @@ func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string,
 	if v == nil {
 		return nil, false
 	}
-	if !strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") && len(v.Issues) > 0 {
+	// An EXPLICIT pass is required — the same tightening isMissionPassVerdict
+	// applies, and for the same reason: "no issues" is a shape a Strict
+	// schema lets a failing reviewer emit, and here it would lock a charter
+	// from a plan the reviewer rejected. The design text allows the empty-
+	// issues fallback (isDesignPass, §5.2); both reviewer prompts promise
+	// the literal word, and the cost of demanding it is one more revision
+	// round, while the cost of the fallback is an implementation phase
+	// spent on a plan that failed review.
+	if !strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
 		return nil, false
 	}
 	if len(v.Acceptance) == 0 {
@@ -251,10 +291,16 @@ type designReviewInput struct {
 
 // dispatchDesignReview runs one design-reviewer subagent through the same
 // task-tool chain the correctness reviewer uses (pool, schema validation,
-// progress events). ok=false is the fail-soft path — interrupted, timed out,
-// tool failure, tampered worktree, unparseable output — and the caller then
+// progress events). ok=false is the fail-soft path — timed out, tool
+// failure, tampered worktree, unparseable output — and the caller then
 // refuses to implement.
-func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, plan string, prev *agent.DesignReviewResult, round int) (*agent.DesignReviewResult, bool) {
+//
+// cancelled is reported separately from ok because the two deserve opposite
+// treatment: a review that FAILED tells us nothing about the plan and ends
+// the mission with the plan in the user's hands, while a review the user
+// INTERRUPTED says nothing at all, so the mission stays active and the next
+// message resumes it.
+func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, plan string, prev *agent.DesignReviewResult, round int) (verdict *agent.DesignReviewResult, ok bool, cancelled bool) {
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
@@ -308,29 +354,28 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 		r.ui.Info(fmt.Sprintf(
 			"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
 			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, false
+		return nil, false, false
 	}
 	if turnErr != nil && turnErr.cancelled {
-		r.ui.Info("  mission: design review interrupted — the plan is unreviewed")
-		return nil, false
+		return nil, false, true
 	}
 	if execErr != nil {
 		if errors.Is(execErr, context.DeadlineExceeded) {
 			r.ui.Info(fmt.Sprintf(
 				"  mission: design review hit its %s deadline — the plan is unreviewed (raise review_timeout in config.yaml)", timeout))
-			return nil, false
+			return nil, false, false
 		}
 		r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — the plan is unreviewed", execErr))
-		return nil, false
+		return nil, false, false
 	}
 
 	schema := agent.GetAgentTypeConfig(agent.AgentTypeDesignReviewer).OutputSchema
-	verdict, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
+	parsed, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
 	if err != nil {
 		r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — the plan is unreviewed", err))
-		return nil, false
+		return nil, false, false
 	}
-	return verdict, true
+	return parsed, true, false
 }
 
 // designPlanPromptCap bounds how much of the plan goes into the reviewer's

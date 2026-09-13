@@ -869,7 +869,14 @@ Phase 1–5 全部落地,`go build ./...` 与 `go test ./...` 通过(`pkg/mcp` �
 
 ### 实现中补的小决定(文档未定义)
 
-- **设计评审 fail-soft 的终态**:§六-1 只说"不实施",没给 `status`。实现写 `handed_over`(计划留盘、明示未评审),不写 `design_failed` —— 后者的语义是"轮次用尽仍 fail"。
-- **`missionReviewGate` 的基线不取调用方参数**,直接读 `r.mission.baseline`。任务在实施相被 Ctrl+C 之后,用户的普通 turn 会经 `runEpisode` 进到这道门,那条路径传进来的是 per-turn 快照(或开关关闭时的零值),会把章程检查悄悄收窄成"这一 turn"。
+- **活动任务拥有下一条输入**(§5.5 原话"下一条用户输入默认续跑",实现补齐):`r.mission != nil` 时,非 slash 输入与 `-c` 的 auto-continue 都走 `runMission`,用户那句话成为该相下一 turn 的输入(这也是本期唯一的"运行中纠偏"通道);`missionReviewGate` **只由 `runImplementPhase` 调用**,不再挂在 `reviewGate` 上。第 1 轮 PR 评审发现的高优先级缺陷:经 `runEpisode` 进这道门时,升层 / `passed` / 终态会被算出来然后丢掉(`runEpisode` 只读 `next`),普通闲聊还会烧掉任务的 idle 额度。
+- **设计评审 fail-soft 的终态**:§六-1 只说"不实施",没给 `status`。实现写 `handed_over`(计划留盘、明示未评审),不写 `design_failed` —— 后者的语义是"轮次用尽仍 fail"。但**打断设计评审子代理**不算 fail-soft:裁决什么都没说,任务保持 `active`,下一条消息续跑。
+- **两道门都要求显式 `verdict=="pass"`**。§5.2 的 `isDesignPass` 沿用 `isPassVerdict`(issues 为空即 pass);但 Strict schema 下"fail + 空 issues"是完全合法的形状,在实施侧会把未修复的改动写成 `done`,在设计侧会把被否的计划锁成章程。两个 reviewer 提示词都承诺输出字面量 `"pass"`,代价只是多一轮修订。
+- **升层额度用尽时 S1 与 S3 同一出口**:reviewer 刚说过问题不在代码,再花修复轮就是花在错误的层上,直接交人工。
+- **中断的设计 turn 不计轮次**:`designRound` 移到 `turnErr` 检查之后 —— 与实施相(`ImplementRound` 只在发 fix 时加)一致。
+- **`/new` 摘掉 `r.mission` 但不改磁盘状态**(任务留在旧会话的 metadata 里);**`/undo` 把章程重挂到新 carry 上**(整份 carry 被换掉,而任务还活着)。
+- **`DeferPlanApproval` 下 `exit_plan_mode` 的 inline `plan` 参数会被写进钉死的 `PlanFile`**:门只认那个文件,否则模型以为提交了、门看到的是空文件,白烧一轮。文件已有内容时不覆盖。
 - **`leaveMission` 同时复位 plan mode 相关的 per-turn 覆盖**(`planMode`/`planFile`/`DisableEnterPlan`/`DeferPlanApproval`)。否则在设计相结束的任务会把用户留在只读模式里,而唯一的出口(`exit_plan_mode`)还被指向一个已经不存在的门。
+- **非 git 警示从相起点移到门里**:降级真正生效的地方是门,这样中途失去 git(被删、index 锁死)也会被说出来。
 - **路径归一化 `workdirRel` 先规范形后原形**:计划点名的新文件、以及连同目录一起被删除的文件都过不了 `EvalSymlinks`,在 macOS(`/var` → `/private/var`)上会被误判成"树外"。
+- **`design_failed` 的首句按是否升层分两种写法**(R37):升层后先说"上一份章程下的改动仍在树上且从未通过评审",不再先说"什么都没实施"。

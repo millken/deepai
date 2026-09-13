@@ -165,11 +165,16 @@ func TestDesignOutcome(t *testing.T) {
 			t.Errorf("%s: must not pass", name)
 		}
 	}
-	// An empty issue list with no explicit "pass" verdict still passes —
-	// isPassVerdict's rule, kept identical here.
+	// A failing verdict with an EMPTY issue list — a shape the Strict schema
+	// permits — must not lock a charter. This is the design-gate half of the
+	// same hole isMissionPassVerdict closes on the done path.
+	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail", ScopeFiles: []string{"a.go"},
+		Acceptance: []string{"Given a, when b, then c"}}); ok {
+		t.Error("a fail verdict must not pass just because it listed no issues")
+	}
 	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "", ScopeFiles: []string{"a.go"},
-		Acceptance: []string{"Given a, when b, then c"}}); !ok {
-		t.Error("no issues = pass, same as the code reviewer")
+		Acceptance: []string{"Given a, when b, then c"}}); ok {
+		t.Error("an empty verdict is not a pass — both reviewer prompts promise the literal word")
 	}
 }
 
@@ -292,5 +297,135 @@ func TestBuildDesignReviewPrompt_CarriesAnchorsAndBudget(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// R28, checked where it actually matters: the design turn that runs AFTER
+// an escalation must not be told it is bound by the charter the gate just
+// rejected. The carry is what the trailing turn injection is built from
+// (pkg/agent's TestTurnInjection_CarriesTheMissionCharter closes that half),
+// so this asserts its state DURING the turn, not after the phase.
+func TestDesignPhase_AfterEscalationTheTurnSeesNoLockedCharter(t *testing.T) {
+	fake := &fakeTaskTool{content: designFailJSON()}
+	dir := t.TempDir()
+	r, _ := newMissionRepl(t, dir)
+	r.cfg.ToolRegistry = fake.registry(t)
+	m, _ := createMission(dir, "brief")
+	writeFileOrFatal(t, m.designPath(), "# old plan")
+	_ = m.lockCharter(&Charter{ScopeFiles: []string{"a.go"}, Acceptance: []string{"Given a, when b, then c"}})
+	r.mission = m
+	r.carry.SetMissionCharter(renderCharter(m.charter))
+
+	// The implementation gate escalates.
+	r.reviewPrev = &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{
+		{File: "a.go", Message: "the charter cannot express this", FaultLayer: "design"}}}
+	r.escalateToDesign(escalateFaultLayer)
+
+	var charterDuringTurn []string
+	var inputs []string
+	r.missionTurn = func(_ context.Context, input string) *turnError {
+		inputs = append(inputs, input)
+		charterDuringTurn = append(charterDuringTurn, r.carry.MissionCharter())
+		writeFileOrFatal(t, m.designPath(), "# a new plan")
+		return nil
+	}
+
+	r.runDesignPhase(context.Background())
+
+	if len(charterDuringTurn) == 0 {
+		t.Fatal("no design turn ran")
+	}
+	for i, got := range charterDuringTurn {
+		if got != "" {
+			t.Errorf("escalated design turn %d still carries a locked charter into every request: %q", i+1, got)
+		}
+	}
+	if !strings.HasPrefix(inputs[0], "[mission-escalate") {
+		t.Fatalf("first escalated input = %q", inputs[0])
+	}
+	// R4: the escalated phase runs on its own, smaller budget.
+	if len(inputs) != maxEscalatedDesignRounds {
+		t.Fatalf("ran %d escalated design rounds, want %d", len(inputs), maxEscalatedDesignRounds)
+	}
+}
+
+// M2: Ctrl+C already costs the user the turn; it must not also cost the
+// mission one of its three chances at the plan.
+func TestDesignPhase_InterruptedTurnDoesNotSpendARound(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, _, _ := newDesignRepl(t, fake, nil)
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+	r.missionTurn = func(context.Context, string) *turnError { return &turnError{cancelled: true} }
+
+	r.runDesignPhase(context.Background())
+
+	if m.state.DesignRound != 0 {
+		t.Fatalf("design_round = %d after an interrupted turn, want 0", m.state.DesignRound)
+	}
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.DesignRound; got != 0 {
+		t.Fatalf("persisted design_round = %d, want 0", got)
+	}
+}
+
+// An interrupted design REVIEW says nothing about the plan: the mission must
+// stay active so the user can simply resume, instead of being ended because
+// they interrupted the thing reading a finished plan.
+func TestDesignPhase_InterruptedReviewKeepsTheMissionActive(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, ui, _ := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+	// Interrupt lands on the reviewer dispatch, not on the design turn.
+	ui.interruptDuringTask = true
+	fake.waitForCancel = true
+
+	r.runDesignPhase(context.Background())
+
+	if r.mission == nil {
+		t.Fatal("an interrupted review must not end the mission")
+	}
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.Status; got != missionStatusActive {
+		t.Fatalf("status = %q, want active", got)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "design review interrupted") {
+		t.Errorf("the user must be told the plan is unreviewed: %v", ui.infoMsgs)
+	}
+}
+
+// R37, on the fail-soft path too: after an escalation the worktree holds
+// edits that never passed a review, and every design-side exit has to say so.
+func TestDesignPhase_FailSoftAfterEscalationWarnsAboutUnreviewedEdits(t *testing.T) {
+	fake := &fakeTaskTool{content: "not json"}
+	r, ui, _ := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.Escalation = 1
+	r.mission = m
+
+	r.runDesignPhase(context.Background())
+
+	joined := strings.Join(ui.infoMsgs, "\n")
+	if !strings.Contains(joined, "NEVER passed by a review") {
+		t.Errorf("an escalated mission's fail-soft must warn about the unreviewed edits:\n%s", joined)
+	}
+}
+
+// L1: design_failed means two different things, and the first sentence the
+// user reads must be the true one for their case.
+func TestFailDesign_WordsTheEscalatedCaseDifferently(t *testing.T) {
+	fake := &fakeTaskTool{content: designFailJSON()}
+	r, ui, _ := newDesignRepl(t, fake, []string{"# p1", "# p2", "# p3"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.Escalation = 1
+	r.mission = m
+
+	r.runDesignPhase(context.Background())
+
+	joined := strings.Join(ui.infoMsgs, "\n")
+	if strings.Contains(joined, "nothing was implemented from it") {
+		t.Error("after an escalation that sentence is false — edits from the previous charter are in the worktree")
+	}
+	if !strings.Contains(joined, "NEVER passed by a review") {
+		t.Errorf("the escalated case must say what is actually in the worktree:\n%s", joined)
 	}
 }

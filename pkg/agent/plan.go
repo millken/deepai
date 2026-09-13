@@ -222,9 +222,11 @@ func (a *Agent) makeExitPlanModeTool() models.Tool {
 		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 			// Read plan from file, fall back to parameter.
 			var plan string
+			fromFile := false
 			if a.planFile != "" {
-				if data, err := os.ReadFile(a.planFile); err == nil {
+				if data, err := os.ReadFile(a.planFile); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 					plan = string(data)
+					fromFile = true
 				}
 			}
 			if plan == "" {
@@ -254,6 +256,24 @@ func (a *Agent) makeExitPlanModeTool() models.Tool {
 			// (§5.2, C3). The gate does not care whether this was ever
 			// called: it reads the plan file itself.
 			if a.deferPlanApproval {
+				// The inline-plan fallback must reach DISK here. The gate
+				// reads the plan file and nothing else, so a plan that
+				// arrived only as this tool's argument — which the tool
+				// description still invites — would leave the reviewer
+				// looking at an empty or stale file while the model has
+				// been told its plan was submitted. That burns a whole
+				// design round on a misunderstanding the loop created.
+				if !fromFile && a.planFile != "" {
+					if err := os.WriteFile(a.planFile, []byte(plan), 0o644); err != nil {
+						return models.ToolResult{
+							CallID:      call.ID,
+							ToolName:    call.Name,
+							Status:      models.CallStatusFailed,
+							Error:       fmt.Sprintf("could not save the inline plan to %s: %v — call write_plan instead", a.planFile, err),
+							CompletedAt: time.Now().UTC(),
+						}, nil
+					}
+				}
 				return models.ToolResult{
 					CallID:   call.ID,
 					ToolName: call.Name,

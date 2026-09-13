@@ -92,14 +92,20 @@ func (r *ChatRepl) runMissionTurn(parentCtx context.Context, input string) *turn
 	}
 	r.turn++
 	in := input
+	// Images ride with the input they were pasted alongside, and only with
+	// it: consumed here so a later synthesized turn in the same phase does
+	// not re-attach them.
+	images := r.missionPendingImages
+	r.missionPendingImages = nil
 	return r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		return r.runTurn(ctx, in, nil, false)
+		return r.runTurn(ctx, in, images, false)
 	})
 }
 
-// missionDesignInput picks the design phase's next turn input: an
-// escalation message computed by the implementation gate, the first-turn
-// brief expansion, or a resume nudge for a phase picked up mid-flight.
+// missionDesignInput picks the design phase's next turn input: whatever the
+// user typed to resume the mission, an escalation message computed by the
+// implementation gate, the first-turn brief expansion, or a resume nudge for
+// a phase picked up mid-flight.
 func (r *ChatRepl) missionDesignInput() string {
 	m := r.mission
 	if in := r.missionPendingInput; in != "" {

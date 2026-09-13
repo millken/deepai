@@ -375,18 +375,15 @@ type gateResult struct {
 // changes behind warns explicitly: the user must never mistake an unreviewed
 // change for a reviewed one.
 //
-// Inside a mission's implementation phase it takes the mission branch
-// instead (R22 — no force parameter, no second gate): that branch enforces
-// the charter's scope, anchors the review on the charter rather than the
-// latest chatter, and can raise an escalation. r.mission is non-nil only
-// while the mission's status is active, so an ordinary /review or runEpisode
-// never reaches it.
+// A mission's implementation phase does NOT come through here: its gate
+// (missionReviewGate) is called directly by runImplementPhase, and only by
+// it. That is deliberate. The mission gate produces two outcomes this
+// function's callers cannot act on — an escalation back to design, and a
+// terminal "reviewed and passed" — so reaching it from runEpisode would
+// compute those decisions and then drop them on the floor: the mission
+// would spend idle rounds on ordinary conversation, lose an escalation the
+// reviewer actually raised, and never record a pass it actually got.
 func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, before worktreeSnapshot, round int) gateResult {
-	if r.mission != nil && r.mission.state.Phase == missionPhaseImplement {
-		// before is deliberately not forwarded: the mission gate uses the
-		// mission's own implementation baseline (see missionReviewGate).
-		return r.missionReviewGate(parentCtx, round)
-	}
 	// r.planMode is read AFTER the turn (the post-turn readback may have
 	// entered plan mode mid-turn); plan-mode turns are read-only in intent
 	// and their gate is skipped defensively (design §4.2).
