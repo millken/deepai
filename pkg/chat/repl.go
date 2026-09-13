@@ -1319,17 +1319,24 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 	var turnErr error
 	var turnToolCalls []memory.ToolCallInfo
 
-	// renderDrained renders one event taken from the queue after Run has
-	// returned. cancelled says the turn is unwinding from a cancelled or
-	// expired context, which is the one case where an event must be
-	// dropped rather than shown: Run emits an AgentEventError carrying the
-	// very ctx.Err() that ended it (react.go's post-batch cancellation
-	// check), and that event is still queued when the drain runs. Rendering
-	// it printed a red "Error: context canceled" directly above the
-	// "⎿ Interrupted." notice on every single Ctrl+C — the REPL already
-	// reports the turn-level error once, from turnErr. Errors that are NOT
-	// this teardown's own reason still render.
-	renderDrained := func(evt agent.AgentEvent, cancelled bool) {
+	// handleEvent processes ONE event from the queue, wherever it was taken
+	// from: the live loop below, or either drain after Run has returned.
+	// Every site routes through here so an event costs the same whether it
+	// arrived while the turn was running or was still queued when it ended —
+	// the drains used to render without collecting, so a tool_call_start
+	// still in flight at the interrupt was dropped from the tool-distribution
+	// signal that gates preference extraction.
+	//
+	// cancelled says the turn is unwinding from a cancelled or expired
+	// context, which is the one case where an event must be dropped rather
+	// than shown: Run emits an AgentEventError carrying the very ctx.Err()
+	// that ended it (react.go's post-batch cancellation check), and that
+	// event is still queued when the drain runs. Rendering it printed a red
+	// "Error: context canceled" directly above the "⎿ Interrupted." notice
+	// on every single Ctrl+C — the REPL already reports the turn-level error
+	// once, from turnErr. Errors that are NOT this teardown's own reason
+	// still render.
+	handleEvent := func(evt agent.AgentEvent, cancelled bool) {
 		if cancelled && isCancellationErrorEvent(evt) {
 			return
 		}
@@ -1337,6 +1344,18 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 			lastUsage = evt.Usage
 		}
 		r.ui.RenderEvent(evt)
+		// Collect tool call names for distribution tracking.
+		if evt.Type == agent.AgentEventToolCallStart {
+			name := ""
+			if evt.ToolEvent != nil {
+				name = evt.ToolEvent.Name
+			} else if evt.ToolCall != nil {
+				name = evt.ToolCall.Name
+			}
+			if name != "" {
+				turnToolCalls = append(turnToolCalls, memory.ToolCallInfo{Name: name})
+			}
+		}
 	}
 	// drainQueuedEvents renders everything left in the channel until it
 	// closes. Safe to block on: Run closes its event channel (deferred in
@@ -1346,7 +1365,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 			return
 		}
 		for evt := range events {
-			renderDrained(evt, cancelled)
+			handleEvent(evt, cancelled)
 		}
 	}
 EventLoop:
@@ -1357,22 +1376,7 @@ EventLoop:
 				events = nil
 				continue
 			}
-			if evt.Usage != nil {
-				lastUsage = evt.Usage
-			}
-			r.ui.RenderEvent(evt)
-			// Collect tool call names for distribution tracking.
-			if evt.Type == agent.AgentEventToolCallStart {
-				name := ""
-				if evt.ToolEvent != nil {
-					name = evt.ToolEvent.Name
-				} else if evt.ToolCall != nil {
-					name = evt.ToolCall.Name
-				}
-				if name != "" {
-					turnToolCalls = append(turnToolCalls, memory.ToolCallInfo{Name: name})
-				}
-			}
+			handleEvent(evt, false)
 		case out := <-outcomes:
 			drainQueuedEvents(false)
 			if out.result != nil {
@@ -1449,7 +1453,7 @@ EventLoop:
 							events = nil
 							continue
 						}
-						renderDrained(evt, true)
+						handleEvent(evt, true)
 						continue
 					default:
 					}
@@ -1496,6 +1500,17 @@ EventLoop:
 	// own goroutine, same as every other SetStatus call site.
 	r.ui.SetStatus(r.currentModel, r.planMode)
 
+	// Record tool call distribution for preference extraction triggers.
+	// BEFORE the turnErr return, not after it: the tools in this slice really
+	// ran, however the turn ended. Recording only clean turns dropped whole
+	// interrupted turns from the cumulative distribution, which then makes
+	// the "<20% of cumulative calls means a new pattern" shift test fire
+	// spuriously the next time one of those tools shows up in a turn that
+	// did finish.
+	if r.prefSched != nil && len(turnToolCalls) > 0 {
+		r.prefSched.RecordToolCalls(turnToolCalls)
+	}
+
 	if turnErr != nil {
 		r.saveSession()
 		return turnErr
@@ -1515,11 +1530,6 @@ EventLoop:
 			}
 		}
 		go r.generateTitle(sessionID, firstUserMsg)
-	}
-
-	// Record tool call distribution for preference extraction triggers.
-	if r.prefSched != nil && len(turnToolCalls) > 0 {
-		r.prefSched.RecordToolCalls(turnToolCalls)
 	}
 
 	// Schedule memory work for this turn.

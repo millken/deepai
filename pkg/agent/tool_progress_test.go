@@ -119,11 +119,14 @@ func TestParallelBatch_ReportsEachCallAsItLands(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("Run: %v (elapsed=%s)", err, elapsed)
-	}
+	// Order matters: on the deadlock path Run returns a non-nil error too, so
+	// the generic check below would fire first and this diagnosis — the
+	// actual reason the test failed — would never print.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("RED: the fast call's tool_call_end never arrived while its sibling was still running, "+
-			"so the blocking tool was only released by the %s deadline", 3*time.Second)
+			"so the blocking tool was only released by the %s deadline (Run returned: %v)", 3*time.Second, err)
+	}
+	if err != nil {
+		t.Fatalf("Run: %v (elapsed=%s)", err, elapsed)
 	}
 }

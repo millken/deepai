@@ -266,6 +266,19 @@ func (ps *PreferenceScheduler) RecordToolCalls(calls []ToolCallInfo) {
 	}
 }
 
+// ToolDistribution returns a copy of the cumulative per-tool call counts the
+// shift detector reads. A snapshot, not a view: the map is rebuilt under the
+// lock so a caller cannot race (or mutate) the scheduler's own state.
+func (ps *PreferenceScheduler) ToolDistribution() map[string]int {
+	ps.throttle.mu.Lock()
+	defer ps.throttle.mu.Unlock()
+	out := make(map[string]int, len(ps.throttle.toolDistrib))
+	for name, n := range ps.throttle.toolDistrib {
+		out[name] = n
+	}
+	return out
+}
+
 // ToolCallInfo is a lightweight record of a tool call for distribution tracking.
 type ToolCallInfo struct {
 	Name string

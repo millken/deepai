@@ -7,6 +7,7 @@ import (
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
 )
 
@@ -183,5 +184,60 @@ func TestRunTurn_InterruptDoesNotRenderCancellationError(t *testing.T) {
 	if !sawToolEnd {
 		t.Fatalf("no tool_call_end rendered at all, so the assertion above proves nothing: %v",
 			renderedEventTypes(ui.events))
+	}
+}
+
+// TestRunTurn_InterruptStillRecordsToolDistribution covers the bookkeeping
+// half of an interrupted turn. Two things dropped the signal that gates
+// preference extraction: the drains rendered events without collecting the
+// tool names (so a tool_call_start still queued when Ctrl+C landed was lost),
+// and RecordToolCalls sat below runTurn's `if turnErr != nil` return, so an
+// interrupted turn contributed nothing at all. Tools that really ran then
+// stayed missing from the cumulative distribution, which makes the "under 20%
+// of cumulative calls is a new pattern" shift test fire spuriously the next
+// time one of them appears in a turn that did finish.
+func TestRunTurn_InterruptStillRecordsToolDistribution(t *testing.T) {
+	r, _ := newSessionCarryTestRepl(t, &fanOutProvider{})
+	r.prefSched = memory.NewPreferenceScheduler()
+
+	quickRan := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := r.cfg.ToolRegistry.Register(models.Tool{
+		Name:         "quick",
+		ParallelSafe: true,
+		Handler: func(context.Context, models.ToolCall) (models.ToolResult, error) {
+			close(quickRan)
+			return models.ToolResult{Content: "quick done"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cfg.ToolRegistry.Register(models.Tool{
+		Name:         "blocking",
+		ParallelSafe: true,
+		Handler: func(hctx context.Context, _ models.ToolCall) (models.ToolResult, error) {
+			<-hctx.Done()
+			return models.ToolResult{Status: models.CallStatusFailed, Error: "interrupted"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		<-quickRan
+		cancel()
+	}()
+
+	if err := r.runTurn(ctx, "fan out", nil, false); err == nil {
+		t.Fatal("expected the interrupted turn to return an error")
+	}
+
+	dist := r.prefSched.ToolDistribution()
+	for _, name := range []string{"quick", "blocking"} {
+		if dist[name] == 0 {
+			t.Errorf("tool %q ran but never reached the distribution: %v", name, dist)
+		}
 	}
 }
