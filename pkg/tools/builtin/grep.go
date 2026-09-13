@@ -171,14 +171,12 @@ func searchDir(root string, re *regexp.Regexp, extFilter map[string]bool, globPa
 			return nil
 		}
 
-		// Apply type-based extension filter
 		if len(extFilter) > 0 {
 			if !extFilter[filepath.Ext(path)] {
 				return nil
 			}
 		}
 
-		// Apply glob filter
 		if len(globPatterns) > 0 {
 			matched := false
 			for _, gp := range globPatterns {

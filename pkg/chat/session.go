@@ -386,7 +386,6 @@ func (s *SQLiteSessionStore) AppendMessage(sessionID string, msg models.Message)
 		return fmt.Errorf("append message: %w", err)
 	}
 
-	// Update session updated_at.
 	_, err = tx.Exec(`UPDATE sessions SET updated_at = ? WHERE id = ?`, unixFrac(msg.CreatedAt), sessionID)
 	if err != nil {
 		return fmt.Errorf("update session timestamp: %w", err)

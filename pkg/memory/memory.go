@@ -353,7 +353,6 @@ func (s *Service) UpdateScopeWithSkillUsage(ctx context.Context, scope Scope, me
 		return fmt.Errorf("load memory %q: %w", sessionID, err)
 	}
 
-	// Run LLM extraction against loaded doc.
 	var update Update
 	if ext != nil && len(filteredMessages) > 0 {
 		extracted, err := ext.ExtractUpdate(ctx, current, cloneMessages(filteredMessages))

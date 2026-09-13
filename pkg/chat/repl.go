@@ -835,7 +835,6 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			continue
 		}
 
-		// Handle slash commands.
 		if cmd, ok := ParseSlashCommand(line); ok {
 			// File-based command: inject its expanded body as a user turn.
 			if c, ok := r.cfg.Commands[cmd.Name]; ok {
@@ -1400,7 +1399,6 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 
 	runAgent := agent.New(agentCfg)
 
-	// Append skill descriptions and system prompt.
 	if r.cfg.SkillRegistry != nil {
 		if desc := r.cfg.SkillRegistry.Descriptions(); desc != "" {
 			runAgent.AppendSystemPrompt(desc)
@@ -1424,7 +1422,6 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		close(events)
 	}()
 
-	// Run the agent.
 	type outcome struct {
 		result *agent.RunResult
 		err    error

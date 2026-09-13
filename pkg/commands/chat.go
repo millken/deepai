@@ -98,7 +98,6 @@ func registerMaxTurnsAlias(cmd *cobra.Command) {
 }
 
 func runChat(ctx context.Context, query, resume string, continueLast, continueAny, forkSession, forceSession bool, modelOverride string, maxToolCalls int) error {
-	// Load config.
 	cfg, err := LoadConfig(ConfigFile())
 	if err != nil {
 		return err
@@ -179,13 +178,11 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		return fmt.Errorf("resolve default model: %w", err)
 	}
 
-	// Create sandbox.
 	workDir, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	// Create tool registry.
 	registry := tools.NewRegistry()
 
 	// Discover Claude plugins early — the agent catalog feeds the task tool's
@@ -336,7 +333,6 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		}
 	}
 
-	// Build REPL config.
 	replCfg := chat.ReplConfig{
 		Provider:             cfg.Provider,
 		ModelRegistry:        modelRegistry,

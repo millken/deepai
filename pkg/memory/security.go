@@ -46,7 +46,6 @@ func ScanContent(content string) error {
 		return nil
 	}
 
-	// Check for invisible Unicode characters.
 	for _, pat := range invisibleUnicodePatterns {
 		if pat.MatchString(content) {
 			return ScanError{Content: content, Threat: "invisible_unicode"}
@@ -60,7 +59,6 @@ func ScanContent(content string) error {
 		}
 	}
 
-	// Check for threat patterns.
 	for _, tp := range threatPatterns {
 		if tp.regex.MatchString(content) {
 			return ScanError{Content: content, Threat: tp.threat}

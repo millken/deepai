@@ -238,7 +238,6 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Save config.
 	if err := saveConfig(configPath, &cfg); err != nil {
 		return err
 	}

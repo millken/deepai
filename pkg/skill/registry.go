@@ -457,7 +457,6 @@ func (r *Registry) DiscoverNested(rootDir, filePath string) error {
 	for dir != rootDir && dir != filepath.Dir(dir) {
 		canonical := filepath.Clean(dir)
 
-		// Check cache
 		r.mu.RLock()
 		cached, exists := r.nestedCache[canonical]
 		r.mu.RUnlock()
@@ -473,7 +472,6 @@ func (r *Registry) DiscoverNested(rootDir, filePath string) error {
 			continue
 		}
 
-		// Load skills from nested directory
 		nestedReg := NewRegistry()
 		if err := nestedReg.LoadFromDir(nestedDir); err != nil {
 			dir = filepath.Dir(dir)

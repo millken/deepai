@@ -77,7 +77,6 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Truncated: reqTruncated,
 	}
 
-	// Build upstream request.
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		reqBodyEvt.Timestamp = time.Now().UTC()

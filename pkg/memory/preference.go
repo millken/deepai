@@ -238,7 +238,6 @@ func (ps *PreferenceScheduler) RecordToolCalls(calls []ToolCallInfo) {
 	ps.throttle.mu.Lock()
 	defer ps.throttle.mu.Unlock()
 
-	// Build current-turn distribution.
 	turnDist := make(map[string]int, len(calls))
 	for _, c := range calls {
 		turnDist[c.Name]++
@@ -260,7 +259,6 @@ func (ps *PreferenceScheduler) RecordToolCalls(calls []ToolCallInfo) {
 		}
 	}
 
-	// Update cumulative distribution.
 	for name, count := range turnDist {
 		ps.throttle.toolDistrib[name] += count
 	}

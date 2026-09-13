@@ -54,7 +54,6 @@ func FindHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 			}
 		}
 
-		// Apply type filter
 		switch fileType {
 		case "file":
 			if d.IsDir() {

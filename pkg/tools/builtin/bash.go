@@ -38,7 +38,6 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	stdout := result.Stdout()
 	stderr := result.Stderr()
 
-	// Check total output size
 	totalSize := len(stdout) + len(stderr)
 	if totalSize > BashMaxOutputBytes {
 		// Truncate output to fit within limit

@@ -114,7 +114,6 @@ func TextCosineSimilarity(a, b string) float64 {
 		return 0
 	}
 
-	// Build frequency maps.
 	freqA := make(map[string]int, len(tokensA))
 	for _, t := range tokensA {
 		freqA[t]++
