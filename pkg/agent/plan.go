@@ -54,7 +54,13 @@ func (a *Agent) enterPlanMode() {
 	}
 	a.tools = restricted
 	a.planMode.Store(true)
-	a.initPlanFile()
+	// Only open a new plan file when the caller has not pinned one. The
+	// mission loop pins .deepai/missions/<id>/design.md for every turn of a
+	// design phase so successive rounds revise ONE document (R9); opening a
+	// fresh timestamped file here would strand the previous round's plan.
+	if a.planFile == "" {
+		a.initPlanFile()
+	}
 	a.logger.Debug("entered plan mode", "plan_file", a.planFile)
 }
 
@@ -71,6 +77,19 @@ func (a *Agent) exitPlanMode() {
 		a.fullTools = nil
 	}
 	a.logger.Debug("exited plan mode")
+}
+
+// PlanFile returns the path of the plan document this agent writes through
+// write_plan, or "" if plan mode was never entered. The REPL reads it after
+// a turn so that a plan written in an ORDINARY turn (the model decided on
+// its own to call enter_plan_mode) can be carried into a mission when
+// mission_on_plan is set — otherwise the upgrade would have to guess which
+// timestamped file under .deepai/plans/ belonged to that turn.
+func (a *Agent) PlanFile() string {
+	if a == nil {
+		return ""
+	}
+	return a.planFile
 }
 
 // IsPlanMode returns whether the agent is currently in plan mode.
@@ -203,9 +222,11 @@ func (a *Agent) makeExitPlanModeTool() models.Tool {
 		Handler: func(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 			// Read plan from file, fall back to parameter.
 			var plan string
+			fromFile := false
 			if a.planFile != "" {
-				if data, err := os.ReadFile(a.planFile); err == nil {
+				if data, err := os.ReadFile(a.planFile); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 					plan = string(data)
+					fromFile = true
 				}
 			}
 			if plan == "" {
@@ -221,12 +242,51 @@ func (a *Agent) makeExitPlanModeTool() models.Tool {
 				}, nil
 			}
 
-			// Ask user to confirm the plan.
-			ui := tools.UserInteractionFromContext(ctx)
 			planLocation := "inline"
 			if a.planFile != "" {
 				planLocation = a.planFile
 			}
+
+			// Approval deferred to a gate (the mission loop's design
+			// review): do NOT ask, and do NOT exit plan mode. The design
+			// phase stays read-only until the gate passes the plan and the
+			// loop moves the mission to its implementation phase — letting
+			// the model exit here would hand it write tools on a plan no
+			// reviewer has seen, which is the whole thing the gate replaces
+			// (§5.2, C3). The gate does not care whether this was ever
+			// called: it reads the plan file itself.
+			if a.deferPlanApproval {
+				// The inline-plan fallback must reach DISK here. The gate
+				// reads the plan file and nothing else, so a plan that
+				// arrived only as this tool's argument — which the tool
+				// description still invites — would leave the reviewer
+				// looking at an empty or stale file while the model has
+				// been told its plan was submitted. That burns a whole
+				// design round on a misunderstanding the loop created.
+				if !fromFile && a.planFile != "" {
+					if err := os.WriteFile(a.planFile, []byte(plan), 0o644); err != nil {
+						return models.ToolResult{
+							CallID:      call.ID,
+							ToolName:    call.Name,
+							Status:      models.CallStatusFailed,
+							Error:       fmt.Sprintf("could not save the inline plan to %s: %v — call write_plan instead", a.planFile, err),
+							CompletedAt: time.Now().UTC(),
+						}, nil
+					}
+				}
+				return models.ToolResult{
+					CallID:   call.ID,
+					ToolName: call.Name,
+					Status:   models.CallStatusCompleted,
+					Content: fmt.Sprintf(
+						"Plan submitted for independent design review (mission mode). You stay in plan mode; the review reads %s as it stands on disk. If it finds problems they arrive as your next message — rewrite the WHOLE plan with write_plan then, since that tool replaces the file rather than patching it.",
+						planLocation),
+					CompletedAt: time.Now().UTC(),
+				}, nil
+			}
+
+			// Ask user to confirm the plan.
+			ui := tools.UserInteractionFromContext(ctx)
 			if ui != nil {
 				answer, err := ui.AskQuestion(ctx,
 					fmt.Sprintf("Implementation plan (%s):\n\n%s\n\nProceed with this plan?", planLocation, plan),

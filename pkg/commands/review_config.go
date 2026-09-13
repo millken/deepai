@@ -30,7 +30,7 @@ const defaultReviewTokenBudget = 150_000
 const defaultReviewTimeout = chat.DefaultReviewTimeout
 
 // resolveReviewTokenBudget maps the config value to an effective budget:
-// 0/absent → the 30k default, negative → unlimited (0 downstream).
+// 0/absent → defaultReviewTokenBudget, negative → unlimited (0 downstream).
 func resolveReviewTokenBudget(configured int) int {
 	switch {
 	case configured == 0:

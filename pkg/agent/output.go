@@ -200,4 +200,40 @@ type Issue struct {
 	// from the absence of omitempty/omitzero).
 	Scenario   string `json:"scenario,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+	// Area classifies a DESIGN review finding: scope | feasibility |
+	// completeness | acceptance | risk. Empty for every code reviewer.
+	Area string `json:"area,omitempty"`
+	// FaultLayer is the mission loop's escalation signal (design
+	// docs/LONG_TASK_LOOP_DESIGN.md §5.4.3, D4): "implementation" (or empty)
+	// means the code is wrong, "design" means the code faithfully implements
+	// a plan that cannot satisfy the brief, and the loop must re-enter the
+	// design phase instead of spending another fix round. Only the
+	// correctness reviewer fills it, and only when its message carried a
+	// locked charter (see rule 3a in correctnessReviewerSystemPrompt) —
+	// without one, rule 3 still forbids reporting anything outside the diff.
+	//
+	// Both fields are omitempty for the same reason Scenario is: the four
+	// existing reviewers share this type under a Strict schema and emit
+	// neither, and google/jsonschema-go infers Required from the absence of
+	// omitempty.
+	FaultLayer string `json:"fault_layer,omitempty"`
+}
+
+// DesignReviewResult is the structured output of the design reviewer — a
+// SEPARATE type from ReviewResult, not a superset of it (design §八 C10):
+// merging the two would make scope_files/acceptance required of the four
+// code reviewers, whose Strict validation would then start failing on
+// output they have always produced.
+//
+// ScopeFiles and Acceptance are not decoration: on a passing verdict they
+// BECOME the mission charter (§5.3), so the gate treats an empty either as
+// a failure rather than a pass (isDesignPass) — a charter with no scope
+// would make the implementation phase's hard scope check admit everything.
+type DesignReviewResult struct {
+	Agent      string   `json:"agent"`
+	Verdict    string   `json:"verdict"`
+	Summary    string   `json:"summary"`
+	Issues     []Issue  `json:"issues"`
+	ScopeFiles []string `json:"scope_files"`
+	Acceptance []string `json:"acceptance"`
 }

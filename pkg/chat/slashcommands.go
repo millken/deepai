@@ -20,6 +20,7 @@ var slashCommands = []slashCmd{
 	{"compact", "Compact context now"},
 	{"refine", "Refine memory now (/refine [undo|rollback <id>|list|status|on|off])"},
 	{"review", "Adversarially review recent edits (/review [on|off|status])"},
+	{"mission", "Run a task design→review→implement→review (/mission <task>|abort|status)"},
 	{"plan", "Enter plan mode (read-only, explore before coding)"},
 	{"run", "Exit plan mode (full tool access)"},
 	{"model", "Show or switch model (/model <name>, /model ? for picker)"},

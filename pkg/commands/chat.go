@@ -370,6 +370,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		ReviewAfterEdit:      cfg.ReviewAfterEdit,
 		ReviewTokenBudget:    resolveReviewTokenBudget(cfg.ReviewTokenBudget),
 		ReviewTimeout:        resolveReviewTimeout(cfg.ReviewTimeoutMinutes),
+		MissionOnPlan:        cfg.MissionOnPlan,
 	}
 
 	repl, err := chat.NewRepl(replCfg)

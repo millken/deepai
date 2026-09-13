@@ -125,6 +125,35 @@ type AgentConfig struct {
 	PlanMode bool
 	WorkDir  string // working directory for writing plan files
 
+	// PlanFile pins the plan document this agent writes through write_plan.
+	// Empty (every /plan user) keeps the existing behavior: entering plan
+	// mode opens a fresh .deepai/plans/<timestamp>.md.
+	//
+	// It exists for the mission loop (docs/LONG_TASK_LOOP_DESIGN.md §5.2,
+	// R9), whose design phase spans several turns and therefore several
+	// Agents — the REPL builds a new one per turn. With a timestamped file
+	// per construction, round 2 would start from an empty plan while round
+	// 1's plan sat in a file nothing reads, and the gate would have no
+	// defensible answer to "which file is the plan".
+	PlanFile string
+
+	// DisableEnterPlan omits the enter_plan_mode tool. The mission loop's
+	// IMPLEMENT phase sets it (R21): a mid-turn enter_plan_mode would be
+	// read back into the REPL's plan-mode flag at turn end and the next
+	// implementation turn would come up read-only, unable to implement
+	// anything and unable to leave (the only exit is exit_plan_mode, which
+	// a mission defers to its gate).
+	DisableEnterPlan bool
+
+	// DeferPlanApproval hands plan approval to a gate instead of the user:
+	// exit_plan_mode neither prompts nor exits plan mode, and says so. The
+	// mission loop's design phase sets it, because the approval decision
+	// there belongs to the independent design review, and a blocking
+	// three-way prompt is precisely the "user approves every step" the loop
+	// exists to replace (D8/C3). Unset, exit_plan_mode behaves exactly as
+	// it always has.
+	DeferPlanApproval bool
+
 	// NonInteractive marks delegated sub-agents and other headless contexts.
 	// It disables plan mode (no user to approve) and suppresses team-delegation
 	// prompt injection (sub-agents don't orchestrate).

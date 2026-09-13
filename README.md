@@ -145,8 +145,11 @@ token_aging: false                  # true 启用 T1 工具结果老化
 
 # 对抗式自审（可选，默认关闭；详见 docs/ADVERSARIAL_REVIEW_DESIGN.md）
 review_after_edit: false            # true 启用编辑后自动对抗式审查
-review_token_budget: 0              # 单次审查 token 预算：0=默认 30000，负值=不限
-review_timeout: 0                   # 单次审查超时（分钟，0=默认 5 分钟）
+review_token_budget: 0              # 单次审查 token 预算：0=默认 150000，负值=不限
+review_timeout: 0                   # 单次审查超时（分钟，0=默认 10 分钟）
+
+# 长任务闭环（可选，默认关闭；详见 docs/LONG_TASK_LOOP_DESIGN.md）
+mission_on_plan: false              # true 时进入 plan mode 的普通 turn 会升级为 /mission 闭环
 ```
 
 ### 3. 环境变量 `~/.deepai/.env`
@@ -422,6 +425,36 @@ temperature: 0.2
 解析优先级：**项目 YAML > 项目 MD > 插件 MD > 内置 > general 回退**。
 
 详见 [`pkg/subagent/README.md`](pkg/subagent/README.md) 与 [`docs/MULTI_AGENT.md`](docs/MULTI_AGENT.md)。
+
+---
+
+## 长任务闭环（/mission）
+
+> 完整设计与决策记录见 [docs/LONG_TASK_LOOP_DESIGN.md](docs/LONG_TASK_LOOP_DESIGN.md)。只经 `/mission` 进入；`mission_on_plan: true` 可让 plan mode 自动升级。
+
+`/mission <任务>` 让一次长任务在无人逐步批准的情况下走完 **设计 → 设计评审 → 实施 → 实施评审**，并用落盘的**章程**（而不是对话记忆）防止跑偏：
+
+```
+/mission <任务>
+   └─ DESIGN（plan mode，只读）──▶ design-reviewer 独立评审计划
+         │ 不通过 → 带着 issue 重写计划（最多 3 轮）
+         │ 通过   → 锁章程（scope_files + acceptance）
+         ▼
+      IMPLEMENT ──▶ 范围硬门（代码判定，不花 reviewer）
+         │             越界 → 命令 revert（独立 2 轮，不占评审轮）
+         ▼
+      correctness-reviewer 评审（对照章程，不是对照最近的闲聊）
+         │ 通过 → done ；计划本身有问题 → 升回 DESIGN（整任务 1 次）
+         └ 轮次用尽 / 空转 / fail-soft → handed_over（明示未通过评审）
+```
+
+要点：
+
+- **章程锁定**：设计通过时把 `scope_files`/`acceptance` 落盘为 `charter.lock.json`，此后每次请求的尾部注入都带上它 —— 压缩之后依然在。
+- **范围是硬门**：越界文件由代码判定（对照实施相起点快照），不花 reviewer；`*_test.go` 与 `testdata/` 伴生自动在范围内。
+- **只有评审通过才算完成**：空改动是 `idle`，fail-soft 是 `handed_over`，都不会被写成 `done`。
+- 状态落在 `.deepai/missions/<id>/`（`brief.md` / `design.md` / `charter.lock.json` / `state.json` / `reviews.jsonl`），`deepai -c` 续接同一会话的活动任务。
+- 命令：`/mission <任务>` 开始、`/mission` 续跑、`/mission status` 查看、`/mission abort` 结束（不回滚已落地的编辑）。
 
 ---
 

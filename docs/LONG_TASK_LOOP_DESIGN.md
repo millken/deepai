@@ -1,6 +1,6 @@
 # 长任务闭环(Mission Loop)设计 — 设计 → 评审 → 实施 → 评审
 
-> 状态:**第 7 轮评审修订,待确认**。未实施。v1 自审见 §八 C1–C12;v2–v6 见 §八;v7 响应 R36–R39(终态清注入、`design_failed` 两种含义、评审范围收窄、外部写者),处置见 §八。
+> 状态:**已实施(2026-09-13)**,Phase 1–5 全部落地,见 §十四「实施记录」。第 7 轮评审修订的正文即实现依据;实现中有两处对本文的偏离,已在 §十四 列明。v1 自审见 §八 C1–C12;v2–v6 见 §八;v7 响应 R36–R39(终态清注入、`design_failed` 两种含义、评审范围收窄、外部写者),处置见 §八。
 > 目标:让一次长任务在无人逐步批准的情况下走完 **设计 → 设计评审(可多轮) → 实施 → 实施评审(可多轮)** ,并且用**章程(charter)**而不是对话记忆来防止跑偏。
 > 前置:对抗式实施审查已落地([ADVERSARIAL_REVIEW_DESIGN.md](ADVERSARIAL_REVIEW_DESIGN.md),`pkg/chat/review.go` 的 `runEpisode`);plan mode 已落地(`pkg/agent/plan.go`);确定性编排层已被实测否决(`87772b6` 删除 `pkg/orchestrator`)。
 
@@ -844,3 +844,39 @@ mission_on_plan: false   # 缺省关;true 时 enter_plan_mode 升级为任务
 | v5 | 2026-09-13 | 响应第 5 轮评审 R25–R29。越界权威改为相对 `S_impl` 的当下差集,revert 后退出越界集、S3 不误触发;进 IMPLEMENT 补 `[mission-implement]`;进相/离相清空 `EditedFiles` 与 `reviewPrev`;升层清 charter 注入;修正"修复零 LLM 成本"的表述。 |
 | v6 | 2026-09-13 | 响应第 6 轮评审 R30–R35。非 git 评审范围回退工具记录;空 scope 走 idle 而非 done,`gateResult.passed` 才结束;五态 `status`;任务分支 `before=S_impl`;续跑手改已知行为;删"stamp 一致即退出越界集"。 |
 | v7 | 2026-09-13 | 响应第 7 轮评审 R36–R39。任一终态走 `leaveMission`(清章程注入、`r.mission=nil`);`design_failed` 区分未实施与升层后未审实施;`reviewScope` 不含豁免生成物;外部写者推广 R34。 |
+
+---
+
+## 十四、实施记录(2026-09-13)
+
+Phase 1–5 全部落地,`go build ./...` 与 `go test ./...` 通过(`pkg/mcp` 的 `TestLoad_RegistersToolsAndReports` / `TestLoadWithServers_ConnectsExtra` 是既有环境失败:t.TempDir 清理只读的 module cache,非本次回归)。
+
+### 落点
+
+| Phase | 文件 |
+|---|---|
+| 1 | `pkg/agent/output.go`(`DesignReviewResult`、`Issue.Area`/`FaultLayer`)、`pkg/agent/types_config.go`(`design-reviewer` 档案 + `designReviewerSystemPrompt` + `namedSchemas["design_review"]` + correctness Rule 3a)、`pkg/agent/design_reviewer_test.go` |
+| 2 | `pkg/chat/mission.go`(目录布局、五态 `status`、章程、`implement.baseline`、`normalizeScopeFiles`)、`pkg/chat/mission_command.go`(`/mission`、`leaveMission`、`attachSessionMission`)、`pkg/chat/mission_test.go` |
+| 3 | `pkg/agent/types.go`(`PlanFile` / `DisableEnterPlan` / `DeferPlanApproval`)、`plan.go`、`react.go`、`promptbuild.go`(章程尾部注入)、`session_carry.go`(`SetMissionCharter`)、`pkg/chat/mission_design.go`、`mission_messages.go`、`mission_loop.go` |
+| 4 | `pkg/chat/review.go`(`gateResult`、章程块)、`pkg/chat/mission_implement.go`(范围硬门、S1–S3、idle) |
+| 5 | `pkg/chat/repl.go`(按相强制 plan mode、`/clear` abort、启动续挂、`mission_on_plan` 升级)、`pkg/commands/setup.go` / `chat.go` |
+
+### 对本文的两处偏离
+
+1. **`design-reviewer` 的 `MaxToolCalls` 用 `defaultReviewerMaxToolCalls`(20),不是 0。** §5.2 写 `MaxToolCalls: 0`,理由是"与另外四个 reviewer profile 相同"。但仓库现状已经变了:`TestReviewerProfiles_CarryAToolCallCap` 要求四个 reviewer 档案都带 20 —— 交互池现在有墙钟,不封顶的 reviewer 遇到墙钟交不出东西。"与另外四个一致"今天的取值就是 20。门侧仍单独传 `reviewMaxToolCalls`,分工不变。
+
+2. **升层回设计后不重拍 `S_impl`,保留原基线。** §5.4 的伪码在"进 IMPLEMENT 相时"拍快照,字面上包括升层后的第二次进相。但重拍会让第一次实施相已经落地的编辑落进新基线 → 对第二次实施评审隐身 → 任务可能以 `done` 收尾而树上留着从未被评审的改动,这正是 §9 #20 / R31 要防的那件事。保留原基线后:新章程覆盖的旧编辑会被评审,不覆盖的会被范围门要求 revert。代码注释写明了这一取舍(`escalateToDesign`)。
+
+### 实现中补的小决定(文档未定义)
+
+- **活动任务拥有下一条输入**(§5.5 原话"下一条用户输入默认续跑",实现补齐):`r.mission != nil` 时,非 slash 输入与 `-c` 的 auto-continue 都走 `runMission`,用户那句话成为该相下一 turn 的输入(这也是本期唯一的"运行中纠偏"通道);`missionReviewGate` **只由 `runImplementPhase` 调用**,不再挂在 `reviewGate` 上。第 1 轮 PR 评审发现的高优先级缺陷:经 `runEpisode` 进这道门时,升层 / `passed` / 终态会被算出来然后丢掉(`runEpisode` 只读 `next`),普通闲聊还会烧掉任务的 idle 额度。
+- **设计评审 fail-soft 的终态**:§六-1 只说"不实施",没给 `status`。实现写 `handed_over`(计划留盘、明示未评审),不写 `design_failed` —— 后者的语义是"轮次用尽仍 fail"。但**打断设计评审子代理**不算 fail-soft:裁决什么都没说,任务保持 `active`,下一条消息续跑。
+- **两道门都要求显式 `verdict=="pass"`**。§5.2 的 `isDesignPass` 沿用 `isPassVerdict`(issues 为空即 pass);但 Strict schema 下"fail + 空 issues"是完全合法的形状,在实施侧会把未修复的改动写成 `done`,在设计侧会把被否的计划锁成章程。两个 reviewer 提示词都承诺输出字面量 `"pass"`,代价只是多一轮修订。
+- **升层额度用尽时 S1 与 S3 同一出口**:reviewer 刚说过问题不在代码,再花修复轮就是花在错误的层上,直接交人工。
+- **中断的设计 turn 不计轮次**:`designRound` 移到 `turnErr` 检查之后 —— 与实施相(`ImplementRound` 只在发 fix 时加)一致。
+- **`/new` 摘掉 `r.mission` 但不改磁盘状态**(任务留在旧会话的 metadata 里);**`/undo` 把章程重挂到新 carry 上**(整份 carry 被换掉,而任务还活着)。
+- **`DeferPlanApproval` 下 `exit_plan_mode` 的 inline `plan` 参数会被写进钉死的 `PlanFile`**:门只认那个文件,否则模型以为提交了、门看到的是空文件,白烧一轮。文件已有内容时不覆盖。
+- **`leaveMission` 同时复位 plan mode 相关的 per-turn 覆盖**(`planMode`/`planFile`/`DisableEnterPlan`/`DeferPlanApproval`)。否则在设计相结束的任务会把用户留在只读模式里,而唯一的出口(`exit_plan_mode`)还被指向一个已经不存在的门。
+- **非 git 警示从相起点移到门里**:降级真正生效的地方是门,这样中途失去 git(被删、index 锁死)也会被说出来。
+- **路径归一化 `workdirRel` 先规范形后原形**:计划点名的新文件、以及连同目录一起被删除的文件都过不了 `EvalSymlinks`,在 macOS(`/var` → `/private/var`)上会被误判成"树外"。
+- **`design_failed` 的首句按是否升层分两种写法**(R37):升层后先说"上一份章程下的改动仍在树上且从未通过评审",不再先说"什么都没实施"。

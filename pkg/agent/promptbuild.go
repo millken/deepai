@@ -332,6 +332,20 @@ func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMes
 		b.WriteString(note)
 	}
 
+	// The mission charter (docs/LONG_TASK_LOOP_DESIGN.md §5.3) rides here,
+	// beside todos and memory, for the same reason they do: this message is
+	// rebuilt for every request — including after a compaction that
+	// summarized the charter's own message away — while everything BEFORE it
+	// stays a stable prefix. A charter that lived only in the history is
+	// exactly the copy compaction is allowed to lose, and losing it is how a
+	// long task drifts back to whatever the conversation lately talked
+	// about (D1/D7). It is present only while a mission is active: the REPL
+	// clears it from the carry on every terminal status (R36).
+	if charter := a.session.MissionCharter(); charter != "" {
+		b.WriteString("\n\n")
+		b.WriteString(charter)
+	}
+
 	if a.memoryService != nil {
 		activeSource := ""
 		if skillName := a.ActiveSkill(); skillName != "" {

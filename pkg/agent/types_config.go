@@ -19,13 +19,18 @@ const (
 	// post-edit review gate (docs/ADVERSARIAL_REVIEW_DESIGN.md §4.3). It is
 	// also directly addressable via the task tool like any other type.
 	AgentTypeCorrectnessReviewer AgentType = "correctness-reviewer"
-	AgentTypeProductManager      AgentType = "product-manager"
-	AgentTypeArchitect           AgentType = "architect"
-	AgentTypeBash                AgentType = "bash"
-	AgentTypeFrontend            AgentType = "frontend"
-	AgentTypeUIDesigner          AgentType = "ui-designer"
-	AgentTypeNews                AgentType = "news"
-	AgentTypeDocEditor           AgentType = "document-editor"
+	// AgentTypeDesignReviewer is the mission loop's design gate
+	// (docs/LONG_TASK_LOOP_DESIGN.md §5.2). It reviews a PLAN against the
+	// original brief — not a diff — which is why it is a separate type from
+	// arch-reviewer, whose whole prompt is scoped to "THIS change".
+	AgentTypeDesignReviewer AgentType = "design-reviewer"
+	AgentTypeProductManager AgentType = "product-manager"
+	AgentTypeArchitect      AgentType = "architect"
+	AgentTypeBash           AgentType = "bash"
+	AgentTypeFrontend       AgentType = "frontend"
+	AgentTypeUIDesigner     AgentType = "ui-designer"
+	AgentTypeNews           AgentType = "news"
+	AgentTypeDocEditor      AgentType = "document-editor"
 )
 
 type AgentTypeConfig struct {
@@ -124,7 +129,34 @@ const (
 	// under a wall clock it cannot see (pkg/chat's review gate): a reviewer
 	// that browses until the deadline kills it delivers nothing at all, so
 	// "finish with a verdict" outranks "investigate exhaustively".
-	correctnessReviewerSystemPrompt = "You are an independent adversarial correctness reviewer. Your job is to try to BREAK the change you are given, not to approve it.\n\nYou receive the original task description and the diff of the change. The changed files' full contents may or may not be attached — the message you are given says which; read what you still need yourself. You do NOT see the implementer's reasoning — judge only what the code actually does.\n\nFocus on: logic errors, unhandled edge cases (empty/nil/zero/boundary), off-by-one, error-path behavior, concurrency hazards introduced by the change, and whether the change actually satisfies the stated task.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. Every issue you report MUST include a concrete failure scenario in the \"scenario\" field: specific input or state → specific wrong output or behavior. An issue without a reproducible scenario does not count — do not report vague concerns.\n3. THIS change is the entire scope: a defect it introduces, or one it was supposed to fix and did not. A pre-existing problem in code the diff does not touch is out of scope no matter how real it is — do not report it.\n4. You may use bash to compile or run tests to substantiate an issue, but you MUST NOT modify, create, or delete any file in the project — you are a reviewer, not a fixer. Keep verification targeted (the specific build or the specific test), not a full-suite sweep.\n5. Your run is bounded. Reason from the diff first and spend tool calls only on questions the diff alone cannot settle; read line ranges around the hunks rather than whole files. Emit your verdict while you still have budget — a review that runs out of budget mid-investigation delivers nothing.\n6. If you cannot construct a failure scenario, output verdict \"pass\" — do not invent issues, and do not fail a change for style or taste.\n7. Output your findings as structured JSON matching the ReviewResult schema."
+	//
+	// Rule 3a is the mission loop's escalation door (LONG_TASK_LOOP_DESIGN
+	// §5.4.3 R1). Without it rule 3 does not merely leave fault_layer
+	// unfilled, it ACTIVELY forbids the finding: "the plan picked the wrong
+	// interface" is by construction a root cause outside the diff. 3a is
+	// conditioned on a locked charter actually being present in the user
+	// message, so a plain /review — which never carries one — keeps exactly
+	// the behavior it had before the mission loop existed.
+	// designReviewerSystemPrompt drives the mission loop's DESIGN gate
+	// (docs/LONG_TASK_LOOP_DESIGN.md §5.2). Structurally it is
+	// correctnessReviewerSystemPrompt with the object swapped — a plan
+	// instead of a diff — because the two failure modes it has to suppress
+	// are the same ones: inventing findings to justify its own existence,
+	// and hedging a pass. Two rules differ from the code reviewers and both
+	// are load-bearing:
+	//
+	//   - rule 5 (a pass MUST fill scope_files and acceptance) exists
+	//     because those fields BECOME the charter: an empty scope_files
+	//     would lock a scope the implementation phase's hard check then
+	//     admits everything through, so the gate counts an unfilled pass as
+	//     a fail (isDesignPass) rather than locking a vacuous charter.
+	//   - rule 3 forbids writes with no bash to enforce it — unlike the
+	//     correctness reviewer, this one gets no shell at all. A plan has no
+	//     compilable hard signal, so bash would buy nothing and only invite
+	//     "let me just verify this quickly" against the tree the mission is
+	//     about to edit.
+	designReviewerSystemPrompt      = "You are an independent adversarial design reviewer.\nYou receive the original brief and a plan document. You do NOT see the author's reasoning, and you do NOT see the conversation the plan came out of — judge only the brief and the plan in front of you.\n\nPass only if all of the following hold:\n1. The plan solves the brief — not a nearby or larger problem.\n2. In-scope files are named as they exist (or will exist) in the repo; out-of-scope is explicit. For a Go change, name the *_test.go files the plan expects to add or edit — the implementer will write them.\n3. Every acceptance criterion is Given/When/Then with one observable outcome. A criterion you cannot imagine falsifying does not count.\n4. Each Decision that cites existing code names file + exact identifier.\n\nRules:\n1. Do not assume the plan's intent is the brief's intent — verify it.\n2. Every issue MUST include a concrete failure scenario in the \"scenario\" field: if this plan were implemented as written, what observable thing would be wrong or missing. An issue without a scenario does not count. Classify it in \"area\": scope, feasibility, completeness, acceptance or risk.\n3. You MUST NOT edit, create or delete any project file. You have read-only tools only — use them to check that identifiers and paths the plan names actually exist.\n4. If you cannot construct a failure scenario, output verdict \"pass\". Do not fail a plan for style or taste.\n5. On pass you MUST fill scope_files and acceptance: scope_files is every repo-relative path the implementation may touch, acceptance is the Given/When/Then list the implementation will be judged against. They become the locked charter the implementer and the code reviewer both work from, so an empty either is treated as a FAIL by the gate — fill them properly rather than hedging with a pass.\n6. Your run is bounded. Reason from the plan first; spend tool calls only to verify identifiers exist. Emit the verdict while you still have budget.\n7. Output your findings as structured JSON matching the DesignReviewResult schema."
+	correctnessReviewerSystemPrompt = "You are an independent adversarial correctness reviewer. Your job is to try to BREAK the change you are given, not to approve it.\n\nYou receive the original task description and the diff of the change. The changed files' full contents may or may not be attached — the message you are given says which; read what you still need yourself. You do NOT see the implementer's reasoning — judge only what the code actually does.\n\nFocus on: logic errors, unhandled edge cases (empty/nil/zero/boundary), off-by-one, error-path behavior, concurrency hazards introduced by the change, and whether the change actually satisfies the stated task.\n\nRules:\n1. Do not assume code intent is correct — verify it.\n2. Every issue you report MUST include a concrete failure scenario in the \"scenario\" field: specific input or state → specific wrong output or behavior. An issue without a reproducible scenario does not count — do not report vague concerns.\n3. THIS change is the entire scope: a defect it introduces, or one it was supposed to fix and did not. A pre-existing problem in code the diff does not touch is out of scope no matter how real it is — do not report it.\n3a. If and only if the user message includes a locked charter (brief + scope_files + acceptance + plan): judge the change against the brief as well as the plan. If the change faithfully implements the plan but the plan cannot satisfy the brief — wrong interface, files that must exist but are not in scope, acceptance that cannot be true in this codebase — set issue.fault_layer=\"design\" and name the charter clause that cannot hold. That is a defect in the plan, not a pre-existing bug in untouched code, and IS in scope. Otherwise omit fault_layer or set \"implementation\".\n4. You may use bash to compile or run tests to substantiate an issue, but you MUST NOT modify, create, or delete any file in the project — you are a reviewer, not a fixer. Keep verification targeted (the specific build or the specific test), not a full-suite sweep.\n5. Your run is bounded. Reason from the diff first and spend tool calls only on questions the diff alone cannot settle; read line ranges around the hunks rather than whole files. Emit your verdict while you still have budget — a review that runs out of budget mid-investigation delivers nothing.\n6. If you cannot construct a failure scenario, output verdict \"pass\" — do not invent issues, and do not fail a change for style or taste.\n7. Output your findings as structured JSON matching the ReviewResult schema."
 	// productManagerSystemPrompt. Load-bearing: "a criterion that cannot
 	// fail cannot be tested and protects nobody", with Verifiable=false as
 	// the honest exit — required, because a rule that only says "must be
@@ -348,6 +380,23 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		MaxToolCalls: defaultReviewerMaxToolCalls,
 		Temperature:  0.2,
 	},
+	AgentTypeDesignReviewer: {
+		Type:         AgentTypeDesignReviewer,
+		Name:         "Design Reviewer",
+		Description:  "Adversarially reviews a design/plan against the original brief; delivers scope and acceptance. Not for code.",
+		SystemPrompt: designReviewerSystemPrompt,
+		// No bash, deliberately — see designReviewerSystemPrompt's doc.
+		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
+		// Same cap as every other reviewer profile: exhaustion is the
+		// RECOVERABLE bound (a forced tool-less wrap-up that must still
+		// satisfy the Strict schema), and the design gate overrides it with
+		// its own reviewMaxToolCalls anyway. The design doc predates
+		// TestReviewerProfiles_CarryAToolCallCap and says 0 here; matching
+		// the other four is what that decision (R6: "same as the other four
+		// reviewer profiles") actually asks for today.
+		MaxToolCalls: defaultReviewerMaxToolCalls,
+		Temperature:  0.2,
+	},
 	AgentTypeProductManager: {
 		Type:         AgentTypeProductManager,
 		Name:         "Product Manager",
@@ -424,6 +473,10 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 // gets.
 var namedSchemas = map[string]*OutputSchema{
 	"review": FromStruct[ReviewResult](WithStrict(true), WithMaxRetries(1)),
+	// "design_review" earns its place by the same test: pkg/chat's mission
+	// loop reads scope_files/acceptance out of it to lock the charter, and
+	// reads issues back into the next design round's revision message.
+	"design_review": FromStruct[DesignReviewResult](WithStrict(true), WithMaxRetries(1)),
 }
 
 func init() {
@@ -434,7 +487,10 @@ func init() {
 			BuiltinAgentTypes[at] = cfg
 		}
 	}
-
+	if cfg, ok := BuiltinAgentTypes[AgentTypeDesignReviewer]; ok {
+		cfg.OutputSchema = namedSchemas["design_review"]
+		BuiltinAgentTypes[AgentTypeDesignReviewer] = cfg
+	}
 }
 
 // NamedSchema looks up a namedSchemas entry by its `output_schema:` YAML

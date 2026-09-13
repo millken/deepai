@@ -332,7 +332,10 @@ func (r *ChatRepl) runEpisode(parentCtx context.Context, initialRequest string, 
 			// (design §4.2).
 			return turnErr
 		}
-		fixMsg := r.reviewGate(parentCtx, initialRequest, before, round)
+		// runEpisode reads ONLY next. escalate is always "" outside a
+		// mission, and passed is the mission loop's business: an ordinary
+		// episode has no third exit to take (R17).
+		fixMsg := r.reviewGate(parentCtx, initialRequest, before, round).next
 		if fixMsg == "" {
 			return nil
 		}
@@ -342,18 +345,50 @@ func (r *ChatRepl) runEpisode(parentCtx context.Context, initialRequest string, 
 	}
 }
 
+// gateResult is what one gate decision produced. It replaced a bare string
+// because the mission loop needs a THIRD exit the string could not express
+// (R17): "the plan itself is wrong, go back to design". Splitting passed out
+// fixes a second conflation the string had — next=="" used to mean pass,
+// nothing to review, fail-soft AND round cap all at once, so a mission would
+// have reported a turn that changed nothing as a completed, reviewed task
+// (R31).
+type gateResult struct {
+	// next is the synthesized input for another round (a fix, a scope
+	// revert, an idle nudge), or "" when this phase does not continue on
+	// its own.
+	next string
+	// escalate names the escalation signal (escalateFaultLayer /
+	// escalateRepeatFile / escalateScope), or "" for none. Always "" outside
+	// a mission.
+	escalate string
+	// passed is true ONLY when a correctness reviewer actually returned a
+	// pass verdict on a non-empty change set. Nothing else may be reported
+	// as a reviewed success.
+	passed bool
+}
+
 // reviewGate decides, after a completed turn, whether the episode continues
-// with a fix round. It returns the synthesized fix message, or "" when the
-// episode is over — pass, nothing to review, gate disabled, any fail-soft
-// path, or the round cap presenting unresolved issues to the user. Every
-// non-reviewed outcome that leaves changes behind warns explicitly: the
-// user must never mistake an unreviewed change for a reviewed one.
-func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, before worktreeSnapshot, round int) string {
+// with a fix round. Outside a mission it returns the synthesized fix message
+// in next, or an empty gateResult when the episode is over — pass, nothing to
+// review, gate disabled, any fail-soft path, or the round cap presenting
+// unresolved issues to the user. Every non-reviewed outcome that leaves
+// changes behind warns explicitly: the user must never mistake an unreviewed
+// change for a reviewed one.
+//
+// A mission's implementation phase does NOT come through here: its gate
+// (missionReviewGate) is called directly by runImplementPhase, and only by
+// it. That is deliberate. The mission gate produces two outcomes this
+// function's callers cannot act on — an escalation back to design, and a
+// terminal "reviewed and passed" — so reaching it from runEpisode would
+// compute those decisions and then drop them on the floor: the mission
+// would spend idle rounds on ordinary conversation, lose an escalation the
+// reviewer actually raised, and never record a pass it actually got.
+func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, before worktreeSnapshot, round int) gateResult {
 	// r.planMode is read AFTER the turn (the post-turn readback may have
 	// entered plan mode mid-turn); plan-mode turns are read-only in intent
 	// and their gate is skipped defensively (design §4.2).
 	if !r.cfg.ReviewAfterEdit || r.planMode {
-		return ""
+		return gateResult{}
 	}
 	after := takeWorktreeSnapshot(r.cfg.WorkDir)
 
@@ -366,7 +401,7 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	// records are canonicalized to match.
 	scope := unionSorted(resolveWorktreePaths(r.carry.EditedFiles()), after.changedSince(before))
 	if len(scope) == 0 {
-		return ""
+		return gateResult{}
 	}
 	if after.root == "" && !r.reviewNonGitWarned {
 		r.reviewNonGitWarned = true
@@ -376,19 +411,19 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	verdict, ok := r.dispatchReview(parentCtx, initialRequest, scope, after, r.reviewPrev)
 	if !ok {
 		r.reviewPrev = nil
-		return "" // fail-soft; dispatchReview already warned
+		return gateResult{} // fail-soft; dispatchReview already warned
 	}
 	if isPassVerdict(verdict) {
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
 		r.ui.Info("  review: pass — " + verdictSummary(verdict))
-		return ""
+		return gateResult{passed: true}
 	}
 	if round >= maxReviewRounds {
 		r.reviewPrev = nil
 		r.presentIssues(fmt.Sprintf(
 			"  review: STILL FAILING after %d fix rounds — human judgment needed. Unresolved issues:", maxReviewRounds), verdict)
-		return ""
+		return gateResult{}
 	}
 	// Carried into the next round's reviewer so it verifies these findings
 	// instead of re-deriving the whole review from scratch — and so a finding
@@ -396,7 +431,7 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	// silently re-reported in different words.
 	r.reviewPrev = verdict
 	r.ui.Info(fmt.Sprintf("  review: %d issue(s) — entering fix round %d/%d", len(verdict.Issues), round+1, maxReviewRounds))
-	return synthesizeFixMessage(round+1, verdict)
+	return gateResult{next: synthesizeFixMessage(round+1, verdict)}
 }
 
 // dispatchReview runs the degradation ladder and the reviewer for one scope.
@@ -417,6 +452,18 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 	// list, which is where a deletion belongs anyway; they just cannot be
 	// attached as content.
 	contextFiles := readableFiles(scope)
+	// Inside a mission the review's anchor is the CHARTER, not the latest
+	// thing anyone said (§5.3/D1): brief + acceptance + scope + the locked
+	// plan. That is also what makes rule 3a in the correctness reviewer'"'"'s
+	// prompt active — it opens the fault_layer="design" door only when a
+	// locked charter is actually present in the message, so a plain /review
+	// is unaffected.
+	var charter *Charter
+	var lockedPlan string
+	if r.mission != nil && r.mission.state.Phase == missionPhaseImplement {
+		charter = r.mission.charter
+		lockedPlan = r.mission.lockedPlan()
+	}
 	// Degradation rung (b): when the full-text bundle would blow the
 	// subagent context cap (a hard task failure, not a truncation), drop
 	// context_files and let the read-only reviewer pull what it needs.
@@ -429,6 +476,8 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 		scope:          relToWorkDir(r.cfg.WorkDir, scope),
 		bundled:        contextFiles != nil,
 		prev:           prev,
+		charter:        charter,
+		lockedPlan:     lockedPlan,
 	}, contextFiles, snap)
 }
 
@@ -549,6 +598,12 @@ type reviewPromptInput struct {
 	bundled bool
 	// prev is the previous round's failing verdict; nil on a first review.
 	prev *agent.ReviewResult
+	// charter/lockedPlan are set only for a mission's implementation review.
+	// They replace "whatever the user last said" with the thing the change
+	// is actually contracted to do, and they are what activates the
+	// correctness reviewer's conditional rule 3a.
+	charter    *Charter
+	lockedPlan string
 	// maxToolCalls/timeout are the reviewer's real operating budget. Told to
 	// it explicitly: a reviewer that does not know it is on a clock browses
 	// until the clock kills it, which loses the entire review.
@@ -563,8 +618,12 @@ type reviewPromptInput struct {
 func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
 	b.WriteString("Adversarially review the code changes below.\n\n")
-	b.WriteString("## Original task (verbatim user request)\n\n")
-	b.WriteString(in.initialRequest)
+	if in.charter != nil {
+		b.WriteString(renderCharterForReview(in.charter, in.lockedPlan))
+	} else {
+		b.WriteString("## Original task (verbatim user request)\n\n")
+		b.WriteString(in.initialRequest)
+	}
 	if len(in.scope) > 0 {
 		b.WriteString("\n\n## Files changed\n\n")
 		for _, f := range in.scope {
@@ -786,7 +845,7 @@ func (r *ChatRepl) lastUserRequest() string {
 			if m.Role != models.RoleHuman {
 				continue
 			}
-			if strings.HasPrefix(m.Content, "[adversarial-review") {
+			if strings.HasPrefix(m.Content, "[adversarial-review") || strings.HasPrefix(m.Content, missionMessagePrefix) {
 				continue
 			}
 			if strings.TrimSpace(m.Content) != "" {
@@ -859,3 +918,42 @@ func relToWorkDir(workDir string, paths []string) []string {
 	}
 	return out
 }
+
+// renderCharterForReview is the review prompt's charter block. The
+// fault_layer sentence is repeated here on purpose (R1): the system prompt's
+// rule 3a states the exception, and this restates it right beside the
+// charter it applies to, because rule 3 immediately above it says in plain
+// language that anything outside the diff is out of scope — which is exactly
+// what "the plan chose the wrong interface" looks like.
+func renderCharterForReview(c *Charter, lockedPlan string) string {
+	var b strings.Builder
+	b.WriteString("## Locked charter (the stated task — this outranks anything else in the conversation)\n\n")
+	b.WriteString("### Original brief (verbatim user request)\n\n")
+	b.WriteString(strings.TrimSpace(c.Brief))
+	b.WriteString("\n\n### Acceptance criteria the change must satisfy\n\n")
+	for i, a := range c.Acceptance {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, a)
+	}
+	b.WriteString("\n### In-scope files\n\n")
+	for _, f := range c.ScopeFiles {
+		b.WriteString("- " + f + "\n")
+	}
+	if plan := strings.TrimSpace(lockedPlan); plan != "" {
+		b.WriteString("\n### The plan being implemented\n\n")
+		if len(plan) > reviewCharterPlanCap {
+			b.WriteString(plan[:reviewCharterPlanCap])
+			b.WriteString("\n(plan truncated)\n")
+		} else {
+			b.WriteString(plan)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\nJudge the change against BOTH the brief and the plan. If the change faithfully implements the plan but the plan cannot satisfy the brief — wrong interface, a file that must change but is not in scope, an acceptance criterion that cannot hold in this codebase — report that with fault_layer=\"design\" and name the charter clause that cannot hold. That is in scope here, and it is the only way the plan itself can be corrected.\n")
+	return b.String()
+}
+
+// reviewCharterPlanCap bounds the locked plan inside the review prompt. The
+// plan is already capped at 64KiB by write_plan; this keeps the charter
+// block from crowding out the diff, which is what the reviewer is actually
+// there to read.
+const reviewCharterPlanCap = 24 << 10
