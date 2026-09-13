@@ -92,7 +92,7 @@ func TestReviewGateDisabled(t *testing.T) {
 	r.cfg.ReviewAfterEdit = false
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("disabled gate returned %q, want empty", got)
 	}
 	if fake.calls != 0 {
@@ -106,7 +106,7 @@ func TestReviewGatePlanModeSkipped(t *testing.T) {
 	r.planMode = true
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("plan-mode gate returned %q, want empty", got)
 	}
 	if fake.calls != 0 {
@@ -118,7 +118,7 @@ func TestReviewGateEmptyScopeZeroCost(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("empty-scope gate returned %q, want empty", got)
 	}
 	if fake.calls != 0 {
@@ -131,7 +131,7 @@ func TestReviewGatePassClearsSlate(t *testing.T) {
 	r, ui := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("pass verdict returned fix message %q", got)
 	}
 	if fake.calls != 1 {
@@ -150,7 +150,7 @@ func TestReviewGateFailSynthesizesFixMessage(t *testing.T) {
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	got := r.reviewGate(context.Background(), "the original request", worktreeSnapshot{}, 0)
+	got := r.reviewGate(context.Background(), "the original request", worktreeSnapshot{}, 0).next
 	for _, want := range []string{
 		"[adversarial-review round 1/2]",
 		"either fix it, or state explicitly why it is not a real problem",
@@ -181,7 +181,7 @@ func TestReviewGateRoundCapPresentsToHuman(t *testing.T) {
 	r, ui := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, maxReviewRounds); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, maxReviewRounds).next; got != "" {
 		t.Fatalf("at round cap the gate must end the episode, got fix message %q", got)
 	}
 	if !strings.Contains(ui.lastInfo(), "STILL FAILING") {
@@ -197,7 +197,7 @@ func TestReviewGateFailSoftOnToolError(t *testing.T) {
 	r, ui := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("tool error must fail soft, got %q", got)
 	}
 	if !strings.Contains(ui.lastInfo(), "changes are unreviewed") {
@@ -213,7 +213,7 @@ func TestReviewGateDeadlineNamesTheWindowAndKnob(t *testing.T) {
 	r.cfg.ReviewTimeout = 90 * time.Second
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("a reviewer deadline must fail soft, got %q", got)
 	}
 	info := ui.lastInfo()
@@ -229,7 +229,7 @@ func TestReviewGateFailSoftOnUnparseableVerdict(t *testing.T) {
 	r, ui := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("unparseable verdict must fail soft, got %q", got)
 	}
 	if !strings.Contains(ui.lastInfo(), "unparseable") {
@@ -251,7 +251,7 @@ func TestReviewGateTamperDiscardsVerdict(t *testing.T) {
 	}
 
 	before := takeWorktreeSnapshot(dir)
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("tampered review must fail soft, got %q", got)
 	}
 	if !strings.Contains(ui.lastInfo(), "DISCARDED") {
@@ -292,7 +292,7 @@ func TestReviewGateDiffOnlyDegradation(t *testing.T) {
 	before := takeWorktreeSnapshot(dir)
 	// Snapshot AFTER seeding so the gate's own S1 sees the same tree and
 	// attribution comes from the carry records.
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("want pass, got fix message %q", got)
 	}
 	if fake.calls != 1 {
@@ -322,7 +322,7 @@ func TestReviewGateOversizedDiffSkips(t *testing.T) {
 	seedEditedFile(t, r, "huge.txt", strings.Repeat("line of text\n", (reviewDiffByteCap/13)+2000))
 
 	before := takeWorktreeSnapshot(dir)
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("oversized diff must end the episode, got %q", got)
 	}
 	if fake.calls != 0 {
@@ -547,7 +547,7 @@ func TestReviewDiff_NewFileUnderSymlinkedWorkDir(t *testing.T) {
 	seedEditedFile(t, r, "brand_new.go", "package x\n\nfunc Boom() { panic(\"x\") }\n")
 
 	before := takeWorktreeSnapshot(link)
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("want pass, got fix message %q", got)
 	}
 	if fake.calls != 1 {
@@ -603,7 +603,7 @@ func TestReviewGate_NewDirectoryIsExpandedToItsFiles(t *testing.T) {
 	r, ui := newReviewRepl(t, dir, fake)
 	// Attribution comes from the snapshot delta alone here — the files were
 	// created outside the tool-record channel (the bash-mediated shape).
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("want pass, got %q (info: %s)", got, ui.lastInfo())
 	}
 	if fake.calls != 1 {
@@ -642,7 +642,7 @@ func TestReviewGate_DeletedFileStaysInDiffNotContextFiles(t *testing.T) {
 
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, ui := newReviewRepl(t, dir, fake)
-	if got := r.reviewGate(context.Background(), "req", before, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", before, 0).next; got != "" {
 		t.Fatalf("want pass, got %q (info: %s)", got, ui.lastInfo())
 	}
 	if fake.calls != 1 {

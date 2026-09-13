@@ -89,6 +89,14 @@ type ReplConfig struct {
 	ReviewTokenBudget int
 	// ReviewTimeout bounds one review subagent run; 0 uses DefaultReviewTimeout.
 	ReviewTimeout time.Duration
+
+	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
+	// full mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1). Default off, for
+	// the same reason ReviewAfterEdit is: a mission spends a design review
+	// and an implementation review the user did not ask for, and "I just
+	// wanted to see the plan" is a perfectly normal reason to type /plan.
+	// /mission stays the only default way in.
+	MissionOnPlan bool
 }
 
 // fallbackExtractInterval is the turn cadence for unconditional async memory
@@ -287,6 +295,49 @@ type ChatRepl struct {
 	// (degraded attribution, no reviewer-write detection) fire once per
 	// session instead of once per edited turn.
 	reviewNonGitWarned bool
+
+	// mission is the long-task loop this session is running
+	// (docs/LONG_TASK_LOOP_DESIGN.md), or nil — which is the ordinary case
+	// and the one every pre-existing path still takes. Non-nil ONLY while
+	// the mission's persisted status is "active": leaveMission clears it on
+	// every terminal status, which is what makes reviewGate fall back to its
+	// ordinary review_after_edit guard and stops the charter injection the
+	// turn after a mission ends (R36).
+	mission *mission
+
+	// missionPendingInput is the next mission turn's synthesized input when
+	// a phase transition already computed it (currently only the escalation
+	// message, which the implementation gate builds from findings the design
+	// phase never sees). Consumed once.
+	missionPendingInput string
+	// missionEscalationNote is the same escalation's explanation, handed to
+	// the DESIGN REVIEWER so it judges the new plan against what the old one
+	// could not do — a reviewer that only sees the brief again has no way to
+	// tell a genuine re-design from a restatement.
+	missionEscalationNote string
+
+	// missionScopeViolations is the last set of out-of-charter files the
+	// scope check found, kept so an escalation can tell the new design
+	// phase which files the implementation actually needed (§5.4.3).
+	missionScopeViolations []string
+
+	// missionTurn overrides how a mission turn is executed. Tests only —
+	// nil in every real ChatRepl, and the production path (runMissionTurn)
+	// then runs an ordinary runTurn. Mirrors the orphanWait /
+	// lockHeartbeatInterval test seams above.
+	missionTurn func(ctx context.Context, input string) *turnError
+
+	// lastPlanFile is the plan document the most recent turn's Agent used
+	// (agent.Agent.PlanFile). Read only by the mission_on_plan upgrade.
+	lastPlanFile string
+
+	// planFile / disableEnterPlan / deferPlanApproval are the per-turn plan
+	// mode overrides the mission loop forces by phase (R9/R21/C3) and passes
+	// straight through to AgentConfig. All three are zero for every
+	// non-mission turn, which is exactly today's behavior.
+	planFile          string
+	disableEnterPlan  bool
+	deferPlanApproval bool
 
 	// reviewPrev is the failing verdict from the previous review round of the
 	// CURRENT episode, replayed to the next round's reviewer so a re-review
@@ -698,6 +749,11 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	}
 	r.ui.SetStatus(r.currentModel, r.planMode)
 
+	// Re-attach this session's mission, if it is still active (§5.5). Only
+	// after r.ui exists: this reports the mission and its external-writer
+	// warning to the user.
+	r.attachSessionMission()
+
 	// Interactive loop. Ctrl+C during a turn cancels only that turn (delivered
 	// via the TUI interrupt channel); Ctrl+C at the prompt exits the REPL.
 
@@ -797,7 +853,12 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 				continue
 			}
 			r.ui.Info(fmt.Sprintf("  Error: %v", turnErr))
+			continue
 		}
+		// C11: the upgrade happens AFTER the turn, never mid-turn — runTurn
+		// is not re-entrant and the plan is usually written by the time the
+		// turn ends anyway.
+		r.maybeUpgradeToMission(parentCtx, line)
 	}
 
 	// Save session metadata on exit.
@@ -1267,13 +1328,20 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		RequestTimeout:  r.cfg.RequestTimeout,
 		UserInteraction: r.ui,
 		PlanMode:        r.planMode,
-		WorkDir:         r.cfg.WorkDir,
-		MemoryService:   r.cfg.MemoryService,
-		MemoryExtractor: r.cfg.MemoryExtractor,
-		MemoryUserID:    r.cfg.WorkDir,
-		ImageDetail:     r.currentImageDetail(),
-		AgentCatalog:    r.cfg.AgentCatalog,
-		Session:         r.carry,
+		// Mission-only (all zero otherwise): pin the plan document across
+		// the design phase's several agents, keep the implementation phase
+		// from re-entering plan mode, and route plan approval to the design
+		// gate instead of a blocking prompt.
+		PlanFile:          r.planFile,
+		DisableEnterPlan:  r.disableEnterPlan,
+		DeferPlanApproval: r.deferPlanApproval,
+		WorkDir:           r.cfg.WorkDir,
+		MemoryService:     r.cfg.MemoryService,
+		MemoryExtractor:   r.cfg.MemoryExtractor,
+		MemoryUserID:      r.cfg.WorkDir,
+		ImageDetail:       r.currentImageDetail(),
+		AgentCatalog:      r.cfg.AgentCatalog,
+		Session:           r.carry,
 	}
 
 	runAgent := agent.New(agentCfg)
@@ -1491,6 +1559,9 @@ EventLoop:
 	// is an atomic.Bool read, safe to call even if the Run goroutine that
 	// owns it hasn't fully returned yet (the orphan path above).
 	r.planMode = runAgent.IsPlanMode()
+	// Remember which plan document this turn used, so mission_on_plan can
+	// carry an ordinary turn's plan into the mission it creates.
+	r.lastPlanFile = runAgent.PlanFile()
 	// M4 final-phase review F-M4-4: every other write to r.planMode pairs
 	// it with a SetStatus call (Run()'s startup, /plan, /run, model
 	// switch) so the TUI footer stays in sync — this symmetric readback
@@ -1825,6 +1896,8 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.handleRefineCommand(parentCtx, cmd.Args)
 	case "review":
 		r.handleReviewCommand(parentCtx, cmd.Args)
+	case "mission":
+		r.handleMissionCommand(parentCtx, cmd.Args)
 	case "doctor":
 		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":
@@ -2114,6 +2187,15 @@ func (r *ChatRepl) clearSession() {
 	if r.lockState.isSuspended() {
 		r.ui.Info(lockLostRejectMsg)
 		return
+	}
+	// R24: /clear during a mission would leave the worst of both worlds — a
+	// mission still "active" on disk, its charter gone from a brand-new
+	// SessionCarry, and no history for it to resume into. Abort it first, on
+	// the same path /mission abort takes (nothing is rolled back).
+	if r.mission != nil {
+		id := r.mission.state.ID
+		r.leaveMission(missionStatusAborted)
+		r.ui.Info(fmt.Sprintf("  mission: %s aborted by /clear — any edits it made are left in the worktree, unreviewed", id))
 	}
 	r.sess.Messages = nil
 	r.turn = 0

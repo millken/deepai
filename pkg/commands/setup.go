@@ -84,6 +84,13 @@ type Config struct {
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
 
+	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
+	// long-task mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1): design →
+	// design review → implement → implement review, held to a locked
+	// charter. Default off — /mission is the explicit way in, and a mission
+	// spends two kinds of reviewer the user did not ask for.
+	MissionOnPlan bool `yaml:"mission_on_plan,omitempty"`
+
 	// SubagentTimeoutMinutes bounds every subagent the model dispatches with
 	// the task tool, in minutes (matching RequestTimeout's unit). 0 or absent
 	// = defaultSubagentTimeout; negative = no deadline, the behaviour before

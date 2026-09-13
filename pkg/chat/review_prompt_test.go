@@ -83,7 +83,7 @@ func TestReviewDispatch_PassesGracefulToolCallCap(t *testing.T) {
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("want pass, got %q", got)
 	}
 	if got := fake.args["max_tool_calls"]; got != reviewMaxToolCalls {
@@ -96,7 +96,7 @@ func TestReviewGate_PrevVerdictLifecycle(t *testing.T) {
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
 	seedEditedFile(t, r, "a.go", "package a\n")
 
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0); got == "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got == "" {
 		t.Fatal("a failing verdict must open a fix round")
 	}
 	if r.reviewPrev == nil {
@@ -106,7 +106,7 @@ func TestReviewGate_PrevVerdictLifecycle(t *testing.T) {
 	// Round cap: the episode ends and the carry-over must not leak into the
 	// next episode's first review.
 	seedEditedFile(t, r, "a.go", "package a // again\n")
-	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, maxReviewRounds); got != "" {
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, maxReviewRounds).next; got != "" {
 		t.Fatalf("at the round cap the episode must end, got %q", got)
 	}
 	if r.reviewPrev != nil {
