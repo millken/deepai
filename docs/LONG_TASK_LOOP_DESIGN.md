@@ -14,7 +14,7 @@
 
 ### 1.2 独立编排引擎 —— 已被实测证伪
 
-commit `87772b6`(2026-06-09,"实测编排功能不可用,整体移除")删除了 `pkg/orchestrator/`(implement→verify→review→fix、design 面板、build 串联、黑板、`MaxAgentCalls`)。`docs/ARCHITECTURE_REVIEW.md` §5.4 的结论仍然有效:**不要重建确定性编排层**。教训是:在 ReAct 循环**之外**另建一层状态机,与会话/事件/持久化脱节,不可维护。
+commit `87772b6`(2026-06-09,"实测编排功能不可用,整体移除")删除了 `pkg/orchestrator/`(implement→verify→review→fix、design 面板、build 串联、黑板、`MaxAgentCalls`)。2026-08 的架构评审据此定下的结论仍然有效:**不要重建确定性编排层**。教训是:在 ReAct 循环**之外**另建一层状态机,与会话/事件/持久化脱节,不可维护。
 
 ### 1.3 把实施审查再套一层"全流程编排" —— 会重蹈覆辙
 
@@ -826,7 +826,7 @@ mission_on_plan: false   # 缺省关;true 时 enter_plan_mode 升级为任务
 1. **设计评审比代码评审软**。没有编译/测试作硬信号,假阳性与假阴性都会更高。缓解:规则 2 要 scenario;规则 4 构造不出必须 pass;`isDesignPass` 要非空章程字段;轮次上限后交人而不是硬开干。
 2. **范围硬门误伤实现文件**(测试伴生已排除)。计划漏写一个必改的非测试文件。缓解:S3 两次越界后升层;不在本期做自动扩 scope。
 3. **S2 把难修的实现 bug 升成设计**。缓解:只在将交人工时触发,且整次任务只升一层;升层后 2 轮设计若确认章程没问题,会带着同一份 brief 再锁一次,实施相从头计轮次。
-4. **章程注入破坏 prompt cache 前缀**。memory 注入已有此问题(ARCHITECTURE_REVIEW §2.2)。缓解:章程段放在与 memory 相同的尾部位置,前缀(系统提示主体)不动。
+4. **章程注入破坏 prompt cache 前缀**。memory 注入已有此问题。缓解:章程段放在与 memory 相同的尾部位置,前缀(系统提示主体)不动。
 5. **`mission_on_plan` 与用户以为的"只是想看一眼计划"冲突**。故默认关;显式 `/mission` 才自动闭环。
 6. **Phase 3 碰 `plan.go` 的 exit 路径与 `PlanFile` API**。回归必须锁住:无 `PlanFile` 时仍 `initPlanFile`;非任务 `exit_plan_mode` 仍三选一询问。漏测任一则所有 `/plan` 用户受损。
 7. **设计失败即停摆**。预算/超时复用已解析的 150k / 10m,避免用已作废阈值把诚实评审打死之后再走停摆路径。

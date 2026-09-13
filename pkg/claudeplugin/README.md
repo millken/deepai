@@ -13,7 +13,7 @@
 
 每个根下的直接子目录是候选插件；含有效 `.claude-plugin/plugin.json` 才视为插件。无清单的目录静默跳过；清单损坏/缺 `name` → 计入 `problems`（供启动 report 展示，不静默）。
 
-## 加载的组件（2a）
+## 加载的组件
 
 - **skills**：`Plugin.SkillRoot()` 返回**插件根目录**（注意：`skill.Registry.LoadAllReported` 自己会拼 `/skills`，所以这里不拼）。同名 skill last-write-wins（不加前缀，命名空间留待后续统一设计）。
 - **mcpServers**：`Plugin.MCPServers()` 合并三种官方来源并展开 `${CLAUDE_PLUGIN_ROOT}`：
@@ -22,9 +22,14 @@
   - 清单 `mcpServers` 为字符串路径 → 读该文件
   - array 等非规范形状 → 计入 `problem`（不静默丢弃），`${VAR}` 环境展开交给 MCP loader。
 
-## 不在 2a 范围
+- **agents / commands**：`Plugin.AgentDir()` 与 `Plugin.CommandDir()` 只返回路径，由 `pkg/commands`
+  的 chat 装配把它们分别交给 agent catalog 与 `chat.PluginCommandDir`（命令写法见
+  [docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md](../../docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md)）。
 
-插件的 `agents/`、`commands/`、`hooks/` 不加载（见 [docs/spec/PLUGIN_INTEGRATION_SPEC.md](../../docs/spec/PLUGIN_INTEGRATION_SPEC.md) 的 2b/2c/2d）。`pkg/plugin`（旧 plugin.yaml 系统）格式不兼容，本包独立实现、不复用。
+## 不加载
+
+插件的 `hooks/` 不加载——deepai 没有 hook 机制。`pkg/plugin`（旧 plugin.yaml 系统）已随死代码清理删除，
+格式也不兼容，本包独立实现、不复用。
 
 ## 用法
 

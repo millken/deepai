@@ -42,7 +42,7 @@ var defaultToolBudgetsByTool = map[string]map[int]int{
 	"docx_read": {1: 20480, 2: 2048, 3: 300},
 }
 
-// Default per-age byte budgets. See docs/spec/token-efficiency.md §T1.
+// Default per-age byte budgets for tool-result aging.
 var (
 	// age 1 keeps most of the previous turn; age 2 trims; age>=3 matches the
 	// existing compaction floor (compactToolResultKeep = 300).
@@ -157,8 +157,9 @@ func (c *AgingConfig) conversationBudget(age int) int {
 // buildPromptView derives a request-scoped compressed view of the canonical
 // message history. Historical RoleTool Content (T1) and RoleAI Content (T4) are
 // truncated by age; ToolResult/ToolCalls structure and the canonical messages
-// themselves are left intact. Age is computed by scanning USER-turn indices (see
-// docs/spec/token-efficiency.md §T1), never from a Run turn counter.
+// themselves are left intact. Age is computed by scanning USER-turn indices,
+// never from a Run turn counter: a Run counter resets across turns, so the same
+// tool result would age at different rates depending on where the run started.
 //
 // contextWindow is the model's window in tokens, used only for the pressure gate.
 func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow int) []models.Message {

@@ -1,33 +1,43 @@
 # Multi-Agent 协同设计
 
-> **⚠️ 2026-08 勘误**："Environment 发布/订阅消息总线"从未实现，代码中不存在 Publish/Subscribe/MessageBus。下表温度已与 `pkg/agent/types_config.go` 对齐（在此之前子 agent 的温度实际全部退化为 0.2）；「工具」列仍是概述，精确列表以 `BuiltinAgentTypes` 的 `DefaultTools` 为准。现状评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
+> 与 `pkg/agent/types_config.go` 的 `BuiltinAgentTypes` 对齐于 2026-09-13。「工具」列是精确的
+> `DefaultTools` 白名单；改了那张表就要回来改这里。
+>
+> 历史勘误（留着是因为旧文档和旧会话里还有这个说法）：「Environment 发布/订阅消息总线」从未实现，
+> 代码中不存在 Publish/Subscribe/MessageBus；agent 间没有 peer 通信，唯一的协同通道是父 → 子的
+> 一次性委派。
 
 ## 概述
 
-deepai 多 agent 系统通过以下机制实现 agent 协同：
-
-- **Subagent** — 主 agent 调用子 agent 执行子任务
-- **Environment** — 发布/订阅消息总线，agent 间异步通信，消息历史追溯
+deepai 的多 agent 协同只有一条通道：**主 agent 通过 `task` 工具委派子 agent**。子 agent 之间不通信，
+也看不见彼此；父 agent 用 `context_files` 显式传递子 agent 需要的上下文，不做隐式共享。
 
 ## Agent 类型
 
-| Agent Type | 角色 | 工具 | 温度 | 用途 |
-|---|---|---|---|---|
-| `general-purpose` | 通用助手 | file_ops, bash, web_search, web_fetch, skill, present_file, ask_clarification | 0.2 | 日常对话 |
-| `researcher` | 研究员 | 全部 | 0.1 | 信息收集与综合 |
-| `coder` | 编码 | bash, file_ops, git | 0.1 | 代码实现、调试 |
-| `analyst` | 分析师 | 全部 | 0.15 | 数据分析 |
-| `security-reviewer` | 安全审查 | read_file, grep, glob, list_dir, find | 0.2 | 漏洞、注入、权限 |
-| `arch-reviewer` | 架构审查 | read_file, grep, glob, list_dir, find | 0.2 | 设计模式、耦合度 |
-| `perf-reviewer` | 性能审查 | read_file, grep, glob, list_dir, find, bash | 0.2 | 算法复杂度、内存 |
-| `product-manager` | 产品经理 | read_file, grep, glob, list_dir, find, ask_clarification | 0.15 | 需求分析、功能拆解 |
-| `architect` | 架构师 | read_file, grep, glob, list_dir, find | 0.2 | 系统设计、接口定义 |
-| `bash` | 命令执行 | bash | 0.0 | 仅执行 shell 命令 |
-| `frontend` | 前端开发 | bash, file_ops, web_search, web_fetch, image_search | 0.15 | HTML/CSS/JS、React/Vue/Angular、响应式设计、无障碍 |
-| `ui-designer` | UI 设计 | file_ops, web_search, web_fetch, image_search | 0.2 | 设计系统、线框图、组件规范、色彩、排版 |
-| `news` | 新闻获取 | web_search, web_fetch, web_fetch_batch | 0.1 | 新闻搜索、来源验证、结构化报道 |
+内置 profile **一律不设温度**：Claude 4.7+ 直接拒绝采样参数，其余现代模型忽略它，所以除非有人显式
+要求（项目 YAML/MD 里写 `temperature:`，或 `task` 工具传参），请求里不带这个字段——见
+`ApplyAgentType` 中 `profile.temperatureSet` 的判断。
 
-审查类 agent（security/arch/perf-reviewer）自动配置 `OutputSchema`，要求输出结构化 JSON：
+| Agent Type | 角色 | 工具（`DefaultTools` 白名单） | 工具上限 | 结构化输出 |
+|---|---|---|---|---|
+| `general-purpose` | 通用助手 | bash, read_file, write_file, edit_file, list_dir, glob, grep, find, code_map, present_file, ask_clarification, skill, web_search, web_fetch | 不限 | — |
+| `researcher` | 研究员（带出处的取证，不改文件） | read_file, list_dir, glob, grep, find, code_map, present_file, ask_clarification | 不限 | — |
+| `coder` | 编码 | 上述通用集 + git_auto_commit | 不限 | — |
+| `analyst` | 分析师（Method + Caveats） | read_file, write_file, edit_file, list_dir, glob, grep, find, code_map, present_file, ask_clarification | 不限 | — |
+| `product-manager` | 产品经理（可证伪的验收） | read_file, grep, glob, list_dir, find, code_map, ask_clarification | 不限 | — |
+| `architect` | 架构师（设计决策记录） | read_file, grep, glob, list_dir, find, code_map | 不限 | — |
+| `security-reviewer` | 安全审查 | read_file, grep, glob, list_dir, find, code_map | 20 | ReviewResult |
+| `arch-reviewer` | 架构审查 | read_file, grep, glob, list_dir, find, code_map | 20 | ReviewResult |
+| `perf-reviewer` | 性能审查 | 上列 + bash | 20 | ReviewResult |
+| `correctness-reviewer` | 对抗式正确性审查（评审门的 reviewer） | 上列 + bash | 20 | ReviewResult |
+| `design-reviewer` | 对抗式方案审查（判 brief vs plan，不看代码） | read_file, grep, glob, list_dir, find, code_map | 20 | DesignReviewResult |
+| `document-editor` | .docx 编辑（默认开修订痕迹） | docx_read, docx_edit, docx_format, docx_write, read_file, write_file, ask_clarification | 30 | — |
+| `frontend` | 前端开发 | 通用集 + web_search, web_fetch, image_search | 不限 | — |
+| `ui-designer` | UI 设计 | read_file, write_file, edit_file, list_dir, glob, grep, find, code_map, present_file, ask_clarification, web_search, web_fetch, image_search | 不限 | — |
+| `news` | 新闻获取 | web_search, web_fetch, web_fetch_batch, read_file, present_file, ask_clarification | 不限 | — |
+| `bash` | 命令执行 | bash | 3 | — |
+
+五个审查类 agent（security / arch / perf / correctness / design-reviewer）自动配置 `OutputSchema`，要求输出结构化 JSON。前四个用 `ReviewResult`：
 
 ```json
 {
@@ -102,7 +112,7 @@ tools:
 ——白名单无法枚举 MCP 工具名，所以 MCP 需要按 agent 类型显式开启。需要放宽就在
 `.deepai/agents/general-purpose.yaml` 里写 `tools:`。
 
-注意主 agent（REPL）建 agent 时**不声明** `AgentType`：它仍以 `general-purpose` 的 prompt/温度为基线，
+注意主 agent（REPL）建 agent 时**不声明** `AgentType`：它仍以 `general-purpose` 的 prompt 为基线，
 但工具注册表不受白名单裁剪（否则 task / skill / MCP 工具会被剪掉）。只有显式声明了类型的 agent 才按
 白名单收窄——见 `ApplyAgentType`。
 
@@ -118,11 +128,10 @@ tools:
 ## 架构参考
 
 ```
-用户 → REPL → Agent → Subagent(s)
-
-Environment (消息总线)
-  ├── Register(Subscription)   → 订阅角色
-  ├── Publish(AgentMessage)    → 定向/广播
-  ├── Receive(role)            → 阻塞接收
-  └── History(filters...)      → 历史查询
+用户 → REPL → Agent ──task──→ Subagent pool (无本地并发上限，单次 Run 内 task 调用封顶 20)
+                                 ├── agent_type    → profile（prompt / 工具白名单 / 上限 / schema）
+                                 ├── context_files → 父显式传入的 <context-files> 块
+                                 └── 结果          → FinalOutput + subagent_usage / subagent_stats
 ```
+
+子 agent 的工具集恒不含 `task`（委派不可嵌套），子 agent 之间没有通道。

@@ -53,7 +53,9 @@ type SubagentConfig struct {
 	// paths whose contents are read and prepended to the subagent's first
 	// message as a <context-files> block (pkg/agent's SubagentExecutor.Execute).
 	// The parent names files explicitly rather than context being shared
-	// automatically — see docs/ARCHITECTURE_REVIEW.md M2.4.
+	// automatically: this is the lesson from the deleted orchestrator's
+	// blackboard (87772b6), where implicit shared state made it impossible to
+	// tell what any one subagent had actually been told.
 	ContextFiles []string
 	// Skill optionally names a context:fork skill (pkg/skill) to run inside
 	// this subagent — the task tool's `skill` argument, verbatim. Validated

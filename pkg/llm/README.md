@@ -1,71 +1,70 @@
 # llm 包
 
-`llm` 包定义了与后端语言模型（LLM）交互的抽象接口与适配器，项目中使用 `LitellmProvider`（基于 github.com/voocel/litellm）封装 OpenAI 兼容的后端。
+`llm` 定义与后端语言模型交互的抽象接口，并自带两个手写的 HTTP provider——不依赖任何第三方 LLM SDK
+（早前的 eino / litellm 封装已移除）。
 
-功能概览
-- 提供统一的 `LLMProvider` 接口用于发起对话请求或流式响应。
-- 定义跨提供者的请求/响应结构：`ChatRequest`、`ChatResponse`、`StreamChunk`、`Usage`。
- - 内置 `LitellmProvider`：将业务中通用的 `models.Message` 转换为 litellm 的消息格式并调用模型。
+## 结构
 
-主要类型
-- `LLMProvider`：接口，方法 `Chat(ctx, req)` 与 `Stream(ctx, req)`。
-- `ChatRequest`：请求载荷，包含 `Model`、`Messages`、`Tools` 等字段。
-- `ChatResponse`：规范化的响应，包含单条 `models.Message`、`Usage` 与停用原因（`Stop`）。
-- `StreamChunk`：流式增量数据结构，支持部分文本、工具调用、最终消息与错误信息。
+| 文件 | 职责 |
+|---|---|
+| `provider.go` | `LLMProvider` 接口与跨 provider 的请求/响应类型 |
+| `anthropic.go` | Anthropic Messages API（原生请求格式与 SSE 事件流） |
+| `openai_compat.go` | OpenAI 兼容格式，覆盖其余全部 provider |
+| `http.go` | 共用的 HTTP 客户端、超时、重试 |
+| `stream_trace.go` | `DEEPAI_STREAM_TRACE_FILE` 下把原始 SSE 落盘，用于排流式问题 |
+| `registry.go` | provider 解析、`ModelRegistry`（多模型别名 → provider + model） |
+| `unavailable.go` | 构造失败时返回的占位 provider：调用时才报原始错误，启动不 panic |
 
-内置提供者
- - `LitellmProvider`（实现位于 [pkg/llm/eino.go](pkg/llm/eino.go#L1-L400)）
-    - 通过 `NewLitellmProvider(name)` 创建，`name` 支持 `openai`、`siliconflow`、`anthropic` 等（字符串小写比较）。
-    - 使用 `github.com/voocel/litellm` 作为后端客户端。
+## 主要类型
 
-配置（环境变量）
-- `DEFAULT_LLM_PROVIDER`：`NewProvider("")` 时的默认提供者（例如 `openai`）。
-- `DEFAULT_LLM_MODEL`：默认模型名称（例如 `gpt-4.1-mini`）。
-- `OPENAI_API_KEY`：OpenAI API Key（`openai` provider 必需）。
-- `OPENAI_API_BASE_URL`：可选自定义 base URL（用于 OpenAI 兼容网关）。
-- `SILICONFLOW_API_KEY`：SiliconFlow 的 API key（若使用 `siliconflow`）。
-- `ANTHROPIC_API_KEY`：Anthropic 的 API key（若使用 `anthropic`，且需提供兼容网关地址）。
+- `LLMProvider`：`Chat(ctx, req)` 与 `Stream(ctx, req)`。
+- `ChatRequest`：`Model` / `Messages` / `Tools` / `SystemPrompt` / `ReasoningEffort` /
+  `Temperature` / `MaxTokens` / `ImageDetail`，以及可选的 `OnChunk` 回调。
+- `ChatResponse`：规范化响应（单条 `models.Message` + `Usage` + `Stop`）。
+- `StreamChunk`：流式增量。`Progress=true` 的心跳块**不携带任何负载**——它只用来证明长参数累积期间
+  流还活着，避免 `pkg/agent` 的 stream idle watchdog 误杀；发送方必须把其余字段留零值。
+- `ModelRegistry`：把 config.yaml 里的模型别名解析成 provider 实例，按 (provider, baseURL, key 摘要)
+  缓存。
 
-快速示例
+## Provider 与环境变量
+
+`providerDefs` 是唯一的注册表；`kind` 决定走哪个实现。
+
+| name | API key | base URL 覆盖 | kind |
+|---|---|---|---|
+| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | anthropic |
+| `openai` / `openai-compat` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | openai |
+| `qwen` / `gemini` / `groq` / `ollama` / `glm` / `bedrock` / `deepseek` | `<NAME>_API_KEY` | — | openai |
+
+API key 允许以 `pkg/secret` 的密封形式传入（来自 `.env`），`resolveConfig` 里统一 `secret.Reveal`；
+对明文是 no-op。未知 provider 或缺 key 不会让启动失败，而是得到一个 `UnavailableProvider`，在真正
+调用时才报错。
+
+## 快速示例
 
 ```go
-ctx := context.Background()
-provider := llm.NewProvider("openai")
+provider := llm.NewProvider("anthropic")
 
 req := llm.ChatRequest{
-    Model: "gpt-4.1-mini",
-    Messages: []models.Message{{ID: "1", SessionID: "s1", Role: models.RoleHuman, Content: "Hello"}},
+    Model:        "claude-opus-5",
+    SystemPrompt: "You are a helpful assistant.",
+    Messages:     []models.Message{{ID: "1", SessionID: "s1", Role: models.RoleHuman, Content: "Hello"}},
 }
 
 resp, err := provider.Chat(ctx, req)
-if err != nil {
-    // 处理错误
-}
-fmt.Println("reply:", resp.Message.Content)
+if err != nil { /* 处理错误 */ }
+fmt.Println(resp.Message.Content)
 
-// 流式示例
 ch, err := provider.Stream(ctx, req)
-if err != nil {
-    // 处理错误
-}
+if err != nil { /* 处理错误 */ }
 for chunk := range ch {
-    if chunk.Err != nil {
-        // 处理错误
-        break
-    }
-    if chunk.Delta != "" {
+    switch {
+    case chunk.Err != nil:
+        // 处理错误并 break
+    case chunk.Progress:
+        // 心跳，无负载，忽略即可
+    case chunk.Delta != "":
         fmt.Print(chunk.Delta)
     }
 }
 ```
-
-测试
-- 包含的测试文件：[pkg/llm/llm_test.go](pkg/llm/llm_test.go#L1-L200)。
-
-扩展建议
-- 若需支持更多后端，可实现新的 `LLMProvider`（例如直接调用 OpenAI 或 Anthropic 官方 SDK），并在 `registry.go` 中扩展 `NewProvider` 的分发逻辑。
- - 可在 `LitellmProvider` 中加入自定义中间件、度量采集和重试逻辑以提高可靠性。
-
-如需，我可以：
-- 添加更完整的示例程序（`cmd/llm-example`）并把其集成测试加入 `go test`；
-- 或将 README 中的配置项补充为更详细的环境示例。

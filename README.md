@@ -547,7 +547,7 @@ deepai plugin remove my-plugin
 
 插件发现顺序：全局 `~/.deepai/plugins` → 项目 `<cwd>/.deepai/plugins`。
 
-详见 [`docs/PLUGIN_SYSTEM_DESIGN.md`](docs/PLUGIN_SYSTEM_DESIGN.md) 与 [`docs/spec/PLUGIN_INTEGRATION_SPEC.md`](docs/spec/PLUGIN_INTEGRATION_SPEC.md)。
+插件包的加载与命令发现见 [`pkg/claudeplugin/README.md`](pkg/claudeplugin/README.md)，命令文件的写法见 [`docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md`](docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md)。
 
 > 早前基于 `.so`/`.dll` 的原生工具插件加载（`pkg/plugin`）已移除，改用上述 Claude 插件包格式。
 
@@ -581,7 +581,7 @@ DeepAI 是 MCP（Model Context Protocol）客户端，可连接任意外部 MCP 
 
 启动时 DeepAI 会连接所有配置的服务器，调用 `tools/list`，把工具注册到 registry，并在启动报告中汇总状态。
 
-详见 [`docs/spec/MCP_INTEGRATION_SPEC.md`](docs/spec/MCP_INTEGRATION_SPEC.md)。
+详见 [`pkg/mcp/README.md`](pkg/mcp/README.md)。
 
 ---
 
@@ -608,7 +608,7 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 
 记忆与偏好存储复用同一个 SQLite 数据库。
 
-详见 [`docs/PERSONALIZED_AGENT_ROADMAP.md`](docs/PERSONALIZED_AGENT_ROADMAP.md) 与 [`docs/hermes-agent-memory-analysis.md`](docs/hermes-agent-memory-analysis.md)。
+记忆的提取 / 合并 / 回滚链路见 [`docs/REFINE_DESIGN.md`](docs/REFINE_DESIGN.md)。
 
 ---
 
@@ -642,7 +642,7 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 | **T4 对话压缩** | 历史 AI 消息文本与 ToolCall 参数按年龄压缩 | 待校准（配置预留） |
 | **上下文压缩** | 上下文窗口 75% 时自动压缩，保留最近 N 条 | 默认启用（需 `context_window > 0`） |
 
-详见 [`docs/spec/token-efficiency.md`](docs/spec/token-efficiency.md)。
+分层压缩的取舍与实测数据见 [`docs/context-compression-design.md`](docs/context-compression-design.md)。
 
 ---
 
@@ -739,21 +739,21 @@ go run ./cmd/deepai/help -d ./docs/cmd
 
 设计与规格文档位于 [`docs/`](docs/)：
 
-| 文档 | 说明 |
-|------|------|
-| [`INSTALL_AND_RUN.md`](docs/INSTALL_AND_RUN.md) | 安装与运行（注意：部分内容可能过时） |
-| [`WORKFLOW.md`](docs/WORKFLOW.md) | 端到端工作流 |
-| [`MULTI_AGENT.md`](docs/MULTI_AGENT.md) | 多代理概述 |
-| [`AUTONOMOUS_MULTI_AGENT.md`](docs/AUTONOMOUS_MULTI_AGENT.md) | 自主多代理设计 |
-| [`SKILL_DESIGN.md`](docs/SKILL_DESIGN.md) | 技能系统设计 |
-| [`PLUGIN_SYSTEM_DESIGN.md`](docs/PLUGIN_SYSTEM_DESIGN.md) | 插件系统设计 |
-| [`SESSION_DESIGN.md`](docs/SESSION_DESIGN.md) | 会话设计 |
-| [`PERSONALIZED_AGENT_ROADMAP.md`](docs/PERSONALIZED_AGENT_ROADMAP.md) | 个性化代理路线图 |
-| [`CLAUDE_PLUGIN_COMMANDS_GUIDE.md`](docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md) | Claude 插件命令指南 |
-| [`pkg-guide-cn.md`](docs/pkg-guide-cn.md) | 包指南（中文） |
-| [`spec/token-efficiency.md`](docs/spec/token-efficiency.md) | Token 效率规格 |
-| [`spec/MCP_INTEGRATION_SPEC.md`](docs/spec/MCP_INTEGRATION_SPEC.md) | MCP 集成规格 |
-| [`spec/PLUGIN_*.md`](docs/spec/) | 插件相关规格 |
+| 文档 | 说明 | 状态 |
+|------|------|------|
+| [`MULTI_AGENT.md`](docs/MULTI_AGENT.md) | 子 agent 委派、内置角色 profile 一览 | 现状 |
+| [`SUBAGENT_VISIBILITY_DESIGN.md`](docs/SUBAGENT_VISIBILITY_DESIGN.md) | 子代理进度块、任务模式、逐任务取消 | 已实现 |
+| [`ADVERSARIAL_REVIEW_DESIGN.md`](docs/ADVERSARIAL_REVIEW_DESIGN.md) | 编辑后对抗式自审（`review_after_edit`） | 已实现 |
+| [`LONG_TASK_LOOP_DESIGN.md`](docs/LONG_TASK_LOOP_DESIGN.md) | 长任务闭环 `/mission`：设计 → 评审 → 实施 → 评审 | 已实现 |
+| [`REVIEW_EVAL_DESIGN.md`](docs/REVIEW_EVAL_DESIGN.md) | reviewer 的离线评测基线（检出率 / 假阳性率 / 成本） | 设计 |
+| [`AGENT_CAPABILITY_DESIGN.md`](docs/AGENT_CAPABILITY_DESIGN.md) | 角色能力（M5）：可执行知识、产出契约、验证手段 | 设计 |
+| [`SKILL_DESIGN.md`](docs/SKILL_DESIGN.md) | 技能系统设计 | 已实现 |
+| [`CLAUDE_PLUGIN_COMMANDS_GUIDE.md`](docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md) | Claude 风格 slash 命令的编写与安装 | 使用指南 |
+| [`DOCX_TOOLS_DESIGN.md`](docs/DOCX_TOOLS_DESIGN.md) | `.docx` 读取 / 编辑 / 排版工具层 | 已实现 |
+| [`REFINE_DESIGN.md`](docs/REFINE_DESIGN.md) | 记忆 refine：review gate、`/refine`、rollback | 已实现 |
+| [`context-compression-design.md`](docs/context-compression-design.md) | 上下文分层压缩（迟滞阈值、分工具预算、源头防护） | 已实现 |
+| [`PI_HARNESS_ADOPTION_DESIGN.md`](docs/PI_HARNESS_ADOPTION_DESIGN.md) | 吸纳 pi harness 优点的调研与设计 | 草案 |
+| [`AUTONOMOUS_MULTI_AGENT.md`](docs/AUTONOMOUS_MULTI_AGENT.md) | 2026-06 的自治协同评估（§9 编排层已删除，见文首勘误） | 历史 |
 
 ---
 

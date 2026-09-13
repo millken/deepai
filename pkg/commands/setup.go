@@ -49,7 +49,7 @@ type Config struct {
 	// any other non-empty value is used as the output file path. Empty = off.
 	// The DEEPAI_TOKEN_METRICS env var, when set, takes precedence.
 	TokenMetrics string `yaml:"token_metrics,omitempty"`
-	// TokenAging enables T1 tool-result aging (docs/spec/token-efficiency.md):
+	// TokenAging enables T1 tool-result aging:
 	// historical tool results in the outgoing prompt are compressed by age once
 	// context pressure passes 40% of the window. The DEEPAI_TOKEN_AGING env var,
 	// when set, takes precedence.

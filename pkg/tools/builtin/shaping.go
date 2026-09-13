@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// Tool-output pre-shaping defaults (docs/spec/token-efficiency.md §T2). These
+// Tool-output pre-shaping defaults: cap what a tool returns at the source,
+// before it ever enters the context. These
 // are package vars, not constants, so a future ToolShapingConfig can override
 // them; per-call args (start_line/end_line, full, max_results, expand_dirs)
 // remain the recovery path in every case.

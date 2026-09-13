@@ -194,7 +194,5 @@ DEEPAI_DEBUG_FILE=/tmp/deepai.log
 
 - [pkg/memory/](../pkg/memory/) — 记忆系统核心（存储、注入、提取、安全）
 - [pkg/agent/react.go](../pkg/agent/react.go) — Agent 执行逻辑（记忆注入、压缩前保存）
-- [pkg/gateway/](../pkg/gateway/) — HTTP Gateway（记忆接线、user-scope 更新）
 - [pkg/tools/builtin/](../pkg/tools/builtin/) — 内置工具（memory、search 等）
-- [pkg/checkpoint/](../pkg/checkpoint/) — 会话持久化（PostgreSQL）
-- [docs/hermes-agent-memory-analysis.md](../docs/hermes-agent-memory-analysis.md) — 记忆系统设计文档
+- [docs/REFINE_DESIGN.md](../docs/REFINE_DESIGN.md) — 记忆 refine（review gate / `/refine` / rollback）设计

@@ -7,7 +7,8 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
-// Phase 0 measurement framework (docs/spec/token-efficiency.md §6 Phase 0).
+// Token measurement framework — the instrumentation that has to exist before
+// any compression strategy is turned on.
 //
 // The goal is to decide, from real sessions, which token source drives context
 // growth — before enabling any compression strategy. It records two things per
