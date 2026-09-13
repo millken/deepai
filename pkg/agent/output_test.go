@@ -249,9 +249,14 @@ func TestEnumTagIsRejectedByJSONSchemaGo(t *testing.T) {
 // TestNamedSchemasTable is the design §8 revision four (M5-4) rollback
 // requirement: the five non-Strict M5-3 contract schemas (design/
 // requirements/research/analysis/test-report) are gone — they had no real
-// program consumer, only the eval harness reading its own invention — and
-// "review" is the ONLY entry left, matching the four builtin reviewer
-// profiles' existing Strict ReviewResult schema.
+// program consumer, only the eval harness reading its own invention.
+//
+// The surviving entries are exactly the ones a PROGRAM reads: "review"
+// (pkg/chat's post-edit gate parses ReviewResult) and "design_review"
+// (LONG_TASK_LOOP_DESIGN §5.2 — the mission loop's design gate parses
+// scope_files/acceptance out of it to lock the charter). Both are Strict.
+// Adding a third entry means demonstrating the same thing: code reads it,
+// not just another model.
 func TestNamedSchemasTable(t *testing.T) {
 	reviewSchema, ok := namedSchemas["review"]
 	if !ok || reviewSchema == nil {
@@ -261,8 +266,15 @@ func TestNamedSchemasTable(t *testing.T) {
 		t.Error("namedSchemas[\"review\"].Strict = false, want true (matches builtin reviewer profiles)")
 	}
 
-	if len(namedSchemas) != 1 {
-		t.Errorf("namedSchemas has %d entries, want exactly 1 (\"review\" only): %v", len(namedSchemas), namedSchemas)
+	designSchema, ok := namedSchemas["design_review"]
+	if !ok || designSchema == nil {
+		t.Fatal("namedSchemas[\"design_review\"] missing")
+	}
+	if !designSchema.Strict {
+		t.Error("namedSchemas[\"design_review\"].Strict = false, want true — the mission gate parses it")
+	}
+	if len(namedSchemas) != 2 {
+		t.Errorf("namedSchemas has %d entries, want exactly 2 (\"review\" and \"design_review\"): %v", len(namedSchemas), namedSchemas)
 	}
 	for _, removed := range []string{"design", "requirements", "research", "analysis", "test-report"} {
 		if _, ok := namedSchemas[removed]; ok {
