@@ -89,6 +89,26 @@ type ReplConfig struct {
 	ReviewTokenBudget int
 	// ReviewTimeout bounds one review subagent run; 0 uses DefaultReviewTimeout.
 	ReviewTimeout time.Duration
+	// ReviewModel is the model alias every reviewer the GATES dispatch runs
+	// on — the post-edit correctness review, the mission's design review and
+	// its implementation review. Empty (the default) keeps today's behavior:
+	// no model argument is sent, so the agent-type profile's own `model:`
+	// decides, and failing that the main agent's model.
+	//
+	// The point of setting it is that a reviewer sharing the implementer's
+	// model shares its blind spots — the same priors about what an API
+	// guarantees, the same idioms, the same misreading of an edge case. An
+	// adversarial review's whole value is an INDEPENDENT look, and two runs
+	// of one model are less independent than the isolation of context alone
+	// suggests (docs/ADVERSARIAL_REVIEW_DESIGN.md §4.4 isolates the
+	// reasoning; this isolates the reasoner).
+	//
+	// This is NOT the multi-reviewer voting that design §七 defers pending a
+	// detection-rate baseline: it is one reviewer, at the same cost, on a
+	// different model. Validated at startup (validateReviewModel) because an
+	// unresolvable alias would otherwise fail every review the gate ever
+	// runs — and on the design side, stop the mission.
+	ReviewModel string
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// full mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1). Default off, for
@@ -754,6 +774,8 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		r.ui.Info("  " + r.cfg.MCPReport)
 	}
 	r.ui.SetStatus(r.currentModel, r.planMode)
+
+	r.validateReviewModel()
 
 	// Re-attach this session's mission, if it is still active (§5.5). Only
 	// after r.ui exists: this reports the mission and its external-writer

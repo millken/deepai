@@ -617,7 +617,10 @@ mission_on_plan: false   # 缺省关;true 时 enter_plan_mode 升级为任务
 # 设计评审与实施评审共用,不另开键:
 # review_token_budget:  <int, 0/缺省=150000, 负值=不限>
 # review_timeout:       <int 分钟, 0/缺省=10, 与 request_timeout 同一类型>
+# review_model:         <models[] 别名, 缺省空=主模型>  # 见下
 ```
+
+**`review_model`(2026-09-13 补)**:两道门派发 reviewer 时传的模型别名,与编辑后审查共用同一个键。理由与"不另开预算/超时键"同源:同源盲区在设计评审、实施评审、普通编辑后审查是同一个问题。设计评审尤其吃这一条 —— 计划阶段没有编译器去否定任何一方,reviewer 与作者同模型时,作者认为成立的前提 reviewer 多半也认为成立。别名不在注册表时启动时丢弃并警示(一个拼错的别名会让设计评审每次 fail-soft,而设计侧 fail-soft 是"不实施",等于把任务停死)。
 
 只新增一个 bool。不新增 `mission_token_budget` / `mission_timeout`——再写一套 30k / `5m` duration 字符串会:(a) 复述两个已被 `13e883f` 作废的阈值;(b) 给 `Config` 多一条与 `review_timeout int` / `request_timeout int` 不一致的解析面。
 

@@ -83,6 +83,16 @@ type Config struct {
 	// ReviewTimeoutMinutes bounds one review subagent run, in minutes
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
+	// ReviewModel names the model every gate-dispatched reviewer runs on —
+	// a models[] alias, not a provider model name. Empty (the default) runs
+	// them on the main agent's model, which is also the case where the
+	// reviewer inherits the implementer's blind spots: same priors, same
+	// idioms, same misreading of the same edge case. Pointing this at a
+	// different provider's model is the cheapest independence the review
+	// gates can buy — one reviewer, same cost, different reasoner. An alias
+	// the registry does not know is dropped with a warning at startup
+	// rather than failing every review (pkg/chat's validateReviewModel).
+	ReviewModel string `yaml:"review_model,omitempty"`
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// long-task mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1): design →

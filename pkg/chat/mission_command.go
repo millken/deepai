@@ -208,6 +208,7 @@ func (r *ChatRepl) missionStatusText() string {
 			b.WriteString("      - " + f + "\n")
 		}
 	}
+	fmt.Fprintf(&b, "    reviewers run on: %s\n", r.reviewModelLabel())
 	fmt.Fprintf(&b, "    dir: %s", m.dir)
 	return b.String()
 }
