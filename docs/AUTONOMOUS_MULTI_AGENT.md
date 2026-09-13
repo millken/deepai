@@ -1,5 +1,7 @@
 # 自治多 Agent 协同 — 现状评估与设计笔记
 
+> **⚠️ 2026-09 补注**：本文 §9 出现的 `review_model` 是已删除的 orchestrator 自己的配置项。**同名的配置项已于 2026-09-13 在评审门上重新落地**（`review_after_edit` 的编辑后审查 + `/mission` 的两道门，见 [ADVERSARIAL_REVIEW_DESIGN.md](ADVERSARIAL_REVIEW_DESIGN.md) §七-2），语义相同（reviewer 换个模型跑，去同源盲区），但载体是评审门而不是编排层。
+
 > **⚠️ 2026-08 勘误**：§9 描述的 orchestrator（`pkg/orchestrator`、implement_task/design_task/build_task、黑板、多评委投票、`MaxAgentCalls`）已于 `87772b6`（2026-06-09，"实测编排功能不可用"）**整体删除**，§9 全节不再反映现状。另：§3 所述"CLI 并发为 1"现为 4；§4-#7 所述"coder 含 task 可嵌套"不成立（task 恒被剥离，深度封顶 1）。当前路线与最新评估见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。
 
 > 目标场景:**给定一个任务,多个 agent 从讨论/设计开始,经规划、实施、自我验证,直到最终完成,全程无人干预。**

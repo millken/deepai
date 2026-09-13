@@ -265,6 +265,8 @@ review_token_budget: 30000   # 单次审查子代理 token 预算,0 = 不限
 review_timeout: 5m           # 单次审查超时
 ```
 
+> **落地后的实际取值**(以代码为准):`review_token_budget` 缺省 **150_000**、负值不限(`pkg/commands/review_config.go`);`review_timeout` 是 **int 分钟**、缺省 **10**(`chat.DefaultReviewTimeout`)。上面两个数是 `13e883f` 之前的设计原值 —— 30k 会让超预算变成子代理硬错误且 `FinalOutput` 为空,5 分钟会被推理模型的思考时间常规打穿。另新增 `review_model`(§七-2):reviewer 跑哪个模型别名,缺省空 = 主模型。
+
 **`/review` slash command**(`pkg/chat/slashcommands.go` 静态表 + `handleSlashCommand` 派发):手动触发一次审查。无参数时审查当前归因文件集;为空则回退 `git diff --name-only HEAD` 的文件集(手动模式下用户明确要求,卷入自己的改动符合预期)。这让未开启自动审查的用户(默认状态)也能按需审查 —— 首发版本的主要入口。
 
 ### 4.6 UI 呈现
@@ -302,7 +304,7 @@ review_timeout: 5m           # 单次审查超时
 ## 七、非本期的增强方向(记录,不实现)
 
 1. **多审投票**:同一 diff 并发派 2-3 个独立 reviewer,多数 fail 才回注(被删 orchestrator 的 `MajorityReview` 中唯一值得回收的部分)。并发路径**现在就是通的**(r2 终审 N2 补强):池无本地并发上限(`pool.go:25` 注释明确是有意设计,`chat.go:365` `NewSubagentPool(subExecutor, 0)`),且 `task` 工具本身 `ParallelSafe: true`(`tools/subagent.go:48`),同批多个 task 调用即并发执行,无排队惩罚。不进本期的理由是成本与两项设计功课:(a) "多数裁决"阈值需要 §十-3 的检出率/假阳性率基线来标定;(b) 同一处注释同时警示**子代理共享工作树与 git 索引** —— N 个带 bash 的 reviewer 并发跑测试可能在文件系统层互相干扰,且 §4.4 的快照防线在并发审查下无法把树变化归因到某一个 reviewer,防线语义需要重新设计(如并发期间任何树变即全体弃权)。基线建立后为**第一优先增强**。
-2. **跨模型审查**:`review_model` 配置项,用不同提供商的模型做 reviewer,消解同源盲区。管道已支持(`SubagentConfig.Model`),只差配置面。与 #1 组合(N 个不同模型投票)是终态形态。
+2. ~~**跨模型审查**~~ **(已实现,2026-09-13)**:`review_model` 配置项落地,取值是 `models[]` 的**别名**(不是提供商的模型名),由门在派发时作为 `task` 的 `model` 参数传下去;缺省空 = 仍跑主模型。三处门共用这一个键:编辑后 correctness 审查、任务的设计评审、任务的实施评审 —— 同源盲区在这三处是同一个问题,没有理由分成三个键。别名不在注册表里时**启动时丢弃并警示**,不是留着让每次审查都失败(设计评审的 fail-soft 是"不实施",一个拼错的别名会直接把任务停掉)。`/review status` 与 `/mission status` 都会报 reviewer 跑在哪个模型上,未配置时明说"与主 agent 同一模型"——那正是有盲区的那一档。与 #1 组合(N 个不同模型投票)仍是终态形态。
 3. **YAML 自定义 reviewer**:`AgentTypeConfig.OutputSchema` 目前是 `yaml:"-"`,项目自定义 agent 无法进入结构化裁决管道。给 `yamlAgentConfig` 加 `output_schema: review` 枚举字段后,`.deepai/agents/*.yaml` 即可定义领域专属对抗审查者。
 4. **多维度并审**:correctness + security 双 reviewer 并发(同 #1,基础设施已就绪,等基线)。
 5. **PostToolUse hook 派发**:skill 系统声明了 `PreToolUse`/`PostToolUse` 但从未派发(`skill/hooks.go:16-20` vs `executor.go`),接线后可支持"编辑特定 glob 时即刻触发轻量检查"这类更细粒度策略 —— 与本设计正交,不混入。

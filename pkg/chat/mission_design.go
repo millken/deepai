@@ -327,6 +327,13 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget
 	}
+	// Same reviewer model as the implementation gate (§5.7's rule for the
+	// two review knobs: one setting, both gates). A design reviewer sharing
+	// the author's model is if anything worse off than a code reviewer
+	// would be — a plan has no compiler to disagree with either of them.
+	if model := strings.TrimSpace(r.cfg.ReviewModel); model != "" {
+		args["model"] = model
+	}
 
 	// A design reviewer has no bash and only read-only tools, so this
 	// snapshot is a much weaker concern than it is for the correctness

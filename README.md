@@ -147,6 +147,7 @@ token_aging: false                  # true 启用 T1 工具结果老化
 review_after_edit: false            # true 启用编辑后自动对抗式审查
 review_token_budget: 0              # 单次审查 token 预算：0=默认 150000，负值=不限
 review_timeout: 0                   # 单次审查超时（分钟，0=默认 10 分钟）
+review_model: ""                    # reviewer 跑哪个模型（models[] 别名）；空=主模型（同源盲区）
 
 # 长任务闭环（可选，默认关闭；详见 docs/LONG_TASK_LOOP_DESIGN.md）
 mission_on_plan: false              # true 时进入 plan mode 的普通 turn 会升级为 /mission 闭环
@@ -453,6 +454,7 @@ temperature: 0.2
 - **章程锁定**：设计通过时把 `scope_files`/`acceptance` 落盘为 `charter.lock.json`，此后每次请求的尾部注入都带上它 —— 压缩之后依然在。
 - **范围是硬门**：越界文件由代码判定（对照实施相起点快照），不花 reviewer；`*_test.go` 与 `testdata/` 伴生自动在范围内。
 - **只有评审通过才算完成**：空改动是 `idle`，fail-soft 是 `handed_over`，都不会被写成 `done`。
+- **跨模型审查**：`review_model` 指向另一个 `models[]` 别名，设计评审与实施评审都跑在那个模型上，实施仍用主模型。reviewer 与实现者同模型时共享同一批盲区（同样的先验、同样的习惯、同样读错同一个边界），而计划阶段连编译器都没有。别名写错会在启动时被丢弃并警示，不会让每次审查静默失败。`/review status`、`/mission status` 都会报 reviewer 跑在哪个模型上。
 - 状态落在 `.deepai/missions/<id>/`（`brief.md` / `design.md` / `charter.lock.json` / `state.json` / `reviews.jsonl`），`deepai -c` 续接同一会话的活动任务。
 - 命令：`/mission <任务>` 开始、`/mission` 续跑、`/mission status` 查看、`/mission abort` 结束（不回滚已落地的编辑）。
 
