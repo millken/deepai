@@ -148,6 +148,19 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		}
 	}
 
+	// Say WHERE the text diverged when the file has an obvious near-miss.
+	// Without it the model is told only that its string is absent, and the
+	// observed failure mode is retrying the same wrong text: nearly every
+	// real miss is one paraphrased line in the middle of an otherwise exact
+	// block (a comment retyped from memory, a call site "remembered" as
+	// something the file never said), and quoting both sides is what makes
+	// that fixable in one step.
+	if hint := nearestMissHint(content, oldStr); hint != "" {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+			"old_string not found in %s. %s Re-read that range with read_file and copy the file's own text — do not retype it",
+			displayPath, hint,
+		)
+	}
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
 		"old_string not found in %s; send the file's own text: drop the line number prefix that read_file adds (\"12<TAB>\") or grep adds (\"file.go:12: \"), and use real newlines and tabs (not escaped \\n/\\t), then retry edit_file",
 		displayPath,
@@ -521,4 +534,111 @@ func EditFileTool() models.Tool {
 		},
 		Handler: EditFileHandler,
 	}
+}
+
+// nearestMissHint locates the text old_string was probably aiming at and
+// reports the FIRST line where the two diverge, quoting both sides.
+//
+// Every analyzable edit_file miss in this project's own session history was
+// the same shape: the block was anchored correctly and matched exactly for
+// several lines, then one line differed because the model retyped it from
+// memory instead of copying it ("// would panic there rather than in
+// production." for "// would panic there.", errNoProductRow() for
+// sql.ErrNoRows). None of them were quoting problems, which is all the
+// generic error talks about — so the model read the advice, found nothing to
+// fix, and resent the same string.
+//
+// This only ever explains the failure. It never edits the near-miss it
+// found: writing text the caller did not send would be silent corruption
+// dressed up as success.
+func nearestMissHint(content, oldStr string) string {
+	oldLines := strings.Split(strings.TrimSuffix(oldStr, "\n"), "\n")
+	anchorIdx := 0
+	for anchorIdx < len(oldLines) && strings.TrimSpace(oldLines[anchorIdx]) == "" {
+		anchorIdx++
+	}
+	if anchorIdx == len(oldLines) {
+		return ""
+	}
+	anchor := strings.TrimSpace(oldLines[anchorIdx])
+
+	fileLines := strings.Split(content, "\n")
+	best, bestScore := -1, 0.0
+	for i, line := range fileLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == anchor {
+			best, bestScore = i, 1
+			break
+		}
+		if score := diceSimilarity(trimmed, anchor); score > bestScore {
+			best, bestScore = i, score
+		}
+	}
+	// Below this the "nearest" line is not recognizably the same line, and
+	// pointing at it would send the model to the wrong place.
+	if best < 0 || bestScore < 0.7 {
+		return ""
+	}
+
+	start := best - anchorIdx
+	if start < 0 {
+		start = 0
+	}
+	for k, want := range oldLines {
+		var got string
+		atEOF := start+k >= len(fileLines)
+		if !atEOF {
+			got = fileLines[start+k]
+		}
+		// Whitespace-only differences are not what to report: applyEdit's
+		// whitespace-tolerant pass already accepts those, so a miss that
+		// reaches here differs in something that actually matters.
+		if !atEOF && (want == got || normalizeWhitespace(want) == normalizeWhitespace(got)) {
+			continue
+		}
+		if atEOF {
+			return fmt.Sprintf(
+				"The closest text starts at line %d and matches your first %d line(s), then your old_string runs past the end of the file.",
+				start+1, k,
+			)
+		}
+		if k == 0 {
+			return fmt.Sprintf(
+				"The closest line is %d — you sent %q, the file has %q.",
+				start+k+1, want, got,
+			)
+		}
+		return fmt.Sprintf(
+			"The closest text starts at line %d: it matches your first %d line(s), then differs at line %d — you sent %q, the file has %q.",
+			start+1, k, start+k+1, want, got,
+		)
+	}
+	return ""
+}
+
+// diceSimilarity scores two strings by shared adjacent rune pairs (Sørensen-
+// Dice), in [0,1]. Cheap, order-aware enough to tell "the same line, retyped"
+// from "a different line", and it degrades gracefully on CJK text, where
+// whole-word tokenization would not.
+func diceSimilarity(a, b string) float64 {
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) < 2 || len(rb) < 2 {
+		if a == b {
+			return 1
+		}
+		return 0
+	}
+	counts := make(map[[2]rune]int, len(ra))
+	for i := 0; i+1 < len(ra); i++ {
+		counts[[2]rune{ra[i], ra[i+1]}]++
+	}
+	shared := 0
+	for i := 0; i+1 < len(rb); i++ {
+		key := [2]rune{rb[i], rb[i+1]}
+		if counts[key] > 0 {
+			counts[key]--
+			shared++
+		}
+	}
+	return 2 * float64(shared) / float64(len(ra)-1+len(rb)-1)
 }
