@@ -274,6 +274,13 @@ const DefaultReviewTimeout = 10 * time.Minute
 // 20 covers reading every hunk's surroundings plus a build/test to
 // substantiate a charge, for the change sizes rung (a) admits at all.
 //
+// pkg/agent's defaultReviewerMaxToolCalls is deliberately the same number —
+// the two review routes had no reason to differ — but it is a SEPARATE
+// constant, not an alias: this one is sized against the input the rungs above
+// admit, that one is the fallback for a reviewer the model dispatches with no
+// budget of its own. If one of those justifications changes, only that one
+// moves.
+//
 // Known trade-off: pkg/agent's schema-validation retry gives a retry only the
 // REMAINING tool-call budget and skips the retry entirely when none is left
 // (subagent.go), so a reviewer that both exhausts this cap AND then emits

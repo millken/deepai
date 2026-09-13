@@ -328,3 +328,17 @@ func builtinFileToolsForTest() []models.Tool {
 		},
 	}}
 }
+
+// The delegation prompt tells the model to fan out whenever sub-tasks are
+// independent, and for a while said nothing about how MANY. Two uncapped
+// reviewers on a three-file diff is "independent" by that rule, and the turn
+// then ends only when the slower one does. The width of a fan-out has to be a
+// function of the size of the work.
+func TestDelegationStrategy_TiesFanOutWidthToChangeSize(t *testing.T) {
+	if !strings.Contains(delegationStrategy, "ONE reviewer") {
+		t.Errorf("delegationStrategy does not bound review fan-out by change size:\n%s", delegationStrategy)
+	}
+	if !strings.Contains(delegationStrategy, "SLOWEST") {
+		t.Errorf("delegationStrategy does not say a fan-out costs the slowest member's wall clock:\n%s", delegationStrategy)
+	}
+}

@@ -115,3 +115,54 @@ func TestSubagentDetail_StallHint(t *testing.T) {
 		}
 	})
 }
+
+// A subagent that ran out of wall clock still returns an answer — pkg/agent
+// winds it down gracefully rather than killing it (react.go's
+// shouldTriggerWallClockWrapUp), so the pool reports task_completed and the
+// line reads "完成", identical to a run that finished on its own terms. That
+// matters now that interactive subagents carry a default deadline: a review
+// verdict written under a forced wrap-up covers less than one that wasn't,
+// and the user has no way to tell unless the line says so.
+func TestSubagentDetail_CompletedUnderDeadlineSaysSo(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"wall clock", "deadline", "超时收尾"},
+		{"tool budget", "tool_budget", "预算用尽"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTUIModel(BannerInfo{Model: "test"})
+			startTask(m, "A", "Adversarial correctness review", "correctness-reviewer")
+
+			m.handleSubagentEvent(subagent.TaskEvent{
+				Type:            "task_completed",
+				TaskID:          "A",
+				Description:     "Adversarial correctness review",
+				WoundDownReason: tc.reason,
+			})
+
+			view := m.View().Content
+			if !strings.Contains(view, tc.want) {
+				t.Fatalf("a wound-down completion must say why (%q):\n%s", tc.want, view)
+			}
+		})
+	}
+}
+
+// The ordinary completion must stay clean — no parenthetical on a task that
+// simply finished.
+func TestSubagentDetail_CleanCompletionHasNoWindDownNote(t *testing.T) {
+	m := newTUIModel(BannerInfo{Model: "test"})
+	startTask(m, "A", "Adversarial correctness review", "correctness-reviewer")
+
+	m.handleSubagentEvent(subagent.TaskEvent{
+		Type: "task_completed", TaskID: "A", Description: "Adversarial correctness review",
+	})
+
+	view := m.View().Content
+	if strings.Contains(view, "超时收尾") || strings.Contains(view, "预算用尽") {
+		t.Fatalf("a clean completion must not claim it was wound down:\n%s", view)
+	}
+}

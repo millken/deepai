@@ -98,7 +98,51 @@ func TestCorrectnessReviewerProfile(t *testing.T) {
 	if !hasBash {
 		t.Fatal("correctness-reviewer needs bash to substantiate charges by running tests")
 	}
-	if cfg.SystemPrompt == "" || cfg.MaxToolCalls != 0 {
+	// MaxToolCalls is defaultReviewerMaxToolCalls, not 0: see
+	// TestReviewerProfiles_CarryAToolCallCap for why the profile stopped being
+	// uncapped.
+	if cfg.SystemPrompt == "" || cfg.MaxToolCalls != defaultReviewerMaxToolCalls {
 		t.Fatalf("unexpected profile: prompt empty=%v maxToolCalls=%d", cfg.SystemPrompt == "", cfg.MaxToolCalls)
+	}
+}
+
+// TestReviewerProfiles_CarryAToolCallCap: a reviewer the MODEL dispatches used
+// to run uncapped. The profiles were left that way on the stated grounds that
+// "only the gate races a wall clock" — true when the interactive pool had no
+// deadline at all. It no longer is: pkg/commands now builds that pool with
+// defaultSubagentTimeout, so a model-dispatched reviewer races a clock too,
+// and an uncapped one meets it with nothing to show.
+//
+// The cap is the recoverable bound, exactly as it is for the gate: exhausting
+// it forces a tool-less wrap-up that must still satisfy the Strict schema, so
+// a reviewer that ran out of room still returns a verdict for what it did
+// examine. An explicit max_tool_calls from the caller still wins
+// (resolveMaxToolCalls), which is how the gate keeps setting its own.
+func TestReviewerProfiles_CarryAToolCallCap(t *testing.T) {
+	for _, at := range []AgentType{
+		AgentTypeCorrectnessReviewer,
+		AgentTypeSecurityReviewer,
+		AgentTypeArchReviewer,
+		AgentTypePerfReviewer,
+	} {
+		cfg := GetAgentTypeConfig(at)
+		if cfg.MaxToolCalls != defaultReviewerMaxToolCalls {
+			t.Errorf("%s MaxToolCalls = %d, want %d — an uncapped reviewer under a wall clock delivers nothing when the clock wins",
+				at, cfg.MaxToolCalls, defaultReviewerMaxToolCalls)
+		}
+		if cfg.OutputSchema == nil || !cfg.OutputSchema.Strict {
+			t.Errorf("%s has no Strict OutputSchema; the cap only degrades into a verdict because one forces the wrap-up to emit JSON", at)
+		}
+	}
+}
+
+// The caller's explicit budget still outranks the profile's, so the gate's own
+// reviewMaxToolCalls keeps deciding on the gate's path.
+func TestReviewerProfileCap_YieldsToAnExplicitCallerBudget(t *testing.T) {
+	if got := resolveMaxToolCalls(7, defaultReviewerMaxToolCalls); got != 7 {
+		t.Fatalf("resolveMaxToolCalls(7, profile) = %d, want the caller's 7", got)
+	}
+	if got := resolveMaxToolCalls(0, defaultReviewerMaxToolCalls); got != defaultReviewerMaxToolCalls {
+		t.Fatalf("resolveMaxToolCalls(0, profile) = %d, want the profile's %d", got, defaultReviewerMaxToolCalls)
 	}
 }

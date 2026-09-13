@@ -47,6 +47,18 @@ func NewPool(executor Executor, cfg PoolConfig) *Pool {
 	}
 }
 
+// DefaultTimeout is the pool-wide per-task deadline a task inherits when its
+// own SubagentConfig.Timeout is unset. Exported so the composition root's
+// wiring can be asserted on: a pool left at 0 hands its executor a
+// deadline-free ctx, which silently disables pkg/agent's graceful wall-clock
+// wind-down (that path reads ctx.Deadline() and nothing else).
+func (p *Pool) DefaultTimeout() time.Duration {
+	if p == nil {
+		return 0
+	}
+	return p.cfg.Timeout
+}
+
 func (p *Pool) StartTask(ctx context.Context, description, prompt string, cfg SubagentConfig) (*Task, error) {
 	if p == nil {
 		return nil, errors.New("subagent pool is nil")
@@ -171,9 +183,30 @@ func (p *Pool) runTask(parentCtx context.Context, task *Task) {
 		Message:     "task started",
 	})
 
+	// Deadline precedence, tightest-intent first:
+	//   1. task.Config.Timeout — this caller bounded THIS task explicitly.
+	//   2. a deadline parentCtx already carries — this caller bounded the
+	//      work by wrapping the ctx instead. The review gate does exactly
+	//      that (pkg/chat/review.go wraps with config.yaml's review_timeout),
+	//      so applying the pool default on top would cap the gate at the
+	//      pool's number and make raising review_timeout past it a no-op —
+	//      while the gate's own timeout message tells the user to raise it.
+	//   3. p.cfg.Timeout — the default, for a caller that bounded nothing.
+	//      This is the interactive REPL case: its turn ctx is a plain
+	//      WithCancel, so before the default existed every dispatched
+	//      subagent ran with no deadline at all, which also meant pkg/agent's
+	//      graceful wall-clock wind-down (it reads ctx.Deadline()) could
+	//      never fire for one.
+	//
+	// Note the tradeoff in 2: a caller that wraps a very loose deadline keeps
+	// it and opts out of the default. That is the intended reading of "the
+	// caller already decided", and such a caller can still ask for a tighter
+	// bound through task.Config.Timeout.
 	timeout := task.Config.Timeout
 	if timeout <= 0 {
-		timeout = p.cfg.Timeout
+		if _, parentBounded := parentCtx.Deadline(); !parentBounded {
+			timeout = p.cfg.Timeout
+		}
 	}
 	// timeout <= 0 (no task- or pool-level deadline configured): run under
 	// the parent ctx directly — lifetime is the parent run's lifetime.
@@ -247,6 +280,12 @@ func (p *Pool) finishTask(ctx context.Context, task *Task, status TaskStatus, re
 		Description: task.Description,
 		Result:      result,
 	}
+	// Carry WHY a run stopped early onto the terminal event. Without it a
+	// wound-down run is indistinguishable from a clean one at the UI: both
+	// arrive as task_completed with a result attached.
+	if stats != nil && stats.BudgetExhausted {
+		event.WoundDownReason = stats.WoundDownReason
+	}
 
 	switch status {
 	case TaskStatusCompleted:
@@ -317,9 +356,12 @@ func (p *Pool) resolveConfig(cfg SubagentConfig) SubagentConfig {
 	if resolved.TokenBudget < 0 {
 		resolved.TokenBudget = 0
 	}
-	if resolved.Timeout <= 0 {
-		resolved.Timeout = p.cfg.Timeout
-	}
+	// Timeout is deliberately NOT defaulted here, unlike the fields above.
+	// Stamping the pool-wide default into the task's own config would erase
+	// the distinction runTask needs — "this caller named a deadline for this
+	// task" vs "nobody did" — and the second case has to lose to a deadline
+	// the parent ctx already carries. Zero means unset, exactly like
+	// MaxToolCalls; runTask resolves the effective deadline.
 	return resolved
 }
 

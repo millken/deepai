@@ -34,6 +34,15 @@ type TaskEvent struct {
 	ToolName   string `json:"tool_name,omitempty"`
 	ToolArgs   string `json:"tool_args,omitempty"`
 	ToolStatus string `json:"tool_status,omitempty"`
+	// WoundDownReason is set on a terminal event when the subagent was forced
+	// into a graceful wrap-up rather than finishing on its own terms: the
+	// wall-clock deadline came due ("deadline") or the tool-call budget ran
+	// out ("tool_budget"). Mirrors RunStats.WoundDownReason, and is empty
+	// otherwise. A wound-down run still reports task_completed and still
+	// returns an answer — a UI that ignores this field shows that answer as
+	// an ordinary success, which is exactly what it looked like before the
+	// field existed.
+	WoundDownReason string `json:"wound_down_reason,omitempty"`
 	// DurationMS is this tool call's duration; ToolCalls and Tokens are the
 	// subagent's running totals, not per-event deltas.
 	DurationMS int64 `json:"duration_ms,omitempty"`

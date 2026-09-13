@@ -223,6 +223,17 @@ const (
 		"mixing someone else's unreviewed changes with yours in the same file."
 )
 
+// defaultReviewerMaxToolCalls is the workload bound every reviewer profile
+// carries when its caller names none. 20 is pkg/chat's reviewMaxToolCalls,
+// the value the review gate has been running with: enough to read every
+// hunk's surroundings plus a build or test to substantiate a charge. Kept
+// equal on purpose — the two review routes (the gate's own reviewer and one
+// the model dispatches itself) had no reason to differ, and did only because
+// one of them was never bounded. They stay SEPARATE constants rather than one
+// aliasing the other: the gate's is sized against the input its degradation
+// rungs admit, this one is the fallback when a caller names no budget at all.
+const defaultReviewerMaxToolCalls = 20
+
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 	AgentTypeGeneral: {
 		Type:         AgentTypeGeneral,
@@ -277,19 +288,36 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		DefaultTools: []string{"read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "find", "code_map", "present_file", "ask_clarification"},
 		MaxToolCalls: 0,
 	},
-	// The three reviewer profiles deliberately set MaxToolCalls 0 (no cap —
-	// same rationale as the global default): a fixed cap cannot fit both a
-	// two-file glance and a whole-repo review, and their Strict OutputSchema
-	// already forces them to stop and emit JSON. Contrast bash (3: a bounded
+	// The reviewer profiles carry defaultReviewerMaxToolCalls. They used to
+	// set 0 (no cap), on the reasoning that a fixed cap cannot fit both a
+	// two-file glance and a whole-repo review and that the Strict
+	// OutputSchema already forces a stop. The first half of that held only
+	// while an uncapped reviewer had nothing to race: the interactive
+	// subagent pool now carries a default deadline (pkg/commands'
+	// defaultSubagentTimeout), so an uncapped reviewer browses until the
+	// clock decides, and the size of what it examined becomes a function of
+	// how slow the model was that day.
+	//
+	// A cap is the better bound because exhausting it is RECOVERABLE where
+	// meeting a deadline barely is: react.go turns the last call into a
+	// forced tool-less wrap-up that must still satisfy the Strict schema, so
+	// the caller gets a real verdict for the part of the change the reviewer
+	// did cover. This is the same argument pkg/chat's reviewMaxToolCalls
+	// already makes for the gate's own dispatch; the profiles now make it on
+	// the route the MODEL dispatches, which had no bound at all.
+	//
+	// An explicit max_tool_calls from the caller still outranks this
+	// (resolveMaxToolCalls), so a caller that really does want a whole-repo
+	// read-through asks for one. Contrast bash (3: a bounded
 	// command-execution errand) and document-editor (30: tuned per docx
-	// chunk) below, which keep deliberate caps.
+	// chunk) below, which keep deliberate caps of their own.
 	AgentTypeSecurityReviewer: {
 		Type:         AgentTypeSecurityReviewer,
 		Name:         "Security Reviewer",
 		Description:  "Use when a diff touches inputs, auth, secrets or crypto; delivers exploit paths. Not for logic bugs.",
 		SystemPrompt: securityReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
-		MaxToolCalls: 0,
+		MaxToolCalls: defaultReviewerMaxToolCalls,
 	},
 	AgentTypeArchReviewer: {
 		Type:         AgentTypeArchReviewer,
@@ -297,7 +325,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Use when a diff adds abstractions or crosses modules; delivers coupling issues. Not for logic bugs.",
 		SystemPrompt: archReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map"},
-		MaxToolCalls: 0,
+		MaxToolCalls: defaultReviewerMaxToolCalls,
 	},
 	AgentTypePerfReviewer: {
 		Type:         AgentTypePerfReviewer,
@@ -305,7 +333,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		Description:  "Use when a diff touches hot paths, loops, allocs or I/O; delivers cost issues. Not for logic bugs.",
 		SystemPrompt: perfReviewerSystemPrompt,
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
-		MaxToolCalls: 0,
+		MaxToolCalls: defaultReviewerMaxToolCalls,
 	},
 	AgentTypeCorrectnessReviewer: {
 		Type:         AgentTypeCorrectnessReviewer,
@@ -317,7 +345,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		// bash is unsandboxed (ExecDirect), so the review gate's worktree
 		// snapshot is the only hard line against reviewer writes.
 		DefaultTools: []string{"read_file", "grep", "glob", "list_dir", "find", "code_map", "bash"},
-		MaxToolCalls: 0,
+		MaxToolCalls: defaultReviewerMaxToolCalls,
 		Temperature:  0.2,
 	},
 	AgentTypeProductManager: {

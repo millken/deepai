@@ -351,10 +351,15 @@ type subagentTaskLine struct {
 	// Message must still render.
 	lastMessage string
 	// status is "" while running, else "done" / "failed" / "cancelled".
-	status   string
-	endNote  string // error text or completion description
-	history  []subagentHistoryEntry
-	expanded bool
+	status string
+	// woundDown is TaskEvent.WoundDownReason: non-empty when this task was
+	// forced into a graceful wrap-up (the wall clock or the tool budget) and
+	// so answered with less than it set out to cover. A wound-down run still
+	// reports "done", so without this the line reads the same as a clean one.
+	woundDown string
+	endNote   string // error text or completion description
+	history   []subagentHistoryEntry
+	expanded  bool
 }
 
 // subagentHistoryEntry is one tool the subagent ran.
@@ -949,6 +954,7 @@ func (m *tuiModel) handleSubagentEvent(evt subagent.TaskEvent) tea.Cmd {
 		if desc == "" {
 			desc = "done"
 		}
+		m.setSubagentWoundDown(evt.TaskID, evt.WoundDownReason)
 		m.resolveSubagentLine(evt.TaskID, "done", desc)
 		return nil
 	case "task_timed_out":
@@ -1124,6 +1130,39 @@ func (m *tuiModel) resolveSubagentLine(taskID, status, note string) {
 	}
 }
 
+// setSubagentWoundDown records why a task stopped early, before
+// resolveSubagentLine marks it done. Separate from resolveSubagentLine because
+// only a completion carries a reason — a failed or cancelled task already
+// explains itself through endNote.
+func (m *tuiModel) setSubagentWoundDown(taskID, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		return
+	}
+	for i := range m.subagentTasks {
+		if m.subagentTasks[i].taskID == taskID {
+			m.subagentTasks[i].woundDown = reason
+			return
+		}
+	}
+}
+
+// subagentWindDownNote renders the parenthetical for a forced wrap-up. An
+// unrecognized reason still renders (verbatim) rather than being swallowed:
+// the set lives in pkg/agent, and a new member silently reading as a clean
+// completion is the failure this whole field exists to prevent.
+func subagentWindDownNote(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "":
+		return ""
+	case "deadline":
+		return "\uff08\u8d85\u65f6\u6536\u5c3e\uff09"
+	case "tool_budget":
+		return "\uff08\u9884\u7b97\u7528\u5c3d\uff09"
+	default:
+		return "\uff08" + reason + "\uff09"
+	}
+}
+
 // subagentSummaryBlock renders the finished fan-out for scrollback. Returns ""
 // when there is nothing to report, so a turn without subagents commits nothing.
 func (m *tuiModel) subagentSummaryBlock() string {
@@ -1196,7 +1235,7 @@ func subagentDetailLine(t subagentTaskLine, now time.Time, gutter string) string
 	case t.status == "done":
 		// endNote is the task's own description for a completed task; echoing
 		// it directly under the head line just prints it twice.
-		parts = append(parts, "\u5b8c\u6210")
+		parts = append(parts, "\u5b8c\u6210"+subagentWindDownNote(t.woundDown))
 	case t.status != "" && t.endNote != "":
 		parts = append(parts, t.endNote)
 	case t.status != "":

@@ -234,7 +234,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		slog.Warn("skill load issue", "source", w.Source, "dir", w.Dir, "err", w.Msg)
 	}
 
-	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts, skillReg)
+	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts, skillReg, resolveSubagentTimeout(cfg.SubagentTimeoutMinutes))
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -383,7 +383,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 // registerChatTools returns the subagent pool so the REPL can cancel a single
 // task from the UI; the pool is created here because this is where the tool
 // registry is assembled.
-func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry) *subagent.Pool {
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry, subagentTimeout time.Duration) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
@@ -399,7 +399,12 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 		WithTemperature(temperature).
 		WithPluginAgentDirs(pluginAgentDirs).
 		WithSkillRegistry(skillReg)
-	subPool := agent.NewSubagentPool(subExecutor, 0)
+	// subagentTimeout (0 = none) is what gives the dispatched agent's ctx a
+	// deadline, which is the ONLY input pkg/agent's graceful wall-clock
+	// wind-down reads. Passing 0 here — as this call did — left every
+	// interactive subagent unbounded: a parallel review fan-out ended only
+	// when its slowest member finished on its own.
+	subPool := agent.NewSubagentPool(subExecutor, subagentTimeout)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))
 

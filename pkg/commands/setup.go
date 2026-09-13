@@ -84,6 +84,12 @@ type Config struct {
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
 
+	// SubagentTimeoutMinutes bounds every subagent the model dispatches with
+	// the task tool, in minutes (matching RequestTimeout's unit). 0 or absent
+	// = defaultSubagentTimeout; negative = no deadline, the behaviour before
+	// the knob existed. Always read through resolveSubagentTimeout.
+	SubagentTimeoutMinutes int `yaml:"subagent_timeout,omitempty"`
+
 	// Models defines multiple named model entries for multi-model support.
 	// Each entry binds an alias to a provider+model pair. When non-empty, the
 	// /model command can switch between them and subagents can select per-task.

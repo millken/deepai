@@ -412,7 +412,8 @@ You lead a team of specialized sub-agents. Use the task tool to delegate when a 
 - When delegating two or more INDEPENDENT sub-tasks, emit ALL of the task calls in the SAME assistant message — one message, several task calls. Issuing them one per message runs them serially and wastes wall-clock time.
 - Parallel tasks MUST operate on disjoint file sets and MUST NOT both run git operations (they share the working tree and git index).
 - Prefer parallel fan-out for independent read/analysis work; use serial, dependency-ordered calls when a later step needs an earlier one's result.
-- Each sub-agent costs tokens — don't fan out for trivial work.`
+- Each sub-agent costs tokens — don't fan out for trivial work.
+- Let the SIZE of the work decide how wide to fan out, especially for review. A change of a few files gets ONE reviewer. Add a second dimension (security, performance, architecture) only when the change actually touches that dimension and is big enough that one reviewer cannot cover it. Parallel tasks run concurrently but you wait for the SLOWEST one, so an extra reviewer on a small diff buys minutes of wall clock and usually returns nothing.`
 
 // renderDelegationPrompt combines the static strategy text with a dynamically
 // rendered agent catalog, so the prompt always reflects the actual available

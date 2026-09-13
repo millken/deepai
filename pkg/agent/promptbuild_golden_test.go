@@ -102,6 +102,11 @@ func buildGoldenNonInteractiveBashOnly() string {
 	return a.BuildSystemPrompt()
 }
 
+// Golden values move only when the prompt TEXT is deliberately changed, never
+// as a side effect of restructuring how it is assembled. Last moved: the
+// "Parallel delegation" section gained the rule tying fan-out width to the
+// size of the change (+447 bytes on both delegation-carrying cases;
+// nonInteractive_bash_only carries no delegation section and is unchanged).
 func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -112,8 +117,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "interactive_full_with_delegation",
 			build:    buildGoldenInteractiveWithDelegation,
-			wantLen:  4787,
-			wantHash: "2ce4f901021133ebe149173039508e120a8bb1f605f7a624d32f8e68965cb9d1",
+			wantLen:  5234,
+			wantHash: "c030cd97a8f6d5074b748ba07c7511f894a32a307ba5a0dd3721f79c538ee3a7",
 		},
 		{
 			name:     "nonInteractive_bash_only",
@@ -124,8 +129,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "all_gates_on",
 			build:    buildGoldenAllGatesOn,
-			wantLen:  5559,
-			wantHash: "b7135ca3ae6fc91e6df7000e45c87d895e14119eba0e53c2079978b78bd38eda",
+			wantLen:  6006,
+			wantHash: "c21387ae21878035681867ec07cdc1b3b605ace10e2c43a6fdaae2dddc4327d8",
 		},
 	}
 	for _, c := range cases {

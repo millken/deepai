@@ -30,7 +30,7 @@ func (stubProvider) Stream(ctx context.Context, req llm.ChatRequest) (<-chan llm
 func TestRegisterChatTools_RegistersDocxTools(t *testing.T) {
 	registry := tools.NewRegistry()
 	modelRegistry := llm.NewSingleModelRegistry("test", "test-model", "")
-	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil)
+	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil, defaultSubagentTimeout)
 
 	read := registry.Get("docx_read")
 	if read == nil {
@@ -63,7 +63,7 @@ func TestRegisterChatTools_RegistersDocxTools(t *testing.T) {
 func TestRegisterChatTools_RegistersTodoWrite(t *testing.T) {
 	registry := tools.NewRegistry()
 	modelRegistry := llm.NewSingleModelRegistry("test", "test-model", "")
-	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil)
+	registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil, defaultSubagentTimeout)
 
 	todoWrite := registry.Get("todo_write")
 	if todoWrite == nil {
