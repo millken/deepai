@@ -3,6 +3,7 @@ package agent
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/millken/deepai/pkg/models"
 	builtin "github.com/millken/deepai/pkg/tools/builtin"
@@ -74,6 +75,23 @@ type SessionCarry struct {
 	// path on the Run goroutine — covered by the same single-goroutine
 	// contract as every other field on this struct.
 	editedFiles map[string]struct{}
+
+	// missionCharter is the rendered, read-only charter text of the mission
+	// currently running in this conversation (pkg/chat's mission loop,
+	// docs/LONG_TASK_LOOP_DESIGN.md §5.3), or "" when none is. It is carried
+	// here — rather than appended to the message history once — because the
+	// history is exactly what compaction is allowed to summarize away, and a
+	// long mission's whole failure mode is the agent quietly reverting to
+	// "what the conversation lately talked about" (D1/D7). Riding the
+	// trailing per-request injection instead means the charter is present in
+	// every request the mission ever makes, including the ones after a
+	// compaction, and it costs the prompt prefix nothing because the
+	// injection is already the last message (see appendTurnInjection).
+	//
+	// Written only by the REPL (mission start, charter lock, escalation,
+	// leaveMission), under the same single-goroutine contract as every other
+	// field here.
+	missionCharter string
 }
 
 // NewSessionCarry returns a zero-value SessionCarry, ready to be passed as
@@ -173,4 +191,26 @@ func (a *Agent) recordEditedFile(call models.ToolCall, result models.ToolResult)
 		path = abs
 	}
 	a.session.RecordEditedFile(path)
+}
+
+// SetMissionCharter sets (or, with "", clears) the rendered mission charter
+// carried into every request's trailing injection. Clearing is as
+// load-bearing as setting: a charter left on the carry after a mission ends
+// keeps instructing ordinary turns to stay inside a scope that no longer
+// applies, which is why leaveMission clears it on EVERY terminal status and
+// an escalation clears it the moment the charter it describes is archived.
+func (s *SessionCarry) SetMissionCharter(text string) {
+	if s == nil {
+		return
+	}
+	s.missionCharter = strings.TrimSpace(text)
+}
+
+// MissionCharter returns the carried charter text, or "" when no mission is
+// active in this conversation.
+func (s *SessionCarry) MissionCharter() string {
+	if s == nil {
+		return ""
+	}
+	return s.missionCharter
 }

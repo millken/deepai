@@ -197,6 +197,9 @@ type Agent struct {
 	fullTools *tools.Registry // saved full tool set, restored on exit
 	workDir   string          // working directory for plan files
 	planFile  string          // path to the current plan file
+	// deferPlanApproval routes exit_plan_mode's approval decision to a gate
+	// instead of the user (AgentConfig.DeferPlanApproval).
+	deferPlanApproval bool
 
 	// offloadDir is where tool results exceeding offloadThresholdBytes are
 	// written to disk. Empty = offload disabled.
@@ -324,7 +327,13 @@ func New(cfg AgentConfig) *Agent {
 		// Registering into it directly would leak this agent's plan tools
 		// (bound via closure to this agent) into every other agent sharing it.
 		a.tools = a.tools.Clone()
-		a.registerPlanTools()
+		// A pinned plan file must be in place BEFORE enterPlanMode, which
+		// only opens a timestamped one when none is set (see initPlanFile).
+		a.planFile = cfg.PlanFile
+		a.deferPlanApproval = cfg.DeferPlanApproval
+		if !cfg.DisableEnterPlan {
+			a.registerPlanTools()
+		}
 
 		// Start in plan mode if requested (e.g. user typed /plan).
 		if cfg.PlanMode {
