@@ -27,6 +27,12 @@ func (m *tuiModel) renderToolDiff(name string, args, data map[string]any) string
 	switch name {
 	case "edit_file":
 		oldStr, _ := args["old_string"].(string)
+		if oldStr == "" {
+			// Hash mode sends no old text in the arguments; the handler returns
+			// the replaced region in Data["old_text"]. Without this the diff
+			// renders as pure additions — not what happened on disk.
+			oldStr, _ = data["old_text"].(string)
+		}
 		newStr, _ := args["new_string"].(string)
 		return m.diffBlock(path, lineDiff(diffSplit(oldStr), diffSplit(newStr)), startLine)
 	case "write_file":

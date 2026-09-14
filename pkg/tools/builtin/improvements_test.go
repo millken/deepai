@@ -101,7 +101,9 @@ func TestReadFileHandler_LineRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "2\tb\n3\tc\n4\td\n"
+	// Hashline prefix: "N:hhhhhh<TAB>content" (hex is FNV-1a 64 low 24 bits of
+	// the line body, computed independently of lineHash to keep the golden real).
+	want := "2:01f1a5\tb\n3:01eff2\tc\n4:01e773\td\n"
 	if res.Content != want {
 		t.Fatalf("got %q want %q", res.Content, want)
 	}
@@ -122,7 +124,7 @@ func TestReadFileHandler_LineNumbersOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Content != "1\tx\n2\ty\n" {
+	if res.Content != "1:021707\tx\n2:021554\ty\n" {
 		t.Fatalf("got %q", res.Content)
 	}
 }
@@ -143,7 +145,7 @@ func TestReadFileHandler_ReversedOutOfRangeLineRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Content != "2\tb\n3\tc\n4\td\n5\te\n" {
+	if res.Content != "2:01f1a5\tb\n3:01eff2\tc\n4:01e773\td\n5:01e5c0\te\n" {
 		t.Fatalf("got %q", res.Content)
 	}
 }

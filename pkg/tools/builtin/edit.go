@@ -11,21 +11,47 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
-// EditFileHandler replaces an exact substring in a file. To make it tolerant
-// of common AI failure modes (tab vs space, CRLF vs LF, collapsed whitespace
-// runs, pasted-back line numbers), the handler retries with normalized
-// matching when the literal match fails. Optional start_line/end_line confine
-// the search — and therefore the uniqueness check and replace_all — to a line
+// EditFileHandler replaces text in a file, in one of two modes. Hash mode
+// (start_hash/end_hash copied from read_file's "N:hhhhhh" prefixes) replaces
+// an inclusive line range without restating the old text — see hashline.go.
+// old_string mode replaces an exact substring; to make it tolerant of common
+// AI failure modes (tab vs space, CRLF vs LF, collapsed whitespace runs,
+// pasted-back line numbers), the handler retries with normalized matching
+// when the literal match fails. Optional start_line/end_line confine the
+// search — and therefore the uniqueness check and replace_all — to a line
 // window, which is the cheap way to disambiguate short repeated snippets.
 func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
 	args := call.Arguments
 	path, _ := args["path"].(string)
-	oldStr, _ := args["old_string"].(string)
-	newStr, _ := args["new_string"].(string)
 
 	if strings.TrimSpace(path) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("path is required")
 	}
+	// A missing key is not an empty string: in hash mode "" means "delete the
+	// range", so a model that forgot new_string must get an error, not a
+	// silent deletion.
+	newRaw, hasNew := args["new_string"]
+	newStr, newIsString := newRaw.(string)
+	if !hasNew || !newIsString {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("new_string is required (pass an empty string to delete the range)")
+	}
+
+	displayPath := strings.TrimSpace(path)
+	path = resolveWritablePath(ctx, path)
+
+	// Mode dispatch runs before the old_string checks: in hash mode
+	// old_string is not needed (and ignored if sent), as is replace_all —
+	// a hash range means "this one place".
+	startHashArg, _ := args["start_hash"].(string)
+	endHashArg, _ := args["end_hash"].(string)
+	if strings.TrimSpace(startHashArg) != "" {
+		return editByHashRange(ctx, call, path, displayPath, startHashArg, endHashArg, newStr)
+	}
+	if strings.TrimSpace(endHashArg) != "" {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("end_hash without start_hash; set start_hash (copy the N:hhhhhh prefix)")
+	}
+
+	oldStr, _ := args["old_string"].(string)
 	if oldStr == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string is required")
 	}
@@ -33,8 +59,6 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("old_string and new_string are identical")
 	}
 
-	displayPath := strings.TrimSpace(path)
-	path = resolveWritablePath(ctx, path)
 	replaceAll, _ := args["replace_all"].(bool)
 
 	startLine, hasStart, err := optionalLineArg(args, "start_line")
@@ -307,9 +331,14 @@ func looksLineNumbered(s string) bool {
 	return false
 }
 
-// splitLineNumberPrefix parses "<spaces><digits><TAB><rest>", returning the
-// parsed number and the remainder. The TAB is required: a space separator would
-// make ordinary numbered prose ("1. step") look like a transcript.
+// splitLineNumberPrefix parses "<spaces><digits><TAB><rest>" or the hashline
+// form "<spaces><digits>:<6 hex><TAB><rest>", returning the parsed number and
+// the remainder. The TAB is required: a space separator would make ordinary
+// numbered prose ("1. step") look like a transcript. Recognizing the hash
+// form here — rather than only in stripLineNumberPrefixes — matters because
+// looksLineNumbered shares this parser: it must flag a pasted-back hashline
+// transcript whose numbering no longer strips cleanly, or that new_string
+// would be written to the file verbatim, prefixes and all.
 func splitLineNumberPrefix(line string) (num int, rest string, ok bool) {
 	i := 0
 	for i < len(line) && line[i] == ' ' {
@@ -320,7 +349,13 @@ func splitLineNumberPrefix(line string) (num int, rest string, ok bool) {
 		num = num*10 + int(line[i]-'0')
 		i++
 	}
-	if i == start || i >= len(line) || line[i] != '\t' {
+	if i == start || i >= len(line) {
+		return 0, "", false
+	}
+	if line[i] == ':' && i+7 < len(line) && isSixHex(line[i+1:i+7]) && line[i+7] == '\t' {
+		return num, line[i+8:], true
+	}
+	if line[i] != '\t' {
 		return 0, "", false
 	}
 	return num, line[i+1:], true
@@ -514,23 +549,25 @@ func filePerm(path string, def os.FileMode) os.FileMode {
 func EditFileTool() models.Tool {
 	return models.Tool{
 		Name: "edit_file",
-		Description: "Replace exact text in a file for in-place edits. old_string must uniquely match (use replace_all for multiple matches) and must be the file's own text: " +
-			"strip the line number + TAB prefix that read_file (ranges, line_numbers, outlines) and grep add before matching. " +
-			"Optional start_line/end_line (1-based, inclusive) scope the search to that line window, so a short old_string that repeats elsewhere in the file still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
-			"Falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
-			"Fails safely if no match or ambiguous match; on failure, re-read the file with read_file (line_numbers=false for a clean span) and retry this tool.",
+		Description: "Replace text in a file, two modes. Hash mode (preferred after read_file): copy the whole N:hhhhhh prefix of the first and last line of the range into start_hash/end_hash and send only new_string — do not restate the old text; the inclusive line range is replaced (empty new_string deletes it). " +
+			"old_string mode (when you have no hashes — grep hits, raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching. " +
+			"Optional start_line/end_line (1-based, inclusive) scope an old_string search to that line window, so a short old_string that repeats elsewhere still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
+			"old_string falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
+			"Both modes fail safely on missing or ambiguous targets; on failure, re-read the file with read_file and copy hashes or text from its output.",
 		Groups: []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path":        map[string]any{"type": "string", "description": "File path to edit"},
-				"old_string":  map[string]any{"type": "string", "description": "Exact text to find (must be unique unless replace_all is set)"},
-				"new_string":  map[string]any{"type": "string", "description": "Replacement text"},
-				"replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match (confined to start_line/end_line when set)"},
-				"start_line":  map[string]any{"type": "number", "description": "1-based inclusive first line to search; restricts matching to this window"},
-				"end_line":    map[string]any{"type": "number", "description": "1-based inclusive last line to search; pairs with start_line (defaults to EOF)"},
+				"start_hash":  map[string]any{"type": "string", "description": "Hash mode: first line of the range — copy the whole N:hhhhhh prefix from read_file"},
+				"end_hash":    map[string]any{"type": "string", "description": "Hash mode: last line of the range (defaults to start_hash for a single line)"},
+				"old_string":  map[string]any{"type": "string", "description": "Exact text to find (must be unique unless replace_all is set); not needed in hash mode"},
+				"new_string":  map[string]any{"type": "string", "description": "Replacement text (empty string deletes the hash range)"},
+				"replace_all": map[string]any{"type": "boolean", "description": "old_string mode: replace all occurrences instead of requiring a unique match (confined to start_line/end_line when set)"},
+				"start_line":  map[string]any{"type": "number", "description": "old_string mode: 1-based inclusive first line to search; restricts matching to this window"},
+				"end_line":    map[string]any{"type": "number", "description": "old_string mode: 1-based inclusive last line to search; pairs with start_line (defaults to EOF)"},
 			},
-			"required": []any{"path", "old_string", "new_string"},
+			"required": []any{"path", "new_string"},
 		},
 		Handler: EditFileHandler,
 	}

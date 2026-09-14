@@ -54,7 +54,7 @@ func buildFileOutline(lines []string, ext string) string {
 		head = total
 	}
 	for i := 0; i < head; i++ {
-		fmt.Fprintf(&b, "%*d\t%s\n", width, i+1, lines[i])
+		writeHashNumberedLine(&b, width, i+1, lines[i])
 	}
 
 	if syms := extractSymbols(strings.Join(lines, "\n"), ext); len(syms) > 0 {
@@ -71,7 +71,7 @@ func buildFileOutline(lines []string, ext string) string {
 	if start < total {
 		b.WriteString("\n--- tail ---\n")
 		for i := start; i < total; i++ {
-			fmt.Fprintf(&b, "%*d\t%s\n", width, i+1, lines[i])
+			writeHashNumberedLine(&b, width, i+1, lines[i])
 		}
 	}
 

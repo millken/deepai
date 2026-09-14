@@ -47,3 +47,30 @@ func TestRenderToolDiff_TodoWrite(t *testing.T) {
 		t.Fatal("renderToolDiff(\"todo_write\", empty list) = \"\", want a non-empty \"plan cleared\"-style message")
 	}
 }
+
+// TestRenderToolDiff_EditFileHashModeUsesOldText guards HASHLINE_EDIT_DESIGN
+// §9: a hash-mode edit_file call carries no old_string in its arguments, so
+// the diff must fall back to the handler's Data["old_text"] — otherwise the
+// replacement renders as pure additions and the user sees something other
+// than what happened on disk.
+func TestRenderToolDiff_EditFileHashModeUsesOldText(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+
+	args := map[string]any{
+		"path":       "foo.go",
+		"start_hash": "12:a3f2b1",
+		"end_hash":   "13:9c01d4",
+		"new_string": "kept line\nnew line",
+	}
+	data := map[string]any{
+		"start_line": 12,
+		"old_text":   "kept line\nremoved line\n",
+	}
+	d := m.renderToolDiff("edit_file", args, data)
+	if !strings.Contains(d, "removed line") {
+		t.Fatalf("hash-mode diff lost the old text (no '-' rows):\n%s", d)
+	}
+	if !strings.Contains(d, "new line") {
+		t.Fatalf("hash-mode diff lost the new text:\n%s", d)
+	}
+}

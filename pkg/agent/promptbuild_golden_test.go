@@ -104,9 +104,10 @@ func buildGoldenNonInteractiveBashOnly() string {
 
 // Golden values move only when the prompt TEXT is deliberately changed, never
 // as a side effect of restructuring how it is assembled. Last moved: the
-// "Parallel delegation" section gained the rule tying fan-out width to the
-// size of the change (+447 bytes on both delegation-carrying cases;
-// nonInteractive_bash_only carries no delegation section and is unchanged).
+// file-operation rule gained the hashline sentence (prefer start_hash/end_hash
+// copied from read_file's N:hhhhhh prefix; HASHLINE_EDIT_DESIGN §10) — +344
+// bytes on both file-tool-carrying cases; nonInteractive_bash_only carries no
+// file-operation rule and is unchanged.
 func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -117,8 +118,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "interactive_full_with_delegation",
 			build:    buildGoldenInteractiveWithDelegation,
-			wantLen:  5234,
-			wantHash: "c030cd97a8f6d5074b748ba07c7511f894a32a307ba5a0dd3721f79c538ee3a7",
+			wantLen:  5578,
+			wantHash: "0e83c8e37301e08dc7fdd04a57a31241b0c637600edfa2f521a43bbdc90727d4",
 		},
 		{
 			name:     "nonInteractive_bash_only",
@@ -129,8 +130,8 @@ func TestBuildSystemPrompt_GoldenBytesUnchangedByRefactor(t *testing.T) {
 		{
 			name:     "all_gates_on",
 			build:    buildGoldenAllGatesOn,
-			wantLen:  6006,
-			wantHash: "c21387ae21878035681867ec07cdc1b3b605ace10e2c43a6fdaae2dddc4327d8",
+			wantLen:  6350,
+			wantHash: "9dc40e558b897e5731c2158332985bde7222122a140d3ee44baf76f9043b19d0",
 		},
 	}
 	for _, c := range cases {

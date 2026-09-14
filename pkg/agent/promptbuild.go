@@ -156,8 +156,10 @@ func assembleSystemPromptSections(base string, toolReg *tools.Registry, nonInter
 // fileOperationRulePrompt is T5c's authoritative file-operation routing
 // rule, gated by hasAnyFileTool. Named as a constant (rather than an inline
 // literal at the assembleSystemPromptSections call site) purely as a
-// structural extraction — its text is unchanged from before this refactor.
-const fileOperationRulePrompt = "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools."
+// structural extraction. The trailing hashline sentence is the single
+// system-prompt home of the hash-edit routing rule (HASHLINE_EDIT_DESIGN §10);
+// tool descriptions must not duplicate it (T3a).
+const fileOperationRulePrompt = "File-operation rule: ALWAYS use the dedicated tools, never bash, to read, edit, write, search, or list files \xe2\x80\x94 read_file (not cat/head/tail/sed), edit_file (not sed/awk/perl), write_file (not echo>/cat>/tee), list_dir (not ls), find (not the find command), grep (not grep/rg/ag). If an edit_file call fails to match, re-read the file with read_file and retry edit_file; do NOT fall back to bash sed/perl. For git operations, use bash commands (git status, git diff, git log, etc.) rather than dedicated git tools. After read_file, prefer edit_file with start_hash/end_hash copied from the whole N:hhhhhh prefix (not just the hex, not just the line number) and only new_string; do not restate the old text. If a hash range misses, re-read and copy the prefixes; do not invent them. old_string remains valid when you did not get hashes (grep hits, raw spans)."
 
 // hasAnyFileTool reports whether any of the dedicated file tools named by the
 // file-operation rule is registered in toolReg.

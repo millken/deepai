@@ -219,7 +219,7 @@ func TestReadFile_RangeStillNumbersByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Content != "2\tb\n3\tc\n" {
-		t.Fatalf("default range mode must stay numbered, got %q", res.Content)
+	if res.Content != "2:01f1a5\tb\n3:01eff2\tc\n" {
+		t.Fatalf("default range mode must stay numbered (with hashline prefix), got %q", res.Content)
 	}
 }

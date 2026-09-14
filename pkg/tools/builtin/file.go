@@ -107,7 +107,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		var b strings.Builder
 		width := numWidth(e)
 		for i, ln := range selected {
-			fmt.Fprintf(&b, "%*d\t%s\n", width, s+i, ln)
+			writeHashNumberedLine(&b, width, s+i, ln)
 		}
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
@@ -143,7 +143,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		width := numWidth(len(lines))
 		var b strings.Builder
 		for i, ln := range lines {
-			fmt.Fprintf(&b, "%*d\t%s\n", width, i+1, ln)
+			writeHashNumberedLine(&b, width, i+1, ln)
 		}
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
@@ -267,7 +267,7 @@ func GlobTool() models.Tool {
 func ReadFileTool() models.Tool {
 	return models.Tool{
 		Name:         "read_file",
-		Description:  "Read a file's contents. Optional start_line/end_line (1-based, inclusive) restrict to a range; line_numbers prefixes each line with its number and a TAB (on by default in range mode — pass line_numbers=false to get the raw span for pasting into edit_file's old_string). Very large files return a structural outline (head + symbol signatures with line numbers + tail); pass full=true or a start_line/end_line range to get exact content.",
+		Description:  "Read a file's contents. Optional start_line/end_line (1-based, inclusive) restrict to a range; numbered output prefixes each line with N:hhhhhh and a TAB (on by default in range mode) — copy that whole prefix into edit_file's start_hash/end_hash to edit without restating the text, or pass line_numbers=false to get the raw span for edit_file's old_string. Very large files return a structural outline (head + symbol signatures with line numbers + tail); pass full=true or a start_line/end_line range to get exact content.",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
