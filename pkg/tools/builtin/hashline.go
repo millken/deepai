@@ -65,36 +65,25 @@ func editByHashRange(ctx context.Context, call models.ToolCall, path, displayPat
 	oldText := content[from:to]
 	startHash, endHash := lineHash(lines[s-1]), lineHash(lines[e-1])
 
-	// §7: the span includes line e's newline (or runs to EOF on the last
-	// line), so a non-empty replacement that does not end in a newline must
-	// get one appended or its last line would merge with line e+1. On the
-	// last line, follow the file's own final-newline state instead — append
-	// only when the file ended with one; never invent one it never had.
-	replacement := conformLineEndings(newStr, content)
-	if replacement != "" && !strings.HasSuffix(replacement, "\n") {
-		nl := "\n"
-		if strings.Contains(content, "\r\n") {
-			nl = "\r\n"
-		}
-		if e < len(lines) || strings.HasSuffix(content, "\n") {
-			replacement += nl
-		}
-	}
+	replacement := mendTrailingNewline(content, conformLineEndings(newStr, content), e == len(lines))
 
 	updated := content[:from] + replacement + content[to:]
 	if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
 		return fail(fmt.Errorf("write failed: %w", writeErr))
 	}
 
-	span := fmt.Sprintf("line %d", s)
-	if e > s {
-		span = fmt.Sprintf("lines %d-%d", s, e)
-	}
+	span := lineSpanLabel(s, e)
 	var msg string
 	if replacement == "" {
 		msg = fmt.Sprintf("Deleted %s (%s..%s) in %s", span, startHash, endHash, displayPath)
+	} else if newLines := splitFileLines(replacement); len(newLines) <= maxNewLineRefs {
+		// §17.4: the refs use post-edit line numbers and are copy-pastable
+		// straight back into start_hash/end_hash, so chained edits to the
+		// just-written lines need no re-read.
+		msg = fmt.Sprintf("Replaced %s (%s..%s) in %s with %d lines: %s",
+			span, startHash, endHash, displayPath, len(newLines),
+			strings.Join(newLineRefs(replacement, s), " "))
 	} else {
-		newLines := splitFileLines(replacement)
 		msg = fmt.Sprintf("Replaced %s (%s..%s) in %s with %d lines (%s..%s)",
 			span, startHash, endHash, displayPath, len(newLines),
 			lineHash(newLines[0]), lineHash(newLines[len(newLines)-1]))
@@ -113,46 +102,412 @@ func editByHashRange(ctx context.Context, call models.ToolCall, path, displayPat
 	}, nil
 }
 
-// parseHashRef parses a start_hash/end_hash argument: either the bare 6-hex
-// hash or the whole read_file prefix "N:hhhhhh". Models are told to copy the
-// entire prefix, so leading pad spaces and an over-copied TAB (with or without
-// trailing content) are tolerated: everything from the first TAB on is cut.
-// hint is 0 when no line number was given.
+// maxNewLineRefs caps the per-line N:hhhhhh listing in success replies
+// (HASHLINE_EDIT_DESIGN §17.4 Q10): beyond it the reply falls back to the
+// start..end pair so it stays within the compact tool-result budget.
+const maxNewLineRefs = 8
+
+// mendTrailingNewline applies §7's trailing-newline rule to a conformed
+// replacement or insertion body: a non-empty body that does not cover EOF
+// must end with a newline or its last line would merge with the next one; a
+// body covering EOF follows the file's own final-newline state — append only
+// when the file ended with one, and never strip what the model sent.
+func mendTrailingNewline(content, body string, coversEOF bool) string {
+	if body == "" || strings.HasSuffix(body, "\n") {
+		return body
+	}
+	if coversEOF && !strings.HasSuffix(content, "\n") {
+		return body
+	}
+	return body + fileNewline(content)
+}
+
+// fileNewline returns the newline style of content's own line endings.
+func fileNewline(content string) string {
+	if strings.Contains(content, "\r\n") {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+// lineSpanLabel renders a 1-based inclusive line range for result messages.
+func lineSpanLabel(s, e int) string {
+	if e > s {
+		return fmt.Sprintf("lines %d-%d", s, e)
+	}
+	return fmt.Sprintf("line %d", s)
+}
+
+// newLineRefs renders post-edit "N:hhhhhh" refs for each line of body, whose
+// first line lands on 1-based line startLine after the edit.
+func newLineRefs(body string, startLine int) []string {
+	ls := splitFileLines(body)
+	refs := make([]string, len(ls))
+	for i, ln := range ls {
+		refs[i] = fmt.Sprintf("%d:%s", startLine+i, lineHash(ln))
+	}
+	return refs
+}
+
+// editByInsertAfter is edit_file's pure-insert mode (§17.3): place newStr
+// after the single line named by afterRef, restating nothing. Prepending
+// before line 1 is not expressible (there is no line 0); that case uses
+// old_string or write_file.
+func editByInsertAfter(ctx context.Context, call models.ToolCall, path, displayPath, afterRef, newStr string) (models.ToolResult, error) {
+	fail := func(err error) (models.ToolResult, error) {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("read failed: %w", err))
+	}
+	content := string(data)
+	lines := splitFileLines(content)
+	if len(lines) == 0 {
+		return fail(fmt.Errorf("%s is empty; use write_file", displayPath))
+	}
+	s, e, err := resolveHashRange(lines, afterRef, "", displayPath)
+	if err != nil {
+		return fail(err)
+	}
+	if s != e {
+		return fail(fmt.Errorf("after_hash %q resolved to lines %d-%d, not a single anchor line; copy one N:hhhhhh prefix", afterRef, s, e))
+	}
+	anchor := s
+
+	_, to, _, _, err := lineWindow(content, anchor, anchor, displayPath)
+	if err != nil {
+		return fail(err)
+	}
+	body := mendTrailingNewline(content, conformLineEndings(newStr, content), anchor == len(lines))
+	// Inserting after a final line that has no newline needs a separator
+	// first, or the insertion would merge with the anchor. The separator is
+	// plumbing, not content: the file keeps its no-final-newline state unless
+	// the model's own new_string ends with one (§17.3 N7).
+	sep := ""
+	if anchor == len(lines) && !strings.HasSuffix(content, "\n") {
+		sep = fileNewline(content)
+	}
+
+	updated := content[:to] + sep + body + content[to:]
+	if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
+		return fail(fmt.Errorf("write failed: %w", writeErr))
+	}
+
+	k := len(splitFileLines(body))
+	msg := fmt.Sprintf("Inserted %d lines after line %d (%s) in %s", k, anchor, lineHash(lines[anchor-1]), displayPath)
+	if k <= maxNewLineRefs {
+		msg += ": " + strings.Join(newLineRefs(body, anchor+1), " ")
+	}
+	return models.ToolResult{
+		CallID:   call.ID,
+		ToolName: call.Name,
+		Content:  msg,
+		Data: map[string]any{
+			"start_line": anchor + 1,
+			"old_text":   "",
+		},
+	}, nil
+}
+
+// resolvedHunk is one entry of a multi-hunk edit after resolution against the
+// original file: line coordinates, the half-open byte span [from,to) (from==to
+// for an insertion), and the mended body ready to splice.
+type resolvedHunk struct {
+	idx    int // position in the model's edits array, for error attribution
+	insert bool
+	s, e   int // replace: inclusive range; insert: s==e==anchor line
+	from   int
+	to     int
+	sep    string // insert-only: separator before body at EOF-without-newline
+	body   string
+	rawNew string // as the model sent it, for the TUI diff
+	k      int    // line count of body (0 = deletion)
+}
+
+// editByHunks is edit_file's multi-hunk mode (§17.2): every hunk resolves
+// against the SAME original file (hashes computed once), all validation runs
+// before any byte is written, and resolution errors are reported together —
+// one retry fixes them all. Overlap is judged by line numbers; application
+// splices half-open byte spans in one ascending pass, zero-width insertions
+// first at equal offsets.
+func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath string, editsRaw any) (models.ToolResult, error) {
+	fail := func(err error) (models.ToolResult, error) {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
+	}
+	list, ok := editsRaw.([]any)
+	if !ok || len(list) == 0 {
+		return fail(fmt.Errorf("edits must be a non-empty array of {start_hash, end_hash, new_string} or {after_hash, new_string} objects"))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fail(fmt.Errorf("read failed: %w", err))
+	}
+	content := string(data)
+	lines := splitFileLines(content)
+	if len(lines) == 0 {
+		return fail(fmt.Errorf("%s is empty; use write_file", displayPath))
+	}
+	total := len(lines)
+
+	var errs []string
+	addErr := func(i int, format string, a ...any) {
+		errs = append(errs, fmt.Sprintf("edits[%d]: %s", i, fmt.Sprintf(format, a...)))
+	}
+	var hunks []resolvedHunk
+	for i, raw := range list {
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			addErr(i, "must be an object")
+			continue
+		}
+		startRef, _ := obj["start_hash"].(string)
+		endRef, _ := obj["end_hash"].(string)
+		afterRef, _ := obj["after_hash"].(string)
+		hasStart := strings.TrimSpace(startRef) != ""
+		hasEnd := strings.TrimSpace(endRef) != ""
+		hasAfter := strings.TrimSpace(afterRef) != ""
+		newRaw, hasNew := obj["new_string"]
+		newStr, newIsString := newRaw.(string)
+		switch {
+		case !hasNew || !newIsString:
+			addErr(i, "new_string is required (pass an empty string to delete the range)")
+			continue
+		case hasAfter && hasStart:
+			addErr(i, "after_hash and start_hash are mutually exclusive")
+			continue
+		case hasAfter && newStr == "":
+			addErr(i, "new_string must not be empty when inserting")
+			continue
+		case !hasAfter && !hasStart && hasEnd:
+			addErr(i, "end_hash without start_hash; set start_hash (copy the N:hhhhhh prefix)")
+			continue
+		case !hasAfter && !hasStart:
+			addErr(i, "needs start_hash (replace) or after_hash (insert)")
+			continue
+		}
+		if hasAfter {
+			s, e, rerr := resolveHashRange(lines, afterRef, "", displayPath)
+			if rerr != nil {
+				addErr(i, "%v", rerr)
+				continue
+			}
+			if s != e {
+				addErr(i, "after_hash resolved to lines %d-%d, not a single anchor line", s, e)
+				continue
+			}
+			hunks = append(hunks, resolvedHunk{idx: i, insert: true, s: s, e: s, rawNew: newStr})
+		} else {
+			s, e, rerr := resolveHashRange(lines, startRef, endRef, displayPath)
+			if rerr != nil {
+				addErr(i, "%v", rerr)
+				continue
+			}
+			hunks = append(hunks, resolvedHunk{idx: i, s: s, e: e, rawNew: newStr})
+		}
+	}
+	if len(errs) > 0 {
+		return fail(fmt.Errorf("%s — nothing was written", strings.Join(errs, "; ")))
+	}
+
+	// Overlap by LINE NUMBERS (§17.2 N6): replace ranges pairwise disjoint,
+	// an insertion anchor never inside a replaced range (the anchor would be
+	// consumed), and no two insertions share an anchor (their order would be
+	// undefined). Byte intervals cannot express "insert after 5 + replace
+	// 6-10 are adjacent", so they are not what is checked here.
+	for a := 0; a < len(hunks); a++ {
+		for b := a + 1; b < len(hunks); b++ {
+			ha, hb := hunks[a], hunks[b]
+			switch {
+			case !ha.insert && !hb.insert:
+				if ha.s <= hb.e && hb.s <= ha.e {
+					addErr(hb.idx, "lines %d-%d overlap edits[%d] (lines %d-%d)", hb.s, hb.e, ha.idx, ha.s, ha.e)
+				}
+			case ha.insert != hb.insert:
+				ins, rep := ha, hb
+				if hb.insert {
+					ins, rep = hb, ha
+				}
+				if rep.s <= ins.s && ins.s <= rep.e {
+					addErr(ins.idx, "insertion anchor line %d is inside edits[%d]'s replaced range %d-%d", ins.s, rep.idx, rep.s, rep.e)
+				}
+			default:
+				if ha.s == hb.s {
+					addErr(hb.idx, "duplicate insertion anchor line %d with edits[%d]", hb.s, ha.idx)
+				}
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return fail(fmt.Errorf("%s — nothing was written", strings.Join(errs, "; ")))
+	}
+
+	hasFinalNL := strings.HasSuffix(content, "\n")
+	for i := range hunks {
+		h := &hunks[i]
+		from, to, _, _, werr := lineWindow(content, h.s, h.e, displayPath)
+		if werr != nil {
+			return fail(werr)
+		}
+		h.body = mendTrailingNewline(content, conformLineEndings(h.rawNew, content), h.e == total)
+		h.k = len(splitFileLines(h.body))
+		if h.insert {
+			h.from, h.to = to, to
+			if h.s == total && !hasFinalNL {
+				h.sep = fileNewline(content)
+			}
+		} else {
+			h.from, h.to = from, to
+		}
+	}
+
+	// Ascending single-pass splice over half-open byte spans; a zero-width
+	// insertion at the same offset as a replacement's start goes first.
+	sortHunksByOffset(hunks)
+	var out strings.Builder
+	cursor := 0
+	for _, h := range hunks {
+		out.WriteString(content[cursor:h.from])
+		out.WriteString(h.sep)
+		out.WriteString(h.body)
+		cursor = h.to
+	}
+	out.WriteString(content[cursor:])
+	if writeErr := os.WriteFile(path, []byte(out.String()), filePerm(path, 0644)); writeErr != nil {
+		return fail(fmt.Errorf("write failed: %w", writeErr))
+	}
+
+	// Summary in file order, capped at 3 details (§17.2 C21); post-edit line
+	// numbers accumulate each hunk's line delta over the hunks above it
+	// (§17.4). Deletions contribute no refs.
+	var details []string
+	var refs []string
+	totalNew := 0
+	deltaSum := 0
+	dataHunks := make([]map[string]any, 0, len(hunks))
+	for _, h := range hunks {
+		switch {
+		case h.insert:
+			details = append(details, fmt.Sprintf("inserted %d lines after line %d", h.k, h.s))
+			refs = append(refs, newLineRefs(h.body, h.s+1+deltaSum)...)
+			totalNew += h.k
+			deltaSum += h.k
+		case h.body == "":
+			details = append(details, fmt.Sprintf("deleted %s", lineSpanLabel(h.s, h.e)))
+			deltaSum -= h.e - h.s + 1
+		default:
+			details = append(details, fmt.Sprintf("replaced %s with %d lines", lineSpanLabel(h.s, h.e), h.k))
+			refs = append(refs, newLineRefs(h.body, h.s+deltaSum)...)
+			totalNew += h.k
+			deltaSum += h.k - (h.e - h.s + 1)
+		}
+		startLine := h.s
+		if h.insert {
+			startLine = h.s + 1
+		}
+		dataHunks = append(dataHunks, map[string]any{
+			"start_line": startLine,
+			"end_line":   h.e,
+			"old_text":   content[h.from:h.to],
+			"new_string": h.rawNew,
+		})
+	}
+	shown := details
+	if len(shown) > 3 {
+		shown = append(append([]string{}, details[:3]...), fmt.Sprintf("+%d more", len(details)-3))
+	}
+	msg := fmt.Sprintf("Applied %d edits in %s: %s", len(hunks), displayPath, strings.Join(shown, ", "))
+	if totalNew > 0 && totalNew <= maxNewLineRefs {
+		msg += "; new lines: " + strings.Join(refs, " ")
+	}
+	return models.ToolResult{
+		CallID:   call.ID,
+		ToolName: call.Name,
+		Content:  msg,
+		Data: map[string]any{
+			"start_line": hunks[0].s,
+			"hunks":      dataHunks,
+		},
+	}, nil
+}
+
+// sortHunksByOffset orders hunks for the splice: ascending byte offset,
+// zero-width insertions before a replacement starting at the same byte.
+func sortHunksByOffset(hunks []resolvedHunk) {
+	for i := 1; i < len(hunks); i++ {
+		for j := i; j > 0; j-- {
+			a, b := hunks[j-1], hunks[j]
+			if b.from < a.from || (b.from == a.from && b.insert && !a.insert) {
+				hunks[j-1], hunks[j] = b, a
+			} else {
+				break
+			}
+		}
+	}
+}
+
+// parseHashRef parses a start_hash/end_hash argument: the bare 6-hex hash, or
+// an over-copied prefix from either numbered source. Models paste the whole
+// span they saw, not a precisely extracted N:hhhhhh, so both shapes must
+// resolve (HASHLINE_EDIT_DESIGN §17.1 D4):
+//
+//	read_file: "  12:a3f2b1<TAB>content"        (TAB-separated)
+//	grep:      "file.go:12:a3f2b1: content"     (colon-separated)
+//
+// Everything from the first TAB on is cut, then locateHashRef finds the first
+// line:hash pair with proper boundaries. hint is 0 when no line number came
+// with the hash.
 func parseHashRef(field, ref string) (hint int, hash string, err error) {
 	s := ref
 	if i := strings.IndexByte(s, '\t'); i >= 0 {
 		s = s[:i]
 	}
 	s = strings.TrimSpace(s)
-	badRef := func() error {
-		return fmt.Errorf("%s %q is not a line hash; copy the whole N:hhhhhh prefix from read_file's numbered output — do not invent hashes or send a bare line number", field, ref)
-	}
-	if s == "" {
-		return 0, "", badRef()
-	}
-	if i := strings.IndexByte(s, ':'); i >= 0 {
-		numPart, hexPart := s[:i], s[i+1:]
-		for _, c := range numPart {
-			if c < '0' || c > '9' {
-				return 0, "", badRef()
-			}
+	if s != "" {
+		if isSixHex(s) {
+			return 0, s, nil
 		}
-		if numPart == "" || !isSixHex(hexPart) {
-			return 0, "", badRef()
+		if h, hx, ok := locateHashRef(s); ok {
+			return h, hx, nil
 		}
-		n := 0
-		for _, c := range numPart {
-			n = n*10 + int(c-'0')
-		}
-		if n <= 0 {
-			return 0, "", badRef()
-		}
-		return n, hexPart, nil
 	}
-	if !isSixHex(s) {
-		return 0, "", badRef()
+	return 0, "", fmt.Errorf("%s %q is not a line hash; copy the whole N:hhhhhh prefix from read_file or grep output — do not invent hashes or send a bare line number", field, ref)
+}
+
+// locateHashRef scans s for the FIRST "<digits>:<6 hex>" whose left neighbor
+// is the start of the string or ':' and whose right neighbor is ':', TAB, or
+// the end of the string. The boundaries keep it from biting hash-shaped noise
+// inside pasted content ("see 99:deadbe: x" — preceded by a space, skipped)
+// while accepting a whole pasted grep line ("file.go:12:a3f2b1: content").
+func locateHashRef(s string) (hint int, hash string, ok bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			continue
+		}
+		if i > 0 && s[i-1] != ':' {
+			continue
+		}
+		j, n := i, 0
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			n = n*10 + int(s[j]-'0')
+			j++
+		}
+		if j >= len(s) || s[j] != ':' || n <= 0 {
+			i = j
+			continue
+		}
+		hexEnd := j + 1 + 6
+		if hexEnd > len(s) || !isSixHex(s[j+1:hexEnd]) {
+			i = j
+			continue
+		}
+		if hexEnd < len(s) && s[hexEnd] != ':' && s[hexEnd] != '\t' {
+			i = j
+			continue
+		}
+		return n, s[j+1 : hexEnd], true
 	}
-	return 0, s, nil
+	return 0, "", false
 }
 
 // isSixHex reports whether s is exactly 6 lowercase hex digits — the only

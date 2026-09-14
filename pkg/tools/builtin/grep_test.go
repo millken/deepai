@@ -338,8 +338,8 @@ func TestGrepHandler_ContextLines(t *testing.T) {
 	if !contains(result.Content, "a.txt:2:") {
 		t.Errorf("expected context line 2, got: %s", result.Content)
 	}
-	if !contains(result.Content, "a.txt:3: target line") {
-		t.Errorf("expected match line 3, got: %s", result.Content)
+	if !contains(result.Content, "a.txt:3:7127c2: target line") {
+		t.Errorf("expected match line 3 in file:line:hash: format, got: %s", result.Content)
 	}
 	if !contains(result.Content, "a.txt:4:") {
 		t.Errorf("expected context line 4, got: %s", result.Content)
@@ -370,8 +370,8 @@ func TestGrepHandler_PreservesOriginalWhitespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !contains(result.Content, ":1: \tkeep trailing  ") {
-		t.Fatalf("expected original whitespace preserved, got: %q", result.Content)
+	if !contains(result.Content, ":1:72e62b: \tkeep trailing  ") {
+		t.Fatalf("expected original whitespace preserved (with hash prefix), got: %q", result.Content)
 	}
 	matches, ok := result.Data["matches"].([]grepMatch)
 	if !ok || len(matches) != 1 {

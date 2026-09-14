@@ -1,6 +1,6 @@
 # Hashline 编辑 — 设计稿（供评审）
 
-> 状态：**定稿，可进 Phase 1**。调研日期 2026-09-14，基线为当前 `edit_file` / `read_file`。v2 响应 D1–D3 / F1；v3 响应 N1–N5。见文末「修订记录」。
+> 状态：**Phase 1 已实施并合入（`747799c`）；§17 Phase 2 设计 v5 修订稿，待终审**。调研日期 2026-09-14。v2 响应 D1–D3 / F1；v3 响应 N1–N5；v5 响应 D4–D5 / N6–N7。见文末「修订记录」。
 > 目标：读文件时给每行一个短 hash；模型用 **hash 范围 + 新内容** 编辑，不再复述旧文本，从而大幅节省 **输出 token**，并消灭「凭记忆重打 `old_string`」这一主失败模式。
 > 不在本文范围：实现。本文只定语义、格式、兼容策略与分期，供评审否决或修订后再动代码。
 
@@ -163,6 +163,8 @@ else:
 `end_hash` 缺省 = `start_hash`（单行替换）。`start_hash` / `end_hash` 接受 `hhhhhh` 或 `N:hhhhhh`（含 read_file 左侧填充空格，以及误抄上的尾 TAB）；推荐模型抄整个前缀。
 
 Schema（`edit.go:533`）`required` 从 `[path, old_string, new_string]` 改为 `[path, new_string]`。严格 schema 校验的 provider 否则会在 hash 模式拒掉缺 `old_string` 的合法调用。handler 仍要求「`start_hash` 或 `old_string` 至少一个」。不做 JSON Schema `oneOf`（部分 provider 支持差）。
+
+> Phase 2 起本节的分派被 §17.2 的完整版本**取代**（新增 `edits` / `after_hash` 分支，`required` 进一步收缩为 `[path]`，见 D5）。
 
 ---
 
@@ -396,12 +398,12 @@ hash 模式下 `args["old_string"]` 为空，diff 会变成「纯新增」，**�
 5. 提示词 + 两个 Tool Description。
 6. 测试见 §12。
 
-**Phase 2 — 视 Phase 1 实测再开**
+**Phase 2 — 分派、格式与字节语义一律以 §17 为准**
 
-- grep 命中行带 hash（少一次「为了编辑去 read」）。
-- `edits: [{start,end,new}, ...]` 单调用多 hunk，自底向上应用。
-- `after_hash` 纯插入。
-- 成功回包把新区间逐行 hash 都带上（若模型常链式改刚写入的行）。
+- grep 命中行带 hash（17.1）。
+- `edits` 单调用多 hunk，按原始字节 span 单遍拼接（17.2）。
+- `after_hash` 纯插入（17.3）。
+- 成功回包带新区间逐行 hash（17.4）。
 
 **Phase 3 — 只在 hash 模式成为主路径之后**
 
@@ -528,6 +530,170 @@ hash 模式下 `args["old_string"]` 为空，diff 会变成「纯新增」，**�
 
 ---
 
+## 17. Phase 2 设计（v4 草案，待评审）
+
+Phase 1 的四个后续项各自的语义、格式与失败面。基线是已合入的 Phase 1（`747799c`）。共同原则不变：hash 是内容校验，行号是提示；定位失败必须失败；工具无状态。
+
+### 17.1 P2-A：grep 命中行带 hash
+
+**现状**（调研于 v4）：grep 有三处渲染点，全部是 `%s:%d: %s`——平铺（`grep.go:110`）、context 模式的读文件失败回退（`grep.go:253`）、context 行本体（`grep.go:280`）。`readFileLines`（`grep.go:301`）用 `strings.Split(data, "\n")`，与 `splitFileLines` 不同：文件以 `\n` 结尾时会多出一个幻影空行（可被 `x*` 这类可匹配空串的 pattern 命中，报出 read_file 认为不存在的行号），且行内保留 `\r`（`lineHash` 剥 `\r`，所以 hash 天然与 read_file 一致）。`Data["matches"]` 是结构化边车（`grepMatch{File, Line, Content}`）。
+
+**格式**：三处渲染统一改为
+
+```
+file.go:12:a3f2b1: content
+```
+
+- **过抄容错（D4）——「edit 侧零改动」不成立，撤回。** Phase 1 已证明模型贴的是「看见的整段前缀」，不是精确抽取 6+2 位。grep 的分隔符是 `:` 不是 TAB，I2 的 TAB 截断帮不上：`12:a3f2b1: content` 会把 `a3f2b1: content` 当 hexPart 拒掉，`file.go:12:a3f2b1: content` 第一段按 `:` 切出 `file.go` 也拒。若不修，P2-A 的「grep 前缀直接编辑、零 read」主路径会按 Phase 1 见过的过抄方式系统性 miss。修法：`parseHashRef` 增加与 I2 同精神的定位规则——取串中**第一个**满足「前邻是串首或 `:`、后邻是 `:` / TAB / 串尾」的 `\d+:[0-9a-f]{6}`。`file.go:12:a3f2b1: see 99:deadbe: x` 解析出 `12:a3f2b1`（`99:deadbe` 前邻是空格，不入选）；bare `hhhhhh` 与 read_file 的 `N:hhhhhh<TAB>` 形态不变。miss 文案从「copy from read_file」改为「copy the N:hhhhhh prefix from read_file or grep」。
+- context 行（`grep.go:280`）**同样带 hash**（Q11）：match ± context 就是现成的 start/end 锚点对，小范围编辑可以完全不 read。
+- context 模式的读文件失败回退（`grep.go:253`）手上仍有 `m.Content`，hash 从它现算——回退行同一格式，不降级成无 hash。
+- `grepMatch` 增加 `Hash` 字段进 `Data["matches"]`。`displayGrepMatches`（`grep.go:292-296`）是逐字段复制，**必须补抄 `Hash`**，否则文本输出有、结构化边车丢（17.6 有门）。
+- `readFileLines` 改用 `splitFileLines`（Q13）：消灭幻影空行，让 grep / read_file / edit_file 对「文件有几行」口径一致。这是行为收紧：以前能匹配幻影空行的 pattern 少报一行，属修正不属回归。
+- `edit.go:165` 的 miss 错误文案里 grep 前缀示例改为 `file.go:12:a3f2b1: `；grep Description 的 `file:line:content` 措辞同步。`old_string` 路径**仍不剥** grep 前缀（与今日一致；模型该抄的是 `N:hhhhhh`，不是整行贴回）。
+
+**提示词**：`fileOperationRulePrompt` 尾句的「old_string remains valid when you did not get hashes (grep hits, raw spans)」中 grep 不再成立，改为「(raw spans)」并加半句「grep hits carry N:hhhhhh too」。prompt 金值随之更新（同 I1 惯例，记录字节增量）。
+
+### 17.2 P2-B：`edits` 多 hunk（含插入 hunk，Q12）
+
+新参数 `edits`：对象数组，每项是 `{start_hash, end_hash?, new_string}`（替换/删除）或 `{after_hash, new_string}`（插入）。**全部对照同一份原始文件解析**——hash 表只算一次，这正是「读一次、发 N 个 hunk」的意义。
+
+**完整分派（D5，取代 §4 的 Phase 1 版本）。** schema `required` 收缩为 `[path]`：顶层 `new_string` 不再由 schema 强制——多 hunk 时每项自带 `new_string`，顶层再 required 会让严格 schema 的 provider 拒掉合法调用，与 Phase 1 小 2 同一个坑。顶层 `new_string` 的键检查移入非 `edits` 分支，由 handler 强制：
+
+```
+path 空 → 错
+if edits 键存在:
+    非数组或空数组 → 错
+    多 hunk 模式：顶层 start_hash / end_hash / after_hash / old_string /
+                  replace_all / new_string 一律忽略（Q4 精神，C18）
+    每个 hunk 自检，错误带下标，与顶层规则对称：
+      new_string 键不存在        → 错
+      after_hash 与 start_hash 都非空 → 错
+      after_hash 非空且 new_string 为空 → 错
+      只有 end_hash              → 错（N4 同款）
+      after_hash / start_hash 都空 → 错
+else:
+    顶层 new_string 键不存在 → 错（漏传 ≠ 空串）
+    if after_hash 与 start_hash 都非空 → 错（17.3）
+    if after_hash 非空 → 插入（new_string 为空 → 错）
+    if start_hash 非空 → hash 替换（replace_all 忽略，N5）
+    if end_hash 非空   → 错（N4）
+    else               → old_string 模式（old_string 空 → 错；其余一字不改）
+```
+
+**解析与校验（写盘之前全部完成）**：
+
+1. 每个 hunk 独立按 §5.2（替换）或单行规则（插入锚点）解析。解析错误**全部收集后一次报出**（Q14），每条带 hunk 下标——模型一次重试就能全修。
+2. 重叠检查**只按行号**（N6）：替换闭区间 `[s,e]` 两两不相交；插入锚点行 ∉ 任何替换闭区间；两个插入锚点行不得相等（应用顺序无定义）。违反则拒绝整个调用，点名 hunk 下标与行号。相邻合法：hunk 到第 5 行、下一个从第 6 行起；after 第 5 行的插入 + 替换 6–10 也合法——插入的零宽字节点与替换 span 起点是**同一个字节**（第 5 行换行之后 = 第 6 行行首），所以重叠判定不能用字节闭区间，否则会把这条合法相邻误杀。
+3. 任何一步失败 → **一个字节都不写**（原子性，C15）。
+
+**应用**：字节 span 一律**半开区间** `[a,b)`，插入是零宽 `[p,p)`（N6）。按原始文件偏移升序单遍拼接（`orig[0:a₁] + r₁ + orig[b₁:a₂] + r₂ + …`）；同一偏移上零宽插入排在替换**之前**（`orig[0:p] + insert + replacement + orig[q:]`）。每个 hunk 的尾换行补齐按 §7；「e 是末行」的 EOF 规则只作用于覆盖末行的那个 hunk。模型发送顺序无关，内部按位置排序，回包按文件顺序列出。
+
+**回包**（仍求短；细节**最多 3 条**，其余折叠——C21 罩的不只是逐行列表，8 个 hunk 的摘要本身就能先破 300B 档）：
+
+```
+Applied 3 edits in foo.go: inserted 2 lines after line 5, deleted lines 20-22, replaced lines 40-45 with 4 lines
+Applied 8 edits in foo.go: inserted 2 lines after line 5, deleted lines 20-22, replaced lines 40-45 with 4 lines, +5 more
+```
+
+`Data["hunks"]`：`[{start_line, end_line, old_text, new_string}, …]`（TUI 用，见 17.5）。行号为原始文件坐标（与单 hunk 的 `start_line` 语义一致）。
+
+### 17.3 P2-C：`after_hash` 纯插入（顶层）
+
+顶层参数 `after_hash`：在锚点行**之后**插入 `new_string`，不复述锚点。与 `start_hash` 同时传 → 报错（两种定位语义，不猜）。`new_string` 为空 → 报错（插入空内容必是笔误，不当 no-op 吞掉）。
+
+字节语义（对齐 §7）：
+
+- 插入点 = 锚点行 span 的末尾（含其换行符之后）。
+- 锚点不是末行，或是末行且文件有最终换行：插入文本补齐为以换行结尾。
+- 锚点是末行且文件**无**最终换行：先补一个分隔换行（否则与锚点行合并）再接插入文本；工具**不发明**尾换行，但模型显式写在 `new_string` 末尾的 `\n` **保留**（N7，与 §7 / I4 同一口径——那是内容变更，文件因此带上最终换行，不算工具发明）。
+- 空文件没有锚点行：报错指去 `write_file`（与 hash 替换的空文件行为一致）。
+- **限制**：无法在第 1 行之前插入（没有第 0 行可锚）。prepend 场景（许可证头等）走 `old_string`（「替换第 1 行为 新内容+原第 1 行」，复述一行）或 `write_file`，Description 写明。不为此开 `before_hash`。
+
+回包：`Inserted 3 lines after line 12 (a3f2b1) in foo.go`；`Data`：`start_line` = 锚点行号 + 1，`old_text` = ""（TUI 渲染为纯新增——这次是真的纯新增）。
+
+### 17.4 P2-D：成功回包带新区间逐行 hash（可链式）
+
+替换/插入后，新区间 ≤ **8 行**（Q10）时，回包把每行的**可直接粘贴的 `N:hhhhhh` 前缀**列出来，行号是**编辑后**的真实行号：
+
+```
+Replaced lines 12-18 (a3f2b1..7e88aa) in foo.go with 4 lines: 12:d1e2f3 13:0aa1b2 14:5c6d7e 15:c0ffee
+```
+
+- 这直接解决 §5.3 的第三条失效（「改自己刚写的行必须再 read」）：模型从回包抄前缀即可链式再改，**零 read**。
+- \> 8 行退回 v1 的起止两个 hash（回包保持短，兼容 aging 300B 档；8 行 ≈ +80 字节）。
+- 多 hunk 模式：编辑后行号的公式写死——替换/删除 hunk 的行数增量 `Δ = k − (e−s+1)`（k 为新行数，删除 k=0），插入 `Δ = +k`；某 hunk 的编辑后起始行 = 原始起始行（插入为锚点行号 + 1）+ 文件序上其**前方**所有 hunk 的 Δ 之和，应用时顺手累计。多 hunk 回包里逐行列表只在**总新行数** ≤ 8 时给出，否则全部退回省略（一个 hunk 列、另一个不列反而教坏模型）。
+
+### 17.5 TUI 与调用方
+
+- 单 hunk 各模式不变（Phase 1 已处理）。
+- 多 hunk：`renderToolDiff` 检测 `args["edits"]` 存在时，改从 `Data["hunks"]` 迭代，逐 hunk 用现有 `diffBlock` 渲染并纵向堆叠（每块自带 `start_line` gutter）。无 `Data["hunks"]`（老会话回放）则退化为不渲染 diff，走通用 preview。
+- `SessionCarry` / breaker / review 归因不变（仍只看工具名与 path）。
+
+### 17.6 测试计划（Phase 2 硬门）
+
+**grep 金值预期改动**（同 N3 惯例）：`grep_test.go` 的格式断言（如 `grep_test.go:341` 的 `a.txt:3: target line`）更新为 `file:line:hash: `。注意 `a.txt:1:` 这类**子串**断言在新格式（`a.txt:1:hhhhhh: ` 含 `a.txt:1:`）下仍然命中——它们测的是「有没有命中该行」，可以留着，但**不能当格式回归门**；格式门一律断言完整的 `file:line:hash: ` 前缀。
+
+| 用例 | 断言 |
+|---|---|
+| grep 平铺 / context / context-回退 三处输出 | 均为 `file:line:hash: content`；`Data["matches"]` 带 `hash`，`displayGrepMatches` 不丢 |
+| grep 前缀直接喂 `start_hash`（不 read） | 单行 hash 编辑成功（P2-A 闭环） |
+| `file.go:12:a3f2b1: content` 与 `12:a3f2b1: content` 整段贴进 `start_hash` | 都解析出 `12:a3f2b1`，编辑成功（D4） |
+| 整行过抄且正文含假 hash（`…a3f2b1: see 99:deadbe: x`） | 取第一个合规前缀，不吃正文里的 `99:deadbe` |
+| CRLF 文件 | grep 报的 hash == read_file 报的 hash |
+| 以 `\n` 结尾的文件 + 可匹配空串的 pattern | 无幻影末行命中（Q13） |
+| 多 hunk：乱序发送 3 个不相交 hunk | 结果 == 依次单 hunk 编辑；回包按文件顺序 |
+| 多 hunk：相邻（e=5 与 s=6）、含插入与替换混合 | 合法且正确 |
+| 多 hunk：after 第 5 行 + 替换 6–10（同一字节偏移） | 合法，insert 排在替换之前（N6） |
+| hunk 级分派：只传 `end_hash` / `after_hash`+`start_hash` 同传 / 插入 hunk 空 `new_string` | 报错带下标，零写入（D5） |
+| 顶层无 `old_string`、无 `start_hash`、无 `edits`（schema 只 require `path`） | handler 报 `old_string is required`，分派兜底不静默 |
+| 8 个 hunk 的摘要 | 3 条细节 + `+5 more`（C21 封顶） |
+| 多 hunk：span 重叠 / 插入锚点在替换区内 / 两插入同锚点 | 拒绝，点名 hunk 下标，文件原样 |
+| 多 hunk：一个 hunk hash 错、其余合法 | 一次报出全部解析错误，零写入（C15/Q14） |
+| 多 hunk：hunk 缺 `new_string` 键 / `edits` 为空数组 | 报错 |
+| `after_hash`：中部插入 / 末行两种 EOF 状态 | 字节精确（17.3 规则） |
+| `after_hash`：末行、文件无最终换行、`new_string="x\n"` | 结果 `…\nx\n`——分隔换行补上，模型的尾 `\n` 保留（N7） |
+| `after_hash`：空文件 | 报错指向 `write_file` |
+| `after_hash`：锚点 hash 多处出现且无行号提示 | 歧义拒绝；带提示则命中 |
+| `after_hash` + `start_hash` 同时传 / `new_string` 为空 | 报错 |
+| 链式：编辑 → 从回包抄 `N:hhhhhh` → 直接改刚写入的行 | 第二次调用零 read 成功（P2-D 闭环） |
+| 新区间 9 行 | 回包只有起止 hash，无逐行列表 |
+| 多 hunk 编辑后行号 | 回包前缀在编辑后的文件上逐一命中 |
+| TUI 多 hunk | 逐 hunk 渲染 `-`/`+` 行；无 `Data["hunks"]` 不崩 |
+| prompt 金值 / T3a / `Replace` gist | 按惯例更新并记录；不回归 |
+
+### 17.7 自审补充（承接 §15 编号）
+
+| # | 风险 | 处置 |
+|---|---|---|
+| C14 | grep 视图过期后拿旧 hash 来编辑 | 与 read 后编辑同一保护：端点 hash 现场重算，对不上即 miss |
+| C15 | 多 hunk 部分成功、部分失败，文件进入中间态 | 解析、校验全部通过才写盘；任何失败零写入（17.2） |
+| C16 | 两个 hunk 解析到重叠区间（模型复制了锚点） | 行区间相交即拒绝，点名下标 |
+| C17 | 插入锚点行被另一 hunk 替换掉 | 锚点在替换区内即拒绝（锚点已被消费） |
+| C18 | `edits` 与顶层 `start_hash`/`old_string` 同时传 | `edits` 赢，其余忽略（Q4 精神） |
+| C19 | 自底向上应用的偏移错位 bug 类 | 不做增量偏移：按原始字节 span 单遍拼接；乱序输入测试压住 |
+| C20 | grep 幻影末行的 hash 指向不存在的行 | Q13 对齐 `splitFileLines`，从源头消灭 |
+| C21 | 逐行 hash 列表**或多 hunk 摘要**撑爆短回包 | 列表 ≤8 行才给（Q10）；摘要细节封顶 3 条 + `+N more`（17.2）——先破 300B 的是摘要，不是列表 |
+| C22 | TUI 多 hunk 渲染缺数据（老会话回放无 `Data["hunks"]`） | 缺则退化为通用 preview，不崩（17.5） |
+
+### 17.8 Phase 2 拍板问题
+
+**Q10. 逐行 hash 的行数上限？**  
+**已采纳：8**，且摘要本身封顶 3 条细节 + `+N more`（C21）——300B 档先被摘要破，不是列表。
+
+**Q11. grep 的 context 行也带 hash？**  
+**已采纳：带**。match ± context 就是 start/end 锚点对；只给 match 行带，等于只支持单行编辑。
+
+**Q12. `edits` 数组里允许插入 hunk？**  
+**已采纳：允许**。规则在 17.2 定死（锚点不得在替换区内、同锚点双插入拒绝）。
+
+**Q13. grep 的 `readFileLines` 改用 `splitFileLines`？**  
+**已采纳：改**。幻影空行的行号 read_file 与 edit_file 都不承认，报出来只会制造 miss。
+
+**Q14. 多 hunk 解析错误：报第一个还是全部？**  
+**已采纳：全部一次报出**（带下标）。逐个报会把一次重试拖成 N 次往返，违背多 hunk 省往返的初衷。
+
+---
+
 ## 修订记录
 
 ### v2（2026-09-14）— 响应评审 D1 / D2 / D3 / F1 及小问题
@@ -567,3 +733,28 @@ hash 模式下 `args["old_string"]` 为空，diff 会变成「纯新增」，**�
 | I3 | 命名 | 渲染函数叫 `writeHashNumberedLine`（设计稿写 `renderNumbered`）；hash 模式的执行体 `editByHashRange` 也放在 `hashline.go`（`edit.go` 只留分派），符合 §11.1「不再堆 edit.go」的意图。 |
 | I4 | 末行 EOF 换行的单向语义 | 「原来没有则不发明」实现为：原文件无最终换行时**不追加**，但模型显式发来的尾换行不剥（那是内容变更，不是工具发明）。原文件有最终换行、new_string 缺尾换行时照常补齐。 |
 | I5 | `new_string` 键检查对两种模式生效 | §4 的伪代码即如此；对 `old_string` 路径这是一个边缘行为收紧（以前漏传 = 空串 = 删除匹配文本，现在报错）。schema 里 `new_string` 本就 required，现有测试无一依赖旧行为。 |
+
+### v4（2026-09-14）— Phase 2 设计草案
+
+新增 §17：P2-A grep 带 hash（三处渲染点统一 `file:line:hash: content`，context 行也带，`readFileLines` 对齐 `splitFileLines`）；P2-B `edits` 多 hunk（同一原始文件解析、重叠拒绝、原子写入、错误全量一次报出）；P2-C 顶层 `after_hash` 纯插入（EOF 两态字节语义、不支持 prepend 第 1 行）；P2-D 回包逐行 `N:hhhhhh`（≤8 行，编辑后行号，可直接链式）。新增拍板问题 Q10–Q14。§11 的 Phase 2 列表改为指向 §17。
+
+### v5（2026-09-14）— 响应 Phase 2 评审 D4 / D5 / N6 / N7 及小问题
+
+| 编号 | 性质 | 修订 |
+|---|---|---|
+| D4 | 设计缺陷 | 17.1：撤回「edit 侧零改动」——grep 分隔符是 `:`，I2 的 TAB 截断救不了整段过抄。`parseHashRef` 增加定位规则：取第一个「前邻串首或 `:`、后邻 `:`/TAB/串尾」的 `\d+:[0-9a-f]{6}`；miss 文案加 or grep；17.6 加两条过抄用例 + 假 hash 用例。 |
+| D5 | 正确性 | 17.2 开头给出完整分派（`edits` → `after_hash` → `start_hash` → `end_hash` → `old_string`），hunk 级与顶层对称报错带下标；schema `required` 收缩为 `[path]`，顶层 `new_string` 键检查移入非 `edits` 分支；§4 加取代指针；17.6 加分派兜底用例。 |
+| N6 | 口径 | 17.2：重叠**只按行号**判定（字节闭区间会误杀「after 第 5 行 + 替换 6–10」的合法相邻）；应用用半开字节区间 `[a,b)`，插入 `[p,p)`，同偏移时 insert 在前。 |
+| N7 | 口径 | 17.3：末行无最终换行时，工具不发明尾换行、模型显式尾 `\n` 保留（与 §7/I4 同口径）；17.6 加 `new_string="x\n"` 用例。 |
+| 小 | 各处 | 「против」笔误改「对照」；§11 子弹删「自底向上」改指 §17；C21 扩到摘要并封顶 3 条；grep 金值列为预期改动、子串断言不当格式门（17.6 开头）；`displayGrepMatches` 必须补抄 `Hash`；context 回退行同格式带 hash；17.4 行号公式写死（Δ 与前缀和）；空文件 + `after_hash` 报错指 `write_file`；prepend 维持限制、不开 `before_hash`。 |
+| Q10–Q14 | 拍板 | 全部落成「已采纳」（Q10 含摘要封顶）。 |
+
+### Phase 2 实施记录（2026-09-14）— 与设计的偏差
+
+| # | 偏差 | 说明 |
+|---|---|---|
+| I6 | D4 的定位规则归并了 I2 | `parseHashRef` 先做 TAB 截断，再跑 `locateHashRef` 单一扫描（前邻串首或 `:`、后邻 `:`/TAB/串尾）；read_file 与 grep 两种过抄同一条路径处理，严格超集。 |
+| I7 | prompt 金值再次移动 | §17.1 的提示词扩句 +64 字节，`promptbuild_golden_test.go` 按 I1 惯例更新并记录。 |
+| I8 | `after_hash` 的防御性守卫 | 单 ref 经 §5.2 解析，评分数学上单行 span 必不劣于跨段 span，理论上拿不到 `s≠e`；实现仍显式拒绝 `s≠e`，当不变量守卫而非可达分支。 |
+| I9 | 多 hunk 回包 Data 多一个键 | 除设计定义的 `hunks` 数组外，顶层再带 `start_line`（= 文件序首个 hunk 起始行），与单 hunk 的 Data 形状兼容。 |
+| I10 | 测试文件组织 | Phase 2 用例集中在新文件 `hashline_phase2_test.go`；grep 金值按 17.6 更新（`grep_test.go` 的 `a.txt:3:7127c2: target line` 与 `:1:72e62b: ` 两处），`TestEditFile_OldStringCopiedFromRangeRead` 哨兵未动、保持绿色。 |

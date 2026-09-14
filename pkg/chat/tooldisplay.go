@@ -26,6 +26,12 @@ func (m *tuiModel) renderToolDiff(name string, args, data map[string]any) string
 	startLine := dataInt(data, "start_line")
 	switch name {
 	case "edit_file":
+		if _, ok := args["edits"]; ok {
+			// Multi-hunk mode: one diff block per hunk from Data["hunks"], in
+			// file order. Absent hunks data (a replayed transcript from an
+			// older session) falls back to the generic result preview.
+			return m.renderHunkDiffs(path, data)
+		}
 		oldStr, _ := args["old_string"].(string)
 		if oldStr == "" {
 			// Hash mode sends no old text in the arguments; the handler returns
@@ -51,6 +57,32 @@ func (m *tuiModel) renderToolDiff(name string, args, data map[string]any) string
 		return m.renderTodoList(data)
 	}
 	return ""
+}
+
+// renderHunkDiffs renders a multi-hunk edit_file result: one diffBlock per
+// entry of Data["hunks"], stacked in file order. Returns "" when the hunks
+// data is missing or empty, so the caller's generic preview path takes over.
+func (m *tuiModel) renderHunkDiffs(path string, data map[string]any) string {
+	raw, ok := data["hunks"].([]map[string]any)
+	if !ok {
+		// A JSON round-trip (persisted transcript) loses the concrete type.
+		anys, ok2 := data["hunks"].([]any)
+		if !ok2 {
+			return ""
+		}
+		for _, a := range anys {
+			if h, ok3 := a.(map[string]any); ok3 {
+				raw = append(raw, h)
+			}
+		}
+	}
+	var blocks []string
+	for _, h := range raw {
+		oldText, _ := h["old_text"].(string)
+		newText, _ := h["new_string"].(string)
+		blocks = append(blocks, m.diffBlock(path, lineDiff(diffSplit(oldText), diffSplit(newText)), dataInt(h, "start_line")))
+	}
+	return strings.Join(blocks, "\n")
 }
 
 // renderTodoList renders the todo_write result's Data["todos"] as a

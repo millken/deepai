@@ -74,3 +74,29 @@ func TestRenderToolDiff_EditFileHashModeUsesOldText(t *testing.T) {
 		t.Fatalf("hash-mode diff lost the new text:\n%s", d)
 	}
 }
+
+// TestRenderToolDiff_EditFileMultiHunk guards HASHLINE_EDIT_DESIGN §17.5: a
+// multi-hunk edit renders one stacked diff block per Data["hunks"] entry, and
+// a result without hunks data (older transcript) falls back to "" so the
+// generic preview path takes over instead of crashing or lying.
+func TestRenderToolDiff_EditFileMultiHunk(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+
+	args := map[string]any{"path": "foo.go", "edits": []any{}}
+	data := map[string]any{
+		"hunks": []map[string]any{
+			{"start_line": 2, "old_text": "old-a\n", "new_string": "new-a"},
+			{"start_line": 9, "old_text": "", "new_string": "inserted-b"},
+		},
+	}
+	d := m.renderToolDiff("edit_file", args, data)
+	for _, want := range []string{"old-a", "new-a", "inserted-b"} {
+		if !strings.Contains(d, want) {
+			t.Fatalf("multi-hunk diff missing %q:\n%s", want, d)
+		}
+	}
+
+	if got := m.renderToolDiff("edit_file", args, map[string]any{}); got != "" {
+		t.Fatalf("missing hunks data must fall back to the generic preview, got:\n%s", got)
+	}
+}

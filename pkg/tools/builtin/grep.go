@@ -16,6 +16,10 @@ type grepMatch struct {
 	File    string `json:"file"`
 	Line    int    `json:"line"`
 	Content string `json:"content"`
+	// Hash is the hashline content hash of the line (HASHLINE_EDIT_DESIGN
+	// §17.1): rendered as file:line:hash: content so the line:hash pair can be
+	// copied straight into edit_file's start_hash/end_hash without a read.
+	Hash string `json:"hash"`
 }
 
 func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
@@ -107,7 +111,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		})
 	} else {
 		for _, m := range displayMatches {
-			fmt.Fprintf(&b, "%s:%d: %s\n", m.File, m.Line, m.Content)
+			fmt.Fprintf(&b, "%s:%d:%s: %s\n", m.File, m.Line, m.Hash, m.Content)
 		}
 	}
 
@@ -214,6 +218,7 @@ func searchFile(path string, re *regexp.Regexp, limit int) ([]grepMatch, error) 
 				File:    path,
 				Line:    i + 1,
 				Content: line,
+				Hash:    lineHash(line),
 			})
 			if len(matches) >= limit {
 				break
@@ -249,8 +254,11 @@ func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLi
 		}
 		lines, err := readFileLines(fr.path)
 		if err != nil {
+			// The file went unreadable between search and render; the match
+			// still carries its content, so the fallback lines keep the same
+			// file:line:hash: format rather than degrading to a hashless one.
 			for _, m := range fr.matches {
-				fmt.Fprintf(b, "%s:%d: %s\n", m.File, m.Line, m.Content)
+				fmt.Fprintf(b, "%s:%d:%s: %s\n", m.File, m.Line, m.Hash, m.Content)
 			}
 			continue
 		}
@@ -277,7 +285,9 @@ func renderMatchesWithContext(b *strings.Builder, matches []grepMatch, contextLi
 			if displayPath != nil {
 				shownPath = displayPath(fr.path)
 			}
-			fmt.Fprintf(b, "%s:%d: %s\n", shownPath, ln, lines[ln-1])
+			// Context lines carry hashes too (Q11): match ± context is a
+			// ready-made start/end anchor pair for a range edit with no read.
+			fmt.Fprintf(b, "%s:%d:%s: %s\n", shownPath, ln, lineHash(lines[ln-1]), lines[ln-1])
 			prev = ln
 		}
 	}
@@ -293,17 +303,23 @@ func displayGrepMatches(ctx context.Context, matches []grepMatch) []grepMatch {
 			File:    displayVirtualPath(ctx, match.File),
 			Line:    match.Line,
 			Content: match.Content,
+			Hash:    match.Hash,
 		}
 	}
 	return out
 }
 
+// readFileLines splits a file the same way read_file and edit_file do
+// (splitFileLines): a trailing newline does not open a phantom empty last
+// line. Before hashline this used a bare strings.Split, and a pattern that
+// can match the empty string would report a line number the other tools do
+// not recognize.
 func readFileLines(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return strings.Split(string(data), "\n"), nil
+	return splitFileLines(string(data)), nil
 }
 
 // binarySniffBytes is how much of a file's head is inspected for binary
@@ -368,7 +384,7 @@ func isBinaryExt(ext string) bool {
 func GrepTool() models.Tool {
 	return models.Tool{
 		Name:         "grep",
-		Description:  "Search file contents by regex pattern. Returns matching file:line:content entries. Skips binary files and hidden directories (.git, node_modules, vendor).",
+		Description:  "Search file contents by regex pattern. Returns file:line:hash: content entries — copy the line:hash pair into edit_file's start_hash/end_hash to edit without reading first. Skips binary files and hidden directories (.git, node_modules, vendor).",
 		Groups:       []string{"builtin", "file_ops"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{

@@ -27,6 +27,17 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if strings.TrimSpace(path) == "" {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("path is required")
 	}
+
+	displayPath := strings.TrimSpace(path)
+	path = resolveWritablePath(ctx, path)
+
+	// Multi-hunk mode dispatches first (HASHLINE_EDIT_DESIGN §17.2 D5): each
+	// hunk carries its own new_string, so the top-level key checks below do
+	// not apply; every other top-level locator argument is ignored.
+	if editsRaw, hasEdits := args["edits"]; hasEdits {
+		return editByHunks(ctx, call, path, displayPath, editsRaw)
+	}
+
 	// A missing key is not an empty string: in hash mode "" means "delete the
 	// range", so a model that forgot new_string must get an error, not a
 	// silent deletion.
@@ -36,15 +47,24 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("new_string is required (pass an empty string to delete the range)")
 	}
 
-	displayPath := strings.TrimSpace(path)
-	path = resolveWritablePath(ctx, path)
-
-	// Mode dispatch runs before the old_string checks: in hash mode
+	// Mode dispatch runs before the old_string checks: in hash modes
 	// old_string is not needed (and ignored if sent), as is replace_all —
 	// a hash range means "this one place".
 	startHashArg, _ := args["start_hash"].(string)
 	endHashArg, _ := args["end_hash"].(string)
-	if strings.TrimSpace(startHashArg) != "" {
+	afterHashArg, _ := args["after_hash"].(string)
+	hasStart := strings.TrimSpace(startHashArg) != ""
+	hasAfter := strings.TrimSpace(afterHashArg) != ""
+	if hasAfter && hasStart {
+		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("after_hash and start_hash are mutually exclusive; use start_hash/end_hash to replace a range, after_hash to insert after a line")
+	}
+	if hasAfter {
+		if newStr == "" {
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("new_string must not be empty when inserting with after_hash")
+		}
+		return editByInsertAfter(ctx, call, path, displayPath, afterHashArg, newStr)
+	}
+	if hasStart {
 		return editByHashRange(ctx, call, path, displayPath, startHashArg, endHashArg, newStr)
 	}
 	if strings.TrimSpace(endHashArg) != "" {
@@ -186,7 +206,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		)
 	}
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
-		"old_string not found in %s; send the file's own text: drop the line number prefix that read_file adds (\"12<TAB>\") or grep adds (\"file.go:12: \"), and use real newlines and tabs (not escaped \\n/\\t), then retry edit_file",
+		"old_string not found in %s; send the file's own text: drop the line number prefix that read_file adds (\"12:a3f2b1<TAB>\") or grep adds (\"file.go:12:a3f2b1: \"), and use real newlines and tabs (not escaped \\n/\\t), then retry edit_file",
 		displayPath,
 	)
 }
@@ -549,25 +569,41 @@ func filePerm(path string, def os.FileMode) os.FileMode {
 func EditFileTool() models.Tool {
 	return models.Tool{
 		Name: "edit_file",
-		Description: "Replace text in a file, two modes. Hash mode (preferred after read_file): copy the whole N:hhhhhh prefix of the first and last line of the range into start_hash/end_hash and send only new_string — do not restate the old text; the inclusive line range is replaced (empty new_string deletes it). " +
-			"old_string mode (when you have no hashes — grep hits, raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching. " +
+		Description: "Replace text in a file. Hash mode (preferred after read_file or grep): copy the whole N:hhhhhh prefix of the first and last line of the range into start_hash/end_hash and send only new_string — do not restate the old text; the inclusive line range is replaced (empty new_string deletes it). " +
+			"after_hash inserts new_string after that line instead (cannot insert before line 1). " +
+			"edits applies several such hunks in one call against the same read: an array of {start_hash, end_hash, new_string} or {after_hash, new_string}; hunks must not overlap, and the call is atomic — any bad hunk means nothing is written. " +
+			"old_string mode (when you have no hashes — raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching (grep's file:line:hash: prefix is not stripped). " +
 			"Optional start_line/end_line (1-based, inclusive) scope an old_string search to that line window, so a short old_string that repeats elsewhere still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
 			"old_string falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
-			"Both modes fail safely on missing or ambiguous targets; on failure, re-read the file with read_file and copy hashes or text from its output.",
+			"All modes fail safely on missing or ambiguous targets; on failure, re-read the file with read_file and copy hashes or text from its output.",
 		Groups: []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":        map[string]any{"type": "string", "description": "File path to edit"},
-				"start_hash":  map[string]any{"type": "string", "description": "Hash mode: first line of the range — copy the whole N:hhhhhh prefix from read_file"},
-				"end_hash":    map[string]any{"type": "string", "description": "Hash mode: last line of the range (defaults to start_hash for a single line)"},
-				"old_string":  map[string]any{"type": "string", "description": "Exact text to find (must be unique unless replace_all is set); not needed in hash mode"},
+				"path":       map[string]any{"type": "string", "description": "File path to edit"},
+				"start_hash": map[string]any{"type": "string", "description": "Hash mode: first line of the range — copy the whole N:hhhhhh prefix from read_file or grep"},
+				"end_hash":   map[string]any{"type": "string", "description": "Hash mode: last line of the range (defaults to start_hash for a single line)"},
+				"after_hash": map[string]any{"type": "string", "description": "Insert mode: N:hhhhhh prefix of the line to insert new_string after"},
+				"edits": map[string]any{
+					"type":        "array",
+					"description": "Multi-hunk mode: non-overlapping hunks applied atomically against the same read",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"start_hash": map[string]any{"type": "string"},
+							"end_hash":   map[string]any{"type": "string"},
+							"after_hash": map[string]any{"type": "string"},
+							"new_string": map[string]any{"type": "string"},
+						},
+					},
+				},
+				"old_string":  map[string]any{"type": "string", "description": "Exact text to find (must be unique unless replace_all is set); not needed in hash modes"},
 				"new_string":  map[string]any{"type": "string", "description": "Replacement text (empty string deletes the hash range)"},
 				"replace_all": map[string]any{"type": "boolean", "description": "old_string mode: replace all occurrences instead of requiring a unique match (confined to start_line/end_line when set)"},
 				"start_line":  map[string]any{"type": "number", "description": "old_string mode: 1-based inclusive first line to search; restricts matching to this window"},
 				"end_line":    map[string]any{"type": "number", "description": "old_string mode: 1-based inclusive last line to search; pairs with start_line (defaults to EOF)"},
 			},
-			"required": []any{"path", "new_string"},
+			"required": []any{"path"},
 		},
 		Handler: EditFileHandler,
 	}
