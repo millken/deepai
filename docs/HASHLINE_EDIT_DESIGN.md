@@ -405,10 +405,25 @@ hash 模式下 `args["old_string"]` 为空，diff 会变成「纯新增」，**�
 - `after_hash` 纯插入（17.3）。
 - 成功回包带新区间逐行 hash（17.4）。
 
-**Phase 3 — 只在 hash 模式成为主路径之后**
+**Phase 3 — 只在 hash 模式成为实测主路径之后**
 
-- 评估能否收缩 unescape / strip / whitespace 容错（**不能删**：grep 与 raw span 仍走 `old_string`）。
+- 评估能否收缩 unescape / strip / whitespace 容错（**不能删**：raw span 仍走 `old_string`；grep 自 Phase 2 起已带 hash，不再是保留理由）。
 - 不删除 `old_string`。
+
+**触发判据（写死，免得到时凭感觉）。** 三个信号全部可从 `~/.deepai/sessions/*.json` 离线统计（会话持久化了 `tool_calls.arguments` 与 `tool_result.content/error`），零新增埋点：
+
+1. **模式份额**：按 arguments 分类——有 `edits` / `after_hash` / `start_hash` 的算 hash 系，其余算 `old_string`。
+2. **各模式失败率**：`old_string not found`（old 路径 miss）；`not in`（hash miss）；`matches N spans` / `occurs N times`（歧义拒绝）。
+3. **容错层使用率**——Phase 3 **真正的开关**：三层容错每次实际救回编辑，成功消息都带注记 `escape-normalized` / `line-number prefixes stripped` / `whitespace-tolerant match`，直接数窗口内出现次数。
+
+| 条件 | 阈值 | 不满足时 |
+|---|---|---|
+| 样本量 | 累计 ≥200 次 `edit_file` 且跨 ≥2 周真实使用 | 继续等；不足量的份额没有统计意义 |
+| 主路径 | hash 系份额 ≥70% | 先查提示词/描述为何模型不用，不是开 Phase 3 |
+| 质量不劣化 | hash 系一次成功率 ≥ `old_string`；歧义拒绝 <5% | 先回 §5.2 调参，不是开 Phase 3 |
+| **收缩开关（逐层）** | 该层的注记在窗口内归零或接近零 | 哪层注记还在出现，哪层就不能收 |
+
+份额达标不等于可以收缩：只要 `whitespace-tolerant match` 还在救 raw-span 场景的编辑，那层就是活的。最可能先死的是 strip 层——模型拿到 hash 后不再贴编号前缀。评估时写个十几行脚本扫 sessions 即可；观测窗口自 Phase 2 合入（2026-09-14，`e5f5177`）起算，本机此前的会话史里只有 2 次 `edit_file`（皆为 hashline 之前的 `old_string`），不计入。
 
 ---
 
@@ -758,3 +773,7 @@ Replaced lines 12-18 (a3f2b1..7e88aa) in foo.go with 4 lines: 12:d1e2f3 13:0aa1b
 | I8 | `after_hash` 的防御性守卫 | 单 ref 经 §5.2 解析，评分数学上单行 span 必不劣于跨段 span，理论上拿不到 `s≠e`；实现仍显式拒绝 `s≠e`，当不变量守卫而非可达分支。 |
 | I9 | 多 hunk 回包 Data 多一个键 | 除设计定义的 `hunks` 数组外，顶层再带 `start_line`（= 文件序首个 hunk 起始行），与单 hunk 的 Data 形状兼容。 |
 | I10 | 测试文件组织 | Phase 2 用例集中在新文件 `hashline_phase2_test.go`；grep 金值按 17.6 更新（`grep_test.go` 的 `a.txt:3:7127c2: target line` 与 `:1:72e62b: ` 两处），`TestEditFile_OldStringCopiedFromRangeRead` 哨兵未动、保持绿色。 |
+
+### v6（2026-09-14）— Phase 3 触发判据
+
+§11 Phase 3 的「hash 模式成为实测主路径」从一句话落成可执行判据：三个信号（模式份额 / 各模式失败率 / 容错层注记使用率）全部离线统计自 `sessions/*.json`，零新增埋点；四条阈值（样本量 ≥200 次且跨 ≥2 周、hash 系份额 ≥70%、质量不劣化、**逐层**注记归零才收对应层）。同时修正过时表述：grep 自 Phase 2 起已带 hash，不再是保留 `old_string` 容错的理由（raw span 仍是）。观测窗口自 `e5f5177` 起算。
