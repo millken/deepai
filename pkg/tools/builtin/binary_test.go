@@ -83,8 +83,9 @@ func TestReadFile_TextFileUnaffected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Content != "package main\n// 中文\n" {
-		t.Fatalf("text read changed: %q", res.Content)
+	want := numberedFileText("package main", "// 中文")
+	if res.Content != want {
+		t.Fatalf("text read changed: %q want %q", res.Content, want)
 	}
 }
 

@@ -223,3 +223,16 @@ func TestReadFile_RangeStillNumbersByDefault(t *testing.T) {
 		t.Fatalf("default range mode must stay numbered (with hashline prefix), got %q", res.Content)
 	}
 }
+
+// numberedFileText renders what read_file now returns for a whole-file read:
+// every line carries the N:hhhhhh prefix that edit_file's hash modes take back.
+// Tests that only care about WHICH file was read use it so they assert the real
+// contract instead of re-deriving the prefix by hand.
+func numberedFileText(lines ...string) string {
+	var b strings.Builder
+	width := numWidth(len(lines))
+	for i, ln := range lines {
+		writeHashNumberedLine(&b, width, i+1, ln)
+	}
+	return b.String()
+}

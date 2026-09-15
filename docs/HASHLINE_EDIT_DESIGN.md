@@ -1,6 +1,6 @@
 # Hashline 编辑 — 设计稿（供评审）
 
-> 状态：**Phase 1 已实施并合入（`747799c`）；§17 Phase 2 设计 v5 修订稿，待终审**。调研日期 2026-09-14。v2 响应 D1–D3 / F1；v3 响应 N1–N5；v5 响应 D4–D5 / N6–N7。见文末「修订记录」。
+> 状态：**Phase 1 / Phase 2 均已实施并合入（`747799c` / `e5f5177`）；v7 按首轮实测修正了 `edits` 的 hunk 形状与读侧编号默认值**。调研日期 2026-09-14。v2 响应 D1–D3 / F1；v3 响应 N1–N5；v5 响应 D4–D5 / N6–N7；v6 定 Phase 3 判据；v7 记首轮统计。见文末「修订记录」。
 > 目标：读文件时给每行一个短 hash；模型用 **hash 范围 + 新内容** 编辑，不再复述旧文本，从而大幅节省 **输出 token**，并消灭「凭记忆重打 `old_string`」这一主失败模式。
 > 不在本文范围：实现。本文只定语义、格式、兼容策略与分期，供评审否决或修订后再动代码。
 
@@ -279,11 +279,10 @@ read 一次
 | `read_file` 路径 | 是否带 `N:hhhhhh<TAB>` |
 |---|---|
 | range 且未显式 `line_numbers=false` | 是（今日已默认编号，`file.go:110`） |
-| `line_numbers=true` 的全文 | 是 |
+| 全文 / `full=true` 且未显式 `line_numbers=false` | 是（**v7 起**默认编号；此前为否，见修订记录） |
 | outline 的 head / tail | 是（`shaping.go:57,74`；模型常直接改文件头/尾） |
 | outline 的 `--- symbols ---` | 否，仍 `L  42  func Foo`（`shaping.go:63`，不含 `:`，C7 成立） |
-| `line_numbers=false` 的 raw span | 否（`file.go:96-105`）。这是今日「干净 old_string」逃生口，保持可粘贴 |
-| `full=true` 且未开 `line_numbers` | 否，与今日一致（原文） |
+| `line_numbers=false`（range 或全文） | 否。这是「干净 old_string」逃生口，保持可粘贴 |
 | 二进制 / 空文件 | 不变 |
 
 **不**做 `hashlines=` 开关。再加一个开关等于让模型猜「这次有没有 hash」。编号输出一律带 hash；要原文去 `line_numbers=false`。
@@ -777,3 +776,22 @@ Replaced lines 12-18 (a3f2b1..7e88aa) in foo.go with 4 lines: 12:d1e2f3 13:0aa1b
 ### v6（2026-09-14）— Phase 3 触发判据
 
 §11 Phase 3 的「hash 模式成为实测主路径」从一句话落成可执行判据：三个信号（模式份额 / 各模式失败率 / 容错层注记使用率）全部离线统计自 `sessions/*.json`，零新增埋点；四条阈值（样本量 ≥200 次且跨 ≥2 周、hash 系份额 ≥70%、质量不劣化、**逐层**注记归零才收对应层）。同时修正过时表述：grep 自 Phase 2 起已带 hash，不再是保留 `old_string` 容错的理由（raw span 仍是）。观测窗口自 `e5f5177` 起算。
+
+### v7（2026-09-15）— 首轮实测（164 次 `edit_file`）与两处修正
+
+Phase 2 合入后第一次按 §11 判据离线统计（窗口 2026-09-14 08:22 → 09-15 08:56，1 个会话，模型 glm-5.3，164 次 `edit_file` / 64 次 `read_file` / 10 次 grep）。结论：**Phase 3 不开**，三条判据全部不满足。
+
+| 信号 | 实测 |
+|---|---|
+| 模式份额 | hash 系 34/164 = **20.7%**（`edits` 27 / `after_hash` 5 / `start_hash` 2）；按天 24.6% → 0% |
+| 一次成功率 | hash 系 26/34 = 76.5%，`old_string` 129/130 = 99.2%（hash 系**更差**） |
+| 容错层注记 | `escape-normalized` 0、`line-number prefixes stripped` 0、`whitespace-tolerant match` 0（全库 13 次均在窗口之前） |
+
+两个可定位的原因，本次各修一处：
+
+1. **`edits` 的形状与模型预期不符。** 8 次 hash 失败里有 **5 次**是同一形状：模型把 `edits` 当成「一次多个 `old_string` 编辑」，每个元素只给 `{old_string, new_string}`，命中 §17.2 的 `needs start_hash (replace) or after_hash (insert)` 而整批不写，随后退回一次一个 `old_string` 调用。修正：**`edits` 的 hunk 允许用 `old_string` 定位**，与 hash hunk 可混用。语义与 `old_string` 模式一致（同一条归一化阶梯 + 空白容忍，`replace_all` 不适用——一个 hunk 就是一处，重复匹配报错）；定位得到的是**精确字节 span**，因此两个 `old_string` hunk 之间按字节判重叠（同一行内的两处互不相干的改动合法），与 hash hunk 之间仍按行判。原子性、错误合并上报、回包形状不变；raw hunk 不产出 `N:hhhhhh` 链式引用（非整行替换时算不出正确 hash，宁可不给），但其行数增量仍计入后续 hunk 的引用偏移。
+2. **整文件读不带 hash。** `read_file` 无 range 且未显式传 `line_numbers` 时走的是裸文本分支，输出无 hash——窗口内 9 次这样的读，之后只能用 `old_string`。修正：**编号输出改为全局默认**（range 与整文件一致），`line_numbers=false` 仍是取裸文本的逃生口。大文件 outline 分支本就带 hash，不受影响。读侧金值断言按 §13 惯例更新（`binary_test.go` 一处、`file_test.go` 四处，均为「读到了哪个文件」而非格式本身的断言，改用新增的 `numberedFileText` 助手）。
+
+另外两类 hash 失败量小但已知：2 次 `start_hash ... not in <file>`（同一文件前面的编辑已使该 hash 过期，符合 §5.2 的设计——失败而非写错），1 次把整行原文当 `start_hash`（`parseHashRef` 已按 D4 尽力，此例是模型未抄前缀）。
+
+观测窗口就此重置：下一次评估自本次修正合入起算，仍按 §11 的四条阈值。

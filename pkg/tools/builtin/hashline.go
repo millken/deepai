@@ -216,6 +216,8 @@ func editByInsertAfter(ctx context.Context, call models.ToolCall, path, displayP
 type resolvedHunk struct {
 	idx    int // position in the model's edits array, for error attribution
 	insert bool
+	raw    bool // resolved from old_string: from/to is an exact byte span, not whole lines
+	note   string
 	s, e   int // replace: inclusive range; insert: s==e==anchor line
 	from   int
 	to     int
@@ -228,16 +230,19 @@ type resolvedHunk struct {
 // editByHunks is edit_file's multi-hunk mode (§17.2): every hunk resolves
 // against the SAME original file (hashes computed once), all validation runs
 // before any byte is written, and resolution errors are reported together —
-// one retry fixes them all. Overlap is judged by line numbers; application
-// splices half-open byte spans in one ascending pass, zero-width insertions
-// first at equal offsets.
+// one retry fixes them all. A hunk locates its target by hash range, insertion
+// anchor, or old_string — models reach for edits as "several old_string edits
+// at once", and rejecting that shape wrote nothing and pushed them back to
+// one call per hunk. Overlap is judged by line numbers (by byte span between
+// two old_string hunks); application splices half-open byte spans in one
+// ascending pass, zero-width insertions first at equal offsets.
 func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath string, editsRaw any) (models.ToolResult, error) {
 	fail := func(err error) (models.ToolResult, error) {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, err
 	}
 	list, ok := editsRaw.([]any)
 	if !ok || len(list) == 0 {
-		return fail(fmt.Errorf("edits must be a non-empty array of {start_hash, end_hash, new_string} or {after_hash, new_string} objects"))
+		return fail(fmt.Errorf("edits must be a non-empty array of {start_hash, end_hash, new_string}, {after_hash, new_string} or {old_string, new_string} objects"))
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -264,9 +269,11 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 		startRef, _ := obj["start_hash"].(string)
 		endRef, _ := obj["end_hash"].(string)
 		afterRef, _ := obj["after_hash"].(string)
+		oldStr, _ := obj["old_string"].(string)
 		hasStart := strings.TrimSpace(startRef) != ""
 		hasEnd := strings.TrimSpace(endRef) != ""
 		hasAfter := strings.TrimSpace(afterRef) != ""
+		hasOld := oldStr != ""
 		newRaw, hasNew := obj["new_string"]
 		newStr, newIsString := newRaw.(string)
 		switch {
@@ -282,8 +289,24 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 		case !hasAfter && !hasStart && hasEnd:
 			addErr(i, "end_hash without start_hash; set start_hash (copy the N:hhhhhh prefix)")
 			continue
-		case !hasAfter && !hasStart:
-			addErr(i, "needs start_hash (replace) or after_hash (insert)")
+		case !hasAfter && !hasStart && !hasOld:
+			addErr(i, "needs start_hash (replace), after_hash (insert) or old_string (exact text)")
+			continue
+		}
+		// A hash ref wins over old_string in the same hunk, matching the
+		// top-level dispatch: the hash is checked against the file, the text
+		// is whatever the model remembered.
+		if !hasAfter && !hasStart {
+			from, to, body, note, lerr := locateOldString(content, oldStr, newStr, displayPath)
+			if lerr != nil {
+				addErr(i, "%v", lerr)
+				continue
+			}
+			ls, le := 1+strings.Count(content[:from], "\n"), 1+strings.Count(content[:to-1], "\n")
+			hunks = append(hunks, resolvedHunk{
+				idx: i, raw: true, note: note, s: ls, e: le,
+				from: from, to: to, body: body, rawNew: newStr,
+			})
 			continue
 		}
 		if hasAfter {
@@ -320,7 +343,14 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 			ha, hb := hunks[a], hunks[b]
 			switch {
 			case !ha.insert && !hb.insert:
-				if ha.s <= hb.e && hb.s <= ha.e {
+				// Two old_string hunks carry exact byte spans, so two edits
+				// inside one long line are legal; anything involving a hash
+				// hunk is judged by whole lines, which is the unit it replaces.
+				if ha.raw && hb.raw {
+					if ha.from < hb.to && hb.from < ha.to {
+						addErr(hb.idx, "old_string span (lines %d-%d) overlaps edits[%d] (lines %d-%d)", hb.s, hb.e, ha.idx, ha.s, ha.e)
+					}
+				} else if ha.s <= hb.e && hb.s <= ha.e {
 					addErr(hb.idx, "lines %d-%d overlap edits[%d] (lines %d-%d)", hb.s, hb.e, ha.idx, ha.s, ha.e)
 				}
 			case ha.insert != hb.insert:
@@ -345,6 +375,11 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 	hasFinalNL := strings.HasSuffix(content, "\n")
 	for i := range hunks {
 		h := &hunks[i]
+		if h.raw {
+			// An old_string span is not line-aligned, so neither the trailing
+			// newline rule nor a line count applies to it.
+			continue
+		}
 		from, to, _, _, werr := lineWindow(content, h.s, h.e, displayPath)
 		if werr != nil {
 			return fail(werr)
@@ -387,6 +422,17 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 	dataHunks := make([]map[string]any, 0, len(hunks))
 	for _, h := range hunks {
 		switch {
+		case h.raw:
+			// No N:hhhhhh refs for a raw span: the hashes of the rewritten
+			// lines are only knowable for whole-line replacements, and a wrong
+			// ref is worse than none. The line delta is counted from the bytes
+			// so later hunks' refs still land on post-edit line numbers.
+			verb := "replaced"
+			if h.body == "" {
+				verb = "deleted"
+			}
+			details = append(details, fmt.Sprintf("%s old_string at %s", verb, lineSpanLabel(h.s, h.e)))
+			deltaSum += strings.Count(h.body, "\n") - strings.Count(content[h.from:h.to], "\n")
 		case h.insert:
 			details = append(details, fmt.Sprintf("inserted %d lines after line %d", h.k, h.s))
 			refs = append(refs, newLineRefs(h.body, h.s+1+deltaSum)...)
@@ -417,6 +463,9 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 		shown = append(append([]string{}, details[:3]...), fmt.Sprintf("+%d more", len(details)-3))
 	}
 	msg := fmt.Sprintf("Applied %d edits in %s: %s", len(hunks), displayPath, strings.Join(shown, ", "))
+	if notes := hunkNotes(hunks); notes != "" {
+		msg += " (" + notes + ")"
+	}
 	if totalNew > 0 && totalNew <= maxNewLineRefs {
 		msg += "; new lines: " + strings.Join(refs, " ")
 	}
@@ -429,6 +478,29 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 			"hunks":      dataHunks,
 		},
 	}, nil
+}
+
+// hunkNotes joins the distinct normalization notes the old_string hunks needed,
+// in first-seen order. They are reported for the same reason old_string mode
+// reports them: each note is one tolerance layer proving it is still load-bearing.
+func hunkNotes(hunks []resolvedHunk) string {
+	var seen []string
+	for _, h := range hunks {
+		if h.note == "" {
+			continue
+		}
+		dup := false
+		for _, s := range seen {
+			if s == h.note {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			seen = append(seen, h.note)
+		}
+	}
+	return strings.Join(seen, "; ")
 }
 
 // sortHunksByOffset orders hunks for the splice: ascending byte offset,

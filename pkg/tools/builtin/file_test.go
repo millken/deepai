@@ -36,8 +36,8 @@ func TestReadFileHandlerResolvesThreadVirtualPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFileHandler() error = %v", err)
 	}
-	if result.Content != "hello" {
-		t.Fatalf("content=%q want hello", result.Content)
+	if want := numberedFileText("hello"); result.Content != want {
+		t.Fatalf("content=%q want %q", result.Content, want)
 	}
 }
 
@@ -105,8 +105,8 @@ func TestReadFileHandlerResolvesACPWorkspaceVirtualPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFileHandler() error = %v", err)
 	}
-	if result.Content != "from acp" {
-		t.Fatalf("content=%q want %q", result.Content, "from acp")
+	if want := numberedFileText("from acp"); result.Content != want {
+		t.Fatalf("content=%q want %q", result.Content, want)
 	}
 }
 
@@ -128,8 +128,8 @@ func TestReadFileHandler_PathAliases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadFileHandler() alias args=%v error = %v", args, err)
 		}
-		if result.Content != "alias-content" {
-			t.Fatalf("content=%q want alias-content", result.Content)
+		if want := numberedFileText("alias-content"); result.Content != want {
+			t.Fatalf("content=%q want %q", result.Content, want)
 		}
 	}
 }
@@ -381,7 +381,7 @@ func TestReadFileHandler_ExpandsHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFileHandler() error = %v", err)
 	}
-	if result.Content != "from-home" {
-		t.Fatalf("content=%q want from-home", result.Content)
+	if want := numberedFileText("from-home"); result.Content != want {
+		t.Fatalf("content=%q want %q", result.Content, want)
 	}
 }

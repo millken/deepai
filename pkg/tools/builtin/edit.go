@@ -117,32 +117,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		scope = fmt.Sprintf("lines %d-%d of %s", firstLine, lastLine, displayPath)
 	}
 
-	type candidate struct {
-		oldS, newS string
-		note       string
-	}
-	candidates := []candidate{{oldStr, newStr, ""}}
-	if uOld, uNew := unescapeLiteral(oldStr), unescapeLiteral(newStr); uOld != oldStr && uOld != uNew {
-		candidates = append(candidates, candidate{uOld, uNew, "escape-normalized"})
-	}
-	// read_file renders ranges and outlines as "<lineno>\t<content>"; models
-	// routinely paste that back verbatim. Try again with the prefixes removed,
-	// but only after literal matching failed, so genuine tab-separated data is
-	// never rewritten by this path.
-	if sOld, ok := stripLineNumberPrefixes(oldStr); ok && sOld != oldStr {
-		sNew, newStripped := stripLineNumberPrefixes(newStr)
-		// If new_string carries prefixes but does not strip cleanly — deleting a
-		// line makes its numbering jump, which is the common case — there is no
-		// safe replacement text. Using it as-is would write the visible line
-		// numbers into the file while old_string matched the real text, i.e.
-		// silent corruption reported as success. Skip the candidate and let the
-		// edit fail instead.
-		if newStripped || !looksLineNumbered(newStr) {
-			if sOld != sNew {
-				candidates = append(candidates, candidate{sOld, sNew, "line-number prefixes stripped"})
-			}
-		}
-	}
+	candidates := editCandidates(oldStr, newStr)
 
 	for _, c := range candidates {
 		updatedRegion, n, offset, kind, err := applyEdit(region, c.oldS, c.newS, replaceAll, scope)
@@ -423,6 +398,97 @@ func applyEdit(content, oldS, newS string, replaceAll bool, displayPath string) 
 	return "", 0, 0, "", nil
 }
 
+// locateOldString resolves an old_string hunk to a byte span of content
+// without writing anything, running the same normalization ladder and
+// whitespace fallback as old_string mode. It exists so edits can carry raw
+// hunks alongside hash hunks (the observed failure was models sending
+// {old_string, new_string} objects in edits and getting nothing written);
+// multi-hunk resolution must happen for every hunk before the first byte is
+// spliced, so applyEdit's replace-in-place shape does not fit. replace_all has
+// no meaning here — a hunk is one place — so a repeated match is an error.
+func locateOldString(content, oldStr, newStr, scope string) (from, to int, body, note string, err error) {
+	for _, c := range editCandidates(oldStr, newStr) {
+		if n := strings.Count(content, c.oldS); n > 0 {
+			if n > 1 {
+				return 0, 0, "", "", fmt.Errorf(
+					"old_string matches %d times in %s; add surrounding context to make it unique (replace_all does not apply inside edits)",
+					n, scope,
+				)
+			}
+			i := strings.Index(content, c.oldS)
+			return i, i + len(c.oldS), c.newS, c.note, nil
+		}
+		if len(strings.TrimSpace(normalizeWhitespace(c.oldS))) < 8 {
+			continue
+		}
+		spans := findWhitespaceTolerantSpans(content, c.oldS)
+		if len(spans) == 0 {
+			continue
+		}
+		if len(spans) > 1 {
+			return 0, 0, "", "", fmt.Errorf(
+				"old_string matches %d locations in %s after whitespace normalization; add surrounding context to make it unique",
+				len(spans), scope,
+			)
+		}
+		notes := "whitespace-tolerant match"
+		if c.note != "" {
+			notes = c.note + ", " + notes
+		}
+		return spans[0][0], spans[0][1], conformLineEndings(c.newS, content), notes, nil
+	}
+
+	if hint := nearestMissHint(content, oldStr); hint != "" {
+		return 0, 0, "", "", fmt.Errorf(
+			"old_string not found in %s. %s Re-read that range with read_file and copy the file's own text — or copy the N:hhhhhh prefixes into start_hash/end_hash instead",
+			scope, hint,
+		)
+	}
+	return 0, 0, "", "", fmt.Errorf(
+		"old_string not found in %s; send the file's own text (drop read_file's \"12:a3f2b1<TAB>\" prefix, use real newlines and tabs), or copy that prefix into start_hash/end_hash instead",
+		scope,
+	)
+}
+
+// editCandidate is one (old, new) pair to try against the file, with the note
+// that names the normalization that produced it. The ladder is ordered: the
+// literal strings first, so a file whose real text contains "\\n" or a numbered
+// column is never rewritten by a normalization that merely looked plausible.
+type editCandidate struct {
+	oldS, newS string
+	note       string
+}
+
+// editCandidates builds the normalization ladder shared by old_string mode and
+// the old_string hunks inside edits: literal, then escape-normalized (the model
+// wrote the two-character "\\n"), then with read_file's numbered prefixes
+// stripped (the model pasted the transcript back).
+func editCandidates(oldStr, newStr string) []editCandidate {
+	candidates := []editCandidate{{oldStr, newStr, ""}}
+	if uOld, uNew := unescapeLiteral(oldStr), unescapeLiteral(newStr); uOld != oldStr && uOld != uNew {
+		candidates = append(candidates, editCandidate{uOld, uNew, "escape-normalized"})
+	}
+	// read_file renders ranges and outlines as "<lineno>:<hash>\t<content>";
+	// models routinely paste that back verbatim. Try again with the prefixes
+	// removed, but only after literal matching failed, so genuine tab-separated
+	// data is never rewritten by this path.
+	if sOld, ok := stripLineNumberPrefixes(oldStr); ok && sOld != oldStr {
+		sNew, newStripped := stripLineNumberPrefixes(newStr)
+		// If new_string carries prefixes but does not strip cleanly — deleting a
+		// line makes its numbering jump, which is the common case — there is no
+		// safe replacement text. Using it as-is would write the visible line
+		// numbers into the file while old_string matched the real text, i.e.
+		// silent corruption reported as success. Skip the candidate and let the
+		// edit fail instead.
+		if newStripped || !looksLineNumbered(newStr) {
+			if sOld != sNew {
+				candidates = append(candidates, editCandidate{sOld, sNew, "line-number prefixes stripped"})
+			}
+		}
+	}
+	return candidates
+}
+
 func unescapeLiteral(s string) string {
 	if !strings.Contains(s, "\\") {
 		return s
@@ -571,7 +637,7 @@ func EditFileTool() models.Tool {
 		Name: "edit_file",
 		Description: "Replace text in a file. Hash mode (preferred after read_file or grep): copy the whole N:hhhhhh prefix of the first and last line of the range into start_hash/end_hash and send only new_string — do not restate the old text; the inclusive line range is replaced (empty new_string deletes it). " +
 			"after_hash inserts new_string after that line instead (cannot insert before line 1). " +
-			"edits applies several such hunks in one call against the same read: an array of {start_hash, end_hash, new_string} or {after_hash, new_string}; hunks must not overlap, and the call is atomic — any bad hunk means nothing is written. " +
+			"edits applies several hunks in one call against the same read: an array of {start_hash, end_hash, new_string}, {after_hash, new_string} or {old_string, new_string} (mixable); hunks must not overlap, and the call is atomic — any bad hunk means nothing is written. " +
 			"old_string mode (when you have no hashes — raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching (grep's file:line:hash: prefix is not stripped). " +
 			"Optional start_line/end_line (1-based, inclusive) scope an old_string search to that line window, so a short old_string that repeats elsewhere still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
 			"old_string falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
@@ -586,13 +652,14 @@ func EditFileTool() models.Tool {
 				"after_hash": map[string]any{"type": "string", "description": "Insert mode: N:hhhhhh prefix of the line to insert new_string after"},
 				"edits": map[string]any{
 					"type":        "array",
-					"description": "Multi-hunk mode: non-overlapping hunks applied atomically against the same read",
+					"description": "Multi-hunk mode: non-overlapping hunks applied atomically against the same read. Each hunk locates its target by start_hash/end_hash (replace a line range), after_hash (insert) or old_string (exact text, must be unique); new_string is always required",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"start_hash": map[string]any{"type": "string"},
 							"end_hash":   map[string]any{"type": "string"},
 							"after_hash": map[string]any{"type": "string"},
+							"old_string": map[string]any{"type": "string", "description": "Exact text to replace in this hunk, when you have no hashes; must match uniquely"},
 							"new_string": map[string]any{"type": "string"},
 						},
 					},
