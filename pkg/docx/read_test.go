@@ -268,6 +268,8 @@ func TestRead_UnknownHeadingErrors(t *testing.T) {
 	}
 	if _, err := d.Read(ReadOptions{Heading: "No Such Heading"}); err == nil {
 		t.Fatal("Read with an unknown heading returned nil error")
+	} else if !strings.Contains(err.Error(), `"Chapter One"`) {
+		t.Fatalf("error should list the document's headings: %v", err)
 	}
 }
 

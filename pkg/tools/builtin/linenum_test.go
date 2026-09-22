@@ -133,11 +133,9 @@ func TestEditFile_PartiallyNumberedNotStripped(t *testing.T) {
 
 func TestEditFile_NotFoundErrorMentionsLineNumberPrefix(t *testing.T) {
 	path := writeTestFile(t, "hello world\n")
-	_, err := editCall(t, path, "nonexistent snippet here", "x", false)
-	if err == nil {
+	if _, err := editCall(t, path, "3\tnonexistent snippet here", "x", false); err == nil {
 		t.Fatal("expected error for missing old_string")
-	}
-	if !strings.Contains(err.Error(), "line number") {
+	} else if !strings.Contains(err.Error(), "line-number prefix") {
 		t.Fatalf("error should warn about line-number prefixes: %v", err)
 	}
 }

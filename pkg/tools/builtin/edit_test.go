@@ -219,10 +219,24 @@ func TestEditFile_NotFoundGivesActionableError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing old_string")
 	}
-	if !strings.Contains(err.Error(), "retry edit_file") {
+	if !strings.Contains(err.Error(), "read_file") {
 		t.Fatalf("error not actionable: %v", err)
 	}
 	_ = res
+}
+
+func TestEditFile_NotFoundDistinguishesPastedPrefixFromUnwrittenText(t *testing.T) {
+	path := writeTestFile(t, "alpha\nbeta\n")
+
+	_, err := editCall(t, path, "2:6016e5\tgamma", "x", false)
+	if err == nil || !strings.Contains(err.Error(), "line-number prefix") {
+		t.Fatalf("pasted-prefix miss should point at the prefix: %v", err)
+	}
+
+	_, err = editCall(t, path, "func neverWritten() {", "x", false)
+	if err == nil || !strings.Contains(err.Error(), "never have been written") {
+		t.Fatalf("unwritten-text miss should say the text is not in the file: %v", err)
+	}
 }
 
 func TestEditFile_LiteralBackslashContentStillMatches(t *testing.T) {

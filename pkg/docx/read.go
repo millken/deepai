@@ -509,7 +509,19 @@ func (d *Document) resolveReadRange(opts ReadOptions, total int) (start, end int
 		}
 		switch len(matches) {
 		case 0:
-			return 0, 0, fmt.Errorf("docx: unknown heading %q", opts.Heading)
+			var heads []string
+			for _, s := range d.Outline().Sections {
+				if s.Heading != "" {
+					heads = append(heads, fmt.Sprintf("%q", s.Heading))
+					if len(heads) == 5 {
+						break
+					}
+				}
+			}
+			if len(heads) == 0 {
+				return 0, 0, fmt.Errorf("docx: unknown heading %q (the document has no headings)", opts.Heading)
+			}
+			return 0, 0, fmt.Errorf("docx: unknown heading %q; headings in this document: %s", opts.Heading, strings.Join(heads, ", "))
 		case 1:
 			return matches[0].StartPara, matches[0].EndPara, nil
 		default:

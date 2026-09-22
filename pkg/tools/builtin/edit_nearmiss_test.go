@@ -50,11 +50,11 @@ func TestEditFile_NearMissNamesTheDivergingLine(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		"line 4",                                  // where the near-miss starts
-		"matches your first 2 line(s)",            // how far it got
-		"differs at line 6",                       // the diverging file line
+		"line 4",                       // where the near-miss starts
+		"matches your first 2 line(s)", // how far it got
+		"differs at line 6",            // the diverging file line
 		"would panic there rather than in production", // what was sent
-		`"\t// would panic there."`,               // what the file actually has
+		`"\t// would panic there."`,                   // what the file actually has
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message is missing %q:\n%s", want, msg)
@@ -95,7 +95,7 @@ func TestEditFile_UnrelatedStringKeepsTheGenericAdvice(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the edit to fail")
 	}
-	if !strings.Contains(err.Error(), "line number prefix") {
+	if !strings.Contains(err.Error(), "no line in the file resembles") {
 		t.Errorf("expected the generic quoting advice, got:\n%s", err)
 	}
 }

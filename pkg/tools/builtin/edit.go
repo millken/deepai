@@ -180,10 +180,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			displayPath, hint,
 		)
 	}
-	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
-		"old_string not found in %s; send the file's own text: drop the line number prefix that read_file adds (\"12:a3f2b1<TAB>\") or grep adds (\"file.go:12:a3f2b1: \"), and use real newlines and tabs (not escaped \\n/\\t), then retry edit_file",
-		displayPath,
-	)
+	return models.ToolResult{CallID: call.ID, ToolName: call.Name}, oldStringNotFoundErr(displayPath, oldStr)
 }
 
 // optionalLineArg reads a 1-based line argument that may arrive as a JSON
@@ -444,8 +441,24 @@ func locateOldString(content, oldStr, newStr, scope string) (from, to int, body,
 			scope, hint,
 		)
 	}
-	return 0, 0, "", "", fmt.Errorf(
-		"old_string not found in %s; send the file's own text (drop read_file's \"12:a3f2b1<TAB>\" prefix, use real newlines and tabs), or copy that prefix into start_hash/end_hash instead",
+	return 0, 0, "", "", oldStringNotFoundErr(scope, oldStr)
+}
+
+// oldStringNotFoundErr is the shared no-near-miss fallback for old_string
+// mode and edits[] hunks. It must tell two misses apart: a transcript pasted
+// back with its line-number prefixes still on, and text nothing in the file
+// resembles — retyped from memory or never written. One shared message sent
+// the model down the wrong fix for the second kind (observed in session
+// history: it kept resending text that was never in the file).
+func oldStringNotFoundErr(scope, oldStr string) error {
+	if looksLineNumbered(oldStr) {
+		return fmt.Errorf(
+			"old_string not found in %s; send the file's own text (drop the line-number prefix that read_file adds (\"12:a3f2b1<TAB>\") or grep adds (\"file.go:12:a3f2b1: \"), and use real newlines and tabs), or copy that prefix into start_hash/end_hash instead",
+			scope,
+		)
+	}
+	return fmt.Errorf(
+		"old_string not found in %s and no line in the file resembles it — the text may never have been written, or it changed since your last read. Re-read with read_file and edit from what is actually there — or copy the N:hhhhhh prefixes into start_hash/end_hash instead",
 		scope,
 	)
 }
@@ -637,7 +650,7 @@ func EditFileTool() models.Tool {
 		Name: "edit_file",
 		Description: "Replace text in a file. Hash mode (preferred after read_file or grep): copy the whole N:hhhhhh prefix of the first and last line of the range into start_hash/end_hash and send only new_string — do not restate the old text; the inclusive line range is replaced (empty new_string deletes it). " +
 			"after_hash inserts new_string after that line instead (cannot insert before line 1). " +
-			"edits applies several hunks in one call against the same read: an array of {start_hash, end_hash, new_string}, {after_hash, new_string} or {old_string, new_string} (mixable); hunks must not overlap, and the call is atomic — any bad hunk means nothing is written. " +
+			"edits applies several hunks in one call against the same read: an array of {start_hash, end_hash, new_string}, {after_hash, new_string} or {old_string, new_string} (mixable — prefer hash hunks after read_file; old_string only for raw spans); hunks must not overlap, and the call is atomic — any bad hunk means nothing is written. " +
 			"old_string mode (when you have no hashes — raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching (grep's file:line:hash: prefix is not stripped). " +
 			"Optional start_line/end_line (1-based, inclusive) scope an old_string search to that line window, so a short old_string that repeats elsewhere still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
 			"old_string falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
@@ -652,7 +665,7 @@ func EditFileTool() models.Tool {
 				"after_hash": map[string]any{"type": "string", "description": "Insert mode: N:hhhhhh prefix of the line to insert new_string after"},
 				"edits": map[string]any{
 					"type":        "array",
-					"description": "Multi-hunk mode: non-overlapping hunks applied atomically against the same read. Each hunk locates its target by start_hash/end_hash (replace a line range), after_hash (insert) or old_string (exact text, must be unique); new_string is always required",
+					"description": "Multi-hunk mode: non-overlapping hunks applied atomically against the same read. Each hunk locates its target by start_hash/end_hash (replace a line range, preferred — copy the N:hhhhhh prefix from your read), after_hash (insert) or old_string (exact text, must be unique; only when you have no hashes); new_string is always required",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
