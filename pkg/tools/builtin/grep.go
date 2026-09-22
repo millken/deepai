@@ -66,6 +66,7 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	}
 
 	includeHidden, _ := args["include_hidden"].(bool)
+	filesOnly, _ := args["files_only"].(bool)
 
 	re, err := compileGrepPattern(pattern, caseInsensitive)
 	if err != nil {
@@ -104,7 +105,23 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 
 	var b strings.Builder
 	displayMatches := displayGrepMatches(ctx, matches)
-	if contextLines > 0 {
+	if filesOnly {
+		counts := make(map[string]int)
+		var files []string
+		for _, m := range displayMatches {
+			if _, seen := counts[m.File]; !seen {
+				files = append(files, m.File)
+			}
+			counts[m.File]++
+		}
+		for _, f := range files {
+			unit := "matches"
+			if counts[f] == 1 {
+				unit = "match"
+			}
+			fmt.Fprintf(&b, "%s (%d %s)\n", f, counts[f], unit)
+		}
+	} else if contextLines > 0 {
 		// Group matches by file and render with context lines
 		renderMatchesWithContext(&b, matches, contextLines, func(path string) string {
 			return displayVirtualPath(ctx, path)
@@ -398,6 +415,7 @@ func GrepTool() models.Tool {
 				"case_insensitive": map[string]any{"type": "boolean", "description": "Case-insensitive search (default: false)"},
 				"include_hidden":   map[string]any{"type": "boolean", "description": "Search inside .git/.github/vendor/node_modules/__pycache__ and dotfiles"},
 				"context":          map[string]any{"type": "number", "description": "Number of context lines before and after each match (default: 0)"},
+				"files_only":       map[string]any{"type": "boolean", "description": "List only matching files with per-file match counts instead of every line (like grep -l); context is ignored"},
 				"max_results":      map[string]any{"type": "number", "description": "Maximum number of results (default: 50)"},
 			},
 		},

@@ -54,6 +54,43 @@ func TestGrepHandler_BasicMatch(t *testing.T) {
 	}
 }
 
+func TestGrepHandler_FilesOnly(t *testing.T) {
+	root := createTestTree(t, map[string]string{
+		"a.txt": "hello world\nfoo bar\nhello again",
+		"b.txt": "no match here",
+		"c.txt": "hello there",
+	})
+
+	result, err := GrepHandler(context.Background(), models.ToolCall{
+		ID:     "grep-files-only",
+		Name:   "grep",
+		Status: models.CallStatusPending,
+		Arguments: map[string]any{
+			"pattern":    "hello",
+			"path":       root,
+			"files_only": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("result error: %s", result.Error)
+	}
+	if !contains(result.Content, "a.txt (2 matches)") {
+		t.Errorf("want a.txt with 2 matches, got: %s", result.Content)
+	}
+	if !contains(result.Content, "c.txt (1 match)") {
+		t.Errorf("want c.txt with singular unit, got: %s", result.Content)
+	}
+	if contains(result.Content, "b.txt") {
+		t.Errorf("should not list b.txt, got: %s", result.Content)
+	}
+	if contains(result.Content, ":1:") {
+		t.Errorf("files_only must not render line entries, got: %s", result.Content)
+	}
+}
+
 func TestGrepHandler_CaseInsensitive(t *testing.T) {
 	root := createTestTree(t, map[string]string{
 		"a.txt": "Hello World\nhello world",
