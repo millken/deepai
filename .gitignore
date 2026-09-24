@@ -13,7 +13,7 @@ deepai-debug.log
 .deepai/plans/
 .superpowers/
 .DS_Store
-
+.env
 # deepai eval agents: run output is derived data, not source. runs.jsonl is
 # large and carries full model output; summary.{md,json} are views over it,
 # and with runs.jsonl out of the repo a committed summary is a number nobody
