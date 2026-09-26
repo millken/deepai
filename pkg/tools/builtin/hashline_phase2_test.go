@@ -157,7 +157,7 @@ func TestMultiHunk_PostEditRefsHitTheEditedFile(t *testing.T) {
 	path := writeTestFile(t, threeFuncs)
 	res, err := multiEditCall(t, path, []any{
 		replaceHunk(t, threeFuncs, 1, 3, "func A() {\n\tx()\n\ty()\n\tz()\n}"), // 3 → 5 lines, Δ=+2
-		replaceHunk(t, threeFuncs, 5, 7, "func B() {\n\tb2()\n}"),             // Δ=0
+		replaceHunk(t, threeFuncs, 5, 7, "func B() {\n\tb2()\n}"),              // Δ=0
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -207,7 +207,7 @@ func TestMultiHunk_OverlapAndAnchorViolationsRejectAll(t *testing.T) {
 	path := writeTestFile(t, content)
 	_, err := multiEditCall(t, path, []any{
 		replaceHunk(t, content, 2, 4, "x"),
-		replaceHunk(t, content, 4, 5, "y"),                                       // overlaps at line 4
+		replaceHunk(t, content, 4, 5, "y"),                                        // overlaps at line 4
 		map[string]any{"after_hash": prefixFor(t, content, 3), "new_string": "z"}, // anchor inside 2-4
 	})
 	if err == nil {
@@ -227,8 +227,8 @@ func TestMultiHunk_ResolutionErrorsReportedTogetherZeroWrite(t *testing.T) {
 	content := "l1\nl2\nl3\n"
 	path := writeTestFile(t, content)
 	_, err := multiEditCall(t, path, []any{
-		map[string]any{"start_hash": "1:aaaaaa", "new_string": "x"}, // bad hash
-		map[string]any{"start_hash": prefixFor(t, content, 2)},      // missing new_string
+		map[string]any{"start_hash": "1:aaaaaa", "new_string": "x"},              // bad hash
+		map[string]any{"start_hash": prefixFor(t, content, 2)},                   // missing new_string
 		map[string]any{"end_hash": prefixFor(t, content, 3), "new_string": "y"},  // end without start
 		map[string]any{"after_hash": prefixFor(t, content, 1), "new_string": ""}, // empty insert
 	})

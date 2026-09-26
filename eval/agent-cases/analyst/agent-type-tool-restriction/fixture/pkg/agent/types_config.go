@@ -19,13 +19,13 @@ const (
 	// post-edit review gate (docs/ADVERSARIAL_REVIEW_DESIGN.md §4.3). It is
 	// also directly addressable via the task tool like any other type.
 	AgentTypeCorrectnessReviewer AgentType = "correctness-reviewer"
-	AgentTypeProductManager   AgentType = "product-manager"
-	AgentTypeArchitect        AgentType = "architect"
-	AgentTypeBash             AgentType = "bash"
-	AgentTypeFrontend         AgentType = "frontend"
-	AgentTypeUIDesigner       AgentType = "ui-designer"
-	AgentTypeNews             AgentType = "news"
-	AgentTypeDocEditor        AgentType = "document-editor"
+	AgentTypeProductManager      AgentType = "product-manager"
+	AgentTypeArchitect           AgentType = "architect"
+	AgentTypeBash                AgentType = "bash"
+	AgentTypeFrontend            AgentType = "frontend"
+	AgentTypeUIDesigner          AgentType = "ui-designer"
+	AgentTypeNews                AgentType = "news"
+	AgentTypeDocEditor           AgentType = "document-editor"
 )
 
 type AgentTypeConfig struct {
