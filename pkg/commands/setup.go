@@ -94,6 +94,20 @@ type Config struct {
 	// rather than failing every review (pkg/chat's validateReviewModel).
 	ReviewModel string `yaml:"review_model,omitempty"`
 
+	// PRReviewAutoDisabled turns off the PR review pipeline's auto-attach:
+	// when a turn's bash output shows a freshly created PR, the REPL enters
+	// the review→fix→re-review loop for it. Default ENABLED (absent key =
+	// false) — the same inverted-bool pattern as memory_auto_refine_disabled,
+	// because a default-on bool cannot be expressed as a plain yaml bool.
+	PRReviewAutoDisabled bool `yaml:"pr_review_auto_disabled,omitempty"`
+	// PRAutoMerge merges the PR automatically once review and CI are green,
+	// instead of stopping in awaiting_merge for an explicit merge command.
+	// Default off — the confirmed decision for this pipeline.
+	PRAutoMerge bool `yaml:"pr_auto_merge,omitempty"`
+	// PRReviewRounds bounds the PR loop's review→fix rounds. 0 or absent =
+	// 5. Always read through ChatRepl.prMaxRounds, never directly.
+	PRReviewRounds int `yaml:"pr_review_rounds,omitempty"`
+
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// long-task mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1): design →
 	// design review → implement → implement review, held to a locked

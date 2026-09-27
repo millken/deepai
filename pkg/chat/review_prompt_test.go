@@ -113,3 +113,41 @@ func TestReviewGate_PrevVerdictLifecycle(t *testing.T) {
 		t.Fatal("ending an episode must clear the carried verdict")
 	}
 }
+
+func TestBuildReviewPrompt_PRMode(t *testing.T) {
+	p := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "ledger export", diff: "d",
+		scope:    []string{"internal/ledger.go"},
+		prNumber: 42, prRound: 2, maxToolCalls: 20, timeout: time.Minute,
+	})
+	for _, want := range []string{
+		"PR #42, review round 2",
+		"already pushed",
+		"report a previously reported issue ONLY if you can still construct",
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("PR-mode prompt missing %q:\n%s", want, p)
+		}
+	}
+	if strings.HasPrefix(p, "Adversarially review the code changes below.\n") {
+		t.Fatalf("PR mode must replace the local-mode header:\n%.120s", p)
+	}
+
+	local := buildReviewPrompt(reviewPromptInput{initialRequest: "r", diff: "d"})
+	if !strings.HasPrefix(local, "Adversarially review the code changes below.") {
+		t.Fatalf("local mode (prNumber=0) header changed:\n%.120s", local)
+	}
+}
+
+func TestBuildReviewPrompt_PRModeComposesWithPrevIssues(t *testing.T) {
+	prev := &agent.ReviewResult{
+		Verdict: "fail",
+		Issues:  []agent.Issue{{Severity: "high", File: "a.go", Line: 3, Message: "off by one", Scenario: "empty slice panics"}},
+	}
+	p := buildReviewPrompt(reviewPromptInput{
+		diff: "d", prev: prev, prNumber: 7, prRound: 3,
+	})
+	if !strings.Contains(p, "PR #7, review round 3") || !strings.Contains(p, "off by one") {
+		t.Fatalf("PR mode must still carry previous issues for re-review:\n%s", p)
+	}
+}

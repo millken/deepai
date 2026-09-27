@@ -130,6 +130,26 @@ func (a *Agent) setCompactionStall(stalled bool, at int) {
 	}
 }
 
+// Todos returns a copy of the carried todo list. Read by the PR loop's
+// merge path to name the next pending task in the post-merge turn.
+func (s *SessionCarry) Todos() []builtin.TodoItem {
+	if s == nil || len(s.todos) == 0 {
+		return nil
+	}
+	out := make([]builtin.TodoItem, len(s.todos))
+	copy(out, s.todos)
+	return out
+}
+
+// SetTodos seeds the carried todo list. The REPL/test seeding path — the
+// production writer is react.go's todo_write result handling, same division
+// of labor as RecordEditedFile.
+func (s *SessionCarry) SetTodos(todos []builtin.TodoItem) {
+	if s != nil {
+		s.todos = todos
+	}
+}
+
 // EditedFiles returns a sorted copy of the accumulated edited-file set.
 func (s *SessionCarry) EditedFiles() []string {
 	if s == nil || len(s.editedFiles) == 0 {

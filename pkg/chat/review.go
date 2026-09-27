@@ -615,6 +615,12 @@ type reviewPromptInput struct {
 	// until the clock kills it, which loses the entire review.
 	maxToolCalls int
 	timeout      time.Duration
+	// prNumber/prRound switch the prompt into PR mode: the diff came from
+	// `gh pr diff` (the change is already pushed), and the round line tells
+	// the reviewer where it sits in the PR loop's review→fix→re-review
+	// cycle. prNumber > 0 is the mode switch; prRound is 1-based.
+	prNumber int
+	prRound  int
 }
 
 // buildReviewPrompt assembles the reviewer's seed message. Deliberately
@@ -623,7 +629,13 @@ type reviewPromptInput struct {
 // the change itself, or the review machinery's own previous output.
 func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
-	b.WriteString("Adversarially review the code changes below.\n\n")
+	if in.prNumber > 0 {
+		fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, review round %d. The change is already pushed; the diff is the PR's current diff. "+
+			"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
+			"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
+	} else {
+		b.WriteString("Adversarially review the code changes below.\n\n")
+	}
 	if in.charter != nil {
 		b.WriteString(renderCharterForReview(in.charter, in.lockedPlan))
 	} else {

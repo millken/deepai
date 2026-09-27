@@ -21,6 +21,7 @@ var slashCommands = []slashCmd{
 	{"refine", "Refine memory now (/refine [undo|rollback <id>|list|status|on|off])"},
 	{"review", "Adversarially review recent edits (/review [on|off|status])"},
 	{"mission", "Run a task design→review→implement→review (/mission <task>|abort|status)"},
+	{"pr", "PR review pipeline (/pr [status|review|resume|merge|abort <n>])"},
 	{"plan", "Enter plan mode (read-only, explore before coding)"},
 	{"run", "Exit plan mode (full tool access)"},
 	{"model", "Show or switch model (/model <name>, /model ? for picker)"},
