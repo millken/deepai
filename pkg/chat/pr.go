@@ -60,11 +60,17 @@ type prState struct {
 	// LastExternalCommentAt is the createdAt of the newest external PR
 	// comment already surfaced to a fix turn; anything newer is pending input.
 	// A time, not a comment id: gh ids are opaque base64 relay strings with no
-	// usable ordering (round-1 review, verified live). Same-second external
-	// comments after an advance are skipped — rare and cheaper than re-feeding.
+	// usable ordering (round-1 review, verified live).
 	LastExternalCommentAt time.Time `json:"last_external_comment_at,omitempty"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	// SurfacedCommentIDs holds the ids of external comments already surfaced
+	// that share the watermark's exact second — gh timestamps are
+	// second-granular, so time alone cannot tell "already surfaced" from
+	// "posted in the same second later" (round-2 review issue 4). The set is
+	// rebuilt from each round's surfaced list, so it never outlives one busy
+	// second; earlier ids age out behind the timestamp.
+	SurfacedCommentIDs []string  `json:"surfaced_comment_ids,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 func prsRoot(workDir string) string {
@@ -233,6 +239,19 @@ func detectPRCreate(outputs []string) (repo string, number int, url string, ok b
 		}
 	}
 	return repo, number, url, ok
+}
+
+// repoFromPRURL extracts "owner/repo" from a github PR URL. Empty string
+// when the URL is not a PR URL — callers keep the empty repo meaning "cwd's
+// repository" rather than guessing (round-2 review issue 3: the manual
+// /pr review path dropped a repo it had already fetched, silently retargeting
+// every later gh call at whatever the process's cwd happened to be).
+func repoFromPRURL(url string) string {
+	m := prCreateURLRe.FindStringSubmatch(url)
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }
 
 // filterExternalComments keeps only comments NOT authored by deepai's own

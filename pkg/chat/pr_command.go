@@ -55,7 +55,12 @@ func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 		r.ui.Info(fmt.Sprintf("  pr: could not read #%d (%v)", n, err))
 		return
 	}
-	st, err := newPRState(r.cfg.WorkDir, n, "", branch, base, url, title)
+	// Pin the repo from the URL the same way the auto-attach path does: an
+	// empty repo would retarget every later gh call at the process's cwd,
+	// which on a different clone means reviewing — and merging — the wrong
+	// PR (round-2 review issue 3).
+	repo := repoFromPRURL(url)
+	st, err := newPRState(r.cfg.WorkDir, n, repo, branch, base, url, title)
 	if err != nil {
 		r.ui.Info(fmt.Sprintf("  pr: could not track #%d (%v)", n, err))
 		return

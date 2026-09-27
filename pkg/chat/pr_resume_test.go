@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -189,5 +190,77 @@ func TestRunPRLoop_ExternalCommentsReachFixTurn(t *testing.T) {
 	}
 	if st.LastExternalCommentAt.IsZero() {
 		t.Fatal("watermark never advanced past the surfaced comment")
+	}
+}
+
+func TestRepoFromPRURL(t *testing.T) {
+	if got := repoFromPRURL("https://github.com/millken/deepai/pull/3"); got != "millken/deepai" {
+		t.Fatalf("repoFromPRURL = %q, want millken/deepai", got)
+	}
+	if got := repoFromPRURL("https://github.com/other/libY/pull/55"); got != "other/libY" {
+		t.Fatalf("repoFromPRURL = %q, want other/libY", got)
+	}
+	for _, bad := range []string{"", "https://example.com/x", "not a url"} {
+		if got := repoFromPRURL(bad); got != "" {
+			t.Fatalf("repoFromPRURL(%q) = %q, want empty", bad, got)
+		}
+	}
+}
+
+// Round-2 review issue 4, pinned: same-second external comments must not be
+// silently dropped by the watermark — the second one is still pending until
+// its id is surfaced.
+func TestSameSecondCommentsNotDropped(t *testing.T) {
+	sec := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
+	st := &prState{Number: 1, LastExternalCommentAt: sec, SurfacedCommentIDs: []string{"IC_a"}}
+	r, _ := newReviewRepl(t, t.TempDir(), &fakeTaskTool{})
+
+	if !externalCommentPending(prComment{ID: "IC_b", CreatedAt: sec}, st) {
+		t.Fatal("same-second unseen comment must be pending")
+	}
+	if externalCommentPending(prComment{ID: "IC_a", CreatedAt: sec}, st) {
+		t.Fatal("same-second already-surfaced comment must not re-surface")
+	}
+	if externalCommentPending(prComment{ID: "IC_old", CreatedAt: sec.Add(-time.Second)}, st) {
+		t.Fatal("comment older than the watermark must not be pending")
+	}
+	if !externalCommentPending(prComment{ID: "IC_new", CreatedAt: sec.Add(time.Second)}, st) {
+		t.Fatal("strictly newer comment must be pending")
+	}
+
+	// Advance over IC_b: the same-second set accumulates while the second
+	// does not move — IC_a must stay recorded or it would resurrect.
+	r.advanceExternalWatermark(st, []prComment{{ID: "IC_b", CreatedAt: sec}})
+	if len(st.SurfacedCommentIDs) != 2 {
+		t.Fatalf("surfaced set = %v, want both same-second ids", st.SurfacedCommentIDs)
+	}
+
+	// A later comment moves the watermark: the set rebuilds from that round
+	// only, older ids sit behind the timestamp for good.
+	later := sec.Add(2 * time.Second)
+	r.advanceExternalWatermark(st, []prComment{{ID: "IC_c", CreatedAt: later}})
+	if len(st.SurfacedCommentIDs) != 1 || st.SurfacedCommentIDs[0] != "IC_c" {
+		t.Fatalf("set after second advance = %v, want [IC_c]", st.SurfacedCommentIDs)
+	}
+	if !st.LastExternalCommentAt.Equal(later) {
+		t.Fatalf("watermark = %v, want %v", st.LastExternalCommentAt, later)
+	}
+}
+
+// Round-2 review issue 2, pinned: Ctrl+C during the CI wait returns
+// errPRCIInterrupted instead of freezing the REPL for the whole budget.
+func TestWaitPRCIInterruptible(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: false, ok: false}}}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.prGH = gh
+	r.prCIPollInterval = time.Millisecond
+	r.prCIWaitTimeout = 50 * time.Millisecond
+	ui.interruptDuringTask = true // InterruptCh fires as soon as waitPRCI selects
+	st := newTrackedPR(t, r, 9, 1, prStatusAwaitingCI)
+
+	_, _, _, err := r.waitPRCI(context.Background(), st, gh)
+	if !errors.Is(err, errPRCIInterrupted) {
+		t.Fatalf("err = %v, want errPRCIInterrupted", err)
 	}
 }

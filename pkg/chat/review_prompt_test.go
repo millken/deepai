@@ -87,7 +87,7 @@ func TestReviewDispatch_PassesGracefulToolCallCap(t *testing.T) {
 	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("want pass, got %q", got)
 	}
-	if got := fake.args["max_tool_calls"]; got != reviewMaxToolCalls {
+	if got := fake.args["max_tool_calls"]; got != DefaultReviewMaxToolCalls {
 		t.Fatalf("max_tool_calls = %v, want %d", got, reviewMaxToolCalls)
 	}
 }

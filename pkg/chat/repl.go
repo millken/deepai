@@ -189,6 +189,12 @@ type ReplUI interface {
 	ReadPrompt(ctx context.Context) (string, []models.MessageImage, error)
 	TurnStart(turn int, userInput string)
 	TurnEnd(usage *agent.Usage)
+	// WaitStart/WaitEnd bracket a long REPL-side wait that is NOT an agent
+	// turn (the PR loop's CI poll). While a wait is active the TUI routes
+	// Ctrl+C to InterruptCh — the same signal a running turn gets — so the
+	// wait is cancellable instead of freezing the prompt.
+	WaitStart(reason string)
+	WaitEnd()
 	RenderEvent(evt agent.AgentEvent)
 	RenderSubagentEvent(evt subagent.TaskEvent)
 	RenderInterrupted()

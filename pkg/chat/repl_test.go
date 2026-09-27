@@ -96,6 +96,8 @@ func (m *mockUI) ReadPrompt(_ context.Context) (string, []models.MessageImage, e
 }
 func (m *mockUI) TurnStart(_ int, _ string)                {}
 func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
+func (m *mockUI) WaitStart(_ string)                       {}
+func (m *mockUI) WaitEnd()                                 {}
 func (m *mockUI) RenderEvent(evt agent.AgentEvent)         { m.events = append(m.events, evt) }
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}

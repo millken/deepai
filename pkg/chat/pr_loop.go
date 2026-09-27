@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -109,9 +110,15 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 			st.save(r.cfg.WorkDir)
 
 		case prStatusAwaitingCI:
+			r.ui.WaitStart(fmt.Sprintf("PR #%d CI", st.Number))
 			done, ok, summary, err := r.waitPRCI(parentCtx, st, gh)
+			r.ui.WaitEnd()
 			if err != nil {
-				r.ui.Info(fmt.Sprintf("  pr: CI lookup failed (%v) — /pr resumes the loop", err))
+				if errors.Is(err, errPRCIInterrupted) {
+					r.ui.Info("  pr: CI wait interrupted — status intact, /pr resumes the loop")
+				} else {
+					r.ui.Info(fmt.Sprintf("  pr: CI lookup failed (%v) — /pr resumes the loop", err))
+				}
 				return
 			}
 			switch {
@@ -190,15 +197,25 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
 }
 
+// errPRCIInterrupted marks a CI wait cut short by Ctrl+C. A sentinel so the
+// caller can say "interrupted, status intact, /pr resumes" instead of
+// reporting it as a CI lookup failure (round-2 review issue 2: the wait
+// blocked the REPL goroutine with no interrupt path for up to 15 minutes).
+var errPRCIInterrupted = fmt.Errorf("CI wait interrupted")
+
 // waitPRCI polls gh until the PR's checks settle or the wait budget runs out.
 // (done=false, err=nil) means still pending at the deadline — fail-soft, the
-// status stays awaiting_ci for /pr to resume.
+// status stays awaiting_ci for /pr to resume. Ctrl+C returns
+// errPRCIInterrupted with the status equally untouched. Progress is printed
+// roughly once a minute so a long wait is visibly alive.
 func (r *ChatRepl) waitPRCI(parentCtx context.Context, st *prState, gh prGH) (done, ok bool, summary string, err error) {
 	deadline := time.Now().Add(r.prCIWait())
 	poll := prCIDefaultPoll
 	if r.prCIPollInterval > 0 {
 		poll = r.prCIPollInterval
 	}
+	start := time.Now()
+	lastProgress := time.Now()
 	for {
 		done, ok, summary, err = gh.Checks(parentCtx, st.Repo, st.Number)
 		if err != nil || done {
@@ -207,9 +224,16 @@ func (r *ChatRepl) waitPRCI(parentCtx context.Context, st *prState, gh prGH) (do
 		if time.Now().After(deadline) {
 			return false, false, summary, nil
 		}
+		if now := time.Now(); now.Sub(lastProgress) >= time.Minute {
+			lastProgress = now
+			r.ui.Info(fmt.Sprintf("  pr: #%d CI still pending (%.0fs elapsed, will wait %.0fs more) — Ctrl+C stops the wait",
+				st.Number, now.Sub(start).Seconds(), time.Until(deadline).Seconds()))
+		}
 		select {
 		case <-parentCtx.Done():
 			return false, false, "", parentCtx.Err()
+		case <-r.ui.InterruptCh():
+			return false, false, "", errPRCIInterrupted
 		case <-time.After(poll):
 		}
 	}
@@ -363,7 +387,7 @@ func pendingExternalComments(ctx context.Context, st *prState, gh prGH, ownLogin
 	external := filterExternalComments(comments, ownLogin)
 	var fresh []prComment
 	for _, c := range external {
-		if c.CreatedAt.After(st.LastExternalCommentAt) {
+		if externalCommentPending(c, st) {
 			fresh = append(fresh, c)
 		}
 	}
@@ -388,13 +412,47 @@ func pendingExternalComments(ctx context.Context, st *prState, gh prGH, ownLogin
 	return fresh[start:]
 }
 
+// externalCommentPending reports whether c is newer than the surfaced
+// watermark: strictly after its timestamp, or at exactly the watermark
+// second with an id not yet surfaced — gh timestamps are second-granular,
+// so time alone cannot tell "already surfaced" from "posted in the same
+// second later" (round-2 review issue 4).
+func externalCommentPending(c prComment, st *prState) bool {
+	if c.CreatedAt.After(st.LastExternalCommentAt) {
+		return true
+	}
+	if c.CreatedAt.Equal(st.LastExternalCommentAt) {
+		for _, id := range st.SurfacedCommentIDs {
+			if id == c.ID {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // advanceExternalWatermark moves the dedup cursor past the comments the fix
-// turn just saw (empty keeps the current cursor). A failed save is logged by
-// the caller; re-surfacing one comment after a crash is the cheaper failure.
+// turn just saw (empty keeps the current cursor). The same-second id set
+// ACCUMULATES while the watermark second does not move — rebuilding it from
+// just this round's list would resurrect previously-surfaced same-second
+// ids — and is rebuilt fresh when the second advances, because older ids
+// then sit behind the timestamp for good. A failed save is logged by the
+// caller; re-surfacing one comment after a crash is the cheaper failure.
 func (r *ChatRepl) advanceExternalWatermark(st *prState, comments []prComment) {
+	max := st.LastExternalCommentAt
 	for _, c := range comments {
-		if c.CreatedAt.After(st.LastExternalCommentAt) {
-			st.LastExternalCommentAt = c.CreatedAt
+		if c.CreatedAt.After(max) {
+			max = c.CreatedAt
+		}
+	}
+	if !max.Equal(st.LastExternalCommentAt) {
+		st.SurfacedCommentIDs = nil
+	}
+	st.LastExternalCommentAt = max
+	for _, c := range comments {
+		if c.CreatedAt.Equal(max) {
+			st.SurfacedCommentIDs = append(st.SurfacedCommentIDs, c.ID)
 		}
 	}
 	if err := st.save(r.cfg.WorkDir); err != nil {
