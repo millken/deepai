@@ -282,15 +282,18 @@ func (ghPRClient) run(ctx context.Context, args ...string) (stdout, stderr strin
 	return result.Stdout(), result.Stderr(), result.ExitCode(), nil
 }
 
-// prRepoArgs keeps the command string shell-safe: repo comes from state/config
-// and is quoted rather than trusted. An empty repo means "current directory's
+// prRepoArgs builds one gh PR subcommand's arguments. The leading "pr" is
+// load-bearing: without it every caller degenerates into `gh view 3` —
+// observed live as `unknown command "view" for "gh"` on /pr review. The
+// optional --repo goes last (quoted; repo comes from state/config and is
+// never trusted on a shell line); empty repo means "current directory's
 // repository" and omits the flag entirely.
 func prRepoArgs(repo string, extra ...string) []string {
-	var args []string
+	args := append([]string{"pr"}, extra...)
 	if repo != "" {
 		args = append(args, "--repo", strconv.Quote(repo))
 	}
-	return append(args, extra...)
+	return args
 }
 
 // PostComment goes through --body-file, not --body: ExecDirect takes a
@@ -374,10 +377,10 @@ func (g ghPRClient) View(ctx context.Context, repo string, number int) (title, b
 		return "", "", "", "", fmt.Errorf("gh pr view exited %d: %s", code, strings.TrimSpace(stderr))
 	}
 	var payload struct {
-		Title      string `json:"title"`
+		Title       string `json:"title"`
 		HeadRefName string `json:"headRefName"`
 		BaseRefName string `json:"baseRefName"`
-		URL        string `json:"url"`
+		URL         string `json:"url"`
 	}
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
 		return "", "", "", "", fmt.Errorf("parse gh pr view: %w", err)

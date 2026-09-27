@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -125,5 +126,17 @@ func TestParsePRCommentsJSON(t *testing.T) {
 	}
 	if _, err := parsePRCommentsJSON([]byte("not json")); err == nil {
 		t.Fatal("invalid JSON accepted")
+	}
+}
+
+// The live failure this pins: prRepoArgs without the leading "pr" made every
+// gh call `gh view 3` — unknown command — and the fake-gh tests never caught
+// it because they bypass command construction entirely.
+func TestPRRepoArgs(t *testing.T) {
+	if got := prRepoArgs("", "view", "3"); strings.Join(got, " ") != "pr view 3" {
+		t.Fatalf("prRepoArgs(\"\") = %v, want [pr view 3]", got)
+	}
+	if got := prRepoArgs("o/r", "checks", "7"); strings.Join(got, " ") != `pr checks 7 --repo "o/r"` {
+		t.Fatalf("prRepoArgs(o/r) = %v", got)
 	}
 }
