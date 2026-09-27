@@ -192,6 +192,40 @@ func TestMergePRAndContinue_NextTodoWithoutInProgress(t *testing.T) {
 	}
 }
 
+// Round-5 review issue 1, pinned: a list whose only unfinished item is the
+// in_progress one the merged PR completed must still get its todo_write — the
+// old code returned on next=="" before ever consulting inProgressTodo.
+func TestMergePRAndContinue_LastUnfinishedItemStillMarkedDone(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line"}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 34, 1, prStatusAwaitingMerge)
+	r.carry.SetTodos([]builtin.TodoItem{
+		{Content: "prep", Status: builtin.TodoDone},
+		{Content: "add ledger export", Status: builtin.TodoInProgress},
+	})
+
+	var got string
+	ran := false
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		ran = true
+		got = input
+		return nil
+	}
+
+	r.mergePRAndContinue(context.Background(), st, gh)
+
+	if !ran {
+		t.Fatal("a remaining in_progress item must still get its todo_write turn")
+	}
+	if !strings.Contains(got, `item 2 ("add ledger export") marked done`) {
+		t.Fatalf("handoff = %q, want the finished item named done", got)
+	}
+	if strings.Contains(got, "in_progress") {
+		t.Fatalf("the handoff must not name anything to start: %q", got)
+	}
+}
+
 func TestMergePRAndContinue_FailedMergeStaysAwaiting(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	gh := &fakeGH{diff: "+line", mergeErr: context.DeadlineExceeded}

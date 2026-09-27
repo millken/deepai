@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,23 @@ import (
 
 func mkComment(id, author, body string, ts time.Time) prComment {
 	return prComment{ID: id, Author: author, Body: body, CreatedAt: ts}
+}
+
+// countVerdictLines reads PR <number>'s verdict log and counts non-empty
+// lines — for asserting a resume did not append a duplicate round entry.
+func countVerdictLines(t *testing.T, workDir string, number int) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(prDir(workDir, number), prVerdictFile))
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func TestPendingExternalComments(t *testing.T) {
@@ -167,31 +186,54 @@ func TestRunPRLoop_ResumeCarriesLastFailVerdict(t *testing.T) {
 	}
 }
 
-// Round-4 review issue 2, pinned: the crash-between-post-and-fix case —
-// verdict logged at round N while st.Round is still N (the fix turn was
-// interrupted, the round not consumed) — must adopt that verdict as prev;
-// the old round == st.Round-1 gate dropped exactly the case the resume
-// contract promised to cover.
-func TestRunPRLoop_ResumeCarriesUnconsumedRoundVerdict(t *testing.T) {
+// Round-4 issue 2 + round-5 issue 2, pinned: a verdict logged at round N
+// while st.Round is still N (fix turn interrupted, round not consumed) is
+// ALREADY POSTED — the resume must skip re-review/append/PostComment for
+// that round and go straight to the fix turn carrying the stored verdict,
+// so one round cannot be reported twice.
+func TestRunPRLoop_ResumeSkipsAlreadyPostedRound(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
 	r := newPRLoopRepl(t, fake, gh)
 	st := newTrackedPR(t, r, 45, 1, prStatusReviewing)
 
-	prev := &agent.ReviewResult{Verdict: "fail", Summary: "posted but fix interrupted",
+	stored := &agent.ReviewResult{Verdict: "fail", Summary: "posted but fix interrupted",
 		Issues: []agent.Issue{{Severity: "medium", File: "b.go", Line: 7, Message: "off by one", Scenario: "empty slice"}}}
-	if err := st.appendVerdict(r.cfg.WorkDir, 1, prev); err != nil {
+	if err := st.appendVerdict(r.cfg.WorkDir, 1, stored); err != nil {
 		t.Fatalf("appendVerdict: %v", err)
+	}
+
+	var fixInput string
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		fixInput = input
+		return nil
 	}
 
 	r.runPRLoop(context.Background(), st)
 
+	// Round 1 was already posted: the only dispatch allowed is the round-2
+	// re-review that verifies the fix (and it must carry the stored verdict
+	// as prev).
+	if fake.calls != 1 {
+		t.Fatalf("reviewer dispatched %d times, want exactly 1 (the round-2 re-review)", fake.calls)
+	}
 	prompt := fake.args["prompt"].(string)
 	if !strings.Contains(prompt, "Previously reported") || !strings.Contains(prompt, "off by one") {
-		t.Fatalf("a verdict whose fix turn never ran must still reach the re-review as prev:\n%s", prompt)
+		t.Fatalf("the round-2 re-review must carry the stored verdict as prev:\n%s", prompt)
+	}
+	if n := countVerdictLines(t, r.cfg.WorkDir, 45); n != 1 {
+		t.Fatalf("verdict log holds %d lines, want the original 1 — a resume must not append a duplicate", n)
+	}
+	for _, c := range gh.commentsPosted {
+		if strings.Contains(c, "deepai review — round 1") {
+			t.Fatal("a resume must not re-post the already-posted round-1 reviewer comment")
+		}
+	}
+	if !strings.Contains(fixInput, "off by one") {
+		t.Fatalf("the fix turn must carry the stored verdict's issues:\n%s", fixInput)
 	}
 	if st.Status != prStatusAwaitingMerge {
-		t.Fatalf("status = %s, want awaiting_merge after pass", st.Status)
+		t.Fatalf("status = %s, want awaiting_merge after the resumed cycle completes", st.Status)
 	}
 }
 

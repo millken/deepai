@@ -57,9 +57,17 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	// finished fix awaiting the next review. Anything older never masquerades
 	// as this round's prev.
 	var prev *agent.ReviewResult
+	prevRound := 0
 	if v, round := loadLastVerdict(r.cfg.WorkDir, st.Number); v != nil && (round == st.Round-1 || round == st.Round) {
-		prev = v
+		prev, prevRound = v, round
 	}
+	// A logged verdict at st.Round in reviewing means the review comment for
+	// THIS round is already on the PR: the resumed pass must not re-review,
+	// re-append or re-post — one round cannot be reported twice — so it skips
+	// straight to the fix turn with the stored verdict (round-5 review
+	// issue 2; also keeps the fix prompt's "fixed or argued" premise true,
+	// since that turn never ran).
+	alreadyPosted := st.Status == prStatusReviewing && prevRound == st.Round
 	// ownLogin identifies this gh account's comments; the external passthrough
 	// filters on it. Unknown (Login failed) disables the passthrough rather
 	// than mis-classifying deepai's own comments as external input.
@@ -81,24 +89,32 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 				return
 			}
 			r.ui.Info(fmt.Sprintf("  pr: #%d review round %d/%d", st.Number, st.Round, maxRounds))
-			verdict, ok := r.dispatchPRReview(parentCtx, st, gh, prev)
-			if !ok {
-				r.ui.Info("  pr: review could not run — nothing posted, no round consumed; /pr resumes the loop")
-				return
-			}
-			if isPassVerdict(verdict) {
-				r.ui.Info(fmt.Sprintf("  pr: #%d review passed — waiting for CI", st.Number))
-				prev = nil
-				st.setStatus(r.cfg.WorkDir, prStatusAwaitingCI)
-				continue
-			}
-			prev = verdict
-			if err := st.appendVerdict(r.cfg.WorkDir, st.Round, verdict); err != nil {
-				r.ui.Info(fmt.Sprintf("  pr: could not persist the verdict (%v) — continuing", err))
-			}
-			if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
-				r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
-				return
+			var verdict *agent.ReviewResult
+			if alreadyPosted {
+				alreadyPosted = false
+				verdict = prev
+				r.ui.Info(fmt.Sprintf("  pr: #%d round %d findings already posted — resuming at the fix turn", st.Number, st.Round))
+			} else {
+				var ok bool
+				verdict, ok = r.dispatchPRReview(parentCtx, st, gh, prev)
+				if !ok {
+					r.ui.Info("  pr: review could not run — nothing posted, no round consumed; /pr resumes the loop")
+					return
+				}
+				if isPassVerdict(verdict) {
+					r.ui.Info(fmt.Sprintf("  pr: #%d review passed — waiting for CI", st.Number))
+					prev = nil
+					st.setStatus(r.cfg.WorkDir, prStatusAwaitingCI)
+					continue
+				}
+				prev = verdict
+				if err := st.appendVerdict(r.cfg.WorkDir, st.Round, verdict); err != nil {
+					r.ui.Info(fmt.Sprintf("  pr: could not persist the verdict (%v) — continuing", err))
+				}
+				if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
+					r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
+					return
+				}
 			}
 			ext := pendingExternalComments(parentCtx, st, gh, ownLogin)
 			turnErr := r.runMissionTurn(parentCtx, prFixMessage(st.Round, maxRounds, verdict)+externalCommentsBlock(ext))
@@ -526,25 +542,31 @@ func (r *ChatRepl) mergePRAndContinue(parentCtx context.Context, st *prState, gh
 	}
 	r.ui.Info(fmt.Sprintf("  pr: #%d merged", st.Number))
 
+	cur, curIdx := inProgressTodo(r.carry.Todos())
 	next, nextIdx := nextPendingTodo(r.carry.Todos())
-	if next == "" {
+	// The handoff names the FINISHED item and the NEXT one separately: naming
+	// only the next item ordered the model to mark UNSTARTED work done while
+	// the merged PR's item stayed in_progress forever (round-4 issue 1) — and
+	// returning on next=="" before consulting cur left a last-unfinished
+	// in_progress item unnamed on the exact same defect (round-5 issue 1).
+	var b strings.Builder
+	switch {
+	case cur != "" && next != "":
+		fmt.Fprintf(&b, "PR #%d was merged. In ONE todo_write call resend the full todo list with item %d (\"%s\") marked done and item %d (\"%s\") marked in_progress, then start it.",
+			st.Number, curIdx, cur, nextIdx, next)
+		r.ui.Info(fmt.Sprintf("  pr: next task — %s", next))
+	case cur != "":
+		fmt.Fprintf(&b, "PR #%d was merged. In ONE todo_write call resend the full todo list with item %d (\"%s\") marked done — it was the last unfinished task, so state that the plan is complete.",
+			st.Number, curIdx, cur)
+	case next != "":
+		fmt.Fprintf(&b, "PR #%d was merged. Mark todo item %d (\"%s\") in_progress with todo_write and start it now.", st.Number, nextIdx, next)
+		r.ui.Info(fmt.Sprintf("  pr: next task — %s", next))
+	default:
 		r.ui.Info("  pr: no pending task in the todo list — all done")
 		return
 	}
-	// The handoff must name the FINISHED item and the NEXT one separately:
-	// naming only the next item ordered the model to mark UNSTARTED work done
-	// while the item the merged PR just completed stayed in_progress forever
-	// (round-4 review issue 1).
-	var b strings.Builder
-	if cur, curIdx := inProgressTodo(r.carry.Todos()); cur != "" {
-		fmt.Fprintf(&b, "PR #%d was merged. In ONE todo_write call resend the full todo list with item %d (\"%s\") marked done and item %d (\"%s\") marked in_progress, then start it.",
-			st.Number, curIdx, cur, nextIdx, next)
-	} else {
-		fmt.Fprintf(&b, "PR #%d was merged. Mark todo item %d (\"%s\") in_progress with todo_write and start it now.", st.Number, nextIdx, next)
-	}
-	r.ui.Info(fmt.Sprintf("  pr: next task — %s", next))
 	if turnErr := r.runMissionTurn(parentCtx, b.String()); turnErr != nil {
-		r.ui.Info("  pr: next-task turn interrupted — the task list still has it pending")
+		r.ui.Info("  pr: next-task turn interrupted — the todo list is unchanged")
 	}
 }
 
