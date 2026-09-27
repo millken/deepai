@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeGH stands in for ghPRClient: scripted diff/files/checks plus a record
@@ -224,5 +225,27 @@ func TestPRLoop_CIPendingTimesOutFailSoft(t *testing.T) {
 	}
 	if gh.checksCalls < 2 {
 		t.Fatalf("Checks called %d times, want polling (>=2)", gh.checksCalls)
+	}
+}
+
+// Round-3 review issue 3, pinned: clip feeds PR comments and fix-turn
+// inputs, so a byte cut mid-rune would post mojibake to GitHub and hand the
+// model a dangling UTF-8 lead byte. The cut must land on a rune boundary.
+func TestClipStaysValidUTF8(t *testing.T) {
+	cjk := strings.Repeat("构建失败：模块 example 未通过测试", 400) // 3 bytes per rune
+	for _, n := range []int{1, 2, 3, 4, 4095, 4096, 4097, 2047} {
+		got := clip(cjk, n)
+		if !utf8.ValidString(got) {
+			t.Fatalf("clip(_, %d) produced invalid UTF-8: tail bytes %v", n, []byte(got[len(got)-4:]))
+		}
+		if len(got) > n+len("\n(truncated)") {
+			t.Fatalf("clip(_, %d) = %d bytes, exceeds budget+marker", n, len(got))
+		}
+	}
+	if got := clip("ascii only", 100); got != "ascii only" {
+		t.Fatalf("short input must pass through, got %q", got)
+	}
+	if got := clip(cjk, 0); !utf8.ValidString(got) {
+		t.Fatalf("clip(_, 0) = %q, want valid UTF-8", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/models"
@@ -123,11 +124,16 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 			}
 			switch {
 			case done && ok:
+				// Both doors into mergePRAndContinue must leave the PR in
+				// awaiting_merge first: its failure path promises "still
+				// awaiting_merge; /pr merge retries", and a persisted awaiting_ci
+				// makes that advice a command the state machine refuses (round-3
+				// review issue 2).
+				st.setStatus(r.cfg.WorkDir, prStatusAwaitingMerge)
 				if r.cfg.PRAutoMerge {
 					r.mergePRAndContinue(parentCtx, st, gh)
 					return
 				}
-				st.setStatus(r.cfg.WorkDir, prStatusAwaitingMerge)
 				r.ui.Info(fmt.Sprintf("  pr: #%d all green — awaiting merge (/pr merge, or just say merge)", st.Number))
 				return
 			case done && !ok:
@@ -209,6 +215,12 @@ var errPRCIInterrupted = fmt.Errorf("CI wait interrupted")
 // errPRCIInterrupted with the status equally untouched. Progress is printed
 // roughly once a minute so a long wait is visibly alive.
 func (r *ChatRepl) waitPRCI(parentCtx context.Context, st *prState, gh prGH) (done, ok bool, summary string, err error) {
+	// Every exit path drops any interrupt token still buffered on the shared
+	// channel: the select below only consumes while parked, so a Ctrl+C that
+	// lands while gh.Checks is in flight (up to 60s) would otherwise survive
+	// the wait and instantly cancel the next unrelated turn's
+	// runTurnWithSignal watcher (round-3 review issue 4).
+	defer r.drainInterrupt()
 	deadline := time.Now().Add(r.prCIWait())
 	poll := prCIDefaultPoll
 	if r.prCIPollInterval > 0 {
@@ -235,6 +247,20 @@ func (r *ChatRepl) waitPRCI(parentCtx context.Context, st *prState, gh prGH) (do
 		case <-r.ui.InterruptCh():
 			return false, false, "", errPRCIInterrupted
 		case <-time.After(poll):
+		}
+	}
+}
+
+func (r *ChatRepl) drainInterrupt() {
+	ch := r.ui.InterruptCh()
+	if ch == nil {
+		return
+	}
+	for {
+		select {
+		case <-ch:
+		default:
+			return
 		}
 	}
 }
@@ -296,9 +322,16 @@ func coderCommentBody(round int, turnSummary string) string {
 	return fmt.Sprintf("**deepai fix — round %d**\n\n%s\n", round, clip(s, 2048))
 }
 
+// clip truncates s to at most n bytes on a rune boundary: the clipped text
+// flows into PR comments and fix-turn inputs, and a byte cut mid-rune would
+// post mojibake to GitHub and hand the model a dangling UTF-8 lead byte
+// (round-3 review issue 3).
 func clip(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "\n(truncated)"
 }

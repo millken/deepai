@@ -115,6 +115,31 @@ func TestVerdictLogRoundTrip(t *testing.T) {
 	}
 }
 
+// Round-3 review issue 4, pinned: an interrupt aimed at the CI wait must not
+// leak into a later turn. A token buffered while gh.Checks was in flight (the
+// wait returned on the fast path, never parking in its select) is drained on
+// the way out — otherwise the next runTurnWithSignal watcher reads it and
+// cancels an unrelated turn at birth.
+func TestWaitPRCI_DrainsStaleInterruptToken(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	ui.interruptCh = make(chan struct{}, 1)
+	ui.interruptCh <- struct{}{} // as if Ctrl+C landed while Checks was running
+	r.prGH = gh
+	st := newTrackedPR(t, r, 10, 1, prStatusAwaitingCI)
+
+	done, ok, _, err := r.waitPRCI(context.Background(), st, gh)
+	if err != nil || !done || !ok {
+		t.Fatalf("waitPRCI = (%v, %v, %v), want the green fast path", done, ok, err)
+	}
+	select {
+	case <-ui.interruptCh:
+		t.Fatal("stale interrupt token survived the wait — it would cancel the next turn")
+	default:
+	}
+}
+
 // The resume path in runPRLoop only adopts the logged verdict when its round
 // is exactly st.Round-1: a PR parked in reviewing at round 2 with a
 // round-1 fail verdict gets it as prev; one whose last verdict is from an

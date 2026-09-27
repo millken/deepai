@@ -172,6 +172,32 @@ func TestMergePRAndContinue_FailedMergeStaysAwaiting(t *testing.T) {
 	}
 }
 
+// Round-3 review issue 2, pinned: the pr_auto_merge door must persist
+// awaiting_merge BEFORE attempting the merge, so a failed merge leaves the
+// state its own advice names — a persisted awaiting_ci makes "/pr merge
+// retries" a command the state machine refuses.
+func TestRunPRLoop_AutoMergeFailurePersistsAwaitingMerge(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", mergeErr: context.DeadlineExceeded,
+		checksScript: []fakeChecks{{done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	r.cfg.PRAutoMerge = true
+	st := newTrackedPR(t, r, 32, 1, prStatusAwaitingCI)
+
+	r.runPRLoop(context.Background(), st)
+
+	if st.Status != prStatusAwaitingMerge {
+		t.Fatalf("status = %s, want awaiting_merge after a failed auto-merge", st.Status)
+	}
+	reloaded, err := openPRState(r.cfg.WorkDir, 32)
+	if err != nil {
+		t.Fatalf("reload pr state: %v", err)
+	}
+	if reloaded.Status != prStatusAwaitingMerge {
+		t.Fatalf("persisted status = %s, want awaiting_merge", reloaded.Status)
+	}
+}
+
 func TestNextPendingTodo(t *testing.T) {
 	todos := []builtin.TodoItem{
 		{Content: "a", Status: builtin.TodoDone},

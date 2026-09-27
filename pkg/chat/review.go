@@ -496,16 +496,28 @@ func (r *ChatRepl) reviewMaxToolCallsOrDefault() int {
 }
 
 // scaleReviewToolBudget sizes the reviewer's tool-call cap against the scope:
-// max(configured-or-default, 3×changed files). Round 1 on PR #3 spent 12 of
-// 20 calls merely reading 14 files ONCE — a fixed cap leaves no re-verification
-// margin as scopes grow, and the half-verified issue text it produced is the
-// accuracy loss this formula prevents. 3× covers one read plus grep
-// follow-ups plus a re-check per file; a configured higher floor always wins
-// for small scopes.
+// max(configured-or-default, 3×changed files) — Round 1 on PR #3 spent 12 of
+// 20 calls merely reading 14 files ONCE, and the half-verified issue text it
+// produced is the accuracy loss this formula prevents. 3× covers one read
+// plus grep follow-ups plus a re-check per file; a configured higher floor
+// always wins for small scopes.
+//
+// The scale term is CLAMPED at twice the floor (round-3 review): cap
+// exhaustion degrades into a tool-less wrap-up verdict, while the wall clock
+// discards the review entirely — so the budget must stay small enough that
+// the cap binds before the deadline. An unbounded 3×files (900 on a
+// 300-file PR) inverts that: the reviewer plans a 900-call investigation,
+// hits the 10-minute DefaultReviewTimeout, and every /pr resume repeats the
+// same total loss. Twice the floor is the largest headroom the default clock
+// plausibly covers; operators needing more raise the config itself.
 func (r *ChatRepl) scaleReviewToolBudget(changedFiles int) int {
-	budget := r.reviewMaxToolCallsOrDefault()
+	floor := r.reviewMaxToolCallsOrDefault()
+	budget := floor
 	if n := 3 * changedFiles; n > budget {
-		return n
+		budget = n
+	}
+	if ceiling := 2 * floor; budget > ceiling {
+		budget = ceiling
 	}
 	return budget
 }

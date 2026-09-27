@@ -161,11 +161,14 @@ func TestScaleReviewToolBudget(t *testing.T) {
 	cases := []struct {
 		configured, files, want int
 	}{
-		{0, 14, 42},  // 3×14 beats the default — PR #3's exact scope
-		{0, 10, 40},  // default floor wins on small scopes
-		{0, 0, 40},   // degenerate scope keeps the floor
-		{60, 30, 90}, // scale beats a higher configured floor
-		{60, 10, 60}, // configured floor wins over scale
+		{0, 14, 42},    // 3×14 beats the default — PR #3's exact scope
+		{0, 10, 40},    // default floor wins on small scopes
+		{0, 0, 40},     // degenerate scope keeps the floor
+		{60, 30, 90},   // scale beats a higher configured floor
+		{60, 10, 60},   // configured floor wins over scale
+		{0, 100, 80},   // clamp: 3×100 capped at 2× the floor
+		{0, 300, 80},   // clamp: the 300-file PR scenario (round-3 review)
+		{60, 300, 120}, // clamp follows a raised floor, not the default
 	}
 	for _, c := range cases {
 		fake := &fakeTaskTool{content: passVerdictJSON()}
