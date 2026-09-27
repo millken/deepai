@@ -49,12 +49,15 @@ func (r *ChatRepl) prMaxRounds() int {
 func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	gh := r.prGHOrDefault()
 	maxRounds := r.prMaxRounds()
-	// Resume: reload the last FAIL verdict so a crash between the reviewer's
-	// post and the fix turn still re-reviews against what was actually
-	// reported. Round-gated — a verdict from an older cycle never masquerades
+	// Resume: reload the last FAIL verdict so a crash anywhere after the
+	// reviewer reported — before OR after the fix turn landed — still
+	// re-reviews against the issues that were actually reported. Two gates
+	// match the two crash points: round == st.Round is a verdict posted whose
+	// fix turn never finished (round not consumed), round == st.Round-1 is a
+	// finished fix awaiting the next review. Anything older never masquerades
 	// as this round's prev.
 	var prev *agent.ReviewResult
-	if v, round := loadLastVerdict(r.cfg.WorkDir, st.Number); v != nil && round == st.Round-1 {
+	if v, round := loadLastVerdict(r.cfg.WorkDir, st.Number); v != nil && (round == st.Round-1 || round == st.Round) {
 		prev = v
 	}
 	// ownLogin identifies this gh account's comments; the external passthrough
@@ -523,13 +526,22 @@ func (r *ChatRepl) mergePRAndContinue(parentCtx context.Context, st *prState, gh
 	}
 	r.ui.Info(fmt.Sprintf("  pr: #%d merged", st.Number))
 
-	next, idx := nextPendingTodo(r.carry.Todos())
+	next, nextIdx := nextPendingTodo(r.carry.Todos())
 	if next == "" {
 		r.ui.Info("  pr: no pending task in the todo list — all done")
 		return
 	}
+	// The handoff must name the FINISHED item and the NEXT one separately:
+	// naming only the next item ordered the model to mark UNSTARTED work done
+	// while the item the merged PR just completed stayed in_progress forever
+	// (round-4 review issue 1).
 	var b strings.Builder
-	fmt.Fprintf(&b, "PR #%d was merged. Mark todo item %d (\"%s\") done with todo_write and start it now.", st.Number, idx, next)
+	if cur, curIdx := inProgressTodo(r.carry.Todos()); cur != "" {
+		fmt.Fprintf(&b, "PR #%d was merged. In ONE todo_write call resend the full todo list with item %d (\"%s\") marked done and item %d (\"%s\") marked in_progress, then start it.",
+			st.Number, curIdx, cur, nextIdx, next)
+	} else {
+		fmt.Fprintf(&b, "PR #%d was merged. Mark todo item %d (\"%s\") in_progress with todo_write and start it now.", st.Number, nextIdx, next)
+	}
 	r.ui.Info(fmt.Sprintf("  pr: next task — %s", next))
 	if turnErr := r.runMissionTurn(parentCtx, b.String()); turnErr != nil {
 		r.ui.Info("  pr: next-task turn interrupted — the task list still has it pending")
@@ -542,6 +554,18 @@ func (r *ChatRepl) mergePRAndContinue(parentCtx context.Context, st *prState, gh
 func nextPendingTodo(todos []builtin.TodoItem) (string, int) {
 	for i, t := range todos {
 		if t.Status == builtin.TodoPending {
+			return t.Content, i + 1
+		}
+	}
+	return "", 0
+}
+
+// inProgressTodo returns the first in_progress item's content and its 1-based
+// index — the work the merged PR just finished, which the handoff has to name
+// so IT gets marked done rather than the unstarted item after it.
+func inProgressTodo(todos []builtin.TodoItem) (string, int) {
+	for i, t := range todos {
+		if t.Status == builtin.TodoInProgress {
 			return t.Content, i + 1
 		}
 	}

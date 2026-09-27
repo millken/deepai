@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,8 +85,9 @@ func prDir(workDir string, number int) string {
 const prStateFile = "state.json"
 
 // prVerdictFile append-logs every review verdict. The resume path reloads
-// the last one so a crash between the reviewer's post and the fix turn still
-// re-reviews against the issues that were actually reported.
+// the last one so a crash after the reviewer reported — before or after the
+// fix turn landed — still re-reviews against the issues that were actually
+// reported.
 const prVerdictFile = "reviews.jsonl"
 
 // appendVerdict writes one JSON line: round + verdict.
@@ -109,12 +111,24 @@ func (s *prState) appendVerdict(workDir string, round int, v *agent.ReviewResult
 	return err
 }
 
+// resetPRVerdicts drops the verdict log so a re-attached loop starts a clean
+// cycle: a stale round-N entry would satisfy the resume gate's round == st.Round
+// arm against the fresh round-1 state and masquerade as this round's prev.
+// A missing log is not an error.
+func resetPRVerdicts(workDir string, number int) error {
+	err := os.Remove(filepath.Join(prDir(workDir, number), prVerdictFile))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // loadLastVerdict returns the newest logged verdict and its round, or (nil,
 // 0). Only FAIL verdicts are ever appended (a pass moves the loop past
 // reviewing), so the last entry is the prev a resumed re-review needs —
-// the caller additionally requires its round to be exactly st.Round-1, so
-// a verdict from an older cycle (e.g. before a CI fix round) never
-// masquerades as the previous review's findings.
+// the caller adopts it when its round is st.Round (verdict posted, fix turn
+// never finished) or st.Round-1 (fix finished, next review pending), so a
+// verdict from an older cycle never masquerades as this round's findings.
 func loadLastVerdict(workDir string, number int) (*agent.ReviewResult, int) {
 	data, err := os.ReadFile(filepath.Join(prDir(workDir, number), prVerdictFile))
 	if err != nil {

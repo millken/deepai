@@ -140,9 +140,9 @@ func TestWaitPRCI_DrainsStaleInterruptToken(t *testing.T) {
 	}
 }
 
-// The resume path in runPRLoop only adopts the logged verdict when its round
-// is exactly st.Round-1: a PR parked in reviewing at round 2 with a
-// round-1 fail verdict gets it as prev; one whose last verdict is from an
+// The resume path adopts the logged verdict on both crash points: a PR
+// parked in reviewing at round 2 with a round-1 fail verdict (fix finished,
+// next review pending) gets it as prev; one whose last verdict is from an
 // older cycle does not.
 func TestRunPRLoop_ResumeCarriesLastFailVerdict(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
@@ -161,6 +161,34 @@ func TestRunPRLoop_ResumeCarriesLastFailVerdict(t *testing.T) {
 	prompt := fake.args["prompt"].(string)
 	if !strings.Contains(prompt, "Previously reported") || !strings.Contains(prompt, "nil deref") {
 		t.Fatalf("resumed re-review must carry the round-1 verdict's issues as prev:\n%s", prompt)
+	}
+	if st.Status != prStatusAwaitingMerge {
+		t.Fatalf("status = %s, want awaiting_merge after pass", st.Status)
+	}
+}
+
+// Round-4 review issue 2, pinned: the crash-between-post-and-fix case —
+// verdict logged at round N while st.Round is still N (the fix turn was
+// interrupted, the round not consumed) — must adopt that verdict as prev;
+// the old round == st.Round-1 gate dropped exactly the case the resume
+// contract promised to cover.
+func TestRunPRLoop_ResumeCarriesUnconsumedRoundVerdict(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 45, 1, prStatusReviewing)
+
+	prev := &agent.ReviewResult{Verdict: "fail", Summary: "posted but fix interrupted",
+		Issues: []agent.Issue{{Severity: "medium", File: "b.go", Line: 7, Message: "off by one", Scenario: "empty slice"}}}
+	if err := st.appendVerdict(r.cfg.WorkDir, 1, prev); err != nil {
+		t.Fatalf("appendVerdict: %v", err)
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	prompt := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "Previously reported") || !strings.Contains(prompt, "off by one") {
+		t.Fatalf("a verdict whose fix turn never ran must still reach the re-review as prev:\n%s", prompt)
 	}
 	if st.Status != prStatusAwaitingMerge {
 		t.Fatalf("status = %s, want awaiting_merge after pass", st.Status)

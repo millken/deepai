@@ -131,9 +131,12 @@ func TestMergePRAndContinue_NextTodoKickoff(t *testing.T) {
 	r := newPRLoopRepl(t, fake, gh)
 	st := newTrackedPR(t, r, 30, 1, prStatusAwaitingMerge)
 
+	// Round-4 review issue 1: the handoff must name the FINISHED item (mark
+	// done) and the NEXT one (mark in_progress) separately — naming only the
+	// next one ordered the model to mark unstarted work done.
 	r.carry.SetTodos([]builtin.TodoItem{
-		{Content: "done task", Status: builtin.TodoDone},
-		{Content: "ledger export", Status: builtin.TodoPending},
+		{Content: "add ledger export", Status: builtin.TodoInProgress},
+		{Content: "write docs", Status: builtin.TodoPending},
 	})
 
 	var got string
@@ -147,8 +150,45 @@ func TestMergePRAndContinue_NextTodoKickoff(t *testing.T) {
 	if st.Status != prStatusMerged {
 		t.Fatalf("status = %s, want merged", st.Status)
 	}
-	if !strings.Contains(got, "PR #30 was merged") || !strings.Contains(got, `"ledger export"`) {
-		t.Fatalf("next-task turn input = %q", got)
+	for _, want := range []string{
+		"PR #30 was merged",
+		"item 1 (\"add ledger export\") marked done",
+		"item 2 (\"write docs\") marked in_progress",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("next-task input missing %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "\"write docs\") marked done") {
+		t.Fatalf("the unstarted item must not be the one marked done: %q", got)
+	}
+}
+
+// The no-in-progress variant: nothing to mark done, the next item simply
+// becomes in_progress — never done.
+func TestMergePRAndContinue_NextTodoWithoutInProgress(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line"}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 33, 1, prStatusAwaitingMerge)
+	r.carry.SetTodos([]builtin.TodoItem{
+		{Content: "done task", Status: builtin.TodoDone},
+		{Content: "ledger export", Status: builtin.TodoPending},
+	})
+
+	var got string
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		got = input
+		return nil
+	}
+
+	r.mergePRAndContinue(context.Background(), st, gh)
+
+	if !strings.Contains(got, "item 2 (\"ledger export\") in_progress") {
+		t.Fatalf("next-task input = %q, want the next item marked in_progress", got)
+	}
+	if strings.Contains(got, "done with todo_write") || strings.Contains(got, "marked done") {
+		t.Fatalf("with nothing in_progress the handoff must not order anything marked done: %q", got)
 	}
 }
 
@@ -195,6 +235,70 @@ func TestRunPRLoop_AutoMergeFailurePersistsAwaitingMerge(t *testing.T) {
 	}
 	if reloaded.Status != prStatusAwaitingMerge {
 		t.Fatalf("persisted status = %s, want awaiting_merge", reloaded.Status)
+	}
+}
+
+// Round-4 review issue 3, pinned: the already-tracked guard used to accept
+// TERMINAL states and point at /pr resume — a command that refuses them, a
+// dead end with no path back to re-reviewing the PR.
+func TestReviewPRCommand_MergedIsRefused(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.prGH = gh
+	r.missionTurn = func(ctx context.Context, input string) *turnError { return nil }
+	st := newTrackedPR(t, r, 55, 1, prStatusMerged)
+	ui.infoMsgs = nil
+
+	r.handlePRCommand(context.Background(), "review 55")
+
+	if fake.calls != 0 {
+		t.Fatal("a merged PR must not re-enter the review loop")
+	}
+	reloaded, _ := openPRState(r.cfg.WorkDir, 55)
+	if reloaded.UpdatedAt != st.UpdatedAt {
+		t.Fatal("the merged state must be untouched")
+	}
+	if msgs := strings.Join(ui.infoMsgs, "\n"); !strings.Contains(msgs, "already merged — nothing to review") {
+		t.Fatalf("the refusal must say merged, got: %s", msgs)
+	}
+}
+
+// An ABORTED loop re-attaches fresh: round 1, no stale prev — the old verdict
+// log is cleared so its round-N entries cannot masquerade as this cycle's.
+func TestReviewPRCommand_AbortedReattachesFresh(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", viewTitle: "second attempt",
+		checksScript: []fakeChecks{{done: true, ok: true}}}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.prGH = gh
+	r.missionTurn = func(ctx context.Context, input string) *turnError { return nil }
+	st := newTrackedPR(t, r, 56, 3, prStatusAborted)
+	old := &agent.ReviewResult{Verdict: "fail", Summary: "stale cycle",
+		Issues: []agent.Issue{{Severity: "low", File: "a.go", Line: 1, Message: "stale finding", Scenario: "s"}}}
+	if err := st.appendVerdict(r.cfg.WorkDir, 3, old); err != nil {
+		t.Fatalf("appendVerdict: %v", err)
+	}
+	ui.infoMsgs = nil
+
+	r.handlePRCommand(context.Background(), "review 56")
+
+	prompt, _ := fake.args["prompt"].(string)
+	if strings.Contains(prompt, "stale cycle") || strings.Contains(prompt, "Previously reported") {
+		t.Fatalf("a re-attach must not adopt the aborted cycle's verdict as prev:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "second attempt") {
+		t.Fatalf("the re-attach must review the CURRENT PR, got:\n%s", prompt)
+	}
+	reloaded, err := openPRState(r.cfg.WorkDir, 56)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Status != prStatusAwaitingMerge || reloaded.Round != 1 {
+		t.Fatalf("reloaded = round %d %s, want a fresh round-1 cycle ending all-green", reloaded.Round, reloaded.Status)
+	}
+	if msgs := strings.Join(ui.infoMsgs, "\n"); !strings.Contains(msgs, "re-attached (was aborted)") {
+		t.Fatalf("the re-attach must be reported, got: %s", msgs)
 	}
 }
 

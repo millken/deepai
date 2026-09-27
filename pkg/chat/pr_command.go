@@ -45,9 +45,22 @@ func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 		r.ui.Info("  pr: review needs a PR number — /pr review <n>")
 		return
 	}
-	if _, err := openPRState(r.cfg.WorkDir, n); err == nil {
-		r.ui.Info(fmt.Sprintf("  pr: #%d is already tracked — /pr resume continues it", n))
-		return
+	existing, err := openPRState(r.cfg.WorkDir, n)
+	if err == nil {
+		// Only an ACTIVE loop points at /pr resume — that command refuses
+		// terminal states, so the old blanket guard sent merged/aborted PRs
+		// into a dead end (round-4 review issue 3). Merged is final; aborted
+		// re-attaches fresh below.
+		if existing.Status.active() {
+			r.ui.Info(fmt.Sprintf("  pr: #%d is already tracked — /pr resume continues it", n))
+			return
+		}
+		if existing.Status == prStatusMerged {
+			r.ui.Info(fmt.Sprintf("  pr: #%d is already merged — nothing to review", n))
+			return
+		}
+	} else {
+		existing = nil
 	}
 	gh := r.prGHOrDefault()
 	title, branch, base, url, err := gh.View(parentCtx, "", n)
@@ -65,7 +78,17 @@ func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 		r.ui.Info(fmt.Sprintf("  pr: could not track #%d (%v)", n, err))
 		return
 	}
-	r.ui.Info(fmt.Sprintf("  pr: #%d attached — %s", n, title))
+	// Re-attach over an aborted loop starts a clean cycle: the old verdict
+	// log must go too, or its round-N entries would satisfy the resume gate
+	// (round == st.Round) of the fresh round-1 loop and masquerade as prev.
+	if err := resetPRVerdicts(r.cfg.WorkDir, n); err != nil {
+		r.ui.Info(fmt.Sprintf("  pr: could not clear #%d's old verdict log (%v) — continuing", n, err))
+	}
+	if existing != nil {
+		r.ui.Info(fmt.Sprintf("  pr: #%d re-attached (was %s) — round 1", n, existing.Status))
+	} else {
+		r.ui.Info(fmt.Sprintf("  pr: #%d attached — %s", n, title))
+	}
 	r.runPRLoop(parentCtx, st)
 }
 
