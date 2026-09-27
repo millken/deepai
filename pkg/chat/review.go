@@ -258,21 +258,22 @@ const maxReviewRounds = 2
 //
 // It is a LAST-RESORT net, not the reviewer's workload bound: the
 // clock expiring kills the run and throws away everything it found, so the
-// real bound is reviewMaxToolCalls below, which degrades gracefully into a
+// real bound is DefaultReviewMaxToolCalls below (or the configured
+// review_max_tool_calls), which degrades gracefully into a
 // verdict. Sized to be reached only by a genuinely stuck run — 5 minutes was
 // routinely hit by an honest reviewer on a reasoning model (minutes of
 // thinking per turn), which cost the whole review.
 const DefaultReviewTimeout = 10 * time.Minute
 
-// reviewMaxToolCalls bounds the reviewer's workload where exhaustion is
-// RECOVERABLE: react.go turns the last call into a forced tool-less wrap-up
-// that must still satisfy the Strict output schema, so the gate gets a real
-// verdict for the part of the change the reviewer did examine. The profile
-// itself stays uncapped (types_config.go) — a direct `task` call to this agent
-// type has no wall clock to race, only the gate does.
-//
-// 20 covers reading every hunk's surroundings plus a build/test to
-// substantiate a charge, for the change sizes rung (a) admits at all.
+// DefaultReviewMaxToolCalls bounds the reviewer's workload where exhaustion
+// is RECOVERABLE: react.go turns the last call into a forced tool-less
+// wrap-up that must still satisfy the Strict output schema, so the gate gets
+// a real verdict for the part of the change the reviewer did examine. The
+// profile itself stays uncapped (types_config.go) — a direct `task` call to
+// this agent type has no wall clock to race, only the gate does. A
+// configured review_max_tool_calls replaces this number wholesale; the
+// gate also never dispatches below 3x the changed-file count
+// (scaleReviewToolBudget).
 //
 // pkg/agent's defaultReviewerMaxToolCalls is deliberately the same number —
 // the two review routes had no reason to differ — but it is a SEPARATE
@@ -294,10 +295,6 @@ const DefaultReviewTimeout = 10 * time.Minute
 // description came out half-verified, which is exactly the accuracy loss the
 // cap must not cause on reviewable diffs.
 const DefaultReviewMaxToolCalls = 40
-
-// reviewMaxToolCalls keeps the old compile-time symbol for tests that assert
-// the dispatch arguments; production reads the configured value.
-const reviewMaxToolCalls = DefaultReviewMaxToolCalls
 
 // reviewDiffByteCap is degradation rung (c) of design §六-3: a diff bigger
 // than this is not reviewed at all — the user is told, loudly, instead of

@@ -498,7 +498,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case waitEndMsg:
 		m.waitActive = false
 		m.waitReason = ""
-		m.inputVisible = true
+		// Visibility is restored by the next ReadPrompt (requestInputMsg),
+		// which is what actually owns the input box between REPL phases —
+		// forcing it visible here would show an input whose submissions
+		// nobody is waiting to read while the loop still has gh work left.
 		return m, nil
 
 	case turnStartMsg:

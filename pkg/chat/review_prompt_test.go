@@ -82,13 +82,17 @@ func TestBuildReviewPrompt_PassingVerdictCarriesNothing(t *testing.T) {
 func TestReviewDispatch_PassesGracefulToolCallCap(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
+	// A configured value must be what enforces the cap AND what the prompt
+	// announces — asserting the constant again would pin a desync (round-2
+	// review issue 1). 7 also beats 3×1 file, so the floor is the config's.
+	r.cfg.ReviewMaxToolCalls = 7
 	seedEditedFile(t, r, "a.go", "package a\n")
 
 	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("want pass, got %q", got)
 	}
-	if got := fake.args["max_tool_calls"]; got != DefaultReviewMaxToolCalls {
-		t.Fatalf("max_tool_calls = %v, want %d", got, reviewMaxToolCalls)
+	if got := fake.args["max_tool_calls"]; got != 7 {
+		t.Fatalf("max_tool_calls = %v, want the configured 7", got)
 	}
 }
 

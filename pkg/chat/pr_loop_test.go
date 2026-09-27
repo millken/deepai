@@ -21,6 +21,8 @@ type fakeGH struct {
 	login string
 	// viewTitle is what View reports.
 	viewTitle string
+	// viewURL is the PR URL View reports; empty means "not a PR URL".
+	viewURL string
 
 	commentsPosted []string
 	checksCalls    int
@@ -38,7 +40,7 @@ func (f *fakeGH) View(context.Context, string, int) (string, string, string, str
 	if title == "" {
 		title = "PR review pipeline"
 	}
-	return title, "feature/pr-pipeline", "main", "", nil
+	return title, "feature/pr-pipeline", "main", f.viewURL, nil
 }
 
 type fakeChecks struct {

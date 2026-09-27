@@ -207,7 +207,11 @@ func TestSessionCarryTodosRoundTrip(t *testing.T) {
 
 func TestReviewPRCommand_AttachesExternalPR(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
+	// The URL is the only place the repo can come from — the attach must pin
+	// it so later gh calls never target the process's cwd instead (round-2
+	// review issue 3).
 	gh := &fakeGH{diff: "+line", files: []string{"a.go"}, viewTitle: "feat: PR review pipeline",
+		viewURL:      "https://github.com/other/libY/pull/55",
 		checksScript: []fakeChecks{{done: true, ok: true}}}
 	r := newPRLoopRepl(t, fake, gh)
 
@@ -219,6 +223,9 @@ func TestReviewPRCommand_AttachesExternalPR(t *testing.T) {
 	}
 	if st.Brief != "feat: PR review pipeline" {
 		t.Fatalf("brief = %q, want the PR title", st.Brief)
+	}
+	if st.Repo != "other/libY" {
+		t.Fatalf("repo = %q, want the repo pinned from the fetched URL", st.Repo)
 	}
 	if st.Status != prStatusAwaitingMerge {
 		t.Fatalf("status = %s, want awaiting_merge after pass+green", st.Status)
