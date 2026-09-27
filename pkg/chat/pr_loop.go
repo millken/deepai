@@ -3,7 +3,6 @@ package chat
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -347,18 +346,6 @@ func (r *ChatRepl) awaitingMergePR() *prState {
 	return nil
 }
 
-// commentIDGt orders gh comment ids NUMERICALLY. They are numeric strings;
-// lexicographic order puts "999" after "1000", which would silently drop
-// every newly-created comment from the watermark advance.
-func commentIDGt(a, b string) bool {
-	na, ea := strconv.ParseInt(a, 10, 64)
-	nb, eb := strconv.ParseInt(b, 10, 64)
-	if ea == nil && eb == nil {
-		return na > nb
-	}
-	return a > b
-}
-
 // pendingExternalComments fetches the PR's comments and returns the external
 // ones — authored by another identity (humans, cursor, …), told apart by
 // author login rather than body markers — newer than the state's watermark,
@@ -376,33 +363,38 @@ func pendingExternalComments(ctx context.Context, st *prState, gh prGH, ownLogin
 	external := filterExternalComments(comments, ownLogin)
 	var fresh []prComment
 	for _, c := range external {
-		if commentIDGt(c.ID, st.LastExternalComment) {
+		if c.CreatedAt.After(st.LastExternalCommentAt) {
 			fresh = append(fresh, c)
 		}
 	}
 	// Cap at the newest: external chatter is context for the coder, not a
 	// mandate, and an unbounded block could crowd the issues out of the fix
-	// turn's input.
+	// turn's input. The newest comment always survives even alone over the
+	// cap (externalCommentsBlock clips its body) — an over-budget first hit
+	// must not empty the whole passthrough.
 	const capBytes = 8 << 10
 	total := 0
-	start := len(fresh)
+	start := len(fresh) - 1
 	for i := len(fresh) - 1; i >= 0; i-- {
 		total += len(fresh[i].Body)
-		if total > capBytes {
+		if total > capBytes && i < len(fresh)-1 {
 			break
 		}
 		start = i
 	}
+	if start < 0 {
+		start = 0
+	}
 	return fresh[start:]
 }
 
-// advanceExternalWatermark moves the dedup cursor to the newest comment id
-// in comments (empty keeps the current cursor). A failed save is logged by
+// advanceExternalWatermark moves the dedup cursor past the comments the fix
+// turn just saw (empty keeps the current cursor). A failed save is logged by
 // the caller; re-surfacing one comment after a crash is the cheaper failure.
 func (r *ChatRepl) advanceExternalWatermark(st *prState, comments []prComment) {
 	for _, c := range comments {
-		if commentIDGt(c.ID, st.LastExternalComment) {
-			st.LastExternalComment = c.ID
+		if c.CreatedAt.After(st.LastExternalCommentAt) {
+			st.LastExternalCommentAt = c.CreatedAt
 		}
 	}
 	if err := st.save(r.cfg.WorkDir); err != nil {

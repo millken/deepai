@@ -101,6 +101,10 @@ func TestClassifyChecksCode(t *testing.T) {
 		{1, "gh: Could not resolve to a Pull Request", false, false, true},
 		{1, "HTTP 404: Not Found", false, false, true},
 		{1, "some checks failed", true, false, false},
+		// Round-1 high issue, pinned: a branch with NO CI configured is not a
+		// failed CI — gh exits 1 with empty stdout and this stderr. Misclassifying
+		// it burned fix rounds chasing a phantom failure.
+		{1, "no checks reported on 'feat/x' branch", true, true, false},
 		{2, "", true, false, false},
 	}
 	for _, c := range cases {

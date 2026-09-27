@@ -287,7 +287,17 @@ const DefaultReviewTimeout = 10 * time.Minute
 // invalid JSON gets no second attempt — it fail-softs as "verdict
 // unparseable". Accepted: that path needs two failures at once, against a
 // wall-clock expiry that loses the review every single time it happens.
-const reviewMaxToolCalls = 20
+// DefaultReviewMaxToolCalls is the fallback for the reviewer's tool-call cap
+// when review_max_tool_calls is unset. 40, not 20: the first live PR-loop run
+// (PR #3 round 1) wrapped up at exactly 20 mid-investigation on a diff rung
+// (a) admits — the wrap-up verdict was still valid but one issue's mechanism
+// description came out half-verified, which is exactly the accuracy loss the
+// cap must not cause on reviewable diffs.
+const DefaultReviewMaxToolCalls = 40
+
+// reviewMaxToolCalls keeps the old compile-time symbol for tests that assert
+// the dispatch arguments; production reads the configured value.
+const reviewMaxToolCalls = DefaultReviewMaxToolCalls
 
 // reviewDiffByteCap is degradation rung (c) of design §六-3: a diff bigger
 // than this is not reviewed at all — the user is told, loudly, instead of
@@ -481,6 +491,13 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 	}, contextFiles, snap)
 }
 
+func (r *ChatRepl) reviewMaxToolCallsOrDefault() int {
+	if r.cfg.ReviewMaxToolCalls > 0 {
+		return r.cfg.ReviewMaxToolCalls
+	}
+	return DefaultReviewMaxToolCalls
+}
+
 func isPassVerdict(v *agent.ReviewResult) bool {
 	return strings.EqualFold(v.Verdict, "pass") || len(v.Issues) == 0
 }
@@ -503,7 +520,7 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
-	in.maxToolCalls = reviewMaxToolCalls
+	in.maxToolCalls = r.reviewMaxToolCallsOrDefault()
 	in.timeout = timeout
 
 	args := map[string]any{

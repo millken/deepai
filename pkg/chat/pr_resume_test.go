@@ -2,7 +2,7 @@ package chat
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,34 +10,19 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 )
 
-func TestCommentIDGt(t *testing.T) {
-	if !commentIDGt("1000", "999") {
-		t.Fatal("numeric order: 1000 > 999, lexicographic would say otherwise")
-	}
-	if commentIDGt("999", "1000") {
-		t.Fatal("999 < 1000 numerically")
-	}
-	if commentIDGt("42", "42") {
-		t.Fatal("equal ids are not greater")
-	}
-	if !commentIDGt("z", "a") {
-		t.Fatal("non-numeric ids fall back to string order")
-	}
-}
-
 func mkComment(id, author, body string, ts time.Time) prComment {
 	return prComment{ID: id, Author: author, Body: body, CreatedAt: ts}
 }
 
 func TestPendingExternalComments(t *testing.T) {
-	base := time.Now().UTC()
-	st := &prState{Number: 1, LastExternalComment: "10"}
+	base := time.Now().UTC().Add(-time.Hour)
+	st := &prState{Number: 1, LastExternalCommentAt: base}
 	gh := &fakeGH{comments: []prComment{
-		mkComment("5", "alice", "old external", base),
-		mkComment("11", "deepai", "own review post", base),
-		mkComment("20", "cursor", "cursor asks about tests", base),
-		mkComment("30", "alice", "human nit", base),
-		mkComment("40", "bob", "newest human note", base),
+		mkComment("5", "alice", "old external", base.Add(-time.Minute)),
+		mkComment("11", "deepai", "own review post", base.Add(time.Minute)),
+		mkComment("20", "cursor", "cursor asks about tests", base.Add(2*time.Minute)),
+		mkComment("30", "alice", "human nit", base.Add(3*time.Minute)),
+		mkComment("40", "bob", "newest human note", base.Add(4*time.Minute)),
 	}}
 
 	got := pendingExternalComments(context.Background(), st, gh, "deepai")
@@ -46,7 +31,7 @@ func TestPendingExternalComments(t *testing.T) {
 		for i, c := range got {
 			ids[i] = c.ID
 		}
-		t.Fatalf("pending = %v, want [20 30 40] (watermark 10, own login skipped)", ids)
+		t.Fatalf("pending = %v, want [20 30 40] (watermark, own login skipped)", ids)
 	}
 }
 
@@ -58,12 +43,26 @@ func TestPendingExternalComments_EmptyOwnLoginDisables(t *testing.T) {
 	}
 }
 
+// The round-1 medium bug, pinned: a single comment larger than the 8KB cap
+// must still reach the fix turn (kept newest, body clipped downstream) —
+// not silently empty the whole passthrough.
+func TestPendingExternalComments_SingleOverBudgetCommentSurvives(t *testing.T) {
+	st := &prState{Number: 1}
+	gh := &fakeGH{comments: []prComment{
+		mkComment("1", "alice", strings.Repeat("x", 9<<10), time.Now().UTC()),
+	}}
+	got := pendingExternalComments(context.Background(), st, gh, "deepai")
+	if len(got) != 1 {
+		t.Fatalf("the only fresh comment must survive the cap, got %d", len(got))
+	}
+}
+
 func TestPendingExternalComments_CapsAtNewest8KB(t *testing.T) {
 	base := time.Now().UTC()
 	var comments []prComment
 	for i := 0; i < 6; i++ {
 		comments = append(comments, mkComment(
-			strconv.Itoa(i+1), "alice", strings.Repeat("x", 3000), base))
+			fmt.Sprintf("%d", i+1), "alice", strings.Repeat("x", 3000), base))
 	}
 	st := &prState{Number: 1}
 	got := pendingExternalComments(context.Background(), st, &fakeGH{comments: comments}, "deepai")
@@ -188,7 +187,7 @@ func TestRunPRLoop_ExternalCommentsReachFixTurn(t *testing.T) {
 	if !strings.Contains(fixInput, "please also fix the migration") {
 		t.Fatalf("external comment never reached the fix turn: %q", fixInput)
 	}
-	if st.LastExternalComment != "5" {
-		t.Fatalf("watermark = %q, want 5", st.LastExternalComment)
+	if st.LastExternalCommentAt.IsZero() {
+		t.Fatal("watermark never advanced past the surfaced comment")
 	}
 }

@@ -57,11 +57,14 @@ type prState struct {
 	Round int      `json:"round"`
 	Brief string   `json:"brief,omitempty"`
 	Scope []string `json:"scope,omitempty"`
-	// LastExternalComment is the id of the newest external PR comment
-	// already surfaced to a fix turn; anything newer is pending input.
-	LastExternalComment string    `json:"last_external_comment,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	// LastExternalCommentAt is the createdAt of the newest external PR
+	// comment already surfaced to a fix turn; anything newer is pending input.
+	// A time, not a comment id: gh ids are opaque base64 relay strings with no
+	// usable ordering (round-1 review, verified live). Same-second external
+	// comments after an advance are skipped — rare and cheaper than re-feeding.
+	LastExternalCommentAt time.Time `json:"last_external_comment_at,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 func prsRoot(workDir string) string {
@@ -436,19 +439,28 @@ func (g ghPRClient) ChangedFiles(ctx context.Context, repo string, number int) (
 	return paths, nil
 }
 
-// Checks mirrors ci_wait's exit-code mapping (pkg/tools/builtin/ciwait.go):
-// 0 all passed, 8 pending, 1 failed-or-lookup-error, 127 gh missing.
+// Checks mirrors ci_wait's exit-code mapping, with one PR-loop-specific
+// addition: exit 1 with gh's "no checks reported" stderr means the branch
+// has NO CI configured — nothing failed, so the PR goes green (verified
+// live against repos without workflows; deepai itself is one).
 func (g ghPRClient) Checks(ctx context.Context, repo string, number int) (bool, bool, string, error) {
 	args := prRepoArgs(repo, "checks", strconv.Itoa(number))
 	out, stderr, code, err := g.run(ctx, args...)
 	if err != nil {
 		return false, false, out, err
 	}
+	summary := strings.TrimSpace(out)
+	if s := strings.TrimSpace(stderr); s != "" {
+		if summary != "" {
+			summary += "\n"
+		}
+		summary += s
+	}
 	done, ok, lookupErr := classifyChecksCode(code, stderr)
 	if lookupErr != "" {
-		return false, false, out, fmt.Errorf("gh pr checks: %s", lookupErr)
+		return false, false, summary, fmt.Errorf("gh pr checks: %s", lookupErr)
 	}
-	return done, ok, out, nil
+	return done, ok, summary, nil
 }
 
 // classifyChecksCode is the pure exit-code verdict shared by Checks and its
@@ -464,6 +476,9 @@ func classifyChecksCode(code int, stderr string) (done, ok bool, lookupErr strin
 		return false, false, "gh is not installed or not on PATH"
 	case code == 1:
 		s := strings.ToLower(stderr)
+		if strings.Contains(s, "no checks reported") {
+			return true, true, ""
+		}
 		if strings.Contains(s, "could not resolve") || strings.Contains(s, "not found") || strings.Contains(s, "no pull requests found") {
 			return false, false, strings.TrimSpace(stderr)
 		}

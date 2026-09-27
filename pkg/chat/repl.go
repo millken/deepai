@@ -89,6 +89,10 @@ type ReplConfig struct {
 	ReviewTokenBudget int
 	// ReviewTimeout bounds one review subagent run; 0 uses DefaultReviewTimeout.
 	ReviewTimeout time.Duration
+	// ReviewMaxToolCalls caps each review subagent's tool calls; 0 uses
+	// DefaultReviewMaxToolCalls (40). The cap trades depth for bounded cost —
+	// budget exhaustion forces a tool-less wrap-up that still emits a verdict.
+	ReviewMaxToolCalls int
 	// ReviewModel is the model alias every reviewer the GATES dispatch runs
 	// on — the post-edit correctness review, the mission's design review and
 	// its implementation review. Empty (the default) keeps today's behavior:

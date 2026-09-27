@@ -83,6 +83,11 @@ type Config struct {
 	// ReviewTimeoutMinutes bounds one review subagent run, in minutes
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
+	// ReviewMaxToolCalls caps each review subagent's tool calls. 0 or absent
+	// = DefaultReviewMaxToolCalls (40) in pkg/chat. Raised from 20 after the
+	// first live PR-loop run wrapped up mid-investigation on a reviewable
+	// diff (PR #3 round 1).
+	ReviewMaxToolCalls int `yaml:"review_max_tool_calls,omitempty"`
 	// ReviewModel names the model every gate-dispatched reviewer runs on —
 	// a models[] alias, not a provider model name. Empty (the default) runs
 	// them on the main agent's model, which is also the case where the
