@@ -498,6 +498,21 @@ func (r *ChatRepl) reviewMaxToolCallsOrDefault() int {
 	return DefaultReviewMaxToolCalls
 }
 
+// scaleReviewToolBudget sizes the reviewer's tool-call cap against the scope:
+// max(configured-or-default, 3×changed files). Round 1 on PR #3 spent 12 of
+// 20 calls merely reading 14 files ONCE — a fixed cap leaves no re-verification
+// margin as scopes grow, and the half-verified issue text it produced is the
+// accuracy loss this formula prevents. 3× covers one read plus grep
+// follow-ups plus a re-check per file; a configured higher floor always wins
+// for small scopes.
+func (r *ChatRepl) scaleReviewToolBudget(changedFiles int) int {
+	budget := r.reviewMaxToolCallsOrDefault()
+	if n := 3 * changedFiles; n > budget {
+		return n
+	}
+	return budget
+}
+
 func isPassVerdict(v *agent.ReviewResult) bool {
 	return strings.EqualFold(v.Verdict, "pass") || len(v.Issues) == 0
 }
@@ -520,7 +535,7 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
-	in.maxToolCalls = r.reviewMaxToolCallsOrDefault()
+	in.maxToolCalls = r.scaleReviewToolBudget(len(in.scope))
 	in.timeout = timeout
 
 	args := map[string]any{
@@ -532,7 +547,7 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 		// wrap-up that still has to satisfy the output schema, so a reviewer
 		// that would otherwise have been killed mid-browse still returns a
 		// verdict for what it examined.
-		"max_tool_calls": reviewMaxToolCalls,
+		"max_tool_calls": in.maxToolCalls,
 	}
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget

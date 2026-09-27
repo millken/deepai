@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -149,5 +150,42 @@ func TestBuildReviewPrompt_PRModeComposesWithPrevIssues(t *testing.T) {
 	})
 	if !strings.Contains(p, "PR #7, review round 3") || !strings.Contains(p, "off by one") {
 		t.Fatalf("PR mode must still carry previous issues for re-review:\n%s", p)
+	}
+}
+
+func TestScaleReviewToolBudget(t *testing.T) {
+	cases := []struct {
+		configured, files, want int
+	}{
+		{0, 14, 42},  // 3×14 beats the default — PR #3's exact scope
+		{0, 10, 40},  // default floor wins on small scopes
+		{0, 0, 40},   // degenerate scope keeps the floor
+		{60, 30, 90}, // scale beats a higher configured floor
+		{60, 10, 60}, // configured floor wins over scale
+	}
+	for _, c := range cases {
+		fake := &fakeTaskTool{content: passVerdictJSON()}
+		r, _ := newReviewRepl(t, t.TempDir(), fake)
+		r.cfg.ReviewMaxToolCalls = c.configured
+		if got := r.scaleReviewToolBudget(c.files); got != c.want {
+			t.Errorf("scaleReviewToolBudget(cfg=%d, files=%d) = %d, want %d", c.configured, c.files, got, c.want)
+		}
+	}
+}
+
+// The dispatch must carry the SCALED value, not the constant — a 14-file
+// scope reaches the subagent as 42 while the single-file gate tests still see
+// the 40 floor.
+func TestReviewGateDispatchesScaledBudget(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _ := newReviewRepl(t, t.TempDir(), fake)
+	for i := 0; i < 14; i++ {
+		seedEditedFile(t, r, fmt.Sprintf("f%02d.go", i), "package a\n")
+	}
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
+		t.Fatalf("want pass, got %q", got)
+	}
+	if got := fake.args["max_tool_calls"]; got != 42 {
+		t.Fatalf("max_tool_calls = %v, want 42 (3×14 files)", got)
 	}
 }
