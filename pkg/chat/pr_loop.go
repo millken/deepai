@@ -47,6 +47,18 @@ func (r *ChatRepl) prMaxRounds() int {
 	return maxPRReviewRounds
 }
 
+// isPRPassVerdict is deliberately STRICTER than isPassVerdict, which also
+// treats "no issues" as a pass. The round-3+ convergence prompt
+// (buildReviewPrompt) tells the reviewer to park genuinely-new minor findings
+// in the summary sentence OUTSIDE the issue list, so an empty issues array is
+// a shape a COMPLIANT failing reviewer now produces on purpose. This check
+// decides the loop's terminal pass — CI wait, then auto-merge — so a fail with
+// an empty issue list must spend another fix round: exactly the hole
+// isMissionPassVerdict closes on the mission path.
+func isPRPassVerdict(v *agent.ReviewResult) bool {
+	return v != nil && strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
+}
+
 func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	gh := r.prGHOrDefault()
 	maxRounds := r.prMaxRounds()
@@ -123,7 +135,7 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					r.ui.Info("  pr: review could not run — nothing posted, no round consumed; /pr resumes the loop")
 					return
 				}
-				if isPassVerdict(verdict) {
+				if isPRPassVerdict(verdict) {
 					r.ui.Info(fmt.Sprintf("  pr: #%d review passed — waiting for CI", st.Number))
 					prev = nil
 					st.setStatus(r.cfg.WorkDir, prStatusAwaitingCI)

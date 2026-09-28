@@ -715,9 +715,12 @@ func buildReviewPrompt(in reviewPromptInput) string {
 		// Round 3+ is the convergence phase (docs/review.md §3): two fix
 		// rounds have already answered the earlier findings, and every new
 		// medium/low raised now only buys another fix round — the loop can
-		// never close that way.
+		// never close that way. A finding demoted to the summary sentence is
+		// still a finding: the text below pins it to verdict "fail", and
+		// isPRPassVerdict (pr_loop.go) accepts only an explicit pass —
+		// together they keep the parked shape from closing the loop on it.
 		if in.prRound >= 3 {
-			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — a genuinely new minor finding goes into the summary sentence, not the issue list.\n\n")
+			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — a genuinely new minor finding goes into the summary sentence, not the issue list. A finding parked in the summary is still a finding: it does not widen the loop, but the verdict must stay \"fail\" until every reported finding is fixed — an empty issue list never passes on its own.\n\n")
 		}
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")

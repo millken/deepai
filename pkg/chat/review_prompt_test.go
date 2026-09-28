@@ -208,6 +208,7 @@ func TestBuildReviewPrompt_PRRound3IsConvergence(t *testing.T) {
 	for _, want := range []string{
 		"Convergence round",
 		"only if it is critical or high",
+		"an empty issue list never passes",
 	} {
 		if !strings.Contains(late, want) {
 			t.Errorf("round-3+ prompt missing %q:\n%s", want, late)

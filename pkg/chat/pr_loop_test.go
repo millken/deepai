@@ -167,6 +167,44 @@ func TestPRLoop_RoundCapAborts(t *testing.T) {
 	}
 }
 
+// The convergence prompt (round 3+) tells the reviewer to park genuinely-new
+// minor findings in the summary sentence, NOT the issue list — so a compliant
+// failing reviewer legitimately emits {"verdict":"fail","issues":[]}. That
+// verdict must spend another fix round, not close the loop: isPassVerdict
+// would treat the empty list as a pass and hand the PR to CI and auto-merge
+// with a confirmed-unfixed finding.
+func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
+	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail",
+		"summary":"one medium issue remains","issues":[]}`}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 42, 3, prStatusReviewing)
+
+	// The fix turn lands the real fix; the next round passes. fake.args keeps
+	// only the LAST dispatch's arguments, so the round-3 prompt is captured
+	// here — missionTurn runs between the two reviews.
+	var round3Prompt string
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		if round3Prompt == "" {
+			round3Prompt = fmt.Sprint(fake.args["prompt"])
+		}
+		fake.content = passVerdictJSON()
+		return nil
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	if st.Status != prStatusAwaitingMerge {
+		t.Fatalf("status = %s, want awaiting_merge — an empty issue list must never close the loop on a fail verdict", st.Status)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("review dispatched %d times, want 2 (fail-with-empty-issues, then pass)", fake.calls)
+	}
+	if !strings.Contains(round3Prompt, "PR #42, review round 3") || !strings.Contains(round3Prompt, "Convergence round") {
+		t.Fatalf("round-3 review must carry the convergence prompt:\n%s", round3Prompt)
+	}
+}
+
 func TestPRLoop_FailSoftReviewConsumesNothing(t *testing.T) {
 	fake := &fakeTaskTool{err: errors.New("boom")}
 	gh := &fakeGH{diff: "+line"}
