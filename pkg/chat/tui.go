@@ -113,9 +113,10 @@ func (t *TUI) WaitEnd() {
 }
 
 // FlushSubagentBlock commits a finished subagent fan-out to scrollback
-// outside a turn. The PR loop dispatches its reviewer from the /pr command
-// path, where no turn ever ends, so the normal turn-end commit never fires
-// and the resolved line would stay pinned on screen indefinitely.
+// outside a turn. Every reviewer dispatch resolves after TurnEnd (gate,
+// mission, PR loop) or with no turn at all (/review), so the normal turn-end
+// commit never fires and the resolved line would stay pinned on screen
+// indefinitely.
 func (t *TUI) FlushSubagentBlock() {
 	t.p.Send(flushSubagentMsg{})
 }
@@ -515,9 +516,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case flushSubagentMsg:
 		// The same commit-and-clear turnEndMsg performs for the fan-out block,
-		// for dispatches that happen outside any turn (the PR loop's reviewer,
-		// driven from /pr commands) — no turn ever ends there, so without this
-		// the resolved line stays pinned in the live region forever.
+		// for reviewer dispatches that resolve outside any live turn — after
+		// TurnEnd (gate, mission, PR loop) or with no turn at all (/review).
+		// Without it the resolved line stays pinned in the live region forever.
 		if block := m.subagentSummaryBlock(); block != "" {
 			m.clearSubagentBlock()
 			return m, commit(block)

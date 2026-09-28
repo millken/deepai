@@ -154,6 +154,41 @@ func TestReviewGatePassClearsSlate(t *testing.T) {
 	}
 }
 
+// Round-1 review follow-up, pinned: the gate runs AFTER runTurn has already
+// sent TurnEnd, so the fan-out block's only commit point has fired before
+// the reviewer even starts. The gate's dispatch must flush its own block —
+// otherwise a pass verdict leaves the resolved reviewer line pinned in the
+// live region until whatever turn the user types NEXT happens to end.
+func TestReviewGateFlushesSubagentBlock(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	seedEditedFile(t, r, "a.go", "package a\n")
+
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
+		t.Fatalf("pass verdict returned fix message %q", got)
+	}
+	if ui.flushes != 1 {
+		t.Fatalf("gate review flushed the fan-out block %d times, want 1", ui.flushes)
+	}
+}
+
+// /review runs with no turn active at all — without a flush of its own the
+// resolved reviewer line has no commit point until the user's next turn.
+func TestManualReviewFlushesSubagentBlock(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	seedEditedFile(t, r, "a.go", "package a\n")
+
+	r.runManualReview(context.Background())
+
+	if !strings.Contains(ui.lastInfo(), "review: pass") {
+		t.Fatalf("lastInfo = %q, want pass confirmation", ui.lastInfo())
+	}
+	if ui.flushes != 1 {
+		t.Fatalf("manual review flushed the fan-out block %d times, want 1", ui.flushes)
+	}
+}
+
 func TestReviewGateFailSynthesizesFixMessage(t *testing.T) {
 	fake := &fakeTaskTool{content: failVerdictJSON()}
 	r, _ := newReviewRepl(t, t.TempDir(), fake)

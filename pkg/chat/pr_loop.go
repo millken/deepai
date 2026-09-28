@@ -314,11 +314,6 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 		incremental:    incremental,
 		sinceSHA:       st.LastReviewHead,
 	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
-	// The reviewer ran outside any turn (the /pr command path), so no
-	// turnEndMsg will ever commit its fan-out line — flush it now or the
-	// resolved reviewer stays pinned in the live region forever (the
-	// post-merge “行一直挂着” report).
-	r.ui.FlushSubagentBlock()
 	if ok {
 		if head, err := runGit(r.cfg.WorkDir, "rev-parse", "HEAD"); err == nil {
 			st.LastReviewHead = strings.TrimSpace(string(head))

@@ -196,10 +196,10 @@ type ReplUI interface {
 	WaitStart(reason string)
 	WaitEnd()
 	// FlushSubagentBlock commits any finished subagent fan-out to scrollback
-	// NOW, outside a turn. The block normally commits at turn end; the PR
-	// loop dispatches reviewers from slash-command paths where no turn ever
-	// ends, so without this the resolved reviewer line stays pinned in the
-	// live region forever (the "merge 后行一直挂着" report).
+	// NOW, outside a turn. The block normally commits at turn end, but every
+	// reviewer dispatch resolves after that point (gate, mission, PR loop)
+	// or with no turn at all (/review) — without this the resolved reviewer
+	// line stays pinned in the live region indefinitely.
 	FlushSubagentBlock()
 	RenderEvent(evt agent.AgentEvent)
 	RenderSubagentEvent(evt subagent.TaskEvent)
