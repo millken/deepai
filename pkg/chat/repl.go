@@ -195,6 +195,12 @@ type ReplUI interface {
 	// wait is cancellable instead of freezing the prompt.
 	WaitStart(reason string)
 	WaitEnd()
+	// FlushSubagentBlock commits any finished subagent fan-out to scrollback
+	// NOW, outside a turn. The block normally commits at turn end; the PR
+	// loop dispatches reviewers from slash-command paths where no turn ever
+	// ends, so without this the resolved reviewer line stays pinned in the
+	// live region forever (the "merge 后行一直挂着" report).
+	FlushSubagentBlock()
 	RenderEvent(evt agent.AgentEvent)
 	RenderSubagentEvent(evt subagent.TaskEvent)
 	RenderInterrupted()

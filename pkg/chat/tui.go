@@ -112,6 +112,14 @@ func (t *TUI) WaitEnd() {
 	t.p.Send(waitEndMsg{})
 }
 
+// FlushSubagentBlock commits a finished subagent fan-out to scrollback
+// outside a turn. The PR loop dispatches its reviewer from the /pr command
+// path, where no turn ever ends, so the normal turn-end commit never fires
+// and the resolved line would stay pinned on screen indefinitely.
+func (t *TUI) FlushSubagentBlock() {
+	t.p.Send(flushSubagentMsg{})
+}
+
 // RenderEvent renders a single agent event.
 func (t *TUI) RenderEvent(evt agent.AgentEvent) {
 	t.p.Send(agentEventMsg{evt: evt})
@@ -229,6 +237,7 @@ type inputResult struct {
 type printMsg struct{ text string }
 type waitStartMsg struct{ reason string }
 type waitEndMsg struct{}
+type flushSubagentMsg struct{}
 type turnStartMsg struct {
 	turn  int
 	input string
@@ -502,6 +511,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// which is what actually owns the input box between REPL phases —
 		// forcing it visible here would show an input whose submissions
 		// nobody is waiting to read while the loop still has gh work left.
+		return m, nil
+
+	case flushSubagentMsg:
+		// The same commit-and-clear turnEndMsg performs for the fan-out block,
+		// for dispatches that happen outside any turn (the PR loop's reviewer,
+		// driven from /pr commands) — no turn ever ends there, so without this
+		// the resolved line stays pinned in the live region forever.
+		if block := m.subagentSummaryBlock(); block != "" {
+			m.clearSubagentBlock()
+			return m, commit(block)
+		}
 		return m, nil
 
 	case turnStartMsg:
