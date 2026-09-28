@@ -33,6 +33,11 @@ type SubagentExecutor struct {
 	// §2.6). nil means neither feature is available; Execute hard-fails
 	// rather than silently ignoring a profile/task that asked for one.
 	skills *skill.Registry
+	// instructions is the operator-level tail appended to every subagent's
+	// system prompt (global + project DEEPAI.md) — same contract the main
+	// REPL agent already has. It rides AFTER the profile prompt so user
+	// constraints (language, format) outrank role defaults by recency.
+	instructions string
 }
 
 func NewSubagentExecutor(registry *llm.ModelRegistry, toolReg *tools.Registry, sb *sandbox.Sandbox) *SubagentExecutor {
@@ -99,6 +104,15 @@ func (e *SubagentExecutor) WithSkillRegistry(r *skill.Registry) *SubagentExecuto
 func (e *SubagentExecutor) WithPluginAgentDirs(dirs []string) *SubagentExecutor {
 	if e != nil {
 		e.pluginAgentDirs = dirs
+	}
+	return e
+}
+
+// WithInstructions appends operator-level instructions (DEEPAI.md) to every
+// subagent's system prompt. Empty string keeps prompts untouched.
+func (e *SubagentExecutor) WithInstructions(s string) *SubagentExecutor {
+	if e != nil {
+		e.instructions = strings.TrimSpace(s)
 	}
 	return e
 }
@@ -261,6 +275,9 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// AppendOutputSchemaPrompt (below) for the same reason as
 	// PreloadSkillsProfile above.
 	systemPrompt = AppendOutputSchemaPrompt(systemPrompt, profileCfg.OutputSchema)
+	if e.instructions != "" {
+		systemPrompt += "\n\n" + e.instructions
+	}
 
 	// Resolve model alias: task.Config.Model (caller-explicit) > fork
 	// skill's model: > agent type YAML model > registry default. The fork

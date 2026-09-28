@@ -231,7 +231,27 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		slog.Warn("skill load issue", "source", w.Source, "dir", w.Dir, "err", w.Msg)
 	}
 
-	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts, skillReg, resolveSubagentTimeout(cfg.SubagentTimeoutMinutes))
+	// Load DEEPAI.md operator instructions once, for BOTH consumers: the REPL
+	// agent's system prompt and every dispatched subagent's (WithInstructions
+	// in registerChatTools) — a reviewer that never sees “使用中文” cannot obey it.
+	var systemPrompt string
+	for _, p := range []string{
+		GlobalInstructions(),
+		ProjectInstructions(workDir),
+	} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if content := strings.TrimSpace(string(data)); content != "" {
+			if systemPrompt != "" {
+				systemPrompt += "\n\n"
+			}
+			systemPrompt += content
+		}
+	}
+
+	subPool := registerChatTools(registry, modelRegistry, defaultProvider, cfg.IsAutonomous(), workDir, cfg.ContextWindow, cfg.Temperature, pluginAgentDirs, agentOpts, skillReg, systemPrompt, resolveSubagentTimeout(cfg.SubagentTimeoutMinutes))
 	if cfg.IsAutonomous() {
 		slog.Info("autonomous mode enabled: ask_clarification will not block")
 	}
@@ -315,24 +335,6 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		resume = sess.ID
 	}
 
-	// Load DEEPAI.md system prompts.
-	var systemPrompt string
-	for _, p := range []string{
-		GlobalInstructions(),
-		ProjectInstructions(workDir),
-	} {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		if content := strings.TrimSpace(string(data)); content != "" {
-			if systemPrompt != "" {
-				systemPrompt += "\n\n"
-			}
-			systemPrompt += content
-		}
-	}
-
 	replCfg := chat.ReplConfig{
 		Provider:             cfg.Provider,
 		ModelRegistry:        modelRegistry,
@@ -385,7 +387,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 // registerChatTools returns the subagent pool so the REPL can cancel a single
 // task from the UI; the pool is created here because this is where the tool
 // registry is assembled.
-func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry, subagentTimeout time.Duration) *subagent.Pool {
+func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry, instructions string, subagentTimeout time.Duration) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, builtin.CIWaitTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
@@ -401,7 +403,8 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 		WithMaxTokens(subagentMaxTokens()).
 		WithTemperature(temperature).
 		WithPluginAgentDirs(pluginAgentDirs).
-		WithSkillRegistry(skillReg)
+		WithSkillRegistry(skillReg).
+		WithInstructions(instructions)
 	// subagentTimeout (0 = none) is what gives the dispatched agent's ctx a
 	// deadline, which is the ONLY input pkg/agent's graceful wall-clock
 	// wind-down reads. Passing 0 here — as this call did — left every
