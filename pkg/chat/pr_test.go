@@ -7,29 +7,53 @@ import (
 
 func TestFilterExternalComments(t *testing.T) {
 	comments := []prComment{
-		{ID: "1", Author: "millken", Body: "deepai's own review post"},
+		{ID: "1", Author: "millken", Body: prMarker{prRoleReviewer, 1}.String() + "\n\n**deepai review — round 1: fail**\n"},
 		{ID: "2", Author: "cursor", Body: "cursor nit"},
-		{ID: "3", Author: "Millken", Body: "own login, different case"},
+		// The owner typing by hand on the same gh account deepai posts through:
+		// no marker, so it is external — the exact case author-based filtering
+		// silently swallowed.
+		{ID: "3", Author: "millken", Body: "owner's own hand-written note"},
 		{ID: "4", Author: "alice", Body: "human asks about tests"},
+		// Legacy: posts from before the marker existed carry the visible bold
+		// header — still own comments (PR #3's first two rounds).
+		{ID: "5", Author: "millken", Body: "**deepai fix — round 1**\n\npushed fixes"},
 	}
 
-	external := filterExternalComments(comments, "millken")
-	if len(external) != 2 || external[0].ID != "2" || external[1].ID != "4" {
+	external := filterExternalComments(comments)
+	if len(external) != 3 || external[0].ID != "2" || external[1].ID != "3" || external[2].ID != "4" {
 		ids := make([]string, len(external))
 		for i, c := range external {
 			ids[i] = c.ID
 		}
-		t.Errorf("external = %v, want [2 4] (own login case-insensitive)", ids)
+		t.Errorf("external = %v, want [2 3 4] (marker + legacy header skipped, owner hand-written kept)", ids)
 	}
 }
 
-func TestFilterExternalComments_EmptyOwnLogin(t *testing.T) {
-	comments := []prComment{{ID: "1", Author: "cursor", Body: "nit"}}
-	// An empty login cannot classify anything — callers treat it as "passthrough
-	// disabled" before reaching here, but the filter itself must not suddenly
-	// pass everything through as "external".
-	if got := filterExternalComments(comments, ""); len(got) != 1 {
-		t.Errorf("empty ownLogin external = %d comments; classification is the caller's job", len(got))
+// A human cannot accidentally forge the marker: the bold header is GitHub
+// markdown a person could type, but it only counts as "own" in the LEGACY
+// form — the current boundary is the HTML comment, which no hand-typed
+// comment carries.
+func TestIsOwnComment(t *testing.T) {
+	for _, own := range []string{
+		prMarker{prRoleReviewer, 3}.String() + "\n\n**deepai review — round 3: fail**\n",
+		prMarker{prRoleCoder, 1}.String() + "\n\nbody",
+		"**deepai review — round 1: fail**\nlegacy",
+		"**deepai fix — round 2**\nlegacy",
+	} {
+		if !isOwnComment(own) {
+			t.Errorf("isOwnComment(%q) = false, want true", own)
+		}
+	}
+	for _, foreign := range []string{
+		"",
+		"owner's note",
+		"**deepseek review** — a human imitating the style",
+		"<!-- some other html comment -->",
+		"<!-- deepai:role=hacker round=1 -->",
+	} {
+		if isOwnComment(foreign) {
+			t.Errorf("isOwnComment(%q) = true, want false", foreign)
+		}
 	}
 }
 

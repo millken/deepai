@@ -68,14 +68,6 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	// issue 2; also keeps the fix prompt's "fixed or argued" premise true,
 	// since that turn never ran).
 	alreadyPosted := st.Status == prStatusReviewing && prevRound == st.Round
-	// ownLogin identifies this gh account's comments; the external passthrough
-	// filters on it. Unknown (Login failed) disables the passthrough rather
-	// than mis-classifying deepai's own comments as external input.
-	ownLogin, err := gh.Login(parentCtx)
-	if err != nil {
-		ownLogin = ""
-		r.ui.Info(fmt.Sprintf("  pr: could not resolve the gh login (%v) — external PR comments will not be surfaced", err))
-	}
 
 	for {
 		switch st.Status {
@@ -116,7 +108,7 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					return
 				}
 			}
-			ext := pendingExternalComments(parentCtx, st, gh, ownLogin)
+			ext := pendingExternalComments(parentCtx, st, gh)
 			turnErr := r.runMissionTurn(parentCtx, prFixMessage(st.Round, maxRounds, verdict)+externalCommentsBlock(ext))
 			if turnErr != nil {
 				r.ui.Info("  pr: fix turn interrupted or failed — no round consumed; /pr resumes the loop")
@@ -163,7 +155,7 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					return
 				}
 				r.ui.Info(fmt.Sprintf("  pr: #%d CI failed — fix round %d", st.Number, st.Round))
-				ext := pendingExternalComments(parentCtx, st, gh, ownLogin)
+				ext := pendingExternalComments(parentCtx, st, gh)
 				turnErr := r.runMissionTurn(parentCtx, prCIFailMessage(st.Round, maxRounds, summary)+externalCommentsBlock(ext))
 				if turnErr != nil {
 					r.ui.Info("  pr: CI fix turn interrupted or failed — /pr resumes the loop")
@@ -323,8 +315,13 @@ func prCIFailMessage(round, maxRounds int, summary string) string {
 		round, maxRounds, clip(summary, 4096))
 }
 
+// reviewerCommentBody renders the review verdict as a PR comment. Template
+// contract (all three loop comments share it): the machine marker sits on
+// line 1 — filterExternalComments depends on it before any rendering — then
+// a blank line, then the visible bold header, then content.
 func reviewerCommentBody(round int, v *agent.ReviewResult) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", prMarker{Role: prRoleReviewer, Round: round})
 	fmt.Fprintf(&b, "**deepai review — round %d: %s**\n\n", round, v.Verdict)
 	writeIssueList(&b, v.Issues)
 	if s := strings.TrimSpace(v.Summary); s != "" {
@@ -338,7 +335,21 @@ func coderCommentBody(round int, turnSummary string) string {
 	if s == "" {
 		s = "pushed fixes for this round"
 	}
-	return fmt.Sprintf("**deepai fix — round %d**\n\n%s\n", round, clip(s, 2048))
+	return fmt.Sprintf("%s\n\n**deepai fix — round %d**\n\n%s\n",
+		prMarker{Role: prRoleCoder, Round: round}, round, clip(s, 2048))
+}
+
+// mergedCommentBody closes the loop's public trail: the PR's conversation
+// ends with an explicit merged marker, so a later resume of the same PR (or
+// a human reading the timeline) sees the loop finished rather than vanished.
+func mergedCommentBody(round int, nextTask string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", prMarker{Role: prRoleMerged, Round: round})
+	b.WriteString("**deepai merged this pull request** — review passed, checks green.\n")
+	if s := strings.TrimSpace(nextTask); s != "" {
+		fmt.Fprintf(&b, "Next task: %s\n", clip(s, 512))
+	}
+	return b.String()
 }
 
 // clip truncates s to at most n bytes on a rune boundary: the clipped text
@@ -423,20 +434,17 @@ func (r *ChatRepl) awaitingMergePR() *prState {
 }
 
 // pendingExternalComments fetches the PR's comments and returns the external
-// ones — authored by another identity (humans, cursor, …), told apart by
-// author login rather than body markers — newer than the state's watermark,
-// oldest first, capped. An empty ownLogin (gh login unknown) disables the
-// passthrough: guessing would feed deepai's own comments back to the coder
-// as external demands.
-func pendingExternalComments(ctx context.Context, st *prState, gh prGH, ownLogin string) []prComment {
-	if ownLogin == "" {
-		return nil
-	}
+// ones — the owner's hand-written comments, other humans, cursor, any
+// identity — told apart from the loop's own posts by the hidden marker (or
+// the legacy visible header), never by author: every gh-CLI comment carries
+// the same account login (PR #3's live run). Newer than the state's
+// watermark, oldest first, capped.
+func pendingExternalComments(ctx context.Context, st *prState, gh prGH) []prComment {
 	comments, err := gh.ListComments(ctx, st.Repo, st.Number)
 	if err != nil {
 		return nil
 	}
-	external := filterExternalComments(comments, ownLogin)
+	external := filterExternalComments(comments)
 	var fresh []prComment
 	for _, c := range external {
 		if externalCommentPending(c, st) {
@@ -544,6 +552,12 @@ func (r *ChatRepl) mergePRAndContinue(parentCtx context.Context, st *prState, gh
 
 	cur, curIdx := inProgressTodo(r.carry.Todos())
 	next, nextIdx := nextPendingTodo(r.carry.Todos())
+	// The merged comment closes the loop's public trail with the marker, so
+	// the timeline shows the loop finishing rather than vanishing — and a
+	// later resume reads it as terminal from the comment list alone.
+	if err := gh.PostComment(parentCtx, st.Repo, st.Number, mergedCommentBody(st.Round, next)); err != nil {
+		r.ui.Info(fmt.Sprintf("  pr: could not post the merged comment (%v) — continuing", err))
+	}
 	// The handoff names the FINISHED item and the NEXT one separately: naming
 	// only the next item ordered the model to mark UNSTARTED work done while
 	// the merged PR's item stayed in_progress forever (round-4 issue 1) — and

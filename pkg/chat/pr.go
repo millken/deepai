@@ -268,14 +268,62 @@ func repoFromPRURL(url string) string {
 	return m[1]
 }
 
-// filterExternalComments keeps only comments NOT authored by deepai's own
-// login. Every party comments through a distinct, configurable author
-// identity (cursor uses "cursor"), so authorship alone draws the boundary —
-// bodies stay plain and human-readable, no hidden markers.
-func filterExternalComments(comments []prComment, ownLogin string) []prComment {
+type prRole string
+
+const (
+	prRoleReviewer prRole = "reviewer"
+	prRoleCoder    prRole = "coder"
+	prRoleMerged   prRole = "merged"
+)
+
+var prMarkerRe = regexp.MustCompile(`<!-- deepai:role=(coder|reviewer|merged) round=(\d+) -->`)
+
+// prMarker tags every comment the loop posts. The GitHub API stamps the
+// token account as the author — with gh CLI that is always the owner's
+// login — so authorship cannot separate deepai from the human owner or from
+// other same-account tools (PR #3's live run showed all comments as the repo
+// owner). The HTML comment is invisible in the GitHub UI, survives the API
+// round trip, and nothing else generates it: the marker IS the boundary.
+type prMarker struct {
+	Role  prRole
+	Round int
+}
+
+func (m prMarker) String() string {
+	return fmt.Sprintf("<!-- deepai:role=%s round=%d -->", m.Role, m.Round)
+}
+
+func markerFromBody(body string) (prMarker, bool) {
+	mm := prMarkerRe.FindStringSubmatch(body)
+	if mm == nil {
+		return prMarker{}, false
+	}
+	n, err := strconv.Atoi(mm[2])
+	if err != nil {
+		return prMarker{}, false
+	}
+	return prMarker{Role: prRole(mm[1]), Round: n}, true
+}
+
+// isOwnComment reports whether a PR comment was posted by this loop: current
+// comments carry a deepai marker; comments posted before the marker existed
+// (PR #3's first two rounds) start with the visible bold header — kept so
+// resuming an in-flight PR never re-feeds its own history to the coder.
+func isOwnComment(body string) bool {
+	if _, ok := markerFromBody(body); ok {
+		return true
+	}
+	return strings.HasPrefix(body, "**deepai ")
+}
+
+// filterExternalComments keeps only comments the loop did not post itself —
+// the owner's own hand-written comments, other humans, cursor, any identity
+// — told apart by the hidden marker (or the legacy visible header), never by
+// author: every gh-CLI comment carries the same account login.
+func filterExternalComments(comments []prComment) []prComment {
 	var external []prComment
 	for _, c := range comments {
-		if !strings.EqualFold(c.Author, ownLogin) {
+		if !isOwnComment(c.Body) {
 			external = append(external, c)
 		}
 	}
@@ -293,9 +341,6 @@ type prComment struct {
 // inject a fake and the loop never shells out behind an abstraction that
 // hides a network call.
 type prGH interface {
-	// Login returns the authenticated account's login — the author every
-	// comment deepai posts carries. External passthrough filters on it.
-	Login(ctx context.Context) (string, error)
 	// View returns a tracked-PR bootstrap: title, branch, base, url.
 	View(ctx context.Context, repo string, number int) (title, branch, base, url string, err error)
 	PostComment(ctx context.Context, repo string, number int, body string) error
@@ -383,23 +428,6 @@ func parsePRCommentsJSON(data []byte) ([]prComment, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
-}
-
-// Login returns the authenticated account's login via `gh api user`.
-// EqualFold comparisons downstream make its case GitHub-canonical enough.
-func (g ghPRClient) Login(ctx context.Context) (string, error) {
-	out, _, code, err := g.run(ctx, "api", "user", "--jq", ".login")
-	if err != nil {
-		return "", err
-	}
-	if code != 0 {
-		return "", fmt.Errorf("gh api user exited %d", code)
-	}
-	login := strings.ToLower(strings.TrimSpace(out))
-	if login == "" {
-		return "", fmt.Errorf("gh api user returned an empty login")
-	}
-	return login, nil
 }
 
 func (g ghPRClient) View(ctx context.Context, repo string, number int) (title, branch, base, url string, err error) {

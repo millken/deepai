@@ -39,29 +39,28 @@ func TestPendingExternalComments(t *testing.T) {
 	st := &prState{Number: 1, LastExternalCommentAt: base}
 	gh := &fakeGH{comments: []prComment{
 		mkComment("5", "alice", "old external", base.Add(-time.Minute)),
-		mkComment("11", "deepai", "own review post", base.Add(time.Minute)),
-		mkComment("20", "cursor", "cursor asks about tests", base.Add(2*time.Minute)),
-		mkComment("30", "alice", "human nit", base.Add(3*time.Minute)),
+		mkComment("11", "millken", "round 1 fail\n"+prMarker{prRoleReviewer, 1}.String(), base.Add(time.Minute)),
+		mkComment("15", "millken", "round 2 fix\n"+prMarker{prRoleCoder, 2}.String(), base.Add(90*time.Minute)),
+		// The owner's own hand-written comment — same gh account as deepai's
+		// posts, no marker: the exact comment author-based filtering swallowed.
+		mkComment("20", "millken", "owner asks about tests", base.Add(2*time.Minute)),
+		mkComment("30", "cursor", "cursor nit", base.Add(3*time.Minute)),
 		mkComment("40", "bob", "newest human note", base.Add(4*time.Minute)),
 	}}
 
-	got := pendingExternalComments(context.Background(), st, gh, "deepai")
+	got := pendingExternalComments(context.Background(), st, gh)
 	if len(got) != 3 || got[0].ID != "20" || got[2].ID != "40" {
 		ids := make([]string, len(got))
 		for i, c := range got {
 			ids[i] = c.ID
 		}
-		t.Fatalf("pending = %v, want [20 30 40] (watermark, own login skipped)", ids)
+		t.Fatalf("pending = %v, want [20 30 40] (marker posts skipped, owner hand-written kept)", ids)
 	}
 }
 
-func TestPendingExternalComments_EmptyOwnLoginDisables(t *testing.T) {
-	st := &prState{Number: 1}
-	gh := &fakeGH{comments: []prComment{mkComment("1", "alice", "nit", time.Now().UTC())}}
-	if got := pendingExternalComments(context.Background(), st, gh, ""); got != nil {
-		t.Fatalf("unknown login must disable the passthrough, got %v", got)
-	}
-}
+// Marker-less classification has no "disabled" state any more — the empty
+// test slot this function held is now covered by the legacy-header cases in
+// TestFilterExternalComments.
 
 // The round-1 medium bug, pinned: a single comment larger than the 8KB cap
 // must still reach the fix turn (kept newest, body clipped downstream) —
@@ -71,7 +70,7 @@ func TestPendingExternalComments_SingleOverBudgetCommentSurvives(t *testing.T) {
 	gh := &fakeGH{comments: []prComment{
 		mkComment("1", "alice", strings.Repeat("x", 9<<10), time.Now().UTC()),
 	}}
-	got := pendingExternalComments(context.Background(), st, gh, "deepai")
+	got := pendingExternalComments(context.Background(), st, gh)
 	if len(got) != 1 {
 		t.Fatalf("the only fresh comment must survive the cap, got %d", len(got))
 	}
@@ -85,7 +84,7 @@ func TestPendingExternalComments_CapsAtNewest8KB(t *testing.T) {
 			fmt.Sprintf("%d", i+1), "alice", strings.Repeat("x", 3000), base))
 	}
 	st := &prState{Number: 1}
-	got := pendingExternalComments(context.Background(), st, &fakeGH{comments: comments}, "deepai")
+	got := pendingExternalComments(context.Background(), st, &fakeGH{comments: comments})
 	total := 0
 	for _, c := range got {
 		total += len(c.Body)

@@ -18,8 +18,6 @@ type fakeGH struct {
 	comments     []prComment
 	checksScript []fakeChecks // consumed per Checks call; last repeats
 	mergeErr     error
-	// login is what Login reports; empty defaults to "deepai".
-	login string
 	// viewTitle is what View reports.
 	viewTitle string
 	// viewURL is the PR URL View reports; empty means "not a PR URL".
@@ -27,13 +25,6 @@ type fakeGH struct {
 
 	commentsPosted []string
 	checksCalls    int
-}
-
-func (f *fakeGH) Login(context.Context) (string, error) {
-	if f.login == "" {
-		return "deepai", nil
-	}
-	return f.login, nil
 }
 
 func (f *fakeGH) View(context.Context, string, int) (string, string, string, string, error) {
@@ -129,16 +120,22 @@ func TestPRLoop_FailFixPass(t *testing.T) {
 	if len(gh.commentsPosted) != 2 {
 		t.Fatalf("posted %d comments, want 2 (reviewer + coder)", len(gh.commentsPosted))
 	}
-	if !strings.HasPrefix(gh.commentsPosted[0], "**deepai review — round 1: fail**") {
-		t.Fatalf("first comment must be the round-1 review body: %q", gh.commentsPosted[0])
+	// Every loop comment leads with its machine marker (line 1), then the
+	// visible bold header — the template contract filterExternalComments
+	// depends on.
+	m0, ok0 := markerFromBody(gh.commentsPosted[0])
+	if !ok0 || m0.Role != prRoleReviewer || m0.Round != 1 {
+		t.Fatalf("first comment must lead with a round-1 reviewer marker: %q", gh.commentsPosted[0])
 	}
-	if !strings.HasPrefix(gh.commentsPosted[1], "**deepai fix — round 1**") {
-		t.Fatalf("second comment must be the round-1 fix body: %q", gh.commentsPosted[1])
+	if !strings.Contains(gh.commentsPosted[0], "**deepai review — round 1: fail**") {
+		t.Fatalf("first comment missing the visible review header: %q", gh.commentsPosted[0])
 	}
-	for _, body := range gh.commentsPosted {
-		if strings.Contains(body, "<!--") {
-			t.Fatalf("comment bodies must stay marker-free: %q", body)
-		}
+	m1, ok1 := markerFromBody(gh.commentsPosted[1])
+	if !ok1 || m1.Role != prRoleCoder || m1.Round != 1 {
+		t.Fatalf("second comment must lead with a round-1 coder marker: %q", gh.commentsPosted[1])
+	}
+	if !strings.Contains(gh.commentsPosted[1], "**deepai fix — round 1**") {
+		t.Fatalf("second comment missing the visible fix header: %q", gh.commentsPosted[1])
 	}
 	// The LAST dispatch (the re-review that passed) must have been in PR mode.
 	if got := fake.args["prompt"]; !strings.Contains(fmt.Sprint(got), "PR #42, review round 2") {
