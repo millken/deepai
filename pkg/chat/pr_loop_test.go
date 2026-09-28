@@ -183,10 +183,11 @@ func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
 	// The fix turn lands the real fix; the next round passes. fake.args keeps
 	// only the LAST dispatch's arguments, so the round-3 prompt is captured
 	// here — missionTurn runs between the two reviews.
-	var round3Prompt string
+	var round3Prompt, round3FixInput string
 	r.missionTurn = func(ctx context.Context, input string) *turnError {
 		if round3Prompt == "" {
 			round3Prompt = fmt.Sprint(fake.args["prompt"])
+			round3FixInput = input
 		}
 		fake.content = passVerdictJSON()
 		return nil
@@ -202,6 +203,46 @@ func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
 	}
 	if !strings.Contains(round3Prompt, "PR #42, review round 3") || !strings.Contains(round3Prompt, "Convergence round") {
 		t.Fatalf("round-3 review must carry the convergence prompt:\n%s", round3Prompt)
+	}
+	if !strings.Contains(round3FixInput, "one medium issue remains") {
+		t.Fatalf("the fix turn must carry the parked summary finding, not an empty list:\n%s", round3FixInput)
+	}
+}
+
+// The parked-summary shape must stay actionable all the way to the cap: every
+// fix turn carries the finding, and when the cap aborts, the unresolved
+// findings shown to the operator carry it too instead of an empty list.
+func TestPRLoop_EmptyIssuesCapSurfacesParkedSummary(t *testing.T) {
+	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail",
+		"summary":"one minor issue remains: clip() still cuts 3-byte runes","issues":[]}`}
+	gh := &fakeGH{diff: "+line"}
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.prGH = gh
+	r.prCIPollInterval = time.Millisecond
+	r.prCIWaitTimeout = 50 * time.Millisecond
+
+	var fixInputs []string
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		fixInputs = append(fixInputs, input)
+		return nil
+	}
+	st := newTrackedPR(t, r, 7, 1, prStatusReviewing)
+
+	r.runPRLoop(context.Background(), st)
+
+	if st.Status != prStatusAborted {
+		t.Fatalf("status = %s, want aborted at the round cap", st.Status)
+	}
+	if len(fixInputs) != maxPRReviewRounds {
+		t.Fatalf("fix turns = %d, want %d", len(fixInputs), maxPRReviewRounds)
+	}
+	for i, in := range fixInputs {
+		if !strings.Contains(in, "clip() still cuts 3-byte runes") {
+			t.Fatalf("fix turn %d does not carry the parked finding:\n%s", i+1, in)
+		}
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "clip() still cuts 3-byte runes") {
+		t.Fatalf("the cap must surface the parked finding to the operator:\n%s", strings.Join(ui.infoMsgs, "\n"))
 	}
 }
 

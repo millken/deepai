@@ -882,6 +882,12 @@ func (r *ChatRepl) presentIssues(header string, v *agent.ReviewResult) {
 	b.WriteString(header)
 	b.WriteString("\n")
 	writeIssueList(&b, v.Issues)
+	// A PR-loop convergence verdict can fail with the finding parked in the
+	// summary and no issues; the cap's "unresolved findings go to the human"
+	// exit must not print an empty list there.
+	if len(v.Issues) == 0 {
+		fmt.Fprintf(&b, "\n1. [summary] %s\n", verdictSummary(v))
+	}
 	r.ui.Info(b.String())
 }
 

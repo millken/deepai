@@ -461,6 +461,14 @@ func prFixMessage(round, maxRounds int, v *agent.ReviewResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[pr-review round %d/%d] An independent review of the pull request found the following issues. For each one: either fix it, or state explicitly why it is not a real problem. Commit the fixes and push them to the PR branch.\n", round, maxRounds)
 	writeIssueList(&b, v.Issues)
+	// The round-3+ convergence prompt parks a genuinely-new minor finding in
+	// the summary sentence OUTSIDE the issue list, and isPRPassVerdict keeps
+	// that verdict failing — so the round this message spends must carry the
+	// parked finding too, or the fixer gets an empty, unactionable prompt and
+	// the loop can only spin to the cap.
+	if len(v.Issues) == 0 {
+		fmt.Fprintf(&b, "\n1. [summary] %s\n", verdictSummary(v))
+	}
 	return b.String()
 }
 
