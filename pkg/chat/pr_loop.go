@@ -178,40 +178,100 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	}
 }
 
-// dispatchPRReview runs one correctness review against the PR's CURRENT diff
-// (the fix turn pushed before re-entering, so the diff is always fresher than
-// the previous verdict). ok=false is the same fail-soft contract as the local
-// gate: interrupted, timed out, unparseable, or an oversized diff — no round
-// is consumed.
+// prIncrementalDiff returns the commits-since diff from the last reviewed
+// head — the human second-reviewer's reading list. ok=false when base is
+// unresolvable (rebased away, shallow clone, never set): the caller falls
+// back to the full PR diff rather than guessing at a stale anchor.
+func prIncrementalDiff(workDir, base string) (diff string, files []string, ok bool) {
+	if base == "" {
+		return "", nil, false
+	}
+	out, err := runGit(workDir, "diff", "--unified=3", base+"..HEAD")
+	if err != nil {
+		return "", nil, false
+	}
+	names, err := runGit(workDir, "diff", "--name-only", base+"..HEAD")
+	if err != nil {
+		return "", nil, false
+	}
+	for _, f := range strings.Split(string(names), "\n") {
+		if f = strings.TrimSpace(f); f != "" {
+			files = append(files, f)
+		}
+	}
+	return string(out), files, true
+}
+
+// dispatchPRReview runs one correctness review against the PR's change. A
+// FIRST review reads the full PR diff; a re-review reads only the commits
+// since the last reviewed head (round-1's live audit: a full re-read of an
+// unchanged 2000-line diff spends the budget re-deriving findings the
+// previous round already made). ok=false is the same fail-soft contract as
+// the local gate: interrupted, timed out, unparseable, or an oversized diff
+// — no round is consumed and the head anchor does not move.
 func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh prGH, prev *agent.ReviewResult) (*agent.ReviewResult, bool) {
-	diff, err := gh.Diff(parentCtx, st.Repo, st.Number)
-	if err != nil {
-		r.ui.Info(fmt.Sprintf("  pr: gh pr diff failed (%v)", err))
-		return nil, false
+	var diff string
+	var scope []string
+	incremental := false
+	if st.Round > 1 {
+		if inc, files, ok := prIncrementalDiff(r.cfg.WorkDir, st.LastReviewHead); ok && inc != "" {
+			diff, scope, incremental = inc, files, true
+			r.ui.Info(fmt.Sprintf("  pr: #%d re-review reads the incremental diff since %s (%d file(s))",
+				st.Number, shortSHA(st.LastReviewHead), len(files)))
+		}
 	}
-	if len(diff) > reviewDiffByteCap {
-		r.ui.Info(fmt.Sprintf("  pr: diff exceeds %dKB — NOT reviewed; split the PR", reviewDiffByteCap>>10))
-		return nil, false
-	}
-	files, err := gh.ChangedFiles(parentCtx, st.Repo, st.Number)
-	if err != nil {
-		files = nil // the diff itself already names every file; not fatal
-	}
-	if !equalStrings(st.Scope, files) {
-		st.Scope = files
-		st.save(r.cfg.WorkDir)
+	if !incremental {
+		var err error
+		diff, err = gh.Diff(parentCtx, st.Repo, st.Number)
+		if err != nil {
+			r.ui.Info(fmt.Sprintf("  pr: gh pr diff failed (%v)", err))
+			return nil, false
+		}
+		if len(diff) > reviewDiffByteCap {
+			r.ui.Info(fmt.Sprintf("  pr: diff exceeds %dKB — NOT reviewed; split the PR", reviewDiffByteCap>>10))
+			return nil, false
+		}
+		files, err := gh.ChangedFiles(parentCtx, st.Repo, st.Number)
+		if err != nil {
+			files = nil // the diff itself already names every file; not fatal
+		}
+		if !equalStrings(st.Scope, files) {
+			st.Scope = files
+			st.save(r.cfg.WorkDir)
+		}
+		scope = files
 	}
 	// No context bundle in PR mode: the worktree IS the PR branch (the fix
-	// turn just pushed it), so read_file sees exactly what the diff shows.
-	return r.runReview(parentCtx, reviewPromptInput{
+	// turn just pushed it), so read_file sees exactly what the diff shows —
+	// which is also what makes incremental review safe: the reviewer verifies
+	// previous findings against the checked-out tree, not against the delta.
+	verdict, ok := r.runReview(parentCtx, reviewPromptInput{
 		initialRequest: st.Brief,
 		diff:           diff,
-		scope:          relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, files)),
+		scope:          relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope)),
 		bundled:        false,
 		prev:           prev,
 		prNumber:       st.Number,
 		prRound:        st.Round,
+		incremental:    incremental,
+		sinceSHA:       st.LastReviewHead,
 	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
+	if ok {
+		if head, err := runGit(r.cfg.WorkDir, "rev-parse", "HEAD"); err == nil {
+			st.LastReviewHead = strings.TrimSpace(string(head))
+			if err := st.save(r.cfg.WorkDir); err != nil {
+				r.ui.Info(fmt.Sprintf("  pr: could not persist the review head (%v)", err))
+			}
+		}
+	}
+	return verdict, ok
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // errPRCIInterrupted marks a CI wait cut short by Ctrl+C. A sentinel so the

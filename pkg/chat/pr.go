@@ -58,6 +58,12 @@ type prState struct {
 	Round int      `json:"round"`
 	Brief string   `json:"brief,omitempty"`
 	Scope []string `json:"scope,omitempty"`
+	// LastReviewHead is the commit sha the last review ran against (empty
+	// before round 1). A re-review reads only the COMMITS SINCE this sha —
+	// the human second-reviewer's approach: pull the incremental diff,
+	// verify the previous findings against it, never re-read the whole PR.
+	// A missing/unresolvable sha falls back to the full PR diff.
+	LastReviewHead string `json:"last_review_head,omitempty"`
 	// LastExternalCommentAt is the createdAt of the newest external PR
 	// comment already surfaced to a fix turn; anything newer is pending input.
 	// A time, not a comment id: gh ids are opaque base64 relay strings with no

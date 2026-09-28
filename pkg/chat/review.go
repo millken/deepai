@@ -662,6 +662,12 @@ type reviewPromptInput struct {
 	// cycle. prNumber > 0 is the mode switch; prRound is 1-based.
 	prNumber int
 	prRound  int
+	// incremental marks a PR re-review reading only the commits since
+	// sinceSHA — the human second-reviewer's approach: verify the previous
+	// findings against the delta, check the delta itself, do not re-read
+	// the whole PR. Only meaningful when prNumber > 0.
+	incremental bool
+	sinceSHA    string
 }
 
 // buildReviewPrompt assembles the reviewer's seed message. Deliberately
@@ -671,9 +677,13 @@ type reviewPromptInput struct {
 func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
 	if in.prNumber > 0 {
-		fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, review round %d. The change is already pushed; the diff is the PR's current diff. "+
-			"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
-			"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
+		if in.incremental {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, re-review round %d. You are the second reviewer. The diff below contains ONLY the commits pushed since %s — the fix commits answering the previous review. Judge like a human second pass: for each previously reported issue, decide from the delta (and the checked-out tree, which IS the PR head) whether it still holds — report it again ONLY if the failure scenario survives the fix. Then review the delta itself for defects the fixes introduced. Do NOT spend budget re-reading parts of the PR the delta does not touch.\n\n", in.prNumber, in.prRound, in.sinceSHA)
+		} else {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, review round %d. The change is already pushed; the diff is the PR's current diff. "+
+				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
+				"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
+		}
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")
 	}
