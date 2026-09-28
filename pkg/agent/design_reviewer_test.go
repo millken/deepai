@@ -156,6 +156,26 @@ func TestCorrectnessReviewerPrompt_OpensFaultLayerOnlyUnderACharter(t *testing.T
 	}
 }
 
+// docs/review.md's focus contract: the severity scale bounds what a finding
+// may claim, the style prohibition keeps taste remarks out of the issue list
+// (each one costs a real fix round), and the cheapest-decisive-signal rule
+// sends the reviewer to a targeted test run before extensive reading —
+// round-1's live data: 3 bash calls produced all three issues while 12
+// read_file calls produced none.
+func TestCorrectnessReviewerPrompt_SeverityScaleAndFocus(t *testing.T) {
+	p := correctnessReviewerSystemPrompt
+	for _, want := range []string{
+		"Severity scale: critical",
+		"at most 3 low issues",
+		"cheapest decisive signal",
+		"never issues — report only observably wrong behavior",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("correctness-reviewer prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
 func TestDesignReviewerPrompt_CarriesItsLoadBearingRules(t *testing.T) {
 	p := designReviewerSystemPrompt
 	for _, want := range []string{

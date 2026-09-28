@@ -712,6 +712,13 @@ func buildReviewPrompt(in reviewPromptInput) string {
 				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
 				"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
 		}
+		// Round 3+ is the convergence phase (docs/review.md §3): two fix
+		// rounds have already answered the earlier findings, and every new
+		// medium/low raised now only buys another fix round — the loop can
+		// never close that way.
+		if in.prRound >= 3 {
+			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — a genuinely new minor finding goes into the summary sentence, not the issue list.\n\n")
+		}
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")
 	}
