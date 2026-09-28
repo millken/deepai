@@ -37,7 +37,7 @@ func TestResolveSubagentTimeout(t *testing.T) {
 func TestRegisterChatTools_SubagentPoolCarriesADeadline(t *testing.T) {
 	registry := tools.NewRegistry()
 	modelRegistry := llm.NewSingleModelRegistry("test", "test-model", "")
-	pool := registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil, defaultSubagentTimeout)
+	pool := registerChatTools(registry, modelRegistry, stubProvider{}, false, t.TempDir(), 0, nil, nil, nil, nil, "", defaultSubagentTimeout)
 
 	if pool == nil {
 		t.Fatal("registerChatTools returned a nil pool")
