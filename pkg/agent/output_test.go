@@ -129,6 +129,23 @@ func TestParseOutputSchemaValidationFail(t *testing.T) {
 	}
 }
 
+// TestParseOutputAcceptsReviewerExtras pins the PR #5 round-2 regression: the
+// reviewer emitted tests_run and previously_reported — behaviors its own rules
+// push it toward — and Strict validation threw away the entire review for two
+// unmodeled keys. The fields are any-typed, so whatever shape a reviewer picks
+// must validate and unmarshal.
+func TestParseOutputAcceptsReviewerExtras(t *testing.T) {
+	schema := FromStruct[ReviewResult](WithStrict(true))
+	input := `{"agent":"correctness-reviewer","verdict":"pass","summary":"fixes verified","issues":[],"tests_run":["go test ./pkg/chat/ -run TestPR -count=1"],"previously_reported":[{"issue":"empty issue list must not pass","status":"fixed"}]}`
+	v, err := ParseOutput[ReviewResult](schema, input)
+	if err != nil {
+		t.Fatalf("ParseOutput error = %v, want the reviewer's extra keys accepted", err)
+	}
+	if v.Verdict != "pass" || len(v.Issues) != 0 {
+		t.Fatalf("parsed verdict = %+v, want the pass with no issues", v)
+	}
+}
+
 // --- ValidateOutput tests ---
 //
 // ValidateOutput is the non-generic sibling of ParseOutput[T]: the subagent
