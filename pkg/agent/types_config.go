@@ -256,14 +256,12 @@ const (
 )
 
 // defaultReviewerMaxToolCalls is the workload bound every reviewer profile
-// carries when its caller names none. 20 is pkg/chat's reviewMaxToolCalls,
-// the value the review gate has been running with: enough to read every
-// hunk's surroundings plus a build or test to substantiate a charge. Kept
-// equal on purpose — the two review routes (the gate's own reviewer and one
-// the model dispatches itself) had no reason to differ, and did only because
-// one of them was never bounded. They stay SEPARATE constants rather than one
-// aliasing the other: the gate's is sized against the input its degradation
-// rungs admit, this one is the fallback when a caller names no budget at all.
+// carries when its caller names none. It matched pkg/chat's gate cap at 20
+// until the gate grew to 40 and became configurable (review_max_tool_calls)
+// after the first live PR-loop run; the numbers are no longer tied. They stay
+// SEPARATE constants: the gate's default is sized against the input its
+// degradation rungs admit, this one is the fallback when a caller names no
+// budget at all.
 const defaultReviewerMaxToolCalls = 20
 
 var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
@@ -334,7 +332,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 	// meeting a deadline barely is: react.go turns the last call into a
 	// forced tool-less wrap-up that must still satisfy the Strict schema, so
 	// the caller gets a real verdict for the part of the change the reviewer
-	// did cover. This is the same argument pkg/chat's reviewMaxToolCalls
+	// did cover. This is the same argument pkg/chat's DefaultReviewMaxToolCalls
 	// already makes for the gate's own dispatch; the profiles now make it on
 	// the route the MODEL dispatches, which had no bound at all.
 	//
@@ -390,7 +388,7 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 		// Same cap as every other reviewer profile: exhaustion is the
 		// RECOVERABLE bound (a forced tool-less wrap-up that must still
 		// satisfy the Strict schema), and the design gate overrides it with
-		// its own reviewMaxToolCalls anyway. The design doc predates
+		// its own configured cap anyway. The design doc predates
 		// TestReviewerProfiles_CarryAToolCallCap and says 0 here; matching
 		// the other four is what that decision (R6: "same as the other four
 		// reviewer profiles") actually asks for today.

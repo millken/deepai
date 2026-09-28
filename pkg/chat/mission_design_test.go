@@ -52,6 +52,10 @@ func TestDesignPhase_PassLocksTheCharterAndMovesToImplement(t *testing.T) {
 	r, ui, inputs := newDesignRepl(t, fake, []string{"# plan\n- do the thing"})
 	m, _ := createMission(r.cfg.WorkDir, "make the gate structured")
 	r.mission = m
+	// One config value must drive every gate-dispatched reviewer: the design
+	// gate hardcoding the constant is exactly what round-2 review issue 1
+	// caught, and asserting the constant again would pin the desync.
+	r.cfg.ReviewMaxToolCalls = 7
 
 	if !r.runDesignPhase(context.Background()) {
 		t.Fatal("a passing design must continue into the implementation phase")
@@ -89,8 +93,8 @@ func TestDesignPhase_PassLocksTheCharterAndMovesToImplement(t *testing.T) {
 	if got := fake.args["agent_type"]; got != "design-reviewer" {
 		t.Errorf("agent_type = %v, want design-reviewer", got)
 	}
-	if got := fake.args["max_tool_calls"]; got != reviewMaxToolCalls {
-		t.Errorf("max_tool_calls = %v, want the gate's %d", got, reviewMaxToolCalls)
+	if got := fake.args["max_tool_calls"]; got != 7 {
+		t.Errorf("max_tool_calls = %v, want the configured 7", got)
 	}
 }
 
@@ -288,7 +292,7 @@ func TestBuildDesignReviewPrompt_CarriesAnchorsAndBudget(t *testing.T) {
 		prev: &agent.DesignReviewResult{Issues: []agent.Issue{{
 			Severity: "high", File: "plan", Message: "old finding", Scenario: "old scenario"}}},
 		escalation:   "the charter's interface cannot express escalation",
-		maxToolCalls: reviewMaxToolCalls,
+		maxToolCalls: DefaultReviewMaxToolCalls,
 	})
 	for _, want := range []string{
 		"the original ask", "# the plan", "old finding",

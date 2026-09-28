@@ -311,7 +311,7 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 		prev:         prev,
 		escalation:   r.missionEscalationNote,
 		planPath:     m.designPath(),
-		maxToolCalls: reviewMaxToolCalls,
+		maxToolCalls: r.reviewMaxToolCallsOrDefault(),
 		timeout:      timeout,
 	}
 	args := map[string]any{
@@ -319,10 +319,10 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 		"agent_type":  string(agent.AgentTypeDesignReviewer),
 		"prompt":      buildDesignReviewPrompt(in),
 		// The gate caps the reviewer, not the profile — the same split the
-		// correctness gate uses, and the same constant: only a gate races a
-		// wall clock, and exhausting a tool-call cap degrades into a verdict
-		// while the clock expiring loses the whole review.
-		"max_tool_calls": reviewMaxToolCalls,
+		// correctness gate uses, and the same configured value: one config
+		// key drives every gate-dispatched reviewer (round-2 review caught this
+		// desync — mission reviewers silently ignored review_max_tool_calls).
+		"max_tool_calls": r.reviewMaxToolCallsOrDefault(),
 	}
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget

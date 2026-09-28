@@ -79,6 +79,10 @@ type mockUI struct {
 	// is scheduled. Pair it with fakeTaskTool.waitForCancel for a
 	// deterministic "the user pressed Ctrl+C while a subagent was running".
 	interruptDuringTask bool
+	// interruptCh, when non-nil, is returned by InterruptCh verbatim — a
+	// persistent channel the way the TUI has one, so a test can buffer a
+	// token and later assert whether it was consumed.
+	interruptCh chan struct{}
 }
 
 func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
@@ -96,10 +100,15 @@ func (m *mockUI) ReadPrompt(_ context.Context) (string, []models.MessageImage, e
 }
 func (m *mockUI) TurnStart(_ int, _ string)                {}
 func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
+func (m *mockUI) WaitStart(_ string)                       {}
+func (m *mockUI) WaitEnd()                                 {}
 func (m *mockUI) RenderEvent(evt agent.AgentEvent)         { m.events = append(m.events, evt) }
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}
 func (m *mockUI) InterruptCh() <-chan struct{} {
+	if m.interruptCh != nil {
+		return m.interruptCh
+	}
 	if !m.interruptDuringTask {
 		return nil
 	}

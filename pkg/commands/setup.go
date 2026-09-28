@@ -83,6 +83,11 @@ type Config struct {
 	// ReviewTimeoutMinutes bounds one review subagent run, in minutes
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
+	// ReviewMaxToolCalls caps each review subagent's tool calls. 0 or absent
+	// = DefaultReviewMaxToolCalls (40) in pkg/chat. Raised from 20 after the
+	// first live PR-loop run wrapped up mid-investigation on a reviewable
+	// diff (PR #3 round 1).
+	ReviewMaxToolCalls int `yaml:"review_max_tool_calls,omitempty"`
 	// ReviewModel names the model every gate-dispatched reviewer runs on —
 	// a models[] alias, not a provider model name. Empty (the default) runs
 	// them on the main agent's model, which is also the case where the
@@ -93,6 +98,20 @@ type Config struct {
 	// the registry does not know is dropped with a warning at startup
 	// rather than failing every review (pkg/chat's validateReviewModel).
 	ReviewModel string `yaml:"review_model,omitempty"`
+
+	// PRReviewAutoDisabled turns off the PR review pipeline's auto-attach:
+	// when a turn's bash output shows a freshly created PR, the REPL enters
+	// the review→fix→re-review loop for it. Default ENABLED (absent key =
+	// false) — the same inverted-bool pattern as memory_auto_refine_disabled,
+	// because a default-on bool cannot be expressed as a plain yaml bool.
+	PRReviewAutoDisabled bool `yaml:"pr_review_auto_disabled,omitempty"`
+	// PRAutoMerge merges the PR automatically once review and CI are green,
+	// instead of stopping in awaiting_merge for an explicit merge command.
+	// Default off — the confirmed decision for this pipeline.
+	PRAutoMerge bool `yaml:"pr_auto_merge,omitempty"`
+	// PRReviewRounds bounds the PR loop's review→fix rounds. 0 or absent =
+	// 5. Always read through ChatRepl.prMaxRounds, never directly.
+	PRReviewRounds int `yaml:"pr_review_rounds,omitempty"`
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// long-task mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1): design →

@@ -258,21 +258,22 @@ const maxReviewRounds = 2
 //
 // It is a LAST-RESORT net, not the reviewer's workload bound: the
 // clock expiring kills the run and throws away everything it found, so the
-// real bound is reviewMaxToolCalls below, which degrades gracefully into a
+// real bound is DefaultReviewMaxToolCalls below (or the configured
+// review_max_tool_calls), which degrades gracefully into a
 // verdict. Sized to be reached only by a genuinely stuck run — 5 minutes was
 // routinely hit by an honest reviewer on a reasoning model (minutes of
 // thinking per turn), which cost the whole review.
 const DefaultReviewTimeout = 10 * time.Minute
 
-// reviewMaxToolCalls bounds the reviewer's workload where exhaustion is
-// RECOVERABLE: react.go turns the last call into a forced tool-less wrap-up
-// that must still satisfy the Strict output schema, so the gate gets a real
-// verdict for the part of the change the reviewer did examine. The profile
-// itself stays uncapped (types_config.go) — a direct `task` call to this agent
-// type has no wall clock to race, only the gate does.
-//
-// 20 covers reading every hunk's surroundings plus a build/test to
-// substantiate a charge, for the change sizes rung (a) admits at all.
+// DefaultReviewMaxToolCalls bounds the reviewer's workload where exhaustion
+// is RECOVERABLE: react.go turns the last call into a forced tool-less
+// wrap-up that must still satisfy the Strict output schema, so the gate gets
+// a real verdict for the part of the change the reviewer did examine. The
+// profile itself stays uncapped (types_config.go) — a direct `task` call to
+// this agent type has no wall clock to race, only the gate does. A
+// configured review_max_tool_calls replaces this number wholesale; the
+// gate also never dispatches below 3x the changed-file count
+// (scaleReviewToolBudget).
 //
 // pkg/agent's defaultReviewerMaxToolCalls is deliberately the same number —
 // the two review routes had no reason to differ — but it is a SEPARATE
@@ -287,7 +288,13 @@ const DefaultReviewTimeout = 10 * time.Minute
 // invalid JSON gets no second attempt — it fail-softs as "verdict
 // unparseable". Accepted: that path needs two failures at once, against a
 // wall-clock expiry that loses the review every single time it happens.
-const reviewMaxToolCalls = 20
+// DefaultReviewMaxToolCalls is the fallback for the reviewer's tool-call cap
+// when review_max_tool_calls is unset. 40, not 20: the first live PR-loop run
+// (PR #3 round 1) wrapped up at exactly 20 mid-investigation on a diff rung
+// (a) admits — the wrap-up verdict was still valid but one issue's mechanism
+// description came out half-verified, which is exactly the accuracy loss the
+// cap must not cause on reviewable diffs.
+const DefaultReviewMaxToolCalls = 40
 
 // reviewDiffByteCap is degradation rung (c) of design §六-3: a diff bigger
 // than this is not reviewed at all — the user is told, loudly, instead of
@@ -481,6 +488,40 @@ func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest stri
 	}, contextFiles, snap)
 }
 
+func (r *ChatRepl) reviewMaxToolCallsOrDefault() int {
+	if r.cfg.ReviewMaxToolCalls > 0 {
+		return r.cfg.ReviewMaxToolCalls
+	}
+	return DefaultReviewMaxToolCalls
+}
+
+// scaleReviewToolBudget sizes the reviewer's tool-call cap against the scope:
+// max(configured-or-default, 3×changed files) — Round 1 on PR #3 spent 12 of
+// 20 calls merely reading 14 files ONCE, and the half-verified issue text it
+// produced is the accuracy loss this formula prevents. 3× covers one read
+// plus grep follow-ups plus a re-check per file; a configured higher floor
+// always wins for small scopes.
+//
+// The scale term is CLAMPED at twice the floor (round-3 review): cap
+// exhaustion degrades into a tool-less wrap-up verdict, while the wall clock
+// discards the review entirely — so the budget must stay small enough that
+// the cap binds before the deadline. An unbounded 3×files (900 on a
+// 300-file PR) inverts that: the reviewer plans a 900-call investigation,
+// hits the 10-minute DefaultReviewTimeout, and every /pr resume repeats the
+// same total loss. Twice the floor is the largest headroom the default clock
+// plausibly covers; operators needing more raise the config itself.
+func (r *ChatRepl) scaleReviewToolBudget(changedFiles int) int {
+	floor := r.reviewMaxToolCallsOrDefault()
+	budget := floor
+	if n := 3 * changedFiles; n > budget {
+		budget = n
+	}
+	if ceiling := 2 * floor; budget > ceiling {
+		budget = ceiling
+	}
+	return budget
+}
+
 func isPassVerdict(v *agent.ReviewResult) bool {
 	return strings.EqualFold(v.Verdict, "pass") || len(v.Issues) == 0
 }
@@ -503,7 +544,29 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
-	in.maxToolCalls = reviewMaxToolCalls
+	// Budget: a re-review is scoped to the delta — 3×delta files plus 2×
+	// previous issues to verify, floored at 10. The floor deliberately does
+	// NOT inherit the full-review default of 40: round-2's live run showed a
+	// 5-file delta handed 40 calls, which at reviewer latency turns a
+	// ~4-minute pass into a deadline collision (871s, timeout wrap-up). An
+	// EXPLICIT review_max_tool_calls still wins over both — the operator
+	// raised that knob precisely to fund this kind of whole-tree
+	// verification. A first review keeps the scope-scaled formula.
+	if in.incremental {
+		n := 3 * len(in.scope)
+		if in.prev != nil {
+			n += 2 * len(in.prev.Issues)
+		}
+		if floor := 10; n < floor {
+			n = floor
+		}
+		if configured := r.cfg.ReviewMaxToolCalls; configured > n {
+			n = configured
+		}
+		in.maxToolCalls = n
+	} else {
+		in.maxToolCalls = r.scaleReviewToolBudget(len(in.scope))
+	}
 	in.timeout = timeout
 
 	args := map[string]any{
@@ -515,7 +578,7 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 		// wrap-up that still has to satisfy the output schema, so a reviewer
 		// that would otherwise have been killed mid-browse still returns a
 		// verdict for what it examined.
-		"max_tool_calls": reviewMaxToolCalls,
+		"max_tool_calls": in.maxToolCalls,
 	}
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget
@@ -615,6 +678,18 @@ type reviewPromptInput struct {
 	// until the clock kills it, which loses the entire review.
 	maxToolCalls int
 	timeout      time.Duration
+	// prNumber/prRound switch the prompt into PR mode: the diff came from
+	// `gh pr diff` (the change is already pushed), and the round line tells
+	// the reviewer where it sits in the PR loop's review→fix→re-review
+	// cycle. prNumber > 0 is the mode switch; prRound is 1-based.
+	prNumber int
+	prRound  int
+	// incremental marks a PR re-review reading only the commits since
+	// sinceSHA — the human second-reviewer's approach: verify the previous
+	// findings against the delta, check the delta itself, do not re-read
+	// the whole PR. Only meaningful when prNumber > 0.
+	incremental bool
+	sinceSHA    string
 }
 
 // buildReviewPrompt assembles the reviewer's seed message. Deliberately
@@ -623,7 +698,17 @@ type reviewPromptInput struct {
 // the change itself, or the review machinery's own previous output.
 func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
-	b.WriteString("Adversarially review the code changes below.\n\n")
+	if in.prNumber > 0 {
+		if in.incremental {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, re-review round %d. You are the second reviewer. The diff below contains ONLY the commits pushed since %s — the fix commits answering the previous review. Judge like a human second pass: for each previously reported issue, decide from the delta whether it still holds — report it again ONLY if the failure scenario survives the fix. Then review the delta itself for defects the fixes introduced. Stay inside the delta: read a file only when an issue's fix cannot be judged from the diff alone, and then only the lines around the relevant hunk. Re-reading files or exploring beyond the delta wastes the review.\n\n", in.prNumber, in.prRound, in.sinceSHA)
+		} else {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, review round %d. The change is already pushed; the diff is the PR's current diff. "+
+				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
+				"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
+		}
+	} else {
+		b.WriteString("Adversarially review the code changes below.\n\n")
+	}
 	if in.charter != nil {
 		b.WriteString(renderCharterForReview(in.charter, in.lockedPlan))
 	} else {

@@ -366,7 +366,11 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		ReviewAfterEdit:      cfg.ReviewAfterEdit,
 		ReviewTokenBudget:    resolveReviewTokenBudget(cfg.ReviewTokenBudget),
 		ReviewTimeout:        resolveReviewTimeout(cfg.ReviewTimeoutMinutes),
+		ReviewMaxToolCalls:   cfg.ReviewMaxToolCalls,
 		ReviewModel:          strings.TrimSpace(cfg.ReviewModel),
+		PRReviewAuto:         !cfg.PRReviewAutoDisabled,
+		PRAutoMerge:          cfg.PRAutoMerge,
+		PRReviewRounds:       cfg.PRReviewRounds,
 		MissionOnPlan:        cfg.MissionOnPlan,
 	}
 

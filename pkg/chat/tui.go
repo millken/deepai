@@ -100,6 +100,18 @@ func (t *TUI) TurnStart(turn int, userInput string) {
 	t.p.Send(turnStartMsg{turn: turn, input: userInput})
 }
 
+// WaitStart marks a long REPL-side wait that is not an agent turn (the PR
+// loop's CI poll): hides the prompt and makes Ctrl+C route to InterruptCh,
+// so the wait is cancellable instead of freezing the session for its whole
+// budget (round-2 review issue 2).
+func (t *TUI) WaitStart(reason string) {
+	t.p.Send(waitStartMsg{reason: reason})
+}
+
+func (t *TUI) WaitEnd() {
+	t.p.Send(waitEndMsg{})
+}
+
 // RenderEvent renders a single agent event.
 func (t *TUI) RenderEvent(evt agent.AgentEvent) {
 	t.p.Send(agentEventMsg{evt: evt})
@@ -215,6 +227,8 @@ type inputResult struct {
 }
 
 type printMsg struct{ text string }
+type waitStartMsg struct{ reason string }
+type waitEndMsg struct{}
 type turnStartMsg struct {
 	turn  int
 	input string
@@ -249,8 +263,10 @@ type tuiModel struct {
 	sp spinner.Model
 
 	// live region state
-	inputVisible bool   // input box shown (idle or asking)
-	agentActive  bool   // agent running -> show spinner/elapsed
+	inputVisible bool // input box shown (idle or asking)
+	agentActive  bool // agent running -> show spinner/elapsed
+	waitActive   bool // REPL-side wait (CI poll) -> Ctrl+C routes to InterruptCh
+	waitReason   string
 	askActive    bool   // currently asking a tool question
 	askHeader    string // rendered question + options shown above the input
 	aiPartial    string // accumulated streamed assistant text (rendered on flush)
@@ -473,6 +489,21 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case printMsg:
 		return m, commit(msg.text)
 
+	case waitStartMsg:
+		m.waitActive = true
+		m.waitReason = msg.reason
+		m.inputVisible = false
+		return m, commit(m.styles.Dim.Render("  ⌛ " + msg.reason + " — Ctrl+C 停止等待"))
+
+	case waitEndMsg:
+		m.waitActive = false
+		m.waitReason = ""
+		// Visibility is restored by the next ReadPrompt (requestInputMsg),
+		// which is what actually owns the input box between REPL phases —
+		// forcing it visible here would show an input whose submissions
+		// nobody is waiting to read while the loop still has gh work left.
+		return m, nil
+
 	case turnStartMsg:
 		m.turn = msg.turn
 		m.turnStart = time.Now()
@@ -582,6 +613,15 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.submitInput(inputResult{err: errInterrupted})
 			return m, nil
 		case m.agentActive:
+			select {
+			case m.interruptCh <- struct{}{}:
+			default:
+			}
+			return m, nil
+		case m.waitActive:
+			// A REPL-side wait (CI poll) takes the same interrupt path a running
+			// turn does — before inputVisible, or Ctrl+C would clear the prompt
+			// instead of stopping the wait (round-2 review issue 2).
 			select {
 			case m.interruptCh <- struct{}{}:
 			default:

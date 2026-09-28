@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -81,13 +82,17 @@ func TestBuildReviewPrompt_PassingVerdictCarriesNothing(t *testing.T) {
 func TestReviewDispatch_PassesGracefulToolCallCap(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
+	// A configured value must be what enforces the cap AND what the prompt
+	// announces — asserting the constant again would pin a desync (round-2
+	// review issue 1). 7 also beats 3×1 file, so the floor is the config's.
+	r.cfg.ReviewMaxToolCalls = 7
 	seedEditedFile(t, r, "a.go", "package a\n")
 
 	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("want pass, got %q", got)
 	}
-	if got := fake.args["max_tool_calls"]; got != reviewMaxToolCalls {
-		t.Fatalf("max_tool_calls = %v, want %d", got, reviewMaxToolCalls)
+	if got := fake.args["max_tool_calls"]; got != 7 {
+		t.Fatalf("max_tool_calls = %v, want the configured 7", got)
 	}
 }
 
@@ -111,5 +116,83 @@ func TestReviewGate_PrevVerdictLifecycle(t *testing.T) {
 	}
 	if r.reviewPrev != nil {
 		t.Fatal("ending an episode must clear the carried verdict")
+	}
+}
+
+func TestBuildReviewPrompt_PRMode(t *testing.T) {
+	p := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "ledger export", diff: "d",
+		scope:    []string{"internal/ledger.go"},
+		prNumber: 42, prRound: 2, maxToolCalls: 20, timeout: time.Minute,
+	})
+	for _, want := range []string{
+		"PR #42, review round 2",
+		"already pushed",
+		"report a previously reported issue ONLY if you can still construct",
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("PR-mode prompt missing %q:\n%s", want, p)
+		}
+	}
+	if strings.HasPrefix(p, "Adversarially review the code changes below.\n") {
+		t.Fatalf("PR mode must replace the local-mode header:\n%.120s", p)
+	}
+
+	local := buildReviewPrompt(reviewPromptInput{initialRequest: "r", diff: "d"})
+	if !strings.HasPrefix(local, "Adversarially review the code changes below.") {
+		t.Fatalf("local mode (prNumber=0) header changed:\n%.120s", local)
+	}
+}
+
+func TestBuildReviewPrompt_PRModeComposesWithPrevIssues(t *testing.T) {
+	prev := &agent.ReviewResult{
+		Verdict: "fail",
+		Issues:  []agent.Issue{{Severity: "high", File: "a.go", Line: 3, Message: "off by one", Scenario: "empty slice panics"}},
+	}
+	p := buildReviewPrompt(reviewPromptInput{
+		diff: "d", prev: prev, prNumber: 7, prRound: 3,
+	})
+	if !strings.Contains(p, "PR #7, review round 3") || !strings.Contains(p, "off by one") {
+		t.Fatalf("PR mode must still carry previous issues for re-review:\n%s", p)
+	}
+}
+
+func TestScaleReviewToolBudget(t *testing.T) {
+	cases := []struct {
+		configured, files, want int
+	}{
+		{0, 14, 42},    // 3×14 beats the default — PR #3's exact scope
+		{0, 10, 40},    // default floor wins on small scopes
+		{0, 0, 40},     // degenerate scope keeps the floor
+		{60, 30, 90},   // scale beats a higher configured floor
+		{60, 10, 60},   // configured floor wins over scale
+		{0, 100, 80},   // clamp: 3×100 capped at 2× the floor
+		{0, 300, 80},   // clamp: the 300-file PR scenario (round-3 review)
+		{60, 300, 120}, // clamp follows a raised floor, not the default
+	}
+	for _, c := range cases {
+		fake := &fakeTaskTool{content: passVerdictJSON()}
+		r, _ := newReviewRepl(t, t.TempDir(), fake)
+		r.cfg.ReviewMaxToolCalls = c.configured
+		if got := r.scaleReviewToolBudget(c.files); got != c.want {
+			t.Errorf("scaleReviewToolBudget(cfg=%d, files=%d) = %d, want %d", c.configured, c.files, got, c.want)
+		}
+	}
+}
+
+// The dispatch must carry the SCALED value, not the constant — a 14-file
+// scope reaches the subagent as 42 while the single-file gate tests still see
+// the 40 floor.
+func TestReviewGateDispatchesScaledBudget(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _ := newReviewRepl(t, t.TempDir(), fake)
+	for i := 0; i < 14; i++ {
+		seedEditedFile(t, r, fmt.Sprintf("f%02d.go", i), "package a\n")
+	}
+	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
+		t.Fatalf("want pass, got %q", got)
+	}
+	if got := fake.args["max_tool_calls"]; got != 42 {
+		t.Fatalf("max_tool_calls = %v, want 42 (3×14 files)", got)
 	}
 }

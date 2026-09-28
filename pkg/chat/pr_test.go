@@ -1,0 +1,170 @@
+package chat
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestFilterExternalComments(t *testing.T) {
+	comments := []prComment{
+		{ID: "1", Author: "millken", Body: prMarker{prRoleReviewer, 1}.String() + "\n\n**deepai review — round 1: fail**\n"},
+		{ID: "2", Author: "cursor", Body: "cursor nit"},
+		// The owner typing by hand on the same gh account deepai posts through:
+		// no marker, so it is external — the exact case author-based filtering
+		// silently swallowed.
+		{ID: "3", Author: "millken", Body: "owner's own hand-written note"},
+		{ID: "4", Author: "alice", Body: "human asks about tests"},
+		// Legacy: posts from before the marker existed carry the visible bold
+		// header — still own comments (PR #3's first two rounds).
+		{ID: "5", Author: "millken", Body: "**deepai fix — round 1**\n\npushed fixes"},
+	}
+
+	external := filterExternalComments(comments)
+	if len(external) != 3 || external[0].ID != "2" || external[1].ID != "3" || external[2].ID != "4" {
+		ids := make([]string, len(external))
+		for i, c := range external {
+			ids[i] = c.ID
+		}
+		t.Errorf("external = %v, want [2 3 4] (marker + legacy header skipped, owner hand-written kept)", ids)
+	}
+}
+
+// A human cannot accidentally forge the marker: the bold header is GitHub
+// markdown a person could type, but it only counts as "own" in the LEGACY
+// form — the current boundary is the HTML comment, which no hand-typed
+// comment carries.
+func TestIsOwnComment(t *testing.T) {
+	for _, own := range []string{
+		prMarker{prRoleReviewer, 3}.String() + "\n\n**deepai review — round 3: fail**\n",
+		prMarker{prRoleCoder, 1}.String() + "\n\nbody",
+		"**deepai review — round 1: fail**\nlegacy",
+		"**deepai fix — round 2**\nlegacy",
+	} {
+		if !isOwnComment(own) {
+			t.Errorf("isOwnComment(%q) = false, want true", own)
+		}
+	}
+	for _, foreign := range []string{
+		"",
+		"owner's note",
+		"**deepseek review** — a human imitating the style",
+		"<!-- some other html comment -->",
+		"<!-- deepai:role=hacker round=1 -->",
+	} {
+		if isOwnComment(foreign) {
+			t.Errorf("isOwnComment(%q) = true, want false", foreign)
+		}
+	}
+}
+
+func TestPRStatePersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	st, err := newPRState(dir, 42, "millken/jp-small", "feature/w5", "develop", "https://github.com/millken/jp-small/pull/42", "ledger export")
+	if err != nil {
+		t.Fatalf("newPRState: %v", err)
+	}
+	if st.Status != prStatusReviewing || st.Round != 1 {
+		t.Fatalf("fresh state = %+v, want reviewing round 1", st)
+	}
+
+	st.Round = 3
+	if err := st.setStatus(dir, prStatusAwaitingMerge); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	back, err := openPRState(dir, 42)
+	if err != nil {
+		t.Fatalf("openPRState: %v", err)
+	}
+	if back.Status != prStatusAwaitingMerge || back.Round != 3 || back.Number != 42 || back.Brief != "ledger export" {
+		t.Fatalf("reloaded state = %+v", back)
+	}
+	if !back.UpdatedAt.After(back.CreatedAt) && !back.UpdatedAt.Equal(back.CreatedAt) {
+		t.Fatalf("UpdatedAt %v not >= CreatedAt %v", back.UpdatedAt, back.CreatedAt)
+	}
+}
+
+func TestActivePRStatesFiltersTerminal(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(n int, status prStatus) {
+		st, err := newPRState(dir, n, "", "", "", "", "")
+		if err != nil {
+			t.Fatalf("newPRState(%d): %v", n, err)
+		}
+		if err := st.setStatus(dir, status); err != nil {
+			t.Fatalf("setStatus(%d): %v", n, err)
+		}
+	}
+	mk(1, prStatusMerged)
+	mk(2, prStatusReviewing)
+	mk(3, prStatusAborted)
+	mk(4, prStatusAwaitingCI)
+
+	active := activePRStates(dir)
+	if len(active) != 2 || active[0].Number != 2 || active[1].Number != 4 {
+		var nums []int
+		for _, a := range active {
+			nums = append(nums, a.Number)
+		}
+		t.Fatalf("activePRStates = %v, want [2 4]", nums)
+	}
+}
+
+func TestClassifyChecksCode(t *testing.T) {
+	cases := []struct {
+		code     int
+		stderr   string
+		wantDone bool
+		wantOK   bool
+		wantLErr bool
+	}{
+		{0, "", true, true, false},
+		{8, "", false, false, false},
+		{127, "", false, false, true},
+		{1, "gh: Could not resolve to a Pull Request", false, false, true},
+		{1, "HTTP 404: Not Found", false, false, true},
+		{1, "some checks failed", true, false, false},
+		// Round-1 high issue, pinned: a branch with NO CI configured is not a
+		// failed CI — gh exits 1 with empty stdout and this stderr. Misclassifying
+		// it burned fix rounds chasing a phantom failure.
+		{1, "no checks reported on 'feat/x' branch", true, true, false},
+		{2, "", true, false, false},
+	}
+	for _, c := range cases {
+		done, ok, lerr := classifyChecksCode(c.code, c.stderr)
+		if done != c.wantDone || ok != c.wantOK || (lerr != "") != c.wantLErr {
+			t.Errorf("classifyChecksCode(%d, %q) = (%v,%v,%q), want (%v,%v,lerr=%v)",
+				c.code, c.stderr, done, ok, lerr, c.wantDone, c.wantOK, c.wantLErr)
+		}
+	}
+}
+
+func TestParsePRCommentsJSON(t *testing.T) {
+	data := []byte(`{"comments":[
+		{"id":"c2","body":"later","author":{"login":"millken"},"createdAt":"2026-09-27T10:01:00Z"},
+		{"id":"c1","body":"earlier","author":{"login":"millken"},"createdAt":"2026-09-27T10:00:00Z"}
+	]}`)
+	got, err := parsePRCommentsJSON(data)
+	if err != nil {
+		t.Fatalf("parsePRCommentsJSON: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "c1" || got[1].ID != "c2" {
+		t.Fatalf("comments not sorted by createdAt: %+v", got)
+	}
+	if _, err := parsePRCommentsJSON([]byte("not json")); err == nil {
+		t.Fatal("invalid JSON accepted")
+	}
+}
+
+// The live failure this pins: prRepoArgs without the leading "pr" made every
+// gh call `gh view 3` — unknown command — and the fake-gh tests never caught
+// it because they bypass command construction entirely.
+func TestPRRepoArgs(t *testing.T) {
+	if got := prRepoArgs("", "view", "3"); strings.Join(got, " ") != "pr view 3" {
+		t.Fatalf("prRepoArgs(\"\") = %v, want [pr view 3]", got)
+	}
+	if got := prRepoArgs("o/r", "checks", "7"); strings.Join(got, " ") != `pr checks 7 --repo "o/r"` {
+		t.Fatalf("prRepoArgs(o/r) = %v", got)
+	}
+}

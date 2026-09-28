@@ -89,6 +89,10 @@ type ReplConfig struct {
 	ReviewTokenBudget int
 	// ReviewTimeout bounds one review subagent run; 0 uses DefaultReviewTimeout.
 	ReviewTimeout time.Duration
+	// ReviewMaxToolCalls caps each review subagent's tool calls; 0 uses
+	// DefaultReviewMaxToolCalls (40). The cap trades depth for bounded cost —
+	// budget exhaustion forces a tool-less wrap-up that still emits a verdict.
+	ReviewMaxToolCalls int
 	// ReviewModel is the model alias every reviewer the GATES dispatch runs
 	// on — the post-edit correctness review, the mission's design review and
 	// its implementation review. Empty (the default) keeps today's behavior:
@@ -109,6 +113,17 @@ type ReplConfig struct {
 	// unresolvable alias would otherwise fail every review the gate ever
 	// runs — and on the design side, stop the mission.
 	ReviewModel string
+
+	// PRReviewAuto auto-attaches the PR review loop when a turn's bash output
+	// shows a freshly created PR (detectPRCreate). Default true; a mission in
+	// flight suppresses it — the mission's own gates own that turn's edits.
+	PRReviewAuto bool
+	// PRAutoMerge merges once review+CI are green instead of stopping in
+	// awaiting_merge for an explicit merge command. Default false (the
+	// confirmed decision: 全绿后等指令).
+	PRAutoMerge bool
+	// PRReviewRounds bounds the PR loop's review→fix rounds; 0 = default 5.
+	PRReviewRounds int
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// full mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1). Default off, for
@@ -174,6 +189,12 @@ type ReplUI interface {
 	ReadPrompt(ctx context.Context) (string, []models.MessageImage, error)
 	TurnStart(turn int, userInput string)
 	TurnEnd(usage *agent.Usage)
+	// WaitStart/WaitEnd bracket a long REPL-side wait that is NOT an agent
+	// turn (the PR loop's CI poll). While a wait is active the TUI routes
+	// Ctrl+C to InterruptCh — the same signal a running turn gets — so the
+	// wait is cancellable instead of freezing the prompt.
+	WaitStart(reason string)
+	WaitEnd()
 	RenderEvent(evt agent.AgentEvent)
 	RenderSubagentEvent(evt subagent.TaskEvent)
 	RenderInterrupted()
@@ -352,6 +373,13 @@ type ChatRepl struct {
 	// then runs an ordinary runTurn. Mirrors the orphanWait /
 	// lockHeartbeatInterval test seams above.
 	missionTurn func(ctx context.Context, input string) *turnError
+
+	// prGH / prCIPollInterval / prCIWaitTimeout override the PR loop's gh
+	// client and CI polling for tests (same seam discipline as missionTurn).
+	// Zero values use the real client and the defaults in pr_loop.go.
+	prGH             prGH
+	prCIPollInterval time.Duration
+	prCIWaitTimeout  time.Duration
 
 	// lastPlanFile is the plan document the most recent turn's Agent used
 	// (agent.Agent.PlanFile). Read only by the mission_on_plan upgrade.
@@ -782,6 +810,14 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	// warning to the user.
 	r.attachSessionMission()
 
+	// Active PR loops survive crashes on disk; say so instead of silently
+	// resuming (a PR review round spends real tokens) — /pr resume is the door.
+	if active := activePRStates(r.cfg.WorkDir); len(active) > 0 {
+		for _, st := range active {
+			r.ui.Info(fmt.Sprintf("  pr: #%d %s (round %d) — /pr resume continues, /pr abort <n> ends it", st.Number, st.Status, st.Round))
+		}
+	}
+
 	// Interactive loop. Ctrl+C during a turn cancels only that turn (delivered
 	// via the TUI interrupt channel); Ctrl+C at the prompt exits the REPL.
 
@@ -892,6 +928,13 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			continue
 		}
 
+		if isMergeInput(line) {
+			if st := r.awaitingMergePR(); st != nil {
+				r.mergePRAndContinue(parentCtx, st, r.prGHOrDefault())
+				continue
+			}
+		}
+
 		r.turn++
 
 		// Capture images for this turn (may be nil).
@@ -912,6 +955,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		// is not re-entrant and the plan is usually written by the time the
 		// turn ends anyway.
 		r.maybeUpgradeToMission(parentCtx, line)
+		r.maybeAttachPRLoop(parentCtx)
 	}
 
 	// Save session metadata on exit.
@@ -1949,6 +1993,8 @@ func (r *ChatRepl) handleSlashCommand(parentCtx context.Context, cmd SlashComman
 		r.handleReviewCommand(parentCtx, cmd.Args)
 	case "mission":
 		r.handleMissionCommand(parentCtx, cmd.Args)
+	case "pr":
+		r.handlePRCommand(parentCtx, cmd.Args)
 	case "doctor":
 		r.ui.Info(r.doctorText(parentCtx))
 	case "status", "st":
