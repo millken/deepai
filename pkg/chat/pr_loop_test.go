@@ -17,7 +17,7 @@ type fakeGH struct {
 	files        []string
 	comments     []prComment
 	checksScript []fakeChecks // consumed per Checks call; last repeats
-	mergeErr error
+	mergeErr     error
 	// listCommentsErr, when set, is what ListComments fails with.
 	listCommentsErr error
 	// viewTitle is what View reports.

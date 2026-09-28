@@ -272,7 +272,6 @@ func TestPRIncrementalDiff_RebasedBaseFallsBack(t *testing.T) {
 	}
 }
 
-
 // Round-3 issue 1, merge half: `git merge origin/main` between rounds keeps
 // the anchor an ancestor (so --is-ancestor passes) while base..HEAD now
 // carries upstream commits — the range must still fall back, never be read
@@ -362,7 +361,6 @@ func TestReviewBudget_IncrementalFloor(t *testing.T) {
 	}
 }
 
-
 // Round-3 issue 2 pin: an explicit review_max_tool_calls must be honored on
 // the incremental path too — the hard-coded floor of 10 silently overrode
 // operator config while the same PR's round-1 review got the full budget.
@@ -424,7 +422,6 @@ func TestPRLoop_ResumeDoesNotDuplicatePostedComment(t *testing.T) {
 		t.Fatalf("CommentPostedRound = %d, want recorded as 1 without re-posting", st.CommentPostedRound)
 	}
 }
-
 
 // Round-3 issue 3 pin, lookup-failure half: when the timeline cannot be
 // consulted (transient gh failure / rate limit), the resume must STOP —

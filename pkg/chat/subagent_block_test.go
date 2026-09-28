@@ -213,3 +213,31 @@ func TestSubagentBlock_UnresolvedTaskCommitsAsCancelled(t *testing.T) {
 		t.Fatalf("the completed task lost its mark:\n%s", block)
 	}
 }
+
+// The post-merge "reviewer 行一直挂在界面上" report: the PR loop dispatches its
+// reviewer from the /pr command path, where NO turn ever ends — so the
+// fan-out block's only commit point (turnEndMsg) never fires. The flush
+// message is that out-of-turn commit path.
+func TestSubagentBlock_FlushCommitsOutsideTurn(t *testing.T) {
+	m := newTUIModel(BannerInfo{Model: "test"})
+	startTask(m, "A", "Adversarial correctness review", "correctness-reviewer")
+	m.handleSubagentEvent(subagent.TaskEvent{Type: "task_completed", TaskID: "A", Description: "review"})
+
+	if len(m.subagentTasks) != 1 {
+		t.Fatalf("precondition: resolved task must stay in the live block, got %d", len(m.subagentTasks))
+	}
+
+	nm, cmd := m.Update(flushSubagentMsg{})
+	m = nm.(*tuiModel)
+	if cmd == nil {
+		t.Fatal("a non-empty block must commit to scrollback on flush")
+	}
+	if len(m.subagentTasks) != 0 {
+		t.Fatalf("flush must clear the live block, got %d entries", len(m.subagentTasks))
+	}
+
+	// Flushing with nothing pending commits nothing and does not panic.
+	if _, cmd := m.Update(flushSubagentMsg{}); cmd != nil {
+		t.Fatal("an empty flush must not commit")
+	}
+}

@@ -83,6 +83,9 @@ type mockUI struct {
 	// persistent channel the way the TUI has one, so a test can buffer a
 	// token and later assert whether it was consumed.
 	interruptCh chan struct{}
+	// flushes counts FlushSubagentBlock calls, pinning that out-of-turn
+	// dispatches commit their fan-out block (review_gate/PR-loop tests).
+	flushes      int
 }
 
 func (m *mockUI) Info(msg string) { m.infoMsgs = append(m.infoMsgs, msg) }
@@ -102,6 +105,7 @@ func (m *mockUI) TurnStart(_ int, _ string)                {}
 func (m *mockUI) TurnEnd(_ *agent.Usage)                   {}
 func (m *mockUI) WaitStart(_ string)                       {}
 func (m *mockUI) WaitEnd()                                 {}
+func (m *mockUI) FlushSubagentBlock()                    { m.flushes++ }
 func (m *mockUI) RenderEvent(evt agent.AgentEvent)         { m.events = append(m.events, evt) }
 func (m *mockUI) RenderSubagentEvent(_ subagent.TaskEvent) {}
 func (m *mockUI) RenderInterrupted()                       {}

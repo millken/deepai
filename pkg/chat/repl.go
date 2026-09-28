@@ -195,6 +195,12 @@ type ReplUI interface {
 	// wait is cancellable instead of freezing the prompt.
 	WaitStart(reason string)
 	WaitEnd()
+	// FlushSubagentBlock commits any finished subagent fan-out to scrollback
+	// NOW, outside a turn. The block normally commits at turn end, but every
+	// reviewer dispatch resolves after that point (gate, mission, PR loop)
+	// or with no turn at all (/review) — without this the resolved reviewer
+	// line stays pinned in the live region indefinitely.
+	FlushSubagentBlock()
 	RenderEvent(evt agent.AgentEvent)
 	RenderSubagentEvent(evt subagent.TaskEvent)
 	RenderInterrupted()

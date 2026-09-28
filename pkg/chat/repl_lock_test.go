@@ -1615,6 +1615,7 @@ func (u *raceSafeLockUI) TurnStart(int, string)                  {}
 func (u *raceSafeLockUI) TurnEnd(*agent.Usage)                   {}
 func (u *raceSafeLockUI) WaitStart(string)                       {}
 func (u *raceSafeLockUI) WaitEnd()                               {}
+func (u *raceSafeLockUI) FlushSubagentBlock()                    {}
 func (u *raceSafeLockUI) RenderEvent(agent.AgentEvent)           {}
 func (u *raceSafeLockUI) RenderSubagentEvent(subagent.TaskEvent) {}
 func (u *raceSafeLockUI) RenderInterrupted()                     {}

@@ -612,6 +612,12 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 		})
 		return nil // review failures are fail-soft, never a turn error
 	})
+	// Every caller resolves this reviewer outside a live turn: the gate and
+	// the mission loop run AFTER TurnEnd has committed, and /review and the
+	// PR loop dispatch with no turn at all — so turnEndMsg is never a commit
+	// point for this fan-out line. Flush it or the resolved reviewer stays
+	// pinned in the live region until some later turn happens to end.
+	r.ui.FlushSubagentBlock()
 
 	// Reviewer-write defense runs FIRST, before any trust decision — a
 	// timed-out reviewer may still have written the tree (design §4.4 B4:
