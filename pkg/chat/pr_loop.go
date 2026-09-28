@@ -61,13 +61,17 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	if v, round := loadLastVerdict(r.cfg.WorkDir, st.Number); v != nil && (round == st.Round-1 || round == st.Round) {
 		prev, prevRound = v, round
 	}
-	// A logged verdict at st.Round in reviewing means the review comment for
-	// THIS round is already on the PR: the resumed pass must not re-review,
-	// re-append or re-post — one round cannot be reported twice — so it skips
-	// straight to the fix turn with the stored verdict (round-5 review
-	// issue 2; also keeps the fix prompt's "fixed or argued" premise true,
-	// since that turn never ran).
-	alreadyPosted := st.Status == prStatusReviewing && prevRound == st.Round
+	// A CONFIRMED comment for THIS round gates the resume's skip-to-fix-turn
+	// path — one round cannot be reported twice — and keeps the fix prompt's
+	// "fixed or argued" premise true, since that turn never ran (round-5
+	// review issue 2). The gate is CommentPostedRound, NEVER the verdict log:
+	// appendVerdict runs before PostComment, so a transient gh failure between
+	// them leaves a logged verdict with no public comment. That state
+	// (unpostedVerdict) re-posts from the stored verdict on resume — no second
+	// review, no duplicate, no missing timeline entry (new-loop round-1
+	// issue 1).
+	alreadyPosted := st.Status == prStatusReviewing && st.CommentPostedRound == st.Round
+	unpostedVerdict := st.Status == prStatusReviewing && !alreadyPosted && prevRound == st.Round
 
 	for {
 		switch st.Status {
@@ -86,6 +90,18 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 				alreadyPosted = false
 				verdict = prev
 				r.ui.Info(fmt.Sprintf("  pr: #%d round %d findings already posted — resuming at the fix turn", st.Number, st.Round))
+			} else if unpostedVerdict {
+				unpostedVerdict = false
+				verdict = prev
+				r.ui.Info(fmt.Sprintf("  pr: #%d round %d verdict was logged but its comment never reached the PR — posting it now", st.Number, st.Round))
+				if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
+					r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
+					return
+				}
+				st.CommentPostedRound = st.Round
+				if err := st.save(r.cfg.WorkDir); err != nil {
+					r.ui.Info(fmt.Sprintf("  pr: could not persist the posted-round marker (%v)", err))
+				}
 			} else {
 				var ok bool
 				verdict, ok = r.dispatchPRReview(parentCtx, st, gh, prev)
@@ -106,6 +122,10 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 				if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
 					r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
 					return
+				}
+				st.CommentPostedRound = st.Round
+				if err := st.save(r.cfg.WorkDir); err != nil {
+					r.ui.Info(fmt.Sprintf("  pr: could not persist the posted-round marker (%v)", err))
 				}
 			}
 			ext := pendingExternalComments(parentCtx, st, gh)
@@ -641,7 +661,17 @@ func (r *ChatRepl) mergePRAndContinue(parentCtx context.Context, st *prState, gh
 	}
 	if turnErr := r.runMissionTurn(parentCtx, b.String()); turnErr != nil {
 		r.ui.Info("  pr: next-task turn interrupted — the todo list is unchanged")
+		return
 	}
+	// The handoff turn is a synthesized one: the Run()-level
+	// maybeAttachPRLoop hook never fires for it, and its bash results fall
+	// behind turnBashOutputs' last-human-message boundary as soon as the
+	// user types again — without this call the SECOND and later chained PRs
+	// never auto-enter their review loops (new-loop round-1 issue 2). The
+	// handoff input lands as a human-role message, so the boundary correctly
+	// scopes to this turn's gh output. Recursion depth equals the task
+	// count: that chain IS the design.
+	r.maybeAttachPRLoop(parentCtx)
 }
 
 // nextPendingTodo returns the first pending item's content and its 1-based

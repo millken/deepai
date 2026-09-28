@@ -2,10 +2,15 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools/builtin"
 )
 
 // gitTestRepo creates a real git repo with two commits; returns the dir,
@@ -144,3 +149,99 @@ func TestBuildReviewPrompt_PRModeIncremental(t *testing.T) {
 		t.Fatalf("full-review framing leaked into incremental prompt:\n%s", p)
 	}
 }
+
+// New-loop round-1 issue 1, pinned: a verdict logged for the round whose
+// comment never reached the PR (transient gh failure between appendVerdict
+// and PostComment) re-posts the comment on resume instead of skipping to
+// the fix turn with the timeline missing its review.
+func TestPRLoop_ResumeRepostsUnpostedVerdict(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	r.missionTurn = func(ctx context.Context, input string) *turnError { return nil }
+
+	st, err := newPRState(dir, 50, "", "feature/x", "main", "", "brief")
+	if err != nil {
+		t.Fatalf("newPRState: %v", err)
+	}
+	// Crash-point state: verdict for round 1 logged, comment never posted,
+	// CommentPostedRound still 0.
+	var v *agent.ReviewResult
+	if err := json.Unmarshal([]byte(failVerdictJSON()), &v); err != nil {
+		t.Fatalf("unmarshal verdict: %v", err)
+	}
+	if err := st.appendVerdict(dir, 1, v); err != nil {
+		t.Fatalf("appendVerdict: %v", err)
+	}
+	st.Round = 1
+	st.Status = prStatusReviewing
+	if err := st.save(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	// The very first posted comment must be the round-1 REVIEW comment —
+	// not a fix comment from a skipped-post path.
+	if len(gh.commentsPosted) == 0 {
+		t.Fatal("resume posted nothing")
+	}
+	first := gh.commentsPosted[0]
+	if m, ok := markerFromBody(first); !ok || m.Role != prRoleReviewer || m.Round != 1 {
+		t.Fatalf("first comment must be the re-posted round-1 review: %q", first)
+	}
+	if st.CommentPostedRound != 1 {
+		t.Fatalf("CommentPostedRound = %d, want 1", st.CommentPostedRound)
+	}
+	// The loop then completes: fix turn ran, comment sequence ends merged.
+	if st.Status != prStatusAwaitingMerge && st.Status != prStatusMerged {
+		t.Fatalf("status = %s, want terminal awaiting_merge/merged", st.Status)
+	}
+}
+
+// New-loop round-1 issue 2, pinned: the merge handoff's next-task turn gets
+// the auto-attach hook, so a PR created inside that turn enters its own
+// review loop — the chained-auto-review contract.
+func TestMergeHandoff_AttachesNextPR(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	r.cfg.PRReviewAuto = true
+	r.missionTurn = func(ctx context.Context, input string) *turnError { return nil }
+
+	// Session with a pending task and a merge-handoff turn whose bash output
+	// shows a freshly created NEXT PR.
+	r.carry.SetTodos([]builtin.TodoItem{
+		{Content: "task A", Status: builtin.TodoInProgress},
+		{Content: "task B", Status: builtin.TodoPending},
+	})
+	r.sess = &models.Session{Messages: []models.Message{
+		{Role: models.RoleHuman, Content: "merge"},
+		{Role: models.RoleTool, ToolResult: &models.ToolResult{ToolName: "bash",
+			Content: `{"stdout":"Creating pull request for feature/b into main in millken/deepai\n\nhttps://github.com/millken/deepai/pull/31\n"}`}},
+	}}
+
+	st, err := newPRState(dir, 30, "", "feature/a", "main", "", "task A")
+	if err != nil {
+		t.Fatalf("newPRState: %v", err)
+	}
+	st.setStatus(dir, prStatusAwaitingMerge)
+
+	r.mergePRAndContinue(context.Background(), st, gh)
+
+	nextSt, err := openPRState(dir, 31)
+	if err != nil {
+		t.Fatalf("the chained PR #31 never attached: %v", err)
+	}
+	if nextSt.Status != prStatusAwaitingMerge {
+		t.Fatalf("chained PR status = %s, want awaiting_merge (pass verdict + green checks in the fake)", nextSt.Status)
+	}
+}
+
+// parseRoundVerdict helper removed: inline unmarshal keeps the crash-point
+// state (single prState) exact — a helper re-creating the state would
+// overwrite the round/status the test is asserting against.

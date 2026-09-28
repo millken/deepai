@@ -58,6 +58,15 @@ type prState struct {
 	Round int      `json:"round"`
 	Brief string   `json:"brief,omitempty"`
 	Scope []string `json:"scope,omitempty"`
+	// CommentPostedRound is the round whose review comment is CONFIRMED on
+	// the PR (0 = none). The resume path gates "skip to the fix turn" on
+	// this, never on the verdict log: appendVerdict runs before PostComment,
+	// so a transient gh failure between them would otherwise make a resume
+	// treat an un-posted review as posted and leave the PR timeline without
+	// its review comment (new-loop round-1 issue 1). A resume that finds a
+	// logged verdict for the round but CommentPostedRound behind it RE-POSTS
+	// the comment from the stored verdict instead of re-reviewing.
+	CommentPostedRound int `json:"comment_posted_round,omitempty"`
 	// LastReviewHead is the commit sha the last review ran against (empty
 	// before round 1). A re-review reads only the COMMITS SINCE this sha —
 	// the human second-reviewer's approach: pull the incremental diff,

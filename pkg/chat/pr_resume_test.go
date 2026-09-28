@@ -201,6 +201,13 @@ func TestRunPRLoop_ResumeSkipsAlreadyPostedRound(t *testing.T) {
 	if err := st.appendVerdict(r.cfg.WorkDir, 1, stored); err != nil {
 		t.Fatalf("appendVerdict: %v", err)
 	}
+	// The comment for round 1 reached the PR (CommentPostedRound), which is
+	// what makes the skip-to-fix-turn resume path correct — a logged verdict
+	// alone now takes the re-post path instead.
+	st.CommentPostedRound = 1
+	if err := st.save(r.cfg.WorkDir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
 
 	var fixInput string
 	r.missionTurn = func(ctx context.Context, input string) *turnError {
