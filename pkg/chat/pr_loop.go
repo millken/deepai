@@ -98,7 +98,11 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 				// but before the posted-round marker persisted leaves the marker behind
 				// while the comment IS public — re-posting would duplicate the review
 				// comment (round-3 issue 3).
-				onPR := prReviewerCommentOnPR(parentCtx, st, gh, st.Round)
+				onPR, lookupErr := prReviewerCommentOnPR(parentCtx, st, gh, st.Round)
+				if lookupErr != nil {
+					r.ui.Info(fmt.Sprintf("  pr: #%d could not verify whether round %d's comment is on the PR (%v) — not posting; /pr resumes", st.Number, st.Round, lookupErr))
+					return
+				}
 				if !onPR {
 					r.ui.Info(fmt.Sprintf("  pr: #%d round %d verdict was logged but its comment never reached the PR — posting it now", st.Number, st.Round))
 					if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
@@ -210,11 +214,11 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 
 // prIncrementalDiff returns the commits-since diff from the last reviewed
 // head — the human second-reviewer's reading list. ok=false when the anchor
-// is unusable: unresolvable sha, or — the rebase trap (round-3 issue 1) — a
-// sha that still resolves but is NO LONGER an ancestor of HEAD, in which
-// case base..HEAD silently contains upstream commits and drops the PR's own
-// files. The caller falls back to the full PR diff rather than guessing at
-// a poisoned anchor.
+// is unusable: an unresolvable sha, a sha that still resolves but is NO
+// LONGER an ancestor of HEAD (rebase/reset divergence), or a range that
+// contains a merge commit (`git merge origin/main` between rounds) — the
+// last two both smuggle upstream commits into base..HEAD. The caller falls
+// back to the full PR diff rather than guessing at a poisoned anchor.
 func prIncrementalDiff(workDir, base string) (diff string, files []string, ok bool) {
 	if base == "" {
 		return "", nil, false
@@ -222,6 +226,14 @@ func prIncrementalDiff(workDir, base string) (diff string, files []string, ok bo
 	// --quiet: exit 0 only when base IS an ancestor of HEAD; 1 (or an error)
 	// means rebase/reset/divergence — treat as a poisoned anchor.
 	if _, err := runGit(workDir, "merge-base", "--is-ancestor", base, "HEAD"); err != nil {
+		return "", nil, false
+	}
+	// Ancestry alone is not soundness — the merge half of the same trap:
+	// `git merge origin/main` between rounds also satisfies --is-ancestor
+	// while base..HEAD carries upstream commits, which the reviewer would
+	// read as the implementer's fixes. A merge in the range means the delta
+	// is not the PR's own commits — fall back too.
+	if merges, err := runGit(workDir, "rev-list", "--merges", base+"..HEAD"); err != nil || strings.TrimSpace(string(merges)) != "" {
 		return "", nil, false
 	}
 	out, err := runGit(workDir, "diff", "--unified=3", base+"..HEAD")
@@ -324,24 +336,24 @@ func shortSHA(sha string) string {
 // already visible on the PR — the durable truth when state and timeline
 // disagree (a crash between PostComment and the marker's save leaves the
 // marker behind while the comment is public; re-posting would duplicate
-// it — round-3 issue 3). A lookup failure answers false: the caller then
-// re-posts, and the timeline's marker makes the duplicate distinguishable
-// from a missing review.
-func prReviewerCommentOnPR(ctx context.Context, st *prState, gh prGH, round int) bool {
+// it — round-3 issue 3). A lookup failure is its own answer: guessing
+// either way means a duplicate public comment or a silently dropped one,
+// so the caller stops and /pr resumes instead.
+func prReviewerCommentOnPR(ctx context.Context, st *prState, gh prGH, round int) (bool, error) {
 	comments, err := gh.ListComments(ctx, st.Repo, st.Number)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, c := range comments {
 		if m, ok := markerFromBody(c.Body); ok && m.Role == prRoleReviewer && m.Round == round {
-			return true
+			return true, nil
 		}
 		// Legacy header (pre-marker rounds) counts for its round too.
 		if _, ok := markerFromBody(c.Body); !ok && strings.HasPrefix(c.Body, "**deepai review — round "+strconv.Itoa(round)+":") {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // errPRCIInterrupted marks a CI wait cut short by Ctrl+C. A sentinel so the

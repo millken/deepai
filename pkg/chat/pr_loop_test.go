@@ -17,7 +17,9 @@ type fakeGH struct {
 	files        []string
 	comments     []prComment
 	checksScript []fakeChecks // consumed per Checks call; last repeats
-	mergeErr     error
+	mergeErr error
+	// listCommentsErr, when set, is what ListComments fails with.
+	listCommentsErr error
 	// viewTitle is what View reports.
 	viewTitle string
 	// viewURL is the PR URL View reports; empty means "not a PR URL".
@@ -47,6 +49,9 @@ func (f *fakeGH) PostComment(_ context.Context, _ string, _ int, body string) er
 }
 
 func (f *fakeGH) ListComments(context.Context, string, int) ([]prComment, error) {
+	if f.listCommentsErr != nil {
+		return nil, f.listCommentsErr
+	}
 	return f.comments, nil
 }
 

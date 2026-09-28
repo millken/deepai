@@ -545,18 +545,23 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 		timeout = DefaultReviewTimeout
 	}
 	// Budget: a re-review is scoped to the delta — 3×delta files plus 2×
-	// previous issues to verify, floor 10. It deliberately does NOT inherit
-	// the full-review floor (40): round-2's live run showed a 5-file delta
-	// handed 40 calls, which at reviewer latency turns a ~4-minute pass into
-	// a deadline collision (871s, timeout wrap-up). A first review keeps
-	// the scope-scaled formula.
+	// previous issues to verify, floored at 10. The floor deliberately does
+	// NOT inherit the full-review default of 40: round-2's live run showed a
+	// 5-file delta handed 40 calls, which at reviewer latency turns a
+	// ~4-minute pass into a deadline collision (871s, timeout wrap-up). An
+	// EXPLICIT review_max_tool_calls still wins over both — the operator
+	// raised that knob precisely to fund this kind of whole-tree
+	// verification. A first review keeps the scope-scaled formula.
 	if in.incremental {
 		n := 3 * len(in.scope)
 		if in.prev != nil {
 			n += 2 * len(in.prev.Issues)
 		}
-		if n < 10 {
-			n = 10
+		if floor := 10; n < floor {
+			n = floor
+		}
+		if configured := r.cfg.ReviewMaxToolCalls; configured > n {
+			n = configured
 		}
 		in.maxToolCalls = n
 	} else {

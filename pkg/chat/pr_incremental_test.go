@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -271,6 +272,28 @@ func TestPRIncrementalDiff_RebasedBaseFallsBack(t *testing.T) {
 	}
 }
 
+
+// Round-3 issue 1, merge half: `git merge origin/main` between rounds keeps
+// the anchor an ancestor (so --is-ancestor passes) while base..HEAD now
+// carries upstream commits — the range must still fall back, never be read
+// as the implementer's fixes.
+func TestPRIncrementalDiff_MergedUpstreamFallsBack(t *testing.T) {
+	dir, base, _ := gitTestRepo(t)
+	gitStep(t, dir, "checkout", "-q", "-b", "upstream", base)
+	os.WriteFile(dir+"/u.txt", []byte("upstream\n"), 0o644)
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "upstream change")
+	gitStep(t, dir, "checkout", "-q", "main")
+	gitStep(t, dir, "merge", "-q", "--no-edit", "upstream")
+	os.WriteFile(dir+"/fix.txt", []byte("fix\n"), 0o644)
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "real fix")
+
+	if _, _, ok := prIncrementalDiff(dir, base); ok {
+		t.Fatal("a range containing a merge of upstream must fall back, not read upstream commits as the implementer's fixes")
+	}
+}
+
 // Round-3 issue 2 pin: the incremental path applies the same byte cap — an
 // oversized delta falls back to the full PR diff (which refuses if it too is
 // oversized), never reaches the reviewer unchallenged.
@@ -339,6 +362,27 @@ func TestReviewBudget_IncrementalFloor(t *testing.T) {
 	}
 }
 
+
+// Round-3 issue 2 pin: an explicit review_max_tool_calls must be honored on
+// the incremental path too — the hard-coded floor of 10 silently overrode
+// operator config while the same PR's round-1 review got the full budget.
+func TestReviewBudget_IncrementalHonorsConfiguredFloor(t *testing.T) {
+	dir, base, _ := gitTestRepo(t) // delta: 1 file, no prev issues → formula floor 10
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "FULL", files: nil}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	r.cfg.ReviewMaxToolCalls = 80
+	st, _ := newPRState(dir, 64, "", "x", "main", "", "b")
+	st.Round = 2
+	st.LastReviewHead = base
+
+	r.dispatchPRReview(context.Background(), st, gh, nil)
+	if got := fake.args["max_tool_calls"]; got != 80 {
+		t.Fatalf("max_tool_calls = %v, want the configured 80 to beat the formula floor 10", got)
+	}
+}
+
 // Round-3 issue 3 pin: crash after PostComment but before the posted-round
 // marker persisted — the resume consults the PR timeline and records the
 // marker instead of duplicating the public comment.
@@ -378,5 +422,47 @@ func TestPRLoop_ResumeDoesNotDuplicatePostedComment(t *testing.T) {
 	}
 	if st.CommentPostedRound != 1 {
 		t.Fatalf("CommentPostedRound = %d, want recorded as 1 without re-posting", st.CommentPostedRound)
+	}
+}
+
+
+// Round-3 issue 3 pin, lookup-failure half: when the timeline cannot be
+// consulted (transient gh failure / rate limit), the resume must STOP —
+// guessing "not posted" duplicates a public comment, guessing "posted"
+// drops it. Neither; the marker stays unset and /pr resumes.
+func TestPRLoop_ResumeCommentLookupFailureStops(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	var stored *agent.ReviewResult
+	if err := json.Unmarshal([]byte(failVerdictJSON()), &stored); err != nil {
+		t.Fatalf("unmarshal verdict: %v", err)
+	}
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{
+		diff:            "+line",
+		listCommentsErr: fmt.Errorf("rate limited"),
+	}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+
+	st, _ := newPRState(dir, 65, "", "x", "main", "", "b")
+	if err := st.appendVerdict(dir, 1, stored); err != nil {
+		t.Fatalf("appendVerdict: %v", err)
+	}
+	st.Round = 1
+	st.Status = prStatusReviewing
+	if err := st.save(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	if len(gh.commentsPosted) != 0 {
+		t.Fatalf("lookup failure must not post — posted %d comment(s)", len(gh.commentsPosted))
+	}
+	if st.CommentPostedRound != 0 {
+		t.Fatalf("CommentPostedRound = %d, want 0 (unverified must not be recorded as posted)", st.CommentPostedRound)
+	}
+	if st.Status != prStatusReviewing {
+		t.Fatalf("status = %s, want reviewing — resume retries the lookup, it does not consume the round", st.Status)
 	}
 }
