@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/models"
@@ -245,3 +246,137 @@ func TestMergeHandoff_AttachesNextPR(t *testing.T) {
 // parseRoundVerdict helper removed: inline unmarshal keeps the crash-point
 // state (single prState) exact — a helper re-creating the state would
 // overwrite the round/status the test is asserting against.
+
+func gitStep(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// Round-3 issue 1 pin: a base that still RESOLVES but is no longer an
+// ancestor of HEAD (rebase/reset between rounds) must fall back to the full
+// PR diff — never diff upstream churn as if it were the implementer's fixes.
+func TestPRIncrementalDiff_RebasedBaseFallsBack(t *testing.T) {
+	dir, _, head := gitTestRepo(t)
+	// Reset onto the base and commit a divergent head: `head` still resolves
+	// in the object store but is no longer an ancestor.
+	gitStep(t, dir, "reset", "-q", "--hard", "HEAD~1")
+	os.WriteFile(dir+"/z.txt", []byte("z\n"), 0o644)
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "divergent")
+	if _, _, ok := prIncrementalDiff(dir, head); ok {
+		t.Fatal("a non-ancestor base must fall back, not diff upstream churn")
+	}
+}
+
+// Round-3 issue 2 pin: the incremental path applies the same byte cap — an
+// oversized delta falls back to the full PR diff (which refuses if it too is
+// oversized), never reaches the reviewer unchallenged.
+func TestDispatchPRReview_OversizedIncrementalFallsBack(t *testing.T) {
+	dir, base, _ := gitTestRepo(t)
+	os.WriteFile(dir+"/big.txt", []byte(strings.Repeat("x", 210<<10)+"\n"), 0o644)
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "big delta")
+
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "FULL-PR-SENTINEL", files: []string{"a.txt"}}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	st, _ := newPRState(dir, 61, "", "x", "main", "", "b")
+	st.Round = 2
+	st.LastReviewHead = base
+
+	r.dispatchPRReview(context.Background(), st, gh, nil)
+	prompt := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "FULL-PR-SENTINEL") {
+		t.Fatal("an oversized incremental diff must fall back to the full PR diff")
+	}
+	if strings.Contains(prompt, "second reviewer") {
+		t.Fatal("fallback is a full review, not the incremental framing")
+	}
+}
+
+// Round-2 latency pin: a re-review's budget is scoped to the delta — 3×delta
+// files + 2×previous issues, floor 10 — and must NOT inherit the full-review
+// floor of 40 (the 871s deadline collision).
+func TestReviewBudget_IncrementalScopesToDelta(t *testing.T) {
+	dir, base, _ := gitTestRepo(t)
+	os.WriteFile(dir+"/c.txt", []byte("c\n"), 0o644)
+	os.WriteFile(dir+"/d.txt", []byte("d\n"), 0o644)
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "widen delta") // delta: b,c,d = 3 files
+
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "FULL", files: nil}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	st, _ := newPRState(dir, 60, "", "x", "main", "", "b")
+	st.Round = 2
+	st.LastReviewHead = base
+	prev := &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{}, {}}}
+
+	r.dispatchPRReview(context.Background(), st, gh, prev)
+	if got := fake.args["max_tool_calls"]; got != 13 { // 3×3 + 2×2
+		t.Fatalf("max_tool_calls = %v, want 13 (3×delta-files + 2×prev-issues)", got)
+	}
+}
+
+func TestReviewBudget_IncrementalFloor(t *testing.T) {
+	dir, base, _ := gitTestRepo(t) // delta: 1 file, no prev issues
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{diff: "FULL", files: nil}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	st, _ := newPRState(dir, 63, "", "x", "main", "", "b")
+	st.Round = 2
+	st.LastReviewHead = base
+
+	r.dispatchPRReview(context.Background(), st, gh, nil)
+	if got := fake.args["max_tool_calls"]; got != 10 {
+		t.Fatalf("max_tool_calls = %v, want floor 10 for a 1-file delta", got)
+	}
+}
+
+// Round-3 issue 3 pin: crash after PostComment but before the posted-round
+// marker persisted — the resume consults the PR timeline and records the
+// marker instead of duplicating the public comment.
+func TestPRLoop_ResumeDoesNotDuplicatePostedComment(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	var stored *agent.ReviewResult
+	if err := json.Unmarshal([]byte(failVerdictJSON()), &stored); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	gh := &fakeGH{
+		diff:         "+line",
+		checksScript: []fakeChecks{{done: true, ok: true}},
+		comments: []prComment{{ID: "1", Author: "millken",
+			Body: reviewerCommentBody(1, stored), CreatedAt: time.Now().UTC()}},
+	}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+	r.missionTurn = func(ctx context.Context, input string) *turnError { return nil }
+
+	st, _ := newPRState(dir, 62, "", "x", "main", "", "b")
+	if err := st.appendVerdict(dir, 1, stored); err != nil {
+		t.Fatalf("appendVerdict: %v", err)
+	}
+	st.Round = 1
+	st.Status = prStatusReviewing
+	if err := st.save(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	for _, body := range gh.commentsPosted {
+		if m, ok := markerFromBody(body); ok && m.Role == prRoleReviewer && m.Round == 1 {
+			t.Fatal("resume duplicated the round-1 review comment already on the PR")
+		}
+	}
+	if st.CommentPostedRound != 1 {
+		t.Fatalf("CommentPostedRound = %d, want recorded as 1 without re-posting", st.CommentPostedRound)
+	}
+}

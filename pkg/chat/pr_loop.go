@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -93,10 +94,19 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 			} else if unpostedVerdict {
 				unpostedVerdict = false
 				verdict = prev
-				r.ui.Info(fmt.Sprintf("  pr: #%d round %d verdict was logged but its comment never reached the PR — posting it now", st.Number, st.Round))
-				if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
-					r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
-					return
+				// The PR's own timeline is the truth here: a crash after PostComment
+				// but before the posted-round marker persisted leaves the marker behind
+				// while the comment IS public — re-posting would duplicate the review
+				// comment (round-3 issue 3).
+				onPR := prReviewerCommentOnPR(parentCtx, st, gh, st.Round)
+				if !onPR {
+					r.ui.Info(fmt.Sprintf("  pr: #%d round %d verdict was logged but its comment never reached the PR — posting it now", st.Number, st.Round))
+					if err := gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, verdict)); err != nil {
+						r.ui.Info(fmt.Sprintf("  pr: could not post the review comment (%v) — stopping; /pr resumes", err))
+						return
+					}
+				} else {
+					r.ui.Info(fmt.Sprintf("  pr: #%d round %d comment is already on the PR — recording the marker only", st.Number, st.Round))
 				}
 				st.CommentPostedRound = st.Round
 				if err := st.save(r.cfg.WorkDir); err != nil {
@@ -199,11 +209,19 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 }
 
 // prIncrementalDiff returns the commits-since diff from the last reviewed
-// head — the human second-reviewer's reading list. ok=false when base is
-// unresolvable (rebased away, shallow clone, never set): the caller falls
-// back to the full PR diff rather than guessing at a stale anchor.
+// head — the human second-reviewer's reading list. ok=false when the anchor
+// is unusable: unresolvable sha, or — the rebase trap (round-3 issue 1) — a
+// sha that still resolves but is NO LONGER an ancestor of HEAD, in which
+// case base..HEAD silently contains upstream commits and drops the PR's own
+// files. The caller falls back to the full PR diff rather than guessing at
+// a poisoned anchor.
 func prIncrementalDiff(workDir, base string) (diff string, files []string, ok bool) {
 	if base == "" {
+		return "", nil, false
+	}
+	// --quiet: exit 0 only when base IS an ancestor of HEAD; 1 (or an error)
+	// means rebase/reset/divergence — treat as a poisoned anchor.
+	if _, err := runGit(workDir, "merge-base", "--is-ancestor", base, "HEAD"); err != nil {
 		return "", nil, false
 	}
 	out, err := runGit(workDir, "diff", "--unified=3", base+"..HEAD")
@@ -235,9 +253,17 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 	incremental := false
 	if st.Round > 1 {
 		if inc, files, ok := prIncrementalDiff(r.cfg.WorkDir, st.LastReviewHead); ok && inc != "" {
-			diff, scope, incremental = inc, files, true
-			r.ui.Info(fmt.Sprintf("  pr: #%d re-review reads the incremental diff since %s (%d file(s))",
-				st.Number, shortSHA(st.LastReviewHead), len(files)))
+			// The same byte cap as the full path: git computed this range
+			// and a poisoned anchor can smuggle upstream churn through —
+			// refuse oversized deltas instead of reviewing them (round-3
+			// issue 2).
+			if len(inc) > reviewDiffByteCap {
+				r.ui.Info(fmt.Sprintf("  pr: incremental diff exceeds %dKB — falling back to the full PR diff", reviewDiffByteCap>>10))
+			} else {
+				diff, scope, incremental = inc, files, true
+				r.ui.Info(fmt.Sprintf("  pr: #%d re-review reads the incremental diff since %s (%d file(s))",
+					st.Number, shortSHA(st.LastReviewHead), len(files)))
+			}
 		}
 	}
 	if !incremental {
@@ -292,6 +318,30 @@ func shortSHA(sha string) string {
 		return sha[:8]
 	}
 	return sha
+}
+
+// prReviewerCommentOnPR reports whether the round's review comment is
+// already visible on the PR — the durable truth when state and timeline
+// disagree (a crash between PostComment and the marker's save leaves the
+// marker behind while the comment is public; re-posting would duplicate
+// it — round-3 issue 3). A lookup failure answers false: the caller then
+// re-posts, and the timeline's marker makes the duplicate distinguishable
+// from a missing review.
+func prReviewerCommentOnPR(ctx context.Context, st *prState, gh prGH, round int) bool {
+	comments, err := gh.ListComments(ctx, st.Repo, st.Number)
+	if err != nil {
+		return false
+	}
+	for _, c := range comments {
+		if m, ok := markerFromBody(c.Body); ok && m.Role == prRoleReviewer && m.Round == round {
+			return true
+		}
+		// Legacy header (pre-marker rounds) counts for its round too.
+		if _, ok := markerFromBody(c.Body); !ok && strings.HasPrefix(c.Body, "**deepai review — round "+strconv.Itoa(round)+":") {
+			return true
+		}
+	}
+	return false
 }
 
 // errPRCIInterrupted marks a CI wait cut short by Ctrl+C. A sentinel so the
@@ -452,11 +502,19 @@ func clip(s string, n int) string {
 // gates own that turn's edits — and for PRs already tracked (a fail-soft
 // stop keeps its state active for /pr resume).
 func (r *ChatRepl) maybeAttachPRLoop(parentCtx context.Context) {
-	if !r.cfg.PRReviewAuto || r.mission != nil || r.sess == nil {
+	if !r.cfg.PRReviewAuto || r.sess == nil {
 		return
 	}
 	repo, number, url, ok := detectPRCreate(turnBashOutputs(r.sess.Messages))
 	if !ok {
+		return
+	}
+	// Detected a real PR first, THEN report the suppression: a mission that
+	// swallows the attach silently left the chained-review pipeline stopped
+	// with no diagnostic at all (round-2 issue 4) — the log is the operator's
+	// only way to see where the chain broke and how to restart it.
+	if r.mission != nil {
+		r.ui.Info(fmt.Sprintf("  pr: #%d was created but auto-attach is suppressed by the active mission — run /pr review %d when the mission hands back", number, number))
 		return
 	}
 	if _, err := openPRState(r.cfg.WorkDir, number); err == nil {

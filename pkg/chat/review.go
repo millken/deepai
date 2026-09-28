@@ -544,7 +544,24 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
-	in.maxToolCalls = r.scaleReviewToolBudget(len(in.scope))
+	// Budget: a re-review is scoped to the delta — 3×delta files plus 2×
+	// previous issues to verify, floor 10. It deliberately does NOT inherit
+	// the full-review floor (40): round-2's live run showed a 5-file delta
+	// handed 40 calls, which at reviewer latency turns a ~4-minute pass into
+	// a deadline collision (871s, timeout wrap-up). A first review keeps
+	// the scope-scaled formula.
+	if in.incremental {
+		n := 3 * len(in.scope)
+		if in.prev != nil {
+			n += 2 * len(in.prev.Issues)
+		}
+		if n < 10 {
+			n = 10
+		}
+		in.maxToolCalls = n
+	} else {
+		in.maxToolCalls = r.scaleReviewToolBudget(len(in.scope))
+	}
 	in.timeout = timeout
 
 	args := map[string]any{
@@ -678,7 +695,7 @@ func buildReviewPrompt(in reviewPromptInput) string {
 	var b strings.Builder
 	if in.prNumber > 0 {
 		if in.incremental {
-			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, re-review round %d. You are the second reviewer. The diff below contains ONLY the commits pushed since %s — the fix commits answering the previous review. Judge like a human second pass: for each previously reported issue, decide from the delta (and the checked-out tree, which IS the PR head) whether it still holds — report it again ONLY if the failure scenario survives the fix. Then review the delta itself for defects the fixes introduced. Do NOT spend budget re-reading parts of the PR the delta does not touch.\n\n", in.prNumber, in.prRound, in.sinceSHA)
+			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, re-review round %d. You are the second reviewer. The diff below contains ONLY the commits pushed since %s — the fix commits answering the previous review. Judge like a human second pass: for each previously reported issue, decide from the delta whether it still holds — report it again ONLY if the failure scenario survives the fix. Then review the delta itself for defects the fixes introduced. Stay inside the delta: read a file only when an issue's fix cannot be judged from the diff alone, and then only the lines around the relevant hunk. Re-reading files or exploring beyond the delta wastes the review.\n\n", in.prNumber, in.prRound, in.sinceSHA)
 		} else {
 			fmt.Fprintf(&b, "Adversarially review the code changes below: PR #%d, review round %d. The change is already pushed; the diff is the PR's current diff. "+
 				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+

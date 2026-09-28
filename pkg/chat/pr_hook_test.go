@@ -87,7 +87,8 @@ func TestMaybeAttachPRLoop(t *testing.T) {
 func TestMaybeAttachPRLoop_SuppressedByMissionAndConfig(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	gh := &fakeGH{diff: "+line"}
-	r := newPRLoopRepl(t, fake, gh)
+	r, ui := newReviewRepl(t, t.TempDir(), fake)
+	r.prGH = gh
 	r.cfg.PRReviewAuto = true
 	r.sess = &models.Session{Messages: []models.Message{
 		{Role: models.RoleHuman, Content: "ship"},
@@ -99,6 +100,12 @@ func TestMaybeAttachPRLoop_SuppressedByMissionAndConfig(t *testing.T) {
 	r.maybeAttachPRLoop(context.Background())
 	if _, err := openPRState(r.cfg.WorkDir, 5); err == nil {
 		t.Fatal("a running mission must suppress auto-attach")
+	}
+	// The suppression must be VISIBLE — a silent swallow is exactly how the
+	// chained-review pipeline stopped with no diagnostic (round-2 issue 4).
+	last := ui.infoMsgs[len(ui.infoMsgs)-1]
+	if !strings.Contains(last, "suppressed by the active mission") || !strings.Contains(last, "/pr review 5") {
+		t.Fatalf("mission suppression must log the restart door, got: %q", last)
 	}
 
 	r.mission = nil
