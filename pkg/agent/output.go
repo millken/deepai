@@ -184,6 +184,15 @@ type ReviewResult struct {
 	Verdict string  `json:"verdict"`
 	Summary string  `json:"summary"`
 	Issues  []Issue `json:"issues"`
+	// TestsRun / PreviouslyReported are reviewer-authored extras no prompt
+	// requests, but the reviewer's own rules push it toward them (run the
+	// targeted test early; report each previous issue's status). PR #5's
+	// round-2 verdict carried both and Strict validation rejected the WHOLE
+	// 96-second review for two unmodeled keys. `any` accepts whatever shape
+	// the reviewer chose — tightening to a guessed shape is how the same
+	// review gets lost twice. Pin real types only when a program consumes them.
+	TestsRun           any `json:"tests_run,omitempty"`
+	PreviouslyReported any `json:"previously_reported,omitempty"`
 }
 
 // Issue represents a single finding from a code review.

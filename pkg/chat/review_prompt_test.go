@@ -196,3 +196,46 @@ func TestReviewGateDispatchesScaledBudget(t *testing.T) {
 		t.Fatalf("max_tool_calls = %v, want 42 (3×14 files)", got)
 	}
 }
+
+// Round 3+ is the PR loop's convergence phase (docs/review.md §3): two fix
+// rounds have already answered the earlier findings, and every NEW medium/low
+// raised now only buys another fix round — the loop can never close that way.
+func TestBuildReviewPrompt_PRRound3IsConvergence(t *testing.T) {
+	late := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "req", diff: "d",
+		prNumber: 7, prRound: 3,
+	})
+	for _, want := range []string{
+		"Convergence round",
+		"only if it is critical or high",
+		"an empty issue list never passes",
+	} {
+		if !strings.Contains(late, want) {
+			t.Errorf("round-3+ prompt missing %q:\n%s", want, late)
+		}
+	}
+
+	early := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "req", diff: "d",
+		prNumber: 7, prRound: 2,
+	})
+	if strings.Contains(early, "Convergence round") {
+		t.Fatalf("rounds 1-2 keep the ordinary charter — findings are not yet throttled:\n%s", early)
+	}
+
+	inc := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "req", diff: "d",
+		prNumber: 7, prRound: 4, incremental: true, sinceSHA: "abc123",
+	})
+	if !strings.Contains(inc, "Convergence round") {
+		t.Fatalf("an incremental late round must carry the convergence discipline too:\n%s", inc)
+	}
+
+	local := buildReviewPrompt(reviewPromptInput{
+		initialRequest: "req", diff: "d",
+		prev: &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{Severity: "high", File: "a.go", Line: 1, Message: "m", Scenario: "s"}}},
+	})
+	if strings.Contains(local, "Convergence round") {
+		t.Fatalf("local re-reviews have their own 2-round cap — no PR convergence language:\n%s", local)
+	}
+}

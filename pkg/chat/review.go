@@ -712,6 +712,16 @@ func buildReviewPrompt(in reviewPromptInput) string {
 				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
 				"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
 		}
+		// Round 3+ is the convergence phase (docs/review.md §3): two fix
+		// rounds have already answered the earlier findings, and every new
+		// medium/low raised now only buys another fix round — the loop can
+		// never close that way. A finding demoted to the summary sentence is
+		// still a finding: the text below pins it to verdict "fail", and
+		// isPRPassVerdict (pr_loop.go) accepts only an explicit pass —
+		// together they keep the parked shape from closing the loop on it.
+		if in.prRound >= 3 {
+			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — a genuinely new minor finding goes into the summary sentence, not the issue list. A finding parked in the summary is still a finding: it does not widen the loop, but the verdict must stay \"fail\" until every reported finding is fixed — an empty issue list never passes on its own.\n\n")
+		}
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")
 	}
@@ -872,6 +882,12 @@ func (r *ChatRepl) presentIssues(header string, v *agent.ReviewResult) {
 	b.WriteString(header)
 	b.WriteString("\n")
 	writeIssueList(&b, v.Issues)
+	// A PR-loop convergence verdict can fail with the finding parked in the
+	// summary and no issues; the cap's "unresolved findings go to the human"
+	// exit must not print an empty list there.
+	if len(v.Issues) == 0 {
+		fmt.Fprintf(&b, "\n1. [summary] %s\n", verdictSummary(v))
+	}
 	r.ui.Info(b.String())
 }
 
