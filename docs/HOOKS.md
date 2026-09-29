@@ -59,7 +59,7 @@ cat >> "$HOME/.deepai/hooks/events.jsonl"   # 完整 JSON
 
 语义要点：
 
-- **reply 在 prompt/ask 可见时立即提交；其余情况排队**。一次 poll 取回多条消息时，第一条入当前 prompt/ask，其余按 FIFO 排队，依次喂入后续每个 prompt/ask；turn 进行中到达的 reply 同样排队到 turn 结束。被脚本确认过的远程消息不会静默丢失。
+- **reply 在 prompt/ask 可见时立即提交；其余情况排队**。一次 poll 取回多条消息时，第一条入当前 prompt/ask，其余按 FIFO 排队；turn 进行中到达的 reply 同样排队。队列只在下一个 REPL prompt 喂入（一次一条）——不会拿去回答 agent 的提问：提问只能由提问期间到达的 reply 回答。被脚本确认过的远程消息不会静默丢失。
 - **interrupt 只对进行中的 turn / CI 等待有效**。空闲期到达的 interrupt 会被丢弃（turn 启动与 CI 等待入口都会清空残留信号），不会误杀你的下一个正常 turn。
 - **去重是 control 脚本自己的责任**（见下面 TG 脚本的 offset 机制）：每次 poll 返回的行都会被当作新指令执行。
 

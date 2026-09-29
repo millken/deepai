@@ -312,8 +312,10 @@ type tuiModel struct {
 
 	// remoteQueue holds remote replies that arrived while no prompt or ask
 	// was waiting (mid-turn, or later replies of a multi-message poll). Fed
-	// FIFO into the next requestInputMsg/askQuestionMsg — an acknowledged
-	// remote message is never dropped silently.
+	// FIFO into the next requestInputMsg ONLY — never into an ask, which would
+	// apply a session-directed reply as the answer to a question it was never
+	// meant for (PR #7 review round 2). An acknowledged remote message is
+	// never dropped silently.
 	remoteQueue []string
 
 	// turn/status
@@ -625,14 +627,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.askHeader = m.renderAskHeader(msg.question, msg.options)
 		m.ta.SetValue("")
 		m.ta.Focus()
-		m.feedQueuedRemote()
+		// Deliberately NOT feedQueuedRemote: a reply queued before this ask
+		// opened was addressed to the SESSION, not to this question — feeding
+		// it here would apply a mid-turn follow-up as the answer to whatever
+		// the agent happens to ask next (PR #7 review round 2). Only a reply
+		// arriving while the ask is already showing answers it, via the
+		// immediate path in remoteInputMsg below.
 		return m, textarea.Blink
 
 	case remoteInputMsg:
 		// A remote reply submits while a prompt or ask is actually waiting;
 		// anything else (mid-turn, or later replies of one multi-message poll)
-		// queues FIFO and is fed to the next prompt/ask — an acknowledged
-		// remote message is never silently dropped (PR #7 review issue 1).
+		// queues FIFO and is fed to the next PROMPT only — an acknowledged
+		// remote message is never silently dropped (PR #7 review issue 1) and
+		// never stolen by a question it was not meant for (round 2).
 		if m.inputReply != nil && (m.inputVisible || m.askActive) {
 			m.submitInput(inputResult{value: msg.text})
 			return m, nil
@@ -886,9 +894,9 @@ func (m *tuiModel) submitInput(r inputResult) {
 }
 
 // feedQueuedRemote submits the oldest queued remote reply to a JUST-ARRIVED
-// prompt/ask (requestInputMsg / askQuestionMsg handlers call it after wiring
-// the reply channel). One item per prompt — the rest stay queued for the
-// prompts after that, FIFO.
+// REPL prompt (the requestInputMsg handler calls it after wiring the reply
+// channel). One item per prompt — the rest stay queued for the prompts after
+// that, FIFO. Asks never consume the queue (see remoteQueue's comment).
 func (m *tuiModel) feedQueuedRemote() {
 	if len(m.remoteQueue) == 0 || m.inputReply == nil {
 		return

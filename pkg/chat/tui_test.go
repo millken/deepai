@@ -592,27 +592,59 @@ func TestRemoteInputMsg_QueueFedOnNextPrompt(t *testing.T) {
 	}
 }
 
-// A reply queued mid-turn also answers the next ask_clarification prompt.
-func TestRemoteInputMsg_QueueFedOnAsk(t *testing.T) {
+// PR #7 review round 2: a reply queued mid-turn must NOT be consumed by the
+// next ask — it would be applied as the answer to a question it was never
+// meant for. It survives the ask and feeds the next REAL prompt. Only a
+// reply arriving while the ask is already showing answers it (immediate
+// path, TestRemoteInputMsg_AnswerAsk).
+func TestRemoteInputMsg_QueueSurvivesAsk(t *testing.T) {
 	m := newTUIModel(BannerInfo{})
 	m.agentActive = true
-	m.Update(remoteInputMsg{text: "option A"})
+	m.Update(remoteInputMsg{text: "stop and write a test instead"})
 	if len(m.remoteQueue) != 1 {
 		t.Fatalf("precondition: reply queued, got %q", m.remoteQueue)
 	}
 
-	reply := make(chan inputResult, 1)
-	m.Update(askQuestionMsg{question: "Pick one?", reply: reply})
+	// The agent opens a question mid-turn: the queued follow-up must stay
+	// queued — it is not an answer to "Which database?".
+	askReply := make(chan inputResult, 1)
+	m.Update(askQuestionMsg{question: "Which database? 1. Postgres 2. SQLite", reply: askReply})
 	select {
-	case r := <-reply:
-		if r.value != "option A" {
-			t.Fatalf("ask feed = %q, want the queued option A", r.value)
+	case r := <-askReply:
+		t.Fatalf("the ask consumed the queued follow-up as its answer: %q", r.value)
+	default:
+	}
+	if !m.askActive || !m.inputVisible || m.inputReply == nil {
+		t.Fatalf("the ask must stay open and unanswered: %+v", m)
+	}
+	if len(m.remoteQueue) != 1 || m.remoteQueue[0] != "stop and write a test instead" {
+		t.Fatalf("remoteQueue = %q, want the follow-up preserved for the next prompt", m.remoteQueue)
+	}
+
+	// A reply arriving while the ask is SHOWING still answers it immediately.
+	m.Update(remoteInputMsg{text: "2"})
+	select {
+	case r := <-askReply:
+		if r.value != "2" {
+			t.Fatalf("ask answer = %q, want 2", r.value)
 		}
 	default:
-		t.Fatal("the queued reply was not fed to the ask")
+		t.Fatal("a reply arriving on a showing ask must answer it")
+	}
+
+	// Turn ends; the next real prompt gets the queued follow-up.
+	promptReply := make(chan inputResult, 1)
+	m.Update(requestInputMsg{reply: promptReply})
+	select {
+	case r := <-promptReply:
+		if r.value != "stop and write a test instead" {
+			t.Fatalf("prompt feed = %q, want the queued follow-up", r.value)
+		}
+	default:
+		t.Fatal("the queued follow-up was not fed to the next prompt")
 	}
 	if len(m.remoteQueue) != 0 {
-		t.Fatalf("remoteQueue after ask feed = %q, want empty", m.remoteQueue)
+		t.Fatalf("remoteQueue after feed = %q, want empty", m.remoteQueue)
 	}
 }
 
