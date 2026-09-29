@@ -310,6 +310,12 @@ type tuiModel struct {
 	inputReply  chan inputResult
 	interruptCh chan struct{}
 
+	// remoteQueue holds remote replies that arrived while no prompt or ask
+	// was waiting (mid-turn, or later replies of a multi-message poll). Fed
+	// FIFO into the next requestInputMsg/askQuestionMsg — an acknowledged
+	// remote message is never dropped silently.
+	remoteQueue []string
+
 	// turn/status
 	turn          int
 	turnStart     time.Time
@@ -609,6 +615,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.histIdx = -1
 		m.ta.SetValue("")
 		m.ta.Focus()
+		m.feedQueuedRemote()
 		return m, textarea.Blink
 
 	case askQuestionMsg:
@@ -618,17 +625,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.askHeader = m.renderAskHeader(msg.question, msg.options)
 		m.ta.SetValue("")
 		m.ta.Focus()
+		m.feedQueuedRemote()
 		return m, textarea.Blink
 
 	case remoteInputMsg:
-		// A remote reply only lands while a prompt or ask is actually waiting;
-		// mid-turn input is dropped (the next idle/ask event tells the remote
-		// user when input will be accepted).
+		// A remote reply submits while a prompt or ask is actually waiting;
+		// anything else (mid-turn, or later replies of one multi-message poll)
+		// queues FIFO and is fed to the next prompt/ask — an acknowledged
+		// remote message is never silently dropped (PR #7 review issue 1).
 		if m.inputReply != nil && (m.inputVisible || m.askActive) {
 			m.submitInput(inputResult{value: msg.text})
 			return m, nil
 		}
-		slog.Warn("hook control reply dropped: no prompt or ask waiting", "preview", clip(msg.text, 80))
+		m.remoteQueue = append(m.remoteQueue, msg.text)
+		slog.Info("hook control reply queued (no prompt waiting)", "queue_len", len(m.remoteQueue), "preview", clip(msg.text, 80))
 		return m, nil
 	}
 
@@ -875,6 +885,19 @@ func (m *tuiModel) submitInput(r inputResult) {
 	m.pendingImages = nil
 }
 
+// feedQueuedRemote submits the oldest queued remote reply to a JUST-ARRIVED
+// prompt/ask (requestInputMsg / askQuestionMsg handlers call it after wiring
+// the reply channel). One item per prompt — the rest stay queued for the
+// prompts after that, FIFO.
+func (m *tuiModel) feedQueuedRemote() {
+	if len(m.remoteQueue) == 0 || m.inputReply == nil {
+		return
+	}
+	next := m.remoteQueue[0]
+	m.remoteQueue = m.remoteQueue[1:]
+	slog.Info("hook control reply fed from queue", "preview", clip(next, 80))
+	m.submitInput(inputResult{value: next})
+}
 func (m *tuiModel) recordHistory(val string) {
 	if strings.TrimSpace(val) == "" {
 		return

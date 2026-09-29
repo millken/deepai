@@ -196,6 +196,10 @@ func runCommandSink(ctx context.Context, argv []string, evt Event) error {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	cmd.Stdin = bytes.NewReader(body)
+	// Same bound as CommandSource.Poll: a grandchild inheriting the pipes
+	// (script backgrounds curl and exits) must not hold the delivery
+	// goroutine for its lifetime.
+	cmd.WaitDelay = time.Second
 	cmd.Env = append(cmd.Environ(),
 		"DEEPAI_EVENT="+string(evt.Kind),
 		"DEEPAI_SESSION_ID="+evt.SessionID,

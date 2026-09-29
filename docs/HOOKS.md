@@ -5,9 +5,9 @@
 ```yaml
 notifications:
   - events: [ask, idle, pr_awaiting_merge, mission_end]   # 省略 = 全部事件
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+    webhook_url: https://example.com/deepai-events          # 必须接收 hook.Event JSON（见下）
   - events: [turn_end]
-    command: ["~/.deepai/hooks/log-turn.sh"]
+    command: ["~/.deepai/hooks/log-turn.sh"]               # 企业微信/TG 用 command 脚本（见参考脚本节）
 
 control:
   command: ["~/.deepai/hooks/tg-control.sh"]   # 二选一；command 优先
@@ -52,15 +52,15 @@ cat >> "$HOME/.deepai/hooks/events.jsonl"   # 完整 JSON
 
 | 行 | 指令 |
 |---|---|
-| `reply <text>`（或不以关键字开头的任意行） | 把 text 注入为当前提问的回答 / 下一条用户输入 |
+| `reply <text>`（或不以关键字开头的任意行） | 把 text 注入为当前提问的回答 / 下一条用户输入（无 prompt 等待时 FIFO 排队） |
 | `interrupt` | 等价 Ctrl+C：取消正在运行的 turn |
 | `cancel-task <id>` | 取消单个 subagent（等价 Ctrl+X） |
-| 空行 / `noop` / `/` 开头的行 | 忽略 |
+| 空行 / `noop` | 忽略（裸 `/` 开头行也被解析器忽略；slash 命令由参考脚本加 `reply ` 前缀转发） |
 
 语义要点：
 
-- **reply 只在 REPL 空闲（prompt 可见）或提问等待中生效**；turn 进行中到达的 reply 会被丢弃并记日志。`idle` / `ask` 事件就是告诉你"现在可以回了"。
-- **interrupt 只对进行中的 turn 有效**。空闲期到达的 interrupt 不会残留——REPL 在下一个 turn 开始前会清空中断信号，不会误杀你的下一个正常 turn。
+- **reply 在 prompt/ask 可见时立即提交；其余情况排队**。一次 poll 取回多条消息时，第一条入当前 prompt/ask，其余按 FIFO 排队，依次喂入后续每个 prompt/ask；turn 进行中到达的 reply 同样排队到 turn 结束。被脚本确认过的远程消息不会静默丢失。
+- **interrupt 只对进行中的 turn / CI 等待有效**。空闲期到达的 interrupt 会被丢弃（turn 启动与 CI 等待入口都会清空残留信号），不会误杀你的下一个正常 turn。
 - **去重是 control 脚本自己的责任**（见下面 TG 脚本的 offset 机制）：每次 poll 返回的行都会被当作新指令执行。
 
 每次 poll 时脚本能拿到当前状态的环境变量：
@@ -79,7 +79,8 @@ cat >> "$HOME/.deepai/hooks/events.jsonl"   # 完整 JSON
 BOT_TOKEN="123456:ABC..."
 CHAT_ID="123456789"
 MSG="$DEEPAI_EVENT: $DEEPAI_MESSAGE"
-curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+# -f：TG API 返回非 2xx 时 curl 非零退出，投递失败才会进 deepai 日志
+curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
   -d chat_id="$CHAT_ID" -d text="$MSG" >/dev/null
 ```
 
@@ -96,7 +97,7 @@ mkdir -p "$(dirname "$OFFSET_FILE")"
 OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
 
 # 只看文本消息；输出行格式 = 上面表格的行协议：
-#   回复消息 → "reply <原文>"
+#   回复消息（含 /pr merge 等 slash 命令）→ "reply <原文>"
 #   interrupt → "interrupt"
 #   cancel-task <id> → 原样转发
 # 局限：按逗号切行，消息文本内含逗号会被截断；要更稳请自行换 jq。
@@ -109,7 +110,7 @@ curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${OFFSET}&t
   /"text"/ {
     text=$0; gsub(/^.*"text":"/, "", text); gsub(/".*$/, "", text);
     if (text == "interrupt" || text ~ /^cancel-task /) print text;
-    else if (text !~ /^\//) print "reply " text;
+    else print "reply " text;
   }
   END { if (max) print max > "'"$OFFSET_FILE"'.tmp" }
 '
@@ -125,10 +126,19 @@ if [ -s "$OFFSET_FILE.tmp" ]; then mv "$OFFSET_FILE.tmp" "$OFFSET_FILE"; fi
 ```sh
 #!/bin/sh
 # ~/.deepai/hooks/wecom.sh
+# 两个硬要求：消息含引号/反斜杠/换行也必须拼出合法 JSON；WeCom 失败也返回
+# HTTP 200 + errcode!=0，不显式检查 errcode 投递失败就无迹可查。
 KEY="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-PAYLOAD=$(printf '{"msgtype":"text","text":{"content":"[%s] %s"}}' "$DEEPAI_EVENT" "$DEEPAI_MESSAGE")
-curl -sS -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${KEY}" \
-  -H 'Content-Type: application/json' -d "$PAYLOAD" >/dev/null
+ESCAPED=$(printf '[%s] %s' "$DEEPAI_EVENT" "$DEEPAI_MESSAGE" | awk 'BEGIN{ORS=""}
+  {gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); print $0 "\\n"}' | tr -d '\r\n')
+PAYLOAD=$(printf '{"msgtype":"text","text":{"content":"%s"}}' "$ESCAPED")
+RESP=$(curl -sS -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${KEY}" \
+  -H 'Content-Type: application/json' -d "$PAYLOAD")
+case "$RESP" in
+  *'"errcode":0'*) exit 0 ;;
+esac
+printf '%s\n' "$RESP" >&2
+exit 1
 ```
 
 微信侧的"控制"用 `control.command` 指向一个轮询你自己中转服务（例如企业微信自建应用的消息回调落地到一个本地文件/接口）的脚本即可，行协议不变。

@@ -52,6 +52,12 @@ func TestPRLoop_AwaitingMergeEmitsHook(t *testing.T) {
 	if msg := em.events[0].Message; !strings.Contains(msg, "#30") {
 		t.Fatalf("message = %q, want it to contain PR #30", msg)
 	}
+	// PR #7 review issue 3: the hint must name a word the control protocol can
+	// actually deliver (bare `merge`; the raw `/pr merge` line is dropped by
+	// parseControlLine and would strand the PR in awaiting_merge).
+	if msg := em.events[0].Message; !strings.Contains(msg, "send: merge") {
+		t.Fatalf("message = %q, want a protocol-deliverable merge hint", msg)
+	}
 }
 
 // The auto-merge path does not wait for the user, so it must NOT emit.

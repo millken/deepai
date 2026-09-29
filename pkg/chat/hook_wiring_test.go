@@ -334,3 +334,25 @@ func TestControlPollIntervalOrDefault(t *testing.T) {
 		t.Fatalf("test seam = %v, want 7s", got)
 	}
 }
+
+// PR-review #2: an interrupt token buffered while idle (remote `interrupt`
+// between turns) must not abort the NEXT CI wait — waitPRCI drains on entry,
+// so only a Ctrl+C that lands during the actual wait cancels it.
+func TestWaitPRCI_DrainsIdleInterruptOnEntry(t *testing.T) {
+	fake := &fakeTaskTool{}
+	gh := &fakeGH{checksScript: []fakeChecks{{done: false, ok: false}, {done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	r.sess = &models.Session{ID: "sess-ci-drain"}
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	r.ui.(*mockUI).interruptCh = ch
+	st := newTrackedPR(t, r, 33, 1, prStatusAwaitingCI)
+
+	done, ok, _, err := r.waitPRCI(context.Background(), st, gh)
+	if err != nil {
+		t.Fatalf("waitPRCI: %v — a stale idle interrupt must be drained on entry, not abort the wait", err)
+	}
+	if !done || !ok {
+		t.Fatalf("done=%v ok=%v, want true/true (second Checks call settles the wait)", done, ok)
+	}
+}

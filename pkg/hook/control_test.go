@@ -2,6 +2,7 @@ package hook
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -278,18 +279,19 @@ func TestDocsTGControlScript_PinnedExtraction(t *testing.T) {
 		t.Fatalf("offset file = %q, want 1000006 (max update_id+1)", off)
 	}
 
-	// A bot slash command must not become a reply, but its update still
-	// advances the offset — otherwise the same /cmd refetches forever.
-	payload = `{"ok":true,"result":[{"update_id":1000010,"message":{"text":"/start"}}]}`
+	// PR #7 review issue 3: a slash command (e.g. /pr merge) must be forwarded
+	// as a reply the parser delivers — ParseSlashCommand handles it on the
+	// REPL side — instead of being swallowed while still advancing the offset.
+	payload = `{"ok":true,"result":[{"update_id":1000010,"message":{"text":"/pr merge"}}]}`
 	outs, off = runDocsTGScript(t, script, payload, "1000010", 2)
-	if got := parseControlLines(outs[0]); len(got) != 0 {
-		t.Fatalf("slash command leaked into commands: %+v", got)
+	if got := parseControlLines(outs[0]); len(got) != 1 || got[0].Kind != CommandReply || got[0].Arg != "/pr merge" {
+		t.Fatalf("slash command must forward as a reply, got %q → %+v", outs[0], got)
 	}
 	if got := parseControlLines(outs[1]); len(got) != 0 {
-		t.Fatalf("run 2 replayed the skipped slash command: %q", outs[1])
+		t.Fatalf("run 2 replayed the consumed slash command: %q", outs[1])
 	}
 	if off != "1000011" {
-		t.Fatalf("offset file = %q, want 1000011 even for a skipped slash command", off)
+		t.Fatalf("offset file = %q, want 1000011", off)
 	}
 }
 
@@ -345,5 +347,110 @@ func TestCommandSource_GrandchildPipeBounded(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("Output blocked %v on a grandchild holding the pipe, want WaitDelay-bounded", elapsed)
+	}
+}
+
+// extractDocsWecomScript pulls the wecom.sh script VERBATIM out of
+// docs/HOOKS.md, same discipline as the TG script pin.
+func extractDocsWecomScript(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "HOOKS.md"))
+	if err != nil {
+		t.Fatalf("read docs/HOOKS.md: %v", err)
+	}
+	s := string(data)
+	i := strings.Index(s, "# ~/.deepai/hooks/wecom.sh")
+	if i < 0 {
+		t.Fatal("docs/HOOKS.md: wecom.sh script not found")
+	}
+	rel := strings.LastIndex(s[:i], "```sh\n")
+	if rel < 0 {
+		t.Fatal("docs/HOOKS.md: wecom.sh opening fence not found")
+	}
+	start := rel + len("```sh\n")
+	end := strings.Index(s[start:], "\n```")
+	if end < 0 {
+		t.Fatal("docs/HOOKS.md: wecom.sh closing fence not found")
+	}
+	return s[start : start+end]
+}
+
+// runDocsWecomScript runs the verbatim wecom.sh with a fake curl that records
+// the -d payload and answers with the given response body.
+func runDocsWecomScript(t *testing.T, script, message, resp string) (string, int) {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	captured := filepath.Join(dir, "payload")
+	fakeCurl := "#!/bin/sh\n" +
+		"prev=\"\"\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$prev\" = \"-d\" ]; then printf '%s' \"$a\" > \"$CAPTURE\"; fi\n" +
+		"  prev=\"$a\"\n" +
+		"done\n" +
+		"printf '%s' \"$RESP\"\n"
+	curlPath := filepath.Join(bin, "curl")
+	if err := os.WriteFile(curlPath, []byte(fakeCurl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(dir, "wecom.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	env := []string{
+		"PATH=" + bin + ":" + os.Getenv("PATH"),
+		"DEEPAI_EVENT=ask",
+		"DEEPAI_MESSAGE=" + message,
+		"CAPTURE=" + captured,
+		"RESP=" + resp,
+	}
+	cmd := exec.Command(scriptPath)
+	cmd.Env = env
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatalf("run verbatim wecom.sh: %v\nscript:\n%s", err, script)
+	}
+	payload, _ := os.ReadFile(captured)
+	return string(payload), code
+}
+
+// PR-review #4: the WeCom script must build VALID JSON even when the ask
+// message carries quotes/backslashes/newlines, and must fail (non-zero) on a
+// 200-with-errcode response so a silent delivery loss becomes a log line.
+func TestDocsWecomScript_PinnedEscapingAndErrcode(t *testing.T) {
+	script := extractDocsWecomScript(t)
+
+	msg := "Proceed with \"plan A\"?\nline two\ttab \\ backslash"
+	payload, code := runDocsWecomScript(t, script, msg, `{"errcode":0,"errmsg":"ok"}`)
+	if code != 0 {
+		t.Fatalf("errcode:0 response must exit 0, got %d", code)
+	}
+	var decoded struct {
+		Text struct {
+			Content string `json:"content"`
+		} `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("payload is not valid JSON (%v): %q", err, payload)
+	}
+	for _, want := range []string{"Proceed with \"plan A\"?", "line two", "tab", "backslash"} {
+		if !strings.Contains(decoded.Text.Content, want) {
+			t.Fatalf("content %q lost %q", decoded.Text.Content, want)
+		}
+	}
+	if !strings.HasPrefix(decoded.Text.Content, "[ask] ") {
+		t.Fatalf("content %q should keep the event prefix", decoded.Text.Content)
+	}
+
+	_, code = runDocsWecomScript(t, script, msg, `{"errcode":93017,"errmsg":"invalid json request"}`)
+	if code == 0 {
+		t.Fatal("a 200 response with errcode!=0 must exit non-zero, or the failure is invisible")
 	}
 }

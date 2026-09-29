@@ -529,7 +529,7 @@ func TestRemoteInputMsg_SubmitsWhenPromptVisible(t *testing.T) {
 	}
 }
 
-func TestRemoteInputMsg_DroppedWhileAgentRunning(t *testing.T) {
+func TestRemoteInputMsg_QueuedWhileAgentRunning(t *testing.T) {
 	m := newTUIModel(BannerInfo{})
 	m.inputVisible = false
 	m.agentActive = true
@@ -537,11 +537,82 @@ func TestRemoteInputMsg_DroppedWhileAgentRunning(t *testing.T) {
 	got, _ := m.Update(remoteInputMsg{text: "hello"})
 	next := got.(*tuiModel)
 
-	if next.agentActive != true || next.inputVisible != false {
-		t.Fatalf("model state changed on a dropped remote input: %+v", next)
+	if !next.agentActive || next.inputVisible {
+		t.Fatalf("model state changed on a queued remote input: %+v", next)
 	}
 	if next.inputReply != nil {
-		t.Fatal("a dropped remote input must not attach a reply channel")
+		t.Fatal("a queued remote input must not attach a reply channel")
+	}
+	if len(next.remoteQueue) != 1 || next.remoteQueue[0] != "hello" {
+		t.Fatalf("remoteQueue = %v, want [hello] — a mid-turn reply must queue, not drop", next.remoteQueue)
+	}
+}
+
+// PR-review #1: three replies fetched in one poll — the first takes the
+// waiting prompt, the rest queue, and the queue feeds the NEXT prompt so no
+// acknowledged Telegram message is ever lost.
+func TestRemoteInputMsg_QueueFedOnNextPrompt(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+
+	// Prompt waiting: first reply submits immediately.
+	reply1 := make(chan inputResult, 1)
+	m.inputReply = reply1
+	m.inputVisible = true
+	m.Update(remoteInputMsg{text: "add a test"})
+	select {
+	case r := <-reply1:
+		if r.value != "add a test" {
+			t.Fatalf("first reply = %q", r.value)
+		}
+	default:
+		t.Fatal("first reply was not submitted to the waiting prompt")
+	}
+
+	// Prompt consumed: later replies from the same poll queue instead of
+	// being dropped.
+	m.Update(remoteInputMsg{text: "also update the README"})
+	m.Update(remoteInputMsg{text: "then run go test"})
+	if q := m.remoteQueue; len(q) != 2 || q[0] != "also update the README" || q[1] != "then run go test" {
+		t.Fatalf("remoteQueue = %q, want the two remaining replies in order", q)
+	}
+
+	// Next prompt: the queue feeds it one item, FIFO.
+	reply2 := make(chan inputResult, 1)
+	m.Update(requestInputMsg{reply: reply2})
+	select {
+	case r := <-reply2:
+		if r.value != "also update the README" {
+			t.Fatalf("queued feed = %q, want the oldest queued reply", r.value)
+		}
+	default:
+		t.Fatal("the queued reply was not fed to the next prompt")
+	}
+	if len(m.remoteQueue) != 1 || m.remoteQueue[0] != "then run go test" {
+		t.Fatalf("remoteQueue after feed = %q, want the remaining one", m.remoteQueue)
+	}
+}
+
+// A reply queued mid-turn also answers the next ask_clarification prompt.
+func TestRemoteInputMsg_QueueFedOnAsk(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.agentActive = true
+	m.Update(remoteInputMsg{text: "option A"})
+	if len(m.remoteQueue) != 1 {
+		t.Fatalf("precondition: reply queued, got %q", m.remoteQueue)
+	}
+
+	reply := make(chan inputResult, 1)
+	m.Update(askQuestionMsg{question: "Pick one?", reply: reply})
+	select {
+	case r := <-reply:
+		if r.value != "option A" {
+			t.Fatalf("ask feed = %q, want the queued option A", r.value)
+		}
+	default:
+		t.Fatal("the queued reply was not fed to the ask")
+	}
+	if len(m.remoteQueue) != 0 {
+		t.Fatalf("remoteQueue after ask feed = %q, want empty", m.remoteQueue)
 	}
 }
 

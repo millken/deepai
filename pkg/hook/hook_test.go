@@ -194,3 +194,22 @@ func TestDispatcher_SinkErrorIsIsolated(t *testing.T) {
 		t.Fatalf("healthy sink skipped after a failing sibling: posts=%d, want 1", n)
 	}
 }
+
+// PR-review #5: a notification command that backgrounds a writer must not
+// hold its delivery goroutine for the grandchild's lifetime — same
+// WaitDelay bound CommandSource.Poll already has.
+func TestDispatcher_CommandSinkGrandchildPipeBounded(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n(sleep 10) &\n"
+	path := filepath.Join(dir, "notify.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDispatcher([]NotificationConfig{{Command: []string{path}}})
+	start := time.Now()
+	d.fireNow(context.Background(), Event{Kind: EventIdle, SessionID: "s", Message: "x"})
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("delivery blocked %v on a grandchild holding the pipe, want WaitDelay-bounded", elapsed)
+	}
+}
