@@ -503,3 +503,63 @@ func TestRenderLastMessageToggleSymmetry(t *testing.T) {
 		t.Fatal("no prior reply should yield empty")
 	}
 }
+
+func TestRemoteInputMsg_SubmitsWhenPromptVisible(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	reply := make(chan inputResult, 1)
+	m.inputReply = reply
+	m.inputVisible = true
+
+	got, _ := m.Update(remoteInputMsg{text: "hello"})
+	next := got.(*tuiModel)
+
+	select {
+	case r := <-reply:
+		if r.value != "hello" {
+			t.Fatalf("value = %q, want %q", r.value, "hello")
+		}
+	default:
+		t.Fatal("remoteInputMsg did not deliver to the reply channel")
+	}
+	if next.inputVisible {
+		t.Fatal("inputVisible should be cleared after a remote submit")
+	}
+	if next.inputReply != nil {
+		t.Fatal("inputReply should be detached after a remote submit")
+	}
+}
+
+func TestRemoteInputMsg_DroppedWhileAgentRunning(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.inputVisible = false
+	m.agentActive = true
+
+	got, _ := m.Update(remoteInputMsg{text: "hello"})
+	next := got.(*tuiModel)
+
+	if next.agentActive != true || next.inputVisible != false {
+		t.Fatalf("model state changed on a dropped remote input: %+v", next)
+	}
+	if next.inputReply != nil {
+		t.Fatal("a dropped remote input must not attach a reply channel")
+	}
+}
+
+func TestRemoteInputMsg_AnswerAsk(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	reply := make(chan inputResult, 1)
+	m.inputReply = reply
+	m.inputVisible = true
+	m.askActive = true
+
+	m.Update(remoteInputMsg{text: "option A"})
+
+	select {
+	case r := <-reply:
+		if r.value != "option A" {
+			t.Fatalf("value = %q, want %q", r.value, "option A")
+		}
+	default:
+		t.Fatal("remoteInputMsg did not answer the pending ask")
+	}
+}

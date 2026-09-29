@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"log/slog"
 	"time"
 
 	"charm.land/bubbles/v2/spinner"
@@ -81,6 +82,22 @@ func (t *TUI) InterruptCh() <-chan struct{} { return t.model.interruptCh }
 // from task mode (Ctrl+X). The REPL forwards each to the subagent pool, which
 // stops that one task and leaves its siblings running.
 func (t *TUI) CancelTaskCh() <-chan string { return t.model.cancelTaskCh }
+
+// SubmitRemoteInput types text into the waiting prompt or ask as if the local
+// user submitted it (remote control path, docs/HOOKS.md). Dropped by the
+// model when no prompt is waiting.
+func (t *TUI) SubmitRemoteInput(text string) {
+	t.p.Send(remoteInputMsg{text: text})
+}
+
+// RemoteInterrupt delivers the same signal Ctrl+C does while an agent turn is
+// running; non-blocking, exactly like the key handler's send.
+func (t *TUI) RemoteInterrupt() {
+	select {
+	case t.model.interruptCh <- struct{}{}:
+	default:
+	}
+}
 
 // --- output (rendering) ---
 
@@ -259,6 +276,8 @@ type askQuestionMsg struct {
 	options  []string
 	reply    chan inputResult
 }
+
+type remoteInputMsg struct{ text string }
 type elapsedTickMsg struct{}
 
 // ---------------------------------------------------------------------------
@@ -600,6 +619,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ta.SetValue("")
 		m.ta.Focus()
 		return m, textarea.Blink
+
+	case remoteInputMsg:
+		// A remote reply only lands while a prompt or ask is actually waiting;
+		// mid-turn input is dropped (the next idle/ask event tells the remote
+		// user when input will be accepted).
+		if m.inputReply != nil && (m.inputVisible || m.askActive) {
+			m.submitInput(inputResult{value: msg.text})
+			return m, nil
+		}
+		slog.Warn("hook control reply dropped: no prompt or ask waiting", "preview", clip(msg.text, 80))
+		return m, nil
 	}
 
 	// Forward anything else to the textarea while it is active.

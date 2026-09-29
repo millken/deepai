@@ -16,6 +16,7 @@ import (
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/imageproc"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
@@ -132,6 +133,18 @@ type ReplConfig struct {
 	// wanted to see the plan" is a perfectly normal reason to type /plan.
 	// /mission stays the only default way in.
 	MissionOnPlan bool
+
+	// Hooks, when non-nil, receives REPL lifecycle events (ask / turn_end /
+	// idle / mission_end / pr_awaiting_merge / session_end); every call site
+	// tolerates nil. Control, when non-nil, is polled for remote commands
+	// (reply / interrupt / cancel-task). Both come from config.yaml's
+	// notifications/control blocks — see docs/HOOKS.md.
+	Hooks   hook.Emitter
+	Control hook.Poller
+
+	// ControlPollInterval overrides the control-source poll cadence
+	// (config.yaml control.poll_seconds); 0 = hook.DefaultControlPollInterval.
+	ControlPollInterval time.Duration
 }
 
 // fallbackExtractInterval is the turn cadence for unconditional async memory
@@ -215,6 +228,14 @@ type ReplUI interface {
 // one task by ID. Kept minimal so the REPL does not depend on the pool type.
 type TaskCanceller interface {
 	CancelTask(taskID string) bool
+}
+
+// remoteTarget is the narrow slice of *TUI the control poller needs. Kept
+// minimal for the same reason as TaskCanceller: *TUI satisfies it, tests
+// inject a fake, and ReplUI stays untouched.
+type remoteTarget interface {
+	SubmitRemoteInput(text string)
+	RemoteInterrupt()
 }
 
 // sessionLockState bundles the two booleans that together describe this
@@ -386,6 +407,23 @@ type ChatRepl struct {
 	prGH             prGH
 	prCIPollInterval time.Duration
 	prCIWaitTimeout  time.Duration
+
+	// remote delivers control commands to the TUI (docs/HOOKS.md). Run
+	// assigns the real *TUI right after r.ui — the go-statement visibility
+	// rule then covers the poller goroutine; tests inject a fake. nil with no
+	// Control config is inert.
+	remote remoteTarget
+
+	// controlPollInterval overrides the control-source poll cadence for
+	// tests (same seam discipline as prCIPollInterval); zero = the
+	// ReplConfig value, which itself defaults to hook.DefaultControlPollInterval.
+	controlPollInterval time.Duration
+
+	// remoteAsk publishes the pending ask's question to the control poller
+	// goroutine (nil or empty string = not asking). Atomic because
+	// AskQuestion runs on the agent's tool goroutine while the poller reads
+	// it — the same reason lockedSessionID is an atomic.
+	remoteAsk atomic.Pointer[string]
 
 	// lastPlanFile is the plan document the most recent turn's Agent used
 	// (agent.Agent.PlanFile). Read only by the mission_on_plan upgrade.
@@ -764,6 +802,9 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 	tui := NewTUI(os.Stdin, os.Stderr, bannerInfo)
 	tui.Start()
 	r.ui = tui
+	// Same visibility rule as every goroutine below: r.remote is read by the
+	// control poller, so it must be assigned before that goroutine starts.
+	r.remote = tui
 	defer r.ui.Close()
 
 	// Start the heartbeat goroutine only NOW, after r.ui is assigned (M3,
@@ -797,6 +838,36 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			}
 		}
 	}()
+
+	// Control poller (docs/HOOKS.md): started only when a control source is
+	// configured, after r.remote was assigned above. controlCtx is cancelled
+	// BEFORE the WaitGroup join on every exit path, so an in-flight Poll (up
+	// to controlCmdTimeout against a hung control script) is killed instead
+	// of holding the exit hostage.
+	controlDone := make(chan struct{})
+	controlCtx, controlCancel := context.WithCancel(parentCtx)
+	var controlWG sync.WaitGroup
+	defer func() {
+		controlCancel()
+		close(controlDone)
+		controlWG.Wait()
+	}()
+	if r.cfg.Control != nil {
+		controlWG.Add(1)
+		go func() {
+			defer controlWG.Done()
+			ticker := time.NewTicker(r.controlPollIntervalOrDefault())
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					r.pollControlOnce(controlCtx)
+				case <-controlDone:
+					return
+				}
+			}
+		}()
+	}
 	if r.historyFile != "" {
 		r.ui.LoadHistory(r.historyFile)
 	}
@@ -862,7 +933,9 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 			}
 		}
 
-		// Wait for user input.
+		// Wait for user input. The idle hook fires here too: it is what tells
+		// a remote control user their reply will be accepted now.
+		r.fireHooks(hook.EventIdle, "waiting for input")
 		line, images, err := r.ui.ReadPrompt(parentCtx)
 		if err != nil {
 			if errors.Is(err, errInterrupted) {
@@ -966,6 +1039,7 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 
 	// Save session metadata on exit.
 	r.saveSession()
+	r.fireHooks(hook.EventSessionEnd, fmt.Sprintf("session ended after %d turns", r.turn))
 	slog.Info("session ended", "session_id", r.sess.ID, "turns", r.turn)
 	return nil
 }
@@ -1326,6 +1400,11 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 	// it after fn returns (which implies the context is done) is race-free.
 	sigFired := make(chan struct{}, 1)
 	cancelTasks := r.ui.CancelTaskCh()
+	// A remote interrupt delivered while no turn was running leaves a token
+	// buffered here (the TUI's own ctrl+c path can never do that — it only
+	// sends while a turn or wait is active). Draining before the watcher
+	// starts keeps that stale token from cancelling THIS turn.
+	r.drainInterrupt()
 	go func() {
 		for {
 			select {
@@ -1359,6 +1438,105 @@ func (r *ChatRepl) runTurnWithSignal(parentCtx context.Context, fn func(context.
 		return nil
 	}
 	return &turnError{err: err, cancelled: interrupted}
+}
+
+// turnSummary renders the turn_end event message from the turn's usage.
+func turnSummary(u *agent.Usage) string {
+	if u == nil {
+		return "turn finished"
+	}
+	return fmt.Sprintf("turn finished · in %d / out %d tok", u.InputTokens, u.OutputTokens)
+}
+
+// fireHooks emits a lifecycle event when Hooks is configured; every field
+// except kind/message is filled from the REPL's own state. Nil-safe by design
+// so call sites never branch.
+func (r *ChatRepl) fireHooks(kind hook.Kind, message string) {
+	if r.cfg.Hooks == nil {
+		return
+	}
+	r.cfg.Hooks.Fire(context.Background(), hook.Event{
+		Kind:      kind,
+		SessionID: r.sess.ID,
+		WorkDir:   r.cfg.WorkDir,
+		Message:   message,
+	})
+}
+
+// controlPollIntervalOrDefault resolves the poll cadence: the test seam
+// wins, then the config value (control.poll_seconds, threaded through
+// ReplConfig by runChat), then the package default.
+func (r *ChatRepl) controlPollIntervalOrDefault() time.Duration {
+	if r.controlPollInterval > 0 {
+		return r.controlPollInterval
+	}
+	if r.cfg.ControlPollInterval > 0 {
+		return r.cfg.ControlPollInterval
+	}
+	return hook.DefaultControlPollInterval
+}
+
+// pollControlOnce runs one control-source poll and dispatches every returned
+// command. Directly testable (no goroutine of its own); Run's poller loop and
+// the tests share this exact dispatch code:
+//   - reply        → remote.SubmitRemoteInput (dropped by the TUI mid-turn)
+//   - interrupt    → remote.RemoteInterrupt (drained at next turn start if stale)
+//   - cancel-task  → cfg.TaskCanceller (same sink the ctrl+x watcher uses)
+func (r *ChatRepl) pollControlOnce(ctx context.Context) {
+	if r.cfg.Control == nil {
+		return
+	}
+	var question string
+	if p := r.remoteAsk.Load(); p != nil {
+		question = *p
+	}
+	cmds, err := r.cfg.Control.Poll(ctx, hook.ControlState{Asking: question != "", Question: question})
+	if err != nil {
+		slog.Warn("hook control poll", "err", err)
+		return
+	}
+	for _, c := range cmds {
+		switch c.Kind {
+		case hook.CommandReply:
+			if r.remote != nil {
+				r.remote.SubmitRemoteInput(c.Arg)
+			}
+		case hook.CommandInterrupt:
+			if r.remote != nil {
+				r.remote.RemoteInterrupt()
+			}
+		case hook.CommandCancelTask:
+			if r.cfg.TaskCanceller != nil {
+				r.cfg.TaskCanceller.CancelTask(c.Arg)
+			}
+		}
+	}
+}
+
+// askHookUI wraps the ReplUI as the agent's UserInteraction: entering
+// AskQuestion publishes the question (ask event + remoteAsk state for the
+// control poller) BEFORE blocking, so a remote user can answer while the
+// local prompt is still open. Cleared on return.
+type askHookUI struct {
+	r  *ChatRepl
+	ui ReplUI
+}
+
+func (a *askHookUI) AskQuestion(ctx context.Context, question string, options []string) (string, error) {
+	q := question
+	a.r.remoteAsk.Store(&q)
+	defer a.r.remoteAsk.Store(nil)
+	a.r.fireHooks(hook.EventAsk, question)
+	return a.ui.AskQuestion(ctx, question, options)
+}
+
+// askUI returns the UserInteraction the turn's agent should carry: the plain
+// UI when no hook is configured, the wrapping askHookUI otherwise.
+func (r *ChatRepl) askUI() tools.UserInteraction {
+	if r.cfg.Hooks == nil && r.cfg.Control == nil {
+		return r.ui
+	}
+	return &askHookUI{r: r, ui: r.ui}
 }
 
 // mainAgentMaxTokens returns a fresh pointer to agent.ResolveMaxOutputTokens()
@@ -1429,7 +1607,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		MaxTokens:       mainAgentMaxTokens(),
 		Temperature:     r.currentTemperature(),
 		RequestTimeout:  r.cfg.RequestTimeout,
-		UserInteraction: r.ui,
+		UserInteraction: r.askUI(),
 		PlanMode:        r.planMode,
 		// Mission-only (all zero otherwise): pin the plan document across
 		// the design phase's several agents, keep the implementation phase
@@ -1459,6 +1637,7 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 	}
 
 	r.ui.TurnStart(r.turn, userInput)
+	r.fireHooks(hook.EventTurnStart, userInput)
 
 	// Remember message count before agent run to only persist new messages.
 	prevMsgCount := len(r.sess.Messages)
@@ -1634,6 +1813,7 @@ EventLoop:
 	}
 
 	r.ui.TurnEnd(lastUsage)
+	r.fireHooks(hook.EventTurnEnd, turnSummary(lastUsage))
 
 	// Always persist new messages, even on timeout/cancellation — UNLESS
 	// this process has lost its session lock (M1, session-lock review round

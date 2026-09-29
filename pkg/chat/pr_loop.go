@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/tools/builtin"
 )
@@ -191,6 +192,7 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					r.mergePRAndContinue(parentCtx, st, gh)
 					return
 				}
+				r.fireHooks(hook.EventPRAwaitingMerge, fmt.Sprintf("PR #%d all green — awaiting merge (/pr merge)", st.Number))
 				r.ui.Info(fmt.Sprintf("  pr: #%d all green — awaiting merge (/pr merge, or just say merge)", st.Number))
 				return
 			case done && !ok:

@@ -13,6 +13,7 @@ import (
 	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/claudeplugin"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
@@ -335,6 +336,21 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		resume = sess.ID
 	}
 
+	// Hook wiring: nil unless configured — the REPL's nil branches then keep
+	// everything off (docs/HOOKS.md).
+	var hooksEmitter hook.Emitter
+	if len(cfg.Notifications) > 0 {
+		hooksEmitter = hook.NewDispatcher(cfg.Notifications)
+	}
+	var controlSource hook.Poller
+	if src, ok := hook.NewControlSource(cfg.Control); ok {
+		controlSource = src
+	}
+	var controlPoll time.Duration
+	if cfg.Control != nil && cfg.Control.PollSeconds > 0 {
+		controlPoll = time.Duration(cfg.Control.PollSeconds) * time.Second
+	}
+
 	replCfg := chat.ReplConfig{
 		Provider:             cfg.Provider,
 		ModelRegistry:        modelRegistry,
@@ -374,6 +390,9 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		PRAutoMerge:          cfg.PRAutoMerge,
 		PRReviewRounds:       cfg.PRReviewRounds,
 		MissionOnPlan:        cfg.MissionOnPlan,
+		Hooks:                hooksEmitter,
+		Control:              controlSource,
+		ControlPollInterval:  controlPoll,
 	}
 
 	repl, err := chat.NewRepl(replCfg)
