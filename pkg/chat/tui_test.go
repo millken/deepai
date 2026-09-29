@@ -503,3 +503,166 @@ func TestRenderLastMessageToggleSymmetry(t *testing.T) {
 		t.Fatal("no prior reply should yield empty")
 	}
 }
+
+func TestRemoteInputMsg_SubmitsWhenPromptVisible(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	reply := make(chan inputResult, 1)
+	m.inputReply = reply
+	m.inputVisible = true
+
+	got, _ := m.Update(remoteInputMsg{text: "hello"})
+	next := got.(*tuiModel)
+
+	select {
+	case r := <-reply:
+		if r.value != "hello" {
+			t.Fatalf("value = %q, want %q", r.value, "hello")
+		}
+	default:
+		t.Fatal("remoteInputMsg did not deliver to the reply channel")
+	}
+	if next.inputVisible {
+		t.Fatal("inputVisible should be cleared after a remote submit")
+	}
+	if next.inputReply != nil {
+		t.Fatal("inputReply should be detached after a remote submit")
+	}
+}
+
+func TestRemoteInputMsg_QueuedWhileAgentRunning(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.inputVisible = false
+	m.agentActive = true
+
+	got, _ := m.Update(remoteInputMsg{text: "hello"})
+	next := got.(*tuiModel)
+
+	if !next.agentActive || next.inputVisible {
+		t.Fatalf("model state changed on a queued remote input: %+v", next)
+	}
+	if next.inputReply != nil {
+		t.Fatal("a queued remote input must not attach a reply channel")
+	}
+	if len(next.remoteQueue) != 1 || next.remoteQueue[0] != "hello" {
+		t.Fatalf("remoteQueue = %v, want [hello] — a mid-turn reply must queue, not drop", next.remoteQueue)
+	}
+}
+
+// PR-review #1: three replies fetched in one poll — the first takes the
+// waiting prompt, the rest queue, and the queue feeds the NEXT prompt so no
+// acknowledged Telegram message is ever lost.
+func TestRemoteInputMsg_QueueFedOnNextPrompt(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+
+	// Prompt waiting: first reply submits immediately.
+	reply1 := make(chan inputResult, 1)
+	m.inputReply = reply1
+	m.inputVisible = true
+	m.Update(remoteInputMsg{text: "add a test"})
+	select {
+	case r := <-reply1:
+		if r.value != "add a test" {
+			t.Fatalf("first reply = %q", r.value)
+		}
+	default:
+		t.Fatal("first reply was not submitted to the waiting prompt")
+	}
+
+	// Prompt consumed: later replies from the same poll queue instead of
+	// being dropped.
+	m.Update(remoteInputMsg{text: "also update the README"})
+	m.Update(remoteInputMsg{text: "then run go test"})
+	if q := m.remoteQueue; len(q) != 2 || q[0] != "also update the README" || q[1] != "then run go test" {
+		t.Fatalf("remoteQueue = %q, want the two remaining replies in order", q)
+	}
+
+	// Next prompt: the queue feeds it one item, FIFO.
+	reply2 := make(chan inputResult, 1)
+	m.Update(requestInputMsg{reply: reply2})
+	select {
+	case r := <-reply2:
+		if r.value != "also update the README" {
+			t.Fatalf("queued feed = %q, want the oldest queued reply", r.value)
+		}
+	default:
+		t.Fatal("the queued reply was not fed to the next prompt")
+	}
+	if len(m.remoteQueue) != 1 || m.remoteQueue[0] != "then run go test" {
+		t.Fatalf("remoteQueue after feed = %q, want the remaining one", m.remoteQueue)
+	}
+}
+
+// PR #7 review round 2: a reply queued mid-turn must NOT be consumed by the
+// next ask — it would be applied as the answer to a question it was never
+// meant for. It survives the ask and feeds the next REAL prompt. Only a
+// reply arriving while the ask is already showing answers it (immediate
+// path, TestRemoteInputMsg_AnswerAsk).
+func TestRemoteInputMsg_QueueSurvivesAsk(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.agentActive = true
+	m.Update(remoteInputMsg{text: "stop and write a test instead"})
+	if len(m.remoteQueue) != 1 {
+		t.Fatalf("precondition: reply queued, got %q", m.remoteQueue)
+	}
+
+	// The agent opens a question mid-turn: the queued follow-up must stay
+	// queued — it is not an answer to "Which database?".
+	askReply := make(chan inputResult, 1)
+	m.Update(askQuestionMsg{question: "Which database? 1. Postgres 2. SQLite", reply: askReply})
+	select {
+	case r := <-askReply:
+		t.Fatalf("the ask consumed the queued follow-up as its answer: %q", r.value)
+	default:
+	}
+	if !m.askActive || !m.inputVisible || m.inputReply == nil {
+		t.Fatalf("the ask must stay open and unanswered: %+v", m)
+	}
+	if len(m.remoteQueue) != 1 || m.remoteQueue[0] != "stop and write a test instead" {
+		t.Fatalf("remoteQueue = %q, want the follow-up preserved for the next prompt", m.remoteQueue)
+	}
+
+	// A reply arriving while the ask is SHOWING still answers it immediately.
+	m.Update(remoteInputMsg{text: "2"})
+	select {
+	case r := <-askReply:
+		if r.value != "2" {
+			t.Fatalf("ask answer = %q, want 2", r.value)
+		}
+	default:
+		t.Fatal("a reply arriving on a showing ask must answer it")
+	}
+
+	// Turn ends; the next real prompt gets the queued follow-up.
+	promptReply := make(chan inputResult, 1)
+	m.Update(requestInputMsg{reply: promptReply})
+	select {
+	case r := <-promptReply:
+		if r.value != "stop and write a test instead" {
+			t.Fatalf("prompt feed = %q, want the queued follow-up", r.value)
+		}
+	default:
+		t.Fatal("the queued follow-up was not fed to the next prompt")
+	}
+	if len(m.remoteQueue) != 0 {
+		t.Fatalf("remoteQueue after feed = %q, want empty", m.remoteQueue)
+	}
+}
+
+func TestRemoteInputMsg_AnswerAsk(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	reply := make(chan inputResult, 1)
+	m.inputReply = reply
+	m.inputVisible = true
+	m.askActive = true
+
+	m.Update(remoteInputMsg{text: "option A"})
+
+	select {
+	case r := <-reply:
+		if r.value != "option A" {
+			t.Fatalf("value = %q, want %q", r.value, "option A")
+		}
+	default:
+		t.Fatal("remoteInputMsg did not answer the pending ask")
+	}
+}

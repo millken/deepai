@@ -14,6 +14,7 @@ import (
 
 	"charm.land/huh/v2"
 	"github.com/dnsoa/go/env"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/secret"
 	"github.com/spf13/cobra"
@@ -125,6 +126,15 @@ type Config struct {
 	// = defaultSubagentTimeout; negative = no deadline, the behaviour before
 	// the knob existed. Always read through resolveSubagentTimeout.
 	SubagentTimeoutMinutes int `yaml:"subagent_timeout,omitempty"`
+
+	// Notifications fans REPL lifecycle events (ask / turn_end / idle / …)
+	// out to user-configured sinks — webhook URL or local command. Empty = off.
+	// See docs/HOOKS.md.
+	Notifications []hook.NotificationConfig `yaml:"notifications,omitempty"`
+
+	// Control names a polled source (local command or GET URL) whose output
+	// lines steer the session remotely (reply / interrupt / cancel-task). nil = off.
+	Control *hook.ControlConfig `yaml:"control,omitempty"`
 
 	// Models defines multiple named model entries for multi-model support.
 	// Each entry binds an alias to a provider+model pair. When non-empty, the

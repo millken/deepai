@@ -161,3 +161,45 @@ func TestUnknownConfigKeys_EmptyAndTypeErrorsAreSilent(t *testing.T) {
 		t.Errorf("type error was misreported as an unknown key: %+v", got)
 	}
 }
+
+func TestUnknownConfigKeys_HookKeysTypedRight(t *testing.T) {
+	data := []byte("provider: anthropic\n" +
+		"notifications:\n" +
+		"  - events: [ask, idle]\n" +
+		"    webhook_url: https://example.com/hook\n" +
+		"  - events: [turn_end]\n" +
+		"    command: [\"/Users/x/.deepai/hooks/notify.sh\"]\n" +
+		"control:\n" +
+		"  command: [\"/Users/x/.deepai/hooks/control.sh\"]\n" +
+		"  poll_seconds: 5\n")
+	if got := unknownConfigKeys(data); len(got) != 0 {
+		t.Fatalf("valid hook config reported unknown keys: %+v", got)
+	}
+
+	bad := []byte("notifications:\n  - events: [ask]\n    webhook_ur: https://example.com/hook\n")
+	got := unknownConfigKeys(bad)
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 unknown key, got %+v", got)
+	}
+	if got[0].name != "webhook_ur" {
+		t.Errorf("name = %q, want webhook_ur", got[0].name)
+	}
+	if got[0].line != 3 {
+		t.Errorf("line = %d, want 3", got[0].line)
+	}
+}
+
+func TestLoadConfig_HookControlPollSeconds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := "provider: anthropic\ncontrol:\n  command: [\"/x/ctl.sh\"]\n  poll_seconds: 60\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Control == nil || cfg.Control.PollSeconds != 60 {
+		t.Fatalf("Control = %+v, want poll_seconds 60 parsed", cfg.Control)
+	}
+}

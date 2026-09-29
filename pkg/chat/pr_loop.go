@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/tools/builtin"
 )
@@ -191,6 +192,7 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					r.mergePRAndContinue(parentCtx, st, gh)
 					return
 				}
+				r.fireHooks(hook.EventPRAwaitingMerge, fmt.Sprintf("PR #%d all green — awaiting merge (send: merge)", st.Number))
 				r.ui.Info(fmt.Sprintf("  pr: #%d all green — awaiting merge (/pr merge, or just say merge)", st.Number))
 				return
 			case done && !ok:
@@ -386,6 +388,12 @@ func (r *ChatRepl) waitPRCI(parentCtx context.Context, st *prState, gh prGH) (do
 	// the wait and instantly cancel the next unrelated turn's
 	// runTurnWithSignal watcher (round-3 review issue 4).
 	defer r.drainInterrupt()
+	// Entry drain: a REMOTE interrupt buffered while the REPL was idle (the
+	// TUI's own ctrl+c path cannot produce one there — see runTurnWithSignal's
+	// drain) would otherwise be consumed by the select below as a genuine
+	// Ctrl+C during this wait and abort it before the first Checks result
+	// (PR #7 review issue 2).
+	r.drainInterrupt()
 	deadline := time.Now().Add(r.prCIWait())
 	poll := prCIDefaultPoll
 	if r.prCIPollInterval > 0 {

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/millken/deepai/pkg/hook"
 )
 
 // sessionMissionKey is the session-metadata key holding the mission this
@@ -146,6 +148,7 @@ func (r *ChatRepl) leaveMission(status missionStatus) {
 	if err := m.setStatus(status); err != nil {
 		slog.Warn("persist mission status", "mission", m.state.ID, "status", status, "err", err)
 	}
+	r.fireHooks(hook.EventMissionEnd, fmt.Sprintf("mission %s ended: %s", m.state.ID, status))
 	r.carry.SetMissionCharter("")
 	r.clearMissionTurnMode()
 	r.mission = nil
