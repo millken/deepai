@@ -424,11 +424,10 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 		WithPluginAgentDirs(pluginAgentDirs).
 		WithSkillRegistry(skillReg).
 		WithInstructions(instructions)
-	// subagentTimeout (0 = none) is what gives the dispatched agent's ctx a
-	// deadline, which is the ONLY input pkg/agent's graceful wall-clock
-	// wind-down reads. Passing 0 here — as this call did — left every
-	// interactive subagent unbounded: a parallel review fan-out ended only
-	// when its slowest member finished on its own.
+	// subagentTimeout (0 = none) is the only deadline pkg/agent's wall-clock
+	// wrap-up reads. The interactive default is 0: a dispatched coder runs
+	// until it stops or the parent turn ends. A positive value, from
+	// subagent_timeout in config.yaml, is what turns the wrap-up on.
 	subPool := agent.NewSubagentPool(subExecutor, subagentTimeout)
 	mustRegisterTool(registry, tools.TaskTool(subPool, agentOpts))
 	mustRegisterTool(registry, tools.GitAutoCommitTool(defaultProvider))

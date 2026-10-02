@@ -321,12 +321,12 @@ var BuiltinAgentTypes = map[AgentType]AgentTypeConfig{
 	// The reviewer profiles carry defaultReviewerMaxToolCalls. They used to
 	// set 0 (no cap), on the reasoning that a fixed cap cannot fit both a
 	// two-file glance and a whole-repo review and that the Strict
-	// OutputSchema already forces a stop. The first half of that held only
-	// while an uncapped reviewer had nothing to race: the interactive
-	// subagent pool now carries a default deadline (pkg/commands'
-	// defaultSubagentTimeout), so an uncapped reviewer browses until the
-	// clock decides, and the size of what it examined becomes a function of
-	// how slow the model was that day.
+	// OutputSchema already forces a stop. The interactive pool itself has
+	// no default deadline (subagent_timeout absent or negative), but a
+	// reviewer still races a clock when one is set — the review gate's
+	// review_timeout, or a positive subagent_timeout. An uncapped reviewer
+	// browses until that clock decides, and the size of what it examined
+	// becomes a function of how slow the model was that day.
 	//
 	// A cap is the better bound because exhausting it is RECOVERABLE where
 	// meeting a deadline barely is: react.go turns the last call into a

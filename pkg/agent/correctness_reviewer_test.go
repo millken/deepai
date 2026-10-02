@@ -107,11 +107,10 @@ func TestCorrectnessReviewerProfile(t *testing.T) {
 }
 
 // TestReviewerProfiles_CarryAToolCallCap: a reviewer the MODEL dispatches used
-// to run uncapped. The profiles were left that way on the stated grounds that
-// "only the gate races a wall clock" — true when the interactive pool had no
-// deadline at all. It no longer is: pkg/commands now builds that pool with
-// defaultSubagentTimeout, so a model-dispatched reviewer races a clock too,
-// and an uncapped one meets it with nothing to show.
+// to run uncapped, on the grounds that only the review gate races a wall
+// clock. The interactive pool is unbounded again unless subagent_timeout is
+// positive, but the gate's review_timeout (and any positive subagent_timeout)
+// still is a clock, and an uncapped reviewer meets it with nothing to show.
 //
 // The cap is the recoverable bound, exactly as it is for the gate: exhausting
 // it forces a tool-less wrap-up that must still satisfy the Strict schema, so

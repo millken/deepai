@@ -122,9 +122,9 @@ type Config struct {
 	MissionOnPlan bool `yaml:"mission_on_plan,omitempty"`
 
 	// SubagentTimeoutMinutes bounds every subagent the model dispatches with
-	// the task tool, in minutes (matching RequestTimeout's unit). 0 or absent
-	// = defaultSubagentTimeout; negative = no deadline, the behaviour before
-	// the knob existed. Always read through resolveSubagentTimeout.
+	// the task tool, in minutes (matching RequestTimeout's unit). 0, absent,
+	// or negative = no deadline (the default); a positive value is that many
+	// minutes. Always read through resolveSubagentTimeout.
 	SubagentTimeoutMinutes int `yaml:"subagent_timeout,omitempty"`
 
 	// Notifications fans REPL lifecycle events (ask / turn_end / idle / …)
