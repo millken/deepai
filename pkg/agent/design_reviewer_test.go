@@ -154,6 +154,12 @@ func TestCorrectnessReviewerPrompt_OpensFaultLayerOnlyUnderACharter(t *testing.T
 	if !strings.Contains(p, `set "implementation"`) {
 		t.Error("3a must say what to do when the fault is NOT in the plan")
 	}
+	// 3b is the same shape of door for /pr review: it opens only when the
+	// message actually carries a claim or an outside comment. A plain
+	// /review has neither heading, so rule 3 still keeps untouched code out.
+	if !strings.Contains(p, `If and only if the user message includes a "PR claim" section or a "Comments already on this PR" section`) {
+		t.Error("rule 3b must be conditional on a PR claim or outside comments being present")
+	}
 }
 
 // docs/review.md's focus contract: the severity scale bounds what a finding

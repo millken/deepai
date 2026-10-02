@@ -22,6 +22,8 @@ type fakeGH struct {
 	listCommentsErr error
 	// viewTitle is what View reports.
 	viewTitle string
+	// viewBody is the PR body View reports. Empty means a body-less PR.
+	viewBody string
 	// viewURL is the PR URL View reports; empty means "not a PR URL".
 	viewURL string
 
@@ -29,12 +31,12 @@ type fakeGH struct {
 	checksCalls    int
 }
 
-func (f *fakeGH) View(context.Context, string, int) (string, string, string, string, error) {
+func (f *fakeGH) View(context.Context, string, int) (string, string, string, string, string, error) {
 	title := f.viewTitle
 	if title == "" {
 		title = "PR review pipeline"
 	}
-	return title, "feature/pr-pipeline", "main", f.viewURL, nil
+	return title, f.viewBody, "feature/pr-pipeline", "main", f.viewURL, nil
 }
 
 type fakeChecks struct {

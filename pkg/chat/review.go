@@ -696,6 +696,10 @@ type reviewPromptInput struct {
 	// the whole PR. Only meaningful when prNumber > 0.
 	incremental bool
 	sinceSHA    string
+	// externalComments are PR comments this loop did not post. Empty on a
+	// local review. Shown so a defect someone already named is in front of
+	// the reviewer before a pass can close the loop.
+	externalComments []prComment
 }
 
 // buildReviewPrompt assembles the reviewer's seed message. Deliberately
@@ -731,6 +735,17 @@ func buildReviewPrompt(in reviewPromptInput) string {
 		b.WriteString("## Original task (verbatim user request)\n\n")
 		b.WriteString(in.initialRequest)
 	}
+	// Full PR reviews only. The heading is the switch rule 3b keys on:
+	// a claim-shaped gap (the body says a path is covered, the diff never
+	// touches it) is in scope. Incremental re-reviews stay inside the delta
+	// and must not grow this section, or a late round reopens the whole tree.
+	if in.prNumber > 0 && !in.incremental {
+		b.WriteString("\n\n## PR claim\n\n")
+		b.WriteString("The original task above is what this pull request claims to do. " +
+			"Where that claim says an entry, path, or case is covered and the diff does not touch the code that implements it, " +
+			"that gap is in scope: search the tree for that sibling and report it with a concrete failure scenario. " +
+			"A pre-existing problem the claim does not name stays out of scope.\n")
+	}
 	if len(in.scope) > 0 {
 		b.WriteString("\n\n## Files changed\n\n")
 		for _, f := range in.scope {
@@ -742,6 +757,9 @@ func buildReviewPrompt(in reviewPromptInput) string {
 	b.WriteString("\n```\n")
 	if !in.bundled {
 		b.WriteString("\n(Full file contents are NOT attached — read what you need with read_file, preferring line ranges around the hunks above.)\n")
+	}
+	if block := reviewCommentsBlock(in.externalComments); block != "" {
+		b.WriteString(block)
 	}
 	if in.prev != nil && len(in.prev.Issues) > 0 {
 		// A re-review's job is narrower than a first review: check the fixes.
@@ -763,6 +781,9 @@ func buildReviewPrompt(in reviewPromptInput) string {
 			fmt.Fprintf(&b, "- %s of wall clock for the whole review. Running out kills the review and your findings are lost, so emit your verdict while you still have room.\n", in.timeout)
 		}
 		b.WriteString("- Reason from the diff first; spend tool calls only on questions the diff alone cannot settle.\n")
+		if in.prNumber > 0 && !in.incremental {
+			b.WriteString("- The PR claim is one of those questions: look up an entry the claim names when the diff does not touch its code.\n")
+		}
 	}
 	return b.String()
 }
