@@ -40,12 +40,17 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	// No tracker in ctx (standalone handler calls) keeps legacy behavior.
 	if tracker := tools.ReadTrackerFromContext(ctx); tracker != nil {
 		if err := tracker.CheckEdit(path); err != nil {
-			var stale *tools.StaleReadError
-			if errors.As(err, &stale) {
+		var stale *tools.StaleReadError
+		if errors.As(err, &stale) {
+			if stale.RecordedSize == stale.CurrentSize {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
-					"%s changed on disk since your last read_file (was %d bytes, now %d) — re-read the file and retry the edit against its current text",
-					displayPath, stale.RecordedSize, stale.CurrentSize)
+					"%s changed on disk since your last read_file (same %d bytes, but modified at %s) — re-read the file and retry the edit against its current text",
+					displayPath, stale.CurrentSize, stale.CurrentModTime.Format("15:04:05"))
 			}
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+				"%s changed on disk since your last read_file (was %d bytes, now %d) — re-read the file and retry the edit against its current text",
+				displayPath, stale.RecordedSize, stale.CurrentSize)
+		}
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
 				"%s has not been read in this session — read it with read_file first, then retry the edit against the file's own text (do not edit from memory)",
 				displayPath)

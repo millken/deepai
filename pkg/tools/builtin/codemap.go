@@ -493,6 +493,8 @@ func renderWithContent(ctx context.Context, files []codeMapFile, budget int) str
 		}
 		used += len(f.content)
 		included++
+		// Full source reached the model — the file satisfies the read gate.
+		stampTrackedFile(ctx, f.abs)
 		fmt.Fprintf(&b, "\n===== %s (%d lines) =====\n%s\n", display, f.lines, f.content)
 	}
 	fmt.Fprintf(&b, "\n[%d files with content (%d bytes), %d listed only; budget %d]\n", included, used, listedOnly, budget)

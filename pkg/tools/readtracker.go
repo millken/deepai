@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // ReadTracker records which files the current session has seen via read_file
@@ -31,8 +32,10 @@ var ErrNotReadInSession = errors.New("not read in this session")
 // StaleReadError reports an on-disk state that no longer matches the stamp
 // from the model's last read/write of the file.
 type StaleReadError struct {
-	RecordedSize int64
-	CurrentSize  int64
+	RecordedSize     int64
+	CurrentSize      int64
+	RecordedModTime  time.Time
+	CurrentModTime   time.Time
 }
 
 func (e *StaleReadError) Error() string {
@@ -64,8 +67,13 @@ func ReadTrackerFromContext(ctx context.Context) *ReadTracker {
 }
 
 // absKey anchors relative paths so the same file reached as "a.go" and
-// "/abs/a.go" lands on one entry.
+// "/abs/a.go" lands on one entry. Symlinks are resolved for the same reason:
+// reading via a link and editing via the real path (or vice versa) is still
+// one file.
 func absKey(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
 	if abs, err := filepath.Abs(path); err == nil {
 		return abs
 	}
@@ -104,7 +112,12 @@ func (t *ReadTracker) CheckEdit(path string) error {
 		return nil
 	}
 	if info.ModTime().UnixNano() != stamp.mtimeNano || info.Size() != stamp.size {
-		return &StaleReadError{RecordedSize: stamp.size, CurrentSize: info.Size()}
+		return &StaleReadError{
+			RecordedSize:    stamp.size,
+			CurrentSize:     info.Size(),
+			RecordedModTime: time.Unix(0, stamp.mtimeNano),
+			CurrentModTime:  info.ModTime(),
+		}
 	}
 	return nil
 }
