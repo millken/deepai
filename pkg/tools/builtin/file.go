@@ -69,6 +69,9 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if startLine > 0 || endLine > 0 {
 		total := len(lines)
 		if total == 0 {
+			// Empty file: the empty text IS the whole file, so this read saw
+			// everything there is to edit.
+			stampTrackedFile(ctx, path)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		s := int(startLine)
@@ -149,6 +152,9 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	if !rawRequested {
 		if len(lines) == 0 {
+			// Empty file: the empty text IS the whole file, so this read saw
+			// everything there is to edit.
+			stampTrackedFile(ctx, path)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		width := numWidth(len(lines))

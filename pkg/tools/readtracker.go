@@ -69,10 +69,11 @@ func ReadTrackerFromContext(ctx context.Context) *ReadTracker {
 // absKey anchors relative paths so the same file reached as "a.go" and
 // "/abs/a.go" lands on one entry. Symlinks are resolved for the same reason:
 // reading via a link and editing via the real path (or vice versa) is still
-// one file.
+// one file. EvalSymlinks alone is not enough — on a relative path it returns
+// a still-relative result, so Abs runs on the resolved path.
 func absKey(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return resolved
+		path = resolved
 	}
 	if abs, err := filepath.Abs(path); err == nil {
 		return abs
