@@ -71,6 +71,7 @@ func editByHashRange(ctx context.Context, call models.ToolCall, path, displayPat
 	if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
 		return fail(fmt.Errorf("write failed: %w", writeErr))
 	}
+	stampTrackedFile(ctx, path)
 
 	span := lineSpanLabel(s, e)
 	var msg string
@@ -193,6 +194,7 @@ func editByInsertAfter(ctx context.Context, call models.ToolCall, path, displayP
 	if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
 		return fail(fmt.Errorf("write failed: %w", writeErr))
 	}
+	stampTrackedFile(ctx, path)
 
 	k := len(splitFileLines(body))
 	msg := fmt.Sprintf("Inserted %d lines after line %d (%s) in %s", k, anchor, lineHash(lines[anchor-1]), displayPath)
@@ -411,6 +413,7 @@ func editByHunks(ctx context.Context, call models.ToolCall, path, displayPath st
 	if writeErr := os.WriteFile(path, []byte(out.String()), filePerm(path, 0644)); writeErr != nil {
 		return fail(fmt.Errorf("write failed: %w", writeErr))
 	}
+	stampTrackedFile(ctx, path)
 
 	// Summary in file order, capped at 3 details (§17.2 C21); post-edit line
 	// numbers accumulate each hunk's line delta over the hunks above it

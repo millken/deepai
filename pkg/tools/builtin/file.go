@@ -69,6 +69,9 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if startLine > 0 || endLine > 0 {
 		total := len(lines)
 		if total == 0 {
+			// Empty file: the empty text IS the whole file, so this read saw
+			// everything there is to edit.
+			stampTrackedFile(ctx, path)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		s := int(startLine)
@@ -108,6 +111,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			if e < total || strings.HasSuffix(text, "\n") {
 				raw += "\n"
 			}
+			stampTrackedFile(ctx, path)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: raw}, nil
 		}
 		var b strings.Builder
@@ -115,6 +119,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		for i, ln := range selected {
 			writeHashNumberedLine(&b, width, s+i, ln)
 		}
+		stampTrackedFile(ctx, path)
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
 
@@ -129,6 +134,9 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	full, _ := args["full"].(bool)
 	if ReadFileOutlineThreshold > 0 && !full && !hasLimit &&
 		len(lines) > ReadFileOutlineThreshold && extToLang(filepath.Ext(path)) != "" {
+		// No read-gate stamp on this branch or the binary one above: neither
+		// hands the model the file's editable body, so the file stays unedited
+		// until a real range/full read.
 		return models.ToolResult{
 			CallID:   call.ID,
 			ToolName: call.Name,
@@ -144,6 +152,9 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	if !rawRequested {
 		if len(lines) == 0 {
+			// Empty file: the empty text IS the whole file, so this read saw
+			// everything there is to edit.
+			stampTrackedFile(ctx, path)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		width := numWidth(len(lines))
@@ -151,9 +162,11 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		for i, ln := range lines {
 			writeHashNumberedLine(&b, width, i+1, ln)
 		}
+		stampTrackedFile(ctx, path)
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
 
+	stampTrackedFile(ctx, path)
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
 }
 
@@ -217,6 +230,7 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	} else if err := os.WriteFile(path, []byte(content), perm); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
+	stampTrackedFile(ctx, path)
 
 	return models.ToolResult{
 		CallID:   call.ID,
@@ -224,6 +238,17 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		Content:  fmt.Sprintf("Written %d bytes to %s", len(content), displayPath),
 		Data:     map[string]any{"start_line": startLine},
 	}, nil
+}
+
+// stampTrackedFile records the file's on-disk state in the session's
+// ReadTracker after a successful read_file or write_file, so a follow-up
+// edit_file is gated against this exact version (see readtracker.go).
+func stampTrackedFile(ctx context.Context, path string) {
+	if tracker := tools.ReadTrackerFromContext(ctx); tracker != nil {
+		if info, err := os.Stat(path); err == nil {
+			tracker.Record(path, info)
+		}
+	}
 }
 
 func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {

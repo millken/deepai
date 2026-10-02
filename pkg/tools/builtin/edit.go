@@ -3,12 +3,14 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // EditFileHandler replaces text in a file, in one of two modes. Hash mode
@@ -30,6 +32,30 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 
 	displayPath := strings.TrimSpace(path)
 	path = resolveWritablePath(ctx, path)
+
+	// The read gate runs before mode dispatch so every edit mode (hash range,
+	// insert-after, hunks, old_string) is covered. Session telemetry shows the
+	// dominant edit_file failure is editing a file never read (or changed
+	// since) in this session: old_string retyped from memory, invented hashes.
+	// No tracker in ctx (standalone handler calls) keeps legacy behavior.
+	if tracker := tools.ReadTrackerFromContext(ctx); tracker != nil {
+		if err := tracker.CheckEdit(path); err != nil {
+		var stale *tools.StaleReadError
+		if errors.As(err, &stale) {
+			if stale.RecordedSize == stale.CurrentSize {
+				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+					"%s changed on disk since your last read_file (same %d bytes, but modified at %s) — re-read the file and retry the edit against its current text",
+					displayPath, stale.CurrentSize, stale.CurrentModTime.Format("15:04:05"))
+			}
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+				"%s changed on disk since your last read_file (was %d bytes, now %d) — re-read the file and retry the edit against its current text",
+				displayPath, stale.RecordedSize, stale.CurrentSize)
+		}
+			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf(
+				"%s has not been read in this session — read it with read_file first, then retry the edit against the file's own text (do not edit from memory)",
+				displayPath)
+		}
+	}
 
 	// Multi-hunk mode dispatches first (HASHLINE_EDIT_DESIGN §17.2 D5): each
 	// hunk carries its own new_string, so the top-level key checks below do
@@ -132,6 +158,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", writeErr)
 		}
+		stampTrackedFile(ctx, path)
 		notes := []string{}
 		if kind != "" {
 			notes = append(notes, kind)
@@ -654,7 +681,7 @@ func EditFileTool() models.Tool {
 			"old_string mode (when you have no hashes — raw spans): old_string must be the file's own exact text and uniquely match (use replace_all for multiple matches); strip the line-number prefix that read_file's numbered output adds before matching (grep's file:line:hash: prefix is not stripped). " +
 			"Optional start_line/end_line (1-based, inclusive) scope an old_string search to that line window, so a short old_string that repeats elsewhere still resolves uniquely without replace_all — prefer this over padding old_string with context. " +
 			"old_string falls back to whitespace-tolerant matching (tab vs space, CRLF vs LF, collapsed runs) when literal match fails. " +
-			"All modes fail safely on missing or ambiguous targets; on failure, re-read the file with read_file and copy hashes or text from its output.",
+				"All modes fail safely on missing or ambiguous targets; a file not previously read in this session (or changed on disk since your last read) is rejected — read it with read_file first; on any failure, re-read the file with read_file and copy hashes or text from its output.",
 		Groups: []string{"builtin", "file_ops"},
 		InputSchema: map[string]any{
 			"type": "object",

@@ -247,6 +247,7 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 	toolStarted := time.Now().UTC()
 	toolCtx := tools.WithSandbox(ctx, a.sandbox)
 	toolCtx = tools.WithThreadID(toolCtx, sessionID)
+	toolCtx = tools.WithReadTracker(toolCtx, a.readTracker)
 	// Window-aware handlers (code_map include_content) size their output
 	// budget against the actual model window instead of a global constant —
 	// a 1M-window model can afford a far larger pull than a 128k one.
