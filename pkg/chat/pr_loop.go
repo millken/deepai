@@ -317,16 +317,20 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 	// turn just pushed it), so read_file sees exactly what the diff shows —
 	// which is also what makes incremental review safe: the reviewer verifies
 	// previous findings against the checked-out tree, not against the delta.
+	// Outside comments are read here, before the verdict, and the watermark
+	// stays put: a fail still hands the same comments to the fix turn.
+	comments := pendingExternalComments(parentCtx, st, gh)
 	verdict, ok := r.runReview(parentCtx, reviewPromptInput{
-		initialRequest: st.Brief,
-		diff:           diff,
-		scope:          relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope)),
-		bundled:        false,
-		prev:           prev,
-		prNumber:       st.Number,
-		prRound:        st.Round,
-		incremental:    incremental,
-		sinceSHA:       st.LastReviewHead,
+		initialRequest:   st.Brief,
+		diff:             diff,
+		scope:            relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope)),
+		bundled:          false,
+		prev:             prev,
+		prNumber:         st.Number,
+		prRound:          st.Round,
+		incremental:      incremental,
+		sinceSHA:         st.LastReviewHead,
+		externalComments: comments,
 	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
 	if ok {
 		if head, err := runGit(r.cfg.WorkDir, "rev-parse", "HEAD"); err == nil {
@@ -696,6 +700,25 @@ func (r *ChatRepl) advanceExternalWatermark(st *prState, comments []prComment) {
 	if err := st.save(r.cfg.WorkDir); err != nil {
 		r.ui.Info(fmt.Sprintf("  pr: could not persist the comment watermark (%v)", err))
 	}
+}
+
+// reviewCommentsBlock is the reviewer's view of the same comments the fix
+// turn sees. The heading is the switch rule 3b keys on. Empty when there
+// is nothing to show, so a comment-less review grows no section.
+func reviewCommentsBlock(comments []prComment) string {
+	if len(comments) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n## Comments already on this PR\n\n")
+	b.WriteString("These were left by someone outside this review loop. " +
+		"A concrete defect one of them describes is in scope even when the diff does not touch that code: " +
+		"verify it against the current tree and report it with a failure scenario. " +
+		"Style and taste in these comments are not issues.\n")
+	for _, c := range comments {
+		fmt.Fprintf(&b, "\n— %s:\n%s\n", c.Author, clip(c.Body, 2048))
+	}
+	return b.String()
 }
 
 // externalCommentsBlock renders the passthrough section of a fix turn's

@@ -55,7 +55,10 @@ type prState struct {
 	// Round is the review round in progress, 1-based. The ONLY authority on
 	// which round we are in — comment markers group content, they never
 	// decide the round, because a role may post several comments per round.
-	Round int      `json:"round"`
+	Round int `json:"round"`
+	// Brief is what the reviewer judges the change against. Auto-attach
+	// stores the user's own request; /pr review stores the PR body, with
+	// the title kept as a one-line summary in front of it (prReviewBrief).
 	Brief string   `json:"brief,omitempty"`
 	Scope []string `json:"scope,omitempty"`
 	// CommentPostedRound is the round whose review comment is CONFIRMED on
@@ -356,8 +359,9 @@ type prComment struct {
 // inject a fake and the loop never shells out behind an abstraction that
 // hides a network call.
 type prGH interface {
-	// View returns a tracked-PR bootstrap: title, branch, base, url.
-	View(ctx context.Context, repo string, number int) (title, branch, base, url string, err error)
+	// View returns a tracked-PR bootstrap: title, body, branch, base, url.
+	// body is the claim /pr review judges against; empty when the PR has none.
+	View(ctx context.Context, repo string, number int) (title, body, branch, base, url string, err error)
 	PostComment(ctx context.Context, repo string, number int, body string) error
 	ListComments(ctx context.Context, repo string, number int) ([]prComment, error)
 	Diff(ctx context.Context, repo string, number int) (string, error)
@@ -445,26 +449,27 @@ func parsePRCommentsJSON(data []byte) ([]prComment, error) {
 	return out, nil
 }
 
-func (g ghPRClient) View(ctx context.Context, repo string, number int) (title, branch, base, url string, err error) {
+func (g ghPRClient) View(ctx context.Context, repo string, number int) (title, body, branch, base, url string, err error) {
 	args := prRepoArgs(repo, "view", strconv.Itoa(number),
-		"--json", "title,headRefName,baseRefName,url")
+		"--json", "title,body,headRefName,baseRefName,url")
 	out, stderr, code, err := g.run(ctx, args...)
 	if err != nil {
-		return "", "", "", "", err
+		return "", "", "", "", "", err
 	}
 	if code != 0 {
-		return "", "", "", "", fmt.Errorf("gh pr view exited %d: %s", code, strings.TrimSpace(stderr))
+		return "", "", "", "", "", fmt.Errorf("gh pr view exited %d: %s", code, strings.TrimSpace(stderr))
 	}
 	var payload struct {
 		Title       string `json:"title"`
+		Body        string `json:"body"`
 		HeadRefName string `json:"headRefName"`
 		BaseRefName string `json:"baseRefName"`
 		URL         string `json:"url"`
 	}
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		return "", "", "", "", fmt.Errorf("parse gh pr view: %w", err)
+		return "", "", "", "", "", fmt.Errorf("parse gh pr view: %w", err)
 	}
-	return payload.Title, payload.HeadRefName, payload.BaseRefName, payload.URL, nil
+	return payload.Title, payload.Body, payload.HeadRefName, payload.BaseRefName, payload.URL, nil
 }
 
 func (g ghPRClient) ListComments(ctx context.Context, repo string, number int) ([]prComment, error) {

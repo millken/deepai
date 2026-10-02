@@ -129,6 +129,54 @@ func TestDispatchPRReview_FallbackWhenBaseMissing(t *testing.T) {
 	if strings.Contains(prompt, "second reviewer") {
 		t.Fatal("fallback is a full review, not the second-reviewer framing")
 	}
+	if !strings.Contains(prompt, "## PR claim") {
+		t.Fatal("a full-diff fallback must still judge the PR claim")
+	}
+}
+
+// Round 1 of /pr review must see the claim and outside comments, and must
+// not be handed its own earlier posts. The watermark stays put so a later
+// fail still gives those comments to the fix turn.
+func TestDispatchPRReview_Round1SeesClaimAndOutsideComments(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	when := time.Now().UTC()
+	gh := &fakeGH{
+		diff:  "+line",
+		files: []string{"a.go"},
+		comments: []prComment{
+			{ID: "ext", Author: "alice", Body: "padding shorthand still bypasses the gate", CreatedAt: when},
+			{ID: "own", Author: "millken", Body: prMarker{prRoleReviewer, 1}.String() + "\nown review", CreatedAt: when.Add(time.Second)},
+		},
+	}
+	r, _ := newReviewRepl(t, dir, fake)
+	r.prGH = gh
+
+	brief := prReviewBrief("clamp style numbers", "All four entries go through the gate.")
+	st, err := newPRState(dir, 8, "millken/deepai", "b", "main", "https://github.com/millken/deepai/pull/8", brief)
+	if err != nil {
+		t.Fatalf("newPRState: %v", err)
+	}
+	if _, ok := r.dispatchPRReview(context.Background(), st, gh, nil); !ok {
+		t.Fatal("dispatch failed")
+	}
+	prompt := fake.args["prompt"].(string)
+	for _, want := range []string{
+		"All four entries go through the gate.",
+		"## PR claim",
+		"padding shorthand still bypasses the gate",
+		"## Comments already on this PR",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("round-1 prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "own review") {
+		t.Fatal("the loop's own comment must not be fed back to the reviewer")
+	}
+	if !st.LastExternalCommentAt.IsZero() {
+		t.Fatal("showing comments to the reviewer must not advance the fix-turn watermark")
+	}
 }
 
 func TestBuildReviewPrompt_PRModeIncremental(t *testing.T) {
@@ -149,6 +197,9 @@ func TestBuildReviewPrompt_PRModeIncremental(t *testing.T) {
 	// The full-review framing must not leak into the incremental one.
 	if strings.Contains(p, "the diff is the PR's current diff") {
 		t.Fatalf("full-review framing leaked into incremental prompt:\n%s", p)
+	}
+	if strings.Contains(p, "## PR claim") {
+		t.Fatalf("an incremental re-review must stay inside the delta:\n%s", p)
 	}
 }
 

@@ -38,6 +38,9 @@ func TestBuildReviewPrompt_FirstReview(t *testing.T) {
 	if strings.Contains(p, "Previously reported") {
 		t.Fatalf("a first review has no previous round:\n%s", p)
 	}
+	if strings.Contains(p, "## PR claim") || strings.Contains(p, "## Comments already on this PR") {
+		t.Fatalf("a local review must not grow the PR-only sections:\n%s", p)
+	}
 }
 
 // A re-review's job is to check the fixes. Without the previous round's
@@ -136,6 +139,12 @@ func TestBuildReviewPrompt_PRMode(t *testing.T) {
 	}
 	if strings.HasPrefix(p, "Adversarially review the code changes below.\n") {
 		t.Fatalf("PR mode must replace the local-mode header:\n%.120s", p)
+	}
+	if !strings.Contains(p, "## PR claim") || !strings.Contains(p, "search the tree for that sibling") {
+		t.Fatalf("a full PR review must open the claim-gap exception:\n%s", p)
+	}
+	if !strings.Contains(p, "The PR claim is one of those questions") {
+		t.Fatalf("the budget closer must not tell a full PR review to ignore the claim:\n%s", p)
 	}
 
 	local := buildReviewPrompt(reviewPromptInput{initialRequest: "r", diff: "d"})

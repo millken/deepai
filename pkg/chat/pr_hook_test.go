@@ -376,12 +376,25 @@ func TestSessionCarryTodosRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPRReviewBrief(t *testing.T) {
+	if got := prReviewBrief("feat: clamp", "All four entries go through the gate."); got != "Title: feat: clamp\n\nAll four entries go through the gate." {
+		t.Fatalf("brief = %q", got)
+	}
+	if got := prReviewBrief("feat: clamp", "  "); got != "feat: clamp" {
+		t.Fatalf("empty body must fall back to the title, got %q", got)
+	}
+	if got := prReviewBrief("", "just the body"); got != "just the body" {
+		t.Fatalf("empty title must be the body alone, got %q", got)
+	}
+}
+
 func TestReviewPRCommand_AttachesExternalPR(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	// The URL is the only place the repo can come from — the attach must pin
 	// it so later gh calls never target the process's cwd instead (round-2
 	// review issue 3).
 	gh := &fakeGH{diff: "+line", files: []string{"a.go"}, viewTitle: "feat: PR review pipeline",
+		viewBody:     "All four entries go through the gate.",
 		viewURL:      "https://github.com/other/libY/pull/55",
 		checksScript: []fakeChecks{{done: true, ok: true}}}
 	r := newPRLoopRepl(t, fake, gh)
@@ -392,8 +405,9 @@ func TestReviewPRCommand_AttachesExternalPR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("review 55 never tracked the PR: %v", err)
 	}
-	if st.Brief != "feat: PR review pipeline" {
-		t.Fatalf("brief = %q, want the PR title", st.Brief)
+	wantBrief := "Title: feat: PR review pipeline\n\nAll four entries go through the gate."
+	if st.Brief != wantBrief {
+		t.Fatalf("brief = %q, want the title as summary plus the PR body", st.Brief)
 	}
 	if st.Repo != "other/libY" {
 		t.Fatalf("repo = %q, want the repo pinned from the fetched URL", st.Repo)

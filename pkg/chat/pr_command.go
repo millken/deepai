@@ -37,8 +37,9 @@ func (r *ChatRepl) handlePRCommand(parentCtx context.Context, args string) {
 
 // reviewPRCommand attaches the loop to a PR created outside this REPL —
 // this session's own push, another terminal, a teammate — and runs it now.
-// The PR title is the loop's review brief (what the PR claims to do), so an
-// external PR needs no local context to be reviewed.
+// The PR body is the loop's review brief (what the PR claims to do); the
+// title stays as the one-line summary in front of it. A body-less PR falls
+// back to the title, so an external PR still needs no local context.
 func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 	n, err := strconv.Atoi(arg)
 	if err != nil || n <= 0 {
@@ -63,17 +64,18 @@ func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 		existing = nil
 	}
 	gh := r.prGHOrDefault()
-	title, branch, base, url, err := gh.View(parentCtx, "", n)
+	title, body, branch, base, url, err := gh.View(parentCtx, "", n)
 	if err != nil {
 		r.ui.Info(fmt.Sprintf("  pr: could not read #%d (%v)", n, err))
 		return
 	}
+	brief := prReviewBrief(title, body)
 	// Pin the repo from the URL the same way the auto-attach path does: an
 	// empty repo would retarget every later gh call at the process's cwd,
 	// which on a different clone means reviewing — and merging — the wrong
 	// PR (round-2 review issue 3).
 	repo := repoFromPRURL(url)
-	st, err := newPRState(r.cfg.WorkDir, n, repo, branch, base, url, title)
+	st, err := newPRState(r.cfg.WorkDir, n, repo, branch, base, url, brief)
 	if err != nil {
 		r.ui.Info(fmt.Sprintf("  pr: could not track #%d (%v)", n, err))
 		return
@@ -90,6 +92,21 @@ func (r *ChatRepl) reviewPRCommand(parentCtx context.Context, arg string) {
 		r.ui.Info(fmt.Sprintf("  pr: #%d attached — %s", n, title))
 	}
 	r.runPRLoop(parentCtx, st)
+}
+
+// prReviewBrief is the anchor a manual /pr review judges against. The body
+// is the claim; the title stays as a one-line summary so a reviewer can
+// tell them apart. Empty body falls back to the title.
+func prReviewBrief(title, body string) string {
+	title = strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return title
+	}
+	if title == "" {
+		return body
+	}
+	return "Title: " + title + "\n\n" + body
 }
 
 func (r *ChatRepl) printPRStatus() {
