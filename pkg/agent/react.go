@@ -226,6 +226,12 @@ type Agent struct {
 	// set (the REPL's normal case); every other caller, including every
 	// subagent, leaves this nil and gets today's per-Run-only behavior.
 	session *SessionCarry
+
+	// readTracker backs the edit_file read gate (pkg/tools/readtracker.go):
+	// an edit is rejected unless the target was read or written in this
+	// session and is unchanged on disk. Rides the carried session when one
+	// exists so reads survive the per-turn Agent churn; otherwise per-Run.
+	readTracker *tools.ReadTracker
 }
 
 func New(cfg AgentConfig) *Agent {
@@ -292,6 +298,15 @@ func New(cfg AgentConfig) *Agent {
 		nonInteractive:      cfg.NonInteractive,
 		agentCatalog:        cfg.AgentCatalog,
 		session:             cfg.Session,
+	}
+
+	if cfg.Session != nil {
+		if cfg.Session.readTracker == nil {
+			cfg.Session.readTracker = tools.NewReadTracker()
+		}
+		a.readTracker = cfg.Session.readTracker
+	} else {
+		a.readTracker = tools.NewReadTracker()
 	}
 
 	// M4-3: prime the compaction anchor/stall bookkeeping from the carried

@@ -35,6 +35,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("read failed: %w", err)
 	}
+	stampTrackedFile(ctx, path)
 
 	// Binary content must never reach the model: this repo's own bin/deepai is
 	// 79 MB with no extension, and reading it would blow the context window on
@@ -217,6 +218,7 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	} else if err := os.WriteFile(path, []byte(content), perm); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
 	}
+	stampTrackedFile(ctx, path)
 
 	return models.ToolResult{
 		CallID:   call.ID,
@@ -224,6 +226,17 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		Content:  fmt.Sprintf("Written %d bytes to %s", len(content), displayPath),
 		Data:     map[string]any{"start_line": startLine},
 	}, nil
+}
+
+// stampTrackedFile records the file's on-disk state in the session's
+// ReadTracker after a successful read_file or write_file, so a follow-up
+// edit_file is gated against this exact version (see readtracker.go).
+func stampTrackedFile(ctx context.Context, path string) {
+	if tracker := tools.ReadTrackerFromContext(ctx); tracker != nil {
+		if info, err := os.Stat(path); err == nil {
+			tracker.Record(path, info)
+		}
+	}
 }
 
 func GlobHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {

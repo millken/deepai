@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
@@ -75,6 +76,13 @@ type SessionCarry struct {
 	// path on the Run goroutine — covered by the same single-goroutine
 	// contract as every other field on this struct.
 	editedFiles map[string]struct{}
+
+	// readTracker gates edit_file on a same-session read_file/write_file of
+	// the target (see pkg/tools/readtracker.go). Shared by pointer across a
+	// conversation's Runs — mutations go straight through the pointer, so no
+	// mirror-back is needed; its internal locking keeps it safe under one
+	// Run's parallel tool execution. Lazily installed by New().
+	readTracker *tools.ReadTracker
 
 	// missionCharter is the rendered, read-only charter text of the mission
 	// currently running in this conversation (pkg/chat's mission loop,
