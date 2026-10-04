@@ -11,6 +11,8 @@ bodies/
 /deepai
 deepai-debug.log
 .deepai/plans/
+.deepai/pr/
+.deepai/missions/
 .superpowers/
 .DS_Store
 .env
