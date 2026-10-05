@@ -267,6 +267,9 @@ func TestDesignPhase_PendingReviewSurvivesExhaustedRounds(t *testing.T) {
 	m, _ := createMission(r.cfg.WorkDir, "brief")
 	m.state.DesignRound = maxDesignRounds // 3/3 spent
 	m.state.PendingReview = missionPhaseDesign
+	if err := m.save(); err != nil {
+		t.Fatal(err)
+	}
 	writeFileOrFatal(t, m.designPath(), "# the plan one review away")
 	r.mission = m
 
@@ -501,6 +504,70 @@ func TestDesignPhase_InterruptedReviewKeepsTheMissionActive(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "design review interrupted") {
 		t.Errorf("the user must be told the plan is unreviewed: %v", ui.infoMsgs)
+	}
+}
+
+// PR #11 review round 2: a resume carrying USER input must spend it on a
+// turn even under a pending review — the user's words are the mission's
+// correction channel (§5.5), and swallowing them behind a re-dispatch
+// would review a plan the user just tried to change. The amendment runs,
+// then the still-owing review, and the round is not re-spent.
+func TestDesignPhase_PendingReviewWithUserInputRunsTheTurnFirst(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, _, inputs := newDesignRepl(t, fake, []string{"# amended plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.DesignRound = 1
+	m.state.PendingReview = missionPhaseDesign
+	writeFileOrFatal(t, m.designPath(), "# original plan")
+	r.mission = m
+	r.missionPendingInput = "add X to the scope" // the user's correction
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("the amended plan's review passed; the mission must proceed")
+	}
+	if len(*inputs) != 1 || (*inputs)[0] != "add X to the scope" {
+		t.Fatalf("the user's words must reach exactly one turn, got %v", *inputs)
+	}
+	if m.state.DesignRound != 1 {
+		t.Fatalf("design_round = %d, want 1 — an amendment must not re-spend the round", m.state.DesignRound)
+	}
+	if m.state.PendingReview != "" {
+		t.Fatalf("pending_review = %q, want cleared once the review reported", m.state.PendingReview)
+	}
+	if m.state.Phase != missionPhaseImplement {
+		t.Fatal("the passing verdict must move the mission to implement")
+	}
+}
+
+// PR #11 review round 2: a Ctrl+C landing on the RE-DISPATCH of a pending
+// review must leave the flag standing on disk — clearing it before the
+// dispatch would drop the next resume back into turn-first mode and
+// rewrite a plan that is still one review away.
+func TestDesignPhase_InterruptedPendingReviewKeepsTheFlagOnDisk(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, ui, inputs := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.DesignRound = 1
+	m.state.PendingReview = missionPhaseDesign
+	if err := m.save(); err != nil {
+		t.Fatal(err)
+	}
+	writeFileOrFatal(t, m.designPath(), "# the plan one review away")
+	r.mission = m
+	ui.interruptDuringTask = true
+	fake.waitForCancel = true
+
+	r.runDesignPhase(context.Background())
+
+	if len(*inputs) != 0 {
+		t.Fatalf("ran %d design turns, want 0 — the pending review dispatches before any turn", len(*inputs))
+	}
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusActive {
+		t.Fatalf("status = %q, want active", reloaded.state.Status)
+	}
+	if reloaded.state.PendingReview != missionPhaseDesign {
+		t.Fatalf("pending_review = %q, want design — an interrupted re-dispatch still owes the review", reloaded.state.PendingReview)
 	}
 }
 

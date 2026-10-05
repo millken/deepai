@@ -5,11 +5,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"log/slog"
 	"time"
 
 	"charm.land/bubbles/v2/spinner"

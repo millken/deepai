@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
-	"github.com/millken/deepai/pkg/imageproc"
 	"github.com/millken/deepai/pkg/hook"
+	"github.com/millken/deepai/pkg/imageproc"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"

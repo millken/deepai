@@ -498,6 +498,63 @@ func TestImplementPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
 	}
 }
 
+// PR #11 review round 2: user input on a pending-review resume runs as an
+// amending turn FIRST — swallowing it behind the re-dispatch would review
+// a diff the user just tried to change.
+func TestImplementPhase_PendingReviewWithUserInputRunsTheTurnFirst(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package a")
+	m.state.PendingReview = missionPhaseImplement
+	var turnInputs []string
+	r.missionTurn = func(_ context.Context, in string) *turnError { turnInputs = append(turnInputs, in); return nil }
+	r.missionPendingInput = "also cover b.go" // the user's correction
+
+	r.runImplementPhase(context.Background())
+
+	if len(turnInputs) != 1 || turnInputs[0] != "also cover b.go" {
+		t.Fatalf("the user's words must reach exactly one turn, got %v", turnInputs)
+	}
+	if m.state.PendingReview != "" {
+		t.Fatalf("pending_review = %q, want cleared once the gate reported", m.state.PendingReview)
+	}
+	if m.state.Status != missionStatusDone {
+		t.Fatalf("status = %q, want done — the recovered review passed", m.state.Status)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "user amendment") {
+		t.Errorf("the user must be told their input ran as an amendment: %v", ui.infoMsgs)
+	}
+}
+
+// PR #11 review round 2: a Ctrl+C landing on the re-dispatch keeps the
+// pending flag on disk, so the next resume still enters through the gate.
+func TestImplementPhase_InterruptedPendingReviewKeepsTheFlagOnDisk(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package a")
+	m.state.PendingReview = missionPhaseImplement
+	if err := m.save(); err != nil {
+		t.Fatal(err)
+	}
+	turns := 0
+	r.missionTurn = func(_ context.Context, _ string) *turnError { turns++; return nil }
+	ui.interruptDuringTask = true
+	fake.waitForCancel = true
+
+	r.runImplementPhase(context.Background())
+
+	if turns != 0 {
+		t.Fatalf("ran %d implement turns, want 0 — the pending review dispatches before any turn", turns)
+	}
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusActive {
+		t.Fatalf("status = %q, want active", reloaded.state.Status)
+	}
+	if reloaded.state.PendingReview != missionPhaseImplement {
+		t.Fatalf("pending_review = %q, want implement — an interrupted re-dispatch still owes the review", reloaded.state.PendingReview)
+	}
+}
+
 // PR #11 review: a pending implementation review re-enters through the
 // GATE, not an "Implement it" turn — a fresh turn would edit a diff that
 // was one review away from passing (or failing) on its own merits.
