@@ -30,6 +30,15 @@ func newHTTPClient() *http.Client {
 		MaxConnsPerHost:     50,
 		IdleConnTimeout:     120 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
+		// ResponseHeaderTimeout bounds only the wait for the FIRST response
+		// byte — dial, TLS, and the server thinking before it starts
+		// streaming. Past that first byte the stream's own idle window
+		// (agent streamIdleTimeout, 2m by default) is the bound, so a
+		// legitimately long stream is never cut. Without this, a request
+		// that connects but never produces a first chunk can hang until the
+		// outer deadline — or forever when there is none: an unattended
+		// overnight mission once sat silent for 8h48m on exactly that.
+		ResponseHeaderTimeout: 5 * time.Minute,
 	}
 	return &http.Client{
 		// Do not set Client.Timeout for streaming LLM responses.

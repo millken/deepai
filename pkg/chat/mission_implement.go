@@ -95,6 +95,14 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 			r.ui.Info("  mission: done — the implementation passed an independent review")
 			r.leaveMission(missionStatusDone)
 			return false
+		case out.reviewFailed:
+			// The reviewer was unavailable, not unconvinced. The changes are
+			// unreviewed but belong to a live mission: keep it active so
+			// /mission re-runs the review, rather than forcing a successor
+			// mission to inherit the edits cold. Must sit BEFORE next==""
+			// — reviewFailed also carries an empty next.
+			r.ui.Info("  mission: review unavailable — the changes are UNREVIEWED; the mission stays active, /mission re-runs the review, /mission abort ends it")
+			return false
 		case out.next == "":
 			r.ui.Info("  mission: handed_over — the changes are in the worktree and did NOT pass a review; they need your judgment")
 			r.leaveMission(missionStatusHandedOver)
@@ -269,10 +277,14 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 	verdict, ok := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
 	if !ok {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
-		// un-write them, so the loop ends rather than looping — but as
-		// handed_over, never done. dispatchReview has already warned.
+		// un-write them, and nothing here may ever report them as reviewed.
+		// But the failure was the REVIEWER's outage (already retried once
+		// inside dispatchReview), not a review that rejected the change — so
+		// the mission stays active with the round unspent, and /mission
+		// re-runs the review. Handing over here once ended 20-hour runs on
+		// a single reviewer hiccup.
 		r.reviewPrev = nil
-		return gateResult{}
+		return gateResult{reviewFailed: true}
 	}
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})

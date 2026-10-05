@@ -372,6 +372,13 @@ type gateResult struct {
 	// pass verdict on a non-empty change set. Nothing else may be reported
 	// as a reviewed success.
 	passed bool
+	// reviewFailed marks a fail-soft REVIEWER FAILURE — the gate could not
+	// obtain a verdict at all (and has already retried once). It is not a
+	// pass, not a round cap, not idleness, and the mission loop must not
+	// hand the work over for it: the changes are unreviewed because the
+	// reviewer was unavailable, not because a review rejected them, so the
+	// mission stays active and /mission re-runs the review.
+	reviewFailed bool
 }
 
 // reviewGate decides, after a completed turn, whether the episode continues
@@ -539,6 +546,13 @@ func verdictSummary(v *agent.ReviewResult) string {
 // the parsed verdict. ok=false is the fail-soft path: interrupted, timed
 // out, tool failure, tampered worktree, or unparseable output — all warned,
 // none fatal (design §六-1).
+//
+// Transient failures (a dropped connection, one malformed verdict) get ONE
+// retry before fail-soft gives up: two 20-hour missions once ended
+// handed_over on the reviewer's first hiccup. The DETERMINISTIC failures —
+// user interruption, the reviewer's own deadline, a tampered worktree — do
+// not retry: re-running them either defies the user or reproduces the same
+// outcome on the same inputs.
 func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, contextFiles []string, preReview worktreeSnapshot) (*agent.ReviewResult, bool) {
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {
@@ -599,61 +613,74 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 
 	var result models.ToolResult
 	var execErr error
-	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-			r.ui.RenderSubagentEvent(evt)
+	var turnErr *turnError
+	for attempt := 0; ; attempt++ {
+		result = models.ToolResult{}
+		execErr = nil
+		turnErr = r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+				r.ui.RenderSubagentEvent(evt)
+			})
+			result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
+				ID:        fmt.Sprintf("review-t%d-%d", r.turn, time.Now().UnixNano()),
+				Name:      "task",
+				Arguments: args,
+			})
+			return nil // review failures are fail-soft, never a turn error
 		})
-		result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
-			ID:        fmt.Sprintf("review-t%d-%d", r.turn, time.Now().UnixNano()),
-			Name:      "task",
-			Arguments: args,
-		})
-		return nil // review failures are fail-soft, never a turn error
-	})
-	// Every caller resolves this reviewer outside a live turn: the gate and
-	// the mission loop run AFTER TurnEnd has committed, and /review and the
-	// PR loop dispatch with no turn at all — so turnEndMsg is never a commit
-	// point for this fan-out line. Flush it or the resolved reviewer stays
-	// pinned in the live region until some later turn happens to end.
-	r.ui.FlushSubagentBlock()
+		// Every caller resolves this reviewer outside a live turn: the gate and
+		// the mission loop run AFTER TurnEnd has committed, and /review and the
+		// PR loop dispatch with no turn at all — so turnEndMsg is never a commit
+		// point for this fan-out line. Flush it or the resolved reviewer stays
+		// pinned in the live region until some later turn happens to end.
+		r.ui.FlushSubagentBlock()
 
-	// Reviewer-write defense runs FIRST, before any trust decision — a
-	// timed-out reviewer may still have written the tree (design §4.4 B4:
-	// bash is unsandboxed; this snapshot is the only hard line).
-	if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
-		r.ui.Info(fmt.Sprintf(
-			"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
-			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, false
-	}
-	if turnErr != nil && turnErr.cancelled {
-		r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
-		return nil, false
-	}
-	if execErr != nil {
-		// The reviewer's own deadline is the most common failure here and the
-		// only one the user can act on, so name the window that ran out and
-		// where to widen it instead of reporting a bare
-		// "context deadline exceeded".
-		if errors.Is(execErr, context.DeadlineExceeded) {
+		// Reviewer-write defense runs FIRST, before any trust decision — a
+		// timed-out reviewer may still have written the tree (design §4.4 B4:
+		// bash is unsandboxed; this snapshot is the only hard line).
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
-				"  review: reviewer hit its %s deadline — changes are unreviewed (raise review_timeout in config.yaml, or narrow the change)",
-				timeout))
+				"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
+				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
 			return nil, false
 		}
-		r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — changes are unreviewed", execErr))
-		return nil, false
-	}
+		if turnErr != nil && turnErr.cancelled {
+			r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
+			return nil, false
+		}
+		if execErr != nil {
+			// The reviewer's own deadline is the most common failure here and the
+			// only one the user can act on, so name the window that ran out and
+			// where to widen it instead of reporting a bare
+			// "context deadline exceeded".
+			if errors.Is(execErr, context.DeadlineExceeded) {
+				r.ui.Info(fmt.Sprintf(
+					"  review: reviewer hit its %s deadline — changes are unreviewed (raise review_timeout in config.yaml, or narrow the change)",
+					timeout))
+				return nil, false
+			}
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — retrying once", execErr))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — changes are unreviewed", execErr))
+			return nil, false
+		}
 
-	schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
-	verdict, err := agent.ParseOutput[agent.ReviewResult](schema, result.Content)
-	if err != nil {
-		r.ui.Info(fmt.Sprintf("  review: verdict unparseable (%v) — changes are unreviewed", err))
-		return nil, false
+		schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
+		verdict, err := agent.ParseOutput[agent.ReviewResult](schema, result.Content)
+		if err != nil {
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  review: verdict unparseable (%v) — retrying once", err))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  review: verdict unparseable (%v) — changes are unreviewed", err))
+			return nil, false
+		}
+		return verdict, true
 	}
-	return verdict, true
 }
 
 // reviewPromptInput is everything the reviewer's seed message is built from.

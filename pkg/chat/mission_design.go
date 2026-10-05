@@ -107,10 +107,19 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			// cannot un-write them, so the gate lets them through with a
 			// warning. Here nothing has been implemented yet, and letting an
 			// unreviewed plan through would skip the whole first half of the
-			// loop — so the mission stops and the plan goes to the user.
+			// loop — so nothing is implemented from it. But the failure was
+			// the REVIEWER's outage, not the plan's: the mission STAYS
+			// ACTIVE with this round refunded (a round the review never ran
+			// must not eat one of the three), and /mission re-runs the
+			// review on the unchanged plan. Ending here as handed_over once
+			// threw away live runs on a single reviewer hiccup.
+			m.setDesignRound(round - 1)
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
 			r.ui.Info("  mission: design review unavailable — NOT implementing; the plan is at " + m.designPath())
 			r.warnUnreviewedImplementation()
-			r.leaveMission(missionStatusHandedOver)
+			r.ui.Info("  mission: the mission stays active — /mission re-runs the review, /mission abort ends it")
 			return false
 		}
 
@@ -300,6 +309,11 @@ type designReviewInput struct {
 // the mission with the plan in the user's hands, while a review the user
 // INTERRUPTED says nothing at all, so the mission stays active and the next
 // message resumes it.
+//
+// Transient failures (a dropped connection, one malformed verdict) get ONE
+// retry before fail-soft gives up — a mission once ended on the reviewer's
+// first hiccup with design rounds still unspent. Deterministic failures
+// (interruption, deadline, tampering) do not retry.
 func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, plan string, prev *agent.DesignReviewResult, round int) (verdict *agent.DesignReviewResult, ok bool, cancelled bool) {
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {
@@ -343,46 +357,59 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 
 	var result models.ToolResult
 	var execErr error
-	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-			r.ui.RenderSubagentEvent(evt)
+	var turnErr *turnError
+	for attempt := 0; ; attempt++ {
+		result = models.ToolResult{}
+		execErr = nil
+		turnErr = r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+				r.ui.RenderSubagentEvent(evt)
+			})
+			result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
+				ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
+				Name:      "task",
+				Arguments: args,
+			})
+			return nil // review failures are fail-soft, never a turn error
 		})
-		result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
-			ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
-			Name:      "task",
-			Arguments: args,
-		})
-		return nil // review failures are fail-soft, never a turn error
-	})
 
-	if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
-		r.ui.Info(fmt.Sprintf(
-			"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
-			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, false, false
-	}
-	if turnErr != nil && turnErr.cancelled {
-		return nil, false, true
-	}
-	if execErr != nil {
-		if errors.Is(execErr, context.DeadlineExceeded) {
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
-				"  mission: design review hit its %s deadline — the plan is unreviewed (raise review_timeout in config.yaml)", timeout))
+				"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
+				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
 			return nil, false, false
 		}
-		r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — the plan is unreviewed", execErr))
-		return nil, false, false
-	}
+		if turnErr != nil && turnErr.cancelled {
+			return nil, false, true
+		}
+		if execErr != nil {
+			if errors.Is(execErr, context.DeadlineExceeded) {
+				r.ui.Info(fmt.Sprintf(
+					"  mission: design review hit its %s deadline — the plan is unreviewed (raise review_timeout in config.yaml)", timeout))
+				return nil, false, false
+			}
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — retrying once", execErr))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — the plan is unreviewed", execErr))
+			return nil, false, false
+		}
 
-	schema := agent.GetAgentTypeConfig(agent.AgentTypeDesignReviewer).OutputSchema
-	parsed, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
-	if err != nil {
-		r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — the plan is unreviewed", err))
-		return nil, false, false
+		schema := agent.GetAgentTypeConfig(agent.AgentTypeDesignReviewer).OutputSchema
+		parsed, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
+		if err != nil {
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — retrying once", err))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — the plan is unreviewed", err))
+			return nil, false, false
+		}
+		return parsed, true, false
 	}
-	return parsed, true, false
 }
 
 // designPlanPromptCap bounds how much of the plan goes into the reviewer's

@@ -22,13 +22,19 @@ const sessionMissionKey = "mission_id"
 //
 //	/mission <text>   start a new mission from <text>
 //	/mission          resume THIS session's active mission
+//	/mission resume   same as a bare /mission (explicit spelling)
 //	/mission abort    end it (nothing is rolled back)
 //	/mission status   print phase, rounds and charter summary
 //
 // Free-form subcommands are deliberately NOT accepted as "extra instructions
 // for the running mission" (§5.7): mid-turn steering is not in this design,
 // and silently treating a sentence as a new mission would be worse than
-// saying what the command does.
+// saying what the command does. "resume"/"continue"/"继续" are the one
+// exception — reserved words, not free-form text. A live run lost a 20-hour
+// mission to this exact hole: `/mission resume` meant to continue the active
+// mission, but "resume" fell through to startMission as the LITERAL brief,
+// aborting the running mission and leaving its successor to reconstruct the
+// task from the wreckage on disk.
 func (r *ChatRepl) handleMissionCommand(parentCtx context.Context, args string) {
 	arg := strings.TrimSpace(args)
 	switch strings.ToLower(arg) {
@@ -44,6 +50,8 @@ func (r *ChatRepl) handleMissionCommand(parentCtx context.Context, args string) 
 	case "status":
 		r.ui.Info(r.missionStatusText())
 		return
+	case "resume", "continue", "继续":
+		arg = "" // an explicit resume word is a bare /mission, never a brief
 	}
 
 	if arg == "" {

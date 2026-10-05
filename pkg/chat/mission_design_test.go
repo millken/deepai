@@ -183,9 +183,13 @@ func TestDesignOutcome(t *testing.T) {
 }
 
 // §六-1: design-side fail-soft is the opposite of the implementation gate's.
-// Nothing has been written yet, so an unavailable review must STOP the
-// mission rather than let an unreviewed plan through to implementation.
-func TestDesignPhase_ReviewFailSoftDoesNotImplement(t *testing.T) {
+// Nothing has been written yet, so an unavailable review must never let an
+// unreviewed plan through to implementation. But the outage was the
+// REVIEWER's, not the plan's: the mission stays ACTIVE with the round
+// refunded, so /mission re-runs the review instead of the user rebuilding
+// from a handed_over corpse — two 20-hour live runs once ended exactly
+// there.
+func TestDesignPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
 	fake := &fakeTaskTool{content: "not json at all"}
 	r, ui, _ := newDesignRepl(t, fake, []string{"# plan"})
 	m, _ := createMission(r.cfg.WorkDir, "brief")
@@ -194,12 +198,22 @@ func TestDesignPhase_ReviewFailSoftDoesNotImplement(t *testing.T) {
 	if r.runDesignPhase(context.Background()) {
 		t.Fatal("an unreviewed plan must never reach implementation")
 	}
-	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.Status; got != missionStatusHandedOver {
-		t.Fatalf("status = %q, want handed_over", got)
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusActive {
+		t.Fatalf("status = %q, want active — a reviewer outage must not end the mission", reloaded.state.Status)
+	}
+	if reloaded.state.DesignRound != 0 {
+		t.Fatalf("design_round = %d, want 0 — a round whose review never ran must be refunded", reloaded.state.DesignRound)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("dispatched %d reviews, want 2 (the attempt plus the one retry)", fake.calls)
 	}
 	joined := strings.Join(ui.infoMsgs, "\n")
 	if !strings.Contains(joined, "unparseable") || !strings.Contains(joined, "NOT implementing") {
 		t.Errorf("the user must be told the plan is unreviewed and nothing was built: %q", joined)
+	}
+	if !strings.Contains(joined, "stays active") {
+		t.Errorf("the user must be told how to resume: %q", joined)
 	}
 }
 
@@ -394,6 +408,30 @@ func TestDesignPhase_InterruptedReviewKeepsTheMissionActive(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "design review interrupted") {
 		t.Errorf("the user must be told the plan is unreviewed: %v", ui.infoMsgs)
+	}
+}
+
+// The retry is not merely a second chance to fail: a transient first
+// attempt (one malformed verdict) followed by a good one must carry the
+// mission straight through to the charter lock — no round spent on the
+// hiccup, no handed_over.
+func TestDesignPhase_RetryRecoversATransientReviewFailure(t *testing.T) {
+	fake := &fakeTaskTool{contents: []string{"not json at all", designPassJSON()}}
+	r, _, _ := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("a review that recovered on the retry must let the mission proceed")
+	}
+	if fake.calls != 2 {
+		t.Fatalf("dispatched %d reviews, want 2 (the failed attempt plus the retry)", fake.calls)
+	}
+	if m.state.Phase != missionPhaseImplement {
+		t.Fatalf("phase = %q, want implement", m.state.Phase)
+	}
+	if m.charter == nil {
+		t.Fatal("the passing verdict must have locked a charter")
 	}
 }
 

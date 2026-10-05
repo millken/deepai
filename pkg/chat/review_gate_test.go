@@ -22,7 +22,11 @@ type fakeTaskTool struct {
 	calls   int
 	args    map[string]any
 	content string
-	err     error
+	// contents, when set, is indexed by call number and takes precedence
+	// over content — used to make the FIRST dispatch fail transiently and
+	// the retry succeed (the fail-soft retry paths).
+	contents []string
+	err      error
 	// sideEffect runs inside the handler — used to simulate a reviewer
 	// writing the worktree during the review.
 	sideEffect func()
@@ -51,7 +55,11 @@ func (f *fakeTaskTool) registry(t *testing.T) *tools.Registry {
 			if f.err != nil {
 				return models.ToolResult{}, f.err
 			}
-			return models.ToolResult{Content: f.content, Status: models.CallStatusCompleted}, nil
+			content := f.content
+			if len(f.contents) > 0 {
+				content = f.contents[min(f.calls, len(f.contents))-1]
+			}
+			return models.ToolResult{Content: content, Status: models.CallStatusCompleted}, nil
 		},
 	})
 	if err != nil {

@@ -465,6 +465,35 @@ func TestImplementPhase_InterruptedTurnLeavesTheMissionActive(t *testing.T) {
 	}
 }
 
+// A reviewer outage is not a review verdict: after the retry also fails the
+// mission stays ACTIVE with the round unspent, so /mission re-runs the
+// review — instead of handing over 20 hours of work because the reviewer
+// blinked twice.
+func TestImplementPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
+	fake := &fakeTaskTool{content: "not json at all"}
+	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package a")
+	r.missionTurn = func(_ context.Context, _ string) *turnError { return nil }
+
+	if r.runImplementPhase(context.Background()) {
+		t.Fatal("a reviewer outage does not change phase")
+	}
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusActive {
+		t.Fatalf("status = %q, want active — a reviewer outage must not hand the work over", reloaded.state.Status)
+	}
+	if reloaded.state.ImplementRound != 0 {
+		t.Fatalf("implement_round = %d, want 0 — a review that never ran must not spend the round", reloaded.state.ImplementRound)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("dispatched %d reviews, want 2 (the attempt plus the one retry)", fake.calls)
+	}
+	joined := strings.Join(ui.infoMsgs, "\n")
+	if !strings.Contains(joined, "UNREVIEWED") || !strings.Contains(joined, "stays active") {
+		t.Errorf("the user must be told the changes are unreviewed and how to resume: %q", joined)
+	}
+}
+
 // A purely conversational implementation phase must never end as done.
 func TestImplementPhase_TalkingOnlyHandsOverNotDone(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}

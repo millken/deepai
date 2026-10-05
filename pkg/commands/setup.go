@@ -29,7 +29,7 @@ type Config struct {
 	DatabaseURL    string `yaml:"database_url,omitempty"`
 	ContextWindow  int    `yaml:"context_window,omitempty"`
 	BaseURL        string `yaml:"base_url,omitempty"`
-	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes (default 30)
+	RequestTimeout int    `yaml:"request_timeout,omitempty"` // agent request timeout in minutes; 0 or absent = unlimited (bounded only by Ctrl+C/context)
 	// ReasoningEffort sets the default reasoning effort for models that support it
 	// (e.g., Claude's "thinking" feature). Valid values: "low", "medium", "high", "disabled".
 	// Empty means provider default. Model-level config overrides this.
