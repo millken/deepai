@@ -2,7 +2,6 @@ package chat
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,6 +29,16 @@ import (
 // true, mission now in the implementation phase) or the mission ends
 // (returns false — leaveMission has already run, or the turn was
 // interrupted and the mission stays active for a later /mission).
+//
+// A pending review (PendingReview==design) re-enters through the gate
+// rather than a fresh turn: the previous run's turn completed but its
+// review never ran, and an ordinary design turn would rewrite a plan that
+// was one review away from the gate. A resume carrying USER input is the
+// exception — the user's words are the mission's correction channel
+// (§5.5), so they get a turn (amending the plan) and the amended plan then
+// takes the still-owing review. The pending flag is cleared only AFTER the
+// review reports, so a crash or a Ctrl+C mid-review leaves it standing
+// (PR #11 review round 2).
 func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 	m := r.mission
 	escalated := m.state.Escalation > 0
@@ -38,70 +47,146 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 		maxRounds = maxEscalatedDesignRounds
 	}
 
-	input := r.missionDesignInput()
+	// hasUserInput survives the whole phase entry: a resume that carried
+	// user words must spend them on a turn even under a pending review —
+	// the user's message is the mission's correction channel (§5.5), and
+	// swallowing it behind a re-dispatch would review a plan the user just
+	// tried to change (PR #11 review round 2).
+	hasUserInput := strings.TrimSpace(r.missionPendingInput) != ""
+	input := r.missionDesignInput() // consumes missionPendingInput when set
 	var prev *agent.DesignReviewResult
 
 	for {
-		round := m.designRound() + 1
-		if round > maxRounds {
-			r.failDesign(nil, maxRounds)
-			return false
-		}
+		// Three ways into a round. An ordinary one spends a new round on a
+		// turn. A pending review with no user input dispatches the gate on
+		// the UNCHANGED plan — the previous run's turn completed but its
+		// review never ran, and a fresh turn (missionDesignFirstMessage
+		// says "replace the whole file") would rewrite a plan that was one
+		// review away from the gate. A pending review WITH user input runs
+		// the user's turn as an amendment to this round's plan and then
+		// takes the still-owing review; the round is not re-spent, because
+		// its turn already ran once.
+		pendingReview := m.state.PendingReview == missionPhaseDesign
+		var plan string
+		round := 0
 
-		// Force plan mode by PHASE, every turn, before the Agent is built
-		// (R10/R21). Flipping only at transitions is not enough: a stray
-		// enter_plan_mode or exit_plan_mode changes the REPL's flag through
-		// the post-turn readback, and the next turn would then run with the
-		// wrong tool set — read-only while implementing, or writable while
-		// designing.
-		r.applyMissionTurnMode(missionPhaseDesign)
-		r.ui.Info(fmt.Sprintf("  mission: design phase (%s %d/%d)", roundLabel(escalated), round, maxRounds))
-
-		turnErr := r.runMissionTurn(parentCtx, input)
-		if turnErr != nil {
-			// An interrupted or errored turn leaves a half-written plan;
-			// reviewing it would burn a round on an artifact the author was
-			// not done with. The mission stays active — /mission resumes.
-			if turnErr.cancelled {
-				r.ui.Info("  mission: design turn interrupted — no design review ran; /mission resumes, /mission abort ends it")
-			} else {
-				r.ui.Info(fmt.Sprintf("  mission: design turn failed (%v) — no design review ran", turnErr))
+		if pendingReview {
+			round = m.designRound() // the round was already spent by its turn
+			plan = strings.TrimSpace(m.readDesign())
+			if plan == "" {
+				pendingReview = false // plan vanished; an ordinary turn must rewrite it
 			}
-			return false
 		}
-		// The round is spent only by a turn that actually completed —
-		// matching the implementation phase, where ImplementRound moves
-		// when a fix round is issued, not when a turn is interrupted. A
-		// Ctrl+C that already costs the user its work must not also cost
-		// the mission one of its three chances to get the plan right.
-		m.setDesignRound(round)
-		if err := m.save(); err != nil {
-			r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
-		}
-
-		plan := strings.TrimSpace(m.readDesign())
-		if plan == "" {
-			m.appendReview(missionReviewRecord{Phase: "design", Round: round, Verdict: "empty", Summary: "no plan was written"})
-			if round >= maxRounds {
+		if !pendingReview {
+			round = m.designRound() + 1
+			// The pending path skips this check deliberately: the round it
+			// belongs to was already spent by its turn, so a 3/3-exhausted
+			// plan whose review never ran must still get that review, not a
+			// failDesign on arrival.
+			if round > maxRounds {
 				r.failDesign(nil, maxRounds)
 				return false
 			}
-			r.ui.Info("  mission: no plan written yet — asking again")
-			input = missionEmptyPlanMessage(round+1, maxRounds, escalated, m.designPath())
-			continue
 		}
 
-		verdict, ok, cancelled := r.dispatchDesignReview(parentCtx, m, plan, prev, round)
-		if cancelled {
+		if !pendingReview || hasUserInput {
+			// Force plan mode by PHASE, every turn, before the Agent is built
+			// (R10/R21). Flipping only at transitions is not enough: a stray
+			// enter_plan_mode or exit_plan_mode changes the REPL's flag through
+			// the post-turn readback, and the next turn would then run with the
+			// wrong tool set — read-only while implementing, or writable while
+			// designing.
+			r.applyMissionTurnMode(missionPhaseDesign)
+			if pendingReview {
+				r.ui.Info(fmt.Sprintf("  mission: design phase — user amendment to %s %d/%d, then its pending review",
+					roundLabel(escalated), round, maxRounds))
+			} else {
+				r.ui.Info(fmt.Sprintf("  mission: design phase (%s %d/%d)", roundLabel(escalated), round, maxRounds))
+			}
+
+			turnErr := r.runMissionTurn(parentCtx, input)
+			if turnErr != nil {
+				// An interrupted or errored turn leaves a half-written plan;
+				// reviewing it would burn a round on an artifact the author was
+				// not done with. The mission stays active — /mission resumes.
+				// The pending flag is untouched on disk, so a later resume
+				// still gets its review-first entry.
+				if turnErr.cancelled {
+					r.ui.Info("  mission: design turn interrupted — no design review ran; /mission resumes, /mission abort ends it")
+				} else {
+					r.ui.Info(fmt.Sprintf("  mission: design turn failed (%v) — no design review ran", turnErr))
+				}
+				return false
+			}
+			// The round is spent only by a turn that actually completed —
+			// matching the implementation phase, where ImplementRound moves
+			// when a fix round is issued, not when a turn is interrupted. A
+			// Ctrl+C that already costs the user its work must not also cost
+			// the mission one of its three chances to get the plan right.
+			// An amendment turn does not move it either: its round was
+			// already spent the first time through.
+			if !pendingReview {
+				m.setDesignRound(round)
+				if err := m.save(); err != nil {
+					r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+				}
+			}
+
+			plan = strings.TrimSpace(m.readDesign())
+			if plan == "" {
+				m.appendReview(missionReviewRecord{Phase: "design", Round: round, Verdict: "empty", Summary: "no plan was written"})
+				if pendingReview {
+					// The amendment wiped the plan; the owing review has
+					// nothing to act on, so retire the flag and let the
+					// ordinary empty-plan flow ask for a rewrite.
+					pendingReview = false
+					m.state.PendingReview = ""
+					if err := m.save(); err != nil {
+						r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+					}
+				}
+				if round >= maxRounds {
+					r.failDesign(nil, maxRounds)
+					return false
+				}
+				r.ui.Info("  mission: no plan written yet — asking again")
+				input = missionEmptyPlanMessage(round+1, maxRounds, escalated, m.designPath())
+				hasUserInput = false
+				continue
+			}
+			hasUserInput = false // consumed by this turn
+		} else {
+			r.ui.Info(fmt.Sprintf("  mission: re-running the design review on the unchanged plan (%s %d/%d)",
+				roundLabel(escalated), round, maxRounds))
+		}
+
+		verdict, outcome := r.dispatchDesignReview(parentCtx, m, plan, prev, round)
+
+		// Retire the pending flag only AFTER the review has reported. Clearing
+		// it before the dispatch meant a crash mid-review, or a user Ctrl+C
+		// landing on it, left the flag gone from disk while the review never
+		// happened — the next resume would drop back into turn-first mode and
+		// rewrite the plan (PR #11 review round 2). Transient re-sets it
+		// below; interrupted leaves it standing; every other outcome —
+		// including the terminal ones — retires it here.
+		if pendingReview && outcome != reviewInterrupted && outcome != reviewFailedTransient {
+			m.state.PendingReview = ""
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+		}
+
+		switch outcome {
+		case reviewInterrupted:
 			// Ctrl+C landed on the REVIEW, not on the plan. Nothing is
 			// wrong with the mission and nothing has been implemented, so
 			// it stays active and the user can simply resume — ending it
 			// here would throw away a finished plan because the user
-			// interrupted the thing reading it.
+			// interrupted the thing reading it. The pending flag survives
+			// on disk, so that resume goes through the gate first.
 			r.ui.Info("  mission: design review interrupted — the plan was NOT reviewed; your next message resumes the mission, /mission abort ends it")
 			return false
-		}
-		if !ok {
+		case reviewFailedTerminal:
 			// Design-side fail-soft is the OPPOSITE of the implementation
 			// gate's (§六-1): there, the edits already exist and stopping
 			// cannot un-write them, so the gate lets them through with a
@@ -111,6 +196,19 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			r.ui.Info("  mission: design review unavailable — NOT implementing; the plan is at " + m.designPath())
 			r.warnUnreviewedImplementation()
 			r.leaveMission(missionStatusHandedOver)
+			return false
+		case reviewFailedTransient:
+			// Nothing is implemented, but the failure was the REVIEWER's
+			// outage (already retried once), not the plan's: mark the review
+			// pending and stay active. /mission re-dispatches the gate on
+			// the unchanged plan BEFORE any new turn (PR #11 review).
+			m.state.PendingReview = missionPhaseDesign
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+			r.ui.Info("  mission: design review unavailable — NOT implementing; the plan is at " + m.designPath())
+			r.warnUnreviewedImplementation()
+			r.ui.Info("  mission: the mission stays active — /mission re-runs the review on the unchanged plan, /mission abort ends it")
 			return false
 		}
 
@@ -291,16 +389,15 @@ type designReviewInput struct {
 
 // dispatchDesignReview runs one design-reviewer subagent through the same
 // task-tool chain the correctness reviewer uses (pool, schema validation,
-// progress events). ok=false is the fail-soft path — timed out, tool
-// failure, tampered worktree, unparseable output — and the caller then
-// refuses to implement.
+// progress events). Every non-OK outcome is fail-soft and already warned,
+// and the outcome class carries what runDesignPhase needs to know — the
+// same three-way split runReview reports (see reviewOutcome).
 //
-// cancelled is reported separately from ok because the two deserve opposite
-// treatment: a review that FAILED tells us nothing about the plan and ends
-// the mission with the plan in the user's hands, while a review the user
-// INTERRUPTED says nothing at all, so the mission stays active and the next
-// message resumes it.
-func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, plan string, prev *agent.DesignReviewResult, round int) (verdict *agent.DesignReviewResult, ok bool, cancelled bool) {
+// Transient failures (a dropped connection, one malformed verdict) get ONE
+// retry before fail-soft gives up — a mission once ended on the reviewer's
+// first hiccup with design rounds still unspent. Deterministic failures
+// (interruption, deadline, tampering) do not retry.
+func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, plan string, prev *agent.DesignReviewResult, round int) (*agent.DesignReviewResult, reviewOutcome) {
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
@@ -343,46 +440,59 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 
 	var result models.ToolResult
 	var execErr error
-	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-			r.ui.RenderSubagentEvent(evt)
+	var turnErr *turnError
+	for attempt := 0; ; attempt++ {
+		result = models.ToolResult{}
+		execErr = nil
+		turnErr = r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+				r.ui.RenderSubagentEvent(evt)
+			})
+			result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
+				ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
+				Name:      "task",
+				Arguments: args,
+			})
+			return nil // review failures are fail-soft, never a turn error
 		})
-		result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
-			ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
-			Name:      "task",
-			Arguments: args,
-		})
-		return nil // review failures are fail-soft, never a turn error
-	})
 
-	if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
-		r.ui.Info(fmt.Sprintf(
-			"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
-			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, false, false
-	}
-	if turnErr != nil && turnErr.cancelled {
-		return nil, false, true
-	}
-	if execErr != nil {
-		if errors.Is(execErr, context.DeadlineExceeded) {
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
-				"  mission: design review hit its %s deadline — the plan is unreviewed (raise review_timeout in config.yaml)", timeout))
-			return nil, false, false
+				"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
+				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
+			return nil, reviewFailedTerminal
 		}
-		r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — the plan is unreviewed", execErr))
-		return nil, false, false
-	}
+		if turnErr != nil && turnErr.cancelled {
+			return nil, reviewInterrupted
+		}
+		if execErr != nil {
+			if isReviewDeadline(execErr) {
+				r.ui.Info(fmt.Sprintf(
+					"  mission: design review hit its %s deadline — the plan is unreviewed (raise review_timeout in config.yaml)", timeout))
+				return nil, reviewFailedTerminal
+			}
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — retrying once", execErr))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  mission: design review failed (%v) — the plan is unreviewed", execErr))
+			return nil, reviewFailedTransient
+		}
 
-	schema := agent.GetAgentTypeConfig(agent.AgentTypeDesignReviewer).OutputSchema
-	parsed, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
-	if err != nil {
-		r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — the plan is unreviewed", err))
-		return nil, false, false
+		schema := agent.GetAgentTypeConfig(agent.AgentTypeDesignReviewer).OutputSchema
+		parsed, err := agent.ParseOutput[agent.DesignReviewResult](schema, result.Content)
+		if err != nil {
+			if attempt == 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — retrying once", err))
+				continue
+			}
+			r.ui.Info(fmt.Sprintf("  mission: design verdict unparseable (%v) — the plan is unreviewed", err))
+			return nil, reviewFailedTransient
+		}
+		return parsed, reviewOK
 	}
-	return parsed, true, false
 }
 
 // designPlanPromptCap bounds how much of the plan goes into the reviewer's

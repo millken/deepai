@@ -472,6 +472,11 @@ func isTransientStreamError(err error) bool {
 	needles := []string{
 		"unexpected end of json input", "unexpected eof", "eof",
 		"connection reset", "connection refused", "broken pipe", "no such host",
+		// ResponseHeaderTimeout's exact wording — without this needle a
+		// 5-minute queue at the provider is a hard failure instead of a
+		// reconnect, and the heartbeat-based retry never engages (PR #11
+		// review).
+		"timeout awaiting response headers",
 		"api_error", "overloaded", "internal server error", "service unavailable",
 		"bad gateway", "gateway timeout", "upstream",
 		"rate limit", "rate_limit",

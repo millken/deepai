@@ -24,6 +24,12 @@ import (
 // runImplementPhase returns true when the mission continues in ANOTHER phase
 // (an escalation put it back in design) and false when the mission ended or
 // the turn was interrupted.
+//
+// A pending review (PendingReview==implement) re-enters through the gate
+// on the unchanged diff, except when the resume carried USER input — that
+// input runs as an amending turn first (§5.5's correction channel), and
+// the amended diff then takes the still-owing review. The pending flag is
+// cleared only AFTER the gate reports (PR #11 review round 2).
 func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 	m := r.mission
 	if m.charter == nil {
@@ -53,7 +59,11 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 	// A user message that resumed the mission is this turn's input: it is
 	// the one channel for correcting a running mission (§5.7 leaves
 	// mid-turn steering out of scope), and the phase gate still runs behind
-	// it. Otherwise the phase opens with its own charter briefing.
+	// it. Otherwise the phase opens with its own charter briefing. A resume
+	// carrying user words spends them on a turn even under a pending
+	// review — swallowing them behind a re-dispatch would review a diff
+	// the user just tried to change (PR #11 review round 2).
+	hasUserInput := strings.TrimSpace(r.missionPendingInput) != ""
 	input := r.missionPendingInput
 	r.missionPendingInput = ""
 	if input == "" {
@@ -61,20 +71,39 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 	}
 	for {
 		round := m.state.ImplementRound
-		r.applyMissionTurnMode(missionPhaseImplement)
-		r.ui.Info(fmt.Sprintf("  mission: implement phase (review round %d/%d)", round, maxReviewRounds))
 
-		turnErr := r.runMissionTurn(parentCtx, input)
-		if turnErr != nil {
-			// Same rule as an episode: a turn that was interrupted or
-			// errored left incomplete edits, and reviewing those is
-			// meaningless. The mission stays active for /mission.
-			if turnErr.cancelled {
-				r.ui.Info("  mission: implement turn interrupted — the changes so far are UNREVIEWED; /mission resumes, /mission abort ends it")
+		// A pending review with no user input re-enters through the gate,
+		// not a turn: the previous run's turn completed but its review
+		// never ran, and a fresh "Implement it" turn would edit a diff that
+		// was one review away from the gate (PR #11 review). The pending
+		// flag is cleared only AFTER the gate reports — below.
+		pendingReview := m.state.PendingReview == missionPhaseImplement
+		if pendingReview && !hasUserInput {
+			r.ui.Info("  mission: re-running the implementation review on the unchanged changes")
+		} else {
+			if pendingReview {
+				r.ui.Info(fmt.Sprintf("  mission: implement phase — user amendment (review round %d/%d), then its pending review",
+					round, maxReviewRounds))
 			} else {
-				r.ui.Info(fmt.Sprintf("  mission: implement turn failed (%v) — the changes so far are UNREVIEWED", turnErr))
+				r.ui.Info(fmt.Sprintf("  mission: implement phase (review round %d/%d)", round, maxReviewRounds))
 			}
-			return false
+			r.applyMissionTurnMode(missionPhaseImplement)
+
+			turnErr := r.runMissionTurn(parentCtx, input)
+			if turnErr != nil {
+				// Same rule as an episode: a turn that was interrupted or
+				// errored left incomplete edits, and reviewing those is
+				// meaningless. The mission stays active for /mission. The
+				// pending flag is untouched on disk, so a later resume still
+				// gets its review-first entry.
+				if turnErr.cancelled {
+					r.ui.Info("  mission: implement turn interrupted — the changes so far are UNREVIEWED; /mission resumes, /mission abort ends it")
+				} else {
+					r.ui.Info(fmt.Sprintf("  mission: implement turn failed (%v) — the changes so far are UNREVIEWED", turnErr))
+				}
+				return false
+			}
+			hasUserInput = false // consumed by this turn
 		}
 
 		// before = S_impl, the PHASE baseline, never a per-turn snapshot
@@ -82,6 +111,21 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		// done, so a file the previous turn put out of scope stays a
 		// violation until it is actually reverted.
 		out := r.missionReviewGate(parentCtx, round)
+
+		// Retire the pending flag only AFTER the gate has reported. Clearing
+		// it before the dispatch meant a crash mid-review, or a Ctrl+C
+		// landing on it, left the flag gone from disk while the review never
+		// happened — the next resume would drop back into turn-first mode
+		// and edit the one-review-away diff (PR #11 review round 2).
+		// Transient re-sets it in the switch below; interrupted leaves it
+		// standing; every other gate outcome — scope-fix, idle, escalation,
+		// pass, terminal — has consumed the owing review or superseded it.
+		if pendingReview && !out.reviewFailed && !out.reviewInterrupted {
+			m.state.PendingReview = ""
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+		}
 
 		switch {
 		case out.escalate != "":
@@ -94,6 +138,25 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 			}
 			r.ui.Info("  mission: done — the implementation passed an independent review")
 			r.leaveMission(missionStatusDone)
+			return false
+		case out.reviewFailed:
+			// The reviewer was unavailable, not unconvinced. The changes are
+			// unreviewed but belong to a live mission: mark the review
+			// pending and keep it active, so /mission re-runs the review on
+			// the UNCHANGED diff rather than running a fresh implement turn
+			// over it. Must sit BEFORE next=="" — reviewFailed also carries
+			// an empty next.
+			m.state.PendingReview = missionPhaseImplement
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+			r.ui.Info("  mission: review unavailable — the changes are UNREVIEWED; the mission stays active, /mission re-runs the review, /mission abort ends it")
+			return false
+		case out.reviewInterrupted:
+			// The user cancelled the review: same rule the design gate has
+			// always had — nothing is wrong with the work, the mission stays
+			// active and the next message resumes it.
+			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message resumes the mission, /mission abort ends it")
 			return false
 		case out.next == "":
 			r.ui.Info("  mission: handed_over — the changes are in the worktree and did NOT pass a review; they need your judgment")
@@ -266,13 +329,22 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		return gateResult{next: missionIdleMessage(m.state.IdleRound, maxIdleRounds)}
 	}
 
-	verdict, ok := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
-	if !ok {
+	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
+	if outcome != reviewOK {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
-		// un-write them, so the loop ends rather than looping — but as
-		// handed_over, never done. dispatchReview has already warned.
+		// un-write them, and nothing here may ever report them as reviewed.
+		// The outcome class decides what the loop does about it — a transient
+		// outage keeps the mission alive with the review pending, an
+		// interruption keeps it alive for the user's next message, and the
+		// terminal class (deadline, oversized diff, tampering) hands over
+		// exactly as it did before these states existed.
 		r.reviewPrev = nil
-		return gateResult{}
+		switch outcome {
+		case reviewFailedTransient:
+			return gateResult{reviewFailed: true}
+		default: // reviewInterrupted, reviewFailedTerminal: no next, not passed
+			return gateResult{reviewInterrupted: outcome == reviewInterrupted}
+		}
 	}
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})

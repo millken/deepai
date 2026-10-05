@@ -284,6 +284,44 @@ func TestMissionCommand_AbortWithoutMission(t *testing.T) {
 	}
 }
 
+// "/mission resume" is a reserved word, not a brief: it must resume this
+// session's active mission, never abort it in favor of a NEW mission whose
+// brief is the literal word "resume". A live 20-hour run was lost to that
+// exact fall-through — the successor mission had to reconstruct the task
+// from the aborted one's files on disk.
+func TestMissionCommand_ResumeWordResumesDoesNotRestart(t *testing.T) {
+	dir := t.TempDir()
+	r, ui := newMissionRepl(t, dir)
+	m, _ := createMission(dir, "the real task")
+	r.mission = m
+	turns := 0
+	r.missionTurn = func(_ context.Context, _ string) *turnError {
+		turns++
+		return &turnError{cancelled: true} // interrupted turn keeps the mission active
+	}
+
+	for _, word := range []string{"resume", "continue", "继续", "RESUME"} {
+		r.handleMissionCommand(context.Background(), word)
+	}
+
+	if turns != len([]string{"resume", "continue", "继续", "RESUME"}) {
+		t.Fatalf("ran %d turns, want 4 — every resume word must take the resume path", turns)
+	}
+	if r.mission == nil || r.mission.state.ID != m.state.ID {
+		t.Fatal("the same mission must still be attached — no abort, no replacement")
+	}
+	if got := openOrFatal(t, dir, m.state.ID).state.Status; got != missionStatusActive {
+		t.Fatalf("status = %q, want active", got)
+	}
+	entries, err := os.ReadDir(missionsRoot(dir))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("missions on disk = %d (err %v), want exactly the original one", len(entries), err)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "resuming") {
+		t.Errorf("the user must see the resume notice: %v", ui.infoMsgs)
+	}
+}
+
 func TestMissionStatusText_ReadsDiskAfterTerminalStatus(t *testing.T) {
 	dir := t.TempDir()
 	r, _ := newMissionRepl(t, dir)

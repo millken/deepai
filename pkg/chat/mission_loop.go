@@ -1,6 +1,23 @@
 package chat
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// missionTurnHardCap bounds ONE mission turn from above — a backstop, not a
+// budget. Ordinary turns are governed by Ctrl+C and (per request) the
+// stream idle window, but a mission runs unattended for hours and an
+// unexplained stall anywhere inside a turn (a hung tool, a wedged loop)
+// otherwise sits silently until someone comes back: one overnight run lost
+// 8h48m to exactly that. 2h is well past the longest legitimate mission
+// turn observed (~45m, implement turns that carry a build+test cycle), and
+// hitting it lands in the same state as a failed turn: the mission stays
+// active and /mission resumes it. A constant, like every other mission
+// bound — the cap IS the safety property (§5.7).
+const missionTurnHardCap = 2 * time.Hour
 
 // runMission drives one mission to a terminal status. It is the outer
 // bounded loop of docs/LONG_TASK_LOOP_DESIGN.md §4: DESIGN until the design
@@ -98,7 +115,16 @@ func (r *ChatRepl) runMissionTurn(parentCtx context.Context, input string) *turn
 	images := r.missionPendingImages
 	r.missionPendingImages = nil
 	return r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		return r.runTurn(ctx, in, images, false)
+		ctx, cancel := context.WithTimeout(ctx, missionTurnHardCap)
+		defer cancel()
+		err := r.runTurn(ctx, in, images, false)
+		// Name the cap when it is what fired: a bare "context deadline
+		// exceeded" reads like a provider outage and gives an unattended
+		// user nothing to raise (PR #11 review).
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("mission turn hit its %s hard cap (unattended-run backstop; per-request and stream timeouts live elsewhere)", missionTurnHardCap)
+		}
+		return err
 	})
 }
 
