@@ -114,9 +114,15 @@ type missionState struct {
 	Escalation           int `json:"escalation"`
 	// Reviewed records that the implementation review returned a pass at
 	// least once. Only this may turn into status=done (R31/§9 #20).
-	Reviewed  bool      `json:"reviewed"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Reviewed bool `json:"reviewed"`
+	// PendingReview names the phase whose last turn completed but whose
+	// review never ran (transient reviewer outage, already retried once).
+	// A resume must dispatch that review BEFORE running any design or
+	// implement turn — a fresh turn would rewrite a plan or diff that was
+	// one review away from the gate (PR #11 review). "" when unset.
+	PendingReview missionPhase `json:"pending_review,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
 }
 
 // Charter is what the mission is actually held to after the design gate

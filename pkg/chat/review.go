@@ -15,6 +15,7 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // Turn-boundary worktree snapshots for the adversarial-review gate
@@ -352,6 +353,41 @@ func (r *ChatRepl) runEpisode(parentCtx context.Context, initialRequest string, 
 	}
 }
 
+// reviewOutcome classifies a dispatch that did NOT produce a verdict. The
+// mission gates act differently per class, so collapsing them into one
+// ok=false is how a tampered worktree and a dropped connection once ended
+// in the same "stay active and try again" bucket (PR #11 review).
+type reviewOutcome int
+
+const (
+	// reviewOK produced a parsed verdict.
+	reviewOK reviewOutcome = iota
+	// reviewFailedTransient: the reviewer was unavailable — a connection
+	// error or a malformed verdict, already retried once. Re-dispatching
+	// later is reasonable, so a mission keeps the phase active and marks
+	// the review pending.
+	reviewFailedTransient
+	// reviewFailedTerminal: deterministic, re-running reproduces it — the
+	// reviewer's own deadline, an oversized diff, or a tampered worktree.
+	// The mission hands over; no retry, no resume path.
+	reviewFailedTerminal
+	// reviewInterrupted: the user cancelled the review. Nothing is wrong
+	// with the work or the reviewer; the mission stays active and the next
+	// user input resumes the phase (the design gate's long-standing rule).
+	reviewInterrupted
+)
+
+// isReviewDeadline reports whether err is the reviewer's own deadline —
+// either the outer context's DeadlineExceeded or the task tool's wrapped
+// ErrTaskTimedOut (the pool flattens the context error into a string, so
+// errors.Is alone does not reach it — PR #11 review).
+func isReviewDeadline(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return errors.Is(err, tools.ErrTaskTimedOut)
+}
+
 // gateResult is what one gate decision produced. It replaced a bare string
 // because the mission loop needs a THIRD exit the string could not express
 // (R17): "the plan itself is wrong, go back to design". Splitting passed out
@@ -372,13 +408,17 @@ type gateResult struct {
 	// pass verdict on a non-empty change set. Nothing else may be reported
 	// as a reviewed success.
 	passed bool
-	// reviewFailed marks a fail-soft REVIEWER FAILURE — the gate could not
-	// obtain a verdict at all (and has already retried once). It is not a
-	// pass, not a round cap, not idleness, and the mission loop must not
-	// hand the work over for it: the changes are unreviewed because the
-	// reviewer was unavailable, not because a review rejected them, so the
-	// mission stays active and /mission re-runs the review.
+	// reviewFailed marks a TRANSIENT reviewer outage (already retried once
+	// inside the dispatch): the changes are unreviewed because the reviewer
+	// was unavailable, not because a review rejected them. The mission
+	// keeps the phase active and marks the review pending so /mission
+	// re-runs it BEFORE any new turn. Terminal failures and interruptions
+	// do not set this — they take the old paths.
 	reviewFailed bool
+	// reviewInterrupted marks a user-cancelled review: keep the mission
+	// active like the design gate always did, but say it was an
+	// interruption, not an outage.
+	reviewInterrupted bool
 }
 
 // reviewGate decides, after a completed turn, whether the episode continues
@@ -422,8 +462,8 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 		r.ui.Info("  review: not a git worktree — bash-side edits are invisible to attribution, and reviewer writes cannot be detected")
 	}
 
-	verdict, ok := r.dispatchReview(parentCtx, initialRequest, scope, after, r.reviewPrev)
-	if !ok {
+	verdict, outcome := r.dispatchReview(parentCtx, initialRequest, scope, after, r.reviewPrev)
+	if outcome != reviewOK {
 		r.reviewPrev = nil
 		return gateResult{} // fail-soft; dispatchReview already warned
 	}
@@ -449,13 +489,13 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 }
 
 // dispatchReview runs the degradation ladder and the reviewer for one scope.
-// Shared by the automatic gate and the manual /review command; ok=false is
-// always fail-soft and already warned.
-func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot, prev *agent.ReviewResult) (*agent.ReviewResult, bool) {
+// Shared by the automatic gate and the manual /review command; every non-OK
+// outcome is fail-soft and already warned.
+func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot, prev *agent.ReviewResult) (*agent.ReviewResult, reviewOutcome) {
 	diff, oversized := buildReviewDiff(r.cfg.WorkDir, snap, scope)
 	if oversized {
 		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
-		return nil, false
+		return nil, reviewFailedTerminal
 	}
 	// context_files may only ever contain readable regular files.
 	// buildContextFilesBlock fails the WHOLE task on any path it cannot read
@@ -543,17 +583,17 @@ func verdictSummary(v *agent.ReviewResult) string {
 // runReview dispatches one correctness-reviewer subagent through the
 // existing task tool (pool, schema validation, progress events — the whole
 // chain is reused; the REPL never touches the pool directly) and returns
-// the parsed verdict. ok=false is the fail-soft path: interrupted, timed
-// out, tool failure, tampered worktree, or unparseable output — all warned,
-// none fatal (design §六-1).
+// the parsed verdict. Every non-OK outcome is fail-soft and already warned
+// (design §六-1); the outcome class tells the mission gates what may be
+// retried later:
 //
-// Transient failures (a dropped connection, one malformed verdict) get ONE
-// retry before fail-soft gives up: two 20-hour missions once ended
-// handed_over on the reviewer's first hiccup. The DETERMINISTIC failures —
-// user interruption, the reviewer's own deadline, a tampered worktree — do
-// not retry: re-running them either defies the user or reproduces the same
-// outcome on the same inputs.
-func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, contextFiles []string, preReview worktreeSnapshot) (*agent.ReviewResult, bool) {
+//   - transient (a dropped connection, one malformed verdict): retried
+//     ONCE here — two 20-hour missions once ended handed_over on the
+//     reviewer's first hiccup;
+//   - terminal (the reviewer's own deadline, a tampered worktree): no
+//     retry — re-running reproduces the same outcome on the same inputs;
+//   - interrupted: the user's cancel, honored as-is.
+func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, contextFiles []string, preReview worktreeSnapshot) (*agent.ReviewResult, reviewOutcome) {
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
@@ -639,34 +679,37 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 
 		// Reviewer-write defense runs FIRST, before any trust decision — a
 		// timed-out reviewer may still have written the tree (design §4.4 B4:
-		// bash is unsandboxed; this snapshot is the only hard line).
+		// bash is unsandboxed; this snapshot is the only hard line). Terminal:
+		// the tree now holds foreign writes, and a retry would only fold them
+		// into the next diff as if the implementer had made them.
 		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
 				"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
 				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-			return nil, false
+			return nil, reviewFailedTerminal
 		}
 		if turnErr != nil && turnErr.cancelled {
 			r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
-			return nil, false
+			return nil, reviewInterrupted
 		}
 		if execErr != nil {
 			// The reviewer's own deadline is the most common failure here and the
 			// only one the user can act on, so name the window that ran out and
 			// where to widen it instead of reporting a bare
-			// "context deadline exceeded".
-			if errors.Is(execErr, context.DeadlineExceeded) {
+			// "context deadline exceeded". Terminal: same inputs, same budget —
+			// a retry just doubles the wait.
+			if isReviewDeadline(execErr) {
 				r.ui.Info(fmt.Sprintf(
 					"  review: reviewer hit its %s deadline — changes are unreviewed (raise review_timeout in config.yaml, or narrow the change)",
 					timeout))
-				return nil, false
+				return nil, reviewFailedTerminal
 			}
 			if attempt == 0 {
 				r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — retrying once", execErr))
 				continue
 			}
 			r.ui.Info(fmt.Sprintf("  review: reviewer failed (%v) — changes are unreviewed", execErr))
-			return nil, false
+			return nil, reviewFailedTransient
 		}
 
 		schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
@@ -677,9 +720,9 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 				continue
 			}
 			r.ui.Info(fmt.Sprintf("  review: verdict unparseable (%v) — changes are unreviewed", err))
-			return nil, false
+			return nil, reviewFailedTransient
 		}
-		return verdict, true
+		return verdict, reviewOK
 	}
 }
 
@@ -984,8 +1027,8 @@ func (r *ChatRepl) runManualReview(parentCtx context.Context) {
 		r.ui.Info("  review: nothing to review — no recorded edits and a clean worktree")
 		return
 	}
-	verdict, ok := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, nil)
-	if !ok {
+	verdict, outcome := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, nil)
+	if outcome != reviewOK {
 		return
 	}
 	if isPassVerdict(verdict) {

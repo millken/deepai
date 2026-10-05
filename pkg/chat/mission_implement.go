@@ -61,20 +61,33 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 	}
 	for {
 		round := m.state.ImplementRound
-		r.applyMissionTurnMode(missionPhaseImplement)
-		r.ui.Info(fmt.Sprintf("  mission: implement phase (review round %d/%d)", round, maxReviewRounds))
 
-		turnErr := r.runMissionTurn(parentCtx, input)
-		if turnErr != nil {
-			// Same rule as an episode: a turn that was interrupted or
-			// errored left incomplete edits, and reviewing those is
-			// meaningless. The mission stays active for /mission.
-			if turnErr.cancelled {
-				r.ui.Info("  mission: implement turn interrupted — the changes so far are UNREVIEWED; /mission resumes, /mission abort ends it")
-			} else {
-				r.ui.Info(fmt.Sprintf("  mission: implement turn failed (%v) — the changes so far are UNREVIEWED", turnErr))
+		// A pending review re-enters through the gate, not a turn: the
+		// previous run's turn completed but its review never ran, and a
+		// fresh "Implement it" turn would edit a diff that was one review
+		// away from the gate (PR #11 review).
+		if m.state.PendingReview == missionPhaseImplement {
+			m.state.PendingReview = ""
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
 			}
-			return false
+			r.ui.Info("  mission: re-running the implementation review on the unchanged changes")
+		} else {
+			r.applyMissionTurnMode(missionPhaseImplement)
+			r.ui.Info(fmt.Sprintf("  mission: implement phase (review round %d/%d)", round, maxReviewRounds))
+
+			turnErr := r.runMissionTurn(parentCtx, input)
+			if turnErr != nil {
+				// Same rule as an episode: a turn that was interrupted or
+				// errored left incomplete edits, and reviewing those is
+				// meaningless. The mission stays active for /mission.
+				if turnErr.cancelled {
+					r.ui.Info("  mission: implement turn interrupted — the changes so far are UNREVIEWED; /mission resumes, /mission abort ends it")
+				} else {
+					r.ui.Info(fmt.Sprintf("  mission: implement turn failed (%v) — the changes so far are UNREVIEWED", turnErr))
+				}
+				return false
+			}
 		}
 
 		// before = S_impl, the PHASE baseline, never a per-turn snapshot
@@ -97,11 +110,22 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 			return false
 		case out.reviewFailed:
 			// The reviewer was unavailable, not unconvinced. The changes are
-			// unreviewed but belong to a live mission: keep it active so
-			// /mission re-runs the review, rather than forcing a successor
-			// mission to inherit the edits cold. Must sit BEFORE next==""
-			// — reviewFailed also carries an empty next.
+			// unreviewed but belong to a live mission: mark the review
+			// pending and keep it active, so /mission re-runs the review on
+			// the UNCHANGED diff rather than running a fresh implement turn
+			// over it. Must sit BEFORE next=="" — reviewFailed also carries
+			// an empty next.
+			m.state.PendingReview = missionPhaseImplement
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
 			r.ui.Info("  mission: review unavailable — the changes are UNREVIEWED; the mission stays active, /mission re-runs the review, /mission abort ends it")
+			return false
+		case out.reviewInterrupted:
+			// The user cancelled the review: same rule the design gate has
+			// always had — nothing is wrong with the work, the mission stays
+			// active and the next message resumes it.
+			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message resumes the mission, /mission abort ends it")
 			return false
 		case out.next == "":
 			r.ui.Info("  mission: handed_over — the changes are in the worktree and did NOT pass a review; they need your judgment")
@@ -274,17 +298,22 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		return gateResult{next: missionIdleMessage(m.state.IdleRound, maxIdleRounds)}
 	}
 
-	verdict, ok := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
-	if !ok {
+	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
+	if outcome != reviewOK {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
 		// un-write them, and nothing here may ever report them as reviewed.
-		// But the failure was the REVIEWER's outage (already retried once
-		// inside dispatchReview), not a review that rejected the change — so
-		// the mission stays active with the round unspent, and /mission
-		// re-runs the review. Handing over here once ended 20-hour runs on
-		// a single reviewer hiccup.
+		// The outcome class decides what the loop does about it — a transient
+		// outage keeps the mission alive with the review pending, an
+		// interruption keeps it alive for the user's next message, and the
+		// terminal class (deadline, oversized diff, tampering) hands over
+		// exactly as it did before these states existed.
 		r.reviewPrev = nil
-		return gateResult{reviewFailed: true}
+		switch outcome {
+		case reviewFailedTransient:
+			return gateResult{reviewFailed: true}
+		default: // reviewInterrupted, reviewFailedTerminal: no next, not passed
+			return gateResult{reviewInterrupted: outcome == reviewInterrupted}
+		}
 	}
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})

@@ -2,6 +2,8 @@ package chat
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
 
@@ -115,7 +117,14 @@ func (r *ChatRepl) runMissionTurn(parentCtx context.Context, input string) *turn
 	return r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, missionTurnHardCap)
 		defer cancel()
-		return r.runTurn(ctx, in, images, false)
+		err := r.runTurn(ctx, in, images, false)
+		// Name the cap when it is what fired: a bare "context deadline
+		// exceeded" reads like a provider outage and gives an unattended
+		// user nothing to raise (PR #11 review).
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("mission turn hit its %s hard cap (unattended-run backstop; per-request and stream timeouts live elsewhere)", missionTurnHardCap)
+		}
+		return err
 	})
 }
 

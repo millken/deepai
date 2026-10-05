@@ -2,11 +2,13 @@ package chat
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 func designPassJSON() string {
@@ -184,11 +186,10 @@ func TestDesignOutcome(t *testing.T) {
 
 // §六-1: design-side fail-soft is the opposite of the implementation gate's.
 // Nothing has been written yet, so an unavailable review must never let an
-// unreviewed plan through to implementation. But the outage was the
-// REVIEWER's, not the plan's: the mission stays ACTIVE with the round
-// refunded, so /mission re-runs the review instead of the user rebuilding
-// from a handed_over corpse — two 20-hour live runs once ended exactly
-// there.
+// unreviewed plan through to implementation. But a TRANSIENT outage was the
+// REVIEWER's, not the plan's: the mission stays ACTIVE with the review
+// marked pending, so /mission re-runs the gate on the unchanged plan — two
+// 20-hour live runs once ended exactly there.
 func TestDesignPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
 	fake := &fakeTaskTool{content: "not json at all"}
 	r, ui, _ := newDesignRepl(t, fake, []string{"# plan"})
@@ -202,8 +203,11 @@ func TestDesignPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
 	if reloaded.state.Status != missionStatusActive {
 		t.Fatalf("status = %q, want active — a reviewer outage must not end the mission", reloaded.state.Status)
 	}
-	if reloaded.state.DesignRound != 0 {
-		t.Fatalf("design_round = %d, want 0 — a round whose review never ran must be refunded", reloaded.state.DesignRound)
+	if reloaded.state.DesignRound != 1 {
+		t.Fatalf("design_round = %d, want 1 — the turn ran and spent it; the pending review must not re-spend it", reloaded.state.DesignRound)
+	}
+	if reloaded.state.PendingReview != missionPhaseDesign {
+		t.Fatalf("pending_review = %q, want design — /mission must know to re-dispatch the gate first", reloaded.state.PendingReview)
 	}
 	if fake.calls != 2 {
 		t.Fatalf("dispatched %d reviews, want 2 (the attempt plus the one retry)", fake.calls)
@@ -214,6 +218,95 @@ func TestDesignPhase_ReviewFailSoftKeepsMissionActive(t *testing.T) {
 	}
 	if !strings.Contains(joined, "stays active") {
 		t.Errorf("the user must be told how to resume: %q", joined)
+	}
+}
+
+// PR #11 review: a pending review must re-enter through the GATE, not a
+// design turn — missionDesignFirstMessage would tell the author to replace
+// the whole plan file, rewriting a plan that was one review away.
+func TestDesignPhase_PendingReviewRedispatchesBeforeAnyTurn(t *testing.T) {
+	fake := &fakeTaskTool{contents: []string{"not json at all", "still not json", designPassJSON()}}
+	r, _, inputs := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+
+	if r.runDesignPhase(context.Background()) {
+		t.Fatal("first run: unreviewed plan must not reach implementation")
+	}
+	turnsAfterFirstRun := len(*inputs)
+
+	// Simulated /mission resume — same mission object reopened from disk.
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	r.mission = reloaded
+	r.missionPendingInput = ""
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("resume: the recovered review must let the mission proceed")
+	}
+	if got := len(*inputs); got != turnsAfterFirstRun {
+		t.Fatalf("ran %d design turns on resume, want 0 — the pending review re-dispatches BEFORE any turn", got-turnsAfterFirstRun)
+	}
+	if fake.calls != 3 {
+		t.Fatalf("dispatched %d reviews, want 3 (two failed, one recovered)", fake.calls)
+	}
+	if reloaded.state.PendingReview != "" {
+		t.Fatalf("pending_review = %q, want cleared once the review ran", reloaded.state.PendingReview)
+	}
+	if reloaded.state.Phase != missionPhaseImplement || reloaded.charter == nil {
+		t.Fatal("the passing verdict must lock the charter and move to implement")
+	}
+}
+
+// A pending review on a 3/3-exhausted round budget must still re-dispatch:
+// the round was spent by its TURN, the maxRounds check must not eat the
+// review it never got (the first cut of this code ran the check first and
+// failDesigned on arrival).
+func TestDesignPhase_PendingReviewSurvivesExhaustedRounds(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, _, inputs := newDesignRepl(t, fake, nil)
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.DesignRound = maxDesignRounds // 3/3 spent
+	m.state.PendingReview = missionPhaseDesign
+	writeFileOrFatal(t, m.designPath(), "# the plan one review away")
+	r.mission = m
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("a pending review must run even when the round budget is spent")
+	}
+	if len(*inputs) != 0 {
+		t.Fatalf("ran %d design turns, want 0 — the pending review re-dispatches directly", len(*inputs))
+	}
+	if fake.calls != 1 || m.state.Phase != missionPhaseImplement {
+		t.Fatalf("calls=%d phase=%s — the review must run and the charter lock", fake.calls, m.state.Phase)
+	}
+}
+
+// PR #11 review: the reviewer's own deadline is TERMINAL — the task tool
+// reports it as a wrapped ErrTaskTimedOut (not context.DeadlineExceeded),
+// so the old errors.Is check never matched and a timed-out review was
+// retried as if transient, doubling the wall clock. It must dispatch
+// exactly once and hand over.
+func TestDesignPhase_ReviewerDeadlineIsTerminalAndDispatchesOnce(t *testing.T) {
+	fake := &fakeTaskTool{err: fmt.Errorf("%w: context deadline exceeded", tools.ErrTaskTimedOut)}
+	r, ui, _ := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+
+	if r.runDesignPhase(context.Background()) {
+		t.Fatal("a timed-out review must not reach implementation")
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1 — a deadline is deterministic and must not retry", fake.calls)
+	}
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusHandedOver {
+		t.Fatalf("status = %q, want handed_over — the terminal class keeps the old outcome", reloaded.state.Status)
+	}
+	if reloaded.state.PendingReview != "" {
+		t.Fatalf("pending_review = %q, want unset — terminal failures do not schedule a resume", reloaded.state.PendingReview)
+	}
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "deadline") {
+		t.Errorf("the user must be told the reviewer hit its deadline: %v", ui.infoMsgs)
 	}
 }
 

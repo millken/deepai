@@ -2,12 +2,20 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
 )
+
+// ErrTaskTimedOut is returned (wrapped) when a dispatched task hits its
+// deadline. The error TEXT has always read "subagent task timed out: …",
+// but callers that classify — the review gates decide retry-vs-terminal on
+// it — need errors.Is, not string matching, and the pool has already
+// flattened the underlying context error into the message by then.
+var ErrTaskTimedOut = errors.New("subagent task timed out")
 
 type taskPool interface {
 	StartTask(ctx context.Context, description, prompt string, cfg subagent.SubagentConfig) (*subagent.Task, error)
@@ -206,7 +214,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 			case subagent.TaskStatusTimedOut:
 				result.Status = models.CallStatusFailed
 				result.Error = completed.Error
-				return result, fmt.Errorf("subagent task timed out: %s", completed.Error)
+				return result, fmt.Errorf("%w: %s", ErrTaskTimedOut, completed.Error)
 			case subagent.TaskStatusCancelled:
 				result.Status = models.CallStatusFailed
 				result.Error = "subagent task cancelled"

@@ -320,7 +320,7 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 	// Outside comments are read here, before the verdict, and the watermark
 	// stays put: a fail still hands the same comments to the fix turn.
 	comments := pendingExternalComments(parentCtx, st, gh)
-	verdict, ok := r.runReview(parentCtx, reviewPromptInput{
+	verdict, outcome := r.runReview(parentCtx, reviewPromptInput{
 		initialRequest:   st.Brief,
 		diff:             diff,
 		scope:            relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope)),
@@ -332,6 +332,7 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 		sinceSHA:         st.LastReviewHead,
 		externalComments: comments,
 	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
+	ok := outcome == reviewOK
 	if ok {
 		if head, err := runGit(r.cfg.WorkDir, "rev-parse", "HEAD"); err == nil {
 			st.LastReviewHead = strings.TrimSpace(string(head))
