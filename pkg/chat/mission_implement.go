@@ -535,11 +535,15 @@ func isTestCompanion(rel string, scope map[string]struct{}, scopeDirs map[string
 // now honors the two glob shapes reviewers actually emit:
 //
 //   - dir/**     everything under dir/, at any depth (prefix match)
+//   - dir/**/*   the same authorization, folded to dir/** before matching
 //   - dir/*.ext  one level, via path.Match (its "*" never crosses "/")
 //
 // Everything else stays an exact path. No support for "**" mid-pattern
-// ("a/**/b.go"): no reviewer has emitted one, and an unsupported shape is
-// better left unmatched than loosely matched.
+// ("a/**/b.go") or in the directory part ("d*/x.go"): path.Match would
+// treat the "**" as a single-level "*" and loosely match one directory
+// segment (review round: "a/**/b.go" matches "a/x/b.go"; "src/**/*"
+// matches "src/waf/a.zig" but NOT "src/metrics.zig"), so those entries
+// are deliberately left UNMATCHED rather than loosely matched.
 type charterScope struct {
 	exact        map[string]struct{}
 	globDirs     []string
@@ -549,8 +553,19 @@ type charterScope struct {
 func buildCharterScope(files []string) charterScope {
 	s := charterScope{exact: make(map[string]struct{}, len(files))}
 	for _, f := range files {
+		// "dir/**/*" is the same authorization as "dir/**" — fold it first
+		// so a reviewer's habit spelling still covers the tree's direct
+		// children (which path.Match would leave behind).
+		if dir, ok := strings.CutSuffix(f, "/**/*"); ok && dir != "" {
+			f = dir + "/**"
+		}
 		if dir, ok := strings.CutSuffix(f, "/**"); ok && dir != "" && !strings.Contains(dir, "*") {
 			s.globDirs = append(s.globDirs, dir)
+			continue
+		}
+		if strings.Contains(f, "**") {
+			// Mid-pattern or wildcard-directory "**": unsupported, and NOT
+			// path.Match fodder — see the type comment.
 			continue
 		}
 		if strings.Contains(f, "*") {
@@ -596,7 +611,12 @@ func classifyAgainstCharter(workDir string, c *Charter, changed []string) (revie
 	cs := buildCharterScope(c.ScopeFiles)
 	scopeDirs := make(map[string]struct{}, len(c.ScopeFiles))
 	for _, f := range c.ScopeFiles {
-		if strings.HasSuffix(f, ".go") && !strings.Contains(f, "*") {
+		// Exact .go entries have always seeded this set; a single-level
+		// "*.go" entry must too ("dir/*.go" authorizes dir/*_test.go AND
+		// dir/testdata/** — review round caught the gap). "**"-bearing
+		// entries are excluded: dir/** already covers the subtree outright,
+		// and unsupported shapes get no companion privileges.
+		if strings.HasSuffix(f, ".go") && !strings.Contains(f, "**") {
 			scopeDirs[path.Dir(f)] = struct{}{}
 		}
 	}
