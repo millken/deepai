@@ -66,14 +66,30 @@ func missionDesignResumeMessage(round, maxRounds int, escalated bool, planPath, 
 // matches the code-review loop: reviewers are wrong sometimes, and the
 // rebuttal goes to the NEXT reviewer to judge rather than being overruled
 // here.
-func missionDesignRevisionMessage(round, maxRounds int, escalated bool, planPath string, v *agent.DesignReviewResult) string {
+//
+// gateReason is set when the REVIEWER passed and the gate did not, which is
+// the one case where the issue list carries nothing: the plan has to change
+// for a reason only the gate knows (an unusable scope path, an acceptance
+// criterion too thin to lock), so the message leads with that reason
+// instead of asking the author to fix a list of zero issues. A revision
+// round spent on an empty instruction is a round that ends in exactly the
+// same refusal.
+func missionDesignRevisionMessage(round, maxRounds int, escalated bool, planPath string, v *agent.DesignReviewResult, gateReason string) string {
 	var b strings.Builder
+	if gateReason != "" {
+		fmt.Fprintf(&b, "[mission-design-review %s %d/%d] The independent design review PASSED your plan at %s, but the mission gate could not lock a charter from it: %s\n\nRewrite the ENTIRE plan via write_plan (the file is replaced, not patched) so the review can derive a usable charter from it. Nothing else about the plan is in question.\n",
+			roundLabel(escalated), round, maxRounds, planPath, gateReason)
+		if s := strings.TrimSpace(v.Summary); s != "" {
+			b.WriteString("\nReviewer summary: " + s + "\n")
+		}
+		return b.String()
+	}
 	fmt.Fprintf(&b, "[mission-design-review %s %d/%d] An independent design review of your plan at %s found the following issues. Rewrite the ENTIRE plan via write_plan (the file is replaced, not patched — a plan you only describe in prose is not submitted). For each issue: fix it in the new plan, or state explicitly why it is not a real problem.\n",
 		roundLabel(escalated), round, maxRounds, planPath)
 	if s := strings.TrimSpace(v.Summary); s != "" {
 		b.WriteString("\nReviewer summary: " + s + "\n")
 	}
-	writeIssueList(&b, v.Issues)
+	writeFindings(&b, v.Issues, v.Summary)
 	if len(v.ScopeFiles) == 0 || len(v.Acceptance) == 0 {
 		b.WriteString("\nThe review could not fill the charter from this plan (scope files and/or acceptance criteria). A plan that does not name its in-scope files and its Given/When/Then acceptance criteria cannot be locked, and the mission cannot start implementing.\n")
 	}

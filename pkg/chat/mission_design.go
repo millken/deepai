@@ -84,7 +84,7 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			// plan whose review never ran must still get that review, not a
 			// failDesign on arrival.
 			if round > maxRounds {
-				r.failDesign(nil, maxRounds)
+				r.failDesign(nil, maxRounds, "")
 				return false
 			}
 		}
@@ -146,7 +146,7 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 					}
 				}
 				if round >= maxRounds {
-					r.failDesign(nil, maxRounds)
+					r.failDesign(nil, maxRounds, "")
 					return false
 				}
 				r.ui.Info("  mission: no plan written yet — asking again")
@@ -223,10 +223,11 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			return false
 		}
 
-		scope, pass := designOutcome(r.cfg.WorkDir, verdict)
+		scope, pass, gateReason := designOutcome(r.cfg.WorkDir, verdict)
 		m.appendReview(missionReviewRecord{
 			Phase: "design", Round: round, Verdict: verdictWord(pass), Summary: verdict.Summary,
-			Detail: map[string]any{"issues": verdict.Issues, "scope_files": scope, "acceptance": verdict.Acceptance},
+			Detail: map[string]any{"issues": verdict.Issues, "scope_files": scope,
+				"acceptance": verdict.Acceptance, "gate_reason": gateReason},
 		})
 
 		if pass {
@@ -247,13 +248,21 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			return true
 		}
 
+		if gateReason != "" {
+			// The reviewer passed and the gate did not. Say so in those
+			// words: "the design review found 0 issue(s)" over an empty
+			// list reads as a machine refusing a plan for no reason.
+			r.ui.Info("  mission: design review passed but the charter could not be locked — " + gateReason)
+		}
 		if round >= maxRounds {
-			r.failDesign(verdict, maxRounds)
+			r.failDesign(verdict, maxRounds, gateReason)
 			return false
 		}
-		r.presentDesignIssues(fmt.Sprintf("  mission: design review found %d issue(s) — revising (round %d/%d)",
-			len(verdict.Issues), round+1, maxRounds), verdict)
-		input = missionDesignRevisionMessage(round+1, maxRounds, escalated, m.designPath(), verdict)
+		if gateReason == "" {
+			r.presentDesignIssues(fmt.Sprintf("  mission: design review found %d issue(s) — revising (round %d/%d)",
+				len(verdict.Issues), round+1, maxRounds), verdict)
+		}
+		input = missionDesignRevisionMessage(round+1, maxRounds, escalated, m.designPath(), verdict, gateReason)
 		prev = verdict
 	}
 }
@@ -294,13 +303,23 @@ func verdictWord(pass bool) string {
 // situations that name covers (R37). After an escalation the worktree holds
 // implementation edits that never passed review — the user has to be told,
 // or "the design failed" reads as "nothing happened".
-func (r *ChatRepl) failDesign(v *agent.DesignReviewResult, maxRounds int) {
+//
+// gateReason is the gate's own refusal of a verdict the reviewer passed. It
+// is reported INSTEAD of the issue list, which is empty on such a verdict:
+// a mission that died this way looked, in the transcript, like a review
+// that failed a plan without naming a single thing wrong with it.
+func (r *ChatRepl) failDesign(v *agent.DesignReviewResult, maxRounds int, gateReason string) {
 	escalated := r.mission != nil && r.mission.state.Escalation > 0
 	planPath := ""
 	if r.mission != nil {
 		planPath = r.mission.designPath()
 	}
-	if v != nil && len(v.Issues) > 0 {
+	switch {
+	case gateReason != "":
+		r.ui.Info(fmt.Sprintf(
+			"  mission: the design review PASSED the plan on round %d, but the charter still could not be locked from it — %s",
+			maxRounds, gateReason))
+	case v != nil:
 		r.presentDesignIssues(fmt.Sprintf(
 			"  mission: design STILL FAILING after %d round(s) — human judgment needed. Unresolved issues:", maxRounds), v)
 	}
@@ -331,7 +350,7 @@ func (r *ChatRepl) presentDesignIssues(header string, v *agent.DesignReviewResul
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteString("\n")
-	writeIssueList(&b, v.Issues)
+	writeFindings(&b, v.Issues, v.Summary)
 	r.ui.Info(b.String())
 }
 
@@ -342,9 +361,19 @@ func (r *ChatRepl) presentDesignIssues(header string, v *agent.DesignReviewResul
 // every edited file is in violation; an empty scope with no violations means
 // nothing is ever reviewed). Normalization can also empty a scope list that
 // looked non-empty — every path outside the worktree is dropped (R19).
-func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string, pass bool) {
+//
+// reason is set whenever the gate refuses a verdict the REVIEWER passed,
+// and it has to be: the issue list on such a verdict is empty, so without
+// this the author was handed "the design review found the following issues"
+// with nothing under it. There is no information in that message to act on,
+// so the next plan comes back the same, the reviewer passes it again, the
+// gate refuses it again, and the mission burns every design round before
+// ending design_failed — all of it over a short acceptance string or a
+// scope path spelled outside the worktree. reason is empty for an ordinary
+// failing verdict, whose issues speak for themselves.
+func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string, pass bool, reason string) {
 	if v == nil {
-		return nil, false
+		return nil, false, "the design review returned no verdict"
 	}
 	// An EXPLICIT pass is required — the same tightening isMissionPassVerdict
 	// applies, and for the same reason: "no issues" is a shape a Strict
@@ -355,23 +384,24 @@ func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string,
 	// round, while the cost of the fallback is an implementation phase
 	// spent on a plan that failed review.
 	if !strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
-		return nil, false
+		return nil, false, ""
 	}
 	if len(v.Acceptance) == 0 {
-		return nil, false
+		return nil, false, "the review passed the plan but returned no acceptance criteria, so there is nothing for the charter to hold the implementation to. State the acceptance criteria in the plan as complete Given/When/Then sentences, each with one observable outcome."
 	}
 	for _, a := range v.Acceptance {
 		// A criterion this short cannot state an observable outcome; it is
 		// the shape a hedged pass takes ("works", "ok").
 		if len(strings.TrimSpace(a)) < 12 {
-			return nil, false
+			return nil, false, fmt.Sprintf("the review passed the plan, but acceptance criterion %q is too short to state an observable outcome, so the charter cannot be locked from it. Write every criterion as a full Given/When/Then sentence naming the thing an observer would see.", strings.TrimSpace(a))
 		}
 	}
 	scope = normalizeScopeFiles(workDir, v.ScopeFiles)
 	if len(scope) == 0 {
-		return nil, false
+		return nil, false, fmt.Sprintf("the review passed the plan, but none of the in-scope paths it returned (%s) resolve to a file inside this working directory, so the charter would lock an empty scope. Name in-scope files in the plan as repo-relative paths (pkg/chat/mission.go), not absolute paths and not paths outside the repository.",
+			strings.Join(v.ScopeFiles, ", "))
 	}
-	return scope, true
+	return scope, true, ""
 }
 
 // ---------------------------------------------------------------------------

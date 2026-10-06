@@ -146,8 +146,15 @@ func TestDesignPhase_PassWithoutCharterFieldsIsAFail(t *testing.T) {
 	if r.runDesignPhase(context.Background()) {
 		t.Fatal("an empty charter must never pass the gate")
 	}
-	if !strings.Contains((*inputs)[1], "could not fill the charter") {
-		t.Errorf("the author must be told WHY: %q", (*inputs)[1])
+	// The reviewer passed, so its issue list is empty: the revision
+	// message has to carry the GATE's reason or it asks the author to fix
+	// a list of nothing, and the next plan comes back identical.
+	next := (*inputs)[1]
+	if !strings.Contains(next, "could not lock a charter") || !strings.Contains(next, "no acceptance criteria") {
+		t.Errorf("the author must be told WHY the gate refused a passing verdict: %q", next)
+	}
+	if strings.Contains(next, "found the following issues") {
+		t.Errorf("a gate refusal must not be worded as reviewer findings, there are none: %q", next)
 	}
 }
 
@@ -155,7 +162,7 @@ func TestDesignOutcome(t *testing.T) {
 	dir := t.TempDir()
 	good := &agent.DesignReviewResult{Verdict: "pass",
 		ScopeFiles: []string{"a.go"}, Acceptance: []string{"Given a, when b, then c"}}
-	if _, ok := designOutcome(dir, good); !ok {
+	if _, ok, _ := designOutcome(dir, good); !ok {
 		t.Error("a filled pass must pass")
 	}
 	cases := map[string]*agent.DesignReviewResult{
@@ -167,20 +174,62 @@ func TestDesignOutcome(t *testing.T) {
 		"scope outside tree": {Verdict: "pass", ScopeFiles: []string{"/etc/passwd"}, Acceptance: []string{"Given a, when b, then c"}},
 	}
 	for name, v := range cases {
-		if _, ok := designOutcome(dir, v); ok {
+		if _, ok, _ := designOutcome(dir, v); ok {
 			t.Errorf("%s: must not pass", name)
 		}
 	}
 	// A failing verdict with an EMPTY issue list — a shape the Strict schema
 	// permits — must not lock a charter. This is the design-gate half of the
 	// same hole isMissionPassVerdict closes on the done path.
-	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail", ScopeFiles: []string{"a.go"},
+	if _, ok, _ := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail", ScopeFiles: []string{"a.go"},
 		Acceptance: []string{"Given a, when b, then c"}}); ok {
 		t.Error("a fail verdict must not pass just because it listed no issues")
 	}
-	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "", ScopeFiles: []string{"a.go"},
+	if _, ok, _ := designOutcome(dir, &agent.DesignReviewResult{Verdict: "", ScopeFiles: []string{"a.go"},
 		Acceptance: []string{"Given a, when b, then c"}}); ok {
 		t.Error("an empty verdict is not a pass — both reviewer prompts promise the literal word")
+	}
+}
+
+// A verdict the REVIEWER passed and the GATE refused carries no issues, so
+// the refusal has to come with its own reason. Without one the author was
+// asked to fix a list of nothing, produced the same plan, and the mission
+// burned all three design rounds on a short acceptance string before
+// ending design_failed.
+func TestDesignOutcome_GateRefusalOfAPassNamesItsReason(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]struct {
+		v    *agent.DesignReviewResult
+		want string
+	}{
+		"no acceptance": {
+			v:    &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"a.go"}},
+			want: "no acceptance criteria",
+		},
+		"hedged acceptance": {
+			v:    &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"a.go"}, Acceptance: []string{"works"}},
+			want: "too short",
+		},
+		"scope outside the tree": {
+			v: &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"/etc/passwd"},
+				Acceptance: []string{"Given a, when b, then c"}},
+			want: "repo-relative",
+		},
+	}
+	for name, tc := range cases {
+		_, pass, reason := designOutcome(dir, tc.v)
+		if pass {
+			t.Fatalf("%s: must not pass", name)
+		}
+		if !strings.Contains(reason, tc.want) {
+			t.Errorf("%s: reason = %q, want it to mention %q", name, reason, tc.want)
+		}
+	}
+	// An ordinary failing verdict needs no gate reason: its issues are the
+	// reason, and inventing one on top would double-report.
+	if _, _, reason := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail",
+		Issues: []agent.Issue{{Message: "the plan never names the gate"}}}); reason != "" {
+		t.Errorf("a reviewer-failed verdict must carry no gate reason, got %q", reason)
 	}
 }
 

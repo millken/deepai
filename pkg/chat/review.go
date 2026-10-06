@@ -1064,7 +1064,7 @@ func synthesizeFixMessage(round int, v *agent.ReviewResult) string {
 	fmt.Fprintf(&b,
 		"[adversarial-review round %d/%d] An independent correctness review of your changes found the following issues. For each one: either fix it, or state explicitly why it is not a real problem.\n",
 		round, maxReviewRounds)
-	writeIssueList(&b, v.Issues)
+	writeFindings(&b, v.Issues, v.Summary)
 	return b.String()
 }
 
@@ -1075,13 +1075,10 @@ func (r *ChatRepl) presentIssues(header string, v *agent.ReviewResult) {
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteString("\n")
-	writeIssueList(&b, v.Issues)
 	// A PR-loop convergence verdict can fail with the finding parked in the
 	// summary and no issues; the cap's "unresolved findings go to the human"
 	// exit must not print an empty list there.
-	if len(v.Issues) == 0 {
-		fmt.Fprintf(&b, "\n1. [summary] %s\n", verdictSummary(v))
-	}
+	writeFindings(&b, v.Issues, verdictSummary(v))
 	r.ui.Info(b.String())
 }
 
@@ -1177,6 +1174,27 @@ func (s worktreeSnapshot) dirtyFiles() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// writeFindings renders a verdict's findings for a human or for the next
+// round's author. It exists because an empty issue list is NOT the same as
+// "nothing to report": a Strict schema makes "fail" with zero issues a
+// perfectly legal shape, the PR loop's convergence round explicitly parks a
+// finding in the summary while keeping the verdict failing, and the gate's
+// own charter-completeness rejections carry their reason outside the issue
+// list too. writeIssueList alone rendered all of those as a message that
+// said "fix the following issues" and then listed none — a round spent on
+// an instruction with no content in it.
+func writeFindings(b *strings.Builder, issues []agent.Issue, summary string) {
+	if len(issues) > 0 {
+		writeIssueList(b, issues)
+		return
+	}
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		s = "the reviewer reported no issue and no summary — treat the verdict itself as the only signal"
+	}
+	fmt.Fprintf(b, "\n1. [summary] %s\n", s)
 }
 
 func writeIssueList(b *strings.Builder, issues []agent.Issue) {
