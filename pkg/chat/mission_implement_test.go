@@ -790,3 +790,71 @@ func TestMissionGate_FailWithNoIssuesIsNotAPass(t *testing.T) {
 		t.Error("Reviewed must stay false")
 	}
 }
+
+// PR #11 follow-up: a charter's "dir/**" entries were stored verbatim and
+// matched EXACTLY, so they never matched anything — every file only a
+// wildcard covered read as a violation (mission 20261005-205218-00f3 lost
+// its post-completion state to exactly that, over nexus-httpd/src/metrics.zig).
+func TestClassifyAgainstCharter_HonorsWildcardScope(t *testing.T) {
+	dir := t.TempDir()
+	abs := func(rel string) string { return filepath.Join(dir, rel) }
+	charter := &Charter{ScopeFiles: []string{
+		"nexus-httpd/src/**", // whole tree, any depth
+		"cmd/*.go",           // one level only
+		"exact/file.zig",     // exact path
+	}}
+	changed := []string{
+		abs("nexus-httpd/src/metrics.zig"),   // wildcard-covered, the file that died last time
+		abs("nexus-httpd/src/waf/deep.zig"),  // wildcard covers subdirectories too
+		abs("cmd/main.go"),                   // single-level glob
+		abs("exact/file.zig"),                // exact match
+		abs("cmd/sub/nested.go"),             // one level too deep for cmd/*.go
+		abs("nexus-httpd/src-extra/evil.go"), // prefix boundary: "src/**" must not match "src-extra/"
+	}
+	reviewScope, violations := classifyAgainstCharter(dir, charter, changed)
+
+	if len(violations) != 2 || violations[0] != "cmd/sub/nested.go" || violations[1] != "nexus-httpd/src-extra/evil.go" {
+		t.Fatalf("violations = %v, want exactly the nested and src-extra files", violations)
+	}
+	if len(reviewScope) != 4 {
+		t.Fatalf("reviewScope has %d files, want the 4 in-scope ones", len(reviewScope))
+	}
+}
+
+// The end-to-end half of the same fix: a gate running under a wildcard
+// charter must let a newly-touched file under the wildcard through to the
+// reviewer instead of spending a scope round on it.
+func TestMissionGate_WildcardCharterCoversNewFiles(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, m := newImplementRepl(t, fake, []string{"tree/**"})
+	if err := os.MkdirAll(filepath.Join(r.cfg.WorkDir, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "tree", "late_discovery.zig"), "x")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if got.reviewFailed || got.escalate != "" || !got.passed {
+		t.Fatalf("gate = %+v, want a pass — the wildcard covers the file, no scope round", got)
+	}
+	if m.state.ScopeRound != 0 {
+		t.Fatalf("scope_round = %d, want 0 — a wildcard-covered file must not spend a scope round", m.state.ScopeRound)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1", fake.calls)
+	}
+}
+
+// The scope-fix message must offer the standoff exit: obeying a revert that
+// re-breaks a passing acceptance criterion is how 20261005-205218-00f3 died.
+func TestMissionScopeMessage_NamesTheCriterionConflictExit(t *testing.T) {
+	msg := missionScopeMessage(1, maxScopeFixRounds, []string{"a/b.zig"})
+	for _, needle := range []string{"must not break a locked acceptance criterion", "restore the minimal change", "escalates the charter itself back to design"} {
+		if !strings.Contains(msg, needle) {
+			t.Errorf("scope message missing %q:\n%s", needle, msg)
+		}
+	}
+	if !strings.Contains(msg, "do not edit the charter yourself") {
+		t.Error("the no-self-widening rule must survive alongside the exception")
+	}
+}

@@ -104,14 +104,24 @@ func missionImplementMessage(c *Charter) string {
 // does NOT offer editing the charter as an option: the only way the charter
 // changes is an escalation, and a scope round that invited the model to
 // widen its own scope would turn the hard check into a suggestion.
+//
+// The one sanctioned exception is a revert that would break a locked
+// acceptance criterion — mission 20261005-205218-00f3 obeyed the revert
+// order after every criterion had already passed, the revert re-broke the
+// build, and the mission died on the resulting standoff. The message now
+// names the way out explicitly: restore the minimal change, say so, and
+// let the NEXT scope round's escalation re-lock a charter that covers it.
+// The file still counts as a violation — this is a path to an escalation,
+// not a license to edit past the charter.
 func missionScopeMessage(round, maxRounds int, files []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[mission-scope round %d/%d] These files are outside the locked charter scope, and are not test companions of an in-scope file. Revert them (git checkout -- <path>, or delete them if the mission created them):\n\n", round, maxRounds)
 	for _, f := range files {
 		b.WriteString("- " + f + "\n")
 	}
-	b.WriteString("\nThen continue the in-scope work. Repeatedly editing out-of-charter implementation files escalates the mission back to design; do not edit the charter yourself.")
-	return b.String()
+	b.WriteString("\nThen continue the in-scope work. Repeatedly editing out-of-charter implementation files escalates the mission back to design; do not edit the charter yourself.\n\n")
+	b.WriteString("Exception — a revert must not break a locked acceptance criterion. If reverting a named file undoes a change a criterion depends on (verify by re-running the criterion's command after the revert and seeing it fail), do not leave it silently reverted: restore the minimal change the criterion needs and state the conflict explicitly in your reply. The file still counts as out-of-charter, the next scope round escalates the charter itself back to design, and the re-locked charter can name it. Obediently reverting a fix the criteria depend on is the one wrong answer here.")
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // missionIdleMessage answers a turn that changed nothing in scope. An empty

@@ -475,6 +475,12 @@ func hashText(s string) string {
 // violation, which costs a scope-fix round and, twice, the mission's only
 // escalation.
 //
+// Wildcard entries ("dir/**", "dir/*.zig") are normalized verbatim and
+// KEPT: classifyAgainstCharter matches them with glob semantics (see
+// buildCharterScope). Dropping them here would strip the charter of its
+// only whole-tree authorizations, and rejecting them would fail every
+// reviewer that writes scope the way LLMs naturally do.
+//
 // Paths that resolve outside the working directory are DROPPED rather than
 // clamped: a charter cannot authorize edits outside the tree the mission
 // runs in, and a clamped path would authorize some unrelated in-tree file.
