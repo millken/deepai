@@ -104,14 +104,36 @@ func missionImplementMessage(c *Charter) string {
 // does NOT offer editing the charter as an option: the only way the charter
 // changes is an escalation, and a scope round that invited the model to
 // widen its own scope would turn the hard check into a suggestion.
+//
+// The message differs by round (PR #12 review): an EARLY round orders the
+// revert with one sanctioned exception — a revert that would break a locked
+// acceptance criterion — and promises nothing about escalation (the next
+// round is still a revert order, and a promise the machinery does not keep
+// teaches the model to distrust every instruction). The LAST round inverts
+// the order: keep criterion-conflict files, revert genuine overreach, and
+// only here name the escalation — the very next gate check re-opens design
+// and a re-locked charter can cover the file. 20261005-205218-00f3 obeyed
+// a revert order after every criterion had passed and died on the result;
+// these wordings are the countermeasure.
 func missionScopeMessage(round, maxRounds int, files []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "[mission-scope round %d/%d] These files are outside the locked charter scope, and are not test companions of an in-scope file. Revert them (git checkout -- <path>, or delete them if the mission created them):\n\n", round, maxRounds)
+	if round < maxRounds {
+		fmt.Fprintf(&b, "[mission-scope round %d/%d] These files are outside the locked charter scope, and are not test companions of an in-scope file. Revert them (git checkout -- <path>, or delete them if the mission created them):\n\n", round, maxRounds)
+		for _, f := range files {
+			b.WriteString("- " + f + "\n")
+		}
+		b.WriteString("\nThen continue the in-scope work. Repeatedly editing out-of-charter implementation files escalates the mission back to design; do not edit the charter yourself.\n\n")
+		b.WriteString("Exception — a revert must not break a locked acceptance criterion. If reverting a named file undoes a change a criterion depends on (verify by re-running the criterion's command after the revert and seeing it fail), restore the minimal change the criterion needs and state the conflict explicitly in your reply. Do not silently revert a fix the criteria depend on; the scope round that follows will re-examine these files.")
+		return strings.TrimRight(b.String(), "\n")
+	}
+	fmt.Fprintf(&b, "[mission-scope round %d/%d — LAST ROUND] These files remain outside the locked charter scope:\n\n", round, maxRounds)
 	for _, f := range files {
 		b.WriteString("- " + f + "\n")
 	}
-	b.WriteString("\nThen continue the in-scope work. Repeatedly editing out-of-charter implementation files escalates the mission back to design; do not edit the charter yourself.")
-	return b.String()
+	b.WriteString("\nSort them by kind. This is the last scope round, and the very next gate check escalates the charter itself back to design:\n\n")
+	b.WriteString("- Genuine overreach (no locked criterion depends on it): revert it now — git checkout -- <path>, or delete it if the mission created it.\n")
+	b.WriteString("- Criterion conflict (reverting it re-breaks a locked acceptance criterion — verify by re-running the criterion's command): KEEP the minimal change the criterion needs and state the conflict explicitly in your reply. The escalation re-opens design and the re-locked charter can name the file. Reverting a fix the criteria depend on is the one wrong answer.")
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // missionIdleMessage answers a turn that changed nothing in scope. An empty

@@ -523,6 +523,81 @@ func isTestCompanion(rel string, scope map[string]struct{}, scopeDirs map[string
 	return false
 }
 
+// charterScope splits a charter's scope entries into the forms the hard
+// scope check can actually match. Reviewers emit scope_files as an LLM's
+// path list, and "**" shows up in it naturally ("nexus-httpd/src/**" — a
+// live charter locked exactly that). Until 2026-10 those entries were
+// stored verbatim and matched EXACTLY, so a wildcard entry never matched
+// anything: every file only a wildcard covered read as a violation, and
+// one such file (nexus-httpd/src/metrics.zig, mission 20261005-205218-00f3)
+// was ordered reverted after every acceptance criterion had already
+// passed — the revert broke the build and the mission with it. The check
+// now honors the two glob shapes reviewers actually emit:
+//
+//   - dir/**     everything under dir/, at any depth (prefix match)
+//   - dir/**/*   the same authorization, folded to dir/** before matching
+//   - dir/*.ext  one level, via path.Match (its "*" never crosses "/")
+//
+// Everything else stays an exact path. No support for "**" mid-pattern
+// ("a/**/b.go") or in the directory part ("d*/x.go"): path.Match would
+// treat the "**" as a single-level "*" and loosely match one directory
+// segment (review round: "a/**/b.go" matches "a/x/b.go"; "src/**/*"
+// matches "src/waf/a.zig" but NOT "src/metrics.zig"), so those entries
+// are deliberately left UNMATCHED rather than loosely matched.
+type charterScope struct {
+	exact        map[string]struct{}
+	globDirs     []string
+	globPatterns []string
+}
+
+func buildCharterScope(files []string) charterScope {
+	s := charterScope{exact: make(map[string]struct{}, len(files))}
+	for _, f := range files {
+		// "dir/**/*" is the same authorization as "dir/**" — fold it first
+		// so a reviewer's habit spelling still covers the tree's direct
+		// children (which path.Match would leave behind).
+		if dir, ok := strings.CutSuffix(f, "/**/*"); ok && dir != "" {
+			f = dir + "/**"
+		}
+		if dir, ok := strings.CutSuffix(f, "/**"); ok && dir != "" && !strings.Contains(dir, "*") {
+			s.globDirs = append(s.globDirs, dir)
+			continue
+		}
+		if strings.Contains(f, "**") {
+			// Mid-pattern or wildcard-directory "**": unsupported, and NOT
+			// path.Match fodder — see the type comment.
+			continue
+		}
+		if strings.Contains(f, "*") {
+			s.globPatterns = append(s.globPatterns, f)
+			continue
+		}
+		s.exact[f] = struct{}{}
+	}
+	return s
+}
+
+// matches reports whether rel (workdir-relative, slash form) is inside the
+// scope.
+func (s charterScope) matches(rel string) bool {
+	if _, ok := s.exact[rel]; ok {
+		return true
+	}
+	for _, dir := range s.globDirs {
+		// "src/**" covers "src/a.zig" and "src/sub/b.zig" but never
+		// "src-extra/a.zig" — the trailing slash is the boundary.
+		if strings.HasPrefix(rel, dir+"/") {
+			return true
+		}
+	}
+	for _, pat := range s.globPatterns {
+		if ok, err := path.Match(pat, rel); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyAgainstCharter splits the phase's current change set into what the
 // review should see and what must be reverted. changed carries ABSOLUTE
 // paths (changedSince's form); reviewScope comes back absolute because that
@@ -533,11 +608,15 @@ func classifyAgainstCharter(workDir string, c *Charter, changed []string) (revie
 	if c == nil {
 		return nil, nil
 	}
-	scope := make(map[string]struct{}, len(c.ScopeFiles))
+	cs := buildCharterScope(c.ScopeFiles)
 	scopeDirs := make(map[string]struct{}, len(c.ScopeFiles))
 	for _, f := range c.ScopeFiles {
-		scope[f] = struct{}{}
-		if strings.HasSuffix(f, ".go") {
+		// Exact .go entries have always seeded this set; a single-level
+		// "*.go" entry must too ("dir/*.go" authorizes dir/*_test.go AND
+		// dir/testdata/** — review round caught the gap). "**"-bearing
+		// entries are excluded: dir/** already covers the subtree outright,
+		// and unsupported shapes get no companion privileges.
+		if strings.HasSuffix(f, ".go") && !strings.Contains(f, "**") {
 			scopeDirs[path.Dir(f)] = struct{}{}
 		}
 	}
@@ -549,9 +628,8 @@ func classifyAgainstCharter(workDir string, c *Charter, changed []string) (revie
 			violations = append(violations, abs)
 			continue
 		}
-		_, inScope := scope[rel]
 		switch {
-		case inScope || isTestCompanion(rel, scope, scopeDirs):
+		case cs.matches(rel) || isTestCompanion(rel, cs.exact, scopeDirs):
 			reviewScope = append(reviewScope, abs)
 		case isScopeExempt(rel):
 			// Exempt from the violation test, and deliberately NOT reviewed.

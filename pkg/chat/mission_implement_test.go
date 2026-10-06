@@ -790,3 +790,141 @@ func TestMissionGate_FailWithNoIssuesIsNotAPass(t *testing.T) {
 		t.Error("Reviewed must stay false")
 	}
 }
+
+// PR #11 follow-up: a charter's "dir/**" entries were stored verbatim and
+// matched EXACTLY, so they never matched anything — every file only a
+// wildcard covered read as a violation (mission 20261005-205218-00f3 lost
+// its post-completion state to exactly that, over nexus-httpd/src/metrics.zig).
+func TestClassifyAgainstCharter_HonorsWildcardScope(t *testing.T) {
+	dir := t.TempDir()
+	abs := func(rel string) string { return filepath.Join(dir, rel) }
+	charter := &Charter{ScopeFiles: []string{
+		"nexus-httpd/src/**", // whole tree, any depth
+		"cmd/*.go",           // one level only
+		"exact/file.zig",     // exact path
+	}}
+	changed := []string{
+		abs("nexus-httpd/src/metrics.zig"),   // wildcard-covered, the file that died last time
+		abs("nexus-httpd/src/waf/deep.zig"),  // wildcard covers subdirectories too
+		abs("cmd/main.go"),                   // single-level glob
+		abs("exact/file.zig"),                // exact match
+		abs("cmd/sub/nested.go"),             // one level too deep for cmd/*.go
+		abs("nexus-httpd/src-extra/evil.go"), // prefix boundary: "src/**" must not match "src-extra/"
+	}
+	reviewScope, violations := classifyAgainstCharter(dir, charter, changed)
+
+	if len(violations) != 2 || violations[0] != "cmd/sub/nested.go" || violations[1] != "nexus-httpd/src-extra/evil.go" {
+		t.Fatalf("violations = %v, want exactly the nested and src-extra files", violations)
+	}
+	if len(reviewScope) != 4 {
+		t.Fatalf("reviewScope has %d files, want the 4 in-scope ones", len(reviewScope))
+	}
+}
+
+// The end-to-end half of the same fix: a gate running under a wildcard
+// charter must let a newly-touched file under the wildcard through to the
+// reviewer instead of spending a scope round on it.
+func TestMissionGate_WildcardCharterCoversNewFiles(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, _, m := newImplementRepl(t, fake, []string{"tree/**"})
+	if err := os.MkdirAll(filepath.Join(r.cfg.WorkDir, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "tree", "late_discovery.zig"), "x")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if got.reviewFailed || got.escalate != "" || !got.passed {
+		t.Fatalf("gate = %+v, want a pass — the wildcard covers the file, no scope round", got)
+	}
+	if m.state.ScopeRound != 0 {
+		t.Fatalf("scope_round = %d, want 0 — a wildcard-covered file must not spend a scope round", m.state.ScopeRound)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1", fake.calls)
+	}
+}
+
+// The scope-fix message must offer the standoff exit — obeying a revert that
+// re-breaks a passing acceptance criterion is how 20261005-205218-00f3 died —
+// and must promise escalation only when the machinery actually escalates:
+// an early round is followed by another scope round, not by an escalation,
+// so promising one there teaches the model to distrust the instructions
+// (PR #12 review).
+func TestMissionScopeMessage_NamesTheCriterionConflictExit(t *testing.T) {
+	early := missionScopeMessage(1, maxScopeFixRounds, []string{"a/b.zig"})
+	if !strings.Contains(early, "[mission-scope round 1/2]") || !strings.Contains(early, "Revert them") {
+		t.Errorf("an early round is still a revert order:\n%s", early)
+	}
+	for _, needle := range []string{"must not break a locked acceptance criterion", "restore the minimal change", "state the conflict explicitly"} {
+		if !strings.Contains(early, needle) {
+			t.Errorf("early scope message missing %q:\n%s", needle, early)
+		}
+	}
+	if strings.Contains(early, "escalates the charter itself back to design") {
+		t.Errorf("an early round must NOT promise an escalation — the next round is another scope message:\n%s", early)
+	}
+	if !strings.Contains(early, "do not edit the charter yourself") {
+		t.Error("the no-self-widening rule must survive alongside the exception")
+	}
+
+	last := missionScopeMessage(maxScopeFixRounds, maxScopeFixRounds, []string{"a/b.zig"})
+	if !strings.Contains(last, "LAST ROUND") {
+		t.Errorf("the final round must say it is the last:\n%s", last)
+	}
+	if !strings.Contains(last, "escalates the charter itself back to design") {
+		t.Errorf("only the last round may promise the escalation:\n%s", last)
+	}
+	for _, needle := range []string{"KEEP the minimal change", "re-locked charter can name the file"} {
+		if !strings.Contains(last, needle) {
+			t.Errorf("final scope message missing %q:\n%s", needle, last)
+		}
+	}
+}
+
+// PR #12 review: entries like "src/**/*" fold to "src/**" (path.Match would
+// cover exactly one subdirectory level and leave the direct children as
+// violations), and mid-pattern "**" ("a/**/b.go") is deliberately
+// UNMATCHED — path.Match would loosely treat the "**" as a single "*".
+// A single-level "dir/*.go" entry also keeps the testdata companion rule
+// for its directory.
+func TestClassifyAgainstCharter_GlobBucketEdges(t *testing.T) {
+	dir := t.TempDir()
+	abs := func(rel string) string { return filepath.Join(dir, rel) }
+
+	t.Run("star-star-slash-star folds to star-star", func(t *testing.T) {
+		charter := &Charter{ScopeFiles: []string{"src/**/*"}}
+		reviewScope, violations := classifyAgainstCharter(dir, charter, []string{
+			abs("src/metrics.zig"), // the direct child path.Match would miss
+			abs("src/waf/a.zig"),   // the subdirectory it would cover
+			abs("src/waf/deep/b.zig"),
+		})
+		if len(violations) != 0 || len(reviewScope) != 3 {
+			t.Fatalf("violations=%v reviewScope=%v — src/**/* must fold to src/**", violations, reviewScope)
+		}
+	})
+
+	t.Run("mid-pattern star-star is unmatched", func(t *testing.T) {
+		charter := &Charter{ScopeFiles: []string{"a/**/b.go"}}
+		_, violations := classifyAgainstCharter(dir, charter, []string{abs("a/x/b.go")})
+		if len(violations) != 1 {
+			t.Fatalf("violations=%v — an unsupported shape must not loosely match", violations)
+		}
+	})
+
+	t.Run("single-level go glob keeps testdata companions", func(t *testing.T) {
+		charter := &Charter{ScopeFiles: []string{"pkg/*.go"}}
+		reviewScope, violations := classifyAgainstCharter(dir, charter, []string{
+			abs("pkg/a.go"),            // glob hit
+			abs("pkg/a_test.go"),       // companion of the glob's directory
+			abs("pkg/testdata/f.json"), // ditto
+			abs("pkg/sub/b.go"),        // too deep for pkg/*.go
+		})
+		if len(violations) != 1 || violations[0] != "pkg/sub/b.go" {
+			t.Fatalf("violations=%v, want only the too-deep file", violations)
+		}
+		if len(reviewScope) != 3 {
+			t.Fatalf("reviewScope=%v, want glob hit plus both companions", reviewScope)
+		}
+	})
+}
