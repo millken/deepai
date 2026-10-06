@@ -268,7 +268,14 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		// record-based check would report the same violation again, spend
 		// the second scope round, and escalate a mission that actually did
 		// what it was told.
-		reviewScope, violations = classifyAgainstCharter(r.cfg.WorkDir, m.charter, after.changedSince(before))
+		//
+		// changesSince, not changedSince: an implementer that COMMITS its
+		// work leaves the dirty set, and the dirty set alone cannot tell
+		// that from a revert. The phase then had nothing to review, which
+		// is an idle round — so a mission whose change was finished and
+		// committed was told "talking about the work is not doing it"
+		// twice and handed back unreviewed.
+		reviewScope, violations = classifyAgainstCharter(r.cfg.WorkDir, m.charter, after.changesSince(before))
 	} else {
 		// Non-git degradation is NARROW (R30): the hard scope check and the
 		// scope escalation switch off, because there is no trustworthy
@@ -329,7 +336,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		return gateResult{next: missionIdleMessage(m.state.IdleRound, maxIdleRounds)}
 	}
 
-	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
+	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, before, r.reviewPrev)
 	if outcome != reviewOK {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
 		// un-write them, and nothing here may ever report them as reviewed.

@@ -121,6 +121,19 @@ func gitInit(t *testing.T, dir string) {
 	}
 }
 
+// gitCommitAll stages and commits the whole worktree, which is what an
+// implementer following ordinary operator instructions does at the end of a
+// turn — and the thing commit attribution exists to keep visible.
+func gitCommitAll(t *testing.T, dir, msg string) {
+	t.Helper()
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", msg}} {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+}
+
 func TestMissionGate_OutOfScopeFileTakesAScopeRoundNotAReviewRound(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, ui, m := newImplementRepl(t, fake, []string{"in_scope.go"})
@@ -178,6 +191,66 @@ func TestMissionGate_RevertedFileLeavesTheViolationSet(t *testing.T) {
 	}
 	if !got.passed {
 		t.Error("a passing verdict on in-scope work must set passed")
+	}
+}
+
+// An implementer that COMMITS its work is following the discipline most
+// operator instructions ask for, and it used to end the mission: the
+// committed files left `git status --porcelain`, the phase delta came back
+// empty, and an empty delta is an idle round. The gate spent both idle
+// nudges telling an agent that had just finished and committed the whole
+// change that "talking about the work is not doing it", then handed the
+// mission back with Reviewed=false.
+func TestMissionGate_CommittedWorkIsReviewedNotIdle(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	dir := t.TempDir()
+	gitInit(t, dir)
+	writeFileOrFatal(t, filepath.Join(dir, "in_scope.go"), "package x\n")
+	gitCommitAll(t, dir, "before the mission")
+
+	r, _, m := newImplementReplIn(t, dir, fake, []string{"in_scope.go"})
+	writeFileOrFatal(t, filepath.Join(dir, "in_scope.go"), "package x\n\nfunc Done() {}\n")
+	gitCommitAll(t, dir, "the mission's work")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if m.state.IdleRound != 0 {
+		t.Fatalf("idle_round = %d — committed work is work, not silence", m.state.IdleRound)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1 — committed work must still be reviewed", fake.calls)
+	}
+	if !got.passed {
+		t.Fatalf("got %+v, want a reviewed pass", got)
+	}
+	// The reviewer has to actually SEE the change: a bare `git diff` on a
+	// committed file is empty, and an empty diff passes anything.
+	prompt, _ := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "func Done()") {
+		t.Fatalf("the reviewer's diff does not contain the committed change:\n%s", prompt)
+	}
+}
+
+// Committing an out-of-charter file does not take it out of scope: the
+// violation check reads the same attribution the review does.
+func TestMissionGate_CommittedOutOfScopeFileIsStillAViolation(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	dir := t.TempDir()
+	gitInit(t, dir)
+	writeFileOrFatal(t, filepath.Join(dir, "in_scope.go"), "package x\n")
+	gitCommitAll(t, dir, "before the mission")
+
+	r, _, _ := newImplementReplIn(t, dir, fake, []string{"in_scope.go"})
+	writeFileOrFatal(t, filepath.Join(dir, "out_of_scope.go"), "package x\n")
+	gitCommitAll(t, dir, "reached outside the charter")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if !strings.Contains(got.next, "[mission-scope round 1/2]") || !strings.Contains(got.next, "out_of_scope.go") {
+		t.Fatalf("next = %q, want a scope-fix round naming the committed file", got.next)
+	}
+	if fake.calls != 0 {
+		t.Error("a scope violation must not spend a reviewer run")
 	}
 }
 

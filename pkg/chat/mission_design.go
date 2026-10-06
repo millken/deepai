@@ -458,7 +458,7 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 			return nil // review failures are fail-soft, never a turn error
 		})
 
-		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
 				"  mission: design reviewer modified the working tree (%s) — verdict DISCARDED",
 				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))

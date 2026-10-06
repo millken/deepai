@@ -118,7 +118,7 @@ func missionImplementMessage(c *Charter) string {
 func missionScopeMessage(round, maxRounds int, files []string) string {
 	var b strings.Builder
 	if round < maxRounds {
-		fmt.Fprintf(&b, "[mission-scope round %d/%d] These files are outside the locked charter scope, and are not test companions of an in-scope file. Revert them (git checkout -- <path>, or delete them if the mission created them):\n\n", round, maxRounds)
+		fmt.Fprintf(&b, "[mission-scope round %d/%d] These files are outside the locked charter scope, and are not test companions of an in-scope file. Revert them (git checkout -- <path>, delete them if the mission created them, or reverse the hunk if the change is already committed — committing an out-of-charter file does not take it out of scope):\n\n", round, maxRounds)
 		for _, f := range files {
 			b.WriteString("- " + f + "\n")
 		}
@@ -131,7 +131,7 @@ func missionScopeMessage(round, maxRounds int, files []string) string {
 		b.WriteString("- " + f + "\n")
 	}
 	b.WriteString("\nSort them by kind. This is the last scope round, and the very next gate check escalates the charter itself back to design:\n\n")
-	b.WriteString("- Genuine overreach (no locked criterion depends on it): revert it now — git checkout -- <path>, or delete it if the mission created it.\n")
+	b.WriteString("- Genuine overreach (no locked criterion depends on it): revert it now — git checkout -- <path>, delete it if the mission created it, or reverse the hunk if it is already committed.\n")
 	b.WriteString("- Criterion conflict (reverting it re-breaks a locked acceptance criterion — verify by re-running the criterion's command): KEEP the minimal change the criterion needs and state the conflict explicitly in your reply. The escalation re-opens design and the re-locked charter can name the file. Reverting a fix the criteria depend on is the one wrong answer.")
 	return strings.TrimRight(b.String(), "\n")
 }

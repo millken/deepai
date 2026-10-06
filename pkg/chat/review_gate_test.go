@@ -398,7 +398,7 @@ func TestBuildReviewDiffScopedWithUntracked(t *testing.T) {
 
 	snap := takeWorktreeSnapshot(dir)
 	scope := []string{filepath.Join(snap.root, "committed.go"), filepath.Join(snap.root, "brandnew.go")}
-	diff, oversized := buildReviewDiff(dir, snap, scope)
+	diff, oversized := buildReviewDiff(dir, snap, worktreeSnapshot{}, scope)
 	if oversized {
 		t.Fatal("small diff flagged oversized")
 	}

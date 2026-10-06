@@ -45,6 +45,7 @@ const gitCommandTimeout = 5 * time.Second
 // attribution only, per the design's non-git degradation.
 type worktreeSnapshot struct {
 	root    string // absolute worktree toplevel
+	head    string // HEAD commit at snapshot time; "" in a repo with no commits
 	entries map[string]fileStamp
 }
 
@@ -98,7 +99,19 @@ func takeWorktreeSnapshot(dir string) worktreeSnapshot {
 		// exists for.
 		entries[e.path] = stamp
 	}
-	return worktreeSnapshot{root: root, entries: entries}
+	return worktreeSnapshot{root: root, head: gitHead(dir), entries: entries}
+}
+
+// gitHead resolves HEAD, or "" when it cannot be resolved — a repository
+// with no commits yet, or a git failure. "" disables commit attribution
+// (committedSince returns nil), which is the same degradation an
+// unavailable snapshot already takes.
+func gitHead(dir string) string {
+	out, err := runGit(dir, "rev-parse", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return string(bytes.TrimSpace(out))
 }
 
 // changedSince returns the absolute paths of files that are new or changed
@@ -118,6 +131,62 @@ func (s worktreeSnapshot) changedSince(prev worktreeSnapshot) []string {
 	}
 	sort.Strings(changed)
 	return changed
+}
+
+// committedSince returns the absolute paths of files that commits landed
+// between prev and s touched, sorted. It is the other half of attribution:
+// changedSince can only see what is DIRTY, and committing a file makes it
+// clean, so by itself it reports a change that was committed exactly the
+// way it reports a change that was reverted — the path simply drops out of
+// `git status --porcelain`.
+//
+// That collapse is what this exists to undo. An implementer that commits
+// its work (the discipline most operator instructions ask for) emptied the
+// mission's review scope, and an empty scope is "nothing to review": the
+// gate spent its idle rounds telling an agent that had just finished and
+// committed the whole change that "talking about the work is not doing it",
+// then handed the mission back with Reviewed=false (§5.4.2 R35 names
+// porcelain disappearance as the ONLY way out of the change set, and never
+// considered that a commit is also a way out).
+//
+// Either snapshot lacking a resolvable HEAD yields nil, as does an
+// unchanged HEAD or a git failure: without two commits to compare there is
+// nothing trustworthy to attribute, and the dirty-state delta still stands
+// on its own.
+func (s worktreeSnapshot) committedSince(prev worktreeSnapshot) []string {
+	if s.root == "" || prev.root == "" || s.root != prev.root {
+		return nil
+	}
+	if s.head == "" || prev.head == "" || s.head == prev.head {
+		return nil
+	}
+	// Two-point diff, not prev..s: a commit the mission made on a branch
+	// that was since rebased or reset is still comparable by object, and a
+	// prev that is no longer an ancestor must not silently report nothing.
+	out, err := runGit(s.root, "diff", "--name-only", "-z", prev.head, s.head)
+	if err != nil {
+		// Unreachable baseline object (a reset or a pruned commit): the
+		// dirty delta is all the attribution left. Degrading quietly is
+		// the same choice an unavailable snapshot makes.
+		return nil
+	}
+	var changed []string
+	for _, f := range bytes.Split(out, []byte{0}) {
+		if len(f) == 0 {
+			continue
+		}
+		changed = append(changed, filepath.Join(s.root, string(f)))
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+// changesSince is the full attribution of what happened to the worktree
+// between prev and s: uncommitted edits plus edits that landed in a commit.
+// Every gate wants this one, not changedSince alone — a change that was
+// committed is still a change the review has to see.
+func (s worktreeSnapshot) changesSince(prev worktreeSnapshot) []string {
+	return unionSorted(s.changedSince(prev), s.committedSince(prev))
 }
 
 // WorktreeSnapshot and TakeWorktreeSnapshot are thin exported wrappers around
@@ -453,7 +522,7 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 	// in the scope (once per form) and its untracked/tracked classification
 	// flips: changedSince already reports git-canonical paths, so the tool
 	// records are canonicalized to match.
-	scope := unionSorted(resolveWorktreePaths(r.carry.EditedFiles()), after.changedSince(before))
+	scope := unionSorted(resolveWorktreePaths(r.carry.EditedFiles()), after.changesSince(before))
 	if len(scope) == 0 {
 		return gateResult{}
 	}
@@ -462,7 +531,7 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 		r.ui.Info("  review: not a git worktree — bash-side edits are invisible to attribution, and reviewer writes cannot be detected")
 	}
 
-	verdict, outcome := r.dispatchReview(parentCtx, initialRequest, scope, after, r.reviewPrev)
+	verdict, outcome := r.dispatchReview(parentCtx, initialRequest, scope, after, before, r.reviewPrev)
 	if outcome != reviewOK {
 		r.reviewPrev = nil
 		return gateResult{} // fail-soft; dispatchReview already warned
@@ -491,8 +560,14 @@ func (r *ChatRepl) reviewGate(parentCtx context.Context, initialRequest string, 
 // dispatchReview runs the degradation ladder and the reviewer for one scope.
 // Shared by the automatic gate and the manual /review command; every non-OK
 // outcome is fail-soft and already warned.
-func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap worktreeSnapshot, prev *agent.ReviewResult) (*agent.ReviewResult, reviewOutcome) {
-	diff, oversized := buildReviewDiff(r.cfg.WorkDir, snap, scope)
+//
+// base is the snapshot the change set was attributed against (the turn's
+// before-snapshot, or a mission's phase baseline); its HEAD is what the
+// diff is taken against so that work the turn COMMITTED is in the diff
+// rather than silently empty. The zero snapshot means "no baseline" — the
+// manual /review, which reviews the dirty tree as it stands.
+func (r *ChatRepl) dispatchReview(parentCtx context.Context, initialRequest string, scope []string, snap, base worktreeSnapshot, prev *agent.ReviewResult) (*agent.ReviewResult, reviewOutcome) {
+	diff, oversized := buildReviewDiff(r.cfg.WorkDir, snap, base, scope)
 	if oversized {
 		r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
 		return nil, reviewFailedTerminal
@@ -682,7 +757,7 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 		// bash is unsandboxed; this snapshot is the only hard line). Terminal:
 		// the tree now holds foreign writes, and a retry would only fold them
 		// into the next diff as if the implementer had made them.
-		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changedSince(preReview); len(tampered) > 0 {
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
 			r.ui.Info(fmt.Sprintf(
 				"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
 				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
@@ -865,7 +940,15 @@ func buildReviewPrompt(in reviewPromptInput) string {
 // (design N1; `git add -N` was rejected because mutating the user's index
 // violates review-has-zero-side-effects). oversized=true means rung (c):
 // do not review.
-func buildReviewDiff(workDir string, snap worktreeSnapshot, scope []string) (diff string, oversized bool) {
+//
+// When base carries a HEAD different from the snapshot's, the tracked diff
+// is taken against THAT commit rather than against the index. A bare
+// `git diff -- <path>` shows only what is still uncommitted, so a change
+// the turn committed came out as an empty diff — and an empty diff is the
+// one input that makes a reviewer pass a change it never saw (the warning
+// resolveWorktreePath already carries). Diffing from the baseline commit
+// covers committed and uncommitted work in one view.
+func buildReviewDiff(workDir string, snap, base worktreeSnapshot, scope []string) (diff string, oversized bool) {
 	var b strings.Builder
 	if snap.root == "" {
 		b.WriteString("(diff unavailable: not a git worktree — attached file contents are the full change view)\n")
@@ -880,7 +963,12 @@ func buildReviewDiff(workDir string, snap worktreeSnapshot, scope []string) (dif
 			}
 		}
 		if len(tracked) > 0 {
-			out, err := runGit(workDir, append([]string{"diff", "--"}, tracked...)...)
+			args := []string{"diff"}
+			if ref := diffBaseRef(snap, base); ref != "" {
+				args = append(args, ref)
+			}
+			args = append(args, "--")
+			out, err := runGit(workDir, append(args, tracked...)...)
 			if err != nil {
 				b.WriteString("(git diff failed for tracked files — rely on attached file contents)\n")
 			} else {
@@ -901,6 +989,21 @@ func buildReviewDiff(workDir string, snap worktreeSnapshot, scope []string) (dif
 		return "", true
 	}
 	return b.String(), false
+}
+
+// diffBaseRef is the commit the tracked diff should be taken against, or ""
+// to diff the working tree against the index as before. Only a baseline in
+// the SAME worktree whose HEAD has actually moved qualifies: an unmoved
+// HEAD makes the ref redundant, and a foreign or unresolvable one would
+// produce a diff that is not this change at all.
+func diffBaseRef(snap, base worktreeSnapshot) string {
+	if base.root == "" || base.root != snap.root {
+		return ""
+	}
+	if base.head == "" || base.head == snap.head {
+		return ""
+	}
+	return base.head
 }
 
 // runGitNoIndexDiff diffs an untracked file against /dev/null. git diff
@@ -1027,7 +1130,9 @@ func (r *ChatRepl) runManualReview(parentCtx context.Context) {
 		r.ui.Info("  review: nothing to review — no recorded edits and a clean worktree")
 		return
 	}
-	verdict, outcome := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, nil)
+	// No baseline: a manual /review judges the dirty tree as it stands,
+	// which is exactly what the index-relative diff shows.
+	verdict, outcome := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, worktreeSnapshot{}, nil)
 	if outcome != reviewOK {
 		return
 	}
