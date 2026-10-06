@@ -628,6 +628,37 @@ func TestImplementPhase_InterruptedPendingReviewKeepsTheFlagOnDisk(t *testing.T)
 	}
 }
 
+// A Ctrl+C on a FIRST review (nothing pending yet) owes the same debt a
+// transient outage does: the turn that produced this diff already ran, so
+// the resume must re-review it rather than run another "Implement it" turn
+// over a diff that was one review away from the gate.
+func TestImplementPhase_InterruptedReviewMarksItPending(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	r, ui, m := newImplementRepl(t, fake, []string{"a.go"})
+	turns := 0
+	r.missionTurn = func(_ context.Context, _ string) *turnError {
+		turns++
+		writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package a")
+		return nil
+	}
+	ui.interruptDuringTask = true
+	fake.waitForCancel = true
+
+	r.runImplementPhase(context.Background())
+
+	if turns != 1 {
+		t.Fatalf("ran %d turns, want 1", turns)
+	}
+	reloaded := openOrFatal(t, r.cfg.WorkDir, m.state.ID)
+	if reloaded.state.Status != missionStatusActive {
+		t.Fatalf("status = %q, want active", reloaded.state.Status)
+	}
+	if reloaded.state.PendingReview != missionPhaseImplement {
+		t.Fatalf("pending_review = %q, want implement — an interrupted review still owes the diff a review",
+			reloaded.state.PendingReview)
+	}
+}
+
 // PR #11 review: a pending implementation review re-enters through the
 // GATE, not an "Implement it" turn — a fresh turn would edit a diff that
 // was one review away from passing (or failing) on its own merits.

@@ -505,6 +505,59 @@ func TestDesignPhase_InterruptedReviewKeepsTheMissionActive(t *testing.T) {
 	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "design review interrupted") {
 		t.Errorf("the user must be told the plan is unreviewed: %v", ui.infoMsgs)
 	}
+	// The round's turn already ran, so what the resume owes this plan is
+	// the review, not another rewrite of it — the same debt a transient
+	// outage records.
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.PendingReview; got != missionPhaseDesign {
+		t.Fatalf("pending_review = %q, want design — an interrupted review still owes the plan a review", got)
+	}
+}
+
+// The interrupted review's missing pending flag was not merely wasteful: on
+// the LAST design round the resume computed round = maxDesignRounds+1, took
+// the round-cap exit, and ended the mission design_failed with a finished
+// plan on disk that no reviewer had ever read. A Ctrl+C on the review is
+// the most ordinary thing a watching user does.
+func TestDesignPhase_InterruptedReviewOnTheLastRoundStillGetsReviewed(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, _, inputs := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.DesignRound = maxDesignRounds - 1
+	if err := m.save(); err != nil {
+		t.Fatal(err)
+	}
+	r.mission = m
+
+	// Round 3/3 runs its turn, and the user interrupts its review.
+	r.ui.(*mockUI).interruptDuringTask = true
+	fake.waitForCancel = true
+	r.runDesignPhase(context.Background())
+	if r.mission == nil {
+		t.Fatal("an interrupted review must not end the mission")
+	}
+	if m.state.DesignRound != maxDesignRounds {
+		t.Fatalf("design_round = %d, want %d", m.state.DesignRound, maxDesignRounds)
+	}
+
+	// The resume: the plan is complete and the budget is spent, so the one
+	// thing left to do is review it.
+	r.ui.(*mockUI).interruptDuringTask = false
+	fake.waitForCancel = false
+	turnsBefore := len(*inputs)
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("the resumed review passed the plan; the mission must proceed to implement")
+	}
+	if len(*inputs) != turnsBefore {
+		t.Fatalf("ran %d extra design turns, want 0 — the owing review dispatches before any turn",
+			len(*inputs)-turnsBefore)
+	}
+	if m.state.Phase != missionPhaseImplement {
+		t.Fatalf("phase = %q, want implement", m.state.Phase)
+	}
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.Status; got != missionStatusActive {
+		t.Fatalf("status = %q, want active — design_failed here throws away a reviewable plan", got)
+	}
 }
 
 // PR #11 review round 2: a resume carrying USER input must spend it on a

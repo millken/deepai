@@ -155,8 +155,16 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		case out.reviewInterrupted:
 			// The user cancelled the review: same rule the design gate has
 			// always had — nothing is wrong with the work, the mission stays
-			// active and the next message resumes it.
-			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message resumes the mission, /mission abort ends it")
+			// active and the next message resumes it. The review is marked
+			// PENDING exactly as a transient outage is: the turn that
+			// produced this diff already ran, so what the resume owes is
+			// the review, not another "Implement it" turn editing a diff
+			// that was one review away from the gate.
+			m.state.PendingReview = missionPhaseImplement
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message re-runs the review on the unchanged changes, /mission abort ends it")
 			return false
 		case out.next == "":
 			r.ui.Info("  mission: handed_over — the changes are in the worktree and did NOT pass a review; they need your judgment")

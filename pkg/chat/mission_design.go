@@ -182,9 +182,20 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			// wrong with the mission and nothing has been implemented, so
 			// it stays active and the user can simply resume — ending it
 			// here would throw away a finished plan because the user
-			// interrupted the thing reading it. The pending flag survives
-			// on disk, so that resume goes through the gate first.
-			r.ui.Info("  mission: design review interrupted — the plan was NOT reviewed; your next message resumes the mission, /mission abort ends it")
+			// interrupted the thing reading it.
+			//
+			// The review is marked PENDING for the same reason a transient
+			// outage is: the round's turn already ran, so the resume owes
+			// this plan a review and not another rewrite of it. Leaving the
+			// flag unset was worse than wasteful on the LAST round — the
+			// resume computed round = maxRounds+1, took the round-cap exit
+			// and ended the mission design_failed with a finished plan on
+			// disk that no reviewer had ever read.
+			m.state.PendingReview = missionPhaseDesign
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+			r.ui.Info("  mission: design review interrupted — the plan was NOT reviewed; your next message re-runs the review on the unchanged plan, /mission abort ends it")
 			return false
 		case reviewFailedTerminal:
 			// Design-side fail-soft is the OPPOSITE of the implementation
