@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,12 +44,22 @@ var (
 	argIndexRegex = regexp.MustCompile(`\$ARGUMENTS\[(\d+)\]`)
 	argShortRegex = regexp.MustCompile(`\$(\d+)`)
 	envVarRegex   = regexp.MustCompile(`\$\{(\w+)\}`)
+	mdLinkRegex   = regexp.MustCompile(`\[([^\]]*)\]\(([^)]+)\)`)
 )
 
 // Render performs string replacement and dynamic context injection.
 // Order: 1) replace variables, 2) execute !`command` blocks.
 func Render(ctx context.Context, body string, args string, skill *Skill) (string, error) {
 	sessionID := SessionIDFromContext(ctx)
+
+	// 0. Resolve skill-relative markdown links against the skill's directory
+	// (references/x.md → <skillDir>/references/x.md) BEFORE variable
+	// replacement and command injection: the body is skill-authored text
+	// here, while args and command output are runtime data that must not be
+	// rewritten.
+	if skill != nil {
+		body = rewriteRelativeLinks(body, skill.Dir)
+	}
 
 	// 1. Replace variables
 	rendered := replaceVariables(body, args, skill, sessionID)
@@ -59,7 +70,58 @@ func Render(ctx context.Context, body string, args string, skill *Skill) (string
 		return rendered, err // return partially rendered content
 	}
 
+	if skill != nil && skill.Dir != "" {
+		injected = strings.TrimRight(injected, "\r\n") +
+			"\n\nSkill directory: " + skill.Dir +
+			" (this skill's SKILL.md and its reference files live here; read them by absolute path, never by searching the filesystem)"
+	}
 	return injected, nil
+}
+
+// rewriteRelativeLinks rewrites relative markdown link/image URLs in body to
+// absolute paths under dir. Absolute URLs, anchors, absolute paths and
+// mailto: links are left alone; !`command` spans are skipped so command
+// text is never rewritten. Returns body unchanged when dir is empty.
+func rewriteRelativeLinks(body, dir string) string {
+	if dir == "" {
+		return body
+	}
+	var buf strings.Builder
+	lastEnd := 0
+	for _, inj := range ParseDynamicInjections(body) {
+		if inj.Start > lastEnd {
+			buf.WriteString(rewriteLinksInSegment(body[lastEnd:inj.Start], dir))
+		}
+		buf.WriteString(body[inj.Start:inj.End])
+		lastEnd = inj.End
+	}
+	if lastEnd < len(body) {
+		buf.WriteString(rewriteLinksInSegment(body[lastEnd:], dir))
+	}
+	return buf.String()
+}
+
+func rewriteLinksInSegment(text, dir string) string {
+	return mdLinkRegex.ReplaceAllStringFunc(text, func(m string) string {
+		sub := mdLinkRegex.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		label, url := sub[1], strings.TrimSpace(sub[2])
+		if url == "" || strings.HasPrefix(url, "#") || strings.HasPrefix(url, "/") ||
+			strings.Contains(url, "://") || strings.HasPrefix(url, "mailto:") {
+			return m
+		}
+		path, frag, _ := strings.Cut(url, "#")
+		if path == "" {
+			return m
+		}
+		resolved := filepath.Join(dir, path)
+		if frag != "" {
+			resolved += "#" + frag
+		}
+		return "[" + label + "](" + resolved + ")"
+	})
 }
 
 // replaceVariables handles $ARGUMENTS, $N, $ARGUMENTS[N], ${SESSION_ID}, ${SKILL_DIR}.

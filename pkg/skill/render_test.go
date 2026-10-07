@@ -1,6 +1,7 @@
 package skill
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -232,5 +233,53 @@ func TestReplaceCommandArgs_OutOfBounds(t *testing.T) {
 	}
 	if !strings.Contains(got, `$SKILL_ARG_9`) {
 		t.Error("expected env var ref for out-of-bounds $9")
+	}
+}
+
+func TestRewriteRelativeLinks(t *testing.T) {
+	body := "See [ref](references/a.md), [frag](references/b.md#sec), [ext](https://x.dev/y.md), [anchor](#top), [abs](/etc/hosts), ![pic](img/p.png), and !`echo [x](cmd.md)`."
+
+	got := rewriteRelativeLinks(body, "/skills/zig")
+
+	want := []string{
+		"[ref](/skills/zig/references/a.md)",
+		"[frag](/skills/zig/references/b.md#sec)",
+		"[ext](https://x.dev/y.md)",
+		"[anchor](#top)",
+		"[abs](/etc/hosts)",
+		"![pic](/skills/zig/img/p.png)",
+		"!`echo [x](cmd.md)`",
+	}
+	for _, w := range want {
+		if !strings.Contains(got, w) {
+			t.Errorf("missing %q in:\n%s", w, got)
+		}
+	}
+
+	if got := rewriteRelativeLinks(body, ""); got != body {
+		t.Errorf("empty dir should leave body unchanged, got:\n%s", got)
+	}
+}
+
+func TestRender_SkillDirectoryFooter(t *testing.T) {
+	sk := &Skill{Dir: "/skills/zig"}
+
+	got, err := Render(context.Background(), "See [ref](references/a.md).", "", sk)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(got, "[ref](/skills/zig/references/a.md)") {
+		t.Errorf("relative link not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "Skill directory: /skills/zig") {
+		t.Errorf("footer missing:\n%s", got)
+	}
+
+	nilGot, err := Render(context.Background(), "body", "", nil)
+	if err != nil {
+		t.Fatalf("Render nil skill: %v", err)
+	}
+	if nilGot != "body" {
+		t.Errorf("nil skill should leave body unchanged, got %q", nilGot)
 	}
 }

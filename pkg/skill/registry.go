@@ -394,7 +394,14 @@ func (r *Registry) describeSkills(include func(*Skill) bool) (string, bool) {
 		// then collapse newlines to spaces, so a catalog entry can never
 		// contain a blank line.
 		desc := strings.ReplaceAll(strings.TrimSpace(s.Meta.Description), "\n", " ")
+		// The dir annotation gives the model the skill's on-disk location so it
+		// can follow the body's relative reference links without searching the
+		// filesystem for SKILL.md (observed failure: "读取zig skills" triggered
+		// a workspace-wide find/grep instead of the skill tool).
 		line := fmt.Sprintf("- /%s: %s\n", s.Meta.Name, desc)
+		if s.Dir != "" {
+			line = fmt.Sprintf("- /%s (%s): %s\n", s.Meta.Name, s.Dir, desc)
+		}
 		if total+len(line) > descriptionKB {
 			break
 		}

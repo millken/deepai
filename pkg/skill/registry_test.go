@@ -85,6 +85,9 @@ func TestRegistry_Descriptions(t *testing.T) {
 	if strings.Contains(desc, "/manual-skill") {
 		t.Error("manual-skill should not appear in descriptions")
 	}
+	if !strings.Contains(desc, "("+filepath.Join(dir, "auto-skill")+")") {
+		t.Error("catalog entry should carry the skill directory")
+	}
 }
 
 // TestDescriptionsForAgent_EmptyAfterFilterReturnsEmptyString is the RED test

@@ -13,7 +13,7 @@ import (
 func SkillTool(executor *Executor) models.Tool {
 	return models.Tool{
 		Name:        "skill",
-		Description: "Invoke a specialized skill. Use when the user request matches a skill's domain.",
+		Description: "Load a specialized skill's full instructions into context by name. Calling this tool IS reading the skill — when the user asks to read/load/apply a skill, or the request matches a skill's domain, call this tool; never search the filesystem (find/grep for SKILL.md or skills directories) to read a skill. Reference files mentioned in the loaded body are already resolved to absolute paths under the skill's directory.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
