@@ -1286,17 +1286,25 @@ func (r *ChatRepl) acquireOrHandleLock(sess *models.Session) error {
 	// a user-facing string; grep the package for user-visible strings
 	// (fmt.Errorf/ui.Info/Fprintln et al.) before adding a new one.
 	// A same-host holder in job-control stop (Ctrl+Z / SIGTTIN) is frozen but
-	// alive — the generic message below assumes "running", which would tell
-	// the user to be afraid of --force. Tell them what is actually going on:
-	// the short clock makes it reclaimable without --force after staleLockAfter.
-	holderStopped := lockErr.Owner.Host == r.lockOwner.Host && processStopped(lockErr.Owner.PID)
-	stoppedHint := ""
-	if holderStopped {
-		stoppedHint = "  持有进程当前处于停止状态（如被 Ctrl+Z 挂起）——稍等 1 分钟后重试本命令即可自动接管，无需 --force；或 kill 该 pid 后重试。\n"
+	// alive. The generic message below is written for a running-or-leftover
+	// pid: its kill -9 line is known-false here, and its --force bullet is
+	// the one action to avoid (fg-ing the old process back after a forced
+	// takeover loses its un-persisted transcript; only --fork rescues that).
+	// The stopped case gets its own CONSTANT format string — splicing a
+	// variable into the format string would silence go vet's printf check
+	// for the whole call — listing only the real ways out: wait out the
+	// short clock (auto takeover, no --force) or kill the pid.
+	if lockErr.Owner.Host == r.lockOwner.Host && processStopped(lockErr.Owner.PID) {
+		return fmt.Errorf(
+			"会话 %s 正在被另一个 deepai 使用（pid %d @ %s，心跳 %s 前），该进程当前处于停止状态（如被 Ctrl+Z 挂起）。\n"+
+				"  稍等约 1 分钟后重试本命令即可自动接管，无需 --force；或 kill 该 pid 后重试。\n"+
+				"  - 直接运行 deepai（不带 -c/-r）开启新会话\n"+
+				"  - 加 --fork：把历史复制到一个新会话里继续，原会话不受影响",
+			sess.ID, lockErr.Owner.PID, lockErr.Owner.Host, time.Since(lockErr.HeartbeatAt).Round(time.Second),
+		)
 	}
 	return fmt.Errorf(
 		"会话 %s 正在被另一个 deepai 使用（pid %d @ %s，心跳 %s 前）。\n"+
-			stoppedHint+
 			"  这也可能是上一次 deepai 异常退出（例如被 kill -9）残留下的 pid——如果确认如此，--force 是安全的。\n"+
 			"  - 直接运行 deepai（不带 -c/-r）开启新会话\n"+
 			"  - 加 --fork：把历史复制到一个新会话里继续，原会话不受影响\n"+

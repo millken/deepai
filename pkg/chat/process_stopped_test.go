@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -27,42 +28,57 @@ func startSleepProcess(t *testing.T) *os.Process {
 	return cmd.Process
 }
 
+// waitProcessState polls the stop probe until want holds or the deadline
+// passes, so a kernel that takes a moment to move the child between states
+// never flakes the test.
+func waitProcessState(t *testing.T, pid int, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for processStopped(pid) != want && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if processStopped(pid) != want {
+		t.Fatalf("precondition: processStopped(%d) = %v, want %v", pid, !want, want)
+	}
+}
+
+// startStoppedProcess is startSleepProcess plus a real SIGSTOP, driven to a
+// confirmed stopped state — the precondition three tests below share.
+func startStoppedProcess(t *testing.T) *os.Process {
+	t.Helper()
+	proc := startSleepProcess(t)
+	if err := proc.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP: %v", err)
+	}
+	waitProcessState(t, proc.Pid, true)
+	return proc
+}
+
 // TestProcessStopped_RealSigstop probes processStopped against a real child
 // process driven through an actual SIGSTOP/SIGCONT cycle — not a mock — so
-// the darwin sysctl and linux /proc parsers are both exercised for real.
+// the darwin sysctl and linux /proc parsers are both exercised for real. The
+// CONT half is asserted too: recovery must report not-stopped before the
+// cycle's second stop is driven, otherwise a broken (always-true) probe
+// would pass the round trip vacuously.
 func TestProcessStopped_RealSigstop(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no job control on windows")
 	}
 	proc := startSleepProcess(t)
 
-	if processStopped(proc.Pid) {
-		t.Fatal("running child must not report stopped")
-	}
+	waitProcessState(t, proc.Pid, false)
 	if err := proc.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatalf("SIGSTOP: %v", err)
 	}
-	// Give the kernel a moment to move the process into the stopped state.
-	deadline := time.Now().Add(2 * time.Second)
-	for !processStopped(proc.Pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !processStopped(proc.Pid) {
-		t.Fatal("SIGSTOP'd child must report stopped")
-	}
+	waitProcessState(t, proc.Pid, true)
 	if err := proc.Signal(syscall.SIGCONT); err != nil {
 		t.Fatalf("SIGCONT: %v", err)
 	}
+	waitProcessState(t, proc.Pid, false)
 	if err := proc.Signal(syscall.SIGSTOP); err != nil {
 		t.Fatalf("re-SIGSTOP: %v", err)
 	}
-	deadline = time.Now().Add(2 * time.Second)
-	for !processStopped(proc.Pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !processStopped(proc.Pid) {
-		t.Fatal("re-SIGSTOP'd child must report stopped")
-	}
+	waitProcessState(t, proc.Pid, true)
 }
 
 // TestCanAcquireSessionLock_StoppedHolderShortClock is the regression test
@@ -76,38 +92,28 @@ func TestCanAcquireSessionLock_StoppedHolderShortClock(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no job control on windows")
 	}
-	proc := startSleepProcess(t)
-	if err := proc.Signal(syscall.SIGSTOP); err != nil {
-		t.Fatalf("SIGSTOP: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !processStopped(proc.Pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !processStopped(proc.Pid) {
-		t.Fatal("precondition: child must be stopped")
-	}
+	proc := startStoppedProcess(t)
 
 	me := models.LockOwner{PID: os.Getpid(), Host: "h"}
 	now := time.Now()
 	existing := &sessionLockRow{
 		Owner:       models.LockOwner{PID: proc.Pid, Host: "h"},
 		AcquiredAt:  now.Add(-2 * time.Hour),
-		HeartbeatAt: now.Add(-30 * time.Second), // fresh-ish: within staleLockAfter
+		HeartbeatAt: now.Add(-staleLockAfter + 30 * time.Second), // fresh-ish: within staleLockAfter
 	}
 	if canAcquireSessionLock(existing, me, false, now) {
 		t.Fatal("want NOT acquirable: stopped holder, heartbeat still within staleLockAfter")
 	}
 
-	existing.HeartbeatAt = now.Add(-61 * time.Second) // past staleLockAfter
+	existing.HeartbeatAt = now.Add(-(staleLockAfter + time.Second)) // past staleLockAfter
 	if !canAcquireSessionLock(existing, me, false, now) {
 		t.Fatal("want acquirable: stopped holder + heartbeat past staleLockAfter (old code held this behind the 10-min pid-reuse veto)")
 	}
 
-	// Sanity: the same row with a RUNNING pid keeps the full D1 veto — 61s
-	// staleness must NOT reclaim a live running holder. Use a SECOND child
-	// left running (os.Getpid() would match `me` and hit the reentrant branch
-	// before the liveness check ever runs).
+	// Sanity: the same row with a RUNNING pid keeps the full D1 veto —
+	// staleness past staleLockAfter must NOT reclaim a live running holder.
+	// Use a SECOND child left running (os.Getpid() would match `me` and hit
+	// the reentrant branch before the liveness check ever runs).
 	running := startSleepProcess(t)
 	existing.Owner.PID = running.Pid
 	if canAcquireSessionLock(existing, me, false, now) {
@@ -122,17 +128,7 @@ func TestAcquireSessionLock_StoppedHolderReclaimed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no job control on windows")
 	}
-	proc := startSleepProcess(t)
-	if err := proc.Signal(syscall.SIGSTOP); err != nil {
-		t.Fatalf("SIGSTOP: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !processStopped(proc.Pid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !processStopped(proc.Pid) {
-		t.Fatal("precondition: child must be stopped")
-	}
+	proc := startStoppedProcess(t)
 
 	store, cleanup := newTestStore(t)
 	defer cleanup()
@@ -150,14 +146,68 @@ func TestAcquireSessionLock_StoppedHolderReclaimed(t *testing.T) {
 		t.Fatalf("holder acquire: %v", err)
 	}
 	// Age the heartbeat past staleLockAfter: the lock row's heartbeat is
-	// refreshed on acquire, so rewind it directly.
+	// refreshed on acquire, so rewind it directly (unixFrac — the column
+	// stores fractional seconds).
 	if _, err := store.db.Exec(`UPDATE session_locks SET heartbeat_at = ? WHERE session_id = ?`,
-		time.Now().Add(-61*time.Second).Unix(), sess.ID); err != nil {
+		unixFrac(time.Now().Add(-(staleLockAfter + time.Second))), sess.ID); err != nil {
 		t.Fatalf("age heartbeat: %v", err)
 	}
 
 	other := models.LockOwner{PID: os.Getpid(), Host: host}
 	if err := store.AcquireSessionLock(sess.ID, other, false); err != nil {
 		t.Fatalf("want takeover of stopped holder without force, got: %v", err)
+	}
+}
+
+// TestAcquireOrHandleLock_StoppedHolderMessageIsAccurate is the message
+// contract for the stopped branch (M3 of the round-1 review): with a
+// same-host STOPPED holder and a fresh heartbeat — a guaranteed conflict —
+// the error must say the holder is stopped and how to get out (wait out the
+// short clock / kill the pid), and must NOT carry the generic kill -9
+// leftover-pid line or the --force bullet, both of which are known-false or
+// harmful in this branch.
+func TestAcquireOrHandleLock_StoppedHolderMessageIsAccurate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no job control on windows")
+	}
+	proc := startStoppedProcess(t)
+
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	sess, err := store.Create(models.CreateOpts{CWD: "/proj"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("hostname: %v", err)
+	}
+	holder := models.LockOwner{PID: proc.Pid, Host: host}
+	// Fresh heartbeat: within staleLockAfter, so even the stopped branch
+	// refuses — the exact moment a user hits this message.
+	if err := store.AcquireSessionLock(sess.ID, holder, false); err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	r := &ChatRepl{
+		cfg:       ReplConfig{WorkDir: "/proj"},
+		sessMgr:   store,
+		lockOwner: models.LockOwner{PID: os.Getpid(), Host: host},
+	}
+	err = r.acquireOrHandleLock(sess)
+	if err == nil {
+		t.Fatal("acquireOrHandleLock() = nil, want the stopped-holder lock error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"停止状态", "无需 --force", "kill"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("stopped-holder message missing %q; got:\n%s", want, msg)
+		}
+	}
+	for _, banned := range []string{"kill -9", "加 --force"} {
+		if strings.Contains(msg, banned) {
+			t.Errorf("stopped-holder message must not contain %q (known-false or harmful here); got:\n%s", banned, msg)
+		}
 	}
 }
