@@ -775,9 +775,10 @@ const staleLockAfter = 60 * time.Second
 // (SIGSTOP/Ctrl+Z, SIGTTIN, ptrace) are deliberately NOT on this list: they
 // keep their pid (there is no reuse to guard against) but cannot heartbeat,
 // so canAcquireSessionLock's processStopped branch judges them on the
-// staleLockAfter clock instead. Past that distance, "abandoned, pid since
-// reused by something else" is simply the more likely explanation than
-// "still the same live deepai". 10x staleLockAfter is the number: generous
+// so canAcquireSessionLock's processStopped branch judges them on the
+// staleLockAfter clock instead. Past staleLockAfterPidReuse, "abandoned, pid
+// since reused by something else" is simply the more likely explanation
+// than "still the same live deepai". 10x staleLockAfter is the number:
 // enough that no merely-slow live holder ever crosses it, but finite so a
 // killed-and-reused pid does not lock a directory out permanently.
 const staleLockAfterPidReuse = 10 * staleLockAfter
@@ -805,8 +806,8 @@ type sessionLockRow struct {
 // heartbeat goroutine is just a 15s time.Ticker, so a suspended laptop
 // (monotonic clock frozen, no ticks fire while asleep) or a long GC/IO
 // stall can put a genuinely live RUNNING holder's heartbeat well past
-// staleLockAfter while the
-// process itself keeps running and keeps writing. Judging staleness first
+// staleLockAfter while the process itself keeps running and keeps writing.
+// Judging staleness first
 // (with no floor at all) would hand its lock to a second process out from
 // under it — the exact interleaving-writers bug this whole feature exists
 // to prevent, now self-inflicted. processAlive is a cheap, reliable signal

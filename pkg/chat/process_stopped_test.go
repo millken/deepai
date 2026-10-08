@@ -99,7 +99,7 @@ func TestCanAcquireSessionLock_StoppedHolderShortClock(t *testing.T) {
 	existing := &sessionLockRow{
 		Owner:       models.LockOwner{PID: proc.Pid, Host: "h"},
 		AcquiredAt:  now.Add(-2 * time.Hour),
-		HeartbeatAt: now.Add(-staleLockAfter + 30 * time.Second), // fresh-ish: within staleLockAfter
+		HeartbeatAt: now.Add(-staleLockAfter + 30*time.Second), // fresh-ish: within staleLockAfter
 	}
 	if canAcquireSessionLock(existing, me, false, now) {
 		t.Fatal("want NOT acquirable: stopped holder, heartbeat still within staleLockAfter")
@@ -160,12 +160,13 @@ func TestAcquireSessionLock_StoppedHolderReclaimed(t *testing.T) {
 }
 
 // TestAcquireOrHandleLock_StoppedHolderMessageIsAccurate is the message
-// contract for the stopped branch (M3 of the round-1 review): with a
+// contract for the stopped branch (M3 round-1, M5/M6 round-2): with a
 // same-host STOPPED holder and a fresh heartbeat — a guaranteed conflict —
-// the error must say the holder is stopped and how to get out (wait out the
-// short clock / kill the pid), and must NOT carry the generic kill -9
-// leftover-pid line or the --force bullet, both of which are known-false or
-// harmful in this branch.
+// the error must lead with fg (the zero-wait, zero-loss exit), offer the
+// short-clock auto takeover, --fork, and --force with its /fork-rescue
+// note, and keep kill LAST with an explicit irreversible-data-loss
+// caveat. The generic kill -9 leftover-pid line stays banned: it is
+// known-false when the holder is verifiably stopped.
 func TestAcquireOrHandleLock_StoppedHolderMessageIsAccurate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no job control on windows")
@@ -200,14 +201,14 @@ func TestAcquireOrHandleLock_StoppedHolderMessageIsAccurate(t *testing.T) {
 		t.Fatal("acquireOrHandleLock() = nil, want the stopped-holder lock error")
 	}
 	msg := err.Error()
-	for _, want := range []string{"停止状态", "无需 --force", "kill"} {
+	for _, want := range []string{"停止状态", "fg", "无需任何参数", "加 --force", "/fork", "kill", "不可逆"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("stopped-holder message missing %q; got:\n%s", want, msg)
 		}
 	}
-	for _, banned := range []string{"kill -9", "加 --force"} {
+	for _, banned := range []string{"kill -9"} {
 		if strings.Contains(msg, banned) {
-			t.Errorf("stopped-holder message must not contain %q (known-false or harmful here); got:\n%s", banned, msg)
+			t.Errorf("stopped-holder message must not contain %q (known-false when holder is stopped); got:\n%s", banned, msg)
 		}
 	}
 }
