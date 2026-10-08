@@ -839,6 +839,18 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		}
 	}()
 
+	// SIGTSTP/SIGCONT lifecycle watcher (issue #18): refreshes the heartbeat
+	// before a Ctrl+Z freeze lands and deterministically re-refreshes on fg,
+	// sharing the heartbeat goroutine's lifecycle domain (same done channel,
+	// same WaitGroup join). Started after r.ui is assigned for the same M3
+	// reason as the heartbeat goroutine above — handleHeartbeatResult may call
+	// onLockLost, which reads r.ui.
+	lockHeartbeatWG.Add(1)
+	go func() {
+		defer lockHeartbeatWG.Done()
+		r.watchStopResume(lockHeartbeatDone)
+	}()
+
 	// Control poller (docs/HOOKS.md): started only when a control source is
 	// configured, after r.remote was assigned above. controlCtx is cancelled
 	// BEFORE the WaitGroup join on every exit path, so an in-flight Poll (up
