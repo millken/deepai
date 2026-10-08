@@ -826,12 +826,23 @@ func canAcquireSessionLock(existing *sessionLockRow, owner models.LockOwner, for
 		if !processAlive(existing.Owner.PID) {
 			return true
 		}
+		// A STOPPED holder (Ctrl+Z, or backgrounded onto a tty read → SIGTTIN)
+		// keeps its pid — H2's pid-reuse rationale does not apply — but it
+		// cannot heartbeat while stopped, so a second deepai must not be
+		// locked out for staleLockAfterPidReuse. Judge it on the same clock
+		// as cross-host: past staleLockAfter, reclaim. If the user later fg's
+		// the old process, its RefreshSessionLock fails and the lock-lost
+		// path suspends its writes — safety holds without the 10-minute wait.
+		if processStopped(existing.Owner.PID) {
+			return now.Sub(existing.HeartbeatAt) > staleLockAfter
+		}
 		// H2: the pid looks alive, but D1's veto is not unconditional past
 		// staleLockAfterPidReuse — see that constant's doc comment for why
 		// a heartbeat gap that large means the pid was almost certainly
 		// reused by an unrelated process, not that the original deepai is
 		// still running. Below that threshold, D1 still applies in full:
-		// a merely-stale heartbeat on a live pid must NOT be reclaimable.
+		// a merely-stale heartbeat on a live RUNNING pid must NOT be
+		// reclaimable (stopped pids took the branch above).
 		return now.Sub(existing.HeartbeatAt) > staleLockAfterPidReuse
 	}
 	// Cross-host: no pid to probe, so heartbeat age is the only signal.
