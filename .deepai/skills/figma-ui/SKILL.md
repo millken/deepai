@@ -1,6 +1,6 @@
 ---
 name: figma-ui
-description: "Use when the user shares a Figma link or asks to implement a design in code, adjust/verify UI against a Figma file, export design assets, edit Figma files programmatically, or explore UI options from scratch. Covers design-to-code, code-to-design iteration, visual verification, and design-system reuse via the figma MCP tools."
+description: "Use when a Figma link needs full UI code — 实现设计/设计比对/导出素材/写回 Figma/从零探索. For Tailwind CSS v4 class strings only use figma-tailwind instead."
 ---
 
 # Figma UI Assistant
@@ -17,9 +17,14 @@ never guess values that the file can tell you.
 - "Check my implementation against the design" (visual diff)
 - "Export this icon/logo/frame" as SVG/PNG
 - Design exploration from zero ("mock up a dashboard", with Figma as canvas)
-- Routing: Tailwind CSS v4 class-string-only extraction from a Figma design
-  (any target — web, 小程序/UniApp) → use `figma-tailwind` instead (its red
-  lines forbid the full-code workflows this skill performs)
+
+## When NOT to use
+
+- Tailwind CSS v4 class-string-only extraction from a Figma design (any
+  target — web, 小程序/UniApp) → use `figma-tailwind` (its red lines forbid
+  the full-code workflows this skill performs). Primary routing lives in the
+  catalog descriptions; this section is the fallback once this skill is
+  already loaded.
 
 ## Tool map
 
