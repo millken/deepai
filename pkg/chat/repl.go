@@ -1285,6 +1285,31 @@ func (r *ChatRepl) acquireOrHandleLock(sess *models.Session) error {
 	// --force line). Keep any such bookkeeping in code comments, never in
 	// a user-facing string; grep the package for user-visible strings
 	// (fmt.Errorf/ui.Info/Fprintln et al.) before adding a new one.
+	// A same-host holder in job-control stop (Ctrl+Z / SIGTTIN) is frozen but
+	// alive, and almost certainly THIS user's own Ctrl+Z from moments ago.
+	// The generic message below is written for a running-or-leftover pid:
+	// its kill -9 line is known-false here. The stopped case gets its own
+	// CONSTANT format string (splicing a variable into the format would
+	// silence go vet's printf check for the whole call), ordered by what
+	// preserves data: fg FIRST — resume the holder to keep using it, or exit
+	// it normally and the release-on-exit defer frees the lock immediately;
+	// then the short-clock wait (auto takeover, no --force). Note --force is
+	// NOT the destructive option: an fg'd old holder lands in the lock-lost
+	// path, which suspends its writes and recommends /fork to rescue its
+	// un-persisted transcript (see onLockLost). kill IS the irreversible
+	// one — it destroys whatever that process still holds in memory — so it
+	// comes last with an explicit data-loss caveat.
+	if lockErr.Owner.Host == r.lockOwner.Host && processStopped(lockErr.Owner.PID) {
+		return fmt.Errorf(
+			"会话 %s 正在被另一个 deepai 使用（pid %d @ %s，心跳 %s 前），该进程当前处于停止状态（如被 Ctrl+Z 挂起）。\n"+
+				"  它多半是你自己刚挂起的：在原终端 fg 恢复可继续使用；或恢复后正常退出，锁会立即释放，随后本命令可直接进入。\n"+
+				"  - 不想恢复它：稍等约 1 分钟后重试本命令即可自动接管，无需任何参数\n"+
+				"  - 加 --fork：把历史复制到一个新会话里继续，原会话不受影响\n"+
+				"  - 加 --force：立即接管；若之后旧进程被 fg 回来，用 /fork 可抢救其未落盘的内容\n"+
+				"  - 或 kill 该 pid 解锁——但会不可逆丢弃该进程尚未保存的内容",
+			sess.ID, lockErr.Owner.PID, lockErr.Owner.Host, time.Since(lockErr.HeartbeatAt).Round(time.Second),
+		)
+	}
 	return fmt.Errorf(
 		"会话 %s 正在被另一个 deepai 使用（pid %d @ %s，心跳 %s 前）。\n"+
 			"  这也可能是上一次 deepai 异常退出（例如被 kill -9）残留下的 pid——如果确认如此，--force 是安全的。\n"+

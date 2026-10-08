@@ -767,13 +767,19 @@ const staleLockAfter = 60 * time.Second
 // guaranteed-reproducible permanent lock-out, which is strictly worse.
 //
 // A genuinely live deepai heartbeats every sessionLockHeartbeatInterval
-// (15s, pkg/chat/repl.go). Nothing on D1's legitimate-staleness list
-// (GC pause, a suspended laptop, SIGSTOP, a debugger breakpoint) plausibly
-// withholds EVERY heartbeat for ten minutes straight while the process
-// keeps running — past that distance, "abandoned, pid since reused by
-// something else" is simply the more likely explanation than "still the
-// same live deepai". 10x staleLockAfter is the number: generous enough
-// that no merely-slow live holder ever crosses it, but finite so a
+// (15s, pkg/chat/repl.go). This window guards only RUNNING holders against
+// pid reuse; their legitimate-staleness list is short (GC pause, slow disk,
+// a suspended laptop — a process asleep with the machine stays runnable,
+// not stopped), and nothing on it plausibly withholds EVERY heartbeat for
+// ten minutes straight while the process keeps running. STOPPED holders
+// (SIGSTOP/Ctrl+Z, SIGTTIN, ptrace) are deliberately NOT on this list: they
+// keep their pid (there is no reuse to guard against) but cannot heartbeat,
+// so canAcquireSessionLock's processStopped branch judges them on the
+// so canAcquireSessionLock's processStopped branch judges them on the
+// staleLockAfter clock instead. Past staleLockAfterPidReuse, "abandoned, pid
+// since reused by something else" is simply the more likely explanation
+// than "still the same live deepai". 10x staleLockAfter is the number:
+// enough that no merely-slow live holder ever crosses it, but finite so a
 // killed-and-reused pid does not lock a directory out permanently.
 const staleLockAfterPidReuse = 10 * staleLockAfter
 
@@ -790,7 +796,7 @@ type sessionLockRow struct {
 // can control staleness without sleeping.
 //
 // Same-host liveness is checked BEFORE staleness, and it is a VETO up to
-// staleLockAfterPidReuse: a live pid on the same host means "no", never
+// staleLockAfterPidReuse: a live RUNNING pid on the same host means "no", never
 // mind how old the heartbeat looks, UNTIL the heartbeat gap grows so large
 // (10x staleLockAfter) that "still the same live deepai" stops being the
 // likely explanation and "pid reused after a kill -9" takes over — see
@@ -798,15 +804,24 @@ type sessionLockRow struct {
 // Getting the ORDER backwards (staleness first, no liveness veto at all) is
 // a real incident, not a hypothetical — heartbeat_at is wall-clock and the
 // heartbeat goroutine is just a 15s time.Ticker, so a suspended laptop
-// (monotonic clock frozen, no ticks fire while asleep), a SIGSTOP'd process
-// (Ctrl+Z), a debugger breakpoint, or a long GC/IO stall can all put a
-// genuinely live holder's heartbeat well past staleLockAfter while the
-// process itself keeps running and keeps writing. Judging staleness first
+// (monotonic clock frozen, no ticks fire while asleep) or a long GC/IO
+// stall can put a genuinely live RUNNING holder's heartbeat well past
+// staleLockAfter while the process itself keeps running and keeps writing.
+// Judging staleness first
 // (with no floor at all) would hand its lock to a second process out from
 // under it — the exact interleaving-writers bug this whole feature exists
 // to prevent, now self-inflicted. processAlive is a cheap, reliable signal
 // on the same host (signal-0 probe, see its doc comment) and must always
 // get to answer before staleness is even considered.
+//
+// STOPPED holders are the deliberate exception to this veto (the
+// processStopped probe, added after two same-day Ctrl+Z incidents): a
+// stopped process keeps its pid — H2's reuse scenario cannot happen to
+// it — but cannot run its heartbeat ticker, so the branch below judges
+// it on staleLockAfter instead of staleLockAfterPidReuse. A user who
+// fg's the old process back gets RefreshSessionLock → ErrLockNotHeld →
+// the lock-lost path suspends its writes, so safety holds without the
+// ten-minute lockout.
 //
 // A lock recorded on a DIFFERENT host than owner can only ever be judged by
 // heartbeat freshness: owner.PID means nothing to os.FindProcess here, since
@@ -826,12 +841,23 @@ func canAcquireSessionLock(existing *sessionLockRow, owner models.LockOwner, for
 		if !processAlive(existing.Owner.PID) {
 			return true
 		}
+		// A STOPPED holder (Ctrl+Z, or backgrounded onto a tty read → SIGTTIN)
+		// keeps its pid — H2's pid-reuse rationale does not apply — but it
+		// cannot heartbeat while stopped, so a second deepai must not be
+		// locked out for staleLockAfterPidReuse. Judge it on the same clock
+		// as cross-host: past staleLockAfter, reclaim. If the user later fg's
+		// the old process, its RefreshSessionLock fails and the lock-lost
+		// path suspends its writes — safety holds without the 10-minute wait.
+		if processStopped(existing.Owner.PID) {
+			return now.Sub(existing.HeartbeatAt) > staleLockAfter
+		}
 		// H2: the pid looks alive, but D1's veto is not unconditional past
 		// staleLockAfterPidReuse — see that constant's doc comment for why
 		// a heartbeat gap that large means the pid was almost certainly
 		// reused by an unrelated process, not that the original deepai is
 		// still running. Below that threshold, D1 still applies in full:
-		// a merely-stale heartbeat on a live pid must NOT be reclaimable.
+		// a merely-stale heartbeat on a live RUNNING pid must NOT be
+		// reclaimable (stopped pids took the branch above).
 		return now.Sub(existing.HeartbeatAt) > staleLockAfterPidReuse
 	}
 	// Cross-host: no pid to probe, so heartbeat age is the only signal.
