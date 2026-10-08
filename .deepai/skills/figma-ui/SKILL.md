@@ -17,6 +17,9 @@ never guess values that the file can tell you.
 - "Check my implementation against the design" (visual diff)
 - "Export this icon/logo/frame" as SVG/PNG
 - Design exploration from zero ("mock up a dashboard", with Figma as canvas)
+- Routing: Tailwind CSS v4 class-string-only extraction from a Figma design
+  (any target — web, 小程序/UniApp) → use `figma-tailwind` instead (its red
+  lines forbid the full-code workflows this skill performs)
 
 ## Tool map
 
