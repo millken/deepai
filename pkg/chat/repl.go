@@ -839,16 +839,19 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		}
 	}()
 
-	// SIGTSTP/SIGCONT lifecycle watcher (issue #18): refreshes the heartbeat
-	// before a Ctrl+Z freeze lands and deterministically re-refreshes on fg,
-	// sharing the heartbeat goroutine's lifecycle domain (same done channel,
-	// same WaitGroup join). Started after r.ui is assigned for the same M3
-	// reason as the heartbeat goroutine above — handleHeartbeatResult may call
-	// onLockLost, which reads r.ui.
+	// SIGCONT resume watcher (issue #18): on every resume (fg, shell job
+	// control) run one synchronous RefreshSessionLock — deterministic
+	// lock-loss discovery instead of waiting for the next heartbeat tick.
+	// Stop signals are deliberately NOT intercepted; see watchResumeRefresh's
+	// doc for the measured reasons. Shares the heartbeat goroutine's
+	// lifecycle domain (same done channel, same WaitGroup join). Started
+	// after r.ui is assigned for the same M3 reason as the heartbeat
+	// goroutine above — handleHeartbeatResult may call onLockLost, which
+	// reads r.ui.
 	lockHeartbeatWG.Add(1)
 	go func() {
 		defer lockHeartbeatWG.Done()
-		r.watchStopResume(lockHeartbeatDone)
+		r.watchResumeRefresh(lockHeartbeatDone)
 	}()
 
 	// Control poller (docs/HOOKS.md): started only when a control source is

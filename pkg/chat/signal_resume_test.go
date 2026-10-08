@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +18,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
-// syncMockUI wraps mockUI with a mutex for the fields the stop/resume
+// syncMockUI wraps mockUI with a mutex for the fields the resume watcher
 // goroutine writes (Info, SetLockLost) while the test goroutine reads them.
 type syncMockUI struct {
 	mockUI
@@ -54,25 +53,13 @@ func (l *lostRefreshStore) RefreshSessionLock(string, models.LockOwner) error {
 	return models.ErrLockNotHeld
 }
 
-// blockingRefreshStore parks inside RefreshSessionLock until block closes,
-// so refreshHeartbeatBounded's timeout path can be exercised in-process.
-type blockingRefreshStore struct {
-	*SQLiteSessionStore
-	block chan struct{}
-}
-
-func (b *blockingRefreshStore) RefreshSessionLock(string, models.LockOwner) error {
-	<-b.block
-	return nil
-}
-
-// TestWatchStopResume_ContAfterTakeoverRoutesToLockLost: a SIGCONT arriving
-// after the lock was taken over must route through heartbeatTick's
+// TestWatchResumeRefresh_ContAfterTakeoverRoutesToLockLost: a SIGCONT
+// arriving after the lock was taken over must route through heartbeatTick's
 // definitive-loss path — onLockLost suspends writes and raises the banner —
 // deterministically, without waiting for the next 15s tick. SIGCONT is safe
 // to self-deliver in-process (its default action on a running process is a
 // no-op; once Notify'd, the runtime just queues it).
-func TestWatchStopResume_ContAfterTakeoverRoutesToLockLost(t *testing.T) {
+func TestWatchResumeRefresh_ContAfterTakeoverRoutesToLockLost(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
 	sess, err := store.Create(models.CreateOpts{CWD: "/proj"})
@@ -88,11 +75,11 @@ func TestWatchStopResume_ContAfterTakeoverRoutesToLockLost(t *testing.T) {
 	r.setLockedSession(sess.ID)
 
 	done := make(chan struct{})
-	go r.watchStopResume(done)
+	go r.watchResumeRefresh(done)
 	defer close(done)
 
-	// The signal.Notify inside watchStopResume races with the send below by
-	// microseconds; a short sleep makes the delivery deterministic in
+	// The signal.Notify inside watchResumeRefresh races with the send below
+	// by microseconds; a short sleep makes the delivery deterministic in
 	// practice, and the 5s assertion window below absorbs any residual skew.
 	time.Sleep(200 * time.Millisecond)
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGCONT); err != nil {
@@ -111,26 +98,6 @@ func TestWatchStopResume_ContAfterTakeoverRoutesToLockLost(t *testing.T) {
 	}
 }
 
-// TestRefreshHeartbeatBounded_Timeout pins the pre-stop refresh budget: a
-// RefreshSessionLock stuck behind a write (busy_timeout is 5s in the real
-// store) must not delay the actual stop beyond stopHeartbeatBudget.
-func TestRefreshHeartbeatBounded_Timeout(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-	block := make(chan struct{})
-	t.Cleanup(func() { close(block) }) // release the parked goroutine
-	r := &ChatRepl{
-		sessMgr:   &blockingRefreshStore{SQLiteSessionStore: store, block: block},
-		lockOwner: models.LockOwner{PID: os.Getpid(), Host: "h"},
-	}
-
-	start := time.Now()
-	r.refreshHeartbeatBounded()
-	if elapsed := time.Since(start); elapsed > 2*stopHeartbeatBudget {
-		t.Fatalf("refreshHeartbeatBounded took %v, want bounded by ~%v", elapsed, stopHeartbeatBudget)
-	}
-}
-
 // helperHeartbeat reads the session_locks heartbeat for id, as a float unix
 // timestamp (the column's storage format — see unixFrac).
 func helperHeartbeat(t *testing.T, store *SQLiteSessionStore, id string) float64 {
@@ -143,16 +110,17 @@ func helperHeartbeat(t *testing.T, store *SQLiteSessionStore, id string) float64
 	return hb
 }
 
-// TestWatchStopResumeHelperProcess is the re-exec half of the lifecycle
-// test below. It builds a real REPL-side store, acquires the lock, runs
-// watchStopResume (no ticker goroutine — the heartbeat row then moves ONLY
-// on acquire / pre-stop refresh / post-CONT refresh, which is exactly what
-// the parent process asserts), and sleeps until the parent kills it.
-func TestWatchStopResumeHelperProcess(t *testing.T) {
-	if os.Getenv("DEEPAI_STOPRESUME_HELPER") != "1" {
-		t.Skip("helper process only, see TestWatchStopResume_SubprocessLifecycle")
+// TestWatchResumeRefreshHelperProcess is the re-exec half of the lifecycle
+// test below. It acquires the lock, runs ONLY the resume watcher (no
+// heartbeat ticker, no stop-signal interception), and sleeps until the
+// parent kills it. Because it never Notifies SIGTSTP, the kernel's default
+// stop action applies — this is exactly the production configuration of
+// Option A, exercised end to end.
+func TestWatchResumeRefreshHelperProcess(t *testing.T) {
+	if os.Getenv("DEEPAI_RESUME_HELPER") != "1" {
+		t.Skip("helper process only, see TestWatchResumeRefresh_SubprocessLifecycle")
 	}
-	store, err := NewSQLiteSessionStore(os.Getenv("DEEPAI_STOPRESUME_DB"))
+	store, err := NewSQLiteSessionStore(os.Getenv("DEEPAI_RESUME_DB"))
 	if err != nil {
 		t.Fatalf("helper store: %v", err)
 	}
@@ -168,35 +136,30 @@ func TestWatchStopResumeHelperProcess(t *testing.T) {
 	r := &ChatRepl{sessMgr: store, lockOwner: owner, ui: &mockUI{}}
 	r.setLockedSession(sess.ID)
 	done := make(chan struct{})
-	go r.watchStopResume(done)
+	go r.watchResumeRefresh(done)
 
 	fmt.Printf("HELPER-READY %s\n", sess.ID)
 	time.Sleep(30 * time.Second) // parent kills us when done
 }
 
-// TestWatchStopResume_SubprocessLifecycle drives a REAL child process
-// through SIGTSTP/SIGCONT and asserts the two heartbeat contracts of issue
-// #18 against the child's lock row:
+// TestWatchResumeRefresh_SubprocessLifecycle drives a REAL child through a
+// kernel-default SIGTSTP stop (the child intercepts nothing — Option A) and
+// a SIGCONT resume, asserting the resume-side contract of issue #18:
 //
-//   - entering the stop: the pre-stop refresh landed, so the row froze FRESH
-//     (heartbeat age ~0s at stop time, not the up-to-15s staleness a frozen
-//     ticker would leave behind);
-//   - frozen: the row does not move while the child is stopped;
-//   - resuming: the post-CONT refresh is deterministic (row moves without
-//     any ticker running).
+//   - stopped: the lock row does not move — there is no pre-stop refresh
+//     under Option A, and no ticker exists in the helper, so any movement
+//     would be a stray writer;
+//   - resumed: the deterministic post-CONT refresh moves the row WITHOUT
+//     any heartbeat ticker running.
 //
 // The stop itself is observed via processStopped, which synchronizes the
-// assertions: the child only becomes stopped AFTER its handler ran the
-// pre-stop refresh and re-raised SIGTSTP.
-func TestWatchStopResume_SubprocessLifecycle(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("no job control on windows")
-	}
+// assertions on the kernel's one-shot stop.
+func TestWatchResumeRefresh_SubprocessLifecycle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "helper.db")
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestWatchStopResumeHelperProcess$")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestWatchResumeRefreshHelperProcess$")
 	cmd.Env = append(os.Environ(),
-		"DEEPAI_STOPRESUME_HELPER=1",
-		"DEEPAI_STOPRESUME_DB="+dbPath,
+		"DEEPAI_RESUME_HELPER=1",
+		"DEEPAI_RESUME_DB="+dbPath,
 	)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -229,26 +192,24 @@ func TestWatchStopResume_SubprocessLifecycle(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Let the acquire-time heartbeat age ~1.5s so a MISSING pre-stop
-	// refresh is distinguishable (row age ~1.5-2s) from a landed one (~0s).
-	time.Sleep(1500 * time.Millisecond)
+	// Space the acquire-time heartbeat from the post-CONT refresh so the
+	// two are unambiguously distinguishable. 2x margin over the ~0 cost of
+	// each write; well under one heartbeat interval so the frozen-row
+	// assertions never race a ticker that does not exist anyway.
+	aging := sessionLockHeartbeatInterval / 5
+	time.Sleep(aging)
 
-	// SIGTSTP: once the child is observably stopped, its handler has
-	// already run the pre-stop refresh (refresh → Reset → self-raise →
-	// kernel stop, in that order).
+	// Kernel-default stop: the helper never registered a TSTP handler, so
+	// this freezes it once, at zero cost — the baseline Option A preserves.
 	if err := cmd.Process.Signal(syscall.SIGTSTP); err != nil {
 		t.Fatalf("SIGTSTP: %v", err)
 	}
 	waitProcessState(t, pid, true)
 
 	hbAtStop := helperHeartbeat(t, store, sessionID)
-	if age := time.Since(unixFracInverse(hbAtStop)); age > time.Second {
-		t.Fatalf("pre-stop refresh did not land: heartbeat age %v at stop, want < 1s (frozen-ticker staleness would be ~1.5s+)", age)
-	}
 
-	// Frozen: nothing may move the row while the child is stopped (this
-	// helper runs no ticker; a moving row would mean a stray writer).
-	time.Sleep(time.Second)
+	// Frozen: nothing may move the row while the child is stopped.
+	time.Sleep(aging)
 	if hb := helperHeartbeat(t, store, sessionID); hb != hbAtStop {
 		t.Fatalf("heartbeat moved while stopped: %v -> %v", hbAtStop, hb)
 	}
@@ -271,6 +232,8 @@ func TestWatchStopResume_SubprocessLifecycle(t *testing.T) {
 }
 
 // unixFracInverse converts a heartbeat_at column value back to time.Time.
+// It pairs with unixFrac (session.go) — kept beside the tests that read
+// the column directly.
 func unixFracInverse(v float64) time.Time {
 	sec, frac := math.Modf(v)
 	return time.Unix(int64(sec), int64(frac*1e9))
