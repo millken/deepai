@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Figma MCP token 管理：从 Claude Code 钥匙串引导，自动续期，输出 access token。
+"""Figma MCP token 管理：从 Claude Code 钥匙串引导，自动续期，同步 .env。
 
 用法:
-用法:
-  figma-mcp-token.py ensure     不足 7 天时自动续期；同步 ~/.deepai/.env 并打印 token
+  figma-mcp-token.py ensure     不足 7 天时自动续期；同步 ~/.deepai/.env（成功时无输出）
   figma-mcp-token.py refresh    强制续期
   figma-mcp-token.py status     查看有效期与来源，不打印密钥
 
-凭证存储: ~/.deepai/figma-mcp-token.json (0600)；access token 同步写入
+凭证存储: ~/.deepai/figma-mcp-token.json (0600，自创建起)；access token 同步写入
 ~/.deepai/.env 的 FIGMA_MCP_TOKEN 行——deepai 启动时 env.Load 注入进程环境，
 mcp.json 的 ${FIGMA_MCP_TOKEN} 即可解析，无需 shell 导出。
 丢失恢复: 删掉该文件后重跑 ensure（钥匙串 refresh_token 实测可复用，无需重新授权）。
 
 原理: Figma 远程 MCP 的白名单只拦 OAuth 注册；token 由 Claude Code（白名单客户端）
 铸造。refresh_token 实测可重复使用（续期响应不含轮换），钥匙串仍可作后备引导源。
-建议在 ~/.zshrc 放一行静默 ensure（输出重定向），让续期随 shell 启动自动发生。
+ensure 成功时静默、失败时向 stderr 报错并以非零码退出——放进 ~/.zshrc 时
+不要重定向，让续期失败可见。
 """
 
 import base64
@@ -28,16 +28,33 @@ import urllib.parse
 import urllib.request
 
 TOKEN_FILE = os.path.expanduser("~/.deepai/figma-mcp-token.json")
+ENV_FILE = os.path.expanduser("~/.deepai/.env")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 TOKEN_ENDPOINT = "https://api.figma.com/v1/oauth/token"
 REFRESH_BEFORE = 7 * 86400  # 剩余不足 7 天即续期
-REFRESH_BEFORE = 7 * 86400  # 剩余不足 7 天即续期
-ENV_FILE = os.path.expanduser("~/.deepai/.env")
 
 
 def fail(msg):
     print(f"figma-mcp-token: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def write_private(path, data):
+    """落盘敏感内容：临时文件自创建起 0600，同目录原子替换，失败不留残件。"""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_file():
@@ -50,20 +67,22 @@ def load_file():
 
 def save_file(cred):
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(cred, f)
-    os.chmod(TOKEN_FILE, 0o600)
+    write_private(TOKEN_FILE, json.dumps(cred))
 
 
 def bootstrap_from_keychain():
-    """首次使用：从 Claude Code 钥匙串条目提取 figma OAuth 凭证。"""
+    """首次使用：从 Claude Code 钥匙串条目提取 figma OAuth 凭证。
+
+    非 macOS 无 security 命令（FileNotFoundError）、条目不存在或无 figma
+    授权时返回 None——由调用方给出统一指引。
+    """
     try:
         out = subprocess.run(
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, check=True,
         ).stdout
         d = json.loads(out)
-    except (subprocess.CalledProcessError, ValueError):
+    except (OSError, subprocess.CalledProcessError, ValueError):
         return None
     for k, v in d.get("mcpOAuth", {}).items():
         if k.startswith("figma|") and v.get("refreshToken"):
@@ -111,7 +130,7 @@ def refresh(cred):
 
 def sync_env(token):
     """同步 access token 到 ~/.deepai/.env；幂等（值未变不写），原子替换。"""
-    want = f"FIGMA_MCP_TOKEN={token}"
+    want = f"FIGMA_MCP_TOKEN={token}\n"
     try:
         with open(ENV_FILE) as f:
             lines = f.readlines()
@@ -124,28 +143,26 @@ def sync_env(token):
             s = s[7:]
         if s.split("=", 1)[0].strip() == "FIGMA_MCP_TOKEN":
             hit = True
-            if s.rstrip("\n") != want:
-                lines[i] = want + "\n"
+            if s != want:
+                lines[i] = want
                 break
             return
     if not hit:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
-        lines.append(want + "\n")
-    tmp = ENV_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        f.writelines(lines)
-    os.replace(tmp, ENV_FILE)
-    os.chmod(ENV_FILE, 0o600)
+        lines.append(want)
+    os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
+    write_private(ENV_FILE, "".join(lines))
+
 
 def cmd_ensure(force=False):
     cred = load_file() or bootstrap_from_keychain()
     if cred is None:
-        fail(f"无凭证：先在 claude 里 /mcp 授权 figma（详见 docs/figma_mcp.md §二）")
+        fail("无凭证：本机需先在 claude 里 /mcp 授权 figma（macOS 钥匙串），"
+             "或按 docs/figma_mcp.md 的 PAT 方式接入")
     if force or cred.get("expires_at", 0) - time.time() < REFRESH_BEFORE:
         cred = refresh(cred)
     sync_env(cred["access_token"])
-    print(cred["access_token"])
 
 
 def cmd_status():
