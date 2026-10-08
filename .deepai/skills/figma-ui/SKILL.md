@@ -23,6 +23,8 @@ never guess values that the file can tell you.
 
 ## Tool map
 
+The map below assumes the **official remote server** (docs/figma_mcp.md §三, 41 tools). On the **community edition** (docs §二, the default path) only `figma__get_figma_data` + `figma__download_figma_images` exist: route every read through those two (get_figma_data covers design-context needs; download_figma_images covers assets) and skip ALL write paths — no `use_figma`, `generate_figma_design`, `create_new_file`, `upload_assets`. Screenshots/metadata come from get_figma_data's response instead.
+
 | Goal | Tool | Notes |
 |---|---|---|
 | Structure overview | `figma__get_metadata` | Cheap. Use FIRST on unknown/large files to find node IDs |
@@ -92,5 +94,7 @@ never guess values that the file can tell you.
    (generative) unless asked for ideas.
 - UI aesthetics/iconography rules come from super-frontend-design; this skill
   supplies the ground-truth data. Compose both when building UI.
-- 401 from figma tools → token expired: see docs/figma_mcp.md (run
-  scripts/figma-mcp-token.py ensure), then retry.
+- 401 from figma tools — check which path is configured (docs/figma_mcp.md):
+  official remote (§三) → run scripts/figma-mcp-token.py ensure, then retry;
+  community PAT (§二) → the FIGMA_API_KEY token is invalid/expired, regenerate
+  it at figma.com → Settings → Security.

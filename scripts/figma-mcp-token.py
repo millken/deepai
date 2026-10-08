@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -39,11 +40,21 @@ def fail(msg):
     sys.exit(1)
 
 
+def ensure_private_dir(path):
+    """敏感目录收紧 0700；makedirs 的 mode 对已存在目录不生效，需显式 chmod。"""
+    os.makedirs(path, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
 def write_private(path, data):
-    """落盘敏感内容：临时文件自创建起 0600，同目录原子替换，失败不留残件。"""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """落盘敏感内容：mkstemp（O_EXCL，创建即 0600）+ fchmod 保险 + 同目录原子
+    替换；失败 unlink 残件。不用固定 .tmp——已存在的旧 inode 权限不会被
+    open 收紧，且可预测路径在 replace 前被杀会留下明文密钥。"""
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path), prefix=os.path.basename(path) + "."
+    )
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(data)
             f.flush()
@@ -66,7 +77,7 @@ def load_file():
 
 
 def save_file(cred):
-    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    ensure_private_dir(os.path.dirname(TOKEN_FILE))
     write_private(TOKEN_FILE, json.dumps(cred))
 
 
@@ -85,7 +96,9 @@ def bootstrap_from_keychain():
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
     for k, v in d.get("mcpOAuth", {}).items():
-        if k.startswith("figma|") and v.get("refreshToken"):
+        if k.startswith("figma|") and all(
+            v.get(f) for f in ("refreshToken", "clientId", "clientSecret")
+        ):
             return {
                 "access_token": v.get("accessToken", ""),
                 "refresh_token": v["refreshToken"],
@@ -146,12 +159,13 @@ def sync_env(token):
             if s != want:
                 lines[i] = want
                 break
+            os.chmod(ENV_FILE, 0o600)
             return
     if not hit:
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"
         lines.append(want)
-    os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
+    ensure_private_dir(os.path.dirname(ENV_FILE))
     write_private(ENV_FILE, "".join(lines))
 
 
