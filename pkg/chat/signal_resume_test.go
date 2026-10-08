@@ -5,7 +5,6 @@ package chat
 import (
 	"bufio"
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -161,6 +160,17 @@ func TestWatchResumeRefresh_SubprocessLifecycle(t *testing.T) {
 		"DEEPAI_RESUME_HELPER=1",
 		"DEEPAI_RESUME_DB="+dbPath,
 	)
+	// The helper MUST sit in its own, non-orphaned process group: the kernel
+	// DROPS job-control stop signals (TSTP/TTIN/TTOU) for members of an
+	// orphaned process group — SIGSTOP is the only stop that always applies.
+	// Without Setpgid the child inherits the test runner's group, which has a
+	// non-orphan anchor under an interactive shell (test passes locally) but
+	// is orphaned under CI runners, containers, or nohup — there the SIGTSTP
+	// below is a silent no-op and waitProcessState hangs (PR #19 round-2
+	// review). With Setpgid the child's group has a living parent (this test)
+	// in another group of the same session, so the kernel's default stop
+	// applies regardless of how the test binary itself was launched.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("stdout pipe: %v", err)
@@ -192,12 +202,11 @@ func TestWatchResumeRefresh_SubprocessLifecycle(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Space the acquire-time heartbeat from the post-CONT refresh so the
-	// two are unambiguously distinguishable. 2x margin over the ~0 cost of
-	// each write; well under one heartbeat interval so the frozen-row
-	// assertions never race a ticker that does not exist anyway.
+	// Distinguish the acquire-time heartbeat from the post-CONT refresh: the
+	// assertions below compare exact row values (frozen: equal; after CONT:
+	// changed), so the two writes only need distinct times — inherently true
+	// (acquire precedes HELPER-READY; the refresh follows the CONT).
 	aging := sessionLockHeartbeatInterval / 5
-	time.Sleep(aging)
 
 	// Kernel-default stop: the helper never registered a TSTP handler, so
 	// this freezes it once, at zero cost — the baseline Option A preserves.
@@ -229,12 +238,4 @@ func TestWatchResumeRefresh_SubprocessLifecycle(t *testing.T) {
 		t.Fatal("post-CONT refresh never landed: heartbeat unchanged 5s after resume")
 	}
 	waitProcessState(t, pid, false)
-}
-
-// unixFracInverse converts a heartbeat_at column value back to time.Time.
-// It pairs with unixFrac (session.go) — kept beside the tests that read
-// the column directly.
-func unixFracInverse(v float64) time.Time {
-	sec, frac := math.Modf(v)
-	return time.Unix(int64(sec), int64(frac*1e9))
 }
