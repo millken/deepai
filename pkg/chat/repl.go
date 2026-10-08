@@ -839,6 +839,21 @@ func (r *ChatRepl) Run(parentCtx context.Context) error {
 		}
 	}()
 
+	// SIGCONT resume watcher (issue #18): on every resume (fg, shell job
+	// control) run one synchronous RefreshSessionLock — deterministic
+	// lock-loss discovery instead of waiting for the next heartbeat tick.
+	// Stop signals are deliberately NOT intercepted; see watchResumeRefresh's
+	// doc for the measured reasons. Shares the heartbeat goroutine's
+	// lifecycle domain (same done channel, same WaitGroup join). Started
+	// after r.ui is assigned for the same M3 reason as the heartbeat
+	// goroutine above — handleHeartbeatResult may call onLockLost, which
+	// reads r.ui.
+	lockHeartbeatWG.Add(1)
+	go func() {
+		defer lockHeartbeatWG.Done()
+		r.watchResumeRefresh(lockHeartbeatDone)
+	}()
+
 	// Control poller (docs/HOOKS.md): started only when a control source is
 	// configured, after r.remote was assigned above. controlCtx is cancelled
 	// BEFORE the WaitGroup join on every exit path, so an in-flight Poll (up
