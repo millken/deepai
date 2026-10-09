@@ -101,10 +101,12 @@ func absKey(path string) string {
 	return filepath.Clean(path)
 }
 
-// Record stamps the on-disk state observed right after a successful
-// read_file or write_file. Stat-after-I/O (not before) so the stamp matches
-// the version the model actually saw.
-func (t *ReadTracker) Record(path string, info os.FileInfo) {
+// Record stamps the state the model just saw. The fingerprint MUST come
+// from the bytes the caller itself observed (read_file/write_file/edit
+// already have them in hand); computing it here from a fresh ReadFile would
+// observe a different moment than info and do IO under t.mu. With sum==""
+// the content-preserving pass in CheckEdit is simply skipped.
+func (t *ReadTracker) Record(path string, info os.FileInfo, sum string) {
 	if t == nil || info == nil {
 		return
 	}
@@ -113,7 +115,7 @@ func (t *ReadTracker) Record(path string, info os.FileInfo) {
 	t.stamps[absKey(path)] = readStamp{
 		mtimeNano:    info.ModTime().UnixNano(),
 		size:         info.Size(),
-		sum:          contentSum(path),
+		sum:          sum,
 		lastVerified: time.Now(),
 	}
 }
@@ -131,11 +133,10 @@ func (t *ReadTracker) NoteGitRewrite() {
 	t.gitRewriteAt = time.Now()
 }
 
-func contentSum(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
+// ContentSum fingerprints observed bytes. Exported so the builtin stamp
+// call sites (which hold the bytes the model just saw) produce the exact
+// format CheckEdit's content-preserving pass compares against.
+func ContentSum(data []byte) string {
 	h := fnv.New64a()
 	_, _ = h.Write(data)
 	return fmt.Sprintf("%x", h.Sum64())
@@ -166,17 +167,21 @@ func (t *ReadTracker) CheckEdit(path string) error {
 	}
 	// Content-preserving rewrite: the text the model read is still the text
 	// on disk, so editing is safe. Re-stamp so later edits take the fast path
-	// instead of re-hashing every time.
-	if stamp.sum != "" && contentSum(key) == stamp.sum {
-		t.mu.Lock()
-		if s, ok := t.stamps[key]; ok {
-			s.mtimeNano = info.ModTime().UnixNano()
-			s.size = info.Size()
-			s.lastVerified = time.Now()
-			t.stamps[key] = s
+	// instead of re-hashing every time — but only if the map still holds the
+	// stamp this comparison ran against; a concurrent Record is fresher and
+	// must not be clobbered.
+	if stamp.sum != "" {
+		if data, rerr := os.ReadFile(key); rerr == nil && ContentSum(data) == stamp.sum {
+			t.mu.Lock()
+			if s, ok := t.stamps[key]; ok && s.sum == stamp.sum && s.mtimeNano == stamp.mtimeNano {
+				s.mtimeNano = info.ModTime().UnixNano()
+				s.size = info.Size()
+				s.lastVerified = time.Now()
+				t.stamps[key] = s
+			}
+			t.mu.Unlock()
+			return nil
 		}
-		t.mu.Unlock()
-		return nil
 	}
 	return &StaleReadError{
 		RecordedSize:     stamp.size,

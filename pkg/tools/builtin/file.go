@@ -35,6 +35,10 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("read failed: %w", err)
 	}
+	// gateBytes holds the whole-file bytes this read observed; the limit
+	// branch below re-slices data to a prefix, but the gate fingerprints
+	// entire files.
+	gateBytes := data
 
 	// Binary content must never reach the model: this repo's own bin/deepai is
 	// 79 MB with no extension, and reading it would blow the context window on
@@ -71,7 +75,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if total == 0 {
 			// Empty file: the empty text IS the whole file, so this read saw
 			// everything there is to edit.
-			stampTrackedFile(ctx, path)
+			stampTrackedFile(ctx, path, gateBytes)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		s := int(startLine)
@@ -111,7 +115,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 			if e < total || strings.HasSuffix(text, "\n") {
 				raw += "\n"
 			}
-			stampTrackedFile(ctx, path)
+			stampTrackedFile(ctx, path, gateBytes)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: raw}, nil
 		}
 		var b strings.Builder
@@ -119,7 +123,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		for i, ln := range selected {
 			writeHashNumberedLine(&b, width, s+i, ln)
 		}
-		stampTrackedFile(ctx, path)
+		stampTrackedFile(ctx, path, gateBytes)
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
 
@@ -154,7 +158,7 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if len(lines) == 0 {
 			// Empty file: the empty text IS the whole file, so this read saw
 			// everything there is to edit.
-			stampTrackedFile(ctx, path)
+			stampTrackedFile(ctx, path, gateBytes)
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: ""}, nil
 		}
 		width := numWidth(len(lines))
@@ -162,11 +166,11 @@ func ReadFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		for i, ln := range lines {
 			writeHashNumberedLine(&b, width, i+1, ln)
 		}
-		stampTrackedFile(ctx, path)
+		stampTrackedFile(ctx, path, gateBytes)
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: b.String()}, nil
 	}
 
-	stampTrackedFile(ctx, path)
+	stampTrackedFile(ctx, path, gateBytes)
 	return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
 }
 
@@ -227,10 +231,13 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 		if _, err := file.WriteString(content); err != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("append failed: %w", err)
 		}
+		// Append wrote only a tail; no whole-file bytes exist at this site.
+		stampTrackedFileFresh(ctx, path)
 	} else if err := os.WriteFile(path, []byte(content), perm); err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", err)
+	} else {
+		stampTrackedFile(ctx, path, []byte(content))
 	}
-	stampTrackedFile(ctx, path)
 
 	return models.ToolResult{
 		CallID:   call.ID,
@@ -240,14 +247,35 @@ func WriteFileHandler(ctx context.Context, call models.ToolCall) (models.ToolRes
 	}, nil
 }
 
-// stampTrackedFile records the file's on-disk state in the session's
-// ReadTracker after a successful read_file or write_file, so a follow-up
-// edit_file is gated against this exact version (see readtracker.go).
-func stampTrackedFile(ctx context.Context, path string) {
-	if tracker := tools.ReadTrackerFromContext(ctx); tracker != nil {
-		if info, err := os.Stat(path); err == nil {
-			tracker.Record(path, info)
-		}
+// stampTrackedFile records the file's state as the model just saw it. data
+// is the content the CALLER itself read or wrote — its fingerprint is the
+// gate's reference, never recomputed from a fresh read here, which would
+// observe a different moment than the Stat below.
+func stampTrackedFile(ctx context.Context, path string, data []byte) {
+	tracker := tools.ReadTrackerFromContext(ctx)
+	if tracker == nil {
+		return
+	}
+	if info, err := os.Stat(path); err == nil {
+		tracker.Record(path, info, tools.ContentSum(data))
+	}
+}
+
+// stampTrackedFileFresh is for call sites that satisfied the gate without
+// holding whole-file bytes (grep hands the model line hashes; append writes
+// just a tail): one fresh read, outside any tracker lock, per successful
+// tool call.
+func stampTrackedFileFresh(ctx context.Context, path string) {
+	tracker := tools.ReadTrackerFromContext(ctx)
+	if tracker == nil {
+		return
+	}
+	sum := ""
+	if data, err := os.ReadFile(path); err == nil {
+		sum = tools.ContentSum(data)
+	}
+	if info, err := os.Stat(path); err == nil {
+		tracker.Record(path, info, sum)
 	}
 }
 

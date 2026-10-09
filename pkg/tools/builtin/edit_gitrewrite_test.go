@@ -25,11 +25,33 @@ func TestLikelyGitRewrite(t *testing.T) {
 		{"git diff && git add x.go && git commit -m 'y'", false},
 		{"echo git checkout main", true},
 		{"gofmt -l . && go test ./...", false},
+		{"git status; git checkout main", true},
+		{"git diff\ngit rebase main", true},
 	}
 	for _, c := range cases {
 		if got := likelyGitRewrite(c.cmd); got != c.want {
 			t.Errorf("likelyGitRewrite(%q) = %v, want %v", c.cmd, got, c.want)
 		}
+	}
+}
+
+func TestEditReadGate_SameLengthContentChangeRejected(t *testing.T) {
+	ctx := gateCtx(t)
+	path := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFileHandler(ctx, gateReadCall(path)); err != nil {
+		t.Fatal(err)
+	}
+	// Same byte length, different content: the size shortcut must not save
+	// it, only the content fingerprint may — and this one differs.
+	if err := os.WriteFile(path, []byte("alpha\nzeta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := EditFileHandler(ctx, gateEditCall(path))
+	if err == nil || !strings.Contains(err.Error(), "changed on disk") {
+		t.Fatalf("same-length content change must be rejected, got %v", err)
 	}
 }
 

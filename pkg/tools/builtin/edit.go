@@ -162,7 +162,7 @@ func EditFileHandler(ctx context.Context, call models.ToolCall) (models.ToolResu
 		if writeErr := os.WriteFile(path, []byte(updated), filePerm(path, 0644)); writeErr != nil {
 			return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("write failed: %w", writeErr)
 		}
-		stampTrackedFile(ctx, path)
+		stampTrackedFile(ctx, path, []byte(updated))
 		notes := []string{}
 		if kind != "" {
 			notes = append(notes, kind)

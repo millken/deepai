@@ -85,11 +85,15 @@ var gitRewriteSubcommands = map[string]bool{
 }
 
 // likelyGitRewrite reports whether cmd runs a git subcommand that rewrites
-// working-tree files. Token-level parse, not a shell grammar: a quoted
-// "&& git checkout" inside a commit message can trip it, which only ever
-// over-triggers the informational NoteGitRewrite — never a false pass.
+// working-tree files. Splits on shell sequencing separators (&&, ||, ;, |,
+// newline) so a rewrite anywhere in the command counts, then token-parses
+// each segment — not a shell grammar: a quoted "git checkout" inside a
+// commit message can trip it, which only ever over-triggers the
+// informational NoteGitRewrite — never a false pass.
 func likelyGitRewrite(cmd string) bool {
-	for _, seg := range strings.Split(cmd, "&&") {
+	for _, seg := range strings.FieldsFunc(cmd, func(r rune) bool {
+		return r == '\n' || r == ';' || r == '|' || r == '&'
+	}) {
 		if gitRewriteSegment(seg) {
 			return true
 		}
