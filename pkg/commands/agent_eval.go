@@ -864,8 +864,8 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	}
 
 	after := chat.TakeWorktreeSnapshot(worktree)
-	// ChangesSince, not ChangedSince: a case that commits its edit leaves
-	// the dirty tree, and the dirty delta then reports the same empty set
+	// ChangesSince, not the dirty-only delta: a case that commits its edit
+	// leaves the dirty tree, and that delta then reports the same empty set
 	// as a case that wrote nothing. no_writes would pass, and files_changed
 	// would fail, on work that landed.
 	changed := after.ChangesSince(before)

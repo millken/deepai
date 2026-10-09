@@ -692,8 +692,8 @@ func TestRunOneCase_FilesChangedAndFileContainsEndToEnd(t *testing.T) {
 	assertStatus(t, rec.Assertions, "file_not_contains:a.go:OldName", "pass")
 }
 
-// Committing the write used to hide it. ChangedSince only sees the dirty
-// tree, and a commit makes the tree clean, so no_writes passed and
+// Committing the write used to hide it. The dirty-only delta only sees the
+// dirty tree, and a commit makes the tree clean, so no_writes passed and
 // files_changed failed on work that had landed — the same hole the mission
 // gate had for an implementer that commits.
 func TestRunOneCase_CommittedWriteIsStillAViolation(t *testing.T) {

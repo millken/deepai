@@ -207,13 +207,6 @@ func TakeWorktreeSnapshot(dir string) WorktreeSnapshot {
 	return WorktreeSnapshot(takeWorktreeSnapshot(dir))
 }
 
-// ChangedSince is the exported form of worktreeSnapshot.changedSince: the
-// DIRTY delta only. A change that was committed is absent here. Callers that
-// need every change, including ones that landed in a commit, want ChangesSince.
-func (s WorktreeSnapshot) ChangedSince(prev WorktreeSnapshot) []string {
-	return worktreeSnapshot(s).changedSince(worktreeSnapshot(prev))
-}
-
 // ChangesSince is the exported form of worktreeSnapshot.changesSince: dirty
 // edits plus edits that commits landed between the two snapshots. This is
 // what the review gate attributes, and what the eval harness must use — a
@@ -331,16 +324,30 @@ func (s worktreeSnapshot) isUntracked(absPath string) bool {
 // the gate to see — produces an empty tracked diff. The index column of
 // porcelain is the first status character; a space means "not staged", and
 // untracked files are not staged either.
+//
+// Unmerged entries (both columns in ADU: UU, AA, DD, AU, UA, DU, UD) are
+// not staged. `git diff --cached` on those compares the worktree to a
+// virtual merge base and would hand the reviewer a conflict view that is
+// not the edit under review.
 func (s worktreeSnapshot) isStaged(absPath string) bool {
 	rel, ok := s.snapshotRel(absPath)
 	if !ok {
 		return false
 	}
 	stamp, found := s.entries[rel]
-	if !found || stamp.status == "" || stamp.status == "??" {
+	if !found || stamp.status == "" || stamp.status == "??" || unmergedPorcelain(stamp.status) {
 		return false
 	}
 	return stamp.status[0] != ' '
+}
+
+// unmergedPorcelain reports an unresolved-conflict XY status: both the index
+// and worktree columns are A, D, or U.
+func unmergedPorcelain(status string) bool {
+	if len(status) < 2 {
+		return false
+	}
+	return strings.ContainsRune("ADU", rune(status[0])) && strings.ContainsRune("ADU", rune(status[1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -994,11 +1001,13 @@ func buildReviewPrompt(in reviewPromptInput) string {
 // covers committed and uncommitted work in one view, including anything
 // sitting in the index.
 //
-// When that ref is absent (HEAD never moved, or there is no baseline), the
-// index-relative diff is kept — it must not resurrect already-committed
-// history — and staged paths get a second `git diff --cached`. Staging is
-// how a commit begins, and `git diff` alone reports it the same way it
-// reports a revert: nothing.
+// When that ref is absent (HEAD never moved, or there is no baseline), or
+// the ref itself is gone (a reset or a pruned commit), the index-relative
+// diff is kept — it must not resurrect already-committed history — and
+// staged paths get a second `git diff --cached`. Staging is how a commit
+// begins, and `git diff` alone reports it the same way it reports a
+// revert: nothing. A failed baseline diff must not stop at a parenthetical
+// and drop that fallback.
 func buildReviewDiff(workDir string, snap, base worktreeSnapshot, scope []string) (diff string, oversized bool) {
 	var b strings.Builder
 	if snap.root == "" {
@@ -1020,12 +1029,22 @@ func buildReviewDiff(workDir string, snap, base worktreeSnapshot, scope []string
 		}
 		ref := diffBaseRef(snap, base)
 		if len(tracked) > 0 {
-			args := []string{"diff"}
+			var out []byte
+			var err error
 			if ref != "" {
-				args = append(args, ref)
+				out, err = runGit(workDir, append([]string{"diff", ref, "--"}, tracked...)...)
+				if err != nil {
+					// Unreachable baseline object (a reset or a pruned
+					// commit). Fall through to the index/worktree diff so
+					// the staged fallback below still runs — stopping at a
+					// parenthetical here hid the edit the ref was supposed
+					// to show.
+					ref = ""
+					out, err = runGit(workDir, append([]string{"diff", "--"}, tracked...)...)
+				}
+			} else {
+				out, err = runGit(workDir, append([]string{"diff", "--"}, tracked...)...)
 			}
-			args = append(args, "--")
-			out, err := runGit(workDir, append(args, tracked...)...)
 			if err != nil {
 				b.WriteString("(git diff failed for tracked files — rely on attached file contents)\n")
 			} else {
@@ -1033,8 +1052,9 @@ func buildReviewDiff(workDir string, snap, base worktreeSnapshot, scope []string
 			}
 		}
 		// A baseline ref already compares the worktree to that commit, so
-		// the index is included. Without one, staged changes need their own
-		// diff or the reviewer reads an empty hunk for a finished edit.
+		// the index is included. Without one — or after that ref failed —
+		// staged changes need their own diff or the reviewer reads an empty
+		// hunk for a finished edit.
 		if ref == "" && len(staged) > 0 {
 			out, err := runGit(workDir, append([]string{"diff", "--cached", "--"}, staged...)...)
 			if err != nil {
