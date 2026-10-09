@@ -124,6 +124,15 @@ func gitInit(t *testing.T, dir string) {
 // gitCommitAll stages and commits the whole worktree, which is what an
 // implementer following ordinary operator instructions does at the end of a
 // turn — and the thing commit attribution exists to keep visible.
+func gitAdd(t *testing.T, dir string, paths ...string) {
+	t.Helper()
+	args := append([]string{"-C", dir, "add"}, paths...)
+	cmd := exec.Command("git", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, out)
+	}
+}
+
 func gitCommitAll(t *testing.T, dir, msg string) {
 	t.Helper()
 	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", msg}} {
@@ -228,6 +237,37 @@ func TestMissionGate_CommittedWorkIsReviewedNotIdle(t *testing.T) {
 	prompt, _ := fake.args["prompt"].(string)
 	if !strings.Contains(prompt, "func Done()") {
 		t.Fatalf("the reviewer's diff does not contain the committed change:\n%s", prompt)
+	}
+}
+
+// git add without a commit is the same hole one step earlier: the file is
+// still dirty, so the gate dispatches a review, but `git diff` is empty
+// and an empty diff passes a change the reviewer never saw.
+func TestMissionGate_StagedWorkIsVisibleInTheDiff(t *testing.T) {
+	fake := &fakeTaskTool{content: passVerdictJSON()}
+	dir := t.TempDir()
+	gitInit(t, dir)
+	writeFileOrFatal(t, filepath.Join(dir, "in_scope.go"), "package x\n")
+	gitCommitAll(t, dir, "before the mission")
+
+	r, _, m := newImplementReplIn(t, dir, fake, []string{"in_scope.go"})
+	writeFileOrFatal(t, filepath.Join(dir, "in_scope.go"), "package x\n\nfunc Staged() {}\n")
+	gitAdd(t, dir, "in_scope.go")
+
+	got := r.missionReviewGate(context.Background(), 0)
+
+	if m.state.IdleRound != 0 {
+		t.Fatalf("idle_round = %d — staged work is work", m.state.IdleRound)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("dispatched %d reviews, want 1", fake.calls)
+	}
+	if !got.passed {
+		t.Fatalf("got %+v, want a reviewed pass", got)
+	}
+	prompt, _ := fake.args["prompt"].(string)
+	if !strings.Contains(prompt, "+func Staged()") {
+		t.Fatalf("the reviewer's diff does not contain the staged change:\n%s", prompt)
 	}
 }
 

@@ -190,18 +190,16 @@ func (s worktreeSnapshot) changesSince(prev worktreeSnapshot) []string {
 }
 
 // WorktreeSnapshot and TakeWorktreeSnapshot are thin exported wrappers around
-// worktreeSnapshot/takeWorktreeSnapshot/changedSince, added for M5-2's
-// `deepai eval agents` harness (pkg/commands/agent_eval.go), which needs the
-// exact same dirty-worktree detection the review gate uses for its
-// no-writes-during-review invariant so a case's `no_writes` assertion is
-// judged by production logic instead of a second, possibly-diverging copy.
+// worktreeSnapshot/takeWorktreeSnapshot, added for M5-2's `deepai eval agents`
+// harness (pkg/commands/agent_eval.go), which needs the exact same worktree
+// detection the review gate uses so a case's `no_writes` / `files_changed`
+// assertions are judged by production logic instead of a second,
+// possibly-diverging copy.
 //
-// A full rename of worktreeSnapshot/takeWorktreeSnapshot/changedSince to
-// exported names would touch this file plus review_test.go,
-// review_gate_test.go and review_prompt_test.go (4 files) — over the
-// implementation brief's 3-file threshold for a "pure rename" — so this adds
-// wrapper symbols instead of renaming the existing ones. No existing
-// identifier below this point changes; this is purely additive.
+// A full rename of the unexported names would touch this file plus
+// review_test.go, review_gate_test.go and review_prompt_test.go — over the
+// implementation brief's threshold for a pure rename — so this adds wrapper
+// symbols instead of renaming the existing ones.
 type WorktreeSnapshot worktreeSnapshot
 
 // TakeWorktreeSnapshot is the exported form of takeWorktreeSnapshot.
@@ -209,9 +207,20 @@ func TakeWorktreeSnapshot(dir string) WorktreeSnapshot {
 	return WorktreeSnapshot(takeWorktreeSnapshot(dir))
 }
 
-// ChangedSince is the exported form of worktreeSnapshot.changedSince.
+// ChangedSince is the exported form of worktreeSnapshot.changedSince: the
+// DIRTY delta only. A change that was committed is absent here. Callers that
+// need every change, including ones that landed in a commit, want ChangesSince.
 func (s WorktreeSnapshot) ChangedSince(prev WorktreeSnapshot) []string {
 	return worktreeSnapshot(s).changedSince(worktreeSnapshot(prev))
+}
+
+// ChangesSince is the exported form of worktreeSnapshot.changesSince: dirty
+// edits plus edits that commits landed between the two snapshots. This is
+// what the review gate attributes, and what the eval harness must use — a
+// subagent that commits its write otherwise looks identical to one that
+// wrote nothing.
+func (s WorktreeSnapshot) ChangesSince(prev WorktreeSnapshot) []string {
+	return worktreeSnapshot(s).changesSince(worktreeSnapshot(prev))
 }
 
 type porcelainEntry struct {
@@ -291,19 +300,47 @@ func runGit(dir string, args ...string) ([]byte, error) {
 	return cmd.Output()
 }
 
+// snapshotRel resolves absPath to the slash-separated worktree-relative key
+// snapshots store. ok is false when the path cannot be expressed under root.
+func (s worktreeSnapshot) snapshotRel(absPath string) (string, bool) {
+	if s.root == "" {
+		return "", false
+	}
+	rel, err := filepath.Rel(s.root, resolveWorktreePath(absPath))
+	if err != nil {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
 // isUntracked reports whether absPath is an untracked ("??") file in this
 // snapshot. Untracked files need special diff treatment: git diff cannot
 // show them (design §4.4 N1).
 func (s worktreeSnapshot) isUntracked(absPath string) bool {
-	if s.root == "" {
+	rel, ok := s.snapshotRel(absPath)
+	if !ok {
 		return false
 	}
-	rel, err := filepath.Rel(s.root, resolveWorktreePath(absPath))
-	if err != nil {
+	stamp, found := s.entries[rel]
+	return found && stamp.status == "??"
+}
+
+// isStaged reports whether absPath has a change in the index. `git diff`
+// (worktree vs index) does not show those, so a turn that git-adds its work
+// and stops there — the step immediately before the commit PR #13 taught
+// the gate to see — produces an empty tracked diff. The index column of
+// porcelain is the first status character; a space means "not staged", and
+// untracked files are not staged either.
+func (s worktreeSnapshot) isStaged(absPath string) bool {
+	rel, ok := s.snapshotRel(absPath)
+	if !ok {
 		return false
 	}
-	stamp, ok := s.entries[filepath.ToSlash(rel)]
-	return ok && stamp.status == "??"
+	stamp, found := s.entries[rel]
+	if !found || stamp.status == "" || stamp.status == "??" {
+		return false
+	}
+	return stamp.status[0] != ' '
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +692,29 @@ func verdictSummary(v *agent.ReviewResult) string {
 	return "no reproducible failure scenario found"
 }
 
+// executeReviewerTask runs one reviewer task outside a user turn and commits
+// the subagent fan-out to scrollback. The correctness gate, the design
+// gate, /review, and the PR loop all dispatch after TurnEnd (or with no
+// turn at all), so turnEndMsg is never a commit point for this line. One
+// helper is what keeps the design gate from forgetting the flush the
+// correctness gate already had: a resolved reviewer otherwise stays pinned
+// in the live region until some later turn happens to end.
+func (r *ChatRepl) executeReviewerTask(parentCtx context.Context, timeout time.Duration, call models.ToolCall) (models.ToolResult, error, *turnError) {
+	var result models.ToolResult
+	var execErr error
+	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+			r.ui.RenderSubagentEvent(evt)
+		})
+		result, execErr = r.cfg.ToolRegistry.Execute(ctx, call)
+		return nil // review failures are fail-soft, never a turn error
+	})
+	r.ui.FlushSubagentBlock()
+	return result, execErr, turnErr
+}
+
 // runReview dispatches one correctness-reviewer subagent through the
 // existing task tool (pool, schema validation, progress events — the whole
 // chain is reused; the REPL never touches the pool directly) and returns
@@ -730,27 +790,11 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	var execErr error
 	var turnErr *turnError
 	for attempt := 0; ; attempt++ {
-		result = models.ToolResult{}
-		execErr = nil
-		turnErr = r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-			ctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-				r.ui.RenderSubagentEvent(evt)
-			})
-			result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
-				ID:        fmt.Sprintf("review-t%d-%d", r.turn, time.Now().UnixNano()),
-				Name:      "task",
-				Arguments: args,
-			})
-			return nil // review failures are fail-soft, never a turn error
+		result, execErr, turnErr = r.executeReviewerTask(parentCtx, timeout, models.ToolCall{
+			ID:        fmt.Sprintf("review-t%d-%d", r.turn, time.Now().UnixNano()),
+			Name:      "task",
+			Arguments: args,
 		})
-		// Every caller resolves this reviewer outside a live turn: the gate and
-		// the mission loop run AFTER TurnEnd has committed, and /review and the
-		// PR loop dispatch with no turn at all — so turnEndMsg is never a commit
-		// point for this fan-out line. Flush it or the resolved reviewer stays
-		// pinned in the live region until some later turn happens to end.
-		r.ui.FlushSubagentBlock()
 
 		// Reviewer-write defense runs FIRST, before any trust decision — a
 		// timed-out reviewer may still have written the tree (design §4.4 B4:
@@ -934,8 +978,8 @@ func buildReviewPrompt(in reviewPromptInput) string {
 }
 
 // buildReviewDiff produces the scoped change view: `git diff -- <scope>`
-// for tracked files (never a bare git diff — the user's own unrelated
-// uncommitted changes must stay out, design §4.4 B2), plus a
+// for tracked files (never a bare git diff of the whole tree — the user's
+// own unrelated uncommitted changes must stay out, design §4.4 B2), plus a
 // `git diff --no-index` synthesized new-file diff per untracked file
 // (design N1; `git add -N` was rejected because mutating the user's index
 // violates review-has-zero-side-effects). oversized=true means rung (c):
@@ -947,30 +991,54 @@ func buildReviewPrompt(in reviewPromptInput) string {
 // the turn committed came out as an empty diff — and an empty diff is the
 // one input that makes a reviewer pass a change it never saw (the warning
 // resolveWorktreePath already carries). Diffing from the baseline commit
-// covers committed and uncommitted work in one view.
+// covers committed and uncommitted work in one view, including anything
+// sitting in the index.
+//
+// When that ref is absent (HEAD never moved, or there is no baseline), the
+// index-relative diff is kept — it must not resurrect already-committed
+// history — and staged paths get a second `git diff --cached`. Staging is
+// how a commit begins, and `git diff` alone reports it the same way it
+// reports a revert: nothing.
 func buildReviewDiff(workDir string, snap, base worktreeSnapshot, scope []string) (diff string, oversized bool) {
 	var b strings.Builder
 	if snap.root == "" {
 		b.WriteString("(diff unavailable: not a git worktree — attached file contents are the full change view)\n")
 	} else {
 		var tracked []string
+		var staged []string
 		var untracked []string
 		for _, f := range scope {
-			if snap.isUntracked(f) {
+			switch {
+			case snap.isUntracked(f):
 				untracked = append(untracked, f)
-			} else {
+			default:
 				tracked = append(tracked, f)
+				if snap.isStaged(f) {
+					staged = append(staged, f)
+				}
 			}
 		}
+		ref := diffBaseRef(snap, base)
 		if len(tracked) > 0 {
 			args := []string{"diff"}
-			if ref := diffBaseRef(snap, base); ref != "" {
+			if ref != "" {
 				args = append(args, ref)
 			}
 			args = append(args, "--")
 			out, err := runGit(workDir, append(args, tracked...)...)
 			if err != nil {
 				b.WriteString("(git diff failed for tracked files — rely on attached file contents)\n")
+			} else {
+				b.Write(out)
+			}
+		}
+		// A baseline ref already compares the worktree to that commit, so
+		// the index is included. Without one, staged changes need their own
+		// diff or the reviewer reads an empty hunk for a finished edit.
+		if ref == "" && len(staged) > 0 {
+			out, err := runGit(workDir, append([]string{"diff", "--cached", "--"}, staged...)...)
+			if err != nil {
+				b.WriteString("(git diff --cached failed for staged files — rely on attached file contents)\n")
 			} else {
 				b.Write(out)
 			}
@@ -1127,8 +1195,9 @@ func (r *ChatRepl) runManualReview(parentCtx context.Context) {
 		r.ui.Info("  review: nothing to review — no recorded edits and a clean worktree")
 		return
 	}
-	// No baseline: a manual /review judges the dirty tree as it stands,
-	// which is exactly what the index-relative diff shows.
+	// No baseline commit: a manual /review judges the dirty tree as it
+	// stands. buildReviewDiff still adds the index diff, so staged files
+	// are part of that tree rather than an empty hunk.
 	verdict, outcome := r.dispatchReview(parentCtx, r.lastUserRequest(), scope, snap, worktreeSnapshot{}, nil)
 	if outcome != reviewOK {
 		return

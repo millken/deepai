@@ -170,6 +170,46 @@ func TestBuildReviewDiffCoversCommittedWork(t *testing.T) {
 	}
 }
 
+// Staging is the step before the commit the gate already learned to see.
+// `git diff` (worktree vs index) is empty once the edit is added, which is
+// the same empty diff that makes a reviewer pass a change it never saw.
+func TestBuildReviewDiffCoversStagedWork(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+
+	base := takeWorktreeSnapshot(dir)
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc StagedEdit() {}\n")
+	runGitOrFatal(t, dir, "add", "committed.go")
+	writeFileOrFatal(t, filepath.Join(dir, "brand_new.go"), "package x\n\nfunc StagedNew() {}\n")
+	runGitOrFatal(t, dir, "add", "brand_new.go")
+
+	snap := takeWorktreeSnapshot(dir)
+	if snap.head != base.head {
+		t.Fatal("staging must not move HEAD — that is the committed-work case")
+	}
+	scope := []string{
+		filepath.Join(snap.root, "committed.go"),
+		filepath.Join(snap.root, "brand_new.go"),
+	}
+
+	diff, oversized := buildReviewDiff(dir, snap, base, scope)
+	if oversized {
+		t.Fatal("small diff flagged oversized")
+	}
+	for _, want := range []string{"+func StagedEdit()", "+func StagedNew()"} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("diff is missing %q:\n%s", want, diff)
+		}
+	}
+
+	// Manual /review has no baseline. Already-committed history must stay
+	// out, but the staged edit is the dirty tree the user asked to review.
+	manual, _ := buildReviewDiff(dir, snap, worktreeSnapshot{}, scope)
+	if !strings.Contains(manual, "+func StagedEdit()") || !strings.Contains(manual, "+func StagedNew()") {
+		t.Fatalf("manual review diff dropped staged work:\n%s", manual)
+	}
+}
+
 func TestWorktreeSnapshotRedirtiedFileIsAttributed(t *testing.T) {
 	gitOrSkip(t)
 	dir := initRepo(t)
