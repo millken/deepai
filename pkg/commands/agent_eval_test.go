@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -275,7 +276,7 @@ func TestEvaluateCase_NoWrites(t *testing.T) {
 // Assertions: files_changed / file_contains / file_not_contains — the
 // "did the edit actually land" assertions the M6 batch-editing corpus needs
 // (see docs brief for this period). changed is always an ABSOLUTE path list
-// (chat.WorktreeSnapshot.ChangedSince's contract — root-joined, see
+// (chat.WorktreeSnapshot.ChangesSince's contract — root-joined, see
 // pkg/chat/review.go), exactly like runOneCase hands evaluateCase; worktree
 // is the same root those absolute paths were joined against, so evaluateCase
 // can convert changed -> worktree-relative paths comparable to the
@@ -689,6 +690,50 @@ func TestRunOneCase_FilesChangedAndFileContainsEndToEnd(t *testing.T) {
 	assertStatus(t, rec.Assertions, "files_changed", "pass")
 	assertStatus(t, rec.Assertions, "file_contains:a.go:NewName", "pass")
 	assertStatus(t, rec.Assertions, "file_not_contains:a.go:OldName", "pass")
+}
+
+// Committing the write used to hide it. ChangedSince only sees the dirty
+// tree, and a commit makes the tree clean, so no_writes passed and
+// files_changed failed on work that had landed — the same hole the mission
+// gate had for an implementer that commits.
+func TestRunOneCase_CommittedWriteIsStillAViolation(t *testing.T) {
+	root := t.TempDir()
+	c := writeCase(t, root, "coder", "commit-case",
+		"id: commit-case\nagent_type: coder\ntask: \"rename and commit\"\nexpect:\n  - no_writes: true\n  - files_changed: [a.go]\n",
+		map[string]string{"a.go": "package a\n\nfunc OldName() {}\n"})
+
+	pool := &fakePool{
+		task: fakeTaskResult{Status: subagent.TaskStatusCompleted, Result: "done"},
+		sideEffect: func() {
+			wd, err := os.Getwd()
+			if err != nil {
+				t.Fatalf("getwd inside side effect: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(wd, "a.go"), []byte("package a\n\nfunc NewName() {}\n"), 0o644); err != nil {
+				t.Fatalf("side effect write: %v", err)
+			}
+			for _, args := range [][]string{
+				{"add", "a.go"},
+				{"-c", "user.email=eval@deepai.local", "-c", "user.name=deepai-eval", "commit", "-q", "-m", "the case's work"},
+			} {
+				cmd := exec.Command("git", args...)
+				cmd.Dir = wd
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, out)
+				}
+			}
+		},
+	}
+
+	rec, err := runOneCase(context.Background(), pool, c, 1, "deadbeef", evalOptions{})
+	if err != nil {
+		t.Fatalf("runOneCase: %v", err)
+	}
+	if !rec.WriteViolation {
+		t.Error("expected WriteViolation = true after a committed edit, got false")
+	}
+	assertStatus(t, rec.Assertions, "no_writes", "fail")
+	assertStatus(t, rec.Assertions, "files_changed", "pass")
 }
 
 func TestRunOneCase_CleanRunNoWritesPasses(t *testing.T) {
