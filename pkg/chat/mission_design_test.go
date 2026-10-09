@@ -512,6 +512,23 @@ func TestDesignPhase_AfterEscalationTheTurnSeesNoLockedCharter(t *testing.T) {
 	}
 }
 
+// The design review runs after the design turn's TurnEnd, same as the
+// correctness gate. Without its own flush the resolved reviewer line stays
+// pinned until whatever turn happens to end next.
+func TestDesignPhase_FlushesSubagentBlock(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, ui, _ := newDesignRepl(t, fake, []string{"# plan\n- do the thing"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	r.mission = m
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("a passing design must continue into the implementation phase")
+	}
+	if ui.flushes != 1 {
+		t.Fatalf("design review flushed the fan-out block %d times, want 1", ui.flushes)
+	}
+}
+
 // M2: Ctrl+C already costs the user the turn; it must not also cost the
 // mission one of its three chances at the plan.
 func TestDesignPhase_InterruptedTurnDoesNotSpendARound(t *testing.T) {

@@ -8,7 +8,6 @@ import (
 
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/models"
-	"github.com/millken/deepai/pkg/subagent"
 )
 
 // ---------------------------------------------------------------------------
@@ -483,20 +482,10 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 	var execErr error
 	var turnErr *turnError
 	for attempt := 0; ; attempt++ {
-		result = models.ToolResult{}
-		execErr = nil
-		turnErr = r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-			ctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-				r.ui.RenderSubagentEvent(evt)
-			})
-			result, execErr = r.cfg.ToolRegistry.Execute(ctx, models.ToolCall{
-				ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
-				Name:      "task",
-				Arguments: args,
-			})
-			return nil // review failures are fail-soft, never a turn error
+		result, execErr, turnErr = r.executeReviewerTask(parentCtx, timeout, models.ToolCall{
+			ID:        fmt.Sprintf("design-review-t%d-r%d-%d", r.turn, round, time.Now().UnixNano()),
+			Name:      "task",
+			Arguments: args,
 		})
 
 		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {

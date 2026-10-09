@@ -170,6 +170,111 @@ func TestBuildReviewDiffCoversCommittedWork(t *testing.T) {
 	}
 }
 
+// Staging is the step before the commit the gate already learned to see.
+// `git diff` (worktree vs index) is empty once the edit is added, which is
+// the same empty diff that makes a reviewer pass a change it never saw.
+func TestBuildReviewDiffCoversStagedWork(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+
+	base := takeWorktreeSnapshot(dir)
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc StagedEdit() {}\n")
+	runGitOrFatal(t, dir, "add", "committed.go")
+	writeFileOrFatal(t, filepath.Join(dir, "brand_new.go"), "package x\n\nfunc StagedNew() {}\n")
+	runGitOrFatal(t, dir, "add", "brand_new.go")
+
+	snap := takeWorktreeSnapshot(dir)
+	if snap.head != base.head {
+		t.Fatal("staging must not move HEAD — that is the committed-work case")
+	}
+	scope := []string{
+		filepath.Join(snap.root, "committed.go"),
+		filepath.Join(snap.root, "brand_new.go"),
+	}
+
+	diff, oversized := buildReviewDiff(dir, snap, base, scope)
+	if oversized {
+		t.Fatal("small diff flagged oversized")
+	}
+	for _, want := range []string{"+func StagedEdit()", "+func StagedNew()"} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("diff is missing %q:\n%s", want, diff)
+		}
+	}
+
+	// Manual /review has no baseline. Already-committed history must stay
+	// out, but the staged edit is the dirty tree the user asked to review.
+	manual, _ := buildReviewDiff(dir, snap, worktreeSnapshot{}, scope)
+	if !strings.Contains(manual, "+func StagedEdit()") || !strings.Contains(manual, "+func StagedNew()") {
+		t.Fatalf("manual review diff dropped staged work:\n%s", manual)
+	}
+}
+
+// Unmerged porcelain (both columns in ADU) is not a staged edit. git diff
+// --cached on those compares against a virtual merge base and would show
+// the reviewer a conflict, not the change under review.
+func TestIsStagedSkipsUnmergedPorcelain(t *testing.T) {
+	root := resolveWorktreePath(t.TempDir())
+	entries := map[string]fileStamp{
+		"staged.go":   {status: "M "},
+		"added.go":    {status: "A "},
+		"both.go":     {status: "MM"},
+		"worktree.go": {status: " M"},
+	}
+	unmerged := []string{"UU", "AA", "DD", "AU", "UA", "DU", "UD"}
+	for _, st := range unmerged {
+		entries[st+".go"] = fileStamp{status: st}
+	}
+	snap := worktreeSnapshot{root: root, entries: entries}
+
+	for _, name := range []string{"staged.go", "added.go", "both.go"} {
+		if !snap.isStaged(filepath.Join(root, name)) {
+			t.Fatalf("%s should count as staged", name)
+		}
+	}
+	if snap.isStaged(filepath.Join(root, "worktree.go")) {
+		t.Fatal("an unstaged modification is not an index change")
+	}
+	for _, st := range unmerged {
+		if snap.isStaged(filepath.Join(root, st+".go")) {
+			t.Fatalf("unmerged status %s must not be treated as staged", st)
+		}
+	}
+}
+
+// A baseline commit that git can no longer resolve (reset, prune) must not
+// end the diff at a parenthetical. The index/worktree view, including
+// staged paths, is still the change under review.
+func TestBuildReviewDiffFallsBackWhenBaselineRefIsGone(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+
+	base := takeWorktreeSnapshot(dir)
+	writeFileOrFatal(t, filepath.Join(dir, "other.go"), "package x\n")
+	runGitOrFatal(t, dir, "add", "other.go")
+	runGitOrFatal(t, dir, "commit", "-q", "-m", "move HEAD so the baseline ref is used")
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc StillStaged() {}\n")
+	runGitOrFatal(t, dir, "add", "committed.go")
+
+	snap := takeWorktreeSnapshot(dir)
+	if snap.head == "" || snap.head == base.head {
+		t.Fatal("expected HEAD to move off the baseline")
+	}
+	base.head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	scope := []string{filepath.Join(snap.root, "committed.go")}
+
+	diff, oversized := buildReviewDiff(dir, snap, base, scope)
+	if oversized {
+		t.Fatal("small diff flagged oversized")
+	}
+	if !strings.Contains(diff, "+func StillStaged()") {
+		t.Fatalf("unreachable baseline dropped the staged change:\n%s", diff)
+	}
+	if strings.Contains(diff, "git diff failed") {
+		t.Fatalf("fallback diff still reports a hard failure:\n%s", diff)
+	}
+}
+
 func TestWorktreeSnapshotRedirtiedFileIsAttributed(t *testing.T) {
 	gitOrSkip(t)
 	dir := initRepo(t)

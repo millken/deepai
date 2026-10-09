@@ -10,10 +10,11 @@
 //
 // Zero production BEHAVIOR changes ship with this file. Production code
 // does gain a small set of additive exports this file depends on: the
-// pkg/chat/review.go WorktreeSnapshot/TakeWorktreeSnapshot/ChangedSince (so
-// the `no_writes` assertion below reuses the exact dirty-worktree detection
-// the review gate uses, instead of a second copy that could silently
-// diverge from it), and — M6 latency, fingerprint-coverage fix —
+// pkg/chat/review.go WorktreeSnapshot/TakeWorktreeSnapshot/ChangesSince (so
+// the `no_writes` and `files_changed` assertions below reuse the review
+// gate's attribution, including work the case committed, instead of a
+// second copy that could silently diverge from it), and — M6 latency,
+// fingerprint-coverage fix —
 // pkg/agent's AssembleSystemPrompt/SelectSubagentTools/
 // PreloadSkillsProfile/AppendOutputSchemaPrompt/ResolveAgentTypeConfig, so
 // caseFingerprint (below) can compute the SAME bytes a real dispatched
@@ -863,7 +864,11 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	}
 
 	after := chat.TakeWorktreeSnapshot(worktree)
-	changed := after.ChangedSince(before)
+	// ChangesSince, not the dirty-only delta: a case that commits its edit
+	// leaves the dirty tree, and that delta then reports the same empty set
+	// as a case that wrote nothing. no_writes would pass, and files_changed
+	// would fail, on work that landed.
+	changed := after.ChangesSince(before)
 
 	restore()
 
@@ -1164,8 +1169,8 @@ func manifestDeclaresNoWrites(m caseManifest) bool {
 // (files_changed/file_contains/file_not_contains, added this period so a
 // batch-editing corpus can assert on file CONTENT, not just text output —
 // see this file's package doc comment): changed is runOneCase's
-// chat.WorktreeSnapshot.ChangedSince(before) result, an ABSOLUTE path list
-// (root-joined, see pkg/chat/review.go's changedSince), and worktree is the
+// chat.WorktreeSnapshot.ChangesSince(before) result, an ABSOLUTE path list
+// (root-joined, see pkg/chat/review.go's changesSince), and worktree is the
 // same root those paths were joined against, so this function can both
 // convert changed into worktree-relative paths comparable to a manifest's
 // repo-relative file lists, and open worktree-relative paths itself to
