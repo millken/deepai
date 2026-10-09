@@ -413,7 +413,14 @@ type persistedStamp struct {
 }
 
 type persistedSnapshot struct {
-	Root    string                    `json:"root"`
+	Root string `json:"root"`
+	// Head is the baseline commit. Without it a resumed mission loses the
+	// ability to see its own commits: commit attribution compares two
+	// HEADs, and a baseline reloaded with an empty one degrades to the
+	// dirty-state delta, which reports committed work as no work at all.
+	// Absent in baselines written before commit attribution existed —
+	// those keep the old behavior rather than failing to load.
+	Head    string                    `json:"head,omitempty"`
 	Entries map[string]persistedStamp `json:"entries"`
 }
 
@@ -424,7 +431,7 @@ type persistedSnapshot struct {
 // them).
 func (m *mission) saveBaseline(s worktreeSnapshot) {
 	m.baseline = s
-	ps := persistedSnapshot{Root: s.root, Entries: make(map[string]persistedStamp, len(s.entries))}
+	ps := persistedSnapshot{Root: s.root, Head: s.head, Entries: make(map[string]persistedStamp, len(s.entries))}
 	for p, st := range s.entries {
 		ps.Entries[p] = persistedStamp{Status: st.status, Size: st.size, ModTime: st.modTime}
 	}
@@ -452,7 +459,7 @@ func (m *mission) loadBaseline() worktreeSnapshot {
 	for p, st := range ps.Entries {
 		entries[p] = fileStamp{status: st.Status, size: st.Size, modTime: st.ModTime}
 	}
-	return worktreeSnapshot{root: ps.Root, entries: entries}
+	return worktreeSnapshot{root: ps.Root, head: ps.Head, entries: entries}
 }
 
 func hashText(s string) string {

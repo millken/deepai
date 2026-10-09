@@ -146,8 +146,15 @@ func TestDesignPhase_PassWithoutCharterFieldsIsAFail(t *testing.T) {
 	if r.runDesignPhase(context.Background()) {
 		t.Fatal("an empty charter must never pass the gate")
 	}
-	if !strings.Contains((*inputs)[1], "could not fill the charter") {
-		t.Errorf("the author must be told WHY: %q", (*inputs)[1])
+	// The reviewer passed, so its issue list is empty: the revision
+	// message has to carry the GATE's reason or it asks the author to fix
+	// a list of nothing, and the next plan comes back identical.
+	next := (*inputs)[1]
+	if !strings.Contains(next, "could not lock a charter") || !strings.Contains(next, "no acceptance criteria") {
+		t.Errorf("the author must be told WHY the gate refused a passing verdict: %q", next)
+	}
+	if strings.Contains(next, "found the following issues") {
+		t.Errorf("a gate refusal must not be worded as reviewer findings, there are none: %q", next)
 	}
 }
 
@@ -155,7 +162,7 @@ func TestDesignOutcome(t *testing.T) {
 	dir := t.TempDir()
 	good := &agent.DesignReviewResult{Verdict: "pass",
 		ScopeFiles: []string{"a.go"}, Acceptance: []string{"Given a, when b, then c"}}
-	if _, ok := designOutcome(dir, good); !ok {
+	if _, ok, _ := designOutcome(dir, good); !ok {
 		t.Error("a filled pass must pass")
 	}
 	cases := map[string]*agent.DesignReviewResult{
@@ -167,20 +174,62 @@ func TestDesignOutcome(t *testing.T) {
 		"scope outside tree": {Verdict: "pass", ScopeFiles: []string{"/etc/passwd"}, Acceptance: []string{"Given a, when b, then c"}},
 	}
 	for name, v := range cases {
-		if _, ok := designOutcome(dir, v); ok {
+		if _, ok, _ := designOutcome(dir, v); ok {
 			t.Errorf("%s: must not pass", name)
 		}
 	}
 	// A failing verdict with an EMPTY issue list — a shape the Strict schema
 	// permits — must not lock a charter. This is the design-gate half of the
 	// same hole isMissionPassVerdict closes on the done path.
-	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail", ScopeFiles: []string{"a.go"},
+	if _, ok, _ := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail", ScopeFiles: []string{"a.go"},
 		Acceptance: []string{"Given a, when b, then c"}}); ok {
 		t.Error("a fail verdict must not pass just because it listed no issues")
 	}
-	if _, ok := designOutcome(dir, &agent.DesignReviewResult{Verdict: "", ScopeFiles: []string{"a.go"},
+	if _, ok, _ := designOutcome(dir, &agent.DesignReviewResult{Verdict: "", ScopeFiles: []string{"a.go"},
 		Acceptance: []string{"Given a, when b, then c"}}); ok {
 		t.Error("an empty verdict is not a pass — both reviewer prompts promise the literal word")
+	}
+}
+
+// A verdict the REVIEWER passed and the GATE refused carries no issues, so
+// the refusal has to come with its own reason. Without one the author was
+// asked to fix a list of nothing, produced the same plan, and the mission
+// burned all three design rounds on a short acceptance string before
+// ending design_failed.
+func TestDesignOutcome_GateRefusalOfAPassNamesItsReason(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]struct {
+		v    *agent.DesignReviewResult
+		want string
+	}{
+		"no acceptance": {
+			v:    &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"a.go"}},
+			want: "no acceptance criteria",
+		},
+		"hedged acceptance": {
+			v:    &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"a.go"}, Acceptance: []string{"works"}},
+			want: "too short",
+		},
+		"scope outside the tree": {
+			v: &agent.DesignReviewResult{Verdict: "pass", ScopeFiles: []string{"/etc/passwd"},
+				Acceptance: []string{"Given a, when b, then c"}},
+			want: "repo-relative",
+		},
+	}
+	for name, tc := range cases {
+		_, pass, reason := designOutcome(dir, tc.v)
+		if pass {
+			t.Fatalf("%s: must not pass", name)
+		}
+		if !strings.Contains(reason, tc.want) {
+			t.Errorf("%s: reason = %q, want it to mention %q", name, reason, tc.want)
+		}
+	}
+	// An ordinary failing verdict needs no gate reason: its issues are the
+	// reason, and inventing one on top would double-report.
+	if _, _, reason := designOutcome(dir, &agent.DesignReviewResult{Verdict: "fail",
+		Issues: []agent.Issue{{Message: "the plan never names the gate"}}}); reason != "" {
+		t.Errorf("a reviewer-failed verdict must carry no gate reason, got %q", reason)
 	}
 }
 
@@ -504,6 +553,59 @@ func TestDesignPhase_InterruptedReviewKeepsTheMissionActive(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "design review interrupted") {
 		t.Errorf("the user must be told the plan is unreviewed: %v", ui.infoMsgs)
+	}
+	// The round's turn already ran, so what the resume owes this plan is
+	// the review, not another rewrite of it — the same debt a transient
+	// outage records.
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.PendingReview; got != missionPhaseDesign {
+		t.Fatalf("pending_review = %q, want design — an interrupted review still owes the plan a review", got)
+	}
+}
+
+// The interrupted review's missing pending flag was not merely wasteful: on
+// the LAST design round the resume computed round = maxDesignRounds+1, took
+// the round-cap exit, and ended the mission design_failed with a finished
+// plan on disk that no reviewer had ever read. A Ctrl+C on the review is
+// the most ordinary thing a watching user does.
+func TestDesignPhase_InterruptedReviewOnTheLastRoundStillGetsReviewed(t *testing.T) {
+	fake := &fakeTaskTool{content: designPassJSON()}
+	r, _, inputs := newDesignRepl(t, fake, []string{"# plan"})
+	m, _ := createMission(r.cfg.WorkDir, "brief")
+	m.state.DesignRound = maxDesignRounds - 1
+	if err := m.save(); err != nil {
+		t.Fatal(err)
+	}
+	r.mission = m
+
+	// Round 3/3 runs its turn, and the user interrupts its review.
+	r.ui.(*mockUI).interruptDuringTask = true
+	fake.waitForCancel = true
+	r.runDesignPhase(context.Background())
+	if r.mission == nil {
+		t.Fatal("an interrupted review must not end the mission")
+	}
+	if m.state.DesignRound != maxDesignRounds {
+		t.Fatalf("design_round = %d, want %d", m.state.DesignRound, maxDesignRounds)
+	}
+
+	// The resume: the plan is complete and the budget is spent, so the one
+	// thing left to do is review it.
+	r.ui.(*mockUI).interruptDuringTask = false
+	fake.waitForCancel = false
+	turnsBefore := len(*inputs)
+
+	if !r.runDesignPhase(context.Background()) {
+		t.Fatal("the resumed review passed the plan; the mission must proceed to implement")
+	}
+	if len(*inputs) != turnsBefore {
+		t.Fatalf("ran %d extra design turns, want 0 — the owing review dispatches before any turn",
+			len(*inputs)-turnsBefore)
+	}
+	if m.state.Phase != missionPhaseImplement {
+		t.Fatalf("phase = %q, want implement", m.state.Phase)
+	}
+	if got := openOrFatal(t, r.cfg.WorkDir, m.state.ID).state.Status; got != missionStatusActive {
+		t.Fatalf("status = %q, want active — design_failed here throws away a reviewable plan", got)
 	}
 }
 

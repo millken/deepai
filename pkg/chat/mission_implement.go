@@ -155,8 +155,16 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		case out.reviewInterrupted:
 			// The user cancelled the review: same rule the design gate has
 			// always had — nothing is wrong with the work, the mission stays
-			// active and the next message resumes it.
-			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message resumes the mission, /mission abort ends it")
+			// active and the next message resumes it. The review is marked
+			// PENDING exactly as a transient outage is: the turn that
+			// produced this diff already ran, so what the resume owes is
+			// the review, not another "Implement it" turn editing a diff
+			// that was one review away from the gate.
+			m.state.PendingReview = missionPhaseImplement
+			if err := m.save(); err != nil {
+				r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
+			}
+			r.ui.Info("  mission: implementation review interrupted — the changes are UNREVIEWED; your next message re-runs the review on the unchanged changes, /mission abort ends it")
 			return false
 		case out.next == "":
 			r.ui.Info("  mission: handed_over — the changes are in the worktree and did NOT pass a review; they need your judgment")
@@ -268,7 +276,14 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		// record-based check would report the same violation again, spend
 		// the second scope round, and escalate a mission that actually did
 		// what it was told.
-		reviewScope, violations = classifyAgainstCharter(r.cfg.WorkDir, m.charter, after.changedSince(before))
+		//
+		// changesSince, not changedSince: an implementer that COMMITS its
+		// work leaves the dirty set, and the dirty set alone cannot tell
+		// that from a revert. The phase then had nothing to review, which
+		// is an idle round — so a mission whose change was finished and
+		// committed was told "talking about the work is not doing it"
+		// twice and handed back unreviewed.
+		reviewScope, violations = classifyAgainstCharter(r.cfg.WorkDir, m.charter, after.changesSince(before))
 	} else {
 		// Non-git degradation is NARROW (R30): the hard scope check and the
 		// scope escalation switch off, because there is no trustworthy
@@ -329,7 +344,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		return gateResult{next: missionIdleMessage(m.state.IdleRound, maxIdleRounds)}
 	}
 
-	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, r.reviewPrev)
+	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, before, r.reviewPrev)
 	if outcome != reviewOK {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
 		// un-write them, and nothing here may ever report them as reviewed.

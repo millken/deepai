@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +71,102 @@ func TestWorktreeSnapshotAttribution(t *testing.T) {
 	}
 	if len(changed) != 2 || !got["committed.go"] || !got["newfile.go"] {
 		t.Fatalf("changedSince = %v, want exactly {committed.go, newfile.go}", changed)
+	}
+}
+
+// Committing a change makes it clean, and the dirty-state delta then
+// reports it exactly as it reports a revert: the path simply leaves
+// `git status --porcelain`. changesSince is what keeps a turn that
+// committed its own work attributable — without it the mission gate saw an
+// empty change set, called it idle, and handed a finished change back
+// unreviewed.
+func TestWorktreeSnapshotCommittedChangeStaysAttributed(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+
+	s0 := takeWorktreeSnapshot(dir)
+	if s0.head == "" {
+		t.Fatal("expected a resolvable HEAD in a repo with one commit")
+	}
+
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc F() {}\n")
+	runGitOrFatal(t, dir, "add", "committed.go")
+	runGitOrFatal(t, dir, "commit", "-q", "-m", "the turn's work")
+
+	s1 := takeWorktreeSnapshot(dir)
+	if got := s1.changedSince(s0); len(got) != 0 {
+		t.Fatalf("the dirty delta sees %v; a committed file is clean, which is the whole problem", got)
+	}
+	changed := s1.changesSince(s0)
+	if len(changed) != 1 || filepath.Base(changed[0]) != "committed.go" {
+		t.Fatalf("changesSince = %v, want exactly {committed.go}", changed)
+	}
+	// The user's own untracked file was not committed and did not change:
+	// commit attribution must not widen the baseline's exclusions.
+	for _, p := range changed {
+		if filepath.Base(p) == "userdirty.go" {
+			t.Errorf("the user's pre-turn dirty file leaked into attribution: %v", changed)
+		}
+	}
+}
+
+// Commit attribution needs two resolvable HEADs. A repo with no commits
+// yet (or a baseline written before this existed) must degrade to the
+// dirty delta rather than guess.
+func TestWorktreeSnapshotCommitAttributionNeedsTwoHeads(t *testing.T) {
+	gitOrSkip(t)
+	dir := t.TempDir()
+	runGitOrFatal(t, dir, "init", "-q")
+
+	s0 := takeWorktreeSnapshot(dir)
+	if s0.root == "" {
+		t.Fatal("expected a git snapshot in a fresh repo")
+	}
+	if s0.head != "" {
+		t.Fatalf("head = %q in a repo with no commits, want empty", s0.head)
+	}
+	writeFileOrFatal(t, filepath.Join(dir, "first.go"), "package x\n")
+	runGitOrFatal(t, dir, "add", "first.go")
+	runGitOrFatal(t, dir, "commit", "-q", "-m", "first")
+
+	s1 := takeWorktreeSnapshot(dir)
+	if got := s1.committedSince(s0); got != nil {
+		t.Fatalf("committedSince = %v with no baseline commit, want nil", got)
+	}
+	if got := s1.committedSince(s1); got != nil {
+		t.Fatalf("committedSince = %v for an unmoved HEAD, want nil", got)
+	}
+}
+
+// buildReviewDiff must diff from the baseline COMMIT when HEAD moved: a
+// bare `git diff -- <path>` on a committed change is empty, and an empty
+// diff is the one input that makes a reviewer pass a change it never saw.
+func TestBuildReviewDiffCoversCommittedWork(t *testing.T) {
+	gitOrSkip(t)
+	dir := initRepo(t)
+
+	base := takeWorktreeSnapshot(dir)
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc Committed() {}\n")
+	runGitOrFatal(t, dir, "add", "committed.go")
+	runGitOrFatal(t, dir, "commit", "-q", "-m", "the turn's work")
+	writeFileOrFatal(t, filepath.Join(dir, "committed.go"), "package x\n\nfunc Committed() {}\n\nfunc Staged() {}\n")
+
+	snap := takeWorktreeSnapshot(dir)
+	scope := []string{filepath.Join(snap.root, "committed.go")}
+
+	// Without a baseline the diff is index-relative: the committed hunk
+	// appears only as context, never as the change under review.
+	if diff, _ := buildReviewDiff(dir, snap, worktreeSnapshot{}, scope); strings.Contains(diff, "+func Committed()") {
+		t.Fatalf("index-relative diff unexpectedly carries the committed hunk:\n%s", diff)
+	}
+	diff, oversized := buildReviewDiff(dir, snap, base, scope)
+	if oversized {
+		t.Fatal("small diff flagged oversized")
+	}
+	for _, want := range []string{"+func Committed()", "+func Staged()"} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("diff from the baseline commit is missing %q:\n%s", want, diff)
+		}
 	}
 }
 
