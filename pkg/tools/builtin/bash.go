@@ -9,6 +9,7 @@ import (
 
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // M2.3: Bash output size limit to prevent extreme results
@@ -32,6 +33,13 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	result, err := sandbox.ExecDirect(ctx, cmd, timeout)
 	if err != nil {
 		return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("bash failed: %w", err)
+	}
+
+	// Runs even on a non-zero exit: a conflicted rebase/merge has already
+	// rewritten files. Purely informational for the edit_file read gate —
+	// it never waives a mismatch, only earns the error a git-specific cause.
+	if likelyGitRewrite(cmd) {
+		tools.ReadTrackerFromContext(ctx).NoteGitRewrite()
 	}
 
 	// M2.3: Apply output size limit
@@ -65,6 +73,68 @@ func BashHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 		res.Error = timeoutMessage(timeout, result.Duration(), stdout, stderr)
 	}
 	return res, nil
+}
+
+// gitRewriteSubcommands are the git subcommands that rewrite working-tree
+// files (as opposed to only moving refs or printing). Best-effort list.
+var gitRewriteSubcommands = map[string]bool{
+	"checkout": true, "switch": true, "restore": true, "rebase": true,
+	"merge": true, "reset": true, "stash": true, "clean": true,
+	"cherry-pick": true, "revert": true, "apply": true, "am": true,
+	"pull": true, "filter-branch": true, "sparse-checkout": true,
+}
+
+// likelyGitRewrite reports whether cmd runs a git subcommand that rewrites
+// working-tree files. Splits on shell sequencing separators (&&, ||, ;, |,
+// newline) so a rewrite anywhere in the command counts, then token-parses
+// each segment — not a shell grammar: a quoted "git checkout" inside a
+// commit message can trip it, which only ever over-triggers the
+// informational NoteGitRewrite — never a false pass.
+func likelyGitRewrite(cmd string) bool {
+	for _, seg := range strings.FieldsFunc(cmd, func(r rune) bool {
+		return r == '\n' || r == ';' || r == '|' || r == '&'
+	}) {
+		if gitRewriteSegment(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitGlobalFlagValues are git's global flags that take a separate value token;
+// the value must not be mistaken for the subcommand (git -C elsewhere status).
+var gitGlobalFlagValues = map[string]bool{
+	"-C": true, "-c": true, "--git-dir": true, "--work-tree": true,
+	"--namespace": true, "--exec-path": true,
+}
+
+func gitRewriteSegment(seg string) bool {
+	fields := strings.Fields(seg)
+	gitAt := -1
+	for i, f := range fields {
+		if f == "git" {
+			gitAt = i
+			break
+		}
+	}
+	if gitAt < 0 {
+		return false
+	}
+	skipValue := false
+	for _, f := range fields[gitAt+1:] {
+		if skipValue {
+			skipValue = false
+			continue
+		}
+		if strings.HasPrefix(f, "-") {
+			if gitGlobalFlagValues[f] {
+				skipValue = true
+			}
+			continue
+		}
+		return gitRewriteSubcommands[f]
+	}
+	return false
 }
 
 // timeoutMessage explains a killed command to the model.

@@ -107,8 +107,13 @@ func GrepHandler(ctx context.Context, call models.ToolCall) (models.ToolResult, 
 	// real hash, so per the edit_file contract it satisfies the read gate
 	// without a read_file. files_only names files without text and does not.
 	if !filesOnly {
+		stamped := make(map[string]bool, len(matches))
 		for _, m := range matches {
-			stampTrackedFile(ctx, m.File)
+			if stamped[m.File] {
+				continue
+			}
+			stamped[m.File] = true
+			stampTrackedFileFresh(ctx, m.File)
 		}
 	}
 
