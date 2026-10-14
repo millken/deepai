@@ -79,7 +79,8 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 1. **先定规格**:动手前写出本次要用的尺寸表(高度/内边距/字号/行高/圆角/间距),取自文件已有组件或 [component-specs.md](references/component-specs.md);不现场目测取值。
 2. **按规格构建**:控件用 recipes §6 的规格化构建(高度 = 行高 + 2×垂直内边距,auto-layout 居中),文字用 §4 `label`(自动选中文字体、显式像素行高)。
 3. **量测**:每次写入后对改动子树跑 recipes §8;它检查控件几何居中、内边距对称、字号/高度比、折行、溢出、
-   文字重叠、近似未对齐、对比度、中日韩字体、变体一致性。先看结果里的 `checked`:构建了控件却 `controls:0`
+   文字重叠、近似未对齐、胶囊收缩/居中(pillCollapsed/pillOffY)、图标栈居中(stackOffX)、图标矢量畸变
+   (iconBBox)、对比度、中日韩字体、变体一致性。先看结果里的 `checked`:构建了控件却 `controls:0`
    (命名未识别)或 `truncated:true` 时,`pass` 不构成证据;页面级结构问题另由 recipes §7 体检覆盖。
 4. **修正到通过**:`errors` 逐条修(通常是按规格重建,而非挪坐标)并重跑同一子树,直到 `pass:true`
    (页面级再加 §7 归零);3 轮不过则如实报告。
@@ -170,10 +171,12 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   构建后必读 after 快照的 `layout.sizing` 确认。
 - **FILL 时机**:`layoutSizing*='FILL'` 只能在节点已 append 进 auto-layout 父级之后设置,否则抛错(新建空画板默认非 auto-layout,先 recipes §4 `ensureAuto`);
   `HUG` 只对 auto-layout 容器与文字有效。
-- **对齐语义**:VERTICAL 布局里 `primaryAxisAlignItems` 是垂直方向,水平
-  居中要看 counter 轴。字段名写错(如 `*AlignWidgets`)赋值不报错、读回 undefined,构建 ok 但视觉全错——
-  写完读回确认。属性不生效时(实测发生过)用子级 `layoutAlign='CENTER'`;文字垂直居中更稳的组合是
-  `layoutAlign='STRETCH'` + `textAlignVertical='CENTER'`;其余兜底见 recipes §6「居中三板斧」。
+- **对齐语义**:控件居中首选正解是容器对齐属性——HORIZONTAL 容器的垂直居中、VERTICAL 容器的水平居中都是
+  `counterAxisAlignItems='CENTER'`,主轴用 `primaryAxisAlignItems`(实测批量设 102 个容器全部生效,偏差归零);
+  容器对齐之外,固定宽/高文字节点内的字形居中由 `textAlignHorizontal`/`textAlignVertical` 控制。字段名写错
+  (如 `*AlignWidgets`)赋值不报错、读回 undefined,构建 ok 但视觉全错——写完读回确认。auto-layout 里字段名
+  正确仍不生效(罕见)的兜底:双 `layoutGrow=1` spacer、文字 STRETCH + `textAlignVertical='CENTER'`(recipes §6);
+  `layoutMode='NONE'` 场景上述子级属性无效,按绝对坐标手算 x/y 定位或先开 auto-layout。
 - **多行文本**:`textAutoResize='HEIGHT'` + `resize(定宽, 初始行高)` 实现固宽换行撑高;
   在 auto-layout 里则 `textAutoResize='HEIGHT'` 后设 `layoutSizingHorizontal='FILL'`。
 - **返回值**:预览图让 `return` 的值本身就是 `exportAsync` 的 Uint8Array(走图像通道落盘

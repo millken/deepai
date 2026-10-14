@@ -430,10 +430,9 @@ return { button: btnSet.id, input: inputSet.id, labelKey: key };
 组件集开启 auto-layout 后显式设两轴 HUG,否则集合保持合并时的固定尺寸,变体溢出(§8 报 `overflow`)。
 Input 的顺序:`resize(280, s.h)` 在设 sizing 之前(resize 会锁回 FIXED),文字加入后再把纵向设回 HUG,高度由「行高 + 2×内边距」得出,恰等于 `s.h`。
 
-**居中三板斧(实测)**:对齐字段名是 `primaryAxisAlignItems` / `counterAxisAlignItems`——写成 `*AlignWidgets` 等不存在的名字,赋值**不报错**、读回 undefined,构建 ok:true 但视觉全错(实测按钮文字贴左上、输入框文字贴顶)。写完读回确认,§8 也会以 `labelOffY` / `contentOffX` 拦下。属性确实不生效或处于非 auto-layout 场景时:
-- 水平居中:两个 `layoutGrow=1` 的空 spacer frame 夹住内容组(主轴为 MIN 时);
-- 文字垂直居中:文字子级 `layoutAlign='STRETCH'` 拉满容器高 + `textAlignVertical='CENTER'`;
-- SVG/图标垂直居中:非 auto-layout 的固定高包装 frame + 内部矢量按 `(高 − 图标高)/2` 绝对定位。
+**控件居中(正解优先)**:对齐字段名是 `primaryAxisAlignItems` / `counterAxisAlignItems`——auto-layout 居中的**首选正解**(实测全页 102 个 HORIZONTAL 容器一次性设 `counterAxisAlignItems='CENTER'` 全部生效,chip/pill/按钮文字几何偏差归零)。交叉轴口诀:HORIZONTAL 容器的垂直居中与 VERTICAL 容器的水平居中都是 `counterAxisAlignItems='CENTER'`;主轴用 `primaryAxisAlignItems`。容器对齐之外,固定宽/高文字节点内的字形居中由 `textAlignHorizontal`/`textAlignVertical` 控制。写成 `*AlignWidgets` 等不存在的名字,赋值**不报错**、读回 undefined,构建 ok:true 但视觉全错(实测按钮文字贴左上、输入框文字贴顶;chip 收缩贴文字属 sizing 问题,由 §8 `pillCollapsed` 拦)——写完读回确认,§8 也会以 `labelOffY` / `contentOffX` 拦下。兜底按场景分:
+- auto-layout 里字段名正确仍不生效(罕见):水平居中用两个 `layoutGrow=1` 的空 spacer frame 夹住内容组(主轴为 MIN 时);文字垂直居中用文字子级 `layoutAlign='STRETCH'` 拉满容器高 + `textAlignVertical='CENTER'`;
+- `layoutMode='NONE'` 场景:上述两条无效(layoutGrow/layoutAlign 是子级属性,只在 auto-layout 父级里生效),按绝对坐标手算 x/y 定位——如 SVG/图标垂直居中:固定高包装 frame + 内部矢量按 `(高 − 图标高)/2` 绝对定位;或先开 auto-layout。
 
 ## 7. 交付前体检(design lint)
 
@@ -597,6 +596,63 @@ function checkControl(n, kind) {
   controls.push(m);
 }
 
+// 胶囊(pill/chip/tag):几何识别(圆角≥高/2 且宽>高),不依赖命名。cornerRadius 可能是
+// figma.mixed(四角不一致,Symbol),typeof 守卫防比较抛错——一个混合圆角节点就能让整次验收崩溃。
+// V2HUB 实测:chip 被 AUTO 收缩到 13px 贴文字、tag 文字未垂直居中均靠这两条拦下。
+const pillLike = n => { const r = get(n, 'cornerRadius'); return (n.type === 'FRAME' || n.type === 'COMPONENT') && get(n, 'layoutMode') === 'HORIZONTAL' && typeof r === 'number' && r >= n.height / 2 - 1 && n.width > n.height + 4 && n.height >= 10 && n.height <= 44; };
+function checkPill(n) {
+  // 真收缩特征:上下 padding 均为 0 且高度≈文字行高(AUTO 贴文字);仅高<18 降为 warn(16px 角标/紧凑 tag 合法)
+  const texts = textNodes(n);
+  if (!texts.length) { if (n.height < 18) warn(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' < 18 且无文字(纯图标胶囊,确认非收缩)'); return; }
+  const lh = Math.max.apply(null, texts.map(t => { const l = get(t, 'lineHeight'); return l && l !== figma.mixed && l.unit === 'PIXELS' ? l.value : t.height; }));
+  if (get(n, 'paddingTop') === 0 && get(n, 'paddingBottom') === 0 && Math.abs(n.height - lh) <= 2)
+    err(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' ≈ 文字高且无上下 padding(counterAxis AUTO 收缩贴文字;用上下 padding 撑高,勿定宽定高)');
+  else if (n.height < 18)
+    warn(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' < 18(紧凑角标/tag 属合法,确认非收缩)');
+  for (const t of texts) {
+    const dy = r1(cy(t.absoluteBoundingBox) - cy(n.absoluteBoundingBox));
+    if (Math.abs(dy) > 1) err(n, 'pillOffY', '胶囊文字垂直偏离中心 ' + dy + 'px(counterAxisAlignItems=CENTER)');
+  }
+}
+// 图标+文字小栈(tab item 等):宽≤80 高≤64、2–3 子级、恰一个图标+一个文字,且为纵向排列。
+// 横向图标+文字行(如「← 返回」)文字天然偏侧,不检查;纵向含 layoutMode=NONE 的绝对定位栈
+// (label 在 icon 下方判定)——V2HUB 实测 tab 文字偏离中心 26px 即此拦下。
+const ICON_TYPES = ['FRAME', 'INSTANCE', 'COMPONENT', 'GROUP', 'VECTOR'];
+function checkStack(n) {
+  if (n.width > 80 || n.height > 64) return;
+  const kids = n.children.filter(c => c.visible !== false);
+  if (kids.length < 2 || kids.length > 3) return;
+  const icon = kids.find(c => ICON_TYPES.includes(c.type) && c.width >= 14 && c.width <= 48 && !textNodes(c).length);
+  const label = kids.find(c => c.type === 'TEXT');
+  if (!icon || !label) return;
+  const vertical = get(n, 'layoutMode') === 'VERTICAL' ||
+    (get(n, 'layoutMode') === 'NONE' && label.absoluteBoundingBox.y >= icon.absoluteBoundingBox.y + icon.absoluteBoundingBox.height - 1);
+  if (!vertical) return;
+  const dx = r1(cx(label.absoluteBoundingBox) - cx(n.absoluteBoundingBox));
+  if (Math.abs(dx) > 1) err(n, 'stackOffX', '栈文字水平偏离中心 ' + dx + 'px(counterAxisAlignItems=CENTER;NONE 布局按 (槽宽−文字宽)/2 绝对居中)');
+  const dxi = r1(cx(icon.absoluteBoundingBox) - cx(n.absoluteBoundingBox));
+  if (Math.abs(dxi) > 1) err(n, 'stackOffX', '栈图标水平偏离中心 ' + dxi + 'px');
+}
+// 图标框(14–32 方形、仅几何形状):矢量联合 bbox 不得越界,且长边充满≥60%。
+// 长边判断避免误伤细长图标(chevron 8×14、⋮ 4×16、对勾 10×8);混合非几何子级时跳过。
+// V2HUB 实测 createNodeFromSvg 对 A/a 圆弧解析出 13×39 畸形 bbox,即此拦下。
+const GEOM_TYPES = ['VECTOR', 'ELLIPSE', 'RECTANGLE', 'LINE', 'POLYGON', 'STAR', 'BOOLEAN_OPERATION'];
+function checkIcon(n) {
+  if (n.type !== 'FRAME' || Math.abs(n.width - n.height) > 1 || n.width < 14 || n.width > 32) return;
+  if (textNodes(n).length) return;
+  const vs = n.children.filter(c => c.visible !== false && GEOM_TYPES.includes(c.type));
+  if (!vs.length) return;
+  if (n.children.some(c => c.visible !== false && !GEOM_TYPES.includes(c.type))) return;
+  const bs = vs.map(v => v.absoluteBoundingBox);
+  const u = { x: Math.min.apply(null, bs.map(b => b.x)), y: Math.min.apply(null, bs.map(b => b.y)) };
+  u.width = Math.max.apply(null, bs.map(b => b.x + b.width)) - u.x; u.height = Math.max.apply(null, bs.map(b => b.y + b.height)) - u.y;
+  const fb = n.absoluteBoundingBox;
+  if (u.x < fb.x - 1 || u.y < fb.y - 1 || u.x + u.width > fb.x + n.width + 1 || u.y + u.height > fb.y + n.height + 1)
+    err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 超出图标框 ' + r1(n.width) + '×' + r1(n.height) + '(SVG 导入畸变:查 A/a 圆弧,改 C 贝塞尔重写)');
+  else if (Math.max(u.width / n.width, u.height / n.height) < 0.6)
+    err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 长边未充满图标框 ' + r1(n.width) + '×' + r1(n.height) + ' 的 60%(疑似 arc 畸变导入)');
+}
+
 function checkVariants(set) {
   const groups = {};
   for (const c of set.children) {
@@ -639,7 +695,7 @@ async function walk(n, inControl) {
   if (n.type === 'COMPONENT_SET') checkVariants(n);
   let kind = null;
   if (!inControl) { kind = await kindOf(n); if (kind) checkControl(n, kind); }
-  if ('children' in n) { checkLayout(n); for (const c of n.children) await walk(c, inControl || !!kind); }
+  if ('children' in n) { checkLayout(n); if (!inControl) { if (!kind && pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
 }
 await walk(target, false);
 return {
@@ -649,5 +705,5 @@ return {
 };
 ```
 
-读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐;页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
+读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐、胶囊收缩/居中(`pillCollapsed`/`pillOffY`)、图标栈居中(`stackOffX`)、图标矢量畸变(`iconBBox`);页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
 `pass:false` 时逐条按 `[code]` 修(多半是重建为规格化 auto-layout,而不是挪坐标),改完**对同一子树重跑**直到 `pass:true`;最多 3 轮仍不过,带着 `errors` 原文与 `controls` 量测表向用户报告。`warn` 需要逐条给出「有意为之」的理由或修掉。`controls` 每行是控件的实测数据(尺寸、内边距、`font`、`fs_h` 字号/高度比、`padX_h`、`dx/dy` 几何偏移、`dyInk` 字形偏移、`contrast`),交付时原样列给用户。
