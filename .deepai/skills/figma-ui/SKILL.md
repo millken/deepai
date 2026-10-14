@@ -29,6 +29,7 @@ never guess values that the file can tell you.
 ## Tool map
 
 The map below assumes the **official remote server** (docs/figma_mcp.md §三, 41 tools). On the **community edition** (docs §二, the default path) only `figma__get_figma_data` + `figma__download_figma_images` exist: route every read through those two (get_figma_data covers design-context needs; download_figma_images covers assets) and skip ALL write paths — no `use_figma`, `generate_figma_design`, `create_new_file`, `upload_assets`. Screenshots/metadata come from get_figma_data's response instead.
+**Write path: builtin `figma` tool (local-figma) first.** It drives the figma-local CLI (Figma Desktop + local plugin) for native editable-layer writes with on-disk evidence: before/after snapshots, preview PNGs, assertion-checked workflow plans, bounded recovery. Prefer it whenever the task EDITS a design (Workflow B/D) and `figma doctor` reports ready; MCP `use_figma`/`generate_figma_design` are the fallback without that environment. Reads may use either path — when a `.figma-agent/` binding exists, prefer `figma inspect/design_system/preview` so read and write see the same live document.
 
 | Goal | Tool | Notes |
 |---|---|---|
@@ -39,7 +40,8 @@ The map below assumes the **official remote server** (docs/figma_mcp.md §三, 4
 | Animation | `figma__get_motion_context` | Keyframes/easing → CSS/@keyframes |
 | Visual truth | `figma__get_screenshot` | PNG of any node — for verification and diffing |
 | Assets | `figma__download_figma_images` | SVG for icons/vectors; PNG scale 2x for raster |
-| Precise edits in Figma | `figma__use_figma` | JS via plugin API — the reliable write path |
+| Native edits + evidence | builtin `figma` tool | local-figma wrapper — preferred write path when Figma Desktop + plugin connected; submit→wait→result in one call |
+| Precise edits in Figma | `figma__use_figma` | Fallback write path when local-figma is unavailable |
 | AI draft in Figma | `figma__generate_figma_design` | Generative; follow with screenshot review |
 | New file / upload | `figma__create_new_file`, `figma__upload_assets` | Canvas for from-scratch work |
 | Design system | `figma__search_design_system`, `figma__get_libraries` | Reuse over reinvent |
@@ -61,15 +63,24 @@ The map below assumes the **official remote server** (docs/figma_mcp.md §三, 4
    compare with `zai-vision__ui_diff_check` if available. Iterate on gaps.
 6. Motion: `get_motion_context` → CSS transitions/@keyframes, respect
    `prefers-reduced-motion`.
+Local-figma binding exists: source step 2 from `figma` action=inspect (structure + Auto Layout + styles), tokens from action=design_system, visual verification from action=preview (PNG path) — the same live document the edits go through.
 
 ## Workflow B — adjust the design in Figma (code → design)
 
-1. `use_figma` for precise, reviewable changes (set fills, layout, text,
-   create frames). Write small JS steps; re-read before editing.
-2. `generate_figma_design` only for generative drafts ("make a hero variant"),
-   never for surgical edits.
-3. After writing, ALWAYS `get_screenshot` to confirm what actually changed —
-   report the visual result to the user, not just "done".
+1. Prefer the builtin `figma` tool: `figma doctor` to confirm readiness; scope
+   edits with node. Single-property tweaks → `edit` (text/fill/font/layout/
+   align/…; call `context` first — they act on the current Figma selection).
+   Multi-step construction → workflow plan (`workflow import` with machine
+   assertions, humanReview at direction-setting steps). Beyond the plan schema
+   → trusted `run` script.
+2. MCP `use_figma` only as fallback (no local-figma): small JS steps, re-read
+   before editing. `generate_figma_design` only for generative drafts, never
+   surgical edits.
+3. After writing, ALWAYS re-render (`figma` action=preview, or
+   `get_screenshot`) to confirm what actually changed — report the visual
+   result, not "done".
+4. Never replay an uncertain job: on timeout/needs-review read it back
+   (wait/result), then independent inspect → resolve per the instruction.
 
 ## Workflow C — verify / iterate an existing implementation
 
@@ -83,11 +94,33 @@ The map below assumes the **official remote server** (docs/figma_mcp.md §三, 4
 1. Clarify intent (ask_clarification if purpose/tone/framework unclear).
 2. `generate_image` moodboard/reference (or skip if a pure-typographic
    direction fits).
-3. `create_new_file` → `use_figma` to lay out structure; or prototype in code
+3. `create_new_file` → `use_figma` (MCP canvas), or with local-figma connected
+   `guide design` + workflow plans in the user's bound file; prototype in code
    first and port once the direction is approved.
 4. Search the design system (`search_design_system`) before inventing
    components; export tokens via `get_variable_defs`.
 5. Iterate with screenshots; hand off the file URL.
+
+## Designer loop — full UI-designer flow (local-figma)
+
+1. Bind & brief: `figma` init once (frame URL with node-id), then guide <mode>
+   and fill the brief from the user's request; guide_check gates readiness.
+   Modes: design | refine | design-to-code | code-to-design | prototype.
+2. Read the target: inspect (scope large files with node), preview baseline,
+   design_system for tokens/components.
+3. Direction first: for new designs propose 2 structure directions before
+   building; the user picks (humanReview checkpoint or ask_clarification).
+4. Build/polish in short verified steps: single-property edit for tweaks;
+   workflow plans (create/update/connect + assertions) for construction; run
+   scripts only beyond the plan schema — high-risk runs need the user's click
+   in the plugin UI. After each step: read result/diff, fresh preview.
+5. Recovery discipline: single-flight jobs, never replayed. Timeout or
+   needs-review → wait/result the job ID → independent inspect of the original
+   target → resolve. The figma tool's instruction field carries the next step.
+6. Template handoff (design settles): inspect + design_system as ground
+   truth, assets via a run export script; deliver the reusable code template
+   + Tailwind class list per figma-tailwind rules. The design file is the
+   single source of truth for the template.
 
 ## Hard rules
 
@@ -103,3 +136,7 @@ The map below assumes the **official remote server** (docs/figma_mcp.md §三, 4
   official remote (§三) → run scripts/figma-mcp-token.py ensure, then retry;
   community PAT (§二) → the FIGMA_API_KEY token is invalid/expired, regenerate
   it at figma.com → Settings → Security.
+- local-figma jobs are single-flight and never replayed; on unknown outcome
+  read the job back first — never resubmit the same edit.
+- Never invent human approval: workflow approve notes and high-risk run
+  confirmations must reflect the user's explicit acceptance.

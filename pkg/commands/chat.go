@@ -409,6 +409,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistry, defaultProvider llm.LLMProvider, autonomous bool, workDir string, contextWindow int, temperature *float64, pluginAgentDirs []string, agentOpts []tools.AgentOption, skillReg *skill.Registry, instructions string, subagentTimeout time.Duration) *subagent.Pool {
 	mustRegisterTool(registry, builtin.BashTool())
 	mustRegisterTool(registry, builtin.CIWaitTool())
+	mustRegisterTool(registry, builtin.FigmaTool())
 	mustRegisterTool(registry, clarification.AskClarificationToolWithMode(autonomous))
 
 	// Subagent tools. pluginAgentDirs is the same slice EnumerateAgents used, so
