@@ -499,6 +499,10 @@ func TestBridge_ReapAndLateCompleteUnlock(t *testing.T) {
 	if st := b.Status(); len(st.Unresolved) != 0 {
 		t.Fatalf("late complete must clear unresolved: %v", st.Unresolved)
 	}
+	// 回传刷新 lastPoll：否则收割后紧随的 Submit 会因陈旧心跳把同一 id 再收割回去。
+	if st := b.Status(); !st.Connected {
+		t.Fatal("complete must refresh lastPoll")
+	}
 	if _, err := b.Submit("next", "", false); err != nil {
 		t.Fatalf("write after late complete: %v", err)
 	}

@@ -368,8 +368,9 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 	job := b.jobs[msg.ID]
 	complete := job != nil && job.State == "delivered"
 	if complete {
-		// 迟到回传同样解除待核实：result.json 落盘即最终证据，无需再走 ack。
-		delete(b.unresolved, msg.ID)
+		// 回传到达即面板存活：刷新心跳，避免紧随其后的 Submit 因陈旧 lastPoll
+		// 误触发假死收割。unresolved 的解除见下方终态锁（result.json 落盘后）。
+		b.lastPoll = time.Now()
 	}
 	b.mu.Unlock()
 	if !complete {
@@ -418,6 +419,10 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	job.State = map[bool]string{true: "done", false: "failed"}[msg.OK]
 	job.FinishedAt = result.FinishedAt
+	// 迟到回传解除待核实：必须与终态同锁、且在 result.json 落盘成功之后——
+	// 提前 delete 会留出无锁窗口（png 解码与两次落盘都在锁外），下一次 Submit
+	// 的假死收割把 id 收回去，已回传成功的任务反而被「结果未知」挡住。
+	delete(b.unresolved, msg.ID)
 	err = writeJSONAtomic(filepath.Join(b.runDir(job.ID), "job.json"), *job, 0o600)
 	b.mu.Unlock()
 	if err != nil {
@@ -521,14 +526,14 @@ func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) Wai
 			instr := fmt.Sprintf("任务 %s 未在超时内回传（未被取消）：用 result %s 读回，或稍后再试；不要重复提交同一修改", id, id)
 			// 面板断连是超时最常见根因。job.State 为空（磁盘读失败）时不猜断连分支，
 			// 落回通用提示，避免拼出「断开（）」。delivered 断连不会重放：handlePoll
-			// 只下发 queued；面板 iframe 活着时下次轮询成功会自行回传 pendingResult，
-			// 面板已关则执行现场没了——重启 deepai 后 recoverRuns 将其记为 unresolved，
-			// 走 inspect+ack 解锁。
+			// 只下发 queued；面板 iframe 活着时下次轮询成功会自行回传 pendingResult；
+			// 面板已关则执行现场没了——断连超阈值后由下一次 run 的假死收割转待核实
+			// （免重启），recoverRuns 仅作进程重启后的兑底，两者终态一致。
 			if st := b.Status(); !st.Connected && (job.State == "queued" || job.State == "delivered") {
 				if job.State == "queued" {
 					instr = fmt.Sprintf("插件面板未连接，任务 %s 已入队未被领取：重开插件面板后会自动执行，届时用 result %s 读回；不要重复提交", id, id)
 				} else {
-					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；持续断连超过 %s 后任务自动转待核实，用 inspect:true run + ack 解锁（无需重启 deepai）", id, id, reapDisconnect)
+					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；若断连持续超过 %.0f 分钟，下一次 figma run 会把该任务转为待核实（普通写入会被挡、inspect:true 可进），用 inspect+ack 解锁，无需重启 deepai", id, id, reapDisconnect.Minutes())
 				}
 			}
 			return WaitOutcome{WaitStatus: "timeout", Job: job, Instruction: instr}
