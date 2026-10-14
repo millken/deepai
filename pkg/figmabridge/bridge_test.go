@@ -184,6 +184,10 @@ func TestBridge_RecoveryAndAck(t *testing.T) {
 	if err := b2.Ack(job.ID, "", "未核实"); err == nil {
 		t.Fatal("ack without inspect job must fail")
 	}
+	// 非inspect 任务不能冒充核实依据（M1：校验 Inspect 标记，用被阻断任务自身 Inspect=false 验证）。
+	if err := b2.Ack(job.ID, job.ID, "自救"); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("ack with non-inspect job must fail: %v", err)
+	}
 	inspectJob, err := b2.Submit("return null", "", true)
 	if err != nil {
 		t.Fatalf("inspect run during unresolved: %v", err)
@@ -316,6 +320,14 @@ func TestGeneratePlugin(t *testing.T) {
 	}
 	if strings.Contains(string(ui), "SESSION_CONFIG") {
 		t.Fatal("SESSION_CONFIG placeholder must be replaced")
+	}
+	// Figma 按请求 URL 对照 devAllowedDomains：fetch 主机与允许列表必须同源，否则轮询被拒。
+	domains := m["networkAccess"].(map[string]any)["devAllowedDomains"].([]any)
+	if len(domains) != 1 || domains[0] != "http://127.0.0.1:43187" {
+		t.Fatalf("devAllowedDomains = %v", domains)
+	}
+	if !strings.Contains(string(ui), "http://127.0.0.1:") || strings.Contains(string(ui), "http://localhost:") {
+		t.Fatal("ui.html fetch host must match devAllowedDomains")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "plugin", "main.js")); err != nil {
 		t.Fatal(err)

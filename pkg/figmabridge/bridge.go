@@ -179,7 +179,8 @@ func (b *Bridge) Retarget(binding Binding) error {
 		return nil
 	}
 	for _, job := range b.jobs {
-		if job.State == "queued" || job.State == "delivered" {
+		// unresolved 的陈旧 delivered 由下方核实检查接管，避免误导去读不存在的 result。
+		if (job.State == "queued" || job.State == "delivered") && !b.unresolved[job.ID] {
 			id, state := job.ID, job.State
 			b.mu.Unlock()
 			return fmt.Errorf("任务 %s 尚未完成（%s）：切换目标前先读回结果", id, state)
@@ -539,9 +540,27 @@ func (b *Bridge) Ack(id, inspectJobID, note string) error {
 		b.mu.Unlock()
 		return fmt.Errorf("ack 需要核实任务 ID：先用 figma run（inspect:true）提交只读脚本并等待完成")
 	}
+	// 核实任务必须是 inspect:true 提交且已完成，且不早于被阻断任务——
+	// 否则历史里任意一次旧 run 都能冒充核实，绕过解锁协议。
+	inspectJob, jerr := b.JobByID(inspectJobID)
+	if jerr != nil || !inspectJob.Inspect {
+		b.mu.Unlock()
+		return fmt.Errorf("核实任务 %s 无效：需为 figma run（inspect:true）提交的任务", inspectJobID)
+	}
+	if blocked, ok := b.jobs[id]; ok && inspectJob.SubmittedAt < blocked.SubmittedAt {
+		b.mu.Unlock()
+		return fmt.Errorf("核实任务 %s 早于被阻断任务，不能作为核实依据：请重新提交 inspect:true", inspectJobID)
+	}
 	if _, err := b.Result(inspectJobID); err != nil {
 		b.mu.Unlock()
 		return fmt.Errorf("核实任务 %s 尚无结果：等待其完成后再 ack", inspectJobID)
+	}
+	b.mu.Unlock()
+	// 先写 ack.json（此时 job.json 仍是 delivered）：中途崩溃后恢复扫描会回到
+	// unresolved，可重试；两份都成功后才动 job.json 与内存。
+	if err := writeJSONAtomic(filepath.Join(b.runDir(id), "ack.json"),
+		map[string]any{"id": id, "note": note, "inspectJobId": inspectJobID, "at": nowISO()}, 0o600); err != nil {
+		return err
 	}
 	var jobCopy *Job
 	if job, ok := b.jobs[id]; ok {
@@ -549,15 +568,10 @@ func (b *Bridge) Ack(id, inspectJobID, note string) error {
 		*jobCopy = *job
 		jobCopy.State = "acknowledged"
 	}
-	b.mu.Unlock()
 	if jobCopy != nil {
 		if err := writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), *jobCopy, 0o600); err != nil {
 			return err
 		}
-	}
-	if err := writeJSONAtomic(filepath.Join(b.runDir(id), "ack.json"),
-		map[string]any{"id": id, "note": note, "inspectJobId": inspectJobID, "at": nowISO()}, 0o600); err != nil {
-		return err
 	}
 	b.mu.Lock()
 	delete(b.unresolved, id)

@@ -20,7 +20,8 @@ function snapshot(node, depth, budget) {
     if (typeof node.fontSize === 'number') out.fontSize = node.fontSize;
     if (typeof node.textAutoResize === 'string' && node.textAutoResize !== 'NONE') out.textAutoResize = node.textAutoResize;
   }
-  if (Array.isArray(node.fills) && node.fills.length) {
+  // Figma 对节点不具备的属性直接读取会抛异常（而非 undefined），用 in 收窄再读。
+  if ('fills' in node && Array.isArray(node.fills) && node.fills.length) {
     const fills = [];
     for (const p of node.fills.slice(0, 4)) {
       if (p.type === 'SOLID' && p.color) fills.push('#' + hexByte(p.color.r) + hexByte(p.color.g) + hexByte(p.color.b));
@@ -28,12 +29,12 @@ function snapshot(node, depth, budget) {
     }
     out.fills = fills;
   }
-  if (node.layoutMode && node.layoutMode !== 'NONE') {
+  if ('layoutMode' in node && node.layoutMode && node.layoutMode !== 'NONE') {
     out.layout = { mode: node.layoutMode, gap: node.itemSpacing,
       padding: [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft] };
   }
-  if (typeof node.cornerRadius === 'number' && node.cornerRadius) out.cornerRadius = node.cornerRadius;
-  if (node.children) {
+  if ('cornerRadius' in node && typeof node.cornerRadius === 'number' && node.cornerRadius) out.cornerRadius = node.cornerRadius;
+  if ('children' in node && node.children) {
     if (depth >= SNAPSHOT_MAX_DEPTH) {
       out.truncated = true;
     } else {
@@ -51,9 +52,9 @@ function snapshot(node, depth, budget) {
 const boundedSnapshot = node => snapshot(node, 0, { count: 0 });
 
 async function locateTarget(job) {
-  // 本地打开的 .fig 无 fileKey（undefined）：放行，靠 nodeId 兜底；云端文件仍严格匹配。
-  if (figma.fileKey && figma.fileKey !== job.binding.fileKey)
-    throw Error('当前文件与绑定不一致：' + figma.fileKey + ' ≠ ' + job.binding.fileKey + '；请在正确文件中运行插件');
+  // 绑定来自 figma.com 链接，fileKey 必非空；当前文件无 fileKey（本地 .fig）即非绑定文件，拒绝。
+  if (figma.fileKey !== job.binding.fileKey)
+    throw Error('当前文件与绑定不一致：' + (figma.fileKey || '无 fileKey（本地文件）') + ' ≠ ' + job.binding.fileKey + '；请在绑定的云端文件中运行插件');
   const root = await figma.getNodeByIdAsync(job.binding.nodeId);
   if (!root) throw Error('绑定节点不存在：' + job.binding.nodeId + '；请重新 init');
   if (!job.targetNodeId || job.targetNodeId === job.binding.nodeId) return root;
