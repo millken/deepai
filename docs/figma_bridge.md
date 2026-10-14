@@ -52,6 +52,8 @@
 改文字：   run {code:'const t=target.findOne(n=>n.name==="标题"); await figma.loadFontAsync(t.fontName); t.characters="新文案"; return t.id'}
 ```
 
+完整配方（含变量名的设计取数、token 表、SVG 导出、构建辅助、variables 绑定、组件变体、交付体检）见 `.deepai/skills/figma-ui/references/bridge-recipes.md`。
+
 写文字前必须 `await figma.loadFontAsync(...)`；大画板用 `node` 缩小目标子树（快照上限 32 层/4000 节点，超出标记 truncated，不拒绝执行）。每次脚本前后自动划分原生 undo 边界，Figma 中一次 Ctrl+Z 即可回退单次脚本。
 
 ## 四、恢复纪律（重要）

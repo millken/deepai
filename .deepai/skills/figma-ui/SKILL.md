@@ -10,7 +10,8 @@ that convert cleanly to code (Figma ↔ code), and verify the result visually.
 Figma data is ground truth — never guess values that the file can tell you.
 
 参考文件(按需读):
-- [bridge-recipes.md](references/bridge-recipes.md) — 原生桥 JS 配方:取数(含变量名)、token 表、SVG 导出、构建辅助、variables 绑定、组件变体、交付体检
+- [bridge-recipes.md](references/bridge-recipes.md) — 原生桥 JS 配方:取数(含变量名)、token 表、SVG 导出、构建辅助、variables 绑定、按规格构建组件、交付体检、**量测验收**
+- [component-specs.md](references/component-specs.md) — Button/Input 尺寸规格与验收不变量(搭控件前必读)
 - [tailwind-v4-map.md](../figma-tailwind/references/tailwind-v4-map.md) — Figma 属性 → Tailwind v4 映射与刻度(目标项目用 Tailwind 时必读;非 Tailwind 项目也可作为 CSS 语义对照)
 
 ## When to use
@@ -52,11 +53,23 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 | 资产导出 | `run` exportAsync(recipes §3:`SVG_STRING` 图标 / PNG 2x) | `figma__download_figma_images` |
 | 写 Figma | `run`(确定性 JS,单飞+证据;recipes §4–6) | `figma__use_figma`(无 Desktop 时) |
 | 交付体检 | `run` design lint(recipes §7) | ❌(用 `get_metadata` 人工核查) |
+| 量测验收 | `run` 验收脚本(recipes §8) | ❌(用 `get_metadata` 坐标逐项核算) |
 | 生成式草稿 | ❌ | `figma__generate_figma_design` |
 | 新文件/传素材 | ❌ | `figma__create_new_file` / `figma__upload_assets` |
 | 设计系统/动效 | ❌ | `figma__search_design_system` / `figma__get_motion_context` |
 
 `before` 快照只含尺寸、填充 hex、基础 auto-layout,**不含描边/阴影/行高/字距/FILL·HUG/变量名**——写代码取数一律用 recipes §1,不要拿快照凑。
+
+## Verification gate(验收闸门:量测数字才是证据)
+
+**你看不到 preview.png。** deepai 的工具结果只带图片路径,像素不进模型;「改后看 PNG 确认无误」在这里等于没验证。脚本 `ok:true` 也只说明 JS 没抛错,不说明布局正确。
+因此任何设计产出都走「规格 → 构建 → 量测 → 修正」闭环:
+
+1. **先定规格**:动手前写出本次要用的尺寸表(高度/内边距/字号/行高/圆角/间距),取自文件已有组件或 [component-specs.md](references/component-specs.md);不现场目测取值。
+2. **按规格构建**:控件用 recipes §6 的规格化构建(高度 = 行高 + 2×垂直内边距,auto-layout 居中),文字用 §4 `label`(自动选中文字体、显式像素行高)。
+3. **量测**:每次写入后对改动子树跑 recipes §8;它检查控件几何居中、内边距对称、字号/高度比、折行、溢出、对比度、中文字体、变体一致性。
+4. **修正到通过**:`errors` 逐条修(通常是按规格重建,而非挪坐标)并重跑同一子树,直到 `pass:true`;3 轮不过则如实报告。
+5. **交付报告**:附通过的验收 job_id、`controls` 实测表、未消除的 `warn` 及理由,并把 preview.png 路径交给用户目视确认。没有通过的验收结果,不得说「已完成 / 已对齐 / 效果良好」。
 
 ## Workflow A — implement a design (design → code)
 
@@ -79,8 +92,10 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
    - `get_design_context` 的输出是参考代码:改写进项目的框架、组件与 token,不要原样粘贴。
 5. **状态与可访问性**:组件集里的 hover/pressed/disabled/focus 变体映射为交互状态;补 `focus-visible`、
    图片 alt、表单 label;正文对比度不足时告知用户(不擅自改色)。
-6. **验证闭环**:设计侧导出基准 PNG + 实现侧同视口截图 → 逐层比对
-   (全图差异% → 分区统计 → 关键色块包围盒几何),不要只看百分比。
+6. **验证闭环(量测对量测)**:设计侧用 recipes §1/§8 取关键元素实测值(尺寸、内边距、字号/行高、
+   相对位置),实现侧在浏览器里量同一批元素(如 Playwright `getBoundingClientRect` + `getComputedStyle`),
+   逐项对数字,差异 > 1px 必须解释或修正。像素截图比对(全图差异% → 分区统计 → 关键色块包围盒)
+   仅在能用程序算出差异时使用,不要凭「看截图」下结论。
    差异可能在任一侧:代码 bug 或 Figma 构建缺陷(见 gotchas),按用户意图修对应侧。
 7. 动效:仅官方远程 `figma__get_motion_context` → CSS,尊重 `prefers-reduced-motion`。
 
@@ -93,7 +108,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 1. `doctor`/`status` 确认连接;`run` {code:'return null'} 先读结构;陌生文件先跑 recipes §2(已有
    variables/styles)与 §7(体检),**复用文件已有的 token、text style、组件**,不平行再造一套。
 2. 小步编辑:一次 `run` 一个有界变更(一个区块/一个组件);写文字前 `await figma.loadFontAsync`;
-   新值绑定 variable / style 而不是写死 hex;改后读 output/before/after 快照 + 新鲜 PNG,报告视觉结果而非 "done"。
+   新值绑定 variable / style 而不是写死 hex;改后对改动子树跑 recipes §8 验收,按 Verification gate 报告。
 3. 恢复纪律:任务单飞、绝不重放。超时先 `result` 读回;delivered 无结果的
    任务会阻断新写入,直到完成的 inspect:true `run` + `ack(job_id,
    inspect_job_id, note)` 记录核实结论。断连超时按提示区分:queued=面板
@@ -104,9 +119,9 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 ## Workflow C — verify / iterate an existing implementation
 
-1. 同视口宽度截两图:设计节点 PNG + 运行页面截图。
-2. 比对定位差异 → 按用户意图修代码或修设计(Workflow B)。
-3. 再截图闭环;汇报遗留的、有意为之的偏差。
+1. 同视口宽度取两侧量测:设计侧 recipes §1/§8,实现侧浏览器 DOM 量测(截图留给用户目视)。
+2. 逐项对数字定位差异 → 按用户意图修代码或修设计(Workflow B)。
+3. 再量测闭环;汇报遗留的、有意为之的偏差(附数字)。
 
 ## Workflow D — design from scratch
 
@@ -115,13 +130,14 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 2. 参考图:仅官方远程 `figma__generate_image` 或跳过(纯排版方向)。
 3. 画布:原生桥让用户建一个空画板(移动端 390×844 / 桌面 1440×900)并 `figma init` 绑定,所有节点建在
    `target` 内;或官方远程 `figma__create_new_file` + `figma__use_figma`;也可先代码原型后移植。
-4. **按 token → 组件 → 页面的顺序搭建**(每步一次 `run`,每步看 PNG):
+4. **按 token → 组件 → 页面的顺序搭建**(每步一次 `run`,每步跑 recipes §8 验收到 `pass:true` 再进下一步):
    - Tokens:recipes §5 建 variables(语义色 + 4px 间距刻度 + 圆角,需要暗色时加 Dark mode),设
      `codeSyntax.WEB`;文字建 text style(字阶 ≤ 6–7 档)。官方远程先 `figma__search_design_system` 复用。
-   - 组件:recipes §6 建 Button/Input/Card 等组件集,变体命名 `属性=值`,文案用 TEXT 组件属性。
+   - 组件:先按 component-specs.md 写出尺寸表,再用 recipes §6 规格化构建 Button/Input 等组件集,变体命名
+     `属性=值`,文案用 TEXT 组件属性;**组件验收通过后才允许在页面里使用**。
    - 页面:recipes §4 辅助按区块搭建(Header → 内容区 → 底部),区块内放组件实例,值全部绑定 token。
-5. 交付前跑 recipes §7 体检并修到 `noAutoLayout`/`group`/`rawColor`/`rawText` 归零(或说明保留原因);
-   出整屏 PNG,交付文件 URL + 已建 tokens/组件清单。
+5. 交付前对整屏跑 recipes §7 体检(修到 `noAutoLayout`/`group`/`rawColor`/`rawText` 归零或说明原因)
+   与 §8 验收(`pass:true`);交付文件 URL + 已建 tokens/组件清单 + 验收报告(Verification gate 第 5 条)。
 
 ## Design-for-code conventions(B/D 搭建时遵守,也是 A 取数质量的前提)
 
@@ -130,6 +146,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 - **间距与尺寸落 4px 网格**;颜色、间距、圆角绑定 variable,文字套 text style——代码侧才能映射为 token 而非魔法数。
 - **图层按职责命名**(`Header`、`Price`、`Button / Primary`),它们会成为组件名/类语义;不留 `Frame 12`。
 - **可复用元素做成组件 + 变体**,状态(hover/disabled)也做成变体,代码侧直接对应 props/状态。
+- **控件按规格**:Button/Input 尺寸取 component-specs.md 档位,内容靠 auto-layout 居中,禁止手摆文字坐标。
 - **文本框自适应**:单行 `WIDTH_AND_HEIGHT`,段落定宽 `HEIGHT`;需要截断时设 `textTruncation`+`maxLines`。
 - **图标用矢量**(独立组件,统一 20/24 尺寸),不拿位图凑。
 
@@ -141,6 +158,8 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 - **字体**:沙箱/容器里 PingFang SC 等系统字体可能不可加载;先
   `await figma.listAvailableFontsAsync()` 探测(注意 "Alegreya SC" 这类拉丁
   小型大写字体会干扰关键词匹配——用精确字体名列表查,不要模糊正则)。
+  中文文字用 Inter 等拉丁字体时 Figma 回退渲染,字形基线与行框错位,表现为按钮文字偏上/偏下;
+  字重样式名因字体而异(`Semi Bold`/`SemiBold`/`Semibold`)。recipes §4 `label` 已处理这两点。
 - **auto-layout 塌陷(最大坑)**:`resize()` 后开 `layoutMode`,或容器未显式
   声明尺寸模式,会被重置为 AUTO 收缩(实测整屏 844px 塌到 154px 且 ok:true
   静默通过)。顺序固定为 `layoutMode` → `appendChild` → `layoutSizingHorizontal/Vertical`
@@ -173,5 +192,6 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   supplies the ground-truth data. Compose both when building UI.
 - 401(官方远程)→ `scripts/figma-mcp-token.py ensure` 续期后重试
   (docs/figma_mcp.md §三)。
+- 没有通过的 recipes §8 验收 job_id,不得宣称设计「完成 / 对齐 / 效果良好」;PNG 只交给用户看,不作为模型自证。
 - 原生桥任务单飞、绝不重放;结果未知时先读回——绝不重新提交同一修改。
 - ack 不是橡皮章:必须附完成的 inspect:true 任务 ID + 实际观察到的文档现状说明。
