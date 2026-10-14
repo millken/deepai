@@ -26,118 +26,102 @@ never guess values that the file can tell you.
   catalog descriptions; this section is the fallback once this skill is
   already loaded.
 
-## Tool map
+## Data source: which path am I on? (先判路径,再选工具)
 
-The map below assumes the **official remote server** (docs/figma_mcp.md §三, 41 tools). On the **community edition** (docs §二, the default path) only `figma__get_figma_data` + `figma__download_figma_images` exist: route every read through those two (get_figma_data covers design-context needs; download_figma_images covers assets) and skip ALL write paths — no `use_figma`, `generate_figma_design`, `create_new_file`, `upload_assets`. Screenshots/metadata come from get_figma_data's response instead.
-**Write path: builtin `figma` tool (deepai embedded bridge) first.** deepai runs the bridge in-process: bind a frame once via `figma init` and import the generated plugin into Figma Desktop (Plugins → Development → Import from manifest); the plugin stays paired across deepai restarts. JS is the interface — `figma run` submits Figma Plugin-API scripts executed as (figma, target) on the bound subtree, with on-disk evidence (output + before/after snapshots + preview.png). No Node/npm/CLI involved. MCP `use_figma`/`generate_figma_design` are the fallback when Figma Desktop isn't available. Reads may use either path — when a binding exists, prefer `figma run` reads so read and write see the same live document.
+三条路径,优先级:**原生桥 > 官方远程 > 社区版**。原生桥可用(已绑定 + 插件面板开着)时永远首选——读写走同一实况文档,证据落盘。
 
-| Goal | Tool | Notes |
-|---|---|---|
-| Structure overview | `figma__get_metadata` | Cheap. Use FIRST on unknown/large files to find node IDs |
-| Design → code data | `figma__get_design_context` | Primary. Returns layout/styles/components + asset URLs |
-| Tokens | `figma__get_variable_defs` | Resolved variable values — use as design tokens, not raw literals |
-| Component↔code map | `figma__get_code_connect_map` | If the team maintains Code Connect |
-| Animation | `figma__get_motion_context` | Keyframes/easing → CSS/@keyframes |
-| Visual truth | `figma__get_screenshot` | PNG of any node — for verification and diffing |
-| Assets | `figma__download_figma_images` | SVG for icons/vectors; PNG scale 2x for raster |
-| Native edits + evidence | builtin `figma` tool | Embedded bridge: run JS on the bound subtree; submit→wait→result in one call; evidence on disk |
-| Precise edits in Figma | `figma__use_figma` | Fallback write path when Figma Desktop is unavailable |
-| AI draft in Figma | `figma__generate_figma_design` | Generative; follow with screenshot review |
-| New file / upload | `figma__create_new_file`, `figma__upload_assets` | Canvas for from-scratch work |
-| Design system | `figma__search_design_system`, `figma__get_libraries` | Reuse over reinvent |
-| Image gen | `figma__generate_image` | Moodboards, hero art, reference imagery |
+```sh
+grep -A3 '"figma"' ~/.deepai/mcp.json
+# "url": "https://mcp.figma.com/mcp"      → 官方远程(41 tools,OAuth)
+# "command": "npx" + figma-developer-mcp  → 社区版(2 tools,PAT,只读)
+# 无 figma 条目                            → 只剩原生桥
+```
+
+原生桥可用性:`figma` action=`status`,`connected:true` 即可用;绑定/导入插件见 docs/figma_bridge.md。
+
+## Tool map by path
+
+| Goal | 原生桥(builtin `figma`,首选) | 官方远程 MCP | 社区版 MCP |
+|---|---|---|---|
+| 结构总览 | `run` {code:'return null'} → before 快照 | `get_metadata` | `get_figma_data` |
+| 设计→代码数据 | `run` 读节点树(大画板分块) | `get_design_context` | `get_figma_data` |
+| Tokens | `run` 读 `getLocalPaintStylesAsync` / `getLocalTextStylesAsync` | `get_variable_defs` | 降级:实测 hex |
+| 截图/视觉基准 | `run` exportAsync → preview.png | `get_screenshot` | 无(用响应内嵌图) |
+| 资产导出 | `run` exportAsync(SVG 图标/PNG 2x) | `download_figma_images` | `download_figma_images` |
+| 写 Figma | `run`(确定性 JS,单飞+证据) | `use_figma`(无 Desktop 时回退) | ❌ 无写路径 |
+| 生成式草稿 | ❌ | `generate_figma_design` | ❌ |
+| 新文件/传素材 | ❌ | `create_new_file` / `upload_assets` | ❌ |
+| 设计系统/动效 | ❌ | `search_design_system` / `get_motion_context` | ❌ |
+
+URL 解析(所有路径通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折号换冒号)。
 
 ## Workflow A — implement a design (design → code)
 
-1. Parse the URL: `fileKey` = path segment after `/design/`; `?node-id=1-2`
-   becomes nodeId `1:2` (dash → colon). No node-id: call `get_metadata` first
-   to locate the target frame.
-2. `get_design_context` on the node. For big frames, prefer several targeted
-   calls (per section) over one giant response.
-3. `get_variable_defs` — map colors/spacing/typography to tokens
-   (`--color-primary`, spacing scale), not magic numbers.
-4. Implement. Assets: use the download URLs the context returns, or
-   `download_figma_images` (SVG for icons — inline them, see
-   super-frontend-design for icon rules).
-5. Verify: `get_screenshot` the node, screenshot your build (playwright),
-   compare with `zai-vision__ui_diff_check` if available. Iterate on gaps.
-6. Motion: `get_motion_context` → CSS transitions/@keyframes, respect
-   `prefers-reduced-motion`.
-Bound via the embedded bridge: `run` {code:'return null'} reads the full structure snapshot from the result's before field; tokens via a run script reading variables; PNG preview via `return await target.exportAsync({format:'PNG'})` — the same live document the edits go through.
+1. 结构与样式走首选路径取数;大画板按 section 分块,不一次拉全树。
+2. Tokens 优先(变量/样式名 → `--color-primary` 等语义名),不要魔法数。
+3. 实现。图标用 SVG 内联(super-frontend-design 的图标规则)。
+4. 验证闭环:设计侧导出基准 PNG + 实现侧同视口截图 → 逐层比对
+   (全图差异% → 分区统计 → 关键色块包围盒几何),不要只看百分比。
+   差异可能在任一侧:代码 bug 或 Figma 构建缺陷(见 gotchas),按用户意图修对应侧。
+5. 动效:`get_motion_context`(官方远程)→ CSS,尊重 `prefers-reduced-motion`。
 
 ## Workflow B — adjust the design in Figma (code → design)
 
-1. Prefer the builtin `figma` tool: `doctor` confirms bridge + plugin
-   connection. Read structure first (`run` {code:'return null'} → before
-   snapshot), then edit in small scripts — one bounded change per run;
-   re-read before each edit.
-2. MCP `use_figma` only as fallback (no Figma Desktop): small JS steps,
-   re-read before editing. `generate_figma_design` only for generative
-   drafts, never surgical edits.
-3. After writing, ALWAYS fetch a fresh PNG (`run` exportAsync) to confirm
-   what actually changed — report the visual result, not "done".
-4. Never replay an uncertain job: on timeout read it back (result); a
-   delivered job with no result blocks new writes until a completed
-   read-only verification run (`run` with inspect:true) +
-   `ack(job_id, inspect_job_id, note)` records what was verified.
+原生桥路径(首选,要求 Figma Desktop + 已绑定):
+
+1. `doctor`/`status` 确认连接;`run` {code:'return null'} 先读结构。
+2. 小步编辑:一次 `run` 一个有界变更;写文字前 `await figma.loadFontAsync`;
+   改前重读、改后读 output/before/after 快照 + 新鲜 PNG,报告视觉结果而非 "done"。
+3. 恢复纪律:任务单飞、绝不重放。超时先 `result` 读回;delivered 无结果的
+   任务会阻断新写入,直到完成的 inspect:true `run` + `ack(job_id,
+   inspect_job_id, note)` 记录核实结论。断连超时按提示区分:queued=面板
+   没开(重开后自动执行),delivered=执行中失联(重开后待回传)。
+
+MCP 回退路径(无 Figma Desktop,官方远程):`use_figma` 小步 JS 编辑,改前重读;`generate_figma_design` 只用于生成式草稿,不做手术式修改。
 
 ## Workflow C — verify / iterate an existing implementation
 
-1. Screenshot the Figma node AND the running page (playwright) at the same
-   viewport width.
-2. Diff (`zai-vision__ui_diff_check`) → fix code or design per user intent.
-3. Re-screenshot to close the loop. Report remaining, intentional deviations.
+1. 同视口宽度截两图:设计节点 PNG + 运行页面截图。
+2. 比对定位差异 → 按用户意图修代码或修设计(Workflow B)。
+3. 再截图闭环;汇报遗留的、有意为之的偏差。
 
 ## Workflow D — design from scratch
 
-1. Clarify intent (ask_clarification if purpose/tone/framework unclear).
-2. `generate_image` moodboard/reference (or skip if a pure-typographic
-   direction fits).
-3. `create_new_file` → `use_figma` (MCP canvas), or bind the target frame
-   via the embedded bridge (`figma init`) and build with `run` scripts;
-   prototype in code first and port once the direction is approved.
-4. Search the design system (`search_design_system`) before inventing
-   components; export tokens via `get_variable_defs`.
-5. Iterate with screenshots; hand off the file URL.
+1. 意图不明先 ask_clarification(用途/调性/框架)。
+2. 参考图:`generate_image`(官方远程)或跳过(纯排版方向)。
+3. 画布:官方远程 `create_new_file` + `use_figma`;或原生桥 `figma init`
+   绑定目标 frame 后 `run` 构建(本机 Desktop 场景更顺手);也可先代码原型后移植。
+4. 先 `search_design_system` 再造组件;tokens 走 `get_variable_defs`。
+5. 截图迭代;交付文件 URL。
 
-## Designer loop — full UI-designer flow (embedded bridge)
+## Bridge gotchas(原生桥实战踩坑,全部实测验证)
 
-1. Bind: `figma init <frame URL with node-id>` once; guide the user through
-   the one-time plugin import (manifest path is returned). `doctor`
-   confirms plugin connection before first use.
-2. Read the target: `run` {code:'return null'} (before snapshot =
-   structure, Auto Layout, text, fills); PNG baseline via exportAsync.
-   Large frames: pass node to scope the subtree.
-3. Direction first: for new designs propose 2 structure directions before
-   building; the user picks (ask_clarification).
-4. Build/polish in short verified steps: one bounded edit per `run` script
-   (load fonts before writing text: await figma.loadFontAsync). After each
-   step: read output/before/after, fresh PNG preview.
-5. Recovery discipline: jobs are single-flight and never replayed. Timeout
-   → read the job back (result); a delivered job with no result blocks new
-   writes until a completed inspect:true `run` +
-   `figma ack(job_id, inspect_job_id, note)` records what was verified.
-6. Template handoff (design settles): structure snapshot + PNG as ground
-   truth, assets via exportAsync run scripts; deliver the reusable code
-   template + Tailwind class list per figma-tailwind rules. The design
-   file is the single source of truth for the template.
+- **dynamic-page 模式**:跨页读前必须 `await figma.loadAllPagesAsync()`;
+  `node.mainComponent` 直接读会抛,用 `await node.getMainComponentAsync()`。
+- **字体**:沙箱/容器里 PingFang SC 等系统字体可能不可加载;先
+  `await figma.listAvailableFontsAsync()` 探测(注意 "Alegreya SC" 这类拉丁
+  小型大写字体会干扰关键词匹配——用精确字体名列表查,不要模糊正则)。
+- **auto-layout 塌陷(最大坑)**:`resize()` 后开 `layoutMode`,或容器未显式
+  声明尺寸模式,会被重置为 AUTO 收缩(实测整屏 844px 塌到 154px 且 ok:true
+  静默通过)。构建容器时显式设 `primaryAxisSizingMode`/`counterAxisSizingMode`
+  再 resize;构建后必读 after 快照的 `layout.sizing` 确认。
+- **对齐语义**:VERTICAL 布局里 `primaryAxisAlignWidgets` 是垂直方向,水平
+  居中要看 counter 轴;两者都不生效时(实测发生过)用子级
+  `layoutAlign='CENTER'`,仍不行就 `layoutMode='NONE'` + 绝对定位兜底。
+- **多行文本**:`textAutoResize='HEIGHT'` + `resize(定宽, 初始行高)` 实现固宽换行撑高。
+- **返回值**:`exportAsync` 的 Uint8Array 可直接 return(走图像通道落盘
+  preview*.png);嵌套在对象里返回则输出 `{__png,bytes}` 占位。不要把大
+  字节数组塞进普通 JSON 字段。
 
 ## Hard rules
 
 - Never invent image URLs — only ones returned by the tools.
 - Never guess values a tool can answer (spacing, color, radius, font).
-- One `get_design_context` per node subtree; batch related nodes in one call
-  when possible (rate limits apply).
-- Writing to Figma: `use_figma` (deterministic) over `generate_figma_design`
-   (generative) unless asked for ideas.
+- 官方远程:one `get_design_context` per node subtree,相关节点合并调用(限流)。
+- 写 Figma:确定性编辑(`run` / `use_figma`)优先于生成式,除非用户要想法。
 - UI aesthetics/iconography rules come from super-frontend-design; this skill
   supplies the ground-truth data. Compose both when building UI.
-- 401 from figma tools — check which path is configured (docs/figma_mcp.md):
-  official remote (§三) → run scripts/figma-mcp-token.py ensure, then retry;
-  community PAT (§二) → the FIGMA_API_KEY token is invalid/expired, regenerate
-  it at figma.com → Settings → Security.
-- figma bridge jobs are single-flight and never replayed; on unknown outcome
-  read the job back first — never resubmit the same edit.
-- Never invent verification: an ack requires a completed inspect:true run
-  (its job ID) and a note stating what was actually observed in the
-  document, never a rubber stamp.
+- 401 排查按路径:官方远程 → `scripts/figma-mcp-token.py ensure` 后重试;
+  社区版 → `FIGMA_API_KEY` 失效,figma.com → Settings → Security 重新生成。
+- 原生桥任务单飞、绝不重放;结果未知时先读回——绝不复述提交同一修改。
+- ack 不是橡皮章:必须附完成的 inspect:true 任务 ID + 实际观察到的文档现状说明。
