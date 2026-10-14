@@ -28,32 +28,28 @@ never guess values that the file can tell you.
 
 ## Data source: which path am I on? (先判路径,再选工具)
 
-三条路径,优先级:**原生桥 > 官方远程 > 社区版**。原生桥可用(已绑定 + 插件面板开着)时永远首选——读写走同一实况文档,证据落盘。
+两条路径,优先级:**原生桥 > 官方远程**。原生桥可用(已绑定 + 插件面板开着)时永远首选——读写走同一实况文档,证据落盘。
 
-```sh
-grep -A3 '"figma"' ~/.deepai/mcp.json
-# "url": "https://mcp.figma.com/mcp"      → 官方远程(41 tools,OAuth)
-# "command": "npx" + figma-developer-mcp  → 社区版(2 tools,PAT,只读)
-# 无 figma 条目                            → 只剩原生桥
-```
+1. **原生桥**(builtin `figma` 工具):`action=status` 返回 `connected:true` 即可用;绑定与插件导入见 docs/figma_bridge.md。
+2. **官方远程 MCP**(mcp.figma.com,41 tools):`~/.deepai/mcp.json` 配有该 url 时可用;401 时跑 `scripts/figma-mcp-token.py ensure` 续期后重试。
 
-原生桥可用性:`figma` action=`status`,`connected:true` 即可用;绑定/导入插件见 docs/figma_bridge.md。
+> 社区版 figma-developer-mcp 路径已从 skills 移除,以官方为准。环境若只配了社区版,提示用户按 docs/figma_mcp.md §三 配置官方远程,或改走原生桥。
+
+URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折号换冒号)。
 
 ## Tool map by path
 
-| Goal | 原生桥(builtin `figma`,首选) | 官方远程 MCP | 社区版 MCP |
-|---|---|---|---|
-| 结构总览 | `run` {code:'return null'} → before 快照 | `get_metadata` | `get_figma_data` |
-| 设计→代码数据 | `run` 读节点树(大画板分块) | `get_design_context` | `get_figma_data` |
-| Tokens | `run` 读 `getLocalPaintStylesAsync` / `getLocalTextStylesAsync` | `get_variable_defs` | 降级:实测 hex |
-| 截图/视觉基准 | `run` exportAsync → preview.png | `get_screenshot` | 无(用响应内嵌图) |
-| 资产导出 | `run` exportAsync(SVG 图标/PNG 2x) | `download_figma_images` | `download_figma_images` |
-| 写 Figma | `run`(确定性 JS,单飞+证据) | `use_figma`(无 Desktop 时回退) | ❌ 无写路径 |
-| 生成式草稿 | ❌ | `generate_figma_design` | ❌ |
-| 新文件/传素材 | ❌ | `create_new_file` / `upload_assets` | ❌ |
-| 设计系统/动效 | ❌ | `search_design_system` / `get_motion_context` | ❌ |
-
-URL 解析(所有路径通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折号换冒号)。
+| Goal | 原生桥(builtin `figma`,首选) | 官方远程 MCP |
+|---|---|---|
+| 结构总览 | `run` {code:'return null'} → before 快照 | `get_metadata` |
+| 设计→代码数据 | `run` 读节点树(大画板分块) | `get_design_context` |
+| Tokens | `run` 读 `getLocalPaintStylesAsync` / `getLocalTextStylesAsync` | `get_variable_defs` |
+| 截图/视觉基准 | `run` exportAsync → preview.png | `get_screenshot` |
+| 资产导出 | `run` exportAsync(SVG 图标/PNG 2x) | `download_figma_images` |
+| 写 Figma | `run`(确定性 JS,单飞+证据) | `use_figma`(无 Desktop 时) |
+| 生成式草稿 | ❌ | `generate_figma_design` |
+| 新文件/传素材 | ❌ | `create_new_file` / `upload_assets` |
+| 设计系统/动效 | ❌ | `search_design_system` / `get_motion_context` |
 
 ## Workflow A — implement a design (design → code)
 
@@ -77,7 +73,8 @@ URL 解析(所有路径通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → 
    inspect_job_id, note)` 记录核实结论。断连超时按提示区分:queued=面板
    没开(重开后自动执行),delivered=执行中失联(重开后待回传)。
 
-MCP 回退路径(无 Figma Desktop,官方远程):`use_figma` 小步 JS 编辑,改前重读;`generate_figma_design` 只用于生成式草稿,不做手术式修改。
+官方远程回退(无 Figma Desktop):`use_figma` 小步 JS 编辑,改前重读;
+`generate_figma_design` 只用于生成式草稿,不做手术式修改。
 
 ## Workflow C — verify / iterate an existing implementation
 
@@ -112,6 +109,8 @@ MCP 回退路径(无 Figma Desktop,官方远程):`use_figma` 小步 JS 编辑,�
 - **返回值**:`exportAsync` 的 Uint8Array 可直接 return(走图像通道落盘
   preview*.png);嵌套在对象里返回则输出 `{__png,bytes}` 占位。不要把大
   字节数组塞进普通 JSON 字段。
+- **本地 .fig**:无 fileKey,绑定校验靠 nodeId 兜底(放行);本地副本与云端
+  原件勿同时开插件面板,避免任务串入另一份。
 
 ## Hard rules
 
@@ -121,7 +120,7 @@ MCP 回退路径(无 Figma Desktop,官方远程):`use_figma` 小步 JS 编辑,�
 - 写 Figma:确定性编辑(`run` / `use_figma`)优先于生成式,除非用户要想法。
 - UI aesthetics/iconography rules come from super-frontend-design; this skill
   supplies the ground-truth data. Compose both when building UI.
-- 401 排查按路径:官方远程 → `scripts/figma-mcp-token.py ensure` 后重试;
-  社区版 → `FIGMA_API_KEY` 失效,figma.com → Settings → Security 重新生成。
+- 401(官方远程)→ `scripts/figma-mcp-token.py ensure` 续期后重试
+  (docs/figma_mcp.md §三)。
 - 原生桥任务单飞、绝不重放;结果未知时先读回——绝不复述提交同一修改。
 - ack 不是橡皮章:必须附完成的 inspect:true 任务 ID + 实际观察到的文档现状说明。
