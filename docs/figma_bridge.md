@@ -63,4 +63,4 @@
 - **结果未知阻断**：任务已交付但 deepai 中断、结果未落盘时，该任务进入 unresolved 并阻断一切新写入（普通 run 一律被拒）。解锁流程：
   1. `run`（`inspect:true`）提交一段只读脚本（如 `return null`）核实文档现状，等待其完成；
   2. `ack` 附上该核实任务 ID 与观察结论：`figma ack <job_id> <inspect_job_id> <核实说明>`（如「inspect 确认仅按钮文字变化，无其他改动」）；核实任务未完成时 ack 被拒，两份证据落盘后才解除阻断。
-- 证据目录（`~/Library/Application Support/deepai/figma/runs/<job_id>/`）保存每次任务的 script.js、result.json、preview.png，可随时人工检视。
+- 证据目录（`~/Library/Application Support/deepai/figma/runs/<job_id>/`）保存每次任务的 script.js、result.json、preview.png，可随时人工检视；桥启动时自动清理已超 7 天的终态证据（待核实与在途任务永不清理）。
