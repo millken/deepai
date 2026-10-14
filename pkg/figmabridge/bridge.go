@@ -500,12 +500,16 @@ func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) Wai
 		if time.Now().After(deadline) {
 			job, _ := b.JobByID(id)
 			instr := fmt.Sprintf("任务 %s 未在超时内回传（未被取消）：用 result %s 读回，或稍后再试；不要重复提交同一修改", id, id)
-			// 面板断连是超时最常见根因：queued=面板没开（无人领取），delivered=执行途中断连。
-			if st := b.Status(); !st.Connected {
+			// 面板断连是超时最常见根因。job.State 为空（磁盘读失败）时不猜断连分支，
+			// 落回通用提示，避免拼出「断开（）」。delivered 断连不会重放：handlePoll
+			// 只下发 queued；面板 iframe 活着时下次轮询成功会自行回传 pendingResult，
+			// 面板已关则执行现场没了——重启 deepai 后 recoverRuns 将其记为 unresolved，
+			// 走 inspect+ack 解锁。
+			if st := b.Status(); !st.Connected && (job.State == "queued" || job.State == "delivered") {
 				if job.State == "queued" {
 					instr = fmt.Sprintf("插件面板未连接，任务 %s 已入队未被领取：重开插件面板后会自动执行，届时用 result %s 读回；不要重复提交", id, id)
 				} else {
-					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开（%s）：重开面板待其回传后用 result %s 读回；不要重复提交同一修改", id, job.State, id)
+					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；面板已关则重启 deepai，任务转待核实后用 inspect:true run + ack 解锁", id, id)
 				}
 			}
 			return WaitOutcome{WaitStatus: "timeout", Job: job, Instruction: instr}

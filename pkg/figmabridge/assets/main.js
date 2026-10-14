@@ -29,15 +29,17 @@ function snapshot(node, depth, budget) {
     }
     out.fills = fills;
   }
+  // 仅 H/V 可安全读完整 auto-layout 状态;GRID 上轴/间距属性会抛(见文件头约定)。
+  // sizing/align 是静默塌陷(FIXED→AUTO)的第一现场,缺失会误判写入成功。
+  const isHV = 'layoutMode' in node && (node.layoutMode === 'HORIZONTAL' || node.layoutMode === 'VERTICAL');
   if ('layoutMode' in node && node.layoutMode && node.layoutMode !== 'NONE') {
-    // sizing/align 是 auto-layout 静默塌陷的第一现场：构建后尺寸模式被重置（FIXED→AUTO）
-    // 只在这里可见，缺失会让人误以为写入成功。子项对齐（layoutAlign/layoutGrow）
-    // 仅在父级处于 layout 模式时可安全读取。
-    out.layout = { mode: node.layoutMode, gap: node.itemSpacing,
-      padding: [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft],
-      sizing: [node.primaryAxisSizingMode, node.counterAxisSizingMode],
-      align: [node.primaryAxisAlignWidgets, node.counterAxisAlignWidgets] };
-  }
+    out.layout = { mode: node.layoutMode };
+    if (isHV) {
+      out.layout.gap = node.itemSpacing;
+      out.layout.padding = [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft];
+      out.layout.sizing = [node.primaryAxisSizingMode, node.counterAxisSizingMode];
+      out.layout.align = [node.primaryAxisAlignItems, node.counterAxisAlignItems];
+    }
   }
   if ('cornerRadius' in node && typeof node.cornerRadius === 'number' && node.cornerRadius) out.cornerRadius = node.cornerRadius;
   if ('children' in node && node.children) {
@@ -48,7 +50,7 @@ function snapshot(node, depth, budget) {
       for (const child of node.children) {
         if (budget.count >= SNAPSHOT_MAX_NODES) { out.truncated = true; break; }
         const cs = snapshot(child, depth + 1, budget);
-        if (out.layout) {
+        if (isHV) {
           if (child.layoutAlign && child.layoutAlign !== 'INHERIT') cs.layoutAlign = child.layoutAlign;
           if (child.layoutGrow) cs.layoutGrow = child.layoutGrow;
         }
@@ -95,23 +97,30 @@ async function execute(job) {
     // 输出中留 {__png,bytes} 占位引用，避免 JSON 序列化成数字数组刷屏。命名与
     // bridge.go handleComplete 的落盘规则一致：第 1 张 preview.png，第 N 张 preview-N.png。
     const pngs = [];
-    const seen = new WeakSet();
+    class CycleError extends Error {}
+    // 进入标记、离开撤销：无环的共享引用（{a:s,b:s}）放行，真环拒绝；数组一并
+    // 纳入，避免先在递归里栈溢出。循环引用错误原样上抛，不落进笼统的序列化 catch。
+    const inStack = new Set();
     const extract = v => {
       if (v instanceof Uint8Array) {
         pngs.push(v);
         return { __png: pngs.length === 1 ? 'preview.png' : 'preview-' + pngs.length + '.png', bytes: v.length };
       }
-      if (Array.isArray(v)) return v.map(extract);
+      if (Array.isArray(v)) {
+        if (inStack.has(v)) throw new CycleError('返回值含循环引用；脚本可能已执行，请核实现状后重试');
+        inStack.add(v);
+        try { return v.map(extract); } finally { inStack.delete(v); }
+      }
       if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) {
-        if (seen.has(v)) throw Error('返回值含循环引用；脚本可能已执行，请核实现状后重试');
-        seen.add(v);
-        const o = {}; for (const k of Object.keys(v)) o[k] = extract(v[k]); return o;
+        if (inStack.has(v)) throw new CycleError('返回值含循环引用；脚本可能已执行，请核实现状后重试');
+        inStack.add(v);
+        try { const o = {}; for (const k of Object.keys(v)) o[k] = extract(v[k]); return o; } finally { inStack.delete(v); }
       }
       return v;
     };
     let output;
     try { output = extract(raw); if (output !== undefined) output = JSON.parse(JSON.stringify(output)); }
-    catch { throw Error('返回值无法序列化；脚本可能已执行，请核实现状后重试'); }
+    catch (e) { if (e instanceof CycleError) throw e; throw Error('返回值无法序列化；脚本可能已执行，请核实现状后重试'); }
     const payload = { type: 'result', id: job.id, ok: true, output: output === undefined ? null : output, before, after };
     if (pngs.length) payload.pngs = pngs;
     figma.ui.postMessage(payload);

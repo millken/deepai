@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -404,7 +405,40 @@ func TestBridge_WaitTimeoutDisconnected(t *testing.T) {
 	b2.lastPoll = time.Now().Add(-pollFreshSecs*time.Second - time.Second)
 	b2.mu.Unlock()
 	outcome2 := b2.Wait(t.Context(), job2.ID, 200*time.Millisecond)
-	if outcome2.WaitStatus != "timeout" || !strings.Contains(outcome2.Instruction, "执行期间断开") {
+	if outcome2.WaitStatus != "timeout" || !strings.Contains(outcome2.Instruction, "执行期间断开") ||
+		!strings.Contains(outcome2.Instruction, "不会被重放") || !strings.Contains(outcome2.Instruction, "ack") {
 		t.Fatalf("delivered-disconnect outcome = %+v", outcome2)
+	}
+}
+
+// 守卫：嵌入的插件 JS 必须可解析。曾有多余的 "}" 带病合并——go 不解析 JS，
+// 测试全绿但插件在 Figma 里加载即失败。GeneratePlugin 落盘后用 node --check
+// 校验 main.js 与 ui.html 抽出的内联脚本；node 缺席时跳过。
+func TestEmbeddedPluginJSSyntax(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node 不在 PATH，跳过 JS 语法守卫")
+	}
+	dir := t.TempDir()
+	manifest, err := GeneratePlugin(dir, 43187, "tok", Binding{FileKey: "KEY", NodeID: "1:2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdir := filepath.Dir(manifest)
+	check := func(path string) {
+		if out, err := exec.Command("node", "--check", path).CombinedOutput(); err != nil {
+			t.Errorf("JS 语法守卫失败 %s: %v\n%s", path, err, out)
+		}
+	}
+	check(filepath.Join(pdir, "main.js"))
+	ui, err := os.ReadFile(filepath.Join(pdir, "ui.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o, c := strings.Index(string(ui), "<script>"), strings.LastIndex(string(ui), "</script>"); o >= 0 && c > o {
+		tmp := filepath.Join(dir, "ui-inline.js")
+		if err := os.WriteFile(tmp, ui[o+len("<script>"):c], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		check(tmp)
 	}
 }
