@@ -430,10 +430,10 @@ return { button: btnSet.id, input: inputSet.id, labelKey: key };
 组件集开启 auto-layout 后显式设两轴 HUG,否则集合保持合并时的固定尺寸,变体溢出(§8 报 `overflow`)。
 Input 的顺序:`resize(280, s.h)` 在设 sizing 之前(resize 会锁回 FIXED),文字加入后再把纵向设回 HUG,高度由「行高 + 2×内边距」得出,恰等于 `s.h`。
 
-**居中三板斧(实测)**:对齐字段名是 `primaryAxisAlignItems` / `counterAxisAlignItems`——写成 `*AlignWidgets` 等不存在的名字,赋值**不报错**、读回 undefined,构建 ok:true 但视觉全错(实测按钮文字贴左上、输入框文字贴顶)。写完读回确认,§8 也会以 `labelOffY` / `contentOffX` 拦下。属性确实不生效或处于非 auto-layout 场景时:
-- 水平居中:两个 `layoutGrow=1` 的空 spacer frame 夹住内容组(主轴为 MIN 时);
-- 文字垂直居中:文字子级 `layoutAlign='STRETCH'` 拉满容器高 + `textAlignVertical='CENTER'`;
-- SVG/图标垂直居中:非 auto-layout 的固定高包装 frame + 内部矢量按 `(高 − 图标高)/2` 绝对定位。
+**控件居中（正解优先）**：对齐字段名是 `primaryAxisAlignItems` / `counterAxisAlignItems`——这是 auto-layout 居中的**首选正解**（实测全页 102 个 HORIZONTAL 容器一次性设 `counterAxisAlignItems='CENTER'` 全部生效，chip/pill/按钮文字几何偏差归零）。交叉轴记住一句：HORIZONTAL 容器的垂直居中与 VERTICAL 容器的水平居中都是 `counterAxisAlignItems='CENTER'`；主轴用 `primaryAxisAlignItems`。写成 `*AlignWidgets` 等不存在的名字，赋值**不报错**、读回 undefined，构建 ok:true 但视觉全错（实测按钮文字贴左上、输入框文字贴顶、chip 收缩贴文字）——写完读回确认，§8 也会以 `labelOffY` / `contentOffX` 拦下。仅当字段名正确仍不生效（罕见）或 `layoutMode='NONE'` 绝对布局场景，才用兜底三板斧：
+- 水平居中：两个 `layoutGrow=1` 的空 spacer frame 夹住内容组（主轴为 MIN 时）；
+- 文字垂直居中：文字子级 `layoutAlign='STRETCH'` 拉满容器高 + `textAlignVertical='CENTER'`；
+- SVG/图标垂直居中：非 auto-layout 的固定高包装 frame + 内部矢量按 `(高 − 图标高)/2` 绝对定位。
 
 ## 7. 交付前体检(design lint)
 
