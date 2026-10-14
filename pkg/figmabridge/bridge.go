@@ -353,6 +353,7 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 		Error       string          `json:"error"`
 		ExecStarted bool            `json:"executionStarted"`
 		PNGB64      string          `json:"pngB64"`
+		PNGsB64     []string        `json:"pngsB64"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil || !jobIDRe.MatchString(msg.ID) {
 		reply(w, http.StatusBadRequest, map[string]any{"error": "结果无效"})
@@ -370,21 +371,35 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 		ID: msg.ID, OK: msg.OK, Output: msg.Output, Before: msg.Before, After: msg.After,
 		Error: msg.Error, ExecStarted: msg.ExecStarted, FinishedAt: nowISO(),
 	}
-	if msg.OK && msg.PNGB64 != "" {
-		png, err := base64.StdEncoding.DecodeString(msg.PNGB64)
-		if err != nil {
-			reply(w, http.StatusBadRequest, map[string]any{"error": "图像数据无效"})
-			return
+	if msg.OK && (msg.PNGB64 != "" || len(msg.PNGsB64) > 0) {
+		// 单图 pngB64 与多图 pngsB64 统一落盘：首张 preview.png，后续 preview-N.png，
+		// 与插件侧输出占位 {__png:'preview.png'|'preview-N.png'} 命名一致。
+		b64s := msg.PNGsB64
+		if len(b64s) == 0 {
+			b64s = []string{msg.PNGB64}
 		}
 		if err := os.MkdirAll(b.runDir(job.ID), 0o700); err != nil {
 			reply(w, http.StatusInternalServerError, map[string]any{"error": "证据目录创建失败：" + err.Error()})
 			return
 		}
-		if err := os.WriteFile(filepath.Join(b.runDir(job.ID), "preview.png"), png, 0o600); err != nil {
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "预览图落盘失败：" + err.Error()})
-			return
+		names := make([]string, 0, len(b64s))
+		for i, s := range b64s {
+			png, err := base64.StdEncoding.DecodeString(s)
+			if err != nil {
+				reply(w, http.StatusBadRequest, map[string]any{"error": "图像数据无效"})
+				return
+			}
+			name := "preview.png"
+			if i > 0 {
+				name = fmt.Sprintf("preview-%d.png", i+1)
+			}
+			if err := os.WriteFile(filepath.Join(b.runDir(job.ID), name), png, 0o600); err != nil {
+				reply(w, http.StatusInternalServerError, map[string]any{"error": "预览图落盘失败：" + err.Error()})
+				return
+			}
+			names = append(names, name)
 		}
-		result.Preview = "preview.png"
+		result.Preview = strings.Join(names, ",")
 	}
 	// 先 result 后 job：任一缺失即视为未完成，恢复扫描据此阻断。
 	if err := writeJSONAtomic(filepath.Join(b.runDir(job.ID), "result.json"), result, 0o600); err != nil {
@@ -484,8 +499,16 @@ func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) Wai
 		}
 		if time.Now().After(deadline) {
 			job, _ := b.JobByID(id)
-			return WaitOutcome{WaitStatus: "timeout", Job: job,
-				Instruction: fmt.Sprintf("任务 %s 未在超时内回传（未被取消）：用 result %s 读回，或稍后再试；不要重复提交同一修改", id, id)}
+			instr := fmt.Sprintf("任务 %s 未在超时内回传（未被取消）：用 result %s 读回，或稍后再试；不要重复提交同一修改", id, id)
+			// 面板断连是超时最常见根因：queued=面板没开（无人领取），delivered=执行途中断连。
+			if st := b.Status(); !st.Connected {
+				if job.State == "queued" {
+					instr = fmt.Sprintf("插件面板未连接，任务 %s 已入队未被领取：重开插件面板后会自动执行，届时用 result %s 读回；不要重复提交", id, id)
+				} else {
+					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开（%s）：重开面板待其回传后用 result %s 读回；不要重复提交同一修改", id, job.State, id)
+				}
+			}
+			return WaitOutcome{WaitStatus: "timeout", Job: job, Instruction: instr}
 		}
 		select {
 		case <-ctx.Done():

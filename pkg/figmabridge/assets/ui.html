@@ -59,13 +59,20 @@ async function tick() {
 onmessage = event => {
   const msg = event.data && event.data.pluginMessage;
   if (msg && msg.type === 'result') {
-    // Uint8Array 无法 JSON 序列化；分块转 base64 走 pngB64 通道（体积比数字数组小 4 倍）。
-    if (msg.png instanceof Uint8Array) {
+    // Uint8Array 无法 JSON 序列化；分块转 base64（体积比数字数组小 4 倍）。
+    // pngs 为多图通道（深检测提取的嵌套图像），单图 png 保留兼容。
+    const toB64 = u8 => {
       let binary = '';
       const chunk = 0x8000;
-      for (let i = 0; i < msg.png.length; i += chunk)
-        binary += String.fromCharCode.apply(null, msg.png.subarray(i, i + chunk));
-      msg.pngB64 = btoa(binary);
+      for (let i = 0; i < u8.length; i += chunk)
+        binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+      return btoa(binary);
+    };
+    if (Array.isArray(msg.pngs)) {
+      msg.pngsB64 = msg.pngs.map(toB64);
+      delete msg.pngs;
+    } else if (msg.png instanceof Uint8Array) {
+      msg.pngB64 = toB64(msg.png);
       delete msg.png;
     }
     pendingResult = msg;
