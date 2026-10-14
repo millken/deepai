@@ -52,9 +52,11 @@ function snapshot(node, depth, budget) {
 const boundedSnapshot = node => snapshot(node, 0, { count: 0 });
 
 async function locateTarget(job) {
-  // 绑定来自 figma.com 链接，fileKey 必非空；当前文件无 fileKey（本地 .fig）即非绑定文件，拒绝。
-  if (figma.fileKey !== job.binding.fileKey)
-    throw Error('当前文件与绑定不一致：' + (figma.fileKey || '无 fileKey（本地文件）') + ' ≠ ' + job.binding.fileKey + '；请在绑定的云端文件中运行插件');
+  // 绑定来自 figma.com 链接，fileKey 必非空；本地打开的 .fig 无 fileKey（undefined），
+  // 放行并靠绑定 nodeId 兜底识别（.fig 保留云端节点 ID，找不到即报「绑定节点不存在」）；
+  // 云端文件仍严格匹配 fileKey，防串文件。
+  if (figma.fileKey && figma.fileKey !== job.binding.fileKey)
+    throw Error('当前文件与绑定不一致：' + figma.fileKey + ' ≠ ' + job.binding.fileKey + '；请在正确文件中运行插件');
   const root = await figma.getNodeByIdAsync(job.binding.nodeId);
   if (!root) throw Error('绑定节点不存在：' + job.binding.nodeId + '；请重新 init');
   if (!job.targetNodeId || job.targetNodeId === job.binding.nodeId) return root;
