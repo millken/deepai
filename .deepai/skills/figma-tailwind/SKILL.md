@@ -11,10 +11,10 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 优先级：**原生桥 > 官方远程**。第一步：若 builtin `figma` 工具（deepai 内嵌桥，Figma Desktop + 插件）已绑定目标文件（`status` connected:true），走内嵌桥路径；否则用官方远程 MCP（mcp.figma.com，docs/figma_mcp.md §三）。
 
-> 社区版 figma-developer-mcp 路径已从 skills 移除，以官方为准。环境若只配了社区版，提示用户按 docs/figma_mcp.md §三 配置官方远程，或改走原生桥。
+> 社区版 figma-developer-mcp 已从 skills 移除，以官方为准。识别到环境只配了社区版（mcp.json 里 npx figma-developer-mcp）时**不要静默当官方用**：提示停用社区版，按 docs/figma_mcp.md §三 配置官方远程，或改走原生桥。
 
 **官方远程 mcp.figma.com（41 工具）：**
-- `get_metadata` 定位 → `get_design_context` 分块取数 → `get_variable_defs` 取变量表（token 映射唯一依据）→ `get_screenshot` 视觉核对
+- `figma__get_metadata` 定位 → `figma__get_design_context` 分块取数 → `figma__get_variable_defs` 取变量表（token 映射唯一依据）→ `figma__get_screenshot` 视觉核对（完整工具名带 `figma__` 前缀）
 
 **deepai 内嵌桥（builtin `figma` 工具，本机 Figma Desktop）：**
 - `figma` run {code:'return null'} 的 before 快照是结构/样式唯一来源（Auto Layout、完整文字、填充、间距字段最全）；PNG 预览用 run {code:'return await target.exportAsync({format:\"PNG\"})'}
@@ -73,5 +73,5 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 1. **只出 class 字符串与 `@theme` token 声明块**：任何 Vue/HTML/JS/CSS 结构代码一律不生成。`@theme` 块是唯一豁免——它是类名映射的前置契约，不是结构样式。用户明确要完整页面时，说明本 skill 职责并建议改用 figma-ui 工作流 A。
 2. **PII 脱敏**：清单的语义名与示例文本中出现任何个人敏感信息（身份证、护照、政府 ID、卡号、手机号等）一律掩码（如 `**** **** **** 1234`）；截图仅用于布局核对，不复述其中敏感值。
-3. **不臆造值**：颜色/间距/字号/圆角全部来自工具实测数据（内嵌桥 before 快照，官方远程 `get_design_context` / `get_variable_defs`）；工具调用失败时说明失败，不用记忆兜底。
+3. **不臆造值**：颜色/间距/字号/圆角全部来自工具实测数据（内嵌桥 before 快照，官方远程 `figma__get_design_context` / `figma__get_variable_defs`）；工具调用失败时说明失败，不用记忆兜底。
 4. **401**（官方远程，docs/figma_mcp.md §三）：跑 deepai 仓库根的 `scripts/figma-mcp-token.py` ensure 后重试。

@@ -1,19 +1,19 @@
 # Figma MCP 接入指南
 
 > 让 deepai 读取 Figma 设计数据（布局、样式、组件、切图），用于设计还原与 UI 代码生成。
-> 两条路径均在 macOS 实测通过：社区版（figma-developer-mcp v0.13.2，默认）、官方远程（2026-10，41 个工具，不受支持的变通）。
+> 两条 MCP 路径均在 macOS 实测通过：官方远程（2026-10，41 个工具，**默认**）、社区版（figma-developer-mcp v0.13.2，遗留只读备选）。本机 Figma Desktop 场景另有原生桥（[figma_bridge.md](figma_bridge.md)，读写同实况文档）与 MCP 互补。
 
 ## 一、方案选型
 
 | 方案 | 传输 | 鉴权 | 工具面 | 可用性 |
 |---|---|---|---|---|
-| 社区版 [figma-developer-mcp](https://github.com/GLips/Figma-Context-MCP)（**默认**） | stdio | Figma PAT | 2 个：`get_figma_data` + `download_figma_images`（只读，简化 + CSS 友好结构） | ✅ 即接即用，任何账号（见 §二） |
-| 官方远程（`mcp.figma.com/mcp`） | http | OAuth，仅白名单客户端可**注册** | 41 个：读 + 写（生成设计/图片、建文件、传素材、搜设计系统、weave 系列） | ⚠️ 需借道白名单客户端铸 token，**不受支持的变通做法**（见 §三） |
+| 社区版 [figma-developer-mcp](https://github.com/GLips/Figma-Context-MCP)（**遗留只读备选**，skills 不再路由） | stdio | Figma PAT | 2 个：`get_figma_data` + `download_figma_images`（只读，简化 + CSS 友好结构） | ✅ 即接即用，任何账号（见 §二） |
+| 官方远程（`mcp.figma.com/mcp`，**默认**） | http | OAuth，仅白名单客户端可**注册** | 41 个：读 + 写（生成设计/图片、建文件、传素材、搜设计系统、weave 系列） | ⚠️ 需借道白名单客户端铸 token，**不受支持的变通做法**（见 §三） |
 | 官方本地 Dev Mode（`127.0.0.1:3845/mcp`） | http | 无需 token | 读为主 | ❌ 需 Figma Desktop + Dev/Full 付费席位，免费版菜单无开关 |
 
-选择建议：**默认走社区版 PAT**——两步即通、无 OAuth、无客户端准入问题，覆盖设计→代码的读取场景。官方远程仅当确需写回 Figma / 截图比对 / 设计系统搜索等 41 工具能力时，再按 §三 自行承担变通风险启用。
+选择建议：**默认走官方远程**（§三）——41 工具覆盖读+写+生成式，skills 已按官方工具面编写；本机 Figma Desktop 场景另优先原生桥（[figma_bridge.md](figma_bridge.md)，读写同实况文档）。社区版仅在官方 OAuth 无法完成时作只读退路（skills 不再路由社区版，见各 SKILL.md）。
 
-## 二、默认接入：社区版（PAT，零依赖）
+## 二、遗留备选：社区版（PAT，只读，零依赖）
 
 ### 1. 生成令牌
 
@@ -50,7 +50,7 @@ curl -s -H "X-Figma-Token: $FIGMA_API_KEY" https://api.figma.com/v1/me
 
 端到端：用假 fileKey 调 `get_figma_data`——404 = 鉴权已过、仅文件不存在；403 = 令牌无效或权限不足。
 
-## 三、变通做法（不受支持）：官方远程借道
+## 三、默认接入：官方远程（OAuth 借道白名单客户端——不受支持的变通）
 
 > **先读这段再决定**：Figma 官方仅允许白名单客户端（VS Code、Cursor、Claude Code、Codex、Xcode）注册接入官方远程 MCP，PAT / `X-Figma-Token` 一律无效。以下做法借白名单客户端替本机账号走完 OAuth，再把 token 复用给 deepai——属于绕过客户端准入控制（合规注记见 §六）。此外 `scripts/figma-mcp-token.py` 持久化的是 Claude Code OAuth 客户端的 `client_id` / `client_secret`，续期时以该客户端身份向 Figma 请求 token；且引导依赖 macOS 钥匙串，Linux 无 `security` 命令时不可用。Figma 若收紧校验，此路径随时失效——届时回到 §二。
 

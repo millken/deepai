@@ -33,23 +33,23 @@ never guess values that the file can tell you.
 1. **原生桥**(builtin `figma` 工具):`action=status` 返回 `connected:true` 即可用;绑定与插件导入见 docs/figma_bridge.md。
 2. **官方远程 MCP**(mcp.figma.com,41 tools):`~/.deepai/mcp.json` 配有该 url 时可用;401 时跑 `scripts/figma-mcp-token.py ensure` 续期后重试。
 
-> 社区版 figma-developer-mcp 路径已从 skills 移除,以官方为准。环境若只配了社区版,提示用户按 docs/figma_mcp.md §三 配置官方远程,或改走原生桥。
+> 社区版 figma-developer-mcp 已从 skills 移除,以官方为准。识别到环境只配了社区版(mcp.json 里 npx figma-developer-mcp)时**不要静默当官方用**:提示停用社区版,按 docs/figma_mcp.md §三 配置官方远程,或改走原生桥。
 
 URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折号换冒号)。
 
 ## Tool map by path
 
-| Goal | 原生桥(builtin `figma`,首选) | 官方远程 MCP |
+| Goal | 原生桥(builtin `figma`,首选) | 官方远程 MCP(完整工具名带 `figma__` 前缀) |
 |---|---|---|
-| 结构总览 | `run` {code:'return null'} → before 快照 | `get_metadata` |
-| 设计→代码数据 | `run` 读节点树(大画板分块) | `get_design_context` |
-| Tokens | `run` 读 `getLocalPaintStylesAsync` / `getLocalTextStylesAsync` | `get_variable_defs` |
-| 截图/视觉基准 | `run` exportAsync → preview.png | `get_screenshot` |
-| 资产导出 | `run` exportAsync(SVG 图标/PNG 2x) | `download_figma_images` |
-| 写 Figma | `run`(确定性 JS,单飞+证据) | `use_figma`(无 Desktop 时) |
-| 生成式草稿 | ❌ | `generate_figma_design` |
-| 新文件/传素材 | ❌ | `create_new_file` / `upload_assets` |
-| 设计系统/动效 | ❌ | `search_design_system` / `get_motion_context` |
+| 结构总览 | `run` {code:'return null'} → before 快照 | `figma__get_metadata` |
+| 设计→代码数据 | `run` 读节点树(大画板分块) | `figma__get_design_context` |
+| Tokens | `run` 读 `getLocalPaintStylesAsync` / `getLocalTextStylesAsync`(样式≈token 近似,无变量名→按 figma-tailwind 降级) | `figma__get_variable_defs`(变量唯一依据) |
+| 截图/视觉基准 | `run` exportAsync → preview.png | `figma__get_screenshot` |
+| 资产导出 | `run` exportAsync(SVG 图标/PNG 2x) | `figma__download_figma_images` |
+| 写 Figma | `run`(确定性 JS,单飞+证据) | `figma__use_figma`(无 Desktop 时) |
+| 生成式草稿 | ❌ | `figma__generate_figma_design` |
+| 新文件/传素材 | ❌ | `figma__create_new_file` / `figma__upload_assets` |
+| 设计系统/动效 | ❌ | `figma__search_design_system` / `figma__get_motion_context` |
 
 ## Workflow A — implement a design (design → code)
 
@@ -59,7 +59,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 4. 验证闭环:设计侧导出基准 PNG + 实现侧同视口截图 → 逐层比对
    (全图差异% → 分区统计 → 关键色块包围盒几何),不要只看百分比。
    差异可能在任一侧:代码 bug 或 Figma 构建缺陷(见 gotchas),按用户意图修对应侧。
-5. 动效:`get_motion_context`(官方远程)→ CSS,尊重 `prefers-reduced-motion`。
+5. 动效:仅官方远程 `figma__get_motion_context` → CSS,尊重 `prefers-reduced-motion`。
 
 ## Workflow B — adjust the design in Figma (code → design)
 
@@ -73,8 +73,8 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
    inspect_job_id, note)` 记录核实结论。断连超时按提示区分:queued=面板
    没开(重开后自动执行),delivered=执行中失联(重开后待回传)。
 
-官方远程回退(无 Figma Desktop):`use_figma` 小步 JS 编辑,改前重读;
-`generate_figma_design` 只用于生成式草稿,不做手术式修改。
+官方远程回退(无 Figma Desktop):`figma__use_figma` 小步 JS 编辑,改前重读;
+`figma__generate_figma_design` 只用于生成式草稿,不做手术式修改。
 
 ## Workflow C — verify / iterate an existing implementation
 
@@ -84,11 +84,12 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 ## Workflow D — design from scratch
 
-1. 意图不明先 ask_clarification(用途/调性/框架)。
-2. 参考图:`generate_image`(官方远程)或跳过(纯排版方向)。
-3. 画布:官方远程 `create_new_file` + `use_figma`;或原生桥 `figma init`
+1. 意图不明先 ask_clarification(用途/调性/框架);**新设计先提 2 个结构方向**(文字或
+   线框)供用户选定,再动手构建。
+2. 参考图:仅官方远程 `figma__generate_image` 或跳过(纯排版方向)。
+3. 画布:官方远程 `figma__create_new_file` + `figma__use_figma`;或原生桥 `figma init`
    绑定目标 frame 后 `run` 构建(本机 Desktop 场景更顺手);也可先代码原型后移植。
-4. 先 `search_design_system` 再造组件;tokens 走 `get_variable_defs`。
+4. 先 `figma__search_design_system` 再造组件;tokens 走 `figma__get_variable_defs`。
 5. 截图迭代;交付文件 URL。
 
 ## Bridge gotchas(原生桥实战踩坑,全部实测验证)
@@ -116,11 +117,11 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 - Never invent image URLs — only ones returned by the tools.
 - Never guess values a tool can answer (spacing, color, radius, font).
-- 官方远程:one `get_design_context` per node subtree,相关节点合并调用(限流)。
-- 写 Figma:确定性编辑(`run` / `use_figma`)优先于生成式,除非用户要想法。
+- 官方远程:one `figma__get_design_context` per node subtree,相关节点合并调用(限流)。
+- 写 Figma:确定性编辑(`run` / `figma__use_figma`)优先于生成式,除非用户要想法。
 - UI aesthetics/iconography rules come from super-frontend-design; this skill
   supplies the ground-truth data. Compose both when building UI.
 - 401(官方远程)→ `scripts/figma-mcp-token.py ensure` 续期后重试
   (docs/figma_mcp.md §三)。
-- 原生桥任务单飞、绝不重放;结果未知时先读回——绝不复述提交同一修改。
+- 原生桥任务单飞、绝不重放;结果未知时先读回——绝不重新提交同一修改。
 - ack 不是橡皮章:必须附完成的 inspect:true 任务 ID + 实际观察到的文档现状说明。
