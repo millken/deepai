@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -352,5 +353,92 @@ func TestBridge_FailedResultCarriesEvidence(t *testing.T) {
 	// 失败任务释放串行锁（无需 ack——ok=false 是确定终态）。
 	if _, err := b.Submit("next", "", false); err != nil {
 		t.Fatalf("failed job must release lock: %v", err)
+	}
+}
+// P0：多图 pngsB64 落盘 preview.png / preview-N.png，Preview 记录清单，PreviewPath 仍指向首图。
+func TestBridge_MultiPreviewPNG(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("return {a: await t1.exportAsync(), b: await t2.exportAsync()}", "", false)
+	pollAs(t, b, "testtoken")
+	png1 := []byte{0x89, 0x50, 0x4E, 0x47}
+	png2 := []byte{0x89, 0x50, 0x4E, 0x47, 0x01}
+	payload := fmt.Sprintf(`{"id":%q,"ok":true,"pngsB64":[%q,%q],"before":{"id":"1:2"},"after":{"id":"1:2"}}`,
+		job.ID, base64.StdEncoding.EncodeToString(png1), base64.StdEncoding.EncodeToString(png2))
+	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
+		t.Fatalf("complete status %d: %s", rec.Code, rec.Body.String())
+	}
+	data1, err := os.ReadFile(filepath.Join(b.RunDir(job.ID), "preview.png"))
+	if err != nil || !bytes.Equal(data1, png1) {
+		t.Fatalf("preview.png = %v, %v", data1, err)
+	}
+	data2, err := os.ReadFile(filepath.Join(b.RunDir(job.ID), "preview-2.png"))
+	if err != nil || !bytes.Equal(data2, png2) {
+		t.Fatalf("preview-2.png = %v, %v", data2, err)
+	}
+	result, _ := b.Result(job.ID)
+	if result.Preview != "preview.png,preview-2.png" {
+		t.Fatalf("preview list = %q", result.Preview)
+	}
+	if p := b.PreviewPath(job.ID); p == "" {
+		t.Fatal("PreviewPath must still resolve first image")
+	}
+}
+
+// P1：断连下的超时提示区分「未领取（queued）」与「执行中失联（delivered）」。
+func TestBridge_WaitTimeoutDisconnected(t *testing.T) {
+	b := newTestBridge(t)
+	// 从未 poll：lastPoll 零值 → 未连接，任务停在 queued。
+	job, _ := b.Submit("read", "", false)
+	outcome := b.Wait(t.Context(), job.ID, 200*time.Millisecond)
+	if outcome.WaitStatus != "timeout" {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+	if !strings.Contains(outcome.Instruction, "面板未连接") || !strings.Contains(outcome.Instruction, "未被领取") {
+		t.Fatalf("queued-disconnect instruction = %q", outcome.Instruction)
+	}
+
+	// 领取后回传前断连：poll 建立连接，再把 lastPoll 拨回过期时刻模拟断连。
+	b2 := newTestBridge(t)
+	job2, _ := b2.Submit("mutate", "", false)
+	pollAs(t, b2, "testtoken")
+	b2.mu.Lock()
+	b2.lastPoll = time.Now().Add(-pollFreshSecs*time.Second - time.Second)
+	b2.mu.Unlock()
+	outcome2 := b2.Wait(t.Context(), job2.ID, 200*time.Millisecond)
+	if outcome2.WaitStatus != "timeout" || !strings.Contains(outcome2.Instruction, "执行期间断开") ||
+		!strings.Contains(outcome2.Instruction, "不会被重放") || !strings.Contains(outcome2.Instruction, "ack") {
+		t.Fatalf("delivered-disconnect outcome = %+v", outcome2)
+	}
+}
+
+// 守卫：嵌入的插件 JS 必须可解析。曾有多余的 "}" 带病合并——go 不解析 JS，
+// 测试全绿但插件在 Figma 里加载即失败。GeneratePlugin 落盘后用 node --check
+// 校验 main.js 与 ui.html 抽出的内联脚本；node 缺席时跳过。
+func TestEmbeddedPluginJSSyntax(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node 不在 PATH，跳过 JS 语法守卫")
+	}
+	dir := t.TempDir()
+	manifest, err := GeneratePlugin(dir, 43187, "tok", Binding{FileKey: "KEY", NodeID: "1:2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdir := filepath.Dir(manifest)
+	check := func(path string) {
+		if out, err := exec.Command("node", "--check", path).CombinedOutput(); err != nil {
+			t.Errorf("JS 语法守卫失败 %s: %v\n%s", path, err, out)
+		}
+	}
+	check(filepath.Join(pdir, "main.js"))
+	ui, err := os.ReadFile(filepath.Join(pdir, "ui.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o, c := strings.Index(string(ui), "<script>"), strings.LastIndex(string(ui), "</script>"); o >= 0 && c > o {
+		tmp := filepath.Join(dir, "ui-inline.js")
+		if err := os.WriteFile(tmp, ui[o+len("<script>"):c], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		check(tmp)
 	}
 }
