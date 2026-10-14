@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<style>
+:root{color-scheme:light dark}
+body{margin:0;padding:14px;font:12px/1.6 system-ui;color:var(--figma-color-text,#242424);background:var(--figma-color-bg,#fff)}
+p{margin:0}
+[role=status]{font-weight:600}
+small{opacity:.75}
+</style>
+<p role="status">连接中…</p>
+<small>保持本面板开启；任务执行进度在此显示</small>
+<script>
+// 会话配置由 bridge 生成时注入（port/token/binding）
+const config = SESSION_CONFIG;
+const status = document.querySelector('[role=status]');
+
+async function request(route, body) {
+  const response = await fetch('http://localhost:' + config.port + route, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(4000)
+  });
+  if (!response.ok) throw Error(route + ' ' + response.status);
+  return response.json();
+}
+
+let busy = false;
+let pendingResult = null;
+
+let ticking = false;
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    if (pendingResult) {
+      await request('/complete', pendingResult);
+      pendingResult = null;
+      busy = false;
+    }
+    if (!busy) {
+      const job = await request('/poll', { client: 'deepai-plugin' });
+      if (job) {
+        busy = true;
+        status.textContent = '执行中：' + (job.id || '');
+        parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
+      } else {
+        status.textContent = '已连接 deepai';
+      }
+    }
+  } catch (e) {
+    status.textContent = '等待连接 deepai…';
+  } finally {
+    ticking = false;
+  }
+}
+
+onmessage = event => {
+  const msg = event.data && event.data.pluginMessage;
+  if (msg && msg.type === 'result') {
+    pendingResult = msg;
+    status.textContent = '回传结果…';
+  }
+};
+
+setInterval(tick, 750);
+tick();
+</script>
+</html>
