@@ -27,6 +27,7 @@ async function request(route, body) {
 }
 
 let busy = false;
+let busyJobId = '';
 let pendingResult = null;
 
 let ticking = false;
@@ -39,15 +40,20 @@ async function tick() {
       pendingResult = null;
       busy = false;
     }
-    if (!busy) {
-      const job = await request('/poll', { client: 'deepai-plugin' });
-      if (job) {
-        busy = true;
-        status.textContent = '执行中：' + (job.id || '');
-        parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
-      } else {
-        status.textContent = '已连接 deepai';
-      }
+    // 执行期也持续轮询作心跳（heartbeat:true 只刷新连接新鲜度、不领取任务）：
+    // 此前 busy 时停发 poll，超过 pollFreshSecs 的执行会让桥误判断连（超时误报 + 假死收割）。
+    const job = await request('/poll', { client: 'deepai-plugin', heartbeat: busy });
+    if (job) {
+      busy = true;
+      busyJobId = job.id || '';
+      status.textContent = '执行中：' + busyJobId;
+      parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
+    } else if (!busy) {
+      status.textContent = '已连接 deepai';
+    } else {
+      // 心跳成功且执行中：把失败时留下的「等待连接」恢复为执行态——否则桥侧
+      // lastPoll 已新鲜、面板却一直显示断连，直到本次执行结束。
+      status.textContent = '执行中：' + busyJobId;
     }
   } catch (e) {
     status.textContent = '等待连接 deepai…';
