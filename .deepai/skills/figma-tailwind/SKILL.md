@@ -7,9 +7,9 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 读取 Figma 画布，把布局、间距、颜色转成符合 Tailwind CSS v4 语法的原子类组合，供用户直接粘贴到目标组件。**只交付 class 字符串与 `@theme` token 声明，不生成页面/模板/逻辑。**
 
-## 取数（先判别服务器，两套管线）
+## 取数（先判别数据源，三条路径）
 
-第一步：判别当前 figma MCP 是哪套（docs/figma_mcp.md）。目标环境不明时用 ask_clarification 问一次（决定 §4 分支）。
+第一步：若 builtin `figma` 工具（local-figma，Figma Desktop + 插件）已连接绑定文件，走下方 local-figma 路径；否则判别当前 figma MCP 是哪套（docs/figma_mcp.md），目标环境不明时用 ask_clarification 问一次（决定 §4 分支）。
 
 **社区版 figma-developer-mcp（默认，PAT）——只有 2 个工具：**
 - `figma__get_figma_data`：唯一的结构/样式来源。URL 里 `?node-id=1-2` → nodeId `1:2`（破折号换冒号）；大画布按 section 分次调用
@@ -19,6 +19,11 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 **官方远程 mcp.figma.com（§三 变通路径，41 工具）：**
 - `get_metadata` 定位 → `get_design_context` 分块取数 → `get_variable_defs` 取变量表（token 映射唯一依据）→ `get_screenshot` 视觉核对
+
+**local-figma（builtin `figma` 工具，本机 Figma Desktop）：**
+- `figma` action=inspect 是结构/样式唯一来源（Auto Layout、完整文字、填充、间距字段最全），action=design_system 补设计系统概览，action=preview 出 PNG 供视觉核对
+- 已连接同一绑定文件时优先此路径：改稿与提类读写同一实况文档，不漂移
+- inspect 仅含 boundVariables 引用，变量名/解析值不可靠 → 按社区版降级规则（§2）处理：吸附标准刻度，品牌色用实测 hex 给 `@theme` 行并注明核对命名
 
 共享取数细节（URL 解析、分块、token 优先原则）见 figma-ui 的 Workflow A。
 
