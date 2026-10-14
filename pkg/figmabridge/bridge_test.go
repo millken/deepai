@@ -322,12 +322,15 @@ func TestGeneratePlugin(t *testing.T) {
 	if strings.Contains(string(ui), "SESSION_CONFIG") {
 		t.Fatal("SESSION_CONFIG placeholder must be replaced")
 	}
-	// Figma 按请求 URL 对照 devAllowedDomains：fetch 主机与允许列表必须同源，否则轮询被拒。
+	// Figma 的 manifest 校验器要求 devAllowedDomains 为合法主机名——IP 字面量
+	// (http://127.0.0.1:...) 会在导入/运行时报 Invalid value 拒绝(#23 round-2 回归,
+	// 2026-10-14 实机复现)。因此 manifest 与 ui fetch 统一用 localhost(回环等价),
+	// 仍需同源以过 Figma 的请求 URL 对照。
 	domains := m["networkAccess"].(map[string]any)["devAllowedDomains"].([]any)
-	if len(domains) != 1 || domains[0] != "http://127.0.0.1:43187" {
+	if len(domains) != 1 || domains[0] != "http://localhost:43187" {
 		t.Fatalf("devAllowedDomains = %v", domains)
 	}
-	if !strings.Contains(string(ui), "http://127.0.0.1:") || strings.Contains(string(ui), "http://localhost:") {
+	if !strings.Contains(string(ui), "http://localhost:") || strings.Contains(string(ui), "http://127.0.0.1:") {
 		t.Fatal("ui.html fetch host must match devAllowedDomains")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "plugin", "main.js")); err != nil {

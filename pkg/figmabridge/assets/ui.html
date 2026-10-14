@@ -16,7 +16,7 @@ const config = SESSION_CONFIG;
 const status = document.querySelector('[role=status]');
 
 async function request(route, body) {
-  const response = await fetch('http://127.0.0.1:' + config.port + route, {
+  const response = await fetch('http://localhost:' + config.port + route, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
     body: JSON.stringify(body),
