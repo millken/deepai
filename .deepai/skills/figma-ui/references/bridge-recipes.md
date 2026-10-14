@@ -597,6 +597,47 @@ function checkControl(n, kind) {
   controls.push(m);
 }
 
+// 胶囊(pill/chip/tag):几何识别(圆角≥高/2 且宽>高),不依赖命名——V2HUB 实测
+// chip 被 AUTO 收缩到 13px 贴文字、tag 文字未垂直居中均靠这两条拦下。
+const pillLike = n => (n.type === 'FRAME' || n.type === 'COMPONENT') && get(n, 'layoutMode') === 'HORIZONTAL' && get(n, 'cornerRadius') >= n.height / 2 - 1 && n.width > n.height + 4 && n.height >= 10 && n.height <= 44;
+function checkPill(n) {
+  if (n.height < 18) { err(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' < 18(counterAxis AUTO 收缩贴文字;用上下 padding 撑高,勿定宽定高)'); return; }
+  for (const t of textNodes(n)) {
+    const dy = r1(cy(t.absoluteBoundingBox) - cy(n.absoluteBoundingBox));
+    if (Math.abs(dy) > 1) err(n, 'pillOffY', '胶囊文字垂直偏离中心 ' + dy + 'px(counterAxisAlignItems=CENTER)');
+  }
+}
+// 图标+文字小栈(tab item 等):宽≤80 高≤64、2–3 子级、恰一个方形图标框+一个文字。
+// 对 layoutMode=NONE 的绝对定位栈同样适用——V2HUB 实测 tab 文字偏离中心 26px 即此拦下。
+function checkStack(n) {
+  if (n.width > 80 || n.height > 64) return;
+  const kids = n.children.filter(c => c.visible !== false);
+  if (kids.length < 2 || kids.length > 3) return;
+  const icon = kids.find(c => c.type === 'FRAME' && c.width >= 14 && c.width <= 48 && !textNodes(c).length);
+  const label = kids.find(c => c.type === 'TEXT');
+  if (!icon || !label) return;
+  const dx = r1(cx(label.absoluteBoundingBox) - cx(n.absoluteBoundingBox));
+  if (Math.abs(dx) > 1) err(n, 'stackOffX', '栈文字水平偏离中心 ' + dx + 'px(counterAxisAlignItems=CENTER;NONE 布局按 (槽宽−文字宽)/2 绝对居中)');
+  const dxi = r1(cx(icon.absoluteBoundingBox) - cx(n.absoluteBoundingBox));
+  if (Math.abs(dxi) > 1) err(n, 'stackOffX', '栈图标水平偏离中心 ' + dxi + 'px');
+}
+// 图标框(14–32 方形、仅矢量):矢量联合 bbox 应充满图标框且不越界。
+// V2HUB 实测 createNodeFromSvg 对 A/a 圆弧解析出 13×39 畸形 bbox,即此拦下。
+function checkIcon(n) {
+  if (n.type !== 'FRAME' || Math.abs(n.width - n.height) > 1 || n.width < 14 || n.width > 32) return;
+  if (textNodes(n).length) return;
+  const vs = n.children.filter(c => c.type === 'VECTOR');
+  if (!vs.length) return;
+  const bs = vs.map(v => v.absoluteBoundingBox);
+  const u = { x: Math.min.apply(null, bs.map(b => b.x)), y: Math.min.apply(null, bs.map(b => b.y)) };
+  u.width = Math.max.apply(null, bs.map(b => b.x + b.width)) - u.x; u.height = Math.max.apply(null, bs.map(b => b.y + b.height)) - u.y;
+  const fb = n.absoluteBoundingBox;
+  if (u.x < fb.x - 1 || u.y < fb.y - 1 || u.x + u.width > fb.x + n.width + 1 || u.y + u.height > fb.y + n.height + 1)
+    err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 超出图标框 ' + r1(n.width) + '×' + r1(n.height) + '(SVG 导入畸变:查 A/a 圆弧,改 C 贝塞尔重写)');
+  else if (u.width < n.width * 0.6 || u.height < n.height * 0.6)
+    err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 未充满图标框 ' + r1(n.width) + '×' + r1(n.height) + '(<60%,疑似 arc 畸变导入)');
+}
+
 function checkVariants(set) {
   const groups = {};
   for (const c of set.children) {
@@ -639,7 +680,7 @@ async function walk(n, inControl) {
   if (n.type === 'COMPONENT_SET') checkVariants(n);
   let kind = null;
   if (!inControl) { kind = await kindOf(n); if (kind) checkControl(n, kind); }
-  if ('children' in n) { checkLayout(n); for (const c of n.children) await walk(c, inControl || !!kind); }
+  if ('children' in n) { checkLayout(n); if (!inControl) { if (pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
 }
 await walk(target, false);
 return {
@@ -649,5 +690,5 @@ return {
 };
 ```
 
-读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐;页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
+读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐、胶囊收缩/居中(`pillCollapsed`/`pillOffY`)、图标栈居中(`stackOffX`)、图标矢量畸变(`iconBBox`);页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
 `pass:false` 时逐条按 `[code]` 修(多半是重建为规格化 auto-layout,而不是挪坐标),改完**对同一子树重跑**直到 `pass:true`;最多 3 轮仍不过,带着 `errors` 原文与 `controls` 量测表向用户报告。`warn` 需要逐条给出「有意为之」的理由或修掉。`controls` 每行是控件的实测数据(尺寸、内边距、`font`、`fs_h` 字号/高度比、`padX_h`、`dx/dy` 几何偏移、`dyInk` 字形偏移、`contrast`),交付时原样列给用户。
