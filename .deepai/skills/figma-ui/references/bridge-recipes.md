@@ -602,12 +602,14 @@ function checkControl(n, kind) {
 const pillLike = n => { const r = get(n, 'cornerRadius'); return (n.type === 'FRAME' || n.type === 'COMPONENT') && get(n, 'layoutMode') === 'HORIZONTAL' && typeof r === 'number' && r >= n.height / 2 - 1 && n.width > n.height + 4 && n.height >= 10 && n.height <= 44; };
 function checkPill(n) {
   // 真收缩特征:上下 padding 均为 0 且高度≈文字行高(AUTO 贴文字);仅高<18 降为 warn(16px 角标/紧凑 tag 合法)
-  const lh = Math.max.apply(null, textNodes(n).map(t => { const l = get(t, 'lineHeight'); return l && l !== figma.mixed && l.unit === 'PIXELS' ? l.value : t.height; }));
+  const texts = textNodes(n);
+  if (!texts.length) { if (n.height < 18) warn(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' < 18 且无文字(纯图标胶囊,确认非收缩)'); return; }
+  const lh = Math.max.apply(null, texts.map(t => { const l = get(t, 'lineHeight'); return l && l !== figma.mixed && l.unit === 'PIXELS' ? l.value : t.height; }));
   if (get(n, 'paddingTop') === 0 && get(n, 'paddingBottom') === 0 && Math.abs(n.height - lh) <= 2)
     err(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' ≈ 文字高且无上下 padding(counterAxis AUTO 收缩贴文字;用上下 padding 撑高,勿定宽定高)');
   else if (n.height < 18)
     warn(n, 'pillCollapsed', '胶囊高 ' + r1(n.height) + ' < 18(紧凑角标/tag 属合法,确认非收缩)');
-  for (const t of textNodes(n)) {
+  for (const t of texts) {
     const dy = r1(cy(t.absoluteBoundingBox) - cy(n.absoluteBoundingBox));
     if (Math.abs(dy) > 1) err(n, 'pillOffY', '胶囊文字垂直偏离中心 ' + dy + 'px(counterAxisAlignItems=CENTER)');
   }
@@ -638,7 +640,7 @@ const GEOM_TYPES = ['VECTOR', 'ELLIPSE', 'RECTANGLE', 'LINE', 'POLYGON', 'STAR',
 function checkIcon(n) {
   if (n.type !== 'FRAME' || Math.abs(n.width - n.height) > 1 || n.width < 14 || n.width > 32) return;
   if (textNodes(n).length) return;
-  const vs = n.children.filter(c => c.type === 'VECTOR' || GEOM_TYPES.includes(c.type));
+  const vs = n.children.filter(c => c.visible !== false && GEOM_TYPES.includes(c.type));
   if (!vs.length) return;
   if (n.children.some(c => c.visible !== false && !GEOM_TYPES.includes(c.type))) return;
   const bs = vs.map(v => v.absoluteBoundingBox);
@@ -693,7 +695,7 @@ async function walk(n, inControl) {
   if (n.type === 'COMPONENT_SET') checkVariants(n);
   let kind = null;
   if (!inControl) { kind = await kindOf(n); if (kind) checkControl(n, kind); }
-   if ('children' in n) { checkLayout(n); if (!inControl) { if (!kind && pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
+  if ('children' in n) { checkLayout(n); if (!inControl) { if (!kind && pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
 }
 await walk(target, false);
 return {
