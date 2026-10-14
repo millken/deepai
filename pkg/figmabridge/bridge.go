@@ -25,7 +25,9 @@ const (
 	pollFreshSecs  = 30
 	// delivered 无结果且持续断连超此时长 → Submit 时自动转待核实（与重启恢复同终态，免重启）
 	reapDisconnect = 5 * time.Minute
-	waitInterval   = 250 * time.Millisecond
+	// 终态证据保留期：桥启动时清理更早的 run 目录；待核实与在途任务是恢复协议的权威证据，永不清。
+	runsRetention = 7 * 24 * time.Hour
+	waitInterval  = 250 * time.Millisecond
 )
 
 type Job struct {
@@ -92,6 +94,7 @@ func New(dir string, binding Binding, token string) (*Bridge, error) {
 	if err := b.recoverRuns(); err != nil {
 		return nil, err
 	}
+	b.pruneRuns()
 	return b, nil
 }
 
@@ -220,27 +223,38 @@ func (b *Bridge) Retarget(binding Binding) error {
 	return nil
 }
 
+// runEntries 列出 runs 下形如任务 ID 的子目录；目录不存在视为空。
+func (b *Bridge) runEntries() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(b.dir, "runs"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && jobIDRe.MatchString(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
 // recoverRuns 重建中断现场：已领取未回传的任务进入 unresolved（阻断写入，
 // 待核实后 ack）；从未领取的任务作废。磁盘是唯一权威证据。
 func (b *Bridge) recoverRuns() error {
-	runsDir := filepath.Join(b.dir, "runs")
-	entries, err := os.ReadDir(runsDir)
-	if os.IsNotExist(err) {
-		return nil
-	}
+	ids, err := b.runEntries()
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if !e.IsDir() || !jobIDRe.MatchString(e.Name()) {
-			continue
-		}
-		jpath := filepath.Join(runsDir, e.Name(), "job.json")
+	for _, id := range ids {
+		jpath := filepath.Join(b.runDir(id), "job.json")
 		var job Job
 		if err := readJSON(jpath, &job); err != nil {
 			return fmt.Errorf("任务记录损坏 %s：%w", jpath, err)
 		}
-		if _, err := os.Stat(filepath.Join(runsDir, e.Name(), "result.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(b.runDir(id), "result.json")); err == nil {
 			continue
 		}
 		switch job.State {
@@ -256,6 +270,42 @@ func (b *Bridge) recoverRuns() error {
 		}
 	}
 	return nil
+}
+
+// pruneRuns 清理超过保留期的终态证据目录（含 preview PNG）。终态 = 已有
+// result.json（done/failed/含崩溃窗口的 delivered）或 cancelled/acknowledged；
+// delivered 无 result 的任务可能仍在待核实，绝不触碰。删除失败静默跳过——
+// 清理是尽力的，不能阻断桥启动。
+func (b *Bridge) pruneRuns() {
+	cutoff := time.Now().Add(-runsRetention)
+	ids, err := b.runEntries()
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		dir := b.runDir(id)
+		var job Job
+		if readJSON(filepath.Join(dir, "job.json"), &job) != nil {
+			continue
+		}
+		_, statErr := os.Stat(filepath.Join(dir, "result.json"))
+		hasResult := statErr == nil
+		if !hasResult && job.State != "cancelled" && job.State != "acknowledged" {
+			continue
+		}
+		finished := job.FinishedAt
+		if finished == "" && hasResult {
+			var res JobResult
+			if readJSON(filepath.Join(dir, "result.json"), &res) == nil {
+				finished = res.FinishedAt
+			}
+		}
+		t, err := time.Parse(time.RFC3339, finished)
+		if err != nil || t.After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(dir)
+	}
 }
 
 var jobIDRe = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -618,6 +668,7 @@ func (b *Bridge) Ack(id, inspectJobID, note string) error {
 		jobCopy = new(Job)
 		*jobCopy = *job
 		jobCopy.State = "acknowledged"
+		jobCopy.FinishedAt = nowISO()
 	}
 	if jobCopy != nil {
 		if err := writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), *jobCopy, 0o600); err != nil {
@@ -634,17 +685,13 @@ func (b *Bridge) Ack(id, inspectJobID, note string) error {
 }
 
 func (b *Bridge) History() []Job {
-	runsDir := filepath.Join(b.dir, "runs")
-	entries, err := os.ReadDir(runsDir)
+	ids, err := b.runEntries()
 	if err != nil {
 		return nil
 	}
 	var jobs []Job
-	for _, e := range entries {
-		if !e.IsDir() || !jobIDRe.MatchString(e.Name()) {
-			continue
-		}
-		if job, err := b.JobByID(e.Name()); err == nil {
+	for _, id := range ids {
+		if job, err := b.JobByID(id); err == nil {
 			jobs = append(jobs, job)
 		}
 	}

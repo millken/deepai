@@ -507,3 +507,53 @@ func TestBridge_ReapAndLateCompleteUnlock(t *testing.T) {
 		t.Fatalf("write after late complete: %v", err)
 	}
 }
+
+// P0：runs 只增不减的回归——启动清理仅回收超过保留期的终态证据；待核实
+// （delivered 无 result）与未到期任务必须完整保留并维持阻断语义。
+func TestBridge_PruneRuns(t *testing.T) {
+	dir := t.TempDir()
+	ago := func(days int) string {
+		return time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02T15:04:05Z")
+	}
+	seed := func(id, state, finished string, withResult bool) {
+		t.Helper()
+		rd := filepath.Join(dir, "runs", id)
+		if err := os.MkdirAll(rd, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		job := Job{ID: id, FileKey: "KEY", NodeID: "1:2", State: state, SubmittedAt: ago(9), FinishedAt: finished}
+		if err := writeJSONAtomic(filepath.Join(rd, "job.json"), job, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if withResult {
+			if err := writeJSONAtomic(filepath.Join(rd, "result.json"), JobResult{ID: id, OK: true, FinishedAt: finished}, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	oldDone := strings.Repeat("a", 32)
+	recentDone := strings.Repeat("b", 32)
+	oldUnresolved := strings.Repeat("c", 32)
+	oldCancelled := strings.Repeat("d", 32)
+	oldAcked := strings.Repeat("e", 32)
+	seed(oldDone, "done", ago(8), true)
+	seed(recentDone, "done", ago(1), true)
+	seed(oldUnresolved, "delivered", ago(8), false)
+	seed(oldCancelled, "cancelled", ago(8), false)
+	seed(oldAcked, "acknowledged", ago(8), false)
+
+	b, err := New(dir, Binding{FileKey: "KEY", NodeID: "1:2"}, "testtoken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{recentDone: true, oldUnresolved: true}
+	for _, id := range []string{oldDone, recentDone, oldUnresolved, oldCancelled, oldAcked} {
+		_, statErr := os.Stat(filepath.Join(dir, "runs", id))
+		if exists := statErr == nil; exists != kept[id] {
+			t.Fatalf("run %s exists=%v want kept=%v", id, exists, kept[id])
+		}
+	}
+	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
+		t.Fatalf("unresolved must survive prune and block writes: %v", err)
+	}
+}
