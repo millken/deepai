@@ -23,6 +23,8 @@ const (
 	listenAddr     = "127.0.0.1:43187"
 	requestMaxByte = 8 << 20
 	pollFreshSecs  = 30
+	// delivered 无结果且持续断连超此时长 → Submit 时自动转待核实（与重启恢复同终态，免重启）
+	reapDisconnect = 5 * time.Minute
 	waitInterval   = 250 * time.Millisecond
 )
 
@@ -291,7 +293,8 @@ func reply(w http.ResponseWriter, status int, v any) {
 func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
-		Client string `json:"client"`
+		Client    string `json:"client"`
+		Heartbeat bool   `json:"heartbeat"` // 执行期心跳：只刷新连接新鲜度，不领取任务
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		reply(w, http.StatusBadRequest, map[string]any{"error": "请求体无效"})
@@ -300,10 +303,12 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	b.lastPoll = time.Now()
 	var deliver *Job
-	for _, job := range b.jobs {
-		if job.State == "queued" {
-			deliver = job
-			break
+	if !body.Heartbeat {
+		for _, job := range b.jobs {
+			if job.State == "queued" {
+				deliver = job
+				break
+			}
 		}
 	}
 	var code []byte
@@ -362,6 +367,10 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	job := b.jobs[msg.ID]
 	complete := job != nil && job.State == "delivered"
+	if complete {
+		// 迟到回传同样解除待核实：result.json 落盘即最终证据，无需再走 ack。
+		delete(b.unresolved, msg.ID)
+	}
 	b.mu.Unlock()
 	if !complete {
 		reply(w, http.StatusConflict, map[string]any{"error": "任务不在待回传状态"})
@@ -435,6 +444,16 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		return nil, fmt.Errorf("目标节点 ID 需形如 1:2（收到 %q）", targetNodeID)
 	}
 	b.mu.Lock()
+	// 假死收割：面板断连超阈值且 delivered 无结果，Submit 时自动转待核实。
+	// 心跳修复后存活面板在执行期也轮询，lastPoll 陈旧即面板真亡；免重启即可走
+	// inspect+ack 解锁（此前唯一出路是重启 deepai，而重启会杀掉会话——真实死锁）。
+	if !b.lastPoll.IsZero() && time.Since(b.lastPoll) > reapDisconnect {
+		for _, job := range b.jobs {
+			if job.State == "delivered" && !b.unresolved[job.ID] {
+				b.unresolved[job.ID] = true
+			}
+		}
+	}
 	if len(b.unresolved) > 0 && !inspectOnly {
 		ids := make([]string, 0, len(b.unresolved))
 		for id := range b.unresolved {
@@ -509,7 +528,7 @@ func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) Wai
 				if job.State == "queued" {
 					instr = fmt.Sprintf("插件面板未连接，任务 %s 已入队未被领取：重开插件面板后会自动执行，届时用 result %s 读回；不要重复提交", id, id)
 				} else {
-					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；面板已关则重启 deepai，任务转待核实后用 inspect:true run + ack 解锁", id, id)
+					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；持续断连超过 %s 后任务自动转待核实，用 inspect:true run + ack 解锁（无需重启 deepai）", id, id, reapDisconnect)
 				}
 			}
 			return WaitOutcome{WaitStatus: "timeout", Job: job, Instruction: instr}

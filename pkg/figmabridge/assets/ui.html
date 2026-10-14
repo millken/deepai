@@ -39,15 +39,15 @@ async function tick() {
       pendingResult = null;
       busy = false;
     }
-    if (!busy) {
-      const job = await request('/poll', { client: 'deepai-plugin' });
-      if (job) {
-        busy = true;
-        status.textContent = '执行中：' + (job.id || '');
-        parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
-      } else {
-        status.textContent = '已连接 deepai';
-      }
+    // 执行期也持续轮询作心跳（heartbeat:true 只刷新连接新鲜度、不领取任务）：
+    // 此前 busy 时停发 poll，超过 pollFreshSecs 的执行会让桥误判断连（超时误报 + 假死收割）。
+    const job = await request('/poll', { client: 'deepai-plugin', heartbeat: busy });
+    if (job) {
+      busy = true;
+      status.textContent = '执行中：' + (job.id || '');
+      parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
+    } else if (!busy) {
+      status.textContent = '已连接 deepai';
     }
   } catch (e) {
     status.textContent = '等待连接 deepai…';
