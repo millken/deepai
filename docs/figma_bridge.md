@@ -27,7 +27,7 @@
 
 - 插件**导入一次长期有效**：配对凭证持久化在状态目录，deepai 重启后无需重导，插件面板重新打开即可重连。
 - 使用期间保持插件面板开启、目标文件在前台（后台时轮询降频，任务回传可能延迟）。
-- 换目标文件或画板：删除状态目录下的 `binding.json` 后重新 init（deepai 会在冲突时给出同样指引），并在 Figma 重新导入生成的插件。
+- 换目标文件或画板：直接对 deepai 说新链接重新 init——桥空闲时自动热切换（内存绑定、插件下发与 binding.json 同步更新）；有在途任务或未决核实时拒绝切换并提示先处理。
 - 端口 43187 被占用时报错会提示：本机若装过 figma-local CLI 并在运行，先停其一。
 
 ## 三、Agent 用法（内置 `figma` 工具）
@@ -38,10 +38,10 @@
 |---|---|---|
 | `init` | `url` | 绑定画板链接，生成插件并返回 manifest 路径与导入指引 |
 | `doctor` / `status` | — | 桥健康、插件连接新鲜度、当前任务与绑定信息 |
-| `run` | `code`, `node?`, `timeout?` | 提交 JS 并等待（默认 150s，上限 600s）；结果含 output、before/after 结构快照（超长截断标记）、`preview` PNG 绝对路径、证据目录 |
+| `run` | `code`, `node?`, `inspect?`, `timeout?` | 提交 JS 并等待（默认 150s，上限 600s）；结果含 output、before/after 结构快照（超长截断标记）、`preview` PNG 绝对路径、证据目录；`inspect:true` 为只读核实通道（见 §四） |
 | `result` | `job_id` | 读回任务证据（插件断线后依然可读） |
 | `history` | — | 全部任务列表 |
-| `ack` | `job_id`, `note` | 解除「结果未知」阻断（见 §四） |
+| `ack` | `job_id`, `inspect_job_id`, `note` | 解除「结果未知」阻断（见 §四） |
 
 标准片段：
 
@@ -57,7 +57,7 @@
 
 - **任务单飞**：同一时刻只有一个在途任务；未读回结果前提交新任务会被拒绝。
 - **绝不重放**：等待超时≠失败（任务未被取消）。用 `result <job_id>` 读回，或稍后再等；不要重复提交同一修改。
-- **结果未知阻断**：任务已交付但 deepai 中断、结果未落盘时，该任务进入 unresolved 并阻断一切新写入。解锁流程：
-  1. `run` 提交一段只读脚本（如 `return null`）核实文档现状；
-  2. `figma ack <job_id> <核实说明>` 记录观察结论（如「inspect 确认仅按钮文字变化，无其他改动」），写入即解除阻断。
+- **结果未知阻断**：任务已交付但 deepai 中断、结果未落盘时，该任务进入 unresolved 并阻断一切新写入（普通 run 一律被拒）。解锁流程：
+  1. `run`（`inspect:true`）提交一段只读脚本（如 `return null`）核实文档现状，等待其完成；
+  2. `ack` 附上该核实任务 ID 与观察结论：`figma ack <job_id> <inspect_job_id> <核实说明>`（如「inspect 确认仅按钮文字变化，无其他改动」）；核实任务未完成时 ack 被拒，两份证据落盘后才解除阻断。
 - 证据目录（`~/Library/Application Support/deepai/figma/runs/<job_id>/`）保存每次任务的 script.js、result.json、preview.png，可随时人工检视。

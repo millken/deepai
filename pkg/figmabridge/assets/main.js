@@ -33,13 +33,17 @@ function snapshot(node, depth, budget) {
       padding: [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft] };
   }
   if (typeof node.cornerRadius === 'number' && node.cornerRadius) out.cornerRadius = node.cornerRadius;
-  if (node.children && depth < SNAPSHOT_MAX_DEPTH) {
-    out.children = [];
-    for (const child of node.children) {
-      if (budget.count >= SNAPSHOT_MAX_NODES) { out.truncated = true; break; }
-      out.children.push(snapshot(child, depth + 1, budget));
+  if (node.children) {
+    if (depth >= SNAPSHOT_MAX_DEPTH) {
+      out.truncated = true;
+    } else {
+      out.children = [];
+      for (const child of node.children) {
+        if (budget.count >= SNAPSHOT_MAX_NODES) { out.truncated = true; break; }
+        out.children.push(snapshot(child, depth + 1, budget));
+      }
+      if (!out.truncated && out.children.length < node.children.length) out.truncated = true;
     }
-    if (!out.truncated && out.children.length < node.children.length) out.truncated = true;
   }
   return out;
 }
@@ -47,7 +51,8 @@ function snapshot(node, depth, budget) {
 const boundedSnapshot = node => snapshot(node, 0, { count: 0 });
 
 async function locateTarget(job) {
-  if (figma.fileKey !== job.binding.fileKey)
+  // 本地打开的 .fig 无 fileKey（undefined）：放行，靠 nodeId 兜底；云端文件仍严格匹配。
+  if (figma.fileKey && figma.fileKey !== job.binding.fileKey)
     throw Error('当前文件与绑定不一致：' + figma.fileKey + ' ≠ ' + job.binding.fileKey + '；请在正确文件中运行插件');
   const root = await figma.getNodeByIdAsync(job.binding.nodeId);
   if (!root) throw Error('绑定节点不存在：' + job.binding.nodeId + '；请重新 init');
@@ -71,9 +76,9 @@ async function execute(job) {
     const raw = await new Function('figma', 'target', 'return (async()=>{\n' + job.code + '\n})()')(figma, target);
     try { if (typeof figma.commitUndo === 'function') figma.commitUndo(); } catch {}
     const after = target.removed ? null : boundedSnapshot(target);
-    // exportAsync 返回 Uint8Array 按预览图通道回传，其余必须可 JSON 序列化。
+    // exportAsync 返回 Uint8Array 按预览图通道回传（ui 侧转 base64 压缩体积），仍携带 before/after 结构证据。
     if (raw instanceof Uint8Array) {
-      figma.ui.postMessage({ type: 'result', id: job.id, ok: true, png: Array.from(raw) });
+      figma.ui.postMessage({ type: 'result', id: job.id, ok: true, png: raw, before, after });
       return;
     }
     let output;

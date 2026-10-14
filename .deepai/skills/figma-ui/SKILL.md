@@ -77,8 +77,9 @@ Bound via the embedded bridge: `run` {code:'return null'} reads the full structu
 3. After writing, ALWAYS fetch a fresh PNG (`run` exportAsync) to confirm
    what actually changed — report the visual result, not "done".
 4. Never replay an uncertain job: on timeout read it back (result); a
-   delivered job with no result blocks new writes until a read-only
-   inspect `run` + `ack` records what was verified.
+   delivered job with no result blocks new writes until a completed
+   read-only verification run (`run` with inspect:true) +
+   `ack(job_id, inspect_job_id, note)` records what was verified.
 
 ## Workflow C — verify / iterate an existing implementation
 
@@ -114,8 +115,8 @@ Bound via the embedded bridge: `run` {code:'return null'} reads the full structu
    step: read output/before/after, fresh PNG preview.
 5. Recovery discipline: jobs are single-flight and never replayed. Timeout
    → read the job back (result); a delivered job with no result blocks new
-   writes until a read-only inspect `run` + `figma ack` records what was
-   verified.
+   writes until a completed inspect:true `run` +
+   `figma ack(job_id, inspect_job_id, note)` records what was verified.
 6. Template handoff (design settles): structure snapshot + PNG as ground
    truth, assets via exportAsync run scripts; deliver the reusable code
    template + Tailwind class list per figma-tailwind rules. The design
@@ -137,5 +138,6 @@ Bound via the embedded bridge: `run` {code:'return null'} reads the full structu
   it at figma.com → Settings → Security.
 - figma bridge jobs are single-flight and never replayed; on unknown outcome
   read the job back first — never resubmit the same edit.
-- Never invent verification: an ack note must state what was actually
-  observed in the document, never a rubber stamp.
+- Never invent verification: an ack requires a completed inspect:true run
+  (its job ID) and a note stating what was actually observed in the
+  document, never a rubber stamp.

@@ -2,6 +2,7 @@ package figmabridge
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -66,7 +67,7 @@ func TestBridge_AuthReject(t *testing.T) {
 
 func TestBridge_JobLifecycle(t *testing.T) {
 	b := newTestBridge(t)
-	job, err := b.Submit("return 1+1", "")
+	job, err := b.Submit("return 1+1", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestBridge_JobLifecycle(t *testing.T) {
 	}
 
 	// 单任务串行：active 未决时拒绝新提交。
-	if _, err := b.Submit("return 2", ""); err == nil || !strings.Contains(err.Error(), "尚未完成") {
+	if _, err := b.Submit("return 2", "", false); err == nil || !strings.Contains(err.Error(), "尚未完成") {
 		t.Fatalf("want single-flight rejection, got %v", err)
 	}
 
@@ -105,21 +106,17 @@ func TestBridge_JobLifecycle(t *testing.T) {
 		t.Fatalf("result = %+v, %v", result, err)
 	}
 	// 完成后可提交新任务。
-	if _, err := b.Submit("return 3", ""); err != nil {
+	if _, err := b.Submit("return 3", "", false); err != nil {
 		t.Fatalf("submit after completion: %v", err)
 	}
 }
 
 func TestBridge_PreviewPNG(t *testing.T) {
 	b := newTestBridge(t)
-	job, _ := b.Submit("return await target.exportAsync({format:'PNG'})", "")
+	job, _ := b.Submit("return await target.exportAsync({format:'PNG'})", "", false)
 	pollAs(t, b, "testtoken")
 	png := []byte{0x89, 0x50, 0x4E, 0x47}
-	arr := make([]string, len(png))
-	for i, v := range png {
-		arr[i] = fmt.Sprintf("%d", v)
-	}
-	payload := fmt.Sprintf(`{"id":%q,"ok":true,"png":[%s]}`, job.ID, strings.Join(arr, ","))
+	payload := fmt.Sprintf(`{"id":%q,"ok":true,"pngB64":%q,"before":{"id":"1:2"},"after":{"id":"1:2"}}`, job.ID, base64.StdEncoding.EncodeToString(png))
 	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
 		t.Fatalf("complete status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -127,17 +124,20 @@ func TestBridge_PreviewPNG(t *testing.T) {
 	if err != nil || !bytes.Equal(data, png) {
 		t.Fatalf("preview = %v, %v", data, err)
 	}
-	// 非法字节拒绝。
-	job2, _ := b.Submit("x", "")
+	result, _ := b.Result(job.ID)
+	if len(result.Before) == 0 || len(result.After) == 0 {
+		t.Fatalf("png result must still carry before/after: %+v", result)
+	}
+	job2, _ := b.Submit("x", "", false)
 	pollAs(t, b, "testtoken")
-	if rec := completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":true,"png":[300]}`, job2.ID)); rec.Code != 400 {
+	if rec := completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":true,"pngB64":"!!!"}`, job2.ID)); rec.Code != 400 {
 		t.Fatalf("invalid png want 400, got %d", rec.Code)
 	}
 }
 
 func TestBridge_WaitCompletes(t *testing.T) {
 	b := newTestBridge(t)
-	job, _ := b.Submit("return 42", "")
+	job, _ := b.Submit("return 42", "", false)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		pollAs(t, b, "testtoken")
@@ -151,14 +151,15 @@ func TestBridge_WaitCompletes(t *testing.T) {
 
 func TestBridge_WaitTimeout(t *testing.T) {
 	b := newTestBridge(t)
-	job, _ := b.Submit("slow", "")
+	job, _ := b.Submit("slow", "", false)
 	outcome := b.Wait(t.Context(), job.ID, 300*time.Millisecond)
 	if outcome.WaitStatus != "timeout" || outcome.Instruction == "" {
 		t.Fatalf("outcome = %+v", outcome)
 	}
 }
 
-// delivered 无 result = 不确定态：重启恢复后进入 unresolved，阻断写入，ack 后解锁。
+// delivered 无 result = 不确定态：重启恢复后进入 unresolved。完整解锁流程：
+// 普通 run 被拒 → inspect run 放行并完成 → 未 ack 前写入仍被拒 → ack（带核实任务）→ 放行。
 func TestBridge_RecoveryAndAck(t *testing.T) {
 	dir := t.TempDir()
 	binding := Binding{ID: "b1", FileKey: "KEY", NodeID: "1:2"}
@@ -166,10 +167,9 @@ func TestBridge_RecoveryAndAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, _ := b1.Submit("mutate", "")
+	job, _ := b1.Submit("mutate", "", false)
 	pollAs(t, b1, "tok") // delivered
 
-	// 模拟进程中断：同一磁盘重建桥。
 	b2, err := New(dir, binding, "tok")
 	if err != nil {
 		t.Fatal(err)
@@ -178,27 +178,68 @@ func TestBridge_RecoveryAndAck(t *testing.T) {
 	if len(status.Unresolved) != 1 || status.Unresolved[0] != job.ID {
 		t.Fatalf("unresolved = %v", status.Unresolved)
 	}
-	if _, err := b2.Submit("write", ""); err == nil {
-		t.Fatal("write must be blocked while unresolved")
-	} else if !strings.Contains(err.Error(), "ack") {
-		t.Fatalf("blocked message should mention ack: %v", err)
+	if _, err := b2.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
+		t.Fatalf("normal run must be blocked with inspect hint: %v", err)
 	}
-	// 失败任务释放串行锁（无需 ack——ok=false 是确定终态）。
-	if err := b2.Ack(job.ID, ""); err == nil {
+	if err := b2.Ack(job.ID, "", "未核实"); err == nil {
+		t.Fatal("ack without inspect job must fail")
+	}
+	inspectJob, err := b2.Submit("return null", "", true)
+	if err != nil {
+		t.Fatalf("inspect run during unresolved: %v", err)
+	}
+	if err := b2.Ack(job.ID, inspectJob.ID, "过早"); err == nil || !strings.Contains(err.Error(), "尚无结果") {
+		t.Fatalf("ack before inspect completes must fail: %v", err)
+	}
+	pollAs(t, b2, "tok")
+	completeAs(t, b2, "tok", fmt.Sprintf(`{"id":%q,"ok":true,"output":null}`, inspectJob.ID))
+	if _, err := b2.Submit("write", "", false); err == nil {
+		t.Fatal("write must stay blocked until ack")
+	}
+	if err := b2.Ack(job.ID, inspectJob.ID, ""); err == nil {
 		t.Fatal("ack without note must fail")
 	}
-	if err := b2.Ack(job.ID, "inspect 确认仅按钮文字变化"); err != nil {
+	if err := b2.Ack(job.ID, inspectJob.ID, "inspect 确认仅按钮文字变化"); err != nil {
 		t.Fatalf("ack: %v", err)
 	}
-	if _, err := b2.Submit("write", ""); err != nil {
+	if _, err := b2.Submit("write", "", false); err != nil {
 		t.Fatalf("write after ack: %v", err)
 	}
-	if err := b2.Ack(job.ID, "again"); err == nil {
+	if err := b2.Ack(job.ID, inspectJob.ID, "again"); err == nil {
 		t.Fatal("double ack must fail")
 	}
 	ackData, _ := os.ReadFile(filepath.Join(dir, "runs", job.ID, "ack.json"))
-	if !strings.Contains(string(ackData), "仅按钮文字变化") {
+	if !strings.Contains(string(ackData), "仅按钮文字变化") || !strings.Contains(string(ackData), inspectJob.ID) {
 		t.Fatalf("ack note not persisted: %s", ackData)
+	}
+}
+
+// 换目标：在途任务拒绝；空闲时内存绑定、插件下发与 binding.json 同步更新。
+func TestBridge_Retarget(t *testing.T) {
+	b := newTestBridge(t)
+	if err := b.Retarget(Binding{FileKey: "KEY", NodeID: "1:2"}); err != nil {
+		t.Fatalf("same target: %v", err)
+	}
+	job, _ := b.Submit("pending", "", false)
+	if err := b.Retarget(Binding{FileKey: "OTHER", NodeID: "9:9"}); err == nil || !strings.Contains(err.Error(), "尚未完成") {
+		t.Fatalf("retarget with active job must fail: %v", err)
+	}
+	pollAs(t, b, "testtoken")
+	completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":true,"output":null}`, job.ID))
+	if err := b.Retarget(Binding{FileKey: "OTHER", NodeID: "9:9"}); err != nil {
+		t.Fatalf("retarget idle: %v", err)
+	}
+	if b.Status().Binding.FileKey != "OTHER" {
+		t.Fatalf("binding not updated: %+v", b.Status().Binding)
+	}
+	var onDisk Binding
+	if err := readJSON(filepath.Join(b.dir, "binding.json"), &onDisk); err != nil || onDisk.FileKey != "OTHER" {
+		t.Fatalf("binding.json = %+v, %v", onDisk, err)
+	}
+	_, _ = b.Submit("next", "", false)
+	delivered := pollAs(t, b, "testtoken")
+	if delivered["binding"].(map[string]any)["fileKey"] != "OTHER" {
+		t.Fatalf("poll binding = %v", delivered["binding"])
 	}
 }
 
@@ -206,7 +247,7 @@ func TestBridge_QueueCancelledOnRecovery(t *testing.T) {
 	dir := t.TempDir()
 	binding := Binding{ID: "b1", FileKey: "KEY", NodeID: "1:2"}
 	b1, _ := New(dir, binding, "tok")
-	job, _ := b1.Submit("never-delivered", "")
+	job, _ := b1.Submit("never-delivered", "", false)
 	_ = job
 	b2, err := New(dir, binding, "tok")
 	if err != nil {
@@ -283,7 +324,7 @@ func TestGeneratePlugin(t *testing.T) {
 
 func TestBridge_FailedResultCarriesEvidence(t *testing.T) {
 	b := newTestBridge(t)
-	job, _ := b.Submit("throw Error('boom')", "")
+	job, _ := b.Submit("throw Error('boom')", "", false)
 	pollAs(t, b, "testtoken")
 	payload := fmt.Sprintf(`{"id":%q,"ok":false,"error":"Error: boom","executionStarted":true,"after":{"id":"1:2"}}`, job.ID)
 	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
@@ -297,7 +338,7 @@ func TestBridge_FailedResultCarriesEvidence(t *testing.T) {
 		t.Fatalf("failed job is still a completed wait: %+v", outcome)
 	}
 	// 失败任务释放串行锁（无需 ack——ok=false 是确定终态）。
-	if _, err := b.Submit("next", ""); err != nil {
+	if _, err := b.Submit("next", "", false); err != nil {
 		t.Fatalf("failed job must release lock: %v", err)
 	}
 }

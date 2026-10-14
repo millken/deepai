@@ -59,6 +59,15 @@ async function tick() {
 onmessage = event => {
   const msg = event.data && event.data.pluginMessage;
   if (msg && msg.type === 'result') {
+    // Uint8Array 无法 JSON 序列化；分块转 base64 走 pngB64 通道（体积比数字数组小 4 倍）。
+    if (msg.png instanceof Uint8Array) {
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < msg.png.length; i += chunk)
+        binary += String.fromCharCode.apply(null, msg.png.subarray(i, i + chunk));
+      msg.pngB64 = btoa(binary);
+      delete msg.png;
+    }
     pendingResult = msg;
     status.textContent = '回传结果…';
   }

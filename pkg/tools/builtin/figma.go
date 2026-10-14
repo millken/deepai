@@ -43,11 +43,12 @@ func FigmaHandler(ctx context.Context, call models.ToolCall) (models.ToolResult,
 			return res, fmt.Errorf("code is required: JS executed as (figma, target), e.g. 'return null' to snapshot the target subtree")
 		}
 		node := strings.ReplaceAll(str("node"), "-", ":")
+		inspect, _ := args["inspect"].(bool)
 		timeout := float64(figmaRunWaitSecs)
 		if t, ok := args["timeout"].(float64); ok && t >= 1 && t <= figmaRunWaitMaxSecs {
 			timeout = t
 		}
-		return figmaRun(ctx, res, code, node, timeout)
+		return figmaRun(ctx, res, code, node, inspect, timeout)
 	case "result":
 		id := str("job_id")
 		if id == "" {
@@ -63,9 +64,12 @@ func FigmaHandler(ctx context.Context, call models.ToolCall) (models.ToolResult,
 		}
 		return figmaJSON(res, map[string]any{"action": "history", "jobs": b.History()})
 	case "ack":
-		id, note := str("job_id"), str("note")
+		id, inspectID, note := str("job_id"), str("inspect_job_id"), str("note")
 		if id == "" || note == "" {
 			return res, fmt.Errorf("job_id and note are required; note states what was verified in the document (an unresolved job blocks all writes until acknowledged)")
+		}
+		if inspectID == "" {
+			return res, fmt.Errorf("inspect_job_id is required: first complete a read-only verification run (figma run with inspect:true), then ack with that job")
 		}
 		b, err := figmabridge.Get()
 		if err != nil {
@@ -73,7 +77,7 @@ func FigmaHandler(ctx context.Context, call models.ToolCall) (models.ToolResult,
 			res.Error = err.Error()
 			return res, nil
 		}
-		if err := b.Ack(id, note); err != nil {
+		if err := b.Ack(id, inspectID, note); err != nil {
 			res.Status = models.CallStatusFailed
 			res.Error = err.Error()
 			return res, nil
@@ -124,14 +128,14 @@ func figmaStatus(res models.ToolResult, action string) (models.ToolResult, error
 	return figmaJSON(res, out)
 }
 
-func figmaRun(ctx context.Context, res models.ToolResult, code, node string, timeoutSecs float64) (models.ToolResult, error) {
+func figmaRun(ctx context.Context, res models.ToolResult, code, node string, inspect bool, timeoutSecs float64) (models.ToolResult, error) {
 	b, err := figmabridge.Get()
 	if err != nil {
 		res.Status = models.CallStatusFailed
 		res.Error = err.Error()
 		return res, nil
 	}
-	job, err := b.Submit(code, node)
+	job, err := b.Submit(code, node, inspect)
 	if err != nil {
 		res.Status = models.CallStatusFailed
 		res.Error = err.Error()
@@ -169,6 +173,11 @@ func figmaRun(ctx context.Context, res models.ToolResult, code, node string, tim
 	}
 	if outcome.Instruction != "" {
 		out["instruction"] = outcome.Instruction
+	}
+	// 超时/取消不是成功：任务未被取消，但本次调用必须显式失败，避免被当作已完成。
+	if outcome.WaitStatus != "completed" {
+		res.Status = models.CallStatusFailed
+		res.Error = outcome.Instruction
 	}
 	data, _ := json.Marshal(out)
 	res.Content = string(data)
@@ -217,19 +226,21 @@ func FigmaTool() models.Tool {
 		Name: "figma",
 		Description: "Drive native Figma editing via deepai's embedded local bridge (Figma Desktop plugin polls this process). JS is the interface: submit Figma Plugin-API scripts executed as (figma, target) on the bound frame subtree; results (output + before/after structure snapshots + optional preview.png) persist on disk as evidence. " +
 			"Standard snippets: read structure = run {code:'return null'} then read the before snapshot; screenshot = run {code:'return await target.exportAsync({format:\\\"PNG\\\"})'} — the result carries an absolute preview.png path. " +
-			"Actions: init(url) bind a frame link (with node-id) and emit the plugin manifest; doctor/status bridge health and connection; run(code, node?, timeout?) submit and wait (single-flight); result(job_id)/history read evidence; ack(job_id, note) release an unresolved job after verifying the document. " +
-			"Discipline: jobs are never replayed — on timeout read the job back (result/wait again); a delivered job with no result blocks new writes until run-inspect + ack.",
+			"Actions: init(url) bind a frame link (with node-id) and emit the plugin manifest; doctor/status bridge health and connection; run(code, node?, inspect?, timeout?) submit and wait (single-flight; inspect:true is the read-only verification pass allowed during an unresolved block); result(job_id)/history read evidence; ack(job_id, inspect_job_id, note) release an unresolved job after a completed verification run. " +
+			"Discipline: jobs are never replayed — on timeout read the job back (result); a delivered job with no result blocks new writes until a completed inspect:true run + ack.",
 		Groups: []string{"builtin"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action":  map[string]any{"type": "string", "enum": []string{"init", "doctor", "status", "run", "result", "history", "ack"}},
-				"url":     map[string]any{"type": "string", "description": "init: Figma frame link containing node-id"},
-				"code":    map[string]any{"type": "string", "description": "run: JS body executed as (figma, target); return a JSON-serializable value, or a Uint8Array from exportAsync for a preview image"},
-				"node":    map[string]any{"type": "string", "description": "run: target node ID like 1:2 within the bound subtree (default: bound frame itself)"},
-				"timeout": map[string]any{"type": "number", "description": "run: wait seconds 1-600 (default 150; plugin polls ~750ms when Figma is visible)"},
-				"job_id":  map[string]any{"type": "string", "description": "result/ack: job UUID"},
-				"note":    map[string]any{"type": "string", "description": "ack: what was verified in the document (e.g. inspect confirmed only the intended text changed)"},
+				"action":         map[string]any{"type": "string", "enum": []string{"init", "doctor", "status", "run", "result", "history", "ack"}},
+				"url":            map[string]any{"type": "string", "description": "init: Figma frame link containing node-id"},
+				"code":           map[string]any{"type": "string", "description": "run: JS body executed as (figma, target); return a JSON-serializable value, or a Uint8Array from exportAsync for a preview image"},
+				"inspect":        map[string]any{"type": "boolean", "description": "run: read-only verification pass — allowed while an unresolved job blocks writes; its job_id then feeds ack"},
+				"node":           map[string]any{"type": "string", "description": "run: target node ID like 1:2 within the bound subtree (default: bound frame itself)"},
+				"timeout":        map[string]any{"type": "number", "description": "run: wait seconds 1-600 (default 150; plugin polls ~750ms when Figma is visible)"},
+				"job_id":         map[string]any{"type": "string", "description": "result/ack: 32-hex job ID"},
+				"inspect_job_id": map[string]any{"type": "string", "description": "ack: job ID of the completed read-only verification run (inspect:true)"},
+				"note":           map[string]any{"type": "string", "description": "ack: what was verified in the document (e.g. inspect confirmed only the intended text changed)"},
 			},
 			"required": []string{"action"},
 		},

@@ -169,7 +169,7 @@ func GeneratePlugin(dir string, port int, token string, b Binding) (string, erro
 		"documentAccess": "dynamic-page",
 		"networkAccess": map[string]any{
 			"allowedDomains":    []string{"none"},
-			"devAllowedDomains": []string{fmt.Sprintf("http://localhost:%d", port)},
+			"devAllowedDomains": []string{fmt.Sprintf("http://127.0.0.1:%d", port)},
 		},
 	}
 	mpath := filepath.Join(pdir, "manifest.json")

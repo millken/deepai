@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,7 @@ const (
 type Job struct {
 	ID           string `json:"id"`
 	TargetNodeID string `json:"targetNodeId,omitempty"`
+	Inspect      bool   `json:"inspect,omitempty"`
 	FileKey      string `json:"fileKey"`
 	NodeID       string `json:"nodeId"`
 	State        string `json:"state"`
@@ -139,7 +141,7 @@ func Get() (*Bridge, error) {
 	return b, nil
 }
 
-// Init 绑定目标（重复绑定同目标幂等）并启动桥。
+// Init 绑定目标并启动桥；活桥存在时安全切换（在途/未决任务拒绝，空闲则热更新）。
 func Init(rawURL string) (*Bridge, error) {
 	binding, err := ParseFigmaURL(rawURL)
 	if err != nil {
@@ -149,15 +151,70 @@ func Init(rawURL string) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	bpath := filepath.Join(dir, "binding.json")
-	if existing, err := loadBinding(dir); err == nil {
-		if existing.FileKey != binding.FileKey || existing.NodeID != binding.NodeID {
-			return nil, fmt.Errorf("已绑定其他目标（%s node %s）；切换请先删除 %s 并在 Figma 重新导入插件", existing.FileKey, existing.NodeID, bpath)
+	mu.Lock()
+	live := activeBridge
+	mu.Unlock()
+	if live != nil {
+		if err := live.Retarget(binding); err != nil {
+			return nil, err
 		}
-	} else if err := writeJSONAtomic(bpath, binding, 0o600); err != nil {
+		return live, nil
+	}
+	bpath := filepath.Join(dir, "binding.json")
+	if existing, err := loadBinding(dir); err == nil && existing.FileKey == binding.FileKey && existing.NodeID == binding.NodeID {
+		return Get()
+	}
+	if err := writeJSONAtomic(bpath, binding, 0o600); err != nil {
 		return nil, err
 	}
 	return Get()
+}
+
+// Retarget 热切换绑定目标：仅在空闲（无在途任务、无未决核实）时允许，
+// 内存绑定、插件与 binding.json 同步更新，任一失败整体回滚。
+func (b *Bridge) Retarget(binding Binding) error {
+	b.mu.Lock()
+	if b.binding.FileKey == binding.FileKey && b.binding.NodeID == binding.NodeID {
+		b.mu.Unlock()
+		return nil
+	}
+	for _, job := range b.jobs {
+		if job.State == "queued" || job.State == "delivered" {
+			id, state := job.ID, job.State
+			b.mu.Unlock()
+			return fmt.Errorf("任务 %s 尚未完成（%s）：切换目标前先读回结果", id, state)
+		}
+	}
+	if len(b.unresolved) > 0 {
+		b.mu.Unlock()
+		return fmt.Errorf("存在结果未知任务，需先核实并 ack 后才能切换目标")
+	}
+	old := b.binding
+	b.binding = binding
+	b.mu.Unlock()
+	rollback := func() {
+		b.mu.Lock()
+		b.binding = old
+		b.mu.Unlock()
+	}
+	manifest, err := GeneratePlugin(b.dir, b.port, b.token, binding)
+	if err != nil {
+		rollback()
+		return err
+	}
+	if err := writeJSONAtomic(filepath.Join(b.dir, "binding.json"), binding, 0o600); err != nil {
+		if regen, rerr := GeneratePlugin(b.dir, b.port, b.token, old); rerr == nil {
+			b.mu.Lock()
+			b.manifest = regen
+			b.mu.Unlock()
+		}
+		rollback()
+		return err
+	}
+	b.mu.Lock()
+	b.manifest = manifest
+	b.mu.Unlock()
+	return nil
 }
 
 // recoverRuns 重建中断现场：已领取未回传的任务进入 unresolved（阻断写入，
@@ -248,7 +305,16 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	var code []byte
 	if deliver != nil {
+		// 先读脚本再标记交付：读失败时任务留在 queued，可重新领取。
+		var err error
+		code, err = os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
+		if err != nil {
+			b.mu.Unlock()
+			reply(w, http.StatusInternalServerError, map[string]any{"error": "脚本读取失败：" + err.Error()})
+			return
+		}
 		deliver.State = "delivered"
 		if err := writeJSONAtomic(filepath.Join(b.runDir(deliver.ID), "job.json"), *deliver, 0o600); err != nil {
 			deliver.State = "queued"
@@ -260,11 +326,6 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 	b.mu.Unlock()
 	if deliver == nil {
 		reply(w, http.StatusOK, nil)
-		return
-	}
-	code, err := os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
-	if err != nil {
-		reply(w, http.StatusInternalServerError, map[string]any{"error": "脚本读取失败：" + err.Error()})
 		return
 	}
 	reply(w, http.StatusOK, map[string]any{
@@ -290,7 +351,7 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 		After       json.RawMessage `json:"after"`
 		Error       string          `json:"error"`
 		ExecStarted bool            `json:"executionStarted"`
-		PNG         []float64       `json:"png"`
+		PNGB64      string          `json:"pngB64"`
 	}
 	if err := json.Unmarshal(raw, &msg); err != nil || !jobIDRe.MatchString(msg.ID) {
 		reply(w, http.StatusBadRequest, map[string]any{"error": "结果无效"})
@@ -308,14 +369,11 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 		ID: msg.ID, OK: msg.OK, Output: msg.Output, Before: msg.Before, After: msg.After,
 		Error: msg.Error, ExecStarted: msg.ExecStarted, FinishedAt: nowISO(),
 	}
-	if msg.OK && len(msg.PNG) > 0 {
-		png := make([]byte, len(msg.PNG))
-		for i, v := range msg.PNG {
-			if v < 0 || v > 255 || v != float64(int(v)) {
-				reply(w, http.StatusBadRequest, map[string]any{"error": "图像数据无效"})
-				return
-			}
-			png[i] = byte(int(v))
+	if msg.OK && msg.PNGB64 != "" {
+		png, err := base64.StdEncoding.DecodeString(msg.PNGB64)
+		if err != nil {
+			reply(w, http.StatusBadRequest, map[string]any{"error": "图像数据无效"})
+			return
 		}
 		if err := os.MkdirAll(b.runDir(job.ID), 0o700); err != nil {
 			reply(w, http.StatusInternalServerError, map[string]any{"error": "证据目录创建失败：" + err.Error()})
@@ -353,7 +411,7 @@ type SubmitError struct {
 
 func (e *SubmitError) Error() string { return e.Msg }
 
-func (b *Bridge) Submit(code, targetNodeID string) (*Job, error) {
+func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, error) {
 	if strings.TrimSpace(code) == "" {
 		return nil, fmt.Errorf("脚本不能为空")
 	}
@@ -361,18 +419,19 @@ func (b *Bridge) Submit(code, targetNodeID string) (*Job, error) {
 		return nil, fmt.Errorf("目标节点 ID 需形如 1:2（收到 %q）", targetNodeID)
 	}
 	b.mu.Lock()
-	if len(b.unresolved) > 0 {
+	if len(b.unresolved) > 0 && !inspectOnly {
 		ids := make([]string, 0, len(b.unresolved))
 		for id := range b.unresolved {
 			ids = append(ids, id)
 		}
 		b.mu.Unlock()
 		return nil, &SubmitError{Msg: fmt.Sprintf(
-			"上次任务 %s 结果未知，已阻断新写入：请先用 figma run 提交只读脚本核实现状，再 figma ack <job_id> <核实说明> 解锁", strings.Join(ids, ", ")),
+			"上次任务 %s 结果未知，已阻断新写入：请用 figma run（inspect:true）提交只读核实脚本并等待完成，再用 figma ack <job_id> <inspect_job_id> <核实说明> 解锁", strings.Join(ids, ", ")),
 			Unresolved: ids}
 	}
 	for _, job := range b.jobs {
-		if job.State == "queued" || job.State == "delivered" {
+		// 陈旧 delivered（恢复后的 unresolved）不占单飞名额，否则核实入口被自己挡住。
+		if (job.State == "queued" || job.State == "delivered") && !b.unresolved[job.ID] {
 			b.mu.Unlock()
 			return nil, fmt.Errorf("任务 %s 尚未完成（%s）：请先读回结果（result %s）", job.ID, job.State, job.ID)
 		}
@@ -383,7 +442,7 @@ func (b *Bridge) Submit(code, targetNodeID string) (*Job, error) {
 		return nil, err
 	}
 	job := &Job{
-		ID: hex.EncodeToString(idBuf), TargetNodeID: targetNodeID,
+		ID: hex.EncodeToString(idBuf), TargetNodeID: targetNodeID, Inspect: inspectOnly,
 		FileKey: b.binding.FileKey, NodeID: b.binding.NodeID,
 		State: "queued", SubmittedAt: nowISO(),
 	}
@@ -465,7 +524,9 @@ func (b *Bridge) PreviewPath(id string) string {
 	return p
 }
 
-func (b *Bridge) Ack(id, note string) error {
+// Ack 解除「结果未知」阻断：note 记录核实结论，inspectJobID 必须指向一个
+// 已落盘完成的核实任务。两份证据都写成功之后才解除阻断。
+func (b *Bridge) Ack(id, inspectJobID, note string) error {
 	if strings.TrimSpace(note) == "" {
 		return fmt.Errorf("ack 需要附带核实说明（当前文档现状与影响判断）")
 	}
@@ -474,21 +535,37 @@ func (b *Bridge) Ack(id, note string) error {
 		b.mu.Unlock()
 		return fmt.Errorf("任务 %s 不在待核实状态", id)
 	}
-	delete(b.unresolved, id)
-	job, hasJob := b.jobs[id]
-	if hasJob {
-		job.State = "acknowledged"
+	if inspectJobID == "" {
+		b.mu.Unlock()
+		return fmt.Errorf("ack 需要核实任务 ID：先用 figma run（inspect:true）提交只读脚本并等待完成")
 	}
-	var err error
-	if hasJob {
-		err = writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), *job, 0o600)
+	if _, err := b.Result(inspectJobID); err != nil {
+		b.mu.Unlock()
+		return fmt.Errorf("核实任务 %s 尚无结果：等待其完成后再 ack", inspectJobID)
+	}
+	var jobCopy *Job
+	if job, ok := b.jobs[id]; ok {
+		jobCopy = new(Job)
+		*jobCopy = *job
+		jobCopy.State = "acknowledged"
 	}
 	b.mu.Unlock()
-	if err != nil {
+	if jobCopy != nil {
+		if err := writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), *jobCopy, 0o600); err != nil {
+			return err
+		}
+	}
+	if err := writeJSONAtomic(filepath.Join(b.runDir(id), "ack.json"),
+		map[string]any{"id": id, "note": note, "inspectJobId": inspectJobID, "at": nowISO()}, 0o600); err != nil {
 		return err
 	}
-	return writeJSONAtomic(filepath.Join(b.runDir(id), "ack.json"),
-		map[string]any{"id": id, "note": note, "at": nowISO()}, 0o600)
+	b.mu.Lock()
+	delete(b.unresolved, id)
+	if job, ok := b.jobs[id]; ok {
+		job.State = "acknowledged"
+	}
+	b.mu.Unlock()
+	return nil
 }
 
 func (b *Bridge) History() []Job {
