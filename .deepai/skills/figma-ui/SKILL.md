@@ -171,11 +171,12 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   构建后必读 after 快照的 `layout.sizing` 确认。
 - **FILL 时机**:`layoutSizing*='FILL'` 只能在节点已 append 进 auto-layout 父级之后设置,否则抛错(新建空画板默认非 auto-layout,先 recipes §4 `ensureAuto`);
   `HUG` 只对 auto-layout 容器与文字有效。
- - **对齐语义**：控件居中首选正解是容器对齐属性——HORIZONTAL 容器的垂直居中、VERTICAL 容器的水平居中都是
-   `counterAxisAlignItems='CENTER'`，主轴用 `primaryAxisAlignItems`（实测批量设 102 个容器全部生效，偏差归零）。
-   字段名写错（如 `*AlignWidgets`）赋值不报错、读回 undefined，构建 ok 但视觉全错——写完读回确认。
-   仅当字段名正确仍不生效（罕见）或 `layoutMode='NONE'` 场景才用兜底：双 `layoutGrow=1` spacer / 文字
-   `layoutAlign='STRETCH'`+`textAlignVertical='CENTER'`，详见 recipes §6。
+- **对齐语义**:控件居中首选正解是容器对齐属性——HORIZONTAL 容器的垂直居中、VERTICAL 容器的水平居中都是
+  `counterAxisAlignItems='CENTER'`,主轴用 `primaryAxisAlignItems`(实测批量设 102 个容器全部生效,偏差归零);
+  容器对齐之外,固定宽/高文字节点内的字形居中由 `textAlignHorizontal`/`textAlignVertical` 控制。字段名写错
+  (如 `*AlignWidgets`)赋值不报错、读回 undefined,构建 ok 但视觉全错——写完读回确认。auto-layout 里字段名
+  正确仍不生效(罕见)的兜底:双 `layoutGrow=1` spacer、文字 STRETCH + `textAlignVertical='CENTER'`(recipes §6);
+  `layoutMode='NONE'` 场景上述子级属性无效,按绝对坐标手算 x/y 定位或先开 auto-layout。
 - **多行文本**:`textAutoResize='HEIGHT'` + `resize(定宽, 初始行高)` 实现固宽换行撑高;
   在 auto-layout 里则 `textAutoResize='HEIGHT'` 后设 `layoutSizingHorizontal='FILL'`。
 - **返回值**:预览图让 `return` 的值本身就是 `exportAsync` 的 Uint8Array(走图像通道落盘
