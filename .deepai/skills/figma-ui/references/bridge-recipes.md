@@ -292,7 +292,7 @@ const label = async (chars, o, parent) => {
 // ……粘贴 §4 辅助……
 ensureAuto(target, 'VERTICAL');
 target.paddingTop = target.paddingBottom = 24; target.paddingLeft = target.paddingRight = 16;
-const card = box('Card / Order', { dir: 'VERTICAL', gap: 12, pad: [16, 16, 16, 16], fill: '#FFFFFF', radius: 16, stroke: '#E5E7EB', w: 'FILL' }, target);
+const card = box('OrderCard', { dir: 'VERTICAL', gap: 12, pad: [16, 16, 16, 16], fill: '#FFFFFF', radius: 16, stroke: '#E5E7EB', w: 'FILL' }, target);
 const head = box('Header', { dir: 'HORIZONTAL', justify: 'SPACE_BETWEEN', align: 'CENTER', w: 'FILL' }, card);
 await label('订单 #1024', { size: 16, lh: 24, weight: 600, name: 'Title' }, head);
 await label('已发货', { size: 12, lh: 16, color: '#047857', name: 'Status' }, head);
@@ -336,8 +336,8 @@ return { collection: col.id, modes: col.modes.map(m => m.name), darkMode: !!dark
 ```js
 const vars = await figma.variables.getLocalVariablesAsync();
 const V = name => { const v = vars.find(x => x.name === name); if (!v) throw Error('变量不存在:' + name + ',先跑上面的创建脚本'); return v; };
-const card = target.findOne(n => n.name === 'Card / Order');
-if (!card) throw Error('未找到 Card / Order');
+const card = target.findOne(n => n.name === 'OrderCard');
+if (!card) throw Error('未找到 OrderCard');
 card.fills = [figma.variables.setBoundVariableForPaint({ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }, 'color', V('color/surface'))];
 for (const f of ['itemSpacing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft']) card.setBoundVariable(f, V('spacing/4'));
 for (const f of ['topLeftRadius', 'topRightRadius', 'bottomRightRadius', 'bottomLeftRadius']) card.setBoundVariable(f, V('radius/lg'));
@@ -376,7 +376,7 @@ const control = (c, s) => {
 const button = async (text, size, v) => {
   const s = BTN[size];
   const c = figma.createComponent();
-  c.name = 'Size=' + size + ', Variant=' + v.name;
+  c.name = 'size=' + size + ', variant=' + v.name;
   control(c, s);
   c.primaryAxisAlignItems = 'CENTER';
   c.itemSpacing = size === 'sm' ? 6 : 8;
@@ -390,7 +390,7 @@ const button = async (text, size, v) => {
 const input = async (placeholder, size, state) => {
   const s = INPUT[size];
   const c = figma.createComponent();
-  c.name = 'Size=' + size + ', State=' + state.name;
+  c.name = 'size=' + size + ', state=' + state.name;
   control(c, s);
   c.itemSpacing = 8;
   c.fills = [solid('#FFFFFF')];
@@ -424,8 +424,8 @@ inputSet.layoutSizingHorizontal = 'HUG'; inputSet.layoutSizingVertical = 'HUG';
 return { button: btnSet.id, input: inputSet.id, labelKey: key };
 ```
 
-使用实例:`const i = btnSet.defaultVariant.createInstance(); parent.appendChild(i); const k = Object.keys(i.componentProperties).find(k => k.indexOf('Label#') === 0); i.setProperties({ Size: 'lg', Variant: 'secondary', [k]: '保存' });`。
-命名约定 `属性=值`(如 `Size=md, State=hover`)——代码侧直接映射为组件 props;§8 验收也靠 `Size=` 分组比对变体高度。
+使用实例:`const i = btnSet.defaultVariant.createInstance(); parent.appendChild(i); const k = Object.keys(i.componentProperties).find(k => k.indexOf('Label#') === 0); i.setProperties({ size: 'lg', variant: 'secondary', [k]: '保存' });`。
+命名约定 `属性=值`,属性名与代码 props 同名(`size` / `variant` / `state`,见 SKILL「Figma 设计端规范」);§8 验收靠 `size=` 分组比对变体高度。
 
 组件集开启 auto-layout 后显式设两轴 HUG,否则集合保持合并时的固定尺寸,变体溢出(§8 报 `overflow`)。
 Input 的顺序:`resize(280, s.h)` 在设 sizing 之前(resize 会锁回 FIXED),文字加入后再把纵向设回 HUG,高度由「行高 + 2×内边距」得出,恰等于 `s.h`。
@@ -476,7 +476,7 @@ return { total, examples: issues, fontSizes: [...sizes].sort((a, b) => a - b), r
 | `absolute` | 合理仅限角标/浮层/装饰 | 其余改回流式 |
 | `rawColor` / `rawText` | 代码里只能落魔法数 | 绑定 variable / text style |
 | `offGrid` | 奇数 px 无法吸附 Tailwind 刻度(2px 倍数可用 `.5` 档,如 6 → `p-1.5`) | 调到 2 的倍数(布局间距优先 4 的倍数)或绑定 spacing 变量 |
-| `defaultName` | 代码命名无语义 | 按职责命名(`Header`、`Price`、`Button / Primary`) |
+| `defaultName` | 代码命名无语义 | 英文语义命名(`Header`、`Price`、`UserProfileCard`) |
 | `fixedTextBox` | 文案变长溢出 | `textAutoResize` 改 HEIGHT 或 WIDTH_AND_HEIGHT |
 | `fontSizes` 超过 6–7 档 | 字阶混乱 | 收敛到字阶表 |
 
@@ -600,12 +600,12 @@ function checkControl(n, kind) {
 function checkVariants(set) {
   const groups = {};
   for (const c of set.children) {
-    const mm = /Size=([^,]+)/.exec(c.name), k = mm ? mm[1].trim() : '*';
+    const mm = /size=([^,]+)/i.exec(c.name), k = mm ? mm[1].trim() : '*';
     (groups[k] = groups[k] || []).push(c);
   }
   for (const k of Object.keys(groups)) {
     const hs = groups[k].map(c => Math.round(c.height));
-    if (Math.max.apply(null, hs) !== Math.min.apply(null, hs)) err(set, 'variantHeight', 'Size=' + k + ' 的变体高度不一致:' + groups[k].map(c => c.name + '=' + Math.round(c.height)).join('; '));
+    if (Math.max.apply(null, hs) !== Math.min.apply(null, hs)) err(set, 'variantHeight', 'size=' + k + ' 的变体高度不一致:' + groups[k].map(c => c.name + '=' + Math.round(c.height)).join('; '));
   }
 }
 

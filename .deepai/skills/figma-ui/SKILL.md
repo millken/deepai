@@ -31,13 +31,15 @@ Figma data is ground truth — never guess values that the file can tell you.
   catalog descriptions; this section is the fallback once this skill is
   already loaded.
 
-## Figma 设计端规范
- 
+## Figma 设计端规范(B/D 搭建时遵守,也是 A 取数质量的前提)
+
 - **Auto Layout**：容器、卡片、页面全部使用，并正确设置 Hug / Fill / Fixed；绝对定位仅限角标、浮层。不要 Detach 实例。
 - **命名**：英文语义命名（`UserProfileCard`），禁止 `Rectangle 1`、`Group 3` 等默认名；图标统一 `Icon/xxx`，且为单一矢量。
 - **组件与变体**：按钮、输入框、标签等必须是 Component，变体属性与代码 props 同名（`variant`、`size`、`state`：default / hover / active / focus / disabled）。布尔差异用 Boolean Property，内容差异用 Text / Instance Swap Property。
 - **Variables / Styles**：颜色、圆角、阴影、字体、间距全部绑定变量，不用裸值。命名对应 `@theme` 命名空间，如 `color/primary/500` → `--color-primary-500` → `bg-primary-500`；`radius/md` → `rounded-md`；`shadow/card` → `shadow-card`。
-- **栅格**：间距基于 4px（4、8、12、16、24、32…）。
+- **栅格**：间距基于 4px（4、8、12、16、24、32…）；控件内部由规格推出的 2px 倍数（如按钮垂直内边距 6/10）除外。
+- **控件按规格**：Button/Input 尺寸取 [component-specs.md](references/component-specs.md) 档位，内容靠 auto-layout 居中，禁止手摆文字坐标。
+- **文本框自适应**：单行 `WIDTH_AND_HEIGHT`，段落定宽 `HEIGHT`；需要截断时设 `textTruncation` + `maxLines`。
 - **响应式**：提供 Mobile / Desktop 两套 Frame，或标注断点行为。
 
 ## Data source: which path am I on? (先判路径,再选工具)
@@ -87,7 +89,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 1. **先读项目,再读设计**:确认框架与样式方案(package.json、`@import "tailwindcss"` 即 v4、CSS Modules 等)、
    现有 token 文件、现有组件库。设计里的 INSTANCE(取数输出 `component` + `props`)优先映射到已有组件,
-   props 直接对应变体属性(`Variant=secondary` → `variant="secondary"`);官方远程可先查
+   props 直接对应变体属性(`variant=secondary` → `variant="secondary"`);官方远程可先查
    `figma__get_code_connect_map`(若工具列表中有)。
 2. **取数**:`get_metadata` / `return null` 看全貌 → 按 section 分块取详细数据(官方远程每个子树一次
    `get_design_context`;原生桥 recipes §1 传 `node`)。同时导出该区块 PNG 作为对照基准。
@@ -150,17 +152,6 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
    - 页面:recipes §4 辅助按区块搭建(Header → 内容区 → 底部),区块内放组件实例,值全部绑定 token。
 5. 交付前对整屏跑 recipes §7 体检(修到 `noAutoLayout`/`group`/`rawColor`/`rawText` 归零或说明原因)
    与 §8 验收(`pass:true`);交付文件 URL + 已建 tokens/组件清单 + 验收报告(Verification gate 第 5 条)。
-
-## Design-for-code conventions(B/D 搭建时遵守,也是 A 取数质量的前提)
-
-- **一切容器都是 auto-layout Frame**:不用 Group;绝对定位只给角标/浮层/装饰。
-- **尺寸意图显式**:撑满用 `FILL`,随内容用 `HUG`,只有图标/头像/按钮高度等真固定才用 `FIXED`。
-- **间距与尺寸落 4px 网格**(控件内部由规格推出的 6/10 等 2px 倍数除外);颜色、间距、圆角绑定 variable,文字套 text style——代码侧才能映射为 token 而非魔法数。
-- **图层按职责命名**(`Header`、`Price`、`Button / Primary`),它们会成为组件名/类语义;不留 `Frame 12`。
-- **可复用元素做成组件 + 变体**,状态(hover/disabled)也做成变体,代码侧直接对应 props/状态。
-- **控件按规格**:Button/Input 尺寸取 component-specs.md 档位,内容靠 auto-layout 居中,禁止手摆文字坐标。
-- **文本框自适应**:单行 `WIDTH_AND_HEIGHT`,段落定宽 `HEIGHT`;需要截断时设 `textTruncation`+`maxLines`。
-- **图标用矢量**(独立组件,统一 20/24 尺寸),不拿位图凑。
 
 ## Bridge gotchas(原生桥实战踩坑,全部实测验证)
 

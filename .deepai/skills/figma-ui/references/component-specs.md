@@ -44,7 +44,7 @@ AI 搭控件最常见的失败是「目测凑数」:按钮高度、字号、内�
 | error | 文字对比度 | 正文 < 4.5:1;大字(≥24px,或 ≥18.66px 粗体)< 3:1 |
 | error | 字体缺失 / 中文用了无中文字形的字体 | `hasMissingFont`;含中日韩字符但字体不是 PingFang / Noto Sans CJK / 思源等 |
 | error | 文字被裁切/溢出 | 渲染区域超出文字框或超出父容器 |
-| error | 同一组件集同 Size 的变体高度不一致 | 按 `Size=` 分组比较 |
+| error | 同一组件集同 size 的变体高度不一致 | 按 `size=` 分组比较 |
 | error | 流式子级溢出 | auto-layout 父级里非 absolute 子级超出父级边界 |
 | error | 文字重叠 | 非 auto-layout 父级里两个含文字的兄弟节点相交 |
 | error | 验收截断 | 子树超过 3000 节点,`pass` 强制为 false,拆小重跑 |
@@ -56,4 +56,4 @@ AI 搭控件最常见的失败是「目测凑数」:按钮高度、字号、内�
 | warn | 近似未对齐 | 非 auto-layout 兄弟节点的左/右/上边相差 0.5–3px |
 
 结果的 `checked` 给出实际覆盖的节点/文字/控件数:构建了控件却 `controls:0` 说明命名未被识别,此时 `pass:true` 不能证明控件正确。
-控件识别靠命名:节点名或其主组件名匹配 `button|btn|按钮` → Button;`input|field|textfield|search|输入|搜索` → Input。所以图层/组件必须按职责命名(Design-for-code conventions)。
+控件识别靠命名:节点名或其主组件名匹配 `button|btn|按钮` → Button;`input|field|textfield|search|输入|搜索` → Input。所以图层/组件必须按职责英文语义命名(SKILL「Figma 设计端规范」)。
