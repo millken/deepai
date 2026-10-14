@@ -31,6 +31,15 @@ Figma data is ground truth — never guess values that the file can tell you.
   catalog descriptions; this section is the fallback once this skill is
   already loaded.
 
+## Figma 设计端规范
+ 
+- **Auto Layout**：容器、卡片、页面全部使用，并正确设置 Hug / Fill / Fixed；绝对定位仅限角标、浮层。不要 Detach 实例。
+- **命名**：英文语义命名（`UserProfileCard`），禁止 `Rectangle 1`、`Group 3` 等默认名；图标统一 `Icon/xxx`，且为单一矢量。
+- **组件与变体**：按钮、输入框、标签等必须是 Component，变体属性与代码 props 同名（`variant`、`size`、`state`：default / hover / active / focus / disabled）。布尔差异用 Boolean Property，内容差异用 Text / Instance Swap Property。
+- **Variables / Styles**：颜色、圆角、阴影、字体、间距全部绑定变量，不用裸值。命名对应 `@theme` 命名空间，如 `color/primary/500` → `--color-primary-500` → `bg-primary-500`；`radius/md` → `rounded-md`；`shadow/card` → `shadow-card`。
+- **栅格**：间距基于 4px（4、8、12、16、24、32…）。
+- **响应式**：提供 Mobile / Desktop 两套 Frame，或标注断点行为。
+
 ## Data source: which path am I on? (先判路径,再选工具)
 
 两条路径,优先级:**原生桥 > 官方远程**。原生桥可用(已绑定 + 插件面板开着)时永远首选——读写走同一实况文档,证据落盘。
