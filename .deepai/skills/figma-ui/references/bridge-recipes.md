@@ -171,7 +171,8 @@ for (const c of await figma.variables.getLocalVariableCollectionsAsync()) {
     const vals = [];
     for (const m of c.modes) {
       const x = v.valuesByMode[m.modeId];
-      if (x && x.type === 'VARIABLE_ALIAS') { const a = await figma.variables.getVariableByIdAsync(x.id); vals.push('→' + (a ? a.name : x.id)); }
+      if (x === undefined || x === null) vals.push(null);
+      else if (x.type === 'VARIABLE_ALIAS') { const a = await figma.variables.getVariableByIdAsync(x.id); vals.push('→' + (a ? a.name : x.id)); }
       else vals.push(v.resolvedType === 'COLOR' ? hex(x) : x);
     }
     vars.push([v.name, v.resolvedType, vals, v.codeSyntax.WEB]);
@@ -205,11 +206,22 @@ return out;
 
 位图/照片:`return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } })` → 结果中的 `preview.png` 路径即文件,复制进项目资源目录。SVG 内的固定色按需换成 `currentColor` 以便代码着色。
 
+反向导入(`figma.createNodeFromSvg`)时**禁用 `A/a` 圆弧参数**:实测 16×16 viewBox 的 3/4 圆弧 `M12 3a9 9 0 1 0 9 9` 导入后矢量包围盒 13×39,超出 viewBox 且比例错误;同形改用三段 C 贝塞尔 `M12 3 C17 3 21 7 21 12 C21 17 17 21 12 21 C7 21 3 17 3 12` 导入后 12×12 规整。纯线段/折线路径不受影响,spinner/loading 类图标是重灾区。导入后读 after 快照核对矢量尺寸是否落在 viewBox 内。
+
 ## 4. 构建辅助(写 Figma 时整段贴在脚本开头)
 
 ```js
 const rgb = h => { const n = parseInt(h.slice(1, 7), 16); return { r: (n >> 16 & 255) / 255, g: (n >> 8 & 255) / 255, b: (n & 255) / 255 }; };
 const solid = h => ({ type: 'SOLID', color: rgb(h) });
+const needAuto = (p, what) => { if (!('layoutMode' in p) || p.layoutMode === 'NONE') throw Error(what + ' 需要父级 ' + p.name + ' 是 auto-layout(先 ensureAuto)'); };
+const ensureAuto = (f, dir) => {
+  if (f.layoutMode !== 'NONE') return;
+  if (f.children.length) throw Error(f.name + ' 非 auto-layout 且已有内容,直接转换会重排;在其内新建 auto-layout 容器,或先与用户确认');
+  const w = f.width, h = f.height;
+  f.layoutMode = dir || 'VERTICAL';
+  f.resize(w, h);
+  f.layoutSizingHorizontal = 'FIXED'; f.layoutSizingVertical = 'FIXED';
+};
 const box = (name, o, parent) => {
   const f = figma.createFrame();
   f.name = name;
@@ -222,23 +234,41 @@ const box = (name, o, parent) => {
   f.fills = o.fill ? [solid(o.fill)] : [];
   if (o.radius) f.cornerRadius = o.radius;
   if (o.stroke) { f.strokes = [solid(o.stroke)]; f.strokeWeight = 1; f.strokeAlign = 'INSIDE'; }
+  if (o.w === 'FILL' || o.h === 'FILL') needAuto(parent, name + ' 的 FILL');
   parent.appendChild(f);
+  if (typeof o.w === 'number' || typeof o.h === 'number') f.resize(typeof o.w === 'number' ? o.w : f.width, typeof o.h === 'number' ? o.h : f.height);
   f.layoutSizingHorizontal = o.w === 'FILL' ? 'FILL' : typeof o.w === 'number' ? 'FIXED' : 'HUG';
   f.layoutSizingVertical = o.h === 'FILL' ? 'FILL' : typeof o.h === 'number' ? 'FIXED' : 'HUG';
-  if (typeof o.w === 'number' || typeof o.h === 'number') f.resize(typeof o.w === 'number' ? o.w : f.width, typeof o.h === 'number' ? o.h : f.height);
   return f;
 };
 const FONTS = (await figma.listAvailableFontsAsync()).map(f => f.fontName.family + '|' + f.fontName.style);
-const STYLES = { 400: ['Regular'], 500: ['Medium'], 600: ['Semi Bold', 'SemiBold', 'Semibold'], 700: ['Bold'] };
+const STYLES = {
+  100: ['Thin', 'Hairline'], 200: ['ExtraLight', 'Extra Light', 'UltraLight', 'Ultralight'], 300: ['Light'],
+  400: ['Regular', 'Normal'], 500: ['Medium'], 600: ['Semi Bold', 'SemiBold', 'Semibold', 'DemiBold'],
+  700: ['Bold'], 800: ['ExtraBold', 'Extra Bold', 'Heavy'], 900: ['Black', 'Heavy'],
+};
 const LH = { 12: 16, 13: 18, 14: 20, 16: 24, 18: 28, 20: 28, 24: 32, 30: 36, 36: 40 };
-const CJK = /[\u3000-\u303f\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
-const CJK_FAMILIES = ['PingFang SC', 'Noto Sans SC', 'Source Han Sans SC', 'Noto Sans CJK SC', 'Microsoft YaHei'];
+const HANGUL = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/, KANA = /[\u3040-\u30ff]/;
+const CJK = /[\u1100-\u11ff\u3000-\u30ff\u3130-\u318f\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/;
+const CJK_FONT = /PingFang|Noto Sans (SC|TC|HK|JP|KR|CJK)|Noto Serif (SC|TC|JP|KR|CJK)|Source Han|思源|Hiragino|YaHei|HarmonyOS|MiSans|PuHuiTi|Heiti|Songti|Apple SD Gothic|Pretendard|Malgun|Yu Gothic|Meiryo/i;
+const CJK_FAMILIES = {
+  ko: ['Apple SD Gothic Neo', 'Noto Sans KR', 'Pretendard', 'Malgun Gothic'],
+  ja: ['Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', 'Yu Gothic'],
+  zh: ['PingFang SC', 'Noto Sans SC', 'Source Han Sans SC', 'Source Han Sans CN', 'Noto Sans CJK SC', 'HarmonyOS Sans SC', 'MiSans', 'Alibaba PuHuiTi', 'Hiragino Sans GB', 'Microsoft YaHei'],
+};
 const fontFor = (chars, family, weight) => {
-  const fams = CJK.test(chars) ? CJK_FAMILIES : [family || 'Inter'];
-  for (const fam of fams) for (const s of STYLES[weight || 400]) if (FONTS.indexOf(fam + '|' + s) >= 0) return { family: fam, style: s };
-  throw Error('无可用字体:' + fams.join('/') + ' weight ' + (weight || 400) + ';先 listAvailableFontsAsync 核对,不要回退到无中文字形的字体');
+  const w = weight || 400;
+  if (!STYLES[w]) throw Error('不支持的字重 ' + w + ',用 100–900 的整百值');
+  let fams = [family || 'Inter'];
+  if (CJK.test(chars)) {
+    fams = CJK_FAMILIES[HANGUL.test(chars) ? 'ko' : KANA.test(chars) ? 'ja' : 'zh'];
+    if (family && CJK_FONT.test(family)) fams = [family].concat(fams);
+  }
+  for (const fam of fams) for (const s of STYLES[w]) if (FONTS.indexOf(fam + '|' + s) >= 0) return { family: fam, style: s };
+  throw Error('无可用字体:' + fams.join('/') + ' weight ' + w + ';先 listAvailableFontsAsync 核对,不要回退到无对应字形的字体');
 };
 const label = async (chars, o, parent) => {
+  if (o.w === 'FILL') needAuto(parent, (o.name || chars) + ' 的 FILL');
   const font = fontFor(chars, o.family, o.weight);
   await figma.loadFontAsync(font);
   const t = figma.createText();
@@ -254,21 +284,25 @@ const label = async (chars, o, parent) => {
 };
 ```
 
-`label` 按字重选字体样式(各字体的 600 叫法不同:`Semi Bold` / `SemiBold` / `Semibold`),含中文时强制选中文字体——Inter 等拉丁字体没有中文字形,Figma 回退渲染会让文字视觉偏移,这是「按钮文字位置不对」的常见根因。行高总是显式像素值。
+`label` 按字重选字体样式(各字体的 600 叫法不同:`Semi Bold` / `SemiBold` / `Semibold`),含中日韩字符时只在对应文种字体里选(调用方传入的 `family` 是中日韩字体时优先)——Inter 等拉丁字体没有这些字形,Figma 回退渲染会让文字视觉偏移,这是「按钮文字位置不对」的常见根因。行高总是显式像素值。
 
-示例(在绑定画板内搭一张卡片):
+示例(在绑定画板内搭一张卡片;Workflow D 新建的空画板默认不是 auto-layout,先 `ensureAuto`):
 
 ```js
 // ……粘贴 §4 辅助……
+ensureAuto(target, 'VERTICAL');
+target.paddingTop = target.paddingBottom = 24; target.paddingLeft = target.paddingRight = 16;
 const card = box('Card / Order', { dir: 'VERTICAL', gap: 12, pad: [16, 16, 16, 16], fill: '#FFFFFF', radius: 16, stroke: '#E5E7EB', w: 'FILL' }, target);
 const head = box('Header', { dir: 'HORIZONTAL', justify: 'SPACE_BETWEEN', align: 'CENTER', w: 'FILL' }, card);
 await label('订单 #1024', { size: 16, lh: 24, weight: 600, name: 'Title' }, head);
-await label('已发货', { size: 12, lh: 16, color: '#059669', name: 'Status' }, head);
+await label('已发货', { size: 12, lh: 16, color: '#047857', name: 'Status' }, head);
 await label('预计 3 天内送达,请保持电话畅通。', { size: 14, lh: 20, color: '#4B5563', w: 'FILL', name: 'Body' }, card);
-return { id: card.id, png: await card.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } }) };
+return await card.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
 ```
 
-顺序铁律:`layoutMode` → `appendChild` → `layoutSizing*` → `resize`。`FILL` 只能在父级是 auto-layout 且**已 append** 之后设置,否则抛错;`HUG` 只对 auto-layout 容器和文字有效。每次构建后跑 §8 验收。
+新节点 ID 从 after 快照读。**预览图必须是 `return` 的顶层值**:旧版插件只把顶层 Uint8Array 送进图像通道,嵌在对象里会被序列化成巨大的数字键对象并撞上 24KB 截断;需要同时拿数据就分两次 `run`。
+
+顺序铁律:`layoutMode` → `appendChild` → `resize(显式尺寸)` → `layoutSizing*`。`resize()` 会把改动的轴锁回 FIXED,所以必须在设置 HUG/FILL **之前**调用;需要按内容撑开的轴(如控件高度)在子节点加入后再设 HUG。`FILL` 只能在父级是 auto-layout 且**已 append** 之后设置,否则抛错;`HUG` 只对 auto-layout 容器和文字有效。每次构建后跑 §8 验收。
 
 ## 5. Variables:创建、绑定、切 mode
 
@@ -301,8 +335,9 @@ return { collection: col.id, modes: col.modes.map(m => m.name), darkMode: !!dark
 
 ```js
 const vars = await figma.variables.getLocalVariablesAsync();
-const V = name => vars.find(v => v.name === name);
+const V = name => { const v = vars.find(x => x.name === name); if (!v) throw Error('变量不存在:' + name + ',先跑上面的创建脚本'); return v; };
 const card = target.findOne(n => n.name === 'Card / Order');
+if (!card) throw Error('未找到 Card / Order');
 card.fills = [figma.variables.setBoundVariableForPaint({ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }, 'color', V('color/surface'))];
 for (const f of ['itemSpacing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft']) card.setBoundVariable(f, V('spacing/4'));
 for (const f of ['topLeftRadius', 'topRightRadius', 'bottomRightRadius', 'bottomLeftRadius']) card.setBoundVariable(f, V('radius/lg'));
@@ -311,7 +346,17 @@ for (const t of card.findAll(n => n.type === 'TEXT' && Array.isArray(n.fills) &&
 return card.id;
 ```
 
-预览暗色:`target.setExplicitVariableModeForCollection(col, darkModeId)` 后导出 PNG;核对完复原(`clearExplicitVariableModeForCollection(col)`)。文字绑定可用 `t.setBoundVariable('fontSize', v)`(亦支持 lineHeight / letterSpacing / fontWeight / fontFamily)。
+预览暗色(独立脚本,各次 `run` 不共享变量,collection 需重新查):
+
+```js
+const col = (await figma.variables.getLocalVariableCollectionsAsync()).find(c => c.name === 'Tokens');
+const dark = col && col.modes.find(m => m.name === 'Dark');
+if (!dark) throw Error('没有 Tokens 集合或 Dark mode');
+target.setExplicitVariableModeForCollection(col, dark.modeId);
+return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
+```
+
+核对完复原:`const col = (await figma.variables.getLocalVariableCollectionsAsync()).find(c => c.name === 'Tokens'); target.clearExplicitVariableModeForCollection(col); return null`。文字绑定可用 `t.setBoundVariable('fontSize', v)`(亦支持 lineHeight / letterSpacing / fontWeight / fontFamily)。
 
 ## 6. 组件与变体(按规格构建 Button / Input)
 
@@ -351,10 +396,11 @@ const input = async (placeholder, size, state) => {
   c.fills = [solid('#FFFFFF')];
   c.strokes = [solid(state.border)]; c.strokeWeight = state.borderWidth || 1; c.strokeAlign = 'INSIDE';
   target.appendChild(c);
-  c.layoutSizingHorizontal = 'FIXED'; c.layoutSizingVertical = 'HUG';
-  c.resize(280, c.height);
+  c.resize(280, s.h);
+  c.layoutSizingHorizontal = 'FIXED';
   const t = await label(placeholder, { size: s.size, lh: s.lh, color: state.text || '#6B7280', name: 'Placeholder', w: 'FILL' }, c);
   t.textTruncation = 'ENDING'; t.maxLines = 1;
+  c.layoutSizingVertical = 'HUG';
   return c;
 };
 const VARIANTS = [{ name: 'primary', bg: '#4F46E5', fg: '#FFFFFF' }, { name: 'secondary', bg: '#FFFFFF', fg: '#111827', border: '#D1D5DB' }];
@@ -362,8 +408,9 @@ const btns = [];
 for (const size of ['sm', 'md', 'lg']) for (const v of VARIANTS) btns.push(await button('确认', size, v));
 const btnSet = figma.combineAsVariants(btns, target);
 btnSet.name = 'Button';
-btnSet.layoutMode = 'HORIZONTAL'; btnSet.layoutWrap = 'WRAP'; btnSet.itemSpacing = 16; btnSet.counterAxisSpacing = 16;
+btnSet.layoutMode = 'HORIZONTAL'; btnSet.itemSpacing = 16; btnSet.counterAxisAlignItems = 'CENTER';
 btnSet.paddingTop = btnSet.paddingRight = btnSet.paddingBottom = btnSet.paddingLeft = 16;
+btnSet.layoutSizingHorizontal = 'HUG'; btnSet.layoutSizingVertical = 'HUG';
 const key = btnSet.addComponentProperty('Label', 'TEXT', '确认');
 for (const c of btnSet.children) c.findOne(n => n.name === 'Label').componentPropertyReferences = { characters: key };
 const ins = [];
@@ -373,11 +420,20 @@ const inputSet = figma.combineAsVariants(ins, target);
 inputSet.name = 'Input';
 inputSet.layoutMode = 'VERTICAL'; inputSet.itemSpacing = 16;
 inputSet.paddingTop = inputSet.paddingRight = inputSet.paddingBottom = inputSet.paddingLeft = 16;
+inputSet.layoutSizingHorizontal = 'HUG'; inputSet.layoutSizingVertical = 'HUG';
 return { button: btnSet.id, input: inputSet.id, labelKey: key };
 ```
 
 使用实例:`const i = btnSet.defaultVariant.createInstance(); parent.appendChild(i); const k = Object.keys(i.componentProperties).find(k => k.indexOf('Label#') === 0); i.setProperties({ Size: 'lg', Variant: 'secondary', [k]: '保存' });`。
 命名约定 `属性=值`(如 `Size=md, State=hover`)——代码侧直接映射为组件 props;§8 验收也靠 `Size=` 分组比对变体高度。
+
+组件集开启 auto-layout 后显式设两轴 HUG,否则集合保持合并时的固定尺寸,变体溢出(§8 报 `overflow`)。
+Input 的顺序:`resize(280, s.h)` 在设 sizing 之前(resize 会锁回 FIXED),文字加入后再把纵向设回 HUG,高度由「行高 + 2×内边距」得出,恰等于 `s.h`。
+
+**居中三板斧(实测)**:对齐字段名是 `primaryAxisAlignItems` / `counterAxisAlignItems`——写成 `*AlignWidgets` 等不存在的名字,赋值**不报错**、读回 undefined,构建 ok:true 但视觉全错(实测按钮文字贴左上、输入框文字贴顶)。写完读回确认,§8 也会以 `labelOffY` / `contentOffX` 拦下。属性确实不生效或处于非 auto-layout 场景时:
+- 水平居中:两个 `layoutGrow=1` 的空 spacer frame 夹住内容组(主轴为 MIN 时);
+- 文字垂直居中:文字子级 `layoutAlign='STRETCH'` 拉满容器高 + `textAlignVertical='CENTER'`;
+- SVG/图标垂直居中:非 auto-layout 的固定高包装 frame + 内部矢量按 `(高 − 图标高)/2` 绝对定位。
 
 ## 7. 交付前体检(design lint)
 
@@ -399,7 +455,7 @@ const walk = n => {
       n.children.some(c => c.type === 'TEXT' || c.type === 'FRAME' || c.type === 'INSTANCE')) add('noAutoLayout', n);
   if (mode === 'HORIZONTAL' || mode === 'VERTICAL')
     for (const f of ['itemSpacing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'])
-      if (n[f] % 4 && !bound(n, f)) { add('offGrid', n); break; }
+      if (n[f] % 2 && !bound(n, f)) { add('offGrid', n); break; }
   if ('fills' in n && Array.isArray(n.fills) && !n.fillStyleId)
     for (const p of n.fills) if (p.type === 'SOLID' && p.visible !== false && !(p.boundVariables && p.boundVariables.color)) { add('rawColor', n); raw.add(hex(p.color)); }
   if (n.type === 'TEXT') {
@@ -419,7 +475,7 @@ return { total, examples: issues, fontSizes: [...sizes].sort((a, b) => a - b), r
 | `noAutoLayout` / `group` | 只能绝对定位还原,响应式失效 | 转 Frame + auto-layout |
 | `absolute` | 合理仅限角标/浮层/装饰 | 其余改回流式 |
 | `rawColor` / `rawText` | 代码里只能落魔法数 | 绑定 variable / text style |
-| `offGrid` | 无法吸附 Tailwind 刻度 | 调到 4 的倍数或绑定 spacing 变量 |
+| `offGrid` | 奇数 px 无法吸附 Tailwind 刻度(2px 倍数可用 `.5` 档,如 6 → `p-1.5`) | 调到 2 的倍数(布局间距优先 4 的倍数)或绑定 spacing 变量 |
 | `defaultName` | 代码命名无语义 | 按职责命名(`Header`、`Price`、`Button / Primary`) |
 | `fixedTextBox` | 文案变长溢出 | `textAutoResize` 改 HEIGHT 或 WIDTH_AND_HEIGHT |
 | `fontSizes` 超过 6–7 档 | 字阶混乱 | 收敛到字阶表 |
@@ -431,17 +487,20 @@ return { total, examples: issues, fontSizes: [...sizes].sort((a, b) => a - b), r
 
 ```js
 const ERR = [], WARN = [], controls = [];
-let seen = 0;
+const LIMIT = 3000;
+let seen = 0, texts = 0, truncated = false;
 const get = (n, k) => { try { return n[k]; } catch (e) { return undefined; } };
 const r1 = v => Math.round(v * 10) / 10;
 const err = (n, code, msg) => { if (ERR.length < 60) ERR.push(n.id + ' ' + n.name + ' [' + code + '] ' + msg); };
 const warn = (n, code, msg) => { if (WARN.length < 40) WARN.push(n.id + ' ' + n.name + ' [' + code + '] ' + msg); };
 const cx = b => b.x + b.width / 2, cy = b => b.y + b.height / 2;
-const CJK = /[\u3000-\u303f\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
-const CJK_FONT = /PingFang|Noto Sans (SC|TC|HK|JP|KR|CJK)|Noto Serif (SC|TC|JP|KR|CJK)|Source Han|思源|Hiragino|YaHei|HarmonyOS|MiSans|PuHuiTi|Heiti|Songti/i;
+const CJK = /[\u1100-\u11ff\u3000-\u30ff\u3130-\u318f\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/;
+const CJK_FONT = /PingFang|Noto Sans (SC|TC|HK|JP|KR|CJK)|Noto Serif (SC|TC|JP|KR|CJK)|Source Han|思源|Hiragino|YaHei|HarmonyOS|MiSans|PuHuiTi|Heiti|Songti|Apple SD Gothic|Pretendard|Malgun|Yu Gothic|Meiryo/i;
 const BTN = /button|btn|按钮/i, INPUT = /input|field|search|输入|搜索/i;
 const STD_H = [24, 28, 32, 36, 40, 44, 48, 52, 56];
-const MOBILE = !!target.absoluteBoundingBox && target.absoluteBoundingBox.width <= 480;
+let screen = target;
+while (screen.parent && screen.parent.type !== 'PAGE' && screen.parent.type !== 'SECTION') screen = screen.parent;
+const MOBILE = screen.type === 'FRAME' && screen.width <= 480 && screen.height >= 560;
 const lum = c => { const f = v => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b); };
 const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
 const solidOf = n => {
@@ -550,16 +609,45 @@ function checkVariants(set) {
   }
 }
 
+const inside = (a, b) => a.x >= b.x - 0.5 && a.y >= b.y - 0.5 && a.x + a.width <= b.x + b.width + 0.5 && a.y + a.height <= b.y + b.height + 0.5;
+const overlap = (a, b) => Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x) > 1 && Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y) > 1;
+function checkLayout(n) {
+  const kids = n.children.filter(c => c.visible !== false && c.absoluteBoundingBox);
+  const pb = n.absoluteBoundingBox, mode = get(n, 'layoutMode');
+  if (!pb || !kids.length) return;
+  if (mode === 'HORIZONTAL' || mode === 'VERTICAL') {
+    for (const c of kids) if (get(c, 'layoutPositioning') !== 'ABSOLUTE' && c.type !== 'TEXT' && !inside(c.absoluteBoundingBox, pb))
+      err(c, 'overflow', '流式子级超出 auto-layout 父级 ' + n.name + '(常见于 FIXED 子级宽于父级,改 FILL 或缩小)');
+  } else if (mode === 'NONE' && n.type !== 'COMPONENT_SET') {
+    const hasText = c => c.type === 'TEXT' || (typeof c.findOne === 'function' && !!c.findOne(x => x.type === 'TEXT'));
+    for (let i = 0; i < kids.length; i++) for (let j = i + 1; j < kids.length; j++) {
+      const a = kids[i], b = kids[j], A = a.absoluteBoundingBox, B = b.absoluteBoundingBox;
+      if (inside(A, B) || inside(B, A)) continue;
+      if (overlap(A, B) && hasText(a) && hasText(b)) err(a, 'overlap', '与 ' + b.name + ' 重叠且都含文字');
+      for (const [ea, eb, axis] of [[A.x, B.x, '左'], [A.x + A.width, B.x + B.width, '右'], [A.y, B.y, '上']]) {
+        const d = Math.abs(ea - eb);
+        if (d > 0.5 && d < 3) { warn(a, 'nearMiss', '与 ' + b.name + ' 的' + axis + '边差 ' + r1(d) + 'px,疑似未对齐'); break; }
+      }
+    }
+  }
+}
+
 async function walk(n, inControl) {
-  if (n.visible === false || seen++ > 3000) return;
-  if (n.type === 'TEXT') { checkText(n); return; }
+  if (n.visible === false) return;
+  if (seen++ >= LIMIT) { truncated = true; return; }
+  if (n.type === 'TEXT') { texts++; checkText(n); return; }
   if (n.type === 'COMPONENT_SET') checkVariants(n);
   let kind = null;
   if (!inControl) { kind = await kindOf(n); if (kind) checkControl(n, kind); }
-  if ('children' in n) for (const c of n.children) await walk(c, inControl || !!kind);
+  if ('children' in n) { checkLayout(n); for (const c of n.children) await walk(c, inControl || !!kind); }
 }
 await walk(target, false);
-return { pass: ERR.length === 0, errors: ERR, warns: WARN, controls };
+return {
+  pass: ERR.length === 0 && !truncated, truncated,
+  checked: { nodes: seen, texts, controls: controls.length, mobile: MOBILE },
+  errors: ERR, warns: WARN, controls,
+};
 ```
 
-读结果:`pass:false` 时逐条按 `[code]` 修(多半是重建为规格化 auto-layout,而不是挪坐标),改完**对同一子树重跑**直到 `pass:true`;最多 3 轮仍不过,带着 `errors` 原文与 `controls` 量测表向用户报告。`warn` 需要逐条给出「有意为之」的理由或修掉。`controls` 每行是控件的实测数据(尺寸、内边距、`font`、`fs_h` 字号/高度比、`padX_h`、`dx/dy` 几何偏移、`dyInk` 字形偏移、`contrast`),交付时原样列给用户。
+读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐;页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
+`pass:false` 时逐条按 `[code]` 修(多半是重建为规格化 auto-layout,而不是挪坐标),改完**对同一子树重跑**直到 `pass:true`;最多 3 轮仍不过,带着 `errors` 原文与 `controls` 量测表向用户报告。`warn` 需要逐条给出「有意为之」的理由或修掉。`controls` 每行是控件的实测数据(尺寸、内边距、`font`、`fs_h` 字号/高度比、`padX_h`、`dx/dy` 几何偏移、`dyInk` 字形偏移、`contrast`),交付时原样列给用户。

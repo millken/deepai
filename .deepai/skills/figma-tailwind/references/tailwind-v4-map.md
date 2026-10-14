@@ -33,7 +33,7 @@
 | GRADIENT_LINEAR | `bg-linear-to-{t,tr,r,br,b,bl,l,tl} from-x via-y to-z`;非 45° 倍数用 `bg-linear-{deg}` | v3 的 `bg-gradient-to-*` 不要输出 |
 | GRADIENT_RADIAL / ANGULAR | `bg-radial from-… to-…` / `bg-conic from-… to-…` | |
 | IMAGE `scaleMode` FILL / FIT | `object-cover` / `object-contain`(配合 `<img>`) | |
-| stroke INSIDE,weight w | `border`(1px)/ `border-{w}` + **`border-{color}`** | v4 `border` 默认色是 currentColor,必须给色 |
+| stroke INSIDE,weight w | 1px `border`;2/4/8 `border-2`/`border-4`/`border-8`;其余 `border-[{w}px]`;并加 **`border-{color}`** | 没有 `border-1`;v4 `border` 默认色是 currentColor,必须给色 |
 | stroke OUTSIDE | `outline outline-{w} outline-{color}` 或 `ring-{w} ring-{color}` | 不占布局;v4 `ring` 默认 1px |
 | stroke CENTER | 按 INSIDE 处理,宽度视觉差 ≤0.5px 可忽略 | |
 | 单边描边 [t,r,b,l] | `border-t` / `border-b` / `border-x` … | |
@@ -43,15 +43,15 @@
 | DROP_SHADOW `x y blur spread #rgba` | 与 §4 阴影刻度逐项吻合才用 `shadow-*`;否则 `shadow-[x_y_blur_spread_#rgba]`(多层逗号分隔,空格换下划线) | |
 | INNER_SHADOW | `inset-shadow-[…]` | |
 | LAYER_BLUR / BACKGROUND_BLUR | `blur-*` / `backdrop-blur-*` | Figma 模糊半径与 CSS `blur()` 非 1:1(Dev Mode 导出约 ÷2);官方远程以 `get_design_context` 为准 |
-| `opacity` | `opacity-{round(v*100)}` | |
+| `opacity` | 吸附到 5 的倍数 `opacity-{n}`(0,5,10,…,100);吸附不上用 `opacity-[37%]` | `opacity-37` 不存在 |
 | `blend` | `mix-blend-{multiply,screen,overlay,…}` | |
-| `rotation` r | r>0 → `-rotate-{r}`;r<0 → `rotate-{abs(r)}` | Figma 逆时针为正,CSS 顺时针为正——取反 |
+| `rotation` r | 取反后吸附默认刻度 0/1/2/3/6/12/45/90/180:r=15 → `rotate-[-15deg]`,r=45 → `-rotate-45`,r=-90 → `rotate-90` | Figma 逆时针为正,CSS 顺时针为正——取反;非刻度角用任意值 |
 
 ## 3. 文字
 
 | Figma | Tailwind v4 | 注意 |
 |---|---|---|
-| `size` + `lh` px | `text-{size}/{lh/4}` 简写(如 `text-sm/6`)或 `text-* leading-{lh/4}` | **v4 的 `text-*` 自带行高**,Figma 行高与默认值不同就必须显式写 |
+| `size` + `lh` px | `text-{size}/{lh/4}` 简写(如 14/20 → `text-sm/5`,14/24 → `text-sm/6`)或 `text-* leading-{lh/4}` | **v4 的 `text-*` 自带行高**,Figma 行高与默认值不同就必须显式写 |
 | `lh` % | `leading-{named}`(吻合时)或 `leading-[1.4]` | |
 | `lh` auto | `leading-[normal]` | `leading-normal` 是 1.5,不是 CSS normal |
 | `weight`(取数字,别解析 style 名) | 100 `font-thin` · 200 `font-extralight` · 300 `font-light` · 400 `font-normal` · 500 `font-medium` · 600 `font-semibold` · 700 `font-bold` · 800 `font-extrabold` · 900 `font-black` | |

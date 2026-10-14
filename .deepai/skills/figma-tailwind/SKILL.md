@@ -29,10 +29,10 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 1. **先结构后样式**：从外到内逐层，`layout` → flex/grid 容器类，子级 `sizing` → `flex-1` / `self-stretch` / 固定尺寸。Figma 默认 MIN 对齐而 CSS 默认 stretch：容器 `items-start` 不可省略。
 2. **再视觉**：填充 → 描边（v4 `border` 默认 currentColor，必须给色）→ 圆角 → 阴影/模糊 → 不透明度。
-3. **再排版**：字号与行高成对输出（v4 `text-*` 自带行高，用 `text-sm/6` 简写）；字重取数字；字距 % ÷100 → em；`maxLines` → `truncate` / `line-clamp-N`。
+3. **再排版**：字号与行高成对输出（v4 `text-*` 自带行高，用 `text-sm/5`（14/20）这类简写）；字重取数字；字距 % ÷100 → em；`maxLines` → `truncate` / `line-clamp-N`。
 4. **吸附顺序：变量 → 标准刻度 → 任意值。**
    - 绑定了变量：用 token 类名（命名规则见映射表 §5）；`@theme` 尚无该变量时先补一行。
-   - 未绑定：吸附 v4 刻度（任何 4 的倍数 px 都是合法 spacing：44px → `p-11`）。
+   - 未绑定：吸附 v4 刻度（任何 4 的倍数 px 都是合法 spacing：44px → `p-11`；2px 倍数用 `.5` 档：6px → `p-1.5`）。
    - 都不行且视觉关键（1px 分隔线 `h-px`、品牌专色）才写任意值，行内注明「未绑定变量」。
 5. **图标/矢量**（取数输出 `asset:'svg'`）：只给尺寸与颜色类（`size-5 text-gray-500`），并说明需按 bridge-recipes §3 导出 SVG，不要用 div 拼形状。
 
@@ -57,7 +57,7 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 - **全量 Flexbox/Grid，禁止绝对定位**：对齐间距用 `flex flex-col gap-4 items-center justify-between`，严格对齐 Auto Layout（direction→`flex-row/flex-col`，gap→`gap-*`，padding→`p-*`，align→`items-*`，justify→`justify-*`）
 - **禁用依赖兄弟/子组合器与 `:not()/:where()` 的工具类**（`space-y-*`、`divide-*`）——间距一律 `gap-*` + flex。注意这与 `before:`/`after:` 伪元素变体是两回事，后者另行判断
-- **特殊字符**：`.`（`p-2.5`）、`/`（`bg-x/10`、`text-sm/6`）、`[]`（`text-[#…]`）同属需要转义的字符，weapp-tailwindcss 的核心功能就是转换它们——机械上可用，但优先整数刻度与标准类（可读性），构建中应确认转换实际生效
+- **特殊字符**：`.`（`p-2.5`）、`/`（`bg-x/10`、`text-sm/5`）、`[]`（`text-[#…]`）同属需要转义的字符，weapp-tailwindcss 的核心功能就是转换它们——机械上可用，但优先整数刻度与标准类（可读性），构建中应确认转换实际生效
 - **oklch / `color-mix()` 风险（杀伤力最大）**：v4 默认色板是 oklch，透明度修饰符编译为 `color-mix(in oklab,…)`，低版本小程序基础库可能整条规则失效（颜色直接不生效）。不确定目标基础库支持度时：`@theme` 用 hex/rgb 定义颜色、透明度用预先算好的色值变量，不用 `/N` 修饰符
 - **750 设计稿基准**：750 宽的稿间距/字号先 ÷2 再吸附（H5 以 375 基准）；375 宽直接吸附
 - **组件语义**：输出对象是 `<view>`/`<text>`/`<image>`——容器 `flex …`、文本 `text-base …`、图片 `w-10 h-10 rounded-full`

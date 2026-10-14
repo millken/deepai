@@ -67,8 +67,11 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 1. **先定规格**:动手前写出本次要用的尺寸表(高度/内边距/字号/行高/圆角/间距),取自文件已有组件或 [component-specs.md](references/component-specs.md);不现场目测取值。
 2. **按规格构建**:控件用 recipes §6 的规格化构建(高度 = 行高 + 2×垂直内边距,auto-layout 居中),文字用 §4 `label`(自动选中文字体、显式像素行高)。
-3. **量测**:每次写入后对改动子树跑 recipes §8;它检查控件几何居中、内边距对称、字号/高度比、折行、溢出、对比度、中文字体、变体一致性。
-4. **修正到通过**:`errors` 逐条修(通常是按规格重建,而非挪坐标)并重跑同一子树,直到 `pass:true`;3 轮不过则如实报告。
+3. **量测**:每次写入后对改动子树跑 recipes §8;它检查控件几何居中、内边距对称、字号/高度比、折行、溢出、
+   文字重叠、近似未对齐、对比度、中日韩字体、变体一致性。先看结果里的 `checked`:构建了控件却 `controls:0`
+   (命名未识别)或 `truncated:true` 时,`pass` 不构成证据;页面级结构问题另由 recipes §7 体检覆盖。
+4. **修正到通过**:`errors` 逐条修(通常是按规格重建,而非挪坐标)并重跑同一子树,直到 `pass:true`
+   (页面级再加 §7 归零);3 轮不过则如实报告。
 5. **交付报告**:附通过的验收 job_id、`controls` 实测表、未消除的 `warn` 及理由,并把 preview.png 路径交给用户目视确认。没有通过的验收结果,不得说「已完成 / 已对齐 / 效果良好」。
 
 ## Workflow A — implement a design (design → code)
@@ -143,7 +146,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 - **一切容器都是 auto-layout Frame**:不用 Group;绝对定位只给角标/浮层/装饰。
 - **尺寸意图显式**:撑满用 `FILL`,随内容用 `HUG`,只有图标/头像/按钮高度等真固定才用 `FIXED`。
-- **间距与尺寸落 4px 网格**;颜色、间距、圆角绑定 variable,文字套 text style——代码侧才能映射为 token 而非魔法数。
+- **间距与尺寸落 4px 网格**(控件内部由规格推出的 6/10 等 2px 倍数除外);颜色、间距、圆角绑定 variable,文字套 text style——代码侧才能映射为 token 而非魔法数。
 - **图层按职责命名**(`Header`、`Price`、`Button / Primary`),它们会成为组件名/类语义;不留 `Frame 12`。
 - **可复用元素做成组件 + 变体**,状态(hover/disabled)也做成变体,代码侧直接对应 props/状态。
 - **控件按规格**:Button/Input 尺寸取 component-specs.md 档位,内容靠 auto-layout 居中,禁止手摆文字坐标。
@@ -162,18 +165,22 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   字重样式名因字体而异(`Semi Bold`/`SemiBold`/`Semibold`)。recipes §4 `label` 已处理这两点。
 - **auto-layout 塌陷(最大坑)**:`resize()` 后开 `layoutMode`,或容器未显式
   声明尺寸模式,会被重置为 AUTO 收缩(实测整屏 844px 塌到 154px 且 ok:true
-  静默通过)。顺序固定为 `layoutMode` → `appendChild` → `layoutSizingHorizontal/Vertical`
-  → `resize`;构建后必读 after 快照的 `layout.sizing` 确认。
-- **FILL 时机**:`layoutSizing*='FILL'` 只能在节点已 append 进 auto-layout 父级之后设置,否则抛错;
+  静默通过)。顺序固定为 `layoutMode` → `appendChild` → `resize(显式尺寸)` →
+  `layoutSizingHorizontal/Vertical`(`resize()` 会把改动的轴锁回 FIXED);按内容撑开的轴在子节点加入后再设 HUG。
+  构建后必读 after 快照的 `layout.sizing` 确认。
+- **FILL 时机**:`layoutSizing*='FILL'` 只能在节点已 append 进 auto-layout 父级之后设置,否则抛错(新建空画板默认非 auto-layout,先 recipes §4 `ensureAuto`);
   `HUG` 只对 auto-layout 容器与文字有效。
 - **对齐语义**:VERTICAL 布局里 `primaryAxisAlignItems` 是垂直方向,水平
-  居中要看 counter 轴;两者都不生效时(实测发生过)用子级
-  `layoutAlign='CENTER'`,仍不行就 `layoutMode='NONE'` + 绝对定位兜底。
+  居中要看 counter 轴。字段名写错(如 `*AlignWidgets`)赋值不报错、读回 undefined,构建 ok 但视觉全错——
+  写完读回确认。属性不生效时(实测发生过)用子级 `layoutAlign='CENTER'`;文字垂直居中更稳的组合是
+  `layoutAlign='STRETCH'` + `textAlignVertical='CENTER'`;其余兜底见 recipes §6「居中三板斧」。
 - **多行文本**:`textAutoResize='HEIGHT'` + `resize(定宽, 初始行高)` 实现固宽换行撑高;
   在 auto-layout 里则 `textAutoResize='HEIGHT'` 后设 `layoutSizingHorizontal='FILL'`。
-- **返回值**:`exportAsync` 的 Uint8Array 可直接 return(走图像通道落盘
-  preview*.png);嵌套在对象里返回则输出 `{__png,bytes}` 占位。不要把大
-  字节数组塞进普通 JSON 字段;SVG 用 `format:'SVG_STRING'` 直接得字符串。
+- **返回值**:预览图让 `return` 的值本身就是 `exportAsync` 的 Uint8Array(走图像通道落盘
+  preview.png)。较新插件会把嵌套的 Uint8Array 替换为 `{__png,bytes}` 占位,但旧版插件只认顶层,
+  嵌套会序列化成巨大的数字键对象并撞上截断——一律顶层返回,数据另起一次 `run`。
+  SVG 用 `format:'SVG_STRING'` 直接得字符串。
+- **SVG 导入**:`createNodeFromSvg` 解析 `A/a` 圆弧参数会产生畸形矢量,圆/弧改写为 C 贝塞尔(recipes §3)。
 - **截断**:工具结果里 output 限 24KB、before/after 限 8KB(`*_truncated`),完整内容在
   evidence 目录 `result.json`;取数脚本要控制节点数并按 `node` 分块。
 - **写入范围**:新节点建在 `target` 子树内,否则 before/after 快照看不到改动、证据不完整。
