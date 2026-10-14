@@ -445,3 +445,65 @@ func TestEmbeddedPluginJSSyntax(t *testing.T) {
 		check(tmp)
 	}
 }
+
+// 心跳轮询（heartbeat:true）：刷新连接新鲜度但不领取任务——busy 面板执行期
+// 持续心跳，避免超过 pollFreshSecs 的执行被误判断连（本 PR 根因）。
+func TestBridge_HeartbeatPollNoDelivery(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("slow", "", false)
+	req, _ := http.NewRequest("POST", "/poll", strings.NewReader(`{"client":"p1","heartbeat":true}`))
+	req.Header.Set("X-Session-Token", "testtoken")
+	rec := httptest.NewRecorder()
+	b.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("heartbeat poll status %d", rec.Code)
+	}
+	if body := rec.Body.String(); strings.Contains(body, job.ID) {
+		t.Fatalf("heartbeat must not deliver jobs: %s", body)
+	}
+	if job.State != "queued" {
+		t.Fatalf("job state = %s, want queued", job.State)
+	}
+	if !b.Status().Connected {
+		t.Fatal("heartbeat must refresh connection freshness")
+	}
+	// 非心跳轮询正常领取。
+	if got := pollAs(t, b, "testtoken"); got["id"] != job.ID {
+		t.Fatalf("normal poll must deliver: %+v", got)
+	}
+}
+
+// 假死收割：delivered 无结果 + 断连超阈值 → Submit 时自动转待核实（免重启）。
+// 随后迟到回传（面板复活）自动解除待核实——不再需要 inspect+ack。
+func TestBridge_ReapAndLateCompleteUnlock(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("mutate", "", false)
+	pollAs(t, b, "testtoken") // delivered；此刻 lastPoll 新鲜
+
+	// 断连超过阈值：拨回 lastPoll 后再提交写入 → 被收割进 unresolved 并阻断。
+	b.mu.Lock()
+	b.lastPoll = time.Now().Add(-reapDisconnect - time.Minute)
+	b.mu.Unlock()
+	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
+		t.Fatalf("write must be blocked after reap: %v", err)
+	}
+	if st := b.Status(); len(st.Unresolved) != 1 || st.Unresolved[0] != job.ID {
+		t.Fatalf("unresolved = %v", st.Unresolved)
+	}
+
+	// 面板复活后迟到回传：handleComplete 解除 unresolved，无需 ack。
+	payload := fmt.Sprintf(`{"id":%q,"ok":true,"output":42}`, job.ID)
+	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
+		t.Fatalf("late complete status %d: %s", rec.Code, rec.Body.String())
+	}
+	if st := b.Status(); len(st.Unresolved) != 0 {
+		t.Fatalf("late complete must clear unresolved: %v", st.Unresolved)
+	}
+	// 回传刷新 lastPoll：否则收割后紧随的 Submit 会因陈旧心跳把同一 id 再收割回去。
+	if st := b.Status(); !st.Connected {
+		t.Fatal("complete must refresh lastPoll")
+	}
+	if _, err := b.Submit("next", "", false); err != nil {
+		t.Fatalf("write after late complete: %v", err)
+	}
+}

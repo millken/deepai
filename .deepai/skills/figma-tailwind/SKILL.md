@@ -7,6 +7,29 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 读取 Figma 画布，把布局、间距、颜色转成符合 Tailwind CSS v4 语法的原子类组合，供用户直接粘贴到目标组件。**只交付 class 字符串与 `@theme` token 声明，不生成页面/模板/逻辑。**
 
+## 技术栈与约束
+ 
+- Vue 3.3+（`<script setup lang="ts">`）+ **Tailwind CSS v4** + Vite。先检查项目 `package.json` 与 CSS 入口，沿用已有约定（别名、图标库、组件库）。
+- **v4 配置**：`@tailwindcss/vite` + `@import "tailwindcss";`，token 只写在 CSS `@theme { --color-*, --radius-*, --shadow-* }`，**不生成 `tailwind.config`**。项目若仍是 v3，提示升级，不按 v3 输出。
+- **零硬编码**：禁止 `bg-[#123456]`、`w-[321px]`、`style=""`。动态值例外：`:style="{ '--progress': `${v}%` }"` + `w-(--progress)`。
+- **组件解耦**：Layout → Block → Component 三层；重复 2 次以上的结构抽组件；单文件建议 ≤ 200 行。
+- **还原范围**：阴影、圆角、字重、行高、字间距、描边、透明度、渐变。
+
+## Auto Layout → Tailwind
+ 
+| Figma | Tailwind |
+| --- | --- |
+| Horizontal / Vertical | `flex` / `flex flex-col` |
+| Gap、Padding | `gap-*`、`p-*` / `px-*` / `py-*` |
+| Hug | `w-fit` / `h-fit` |
+| Fill container | 主轴 `flex-1`；交叉轴 `self-stretch` 或 `w-full` |
+| Fixed / Min / Max | `w-*` `h-*` / `min-*` `max-*` |
+| Align / Space between / Wrap | `items-*` / `justify-between` / `flex-wrap` |
+| Clip content | `overflow-hidden` |
+| Absolute | `absolute` + `inset-*`，父级 `relative` |
+| 文本截断 | `truncate` / `line-clamp-*` |
+| 多层阴影 | 在 `@theme` 新增 `--shadow-*` |
+
 ## 取数（先判别数据源，两条路径）
 
 优先级：**原生桥 > 官方远程**。第一步：若 builtin `figma` 工具（deepai 内嵌桥，Figma Desktop + 插件）已绑定目标文件（`status` connected:true），走内嵌桥路径；否则用官方远程 MCP（mcp.figma.com，docs/figma_mcp.md §三）。
@@ -62,10 +85,10 @@ description: "Use when a Figma link needs Tailwind CSS v4 utility classes only (
 
 禁止输出 `<template>` / `<script>` / `<style>` / 完整 HTML。按层级列清单，每行 = 语义名 + class 字符串：
 
-- 📦 **外层包裹容器 (Wrapper)**: `flex flex-col p-4 bg-white rounded-2xl shadow-sm`
-- 🏷️ **左侧图标区 (Icon Box)**: `flex items-center justify-center w-10 h-10 bg-brand-primary/10 text-brand-primary`
-- 📝 **核心文本域 (Text Body)**: `flex-1 ml-3 text-base font-medium text-gray-900`
-- 💰 **右侧金额 (Badge/Amount)**: `text-lg font-semibold text-emerald-600`
+-  **外层包裹容器 (Wrapper)**: `flex flex-col p-4 bg-white rounded-2xl shadow-sm`
+-  **左侧图标区 (Icon Box)**: `flex items-center justify-center w-10 h-10 bg-brand-primary/10 text-brand-primary`
+-  **核心文本域 (Text Body)**: `flex-1 ml-3 text-base font-medium text-gray-900`
+-  **右侧金额 (Badge/Amount)**: `text-lg font-semibold text-emerald-600`
 
 清单前按需附 `@theme` 补充块（仅列本次新映射的变量）。小程序目标且基础库支持度不明时，示例中的 `/N` 修饰符按 §4 规则替换。
 
