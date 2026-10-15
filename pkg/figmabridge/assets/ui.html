@@ -19,19 +19,24 @@ const status = document.querySelector('[role=status]');
 const POLL_TIMEOUT_MS = 35000;
 const COMPLETE_TIMEOUT_MS = 60000;
 
-async function request(route, body, timeoutMs) {
-  const response = await fetch('http://localhost:' + config.port + route, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
-  if (!response.ok) {
-    const err = Error(route + ' ' + response.status);
-    err.status = response.status;
-    throw err;
+async function request(route, body, timeoutMs, ctrl = new AbortController()) {
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const response = await fetch('http://localhost:' + config.port + route, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    });
+    if (!response.ok) {
+      const err = Error(route + ' ' + response.status);
+      err.status = response.status;
+      throw err;
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return response.json();
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -45,6 +50,7 @@ let authFailed = false;
 let busy = false;
 let busyJobId = '';
 let pendingResult = null;
+let heartbeatPoll = null;
 
 function render() {
   if (authFailed) status.textContent = '认证失败：请重新导入插件';
@@ -58,6 +64,12 @@ function finishJob() {
   pendingResult = null;
   busy = false;
   busyJobId = '';
+  // 在途的心跳长轮询不领取任务；中止它让循环立刻改发领取轮询，否则执行期间
+  // 入队的下一个任务要干等满一次挂起（20s）。
+  if (heartbeatPoll) {
+    heartbeatPoll.handoff = true;
+    heartbeatPoll.abort();
+  }
 }
 
 // 桥以 400/413 拒收（图像无效 / 超 8MB）时原样重发只会无限失败：逐级瘦身为
@@ -111,8 +123,18 @@ async function flushResult() {
 async function pollLoop() {
   for (let failures = 0; ; ) {
     try {
-      // 未连上时先发不挂起的探测，连上即刻刷新面板状态。
-      const job = await request('/poll', { client: 'deepai-plugin', session, heartbeat: busy, wait: online }, POLL_TIMEOUT_MS);
+      const ctrl = new AbortController();
+      heartbeatPoll = busy ? ctrl : null;
+      let job;
+      try {
+        // 未连上时先发不挂起的探测，连上即刻刷新面板状态。
+        job = await request('/poll', { client: 'deepai-plugin', session, heartbeat: busy, wait: online }, POLL_TIMEOUT_MS, ctrl);
+      } catch (e) {
+        if (ctrl.handoff) continue;
+        throw e;
+      } finally {
+        heartbeatPoll = null;
+      }
       online = true;
       authFailed = false;
       failures = 0;

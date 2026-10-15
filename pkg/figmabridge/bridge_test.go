@@ -493,11 +493,36 @@ func requireExpired(t *testing.T, b *Bridge, id, reason string) {
 	outcome := b.Wait(t.Context(), id, time.Second)
 	if outcome.WaitStatus != "completed" || outcome.Job.State != "expired" || outcome.Result == nil ||
 		outcome.Result.OK || !outcome.Result.ExecStarted || !strings.Contains(outcome.Result.Error, reason) ||
-		!strings.Contains(outcome.Result.Error, "inspect:true") {
+		!strings.Contains(outcome.Instruction, "inspect:true") {
 		t.Fatalf("want expired (%s), got %+v result=%+v", reason, outcome, outcome.Result)
 	}
+	// 核销不放行普通写入：模型看到失败后的重试会与迟到的真实执行双写。
+	if _, err := b.Submit("retry same change", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("write after expiry must be blocked: %v", err)
+	}
+	if st := b.Status(); len(st.Unverified) != 1 || st.Unverified[0] != id {
+		t.Fatalf("unverified = %v", st.Unverified)
+	}
+}
+
+// requireVerifyUnlocks：inspect:true 成功完成即解除核销阻断（无需 ack）。
+func requireVerifyUnlocks(t *testing.T, b *Bridge, expiredID, session string) {
+	t.Helper()
+	inspect, err := b.Submit("return null", "", true)
+	if err != nil {
+		t.Fatalf("inspect after expiry must be accepted: %v", err)
+	}
+	if got := pollSession(t, b, session, false); got["id"] != inspect.ID {
+		t.Fatalf("inspect delivery = %+v", got)
+	}
+	if rec := completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":true,"output":null}`, inspect.ID)); rec.Code != 200 {
+		t.Fatalf("inspect complete %d: %s", rec.Code, rec.Body.String())
+	}
+	if j, _ := b.JobByID(expiredID); j.State != "verified" {
+		t.Fatalf("expired job state after verify = %s", j.State)
+	}
 	if _, err := b.Submit("next", "", false); err != nil {
-		t.Fatalf("expired job must release single-flight: %v", err)
+		t.Fatalf("write after successful inspect: %v", err)
 	}
 }
 
@@ -517,9 +542,10 @@ func TestBridge_ExpireWhenPanelReopened(t *testing.T) {
 	b.mu.Unlock()
 	pollSession(t, b, "new", false)
 	requireExpired(t, b, job.ID, "面板已断开")
+	requireVerifyUnlocks(t, b, job.ID, "new")
 }
 
-// 同一面板空闲后发领取轮询 = 它已丢失该任务 → 立即核销。
+// 同一面板空闲后发领取轮询 = 它已丢失该任务 → 立即核销；失败的 inspect 不解锁。
 func TestBridge_ExpireWhenSamePanelIdle(t *testing.T) {
 	b := newTestBridge(t)
 	job, _ := b.Submit("mutate", "", false)
@@ -530,9 +556,19 @@ func TestBridge_ExpireWhenSamePanelIdle(t *testing.T) {
 	}
 	pollSession(t, b, "s1", false)
 	requireExpired(t, b, job.ID, "面板已空闲")
+
+	bad, _ := b.Submit("syntax error(", "", true)
+	pollSession(t, b, "s1", false)
+	completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":false,"error":"SyntaxError"}`, bad.ID))
+	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("failed inspect must not unlock: %v", err)
+	}
+	requireVerifyUnlocks(t, b, job.ID, "s1")
 }
 
-// 面板持续心跳但脚本挂死：交付超过 execTimeout 自动核销。
+// 面板持续心跳但脚本挂死：交付超过 execTimeout 自动核销。原面板仍在心跳时它
+// 不领新任务，任何新提交（含 inspect）都拒绝，避免堵在 queued 再次占死单飞；
+// 面板关闭（会话静默）后 inspect 可进。
 func TestBridge_ExpireOnExecTimeout(t *testing.T) {
 	b := newTestBridge(t)
 	job, _ := b.Submit("await new Promise(()=>{})", "", false)
@@ -542,6 +578,16 @@ func TestBridge_ExpireOnExecTimeout(t *testing.T) {
 	b.mu.Unlock()
 	pollSession(t, b, "s1", true)
 	requireExpired(t, b, job.ID, "未回传")
+	if _, err := b.Submit("return null", "", true); err == nil || !strings.Contains(err.Error(), "仍在执行") {
+		t.Fatalf("submit while panel still runs expired job must be rejected: %v", err)
+	}
+	if st := b.Status(); st.Active != nil {
+		t.Fatalf("nothing may be queued behind a busy panel: %+v", st.Active)
+	}
+	b.mu.Lock()
+	b.sessions["s1"].lastSeen = time.Now().Add(-orphanAfter - time.Second)
+	b.mu.Unlock()
+	requireVerifyUnlocks(t, b, job.ID, "s2")
 }
 
 // 旧版面板（无会话 ID）：按整体连接新鲜度判定，断连超阈值核销。
@@ -555,15 +601,16 @@ func TestBridge_ExpireLegacyPanel(t *testing.T) {
 	requireExpired(t, b, job.ID, "面板已断开")
 }
 
-// 核销后迟到的真实回传仍被接收并覆盖「结果未知」。
+// 核销后迟到的真实回传被接收、覆盖「结果未知」并解除阻断（与 unresolved 迟到回传一致）。
 func TestBridge_LateCompleteAfterExpire(t *testing.T) {
 	b := newTestBridge(t)
 	job, _ := b.Submit("mutate", "", false)
 	pollSession(t, b, "s1", false)
-	pollSession(t, b, "s1", false)
-	if j, _ := b.JobByID(job.ID); j.State != "expired" {
-		t.Fatalf("state = %s", j.State)
-	}
+	b.mu.Lock()
+	b.jobs[job.ID].deliveredAt = time.Now().Add(-execTimeout - time.Second)
+	b.mu.Unlock()
+	pollSession(t, b, "s1", true)
+	requireExpired(t, b, job.ID, "未回传")
 	payload := fmt.Sprintf(`{"id":%q,"ok":true,"output":42}`, job.ID)
 	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
 		t.Fatalf("late complete status %d: %s", rec.Code, rec.Body.String())
@@ -574,6 +621,34 @@ func TestBridge_LateCompleteAfterExpire(t *testing.T) {
 	}
 	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 409 {
 		t.Fatalf("duplicate complete want 409, got %d", rec.Code)
+	}
+	pollSession(t, b, "s1", false)
+	if _, err := b.Submit("next", "", false); err != nil {
+		t.Fatalf("late real result must release the block: %v", err)
+	}
+}
+
+// 核销阻断跨重启保留：result.json 已在，但未经核实的 expired 仍需 inspect。
+func TestBridge_ExpiredBlockSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	binding := Binding{ID: "b1", FileKey: "KEY", NodeID: "1:2"}
+	b1, _ := New(dir, binding, "testtoken")
+	job, _ := b1.Submit("mutate", "", false)
+	pollSession(t, b1, "s1", false)
+	pollSession(t, b1, "s1", false)
+	requireExpired(t, b1, job.ID, "面板已空闲")
+
+	b2, err := New(dir, binding, "testtoken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("expired block must survive restart: %v", err)
+	}
+	requireVerifyUnlocks(t, b2, job.ID, "s9")
+	b3, _ := New(dir, binding, "testtoken")
+	if st := b3.Status(); len(st.Unverified) != 0 {
+		t.Fatalf("verified job must not re-block after restart: %v", st.Unverified)
 	}
 }
 
@@ -622,18 +697,20 @@ func TestBridge_PruneRuns(t *testing.T) {
 	oldUnresolved := strings.Repeat("c", 32)
 	oldCancelled := strings.Repeat("d", 32)
 	oldAcked := strings.Repeat("e", 32)
+	oldExpired := strings.Repeat("f", 32)
 	seed(oldDone, "done", ago(8), true)
 	seed(recentDone, "done", ago(1), true)
 	seed(oldUnresolved, "delivered", ago(8), false)
 	seed(oldCancelled, "cancelled", ago(8), false)
 	seed(oldAcked, "acknowledged", ago(8), false)
+	seed(oldExpired, "expired", ago(8), true)
 
 	b, err := New(dir, Binding{FileKey: "KEY", NodeID: "1:2"}, "testtoken")
 	if err != nil {
 		t.Fatal(err)
 	}
-	kept := map[string]bool{recentDone: true, oldUnresolved: true}
-	for _, id := range []string{oldDone, recentDone, oldUnresolved, oldCancelled, oldAcked} {
+	kept := map[string]bool{recentDone: true, oldUnresolved: true, oldExpired: true}
+	for _, id := range []string{oldDone, recentDone, oldUnresolved, oldCancelled, oldAcked, oldExpired} {
 		_, statErr := os.Stat(filepath.Join(dir, "runs", id))
 		if exists := statErr == nil; exists != kept[id] {
 			t.Fatalf("run %s exists=%v want kept=%v", id, exists, kept[id])
@@ -720,7 +797,12 @@ func TestBridge_LongPollHeartbeatNoDelivery(t *testing.T) {
 	done := longPoll(b, t.Context(), `{"client":"p1","heartbeat":true,"wait":true}`)
 	waitForWaiters(t, b, 1)
 	job, _ := b.Submit("x", "", false)
-	rec := <-done
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("submit must wake a held heartbeat poll immediately")
+	}
 	if strings.TrimSpace(rec.Body.String()) != "null" || job.State != "queued" {
 		t.Fatalf("heartbeat long poll delivered: %s (state %s)", rec.Body.String(), job.State)
 	}

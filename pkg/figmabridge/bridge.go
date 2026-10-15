@@ -50,11 +50,13 @@ type Job struct {
 	FinishedAt   string `json:"finishedAt,omitempty"`
 
 	deliveredAt time.Time
+	verifies    []string // inspect 任务提交时待核实的核销任务；该 inspect 成功即解除
 }
 
 type panelSession struct {
 	lastSeen time.Time
 	waiting  int
+	busy     bool // 最近一次轮询为执行期心跳
 }
 
 type JobResult struct {
@@ -76,6 +78,7 @@ type StatusReport struct {
 	Binding      *Binding `json:"binding,omitempty"`
 	Active       *Job     `json:"activeJob,omitempty"`
 	Unresolved   []string `json:"unresolvedJobs,omitempty"`
+	Unverified   []string `json:"expiredUnverifiedJobs,omitempty"`
 	ManifestPath string   `json:"manifestPath,omitempty"`
 }
 
@@ -93,6 +96,7 @@ type Bridge struct {
 	waiters    int           // 挂起中的长轮询数：>0 即面板在线
 	wake       chan struct{} // 有新任务入队时关闭并替换，唤醒挂起的长轮询
 	sessions   map[string]*panelSession
+	unverified map[string]bool // 已核销、尚未经 inspect 核实的任务：阻断普通写入
 }
 
 var (
@@ -109,7 +113,7 @@ func New(dir string, binding Binding, token string) (*Bridge, error) {
 	b := &Bridge{
 		dir: dir, token: token, binding: binding,
 		jobs: map[string]*Job{}, unresolved: map[string]bool{},
-		wake: make(chan struct{}), sessions: map[string]*panelSession{},
+		wake: make(chan struct{}), sessions: map[string]*panelSession{}, unverified: map[string]bool{},
 	}
 	if err := b.recoverRuns(); err != nil {
 		return nil, err
@@ -216,6 +220,10 @@ func (b *Bridge) Retarget(binding Binding) error {
 		b.mu.Unlock()
 		return fmt.Errorf("存在结果未知任务，需先核实并 ack 后才能切换目标")
 	}
+	if len(b.unverified) > 0 {
+		b.mu.Unlock()
+		return fmt.Errorf("存在已核销、结果未知的任务，需先用 inspect:true 核实成功后才能切换目标")
+	}
 	old := b.binding
 	b.binding = binding
 	b.mu.Unlock()
@@ -276,6 +284,10 @@ func (b *Bridge) recoverRuns() error {
 			return fmt.Errorf("任务记录损坏 %s：%w", jpath, err)
 		}
 		if _, err := os.Stat(filepath.Join(b.runDir(id), "result.json")); err == nil {
+			if job.State == "expired" {
+				b.jobs[job.ID] = &job
+				b.unverified[job.ID] = true
+			}
 			continue
 		}
 		switch job.State {
@@ -312,6 +324,9 @@ func (b *Bridge) pruneRuns() {
 		_, statErr := os.Stat(filepath.Join(dir, "result.json"))
 		hasResult := statErr == nil
 		if !hasResult && job.State != "cancelled" && job.State != "acknowledged" {
+			continue
+		}
+		if job.State == "expired" {
 			continue
 		}
 		finished := job.FinishedAt
@@ -378,12 +393,15 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hold <-chan time.Time
+	var wake <-chan struct{}
 	if body.Wait {
 		timer := time.NewTimer(pollHold)
 		defer timer.Stop()
 		hold = timer.C
 		b.mu.Lock()
 		b.touchLocked(body.Session, 1)
+		// 心跳不查队列、只等通道：在计入挂起的同一把锁内取通道，此后的入队必能唤醒它。
+		wake = b.wake
 		b.mu.Unlock()
 		defer func() {
 			b.mu.Lock()
@@ -396,7 +414,10 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return
 		}
-		delivery, wake, err := b.takeJob(body.Heartbeat, body.Session)
+		delivery, next, err := b.takeJob(body.Heartbeat, body.Session)
+		if !body.Heartbeat || wake == nil {
+			wake = next
+		}
 		if err != nil {
 			reply(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -407,7 +428,7 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 		}
 		select {
 		case <-wake:
-			// 心跳轮询被唤醒即返回：面板可能已执行完，需以 heartbeat:false 重新领取。
+			// 心跳轮询被唤醒即返回空：心跳不领取，面板执行完会中止在途心跳、改发领取轮询。
 			if body.Heartbeat {
 				reply(w, http.StatusOK, nil)
 				return
@@ -427,6 +448,9 @@ func (b *Bridge) takeJob(heartbeat bool, session string) (map[string]any, <-chan
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.touchLocked(session, 0)
+	if s := b.sessions[session]; s != nil {
+		s.busy = heartbeat
+	}
 	if !heartbeat && session != "" {
 		// 同一面板发来领取轮询 = 它已空闲：交给它的 delivered 任务已丢失（回传被放弃或交付响应丢失）。
 		for _, job := range b.jobs {
@@ -524,7 +548,7 @@ func (b *Bridge) expireJobLocked(job *Job, reason string) {
 	finished := nowISO()
 	result := JobResult{
 		ID: job.ID, OK: false, ExecStarted: true, FinishedAt: finished,
-		Error: "自动核销：" + reason + "。脚本可能已部分执行，结果未知——继续写入前先用 inspect:true 只读核实文档现状，不要直接重复提交同一修改",
+		Error: "自动核销：" + reason + "。脚本可能已部分执行，结果未知，普通写入已阻断——先用 inspect:true 只读核实文档现状（成功即自动放行），不要直接重复提交同一修改",
 	}
 	if err := writeJSONAtomic(filepath.Join(b.runDir(job.ID), "result.json"), result, 0o600); err != nil {
 		return
@@ -535,6 +559,42 @@ func (b *Bridge) expireJobLocked(job *Job, reason string) {
 		return
 	}
 	*job = expired
+	b.unverified[job.ID] = true
+}
+
+// busyExpiredLocked 返回仍在其原面板上执行（会话存活且在心跳）的已核销任务：
+// 此时面板不领新任务，新提交只会堵在 queued 占住单飞。
+func (b *Bridge) busyExpiredLocked() string {
+	executing := map[string]bool{}
+	for _, job := range b.jobs {
+		if job.State == "delivered" {
+			executing[job.DeliveredTo] = true
+		}
+	}
+	for _, job := range b.jobs {
+		// 该面板已领走更新的任务：它在忙的是那个任务，交给单飞判断。
+		if job.State != "expired" || job.DeliveredTo == "" || executing[job.DeliveredTo] {
+			continue
+		}
+		if s := b.sessions[job.DeliveredTo]; s != nil && s.busy && (s.waiting > 0 || time.Since(s.lastSeen) < orphanAfter) {
+			return job.ID
+		}
+	}
+	return ""
+}
+
+// markVerifiedLocked 解除核销阻断并落盘为 verified（迟到回传走 handleComplete 的终态）。
+func (b *Bridge) markVerifiedLocked(id string) {
+	delete(b.unverified, id)
+	job := b.jobs[id]
+	if job == nil || job.State != "expired" {
+		return
+	}
+	verified := *job
+	verified.State = "verified"
+	if writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), verified, 0o600) == nil {
+		*job = verified
+	}
 }
 
 func (b *Bridge) expireStale() {
@@ -630,6 +690,12 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 	job.FinishedAt = result.FinishedAt
 	// 迟到回传解除待核实：必须与终态同锁、且在 result.json 落盘成功之后。
 	delete(b.unresolved, msg.ID)
+	delete(b.unverified, msg.ID)
+	if job.Inspect && msg.OK {
+		for _, id := range job.verifies {
+			b.markVerifiedLocked(id)
+		}
+	}
 	err = writeJSONAtomic(filepath.Join(b.runDir(job.ID), "job.json"), *job, 0o600)
 	b.mu.Unlock()
 	if err != nil {
@@ -657,6 +723,12 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 	}
 	b.mu.Lock()
 	b.expireStaleLocked()
+	if id := b.busyExpiredLocked(); id != "" {
+		b.mu.Unlock()
+		return nil, &SubmitError{Msg: fmt.Sprintf(
+			"任务 %s 已核销但插件面板仍在执行它（脚本可能挂起），面板此时不领新任务：等待其回传后用 result %s 读回，或在 Figma 中关闭并重开插件面板，约 %.0f 秒后再提交 inspect:true 核实", id, id, orphanAfter.Seconds()),
+			Unresolved: []string{id}}
+	}
 	if len(b.unresolved) > 0 && !inspectOnly {
 		ids := make([]string, 0, len(b.unresolved))
 		for id := range b.unresolved {
@@ -665,6 +737,16 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		b.mu.Unlock()
 		return nil, &SubmitError{Msg: fmt.Sprintf(
 			"上次任务 %s 结果未知，已阻断新写入：请用 figma run（inspect:true）提交只读核实脚本并等待完成，再用 figma ack <job_id> <inspect_job_id> <核实说明> 解锁", strings.Join(ids, ", ")),
+			Unresolved: ids}
+	}
+	if len(b.unverified) > 0 && !inspectOnly {
+		ids := make([]string, 0, len(b.unverified))
+		for id := range b.unverified {
+			ids = append(ids, id)
+		}
+		b.mu.Unlock()
+		return nil, &SubmitError{Msg: fmt.Sprintf(
+			"任务 %s 已自动核销、结果未知，已阻断新写入：先用 figma run（inspect:true）只读核实文档现状，核实成功后即自动放行；不要直接重复提交同一修改", strings.Join(ids, ", ")),
 			Unresolved: ids}
 	}
 	for _, job := range b.jobs {
@@ -683,6 +765,11 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		ID: hex.EncodeToString(idBuf), TargetNodeID: targetNodeID, Inspect: inspectOnly,
 		FileKey: b.binding.FileKey, NodeID: b.binding.NodeID,
 		State: "queued", SubmittedAt: nowISO(),
+	}
+	if inspectOnly {
+		for id := range b.unverified {
+			job.verifies = append(job.verifies, id)
+		}
 	}
 	dir := b.runDir(job.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -720,7 +807,11 @@ func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) Wai
 		b.expireStale()
 		if result, err := b.Result(id); err == nil {
 			job, _ := b.JobByID(id)
-			return WaitOutcome{WaitStatus: "completed", Job: job, Result: result}
+			outcome := WaitOutcome{WaitStatus: "completed", Job: job, Result: result}
+			if job.State == "expired" {
+				outcome.Instruction = fmt.Sprintf("任务 %s 已自动核销、结果未知：普通写入已阻断，先用 run（inspect:true）只读核实文档现状，成功后自动放行；不要直接重复提交同一修改", id)
+			}
+			return outcome
 		}
 		if time.Now().After(deadline) {
 			job, _ := b.JobByID(id)
@@ -868,6 +959,9 @@ func (b *Bridge) Status() StatusReport {
 		}
 		if b.unresolved[job.ID] {
 			report.Unresolved = append(report.Unresolved, job.ID)
+		}
+		if b.unverified[job.ID] {
+			report.Unverified = append(report.Unverified, job.ID)
 		}
 	}
 	return report
