@@ -188,7 +188,17 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   evidence 目录 `result.json`;取数脚本要控制节点数并按 `node` 分块。
 - **写入范围**:新节点建在 `target` 子树内,否则 before/after 快照看不到改动、证据不完整。
 - **Variables**:免费版每个 collection 只有 1 个 mode,`addMode` 会抛;绑定颜色用
-  `figma.variables.setBoundVariableForPaint` 生成新 paint 再整体赋给 `fills`。
+  `figma.variables.setBoundVariableForPaint` 生成新 paint 再整体赋给 `fills`。V2HUB TOKEN 轮实测四坑(详见 recipes §5):
+  ① `createVariable` 增量模式须传集合**对象**而非 id(传 id 报 incremental mode 错);
+  ② 绑定正解签名 `setBoundVariableForPaint(paint, 'color', variable)` 返回**新 paint** 回写——
+  直接改 paint 对象的 `boundVariables` 会被校验拒绝(Unrecognized key);
+  ③ 绑定回读形状是 `paint.boundVariables.color.id`(按字段名嵌套,不是 `boundVariables.id`);
+  ④ **扫描盲区**:`findAll()` 不含节点自身,单组件(非 Set)的根填充常被漏绑——绑定循环要
+  `[set, ...set.findAll()]` 含根扫描。另:白字消歧(TEXT 白字/白描边绑 `onAccent`,FRAME 白底绑
+  `surface`,否则深色模式白字变深);集合对象没有 `.variables` 属性,取变量用
+  `getLocalVariablesAsync()` 按 `variableCollectionId` 过滤;单模式受限时用两个单模式集合
+  (`X` + `X Dark` 同名 token)替代,深色 demo 用 clone + `detachInstance()`(非 `detach_instance`)
+  + 色值映射重涂,升级后可合并双模式。
 - **本地 .fig**:无 fileKey,绑定校验靠 nodeId 兜底(放行);本地副本与云端
   原件勿同时开插件面板,避免任务串入另一份。
 

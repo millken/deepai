@@ -358,6 +358,76 @@ return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', va
 
 核对完复原:`const col = (await figma.variables.getLocalVariableCollectionsAsync()).find(c => c.name === 'Tokens'); target.clearExplicitVariableModeForCollection(col); return null`。文字绑定可用 `t.setBoundVariable('fontSize', v)`(亦支持 lineHeight / letterSpacing / fontWeight / fontFamily)。
 
+### 实战坑与批量配方(V2HUB TOKEN 轮实测,45 屏/6 组件集验证)
+
+**四条 API 坑**(上示代码之外):
+
+1. `createVariable` 增量模式必须传集合**对象**(上例正确),传 `col.id` 会报
+   `Cannot call createVariable with a collection id in incremental mode`;
+2. 绑定回读形状是 `paint.boundVariables.color.id`(按字段名嵌套)——读
+   `boundVariables.id` 永远 undefined,会误判「绑定未生效」;校验直写
+   `paint.boundVariables = {type:'VARIABLE_ALIAS', id}` 会被拒(Unrecognized key),
+   正解只有 `setBoundVariableForPaint` 返回新 paint;
+3. **扫描盲区**:`findAll()` 不含节点自身——单组件(非 Set)的根填充最易漏绑,
+   绑定与验收循环都要 `[set, ...set.findAll()]` 含根;
+4. 集合对象上**没有** `.variables` 属性,取变量用 `getLocalVariablesAsync()`
+   再按 `variableCollectionId` 过滤。
+
+**批量绑定配方**(整个组件集按 hex→token 映射,白字消歧):
+
+```js
+const hx = c => '#' + [c.r, c.g, c.b].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('').toUpperCase();
+const boundVarOf = p => p && p.boundVariables && p.boundVariables.color && p.boundVariables.color.id;
+const L2V = { '#F2F4F7':'bg', '#4F46E5':'accent', '#EEF2FF':'accentSoft', '#111827':'title', '#4B5563':'body', '#9CA3AF':'caption', '#E5E7EB':'border', '#EF4444':'like' };
+const stats = { ok: 0, skip: 0 };
+for (const sid of ['984:15997' /* …全部组件集 id… */]) {
+  const set = await figma.getNodeByIdAsync(sid);
+  for (const n of [set, ...set.findAll(() => true)]) {          // ③ 含根扫描
+    for (const field of ['fills', 'strokes']) {
+      let paints; try { paints = n[field]; } catch (e) { continue; }   // INSTANCE 内部不可写
+      if (!Array.isArray(paints) || !paints.length) continue;
+      let touched = false;
+      const next = paints.map(p => {
+        if (!p || p.type !== 'SOLID' || !p.color || boundVarOf(p)) { if (p && boundVarOf(p)) stats.skip++; return p; }
+        const hex = hx(p.color);
+        let name = L2V[hex];
+        if (hex === '#FFFFFF') name = (n.type === 'TEXT' || field === 'strokes') ? 'onAccent' : 'surface';  // 白字消歧
+        if (!name || !LV[name]) return p;
+        touched = true; stats.ok++;
+        return figma.variables.setBoundVariableForPaint(p, 'color', LV[name]);   // ② 返回新 paint
+      });
+      if (touched) { try { n[field] = next; } catch (e) {} }     // 实例写失败静默,组件源才是权威
+    }
+  }
+}
+return stats;   // ok=实际绑定数,skip=已绑跳过;终验再跑一轮含根扫描,残余应 0
+```
+
+**单模式受限的替代结构**(免费版 addMode 抛错时):建两个单模式集合
+`X`(Light)+ `X Dark`(同名 token),组件绑 Light 集;深色预览用 **demo 屏**而非切 mode:
+
+```js
+const DMAP = { '#F2F4F7':'#111827', '#FFFFFF':'#1F2937', '#4F46E5':'#818CF8', /* … */ };
+const demo = target.clone();
+demo.name = target.name.replace(' / V3', ' Dark (demo)');
+for (const inst of demo.findAll(n => n.type === 'INSTANCE')) { try { inst.detachInstance(); } catch (e) {} }  // 正名 detachInstance,非 detach_instance
+const repaint = n => { for (const f of ['fills','strokes']) {
+  let ps; try { ps = n[f]; } catch (e) { return; }
+  if (!Array.isArray(ps)) return;
+  let t = false;
+  const nx = ps.map(p => { if (!p || p.type!=='SOLID' || !p.color) return p;
+    const hex = hx(p.color); let to = DMAP[hex];
+    if (hex === '#FFFFFF') to = (n.type==='TEXT' || f==='strokes') ? '#FFFFFF' : '#1F2937';
+    if (!to) return p; t = true; return { type:'SOLID', color: rgb(to) }; });
+  if (t) { try { n[f] = nx; } catch (e) {} } } };
+repaint(demo);                                    // 根不在 findAll 里,单独涂
+for (const n of demo.findAll(() => true)) repaint(n);
+return await demo.exportAsync({ format:'PNG', constraint:{type:'SCALE',value:1} });
+```
+
+配套交付物:TOKEN 展示板(每 token 一行,Light/Dark 双色板,色板本身绑变量——
+改变量值即预览换肤)与 demo 屏并排摆放,即「主题切换有 TOKEN 支撑」的完整证据。
+
 ## 6. 组件与变体(按规格构建 Button / Input)
 
 尺寸只从规格表取([component-specs.md](component-specs.md)),不现场估算;高度由「行高 + 2×垂直内边距」推出,文字靠 auto-layout 居中,绝不手摆坐标。
@@ -653,6 +723,19 @@ function checkIcon(n) {
     err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 长边未充满图标框 ' + r1(n.width) + '×' + r1(n.height) + ' 的 60%(疑似 arc 畸变导入)');
 }
 
+// 圆形小按钮(≤40 方形圆角≥半)内的手摆文本图标(‹ ↗ ⋯ ⌕ ⚙ ♥ ☆ + › 等):
+// 文字字形在行框内天然偏移,32 盒手摆 y 近似必偏(实测 ‹ y=6 差 1px 仍被点名)。
+// 应换贝塞尔 SVG 按 (盒宽-图标宽)/2 居中;检查器拦「圆钮内 TEXT 单字符大号」。
+const GLYPH_ICONS = /^([‹›⌕⚙↗⋯♥☆★✈✉🌐🗂📦⚖ⓘ↻❓🔒·+])$/;
+function checkGlyphIcon(n) {
+  if (n.type !== 'FRAME' || Math.abs(n.width - n.height) > 1 || n.width < 24 || n.width > 48) return;
+  if (n.cornerRadius < n.width / 2 - 1) return;
+  const txt = n.children.filter(c => c.type === 'TEXT')[0];
+  if (!txt) return;
+  if (GLYPH_ICONS.test(txt.characters.trim()) && txt.fontSize >= 11)
+    err(n, 'glyphIcon', '圆钮内手摆文本图标「' + txt.characters.trim() + '」(字形在行框内偏移,无法精确居中)——换贝塞尔 SVG 按 (盒宽−图标宽)/2 落位');
+}
+
 function checkVariants(set) {
   const groups = {};
   for (const c of set.children) {
@@ -695,7 +778,7 @@ async function walk(n, inControl) {
   if (n.type === 'COMPONENT_SET') checkVariants(n);
   let kind = null;
   if (!inControl) { kind = await kindOf(n); if (kind) checkControl(n, kind); }
-  if ('children' in n) { checkLayout(n); if (!inControl) { if (!kind && pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
+  if ('children' in n) { checkLayout(n); if (!inControl) { if (!kind && pillLike(n)) checkPill(n); checkStack(n); checkIcon(n); checkGlyphIcon(n); } for (const c of n.children) await walk(c, inControl || !!kind); }
 }
 await walk(target, false);
 return {
