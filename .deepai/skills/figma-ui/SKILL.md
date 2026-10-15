@@ -188,7 +188,10 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
   evidence 目录 `result.json`;取数脚本要控制节点数并按 `node` 分块。
 - **写入范围**:新节点建在 `target` 子树内,否则 before/after 快照看不到改动、证据不完整。
 - **Variables**:免费版每个 collection 只有 1 个 mode,`addMode` 会抛;绑定颜色用
-  `figma.variables.setBoundVariableForPaint` 生成新 paint 再整体赋给 `fills`。
+  `setBoundVariableForPaint` 生成新 paint 再整体赋给 `fills`。实测四坑与批量绑定/深色 demo
+  配方**详见 recipes §5**(createVariable 传集合对象、绑定签名返回新 paint、回读
+  `boundVariables.color.id` 形状、`findAll` 不含根的盲区、白字 onAccent/surface 消歧、
+  单模式双集合替代结构)。
 - **本地 .fig**:无 fileKey,绑定校验靠 nodeId 兜底(放行);本地副本与云端
   原件勿同时开插件面板,避免任务串入另一份。
 
