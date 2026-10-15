@@ -62,6 +62,9 @@ const nodeCss = n => {
 let compCss = '/* codegen 确定性生成 — 勿手改;源:ir/design.json components */\n';
 for (const key of Object.keys(IR.comps).sort()) {
   for (const variant of IR.comps[key]) {
+    // extract 侧的坏集/坏变体标记({v, err})在此跳过并留痕,保持确定性——
+    // 「坏节点标记不炸整跑」的承诺需要 codegen 侧配合兑现
+    if (variant.err || !variant.n) { compCss += `\n/* skipped ${key} ${variant.v}: ${variant.err || 'no-node'} */\n`; continue; }
     compCss += `\n.${key}--${slug(variant.v)} {\n`;
     for (const line of nodeCss(variant.n)) compCss += `  ${line};\n`;
     compCss += '}\n';
@@ -134,6 +137,8 @@ const irSectionTexts = (name, sec) => {
   const found = scr && scr.secs && scr.secs.find(x => x.name === sec);
   return (found && found.texts) || [];
 };
+// demo 启发式:按 size===16 识别卡片标题。真实项目应按图层名匹配(如 name==='title'),
+// 与「稳定键用图层名」原则一致(extract 端在 txt() 输出里带 k 字段即可)。
 const irCardTitles = name => irSectionTexts(name, 'list').filter(t => t.size === 16).map(t => t.t);
 const mergeIR = (name, d) => {
   const titles = irCardTitles(name);

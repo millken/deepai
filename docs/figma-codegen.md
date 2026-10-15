@@ -46,9 +46,9 @@ dist/(逐文件输出:tokens.css / base.css / screens/*.html / index.html 画廊
 |---|---|---|
 | **模板自验证**(仓库内 `codegen-template/`,任何人可复现) | `node codegen.js` 双跑 + `diff -r dist` | 逐字节一致(demo-feed.html + 3 css) |
 | extract 确定性(仓库外参考) | 同脚本双跑,规范化 JSON 对比 | IR 逐字节一致(31,728B);还原后第三跑与基线 diff 0(三重确认) |
-| codegen 确定性 | `node codegen.js` 双跑 + `diff -r dist` | 逐字节一致(45 屏 + 3 资源 + 画廊共 48 文件) |
-| 增量性 | Figma 仅改一处卡片标题 → 重跑全管线 → `git status` | 仅 `topic-hot.html` 1 行 + `ir/design.json` 1 行 diff;还原后 dist 与基线 diff 0 |
-| 像素保真 | Chrome 1x 截图 vs Figma 导出基准 | Light 9.6% / Dark 10.0% 差异(与手写 LLM 版同量级,剩余为跨渲染器文本栅格化) |
+| codegen 确定性(仓库外参考) | `node codegen.js` 双跑 + `diff -r dist` | 逐字节一致(45 屏 + 3 资源 + 画廊共 48 文件) |
+| 增量性(仓库外参考) | Figma 仅改一处卡片标题 → 重跑全管线 → `git status` | 仅 `topic-hot.html` 1 行 + `ir/design.json` 1 行 diff;还原后 dist 与基线 diff 0 |
+| 像素保真(仓库外参考) | Chrome 1x 截图 vs Figma 导出基准 | Light 9.6% / Dark 10.0% 差异(与手写 LLM 版同量级,剩余为跨渲染器文本栅格化) |
 
 git 证据链(**仓库外**项目 `~/v2hub-v3/pipeline`,仅供参考、不可在 deepai 仓库内复现;仓库内可复现验证见上表「模板自验证」行):
 ```
@@ -60,7 +60,7 @@ b5fbfb7  codegen v3: 45 屏一次性生成(双跑逐字节一致)
 
 ## 五、落地步骤(新项目 checklist)
 > 模板起点:复制 `codegen-template/`(含 ir 样例/assets/可跑 codegen,README 有快速开始与验证命令),按下述步骤替换数据源与渲染器。
-> 仓库内 `codegen-template/` 是唯一可复现的验证载体(双跑 `diff -r` 逐字节一致);下表外部项目的数字仅作规模参考。
+> 仓库内 `codegen-template/` 是唯一可复现的验证载体(双跑 `diff -r` 逐字节一致);上表(§四)外部项目的数字仅作规模参考。
 
 
 1. **Figma 源规范化**(管线质量的上限):公共组件抽 Component Set + 变体;图层语义命名(`avatar/title/chip/username`…);颜色绑变量集合(Light/Dark 同名 token);一屏一画板、分区命名(`status/header/filters/list/tabbar`)。
