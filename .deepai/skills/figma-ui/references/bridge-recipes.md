@@ -208,6 +208,37 @@ return out;
 
 反向导入(`figma.createNodeFromSvg`)时**禁用 `A/a` 圆弧参数**:实测 16×16 viewBox 的 3/4 圆弧 `M12 3a9 9 0 1 0 9 9` 导入后矢量包围盒 13×39,超出 viewBox 且比例错误;同形改用三段 C 贝塞尔 `M12 3 C17 3 21 7 21 12 C21 17 17 21 12 21 C7 21 3 17 3 12` 导入后 12×12 规整。纯线段/折线路径不受影响,spinner/loading 类图标是重灾区。导入后读 after 快照核对矢量尺寸是否落在 viewBox 内。
 
+### 线性图标字典(可直接 `createNodeFromSvg`,全贝塞尔/线段,已过 iconBBox 验证)
+
+构建新屏需要图标时优先查此表(24×24 viewBox,stroke 1.8,round cap/join,与 §6 组件风格一致);表内没有再自绘——自绘遵守「禁 A/a 圆弧」规则(上节)。取用模板:
+
+```js
+const ICONS = { /* 下表 */ };
+const icon = (name, color, size = 24) => figma.createNodeFromSvg(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="${ICONS[name]}"/></svg>`);
+```
+
+| name | path d |
+|---|---|
+| home | `M3 11 L12 3 L21 11 M5 10 L5 20 L10 20 L10 15 L14 15 L14 20 L19 20 L19 10` |
+| discover | `M12 21 C7.03 21 3 16.97 3 12 C3 7.03 7.03 3 12 3 C16.97 3 21 7.03 21 12 C21 16.97 16.97 21 12 21 Z M15.5 8.5 L13.5 13 L9 15 L11 10.5 Z` |
+| notify | `M18 16 V11 C18 7.69 15.31 5 12 5 C8.69 5 6 7.69 6 11 V16 L4 18 H20 Z M10 20 C10 21.1 10.9 22 12 22 C13.1 22 14 21.1 14 20` |
+| my | `M12 11 C13.93 11 15.5 9.43 15.5 7.5 C15.5 5.57 13.93 4 12 4 C10.07 4 8.5 5.57 8.5 7.5 C8.5 9.43 10.07 11 12 11 Z M5 20 C5 16.15 8.25 13 12 13 C15.75 13 19 16.15 19 20` |
+| publish | `M12 20 H5 C3.9 20 3 19.1 3 18 V5 C3 3.9 3.9 3 5 3 H12 M8.5 15.5 L17.5 6.5 C18.33 5.67 19.67 5.67 20.5 6.5 C21.33 7.33 21.33 8.67 20.5 9.5 L11.5 18.5 L7 20 Z` |
+| back | `M14 6 L8 12 L14 18` |
+| share | `M7 17 L17 7 M9 7 H17 V15` |
+| more | `M5 12 L5.01 12 M12 12 L12.01 12 M19 12 L19.01 12` |
+| search | `M10.5 17 C14.09 17 17 14.09 17 10.5 C17 6.91 14.09 4 10.5 4 C6.91 4 4 6.91 4 10.5 C4 14.09 6.91 17 10.5 17 Z M15 15 L20 20` |
+| gear | `M12 15.5 C13.93 15.5 15.5 13.93 15.5 12 C15.5 10.07 13.93 8.5 12 8.5 C10.07 8.5 8.5 10.07 8.5 12 C8.5 13.93 10.07 15.5 12 15.5 Z M12 2.8 L13.4 5.2 L16.2 4.6 L16.6 7.4 L19.2 8.6 L18 11.1 L19.6 13.4 L17.4 15.2 L17.8 18 L15 18.7 L13.8 21.2 L11.3 20.3 L9 21.7 L7.3 19.5 L4.5 19.3 L4.2 16.5 L2 14.9 L3.1 12.3 L2.2 9.7 L4.7 8.3 L5.3 5.5 L8.1 5.7 L10 3.7 Z` |
+| history | `M12 21 C7.03 21 3 16.97 3 12 C3 7.03 7.03 3 12 3 C16.97 3 21 7.03 21 12 C21 16.97 16.97 21 12 21 Z M12 7 L12 12 L15.5 14` |
+| doc | `M5 3 L16 3 C17.1 3 18 3.9 18 5 L18 15 L14 19 L5 19 C3.9 19 3 18.1 3 17 L3 5 C3 3.9 3.9 3 5 3 Z M14 19 L14 15 L18 15 M7 8 L14 8 M7 12 L11 12` |
+| star | `M12 3.5 L14.6 9 L20.5 9.8 L16 14 L17.2 20 L12 17 L6.8 20 L8 14 L3.5 9.8 L9.4 9 Z` |
+| people | `M8.5 11 C10.15 11 11.5 9.66 11.5 8 C11.5 6.34 10.15 5 8.5 5 C6.85 5 5.5 6.34 5.5 8 C5.5 9.66 6.85 11 8.5 11 Z M15.5 11 C17.15 11 18.5 9.66 18.5 8 C18.5 6.34 17.15 5 15.5 5 M2.5 19 C2.5 16 5.13 13.5 8.5 13.5 C11.87 13.5 14.5 16 14.5 19 M15 13.6 C17.6 14.1 19.5 16.3 19.5 19` |
+| wrench | `M14.7 6.3 L16.3 7.9 L17.7 6.5 L21.47 2.73 C18.6 0.9 14.7 1.3 12.2 3.8 C10 6 9.4 9.2 10.6 11.9 L3.9 18.6 C3.1 19.4 3.1 20.6 3.9 21.4 C4.7 22.2 5.9 22.2 6.7 21.4 L13.4 14.7 C16.1 15.9 19.3 15.3 21.5 13.1 C19.6 14.2 17.2 14.2 15.4 13.1 L14 11.7 C13 10.7 13 9.1 14 8.1` |
+| spin | `M12 3 C17 3 21 7 21 12 C21 17 17 21 12 21 C7 21 3 17 3 12` |
+
+loading 场景直接用 `spin`(圆心留缺口即旋转指示);色值传 hex,图标盒内按 `(盒宽−图标宽)/2` 落位(§6 居中正解)。
+
 ## 4. 构建辅助(写 Figma 时整段贴在脚本开头)
 
 ```js
@@ -555,6 +586,29 @@ walk(target);
 return { total, examples: issues, fontSizes: [...sizes].sort((a, b) => a - b), rawColors: [...raw].slice(0, 24) };
 ```
 
+### 同构屏指纹组反查(批量修复前必跑,防变体漏修)
+
+实测教训:修复清单只写了 `My-Profile`,漏了同构变体 `My-Profile-NoTopic`——两屏资料卡完全同构,一处漏修一处返工。**凡批量修复/调整,先跑指纹分组,同组屏一并处理**:
+
+```js
+await figma.loadAllPagesAsync();
+const page = figma.root.children.find(p => p.name === 'V3 Redesign');   // ← 目标页
+const boards = page.children.filter(c => c.width >= 300).sort((a, b) => a.x - b.x || a.y - b.y);
+const groups = new Map();
+for (const b of boards) {
+  // 指纹 = 尺寸 + 前 30 条文案(各截 20 字符):同内容变体/深浅主题归并为一组
+  const texts = b.findAll(n => n.type === 'TEXT').map(t => t.characters).filter(s => s && s.trim()).slice(0, 30).map(s => s.slice(0, 20));
+  const fp = Math.round(b.width) + 'x' + Math.round(b.height) + '|' + texts.join('¶');
+  if (!groups.has(fp)) groups.set(fp, []);
+  groups.get(fp).push(b.name);
+}
+// 待修屏 → 反查同组变体:修它之前,同组的其它屏必须进同一修复清单
+const variantsOf = name => { for (const g of groups.values()) if (g.includes(name)) return g; return [name]; };
+return { groups: [...groups.values()], variantsOf: variantsOf('My-Profile') };  // ← 换成待修屏名
+```
+
+确定性要点:画板按 `(x,y)` 排序后分组;指纹只取尺寸+文案(不含 node-id,复制粘贴会变);重复执行输出一致。典型输出:`["My-Profile", "My-Profile-NoTopic"]`——修复命令对两屏都要跑。
+
 | 项 | 对代码转换的影响 | 修法 |
 |---|---|---|
 | `noAutoLayout` / `group` | 只能绝对定位还原,响应式失效 | 转 Frame + auto-layout |
@@ -809,3 +863,52 @@ return {
 
 读结果:先看 `checked`——它说明这次验收**实际覆盖了什么**。`truncated:true`(超过 3000 节点)时 `pass` 必为 false,用 `node` 拆小子树重跑;刚构建了按钮/输入框却 `checked.controls` 为 0,说明命名没被识别(按 `button|input…` 规则改名后重跑),此时的 `pass:true` 不能证明控件正确。脚本覆盖控件几何、文字、流式溢出、文字重叠、近似未对齐、胶囊收缩/居中(`pillCollapsed`/`pillOffY`)、图标栈居中(`stackOffX`)、图标矢量畸变(`iconBBox`);页面级的结构问题(Group、缺 auto-layout、原始色值)由 §7 体检负责,两者都过才算页面验收通过。
 `pass:false` 时逐条按 `[code]` 修(多半是重建为规格化 auto-layout,而不是挪坐标),改完**对同一子树重跑**直到 `pass:true`;最多 3 轮仍不过,带着 `errors` 原文与 `controls` 量测表向用户报告。`warn` 需要逐条给出「有意为之」的理由或修掉。`controls` 每行是控件的实测数据(尺寸、内边距、`font`、`fs_h` 字号/高度比、`padX_h`、`dx/dy` 几何偏移、`dyInk` 字形偏移、`contrast`),交付时原样列给用户。
+
+## 9. 流程走读(多屏交付后,按真实用户路径找断点)
+
+多屏项目(≥10 屏)交付前必跑:静态检查(lint/量测)证明「每屏做对了」,走读证明「屏与屏连得起来」。实测:V2HUB 44 屏 lint 全绿,走读仍揪出 3 个孤儿屏 + 2 处导航不一致——两类检查互补,缺一不可。
+
+### 第一步:导航摘要(只读,每屏一行)
+
+```js
+await figma.loadAllPagesAsync();
+const page = figma.root.children.find(p => p.name === 'V3 Redesign');   // ← 目标页
+const summary = [];
+for (const s of page.children) {
+  if (s.type !== 'FRAME' || !s.name.endsWith(' / V3')) continue;       // ← 命名规则换项目的
+  const secs = s.children.filter(c => c.type === 'FRAME' || c.type === 'INSTANCE');
+  const top = secs[1];                                                  // 第 2 分区 = header/navbar(status 之后)
+  const topTexts = top ? top.findAll(n => n.type === 'TEXT').map(t => t.characters.slice(0, 8)).slice(0, 3) : [];
+  const tabInst = s.children.find(c => c.type === 'INSTANCE' && c.name === 'Tabbar');
+  const bottom = s.children.find(c => c.name === 'bottom');
+  const actionbar = secs.find(c => c.name === 'actionbar');
+  const bottomKind = tabInst ? 'tabbar' : (actionbar ? 'actionbar' : (bottom ? 'homebar-only' : 'none'));
+  let activeTab = null;
+  if (tabInst) {                                                        // 激活 tab = accent 色的 10px 标签
+    for (const l of tabInst.findAll(n => n.type === 'TEXT' && n.fontSize === 10)) {
+      const f = l.fills[0] && l.fills[0].color;
+      if (f && Math.abs(f.r - 0x4F / 255) < 0.02 && Math.abs(f.b - 0xE5 / 255) < 0.03) { activeTab = l.characters; break; }
+    }
+  }
+  const btns = s.findAll(n => n.type === 'TEXT' && ['去登陆', '刷新', '重试', '全部已读', '发表主题'].some(k => n.characters.includes(k))).map(n => n.characters.slice(0, 8));
+  summary.push({ name: s.name.slice(0, -5), top: top ? top.name + '(' + topTexts.join(',') + ')' : null, bottomKind, activeTab, btns });
+}
+return summary;
+```
+
+### 第二步:链路分析(对照摘要,逐路径核对)
+
+按真实用户旅程连线,每条路径回答「下一屏存在吗 / 入口在哪 / 状态齐吗」:
+
+| 检查类 | 问法 | 实测案例(V2HUB) |
+|---|---|---|
+| 孤儿屏 | 全 app 有入口能到这张屏吗 | Like×2 / SiteStat 无任何入口可达 |
+| 入口无目标 | 按钮/tab 点了有下一屏吗 | 发布 tab 无 Compose 屏 |
+| 同族不一致 | 同族屏底部形态/导航一致吗 | Notification-Construction 缺 tabbar(同族两屏都有) |
+| 重复导航 | 同一入口出现多处吗 | Setting×7 尾部重复 3 行入口 ×21 处 |
+| 状态缺失 | 空态/加载态/错误态齐吗 | Follow 空态无出口 CTA |
+| 文案与 UI 相符 | 提到的控件存在吗 | OpenLinkFail 说「点右上角图标」但 navbar 只有返回 |
+
+### 第三步:断点分级与修复
+
+按 P0(流程断裂:孤儿/无目标)/ P1(体验不一致)/ P2(打磨)列清单,带屏名与修法(补入口/建屏/删重复/改文案),交用户挑选批次;修复后重跑摘要复验断点清零。
