@@ -1,0 +1,28 @@
+/* codegen 确定性生成 — 勿手改;源:ir/design.json components */
+
+.button--variant-primary {
+  width: 358px;
+  height: 48px;
+  border-radius: 14px;
+  background: var(--accent);
+  display: flex;
+  flex-direction: row;
+}
+
+.button--variant-secondary {
+  width: 358px;
+  height: 48px;
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.topicList--default {
+  width: 358px;
+  height: 96px;
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 14px 14px 14px 14px;
+  gap: 5px;
+  display: flex;
+  flex-direction: column;
+}

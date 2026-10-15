@@ -1,7 +1,7 @@
 # Figma 确定性代码生成管线(design → code pipeline)
 
 > 让「Figma 改一处 → 代码 diff 一行」成为可预测的工程流程:同输入必同输出(逐字节)、局部改动只动对应文件、生成物全部可进 git 审阅。
-> 本文是架构说明与落地指南;实证项目见 `~/v2hub-v3/pipeline/`(V2HUB V3,45 屏全量)。
+> 本文是架构说明与落地指南;**可运行模板在仓库内 [`codegen-template/`](../codegen-template/README.md)**(自包含:ir 样例 + assets + codegen,`node codegen.js` 双跑 `diff -r` 即验确定性);外部实证项目参考 `~/v2hub-v3/pipeline/`(V2HUB V3,45 屏全量)。
 
 ## 一、为什么需要确定性管线
 
@@ -44,6 +44,7 @@ dist/(逐文件输出:tokens.css / base.css / screens/*.html / index.html 画廊
 
 | 验证项 | 方法 | 结果 |
 |---|---|---|
+| **模板自验证**(仓库内 `codegen-template/`,任何人可复现) | `node codegen.js` 双跑 + `diff -r dist` | 逐字节一致(demo-feed.html + 3 css) |
 | extract 确定性 | 同脚本双跑,规范化 JSON 对比 | IR 逐字节一致(31,728B);还原后第三跑与基线 diff 0(三重确认) |
 | codegen 确定性 | `node codegen.js` 双跑 + `diff -r dist` | 逐字节一致(45 屏 + 3 资源 + 画廊共 48 文件) |
 | 增量性 | Figma 仅改一处卡片标题 → 重跑全管线 → `git status` | 仅 `topic-hot.html` 1 行 + `ir/design.json` 1 行 diff;还原后 dist 与基线 diff 0 |
@@ -58,6 +59,8 @@ b5fbfb7  codegen v3: 45 屏一次性生成(双跑逐字节一致)
 ```
 
 ## 五、落地步骤(新项目 checklist)
+> 模板起点:复制 `codegen-template/`(含 ir 样例/assets/可跑 codegen,README 有快速开始与验证命令),按下述步骤替换数据源与渲染器。
+
 
 1. **Figma 源规范化**(管线质量的上限):公共组件抽 Component Set + 变体;图层语义命名(`avatar/title/chip/username`…);颜色绑变量集合(Light/Dark 同名 token);一屏一画板、分区命名(`status/header/filters/list/tabbar`)。
 2. **写 extract**:对组件集递归、对屏按分区扁平读取(见已知坑①②);每分区/每集独立 try/catch,坏节点标记不炸整跑;返回值只带摘要,PNG 走 `exportAsync` 字节直返。

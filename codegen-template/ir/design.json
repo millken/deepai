@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "comps": {
+    "topicList": [
+      {
+        "v": "default",
+        "n": { "k": "Card/Topic/List", "w": 358, "h": 96, "r": 16, "fill": "var(--surface)", "dir": "v", "gap": 5, "pad": [14, 14, 14, 14] }
+      }
+    ],
+    "button": [
+      { "v": "variant=primary", "n": { "k": "Button", "w": 358, "h": 48, "r": 14, "fill": "var(--accent)", "dir": "h" } },
+      { "v": "variant=secondary", "n": { "k": "Button", "w": 358, "h": 48, "r": 14, "fill": "var(--surface)" } }
+    ]
+  },
+  "screens": {
+    "demo-feed": { "w": 390, "h": 844, "secs": [{ "name": "status" }, { "name": "header" }, { "name": "filters" }, { "name": "list" }, { "name": "tabbar", "inst": true }] }
+  }
+}

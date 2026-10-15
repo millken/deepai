@@ -1,0 +1,39 @@
+/* codegen 确定性生成 — 勿手改 */
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Noto Sans SC","PingFang SC",sans-serif;background:var(--bg);-webkit-font-smoothing:antialiased}
+.screen{width:390px;height:844px;margin:0;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.status{height:44px;position:relative;flex-shrink:0}
+.status .time{position:absolute;left:28px;top:12px;font-size:15px;font-weight:500;color:var(--title)}
+.signal{position:absolute;left:300px;top:14px;display:flex;gap:2px;align-items:flex-end}
+.signal i{width:3px;background:var(--title);border-radius:.5px;display:block}
+.signal i:nth-child(1){height:4px}.signal i:nth-child(2){height:6px}.signal i:nth-child(3){height:8px}
+.battery{position:absolute;left:322px;top:16px;width:22px;height:11px;border:1px solid var(--title);border-radius:3px;padding:2px}
+.battery i{display:block;width:15px;height:6px;background:var(--title);border-radius:1px}
+.big-header{height:60px;padding:6px 20px 0;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.big-header .titles{display:flex;flex-direction:column;gap:2px;flex:1}
+.big-header h1{font-size:26px;font-weight:700;color:var(--title);line-height:32px}
+.big-header .sub{font-size:11px;color:var(--caption)}
+.filters{height:50px;padding:13px 20px 0;display:flex;gap:8px;flex-shrink:0}
+.pill{height:32px;padding:4px 14px 3px;border-radius:100px;display:inline-flex;align-items:center;font-size:13px;background:var(--surface);color:var(--body);border:1px solid var(--border)}
+.pill.active{background:var(--accent);color:var(--on-accent);font-weight:500;border-color:transparent}
+.content{flex:1;padding:12px 16px;display:flex;flex-direction:column;gap:12px;overflow:hidden}
+.card{background:var(--surface);border-radius:16px;padding:14px;display:flex;gap:10px}
+.avatar{width:36px;height:36px;border-radius:18px;flex-shrink:0;color:var(--on-accent);font-size:14px;font-weight:500;display:flex;align-items:center;justify-content:center}
+.card .cbody{width:284px;display:flex;flex-direction:column;gap:5px;min-width:0}
+.byline{display:flex;align-items:baseline;gap:6px;height:16px}
+.byline .author{font-size:13px;font-weight:500;color:var(--title);line-height:16px}
+.byline .dot,.byline .time{font-size:11px;color:var(--caption);line-height:16px}
+.card h2{font-size:16px;font-weight:500;color:var(--title);line-height:22px}
+.meta{display:flex;align-items:center;gap:10px;height:20px}
+.chip{height:20px;padding:3px 10px 2px;border-radius:100px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:500;line-height:15px;display:inline-flex;align-items:center;white-space:nowrap}
+.meta .sp{flex:1}
+.meta .replies{font-size:11px;color:var(--caption);line-height:13px}
+.meta .likes{font-size:11px;color:var(--like);line-height:13px}
+.tabbar{height:75px;background:var(--surface);padding:6px 12px 18px;display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+.tabs{display:flex;height:40px;align-items:center}
+.tab-item{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px}
+.tab-item svg{width:24px;height:24px;stroke:var(--caption)}
+.tab-item span{font-size:10px;color:var(--caption)}
+.tab-item.active svg{stroke:var(--accent)}
+.tab-item.active span{color:var(--accent);font-weight:500}
+.home-indicator{width:134px;height:5px;border-radius:3px;background:var(--title);opacity:.9;margin:0 auto}
