@@ -1,0 +1,39 @@
+/* codegen 确定性生成 — 勿手改;源:codegen-template/assets/tokens.json */
+:root {
+  --accent: #4F46E5;
+  --accent-soft: #EEF2FF;
+  --bg: #F2F4F7;
+  --body: #4B5563;
+  --border: #E5E7EB;
+  --caption: #9CA3AF;
+  --like: #EF4444;
+  --on-accent: #FFFFFF;
+  --surface: #FFFFFF;
+  --title: #111827;
+}
+html[data-theme="dark"] {
+  --accent: #818CF8;
+  --accent-soft: #312E81;
+  --bg: #111827;
+  --body: #D1D5DB;
+  --border: #374151;
+  --caption: #9CA3AF;
+  --like: #F87171;
+  --on-accent: #FFFFFF;
+  --surface: #1F2937;
+  --title: #F9FAFB;
+}
+@media (prefers-color-scheme: dark) {
+  html[data-theme="auto"] {
+    --accent: #818CF8;
+    --accent-soft: #312E81;
+    --bg: #111827;
+    --body: #D1D5DB;
+    --border: #374151;
+    --caption: #9CA3AF;
+    --like: #F87171;
+    --on-accent: #FFFFFF;
+    --surface: #1F2937;
+    --title: #F9FAFB;
+  }
+}

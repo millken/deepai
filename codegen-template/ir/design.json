@@ -1,0 +1,92 @@
+{
+  "comps": {
+    "button": [
+      {
+        "n": {
+          "dir": "h",
+          "fill": "var(--accent)",
+          "h": 48,
+          "k": "Button",
+          "r": 14,
+          "w": 358
+        },
+        "v": "variant=primary"
+      },
+      {
+        "n": {
+          "fill": "var(--surface)",
+          "h": 48,
+          "k": "Button",
+          "r": 14,
+          "w": 358
+        },
+        "v": "variant=secondary"
+      }
+    ],
+    "topicList": [
+      {
+        "n": {
+          "dir": "v",
+          "fill": "var(--surface)",
+          "gap": 5,
+          "h": 96,
+          "k": "Card/Topic/List",
+          "pad": [
+            14,
+            14,
+            14,
+            14
+          ],
+          "r": 16,
+          "w": 358
+        },
+        "v": "default"
+      }
+    ]
+  },
+  "screens": {
+    "demo-feed": {
+      "h": 844,
+      "secs": [
+        {
+          "name": "status"
+        },
+        {
+          "name": "header"
+        },
+        {
+          "name": "filters"
+        },
+        {
+          "name": "list",
+          "texts": [
+            {
+              "c": "var(--title)",
+              "size": 16,
+              "t": "用 React Native 构建了一个 V2EX 移动客户端，已开源可下载",
+              "w": 500
+            },
+            {
+              "c": "var(--title)",
+              "size": 16,
+              "t": "分享一个基于 Koa2 构建的 Web 开发脚手架，欢迎 Star",
+              "w": 500
+            },
+            {
+              "c": "var(--title)",
+              "size": 16,
+              "t": "TTS Now：基于云平台语音合成 API 的文字转语音助手",
+              "w": 500
+            }
+          ]
+        },
+        {
+          "inst": true,
+          "name": "tabbar"
+        }
+      ],
+      "w": 390
+    }
+  },
+  "v": 1
+}

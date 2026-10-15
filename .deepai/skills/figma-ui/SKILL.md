@@ -88,6 +88,8 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 ## Workflow A — implement a design (design → code)
 
+> **交付分档(前置判断,非步骤)**:一次性原型/探索可直接手写;长期维护的项目页面(≥10 屏/多主题/多人协作)走**确定性生成管线**——extract→IR+assets→codegen 三段式,Figma 改一处→git diff 单文件单行,双跑逐字节一致;架构/四要素/落地 checklist/可运行模板见 [docs/figma-codegen.md](../../../docs/figma-codegen.md) 与仓库内 `codegen-template/`。
+
 1. **先读项目,再读设计**:确认框架与样式方案(package.json、`@import "tailwindcss"` 即 v4、CSS Modules 等)、
    现有 token 文件、现有组件库。设计里的 INSTANCE(取数输出 `component` + `props`)优先映射到已有组件,
    props 直接对应变体属性(`variant=secondary` → `variant="secondary"`);官方远程可先查
