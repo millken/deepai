@@ -378,6 +378,7 @@ return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', va
 ```js
 const cols = await figma.variables.getLocalVariableCollectionsAsync();
 const col = cols.find(c => c.name === 'X');                 // ← 换成本项目集合名
+if (!col) throw Error('变量集合「X」不存在,可用: ' + cols.map(c => c.name).join(', '));   // 找不到明确报错并列出可用集合,防后续对 undefined 取 id
 const varsAll = await figma.variables.getLocalVariablesAsync();   // 集合对象没有 .variables,从这里取
 const LV = {}; for (const v of varsAll) if (v.variableCollectionId === col.id) LV[v.name] = v;
 const hx = c => '#' + [c.r, c.g, c.b].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('').toUpperCase();
@@ -388,7 +389,7 @@ for (const sid of ['984:15997' /* …全部组件集 id… */]) {
   const set = await figma.getNodeByIdAsync(sid);
   for (const n of [set, ...set.findAll(() => true)]) {          // 含根扫描(findAll 不含节点自身)
     for (const field of ['fills', 'strokes']) {
-      let paints; try { paints = n[field]; } catch (e) { continue; }   // INSTANCE 内部不可写
+      let paints; try { paints = n[field]; } catch (e) { stats.fail++; continue; }   // INSTANCE 内部不可写,计入 fail(与计数点对齐)
       if (!Array.isArray(paints) || !paints.length) continue;
       let touched = false;
       const next = paints.map(p => {
@@ -418,7 +419,8 @@ const hx = c => '#' + [c.r, c.g, c.b].map(v => Math.round(v*255).toString(16).pa
 const rgb = h => ({ r: parseInt(h.slice(1,3),16)/255, g: parseInt(h.slice(3,5),16)/255, b: parseInt(h.slice(5,7),16)/255 });
 const DMAP = { '#F2F4F7':'#111827', '#FFFFFF':'#1F2937', '#4F46E5':'#818CF8', /* …按本项目 token 表替换… */ };
 const demo = target.clone();
-demo.name = target.name.replace(' / V3', ' Dark (demo)');
+demo.name = target.name + ' Dark (demo)';               // 后缀式命名,不依赖原屏命名规则
+demo.x += target.width + 100;                            // 右移一屏+沟距,防与原屏重叠遮挡
 let guard = 0;   // detach 会暴露内层实例,循环到无实例为止;guard 防个别 detach 失败时死循环
 while (demo.findAll(n => n.type === 'INSTANCE').length && guard++ < 10)
   for (const inst of demo.findAll(n => n.type === 'INSTANCE')) { try { inst.detachInstance(); } catch (e) {} }  // 正名 detachInstance,非 detach_instance
@@ -430,7 +432,9 @@ const repaint = n => { for (const f of ['fills','strokes']) {
     const hex = hx(p.color); let to = DMAP[hex];
     if (hex === '#FFFFFF') to = (n.type==='TEXT' || f==='strokes') ? '#FFFFFF' : '#1F2937';
     if (!to) return p; t = true;
-    return Object.assign({}, p, { color: rgb(to) }); });   // 保留 opacity/visible/blendMode 等原 paint 属性
+    const q = Object.assign({}, p, { color: rgb(to) });   // 保留 opacity/visible/blendMode 等原 paint 属性
+    delete q.boundVariables;                              // 必须剥离:已绑定的色会继续按 Light 变量解析,深色重涂不生效
+    return q; });
   if (t) { try { n[f] = nx; } catch (e) {} } } };
 repaint(demo);                                    // 根不在 findAll 里,单独涂
 for (const n of demo.findAll(() => true)) repaint(n);
