@@ -2,6 +2,7 @@ package figmabridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -409,7 +410,7 @@ func TestBridge_WaitTimeoutDisconnected(t *testing.T) {
 	b2.mu.Unlock()
 	outcome2 := b2.Wait(t.Context(), job2.ID, 200*time.Millisecond)
 	if outcome2.WaitStatus != "timeout" || !strings.Contains(outcome2.Instruction, "执行期间断开") ||
-		!strings.Contains(outcome2.Instruction, "不会被重放") || !strings.Contains(outcome2.Instruction, "ack") {
+		!strings.Contains(outcome2.Instruction, "不会被重放") || !strings.Contains(outcome2.Instruction, "自动核销") {
 		t.Fatalf("delivered-disconnect outcome = %+v", outcome2)
 	}
 }
@@ -473,39 +474,199 @@ func TestBridge_HeartbeatPollNoDelivery(t *testing.T) {
 	}
 }
 
-// 假死收割：delivered 无结果 + 断连超阈值 → Submit 时自动转待核实（免重启）。
-// 随后迟到回传（面板复活）自动解除待核实——不再需要 inspect+ack。
-func TestBridge_ReapAndLateCompleteUnlock(t *testing.T) {
+func pollSession(t *testing.T, b *Bridge, session string, heartbeat bool) map[string]any {
+	t.Helper()
+	req, _ := http.NewRequest("POST", "/poll", strings.NewReader(fmt.Sprintf(`{"client":"p1","session":%q,"heartbeat":%v}`, session, heartbeat)))
+	req.Header.Set("X-Session-Token", "testtoken")
+	rec := httptest.NewRecorder()
+	b.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("poll status %d: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	return body
+}
+
+func requireExpired(t *testing.T, b *Bridge, id, reason string) {
+	t.Helper()
+	outcome := b.Wait(t.Context(), id, time.Second)
+	if outcome.WaitStatus != "completed" || outcome.Job.State != "expired" || outcome.Result == nil ||
+		outcome.Result.OK || !outcome.Result.ExecStarted || !strings.Contains(outcome.Result.Error, reason) ||
+		!strings.Contains(outcome.Instruction, "inspect:true") {
+		t.Fatalf("want expired (%s), got %+v result=%+v", reason, outcome, outcome.Result)
+	}
+	// 核销不放行普通写入：模型看到失败后的重试会与迟到的真实执行双写。
+	if _, err := b.Submit("retry same change", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("write after expiry must be blocked: %v", err)
+	}
+	if st := b.Status(); len(st.Unverified) != 1 || st.Unverified[0] != id {
+		t.Fatalf("unverified = %v", st.Unverified)
+	}
+}
+
+// requireVerifyUnlocks：inspect:true 成功完成即解除核销阻断（无需 ack）。
+func requireVerifyUnlocks(t *testing.T, b *Bridge, expiredID, session string) {
+	t.Helper()
+	inspect, err := b.Submit("return null", "", true)
+	if err != nil {
+		t.Fatalf("inspect after expiry must be accepted: %v", err)
+	}
+	if got := pollSession(t, b, session, false); got["id"] != inspect.ID {
+		t.Fatalf("inspect delivery = %+v", got)
+	}
+	if rec := completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":true,"output":null}`, inspect.ID)); rec.Code != 200 {
+		t.Fatalf("inspect complete %d: %s", rec.Code, rec.Body.String())
+	}
+	if j, _ := b.JobByID(expiredID); j.State != "verified" {
+		t.Fatalf("expired job state after verify = %s", j.State)
+	}
+	if _, err := b.Submit("next", "", false); err != nil {
+		t.Fatalf("write after successful inspect: %v", err)
+	}
+}
+
+// 面板执行中被关掉再重开（新会话一直在线）：旧会话静默超阈值 → 自动核销，不再永久卡死。
+func TestBridge_ExpireWhenPanelReopened(t *testing.T) {
 	b := newTestBridge(t)
 	job, _ := b.Submit("mutate", "", false)
-	pollAs(t, b, "testtoken") // delivered；此刻 lastPoll 新鲜
-
-	// 断连超过阈值：拨回 lastPoll 后再提交写入 → 被收割进 unresolved 并阻断。
+	if got := pollSession(t, b, "old", false); got["id"] != job.ID {
+		t.Fatalf("delivery = %+v", got)
+	}
+	pollSession(t, b, "new", false) // 新面板在线
+	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "尚未完成") {
+		t.Fatalf("live delivered job must hold single-flight: %v", err)
+	}
 	b.mu.Lock()
-	b.lastPoll = time.Now().Add(-reapDisconnect - time.Minute)
+	b.sessions["old"].lastSeen = time.Now().Add(-orphanAfter - time.Second)
 	b.mu.Unlock()
-	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
-		t.Fatalf("write must be blocked after reap: %v", err)
-	}
-	if st := b.Status(); len(st.Unresolved) != 1 || st.Unresolved[0] != job.ID {
-		t.Fatalf("unresolved = %v", st.Unresolved)
-	}
+	pollSession(t, b, "new", false)
+	requireExpired(t, b, job.ID, "面板已断开")
+	requireVerifyUnlocks(t, b, job.ID, "new")
+}
 
-	// 面板复活后迟到回传：handleComplete 解除 unresolved，无需 ack。
+// 同一面板空闲后发领取轮询 = 它已丢失该任务 → 立即核销；失败的 inspect 不解锁。
+func TestBridge_ExpireWhenSamePanelIdle(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("mutate", "", false)
+	pollSession(t, b, "s1", false)
+	pollSession(t, b, "s1", true) // 执行期心跳不触发
+	if j, _ := b.JobByID(job.ID); j.State != "delivered" || j.DeliveredTo != "s1" || j.DeliveredAt == "" {
+		t.Fatalf("heartbeat must not expire: %+v", j)
+	}
+	pollSession(t, b, "s1", false)
+	requireExpired(t, b, job.ID, "面板已空闲")
+
+	bad, _ := b.Submit("syntax error(", "", true)
+	pollSession(t, b, "s1", false)
+	completeAs(t, b, "testtoken", fmt.Sprintf(`{"id":%q,"ok":false,"error":"SyntaxError"}`, bad.ID))
+	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("failed inspect must not unlock: %v", err)
+	}
+	requireVerifyUnlocks(t, b, job.ID, "s1")
+}
+
+// 面板持续心跳但脚本挂死：交付超过 execTimeout 自动核销。原面板仍在心跳时它
+// 不领新任务，任何新提交（含 inspect）都拒绝，避免堵在 queued 再次占死单飞；
+// 面板关闭（会话静默）后 inspect 可进。
+func TestBridge_ExpireOnExecTimeout(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("await new Promise(()=>{})", "", false)
+	pollSession(t, b, "s1", false)
+	b.mu.Lock()
+	b.jobs[job.ID].deliveredAt = time.Now().Add(-execTimeout - time.Second)
+	b.mu.Unlock()
+	pollSession(t, b, "s1", true)
+	requireExpired(t, b, job.ID, "未回传")
+	if _, err := b.Submit("return null", "", true); err == nil || !strings.Contains(err.Error(), "仍在执行") {
+		t.Fatalf("submit while panel still runs expired job must be rejected: %v", err)
+	}
+	if st := b.Status(); st.Active != nil {
+		t.Fatalf("nothing may be queued behind a busy panel: %+v", st.Active)
+	}
+	b.mu.Lock()
+	b.sessions["s1"].lastSeen = time.Now().Add(-orphanAfter - time.Second)
+	b.mu.Unlock()
+	requireVerifyUnlocks(t, b, job.ID, "s2")
+}
+
+// 旧版面板（无会话 ID）：按整体连接新鲜度判定，断连超阈值核销。
+func TestBridge_ExpireLegacyPanel(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("mutate", "", false)
+	pollAs(t, b, "testtoken")
+	b.mu.Lock()
+	b.lastPoll = time.Now().Add(-orphanAfter - time.Second)
+	b.mu.Unlock()
+	requireExpired(t, b, job.ID, "面板已断开")
+}
+
+// 核销后迟到的真实回传被接收、覆盖「结果未知」并解除阻断（与 unresolved 迟到回传一致）。
+func TestBridge_LateCompleteAfterExpire(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("mutate", "", false)
+	pollSession(t, b, "s1", false)
+	b.mu.Lock()
+	b.jobs[job.ID].deliveredAt = time.Now().Add(-execTimeout - time.Second)
+	b.mu.Unlock()
+	pollSession(t, b, "s1", true)
+	requireExpired(t, b, job.ID, "未回传")
 	payload := fmt.Sprintf(`{"id":%q,"ok":true,"output":42}`, job.ID)
 	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 200 {
 		t.Fatalf("late complete status %d: %s", rec.Code, rec.Body.String())
 	}
-	if st := b.Status(); len(st.Unresolved) != 0 {
-		t.Fatalf("late complete must clear unresolved: %v", st.Unresolved)
+	result, _ := b.Result(job.ID)
+	if j, _ := b.JobByID(job.ID); j.State != "done" || !result.OK || string(result.Output) != "42" {
+		t.Fatalf("late result must replace expiry: %+v %+v", j, result)
 	}
-	// 回传刷新 lastPoll：否则收割后紧随的 Submit 会因陈旧心跳把同一 id 再收割回去。
-	if st := b.Status(); !st.Connected {
-		t.Fatal("complete must refresh lastPoll")
+	if rec := completeAs(t, b, "testtoken", payload); rec.Code != 409 {
+		t.Fatalf("duplicate complete want 409, got %d", rec.Code)
 	}
+	pollSession(t, b, "s1", false)
 	if _, err := b.Submit("next", "", false); err != nil {
-		t.Fatalf("write after late complete: %v", err)
+		t.Fatalf("late real result must release the block: %v", err)
 	}
+}
+
+// 核销阻断跨重启保留：result.json 已在，但未经核实的 expired 仍需 inspect。
+func TestBridge_ExpiredBlockSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	binding := Binding{ID: "b1", FileKey: "KEY", NodeID: "1:2"}
+	b1, _ := New(dir, binding, "testtoken")
+	job, _ := b1.Submit("mutate", "", false)
+	pollSession(t, b1, "s1", false)
+	pollSession(t, b1, "s1", false)
+	requireExpired(t, b1, job.ID, "面板已空闲")
+
+	b2, err := New(dir, binding, "testtoken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect:true") {
+		t.Fatalf("expired block must survive restart: %v", err)
+	}
+	requireVerifyUnlocks(t, b2, job.ID, "s9")
+	b3, _ := New(dir, binding, "testtoken")
+	if st := b3.Status(); len(st.Unverified) != 0 {
+		t.Fatalf("verified job must not re-block after restart: %v", st.Unverified)
+	}
+}
+
+// 挂起中的长轮询会话视为存活，即便 lastSeen 已陈旧。
+func TestBridge_NoExpireWhileSessionHeld(t *testing.T) {
+	b := newTestBridge(t)
+	job, _ := b.Submit("slow", "", false)
+	pollSession(t, b, "s1", false)
+	done := longPoll(b, t.Context(), `{"client":"p1","session":"s1","heartbeat":true,"wait":true}`)
+	waitForWaiters(t, b, 1)
+	b.mu.Lock()
+	b.sessions["s1"].lastSeen = time.Now().Add(-orphanAfter - time.Second)
+	b.lastPoll = b.sessions["s1"].lastSeen
+	b.mu.Unlock()
+	if st := b.Status(); st.Active == nil || st.Active.ID != job.ID || st.Active.State != "delivered" {
+		t.Fatalf("held session must keep job alive: %+v", st.Active)
+	}
+	_ = done
 }
 
 // P0：runs 只增不减的回归——启动清理仅回收超过保留期的终态证据；待核实
@@ -536,18 +697,20 @@ func TestBridge_PruneRuns(t *testing.T) {
 	oldUnresolved := strings.Repeat("c", 32)
 	oldCancelled := strings.Repeat("d", 32)
 	oldAcked := strings.Repeat("e", 32)
+	oldExpired := strings.Repeat("f", 32)
 	seed(oldDone, "done", ago(8), true)
 	seed(recentDone, "done", ago(1), true)
 	seed(oldUnresolved, "delivered", ago(8), false)
 	seed(oldCancelled, "cancelled", ago(8), false)
 	seed(oldAcked, "acknowledged", ago(8), false)
+	seed(oldExpired, "expired", ago(8), true)
 
 	b, err := New(dir, Binding{FileKey: "KEY", NodeID: "1:2"}, "testtoken")
 	if err != nil {
 		t.Fatal(err)
 	}
-	kept := map[string]bool{recentDone: true, oldUnresolved: true}
-	for _, id := range []string{oldDone, recentDone, oldUnresolved, oldCancelled, oldAcked} {
+	kept := map[string]bool{recentDone: true, oldUnresolved: true, oldExpired: true}
+	for _, id := range []string{oldDone, recentDone, oldUnresolved, oldCancelled, oldAcked, oldExpired} {
 		_, statErr := os.Stat(filepath.Join(dir, "runs", id))
 		if exists := statErr == nil; exists != kept[id] {
 			t.Fatalf("run %s exists=%v want kept=%v", id, exists, kept[id])
@@ -555,5 +718,107 @@ func TestBridge_PruneRuns(t *testing.T) {
 	}
 	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
 		t.Fatalf("unresolved must survive prune and block writes: %v", err)
+	}
+}
+
+func longPoll(b *Bridge, ctx context.Context, body string) <-chan *httptest.ResponseRecorder {
+	done := make(chan *httptest.ResponseRecorder, 1)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "/poll", strings.NewReader(body))
+	req.Header.Set("X-Session-Token", "testtoken")
+	go func() {
+		rec := httptest.NewRecorder()
+		b.ServeHTTP(rec, req)
+		done <- rec
+	}()
+	return done
+}
+
+func waitForWaiters(t *testing.T, b *Bridge, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b.mu.Lock()
+		got := b.waiters
+		b.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters = %d, want %d", got, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// 长轮询：挂起期间即视为在线（即便 lastPoll 已陈旧——后台节流下面板仍活着），
+// 入队立即唤醒并交付。
+func TestBridge_LongPollDeliversOnSubmit(t *testing.T) {
+	b := newTestBridge(t)
+	done := longPoll(b, t.Context(), `{"client":"p1","wait":true}`)
+	waitForWaiters(t, b, 1)
+	b.mu.Lock()
+	b.lastPoll = time.Now().Add(-orphanAfter - time.Minute)
+	b.mu.Unlock()
+	if !b.Status().Connected {
+		t.Fatal("held long poll must count as connected")
+	}
+	job, err := b.Submit("return 1", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rec := <-done:
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), job.ID) {
+			t.Fatalf("long poll = %d %s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit must wake the held poll")
+	}
+	waitForWaiters(t, b, 0)
+	if !b.Status().Connected {
+		t.Fatal("returning long poll must refresh lastPoll")
+	}
+}
+
+func TestBridge_LongPollHoldTimeout(t *testing.T) {
+	old := pollHold
+	pollHold = 50 * time.Millisecond
+	t.Cleanup(func() { pollHold = old })
+	b := newTestBridge(t)
+	rec := <-longPoll(b, t.Context(), `{"client":"p1","wait":true}`)
+	if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != "null" {
+		t.Fatalf("hold timeout = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// 执行期心跳也挂起：入队唤醒后返回空、不领取任务。
+func TestBridge_LongPollHeartbeatNoDelivery(t *testing.T) {
+	b := newTestBridge(t)
+	done := longPoll(b, t.Context(), `{"client":"p1","heartbeat":true,"wait":true}`)
+	waitForWaiters(t, b, 1)
+	job, _ := b.Submit("x", "", false)
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("submit must wake a held heartbeat poll immediately")
+	}
+	if strings.TrimSpace(rec.Body.String()) != "null" || job.State != "queued" {
+		t.Fatalf("heartbeat long poll delivered: %s (state %s)", rec.Body.String(), job.State)
+	}
+}
+
+// 面板关闭（请求取消）后不得再领取任务，挂起计数归零。
+func TestBridge_LongPollClientGone(t *testing.T) {
+	b := newTestBridge(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := longPoll(b, ctx, `{"client":"p1","wait":true}`)
+	waitForWaiters(t, b, 1)
+	cancel()
+	<-done
+	waitForWaiters(t, b, 0)
+	job, _ := b.Submit("x", "", false)
+	if job.State != "queued" {
+		t.Fatalf("cancelled poll must not take jobs: %s", job.State)
 	}
 }

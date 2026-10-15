@@ -15,50 +15,141 @@ small{opacity:.75}
 const config = SESSION_CONFIG;
 const status = document.querySelector('[role=status]');
 
-async function request(route, body) {
-  const response = await fetch('http://localhost:' + config.port + route, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(4000)
-  });
-  if (!response.ok) throw Error(route + ' ' + response.status);
-  return response.json();
+// 长轮询挂起上限（桥侧 pollHold=20s）之上留余量，避免正常挂起被误判超时。
+const POLL_TIMEOUT_MS = 35000;
+const COMPLETE_TIMEOUT_MS = 60000;
+
+async function request(route, body, timeoutMs, ctrl = new AbortController()) {
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const response = await fetch('http://localhost:' + config.port + route, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Token': config.token },
+      body: JSON.stringify(body),
+      signal: ctrl.signal
+    });
+    if (!response.ok) {
+      const err = Error(route + ' ' + response.status);
+      err.status = response.status;
+      throw err;
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const backoff = failures => Math.min(5000, 500 * 2 ** Math.min(failures, 4));
+
+// 面板实例 ID：桥据此判断领取任务的面板是否仍在（重开面板即新会话），失联任务自动核销。
+const session = Array.from(crypto.getRandomValues(new Uint8Array(16)), v => v.toString(16).padStart(2, '0')).join('');
+
+let online = false;
+let authFailed = false;
 let busy = false;
 let busyJobId = '';
 let pendingResult = null;
+let heartbeatPoll = null;
 
-let ticking = false;
-async function tick() {
-  if (ticking) return;
-  ticking = true;
+function render() {
+  if (authFailed) status.textContent = '认证失败：请重新导入插件';
+  else if (!online) status.textContent = '等待连接 deepai…';
+  else if (pendingResult) status.textContent = '回传结果…';
+  else if (busy) status.textContent = '执行中：' + busyJobId;
+  else status.textContent = '已连接 deepai';
+}
+
+function finishJob() {
+  pendingResult = null;
+  busy = false;
+  busyJobId = '';
+  // 在途的心跳长轮询不领取任务；中止它让循环立刻改发领取轮询，否则执行期间
+  // 入队的下一个任务要干等满一次挂起（20s）。
+  if (heartbeatPoll) {
+    heartbeatPoll.handoff = true;
+    heartbeatPoll.abort();
+  }
+}
+
+// 桥以 400/413 拒收（图像无效 / 超 8MB）时原样重发只会无限失败：逐级瘦身为
+// 失败结果，保证任务落到确定终态；连最小结果也被拒则放弃。
+function shrink(result, httpStatus) {
+  const executionStarted = !!(result.ok || result.executionStarted);
+  if (!result.shrunk) {
+    const error = '结果回传被桥拒收（HTTP ' + httpStatus + '）' +
+      (result.ok ? '：脚本已执行，请缩小返回值或截图后核实现状' : '：' + (result.error || ''));
+    return { type: 'result', id: result.id, ok: false, executionStarted, error,
+      before: result.before, after: result.after, shrunk: 1 };
+  }
+  if (result.shrunk === 1)
+    return { type: 'result', id: result.id, ok: false, executionStarted, error: result.error, shrunk: 2 };
+  return null;
+}
+
+// 回传与轮询解耦：回传失败不再挡住轮询（此前 /complete 一旦持续失败，面板就
+// 永久停在「等待连接」，只能重开插件）。
+let flushing = false;
+async function flushResult() {
+  if (flushing) return;
+  flushing = true;
   try {
-    if (pendingResult) {
-      await request('/complete', pendingResult);
-      pendingResult = null;
-      busy = false;
+    for (let failures = 0; pendingResult; ) {
+      try {
+        await request('/complete', pendingResult, COMPLETE_TIMEOUT_MS);
+        finishJob();
+      } catch (e) {
+        if (e.status === 409) {
+          // 桥已不认该任务（上次回传其实已落盘但响应丢失，或已被核实 ack）。
+          finishJob();
+        } else if (e.status === 400 || e.status === 413) {
+          pendingResult = shrink(pendingResult, e.status);
+          if (!pendingResult) finishJob();
+        } else {
+          authFailed = e.status === 403;
+          render();
+          await sleep(backoff(failures++));
+        }
+      }
+      render();
     }
-    // 执行期也持续轮询作心跳（heartbeat:true 只刷新连接新鲜度、不领取任务）：
-    // 此前 busy 时停发 poll，超过 pollFreshSecs 的执行会让桥误判断连（超时误报 + 假死收割）。
-    const job = await request('/poll', { client: 'deepai-plugin', heartbeat: busy });
-    if (job) {
-      busy = true;
-      busyJobId = job.id || '';
-      status.textContent = '执行中：' + busyJobId;
-      parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
-    } else if (!busy) {
-      status.textContent = '已连接 deepai';
-    } else {
-      // 心跳成功且执行中：把失败时留下的「等待连接」恢复为执行态——否则桥侧
-      // lastPoll 已新鲜、面板却一直显示断连，直到本次执行结束。
-      status.textContent = '执行中：' + busyJobId;
-    }
-  } catch (e) {
-    status.textContent = '等待连接 deepai…';
   } finally {
-    ticking = false;
+    flushing = false;
+  }
+}
+
+// 长轮询循环：成功路径不经过定时器（后台节流只影响失败重试的退避），
+// 有任务入队时桥立即返回。执行期以 heartbeat:true 持续挂起作心跳、不领取任务。
+async function pollLoop() {
+  for (let failures = 0; ; ) {
+    try {
+      const ctrl = new AbortController();
+      heartbeatPoll = busy ? ctrl : null;
+      let job;
+      try {
+        // 未连上时先发不挂起的探测，连上即刻刷新面板状态。
+        job = await request('/poll', { client: 'deepai-plugin', session, heartbeat: busy, wait: online }, POLL_TIMEOUT_MS, ctrl);
+      } catch (e) {
+        if (ctrl.handoff) continue;
+        throw e;
+      } finally {
+        heartbeatPoll = null;
+      }
+      online = true;
+      authFailed = false;
+      failures = 0;
+      if (job) {
+        busy = true;
+        busyJobId = job.id || '';
+        parent.postMessage({ pluginMessage: { type: 'job', ...job } }, '*');
+      }
+      render();
+    } catch (e) {
+      online = false;
+      authFailed = e.status === 403;
+      render();
+      await sleep(backoff(failures++));
+    }
   }
 }
 
@@ -82,11 +173,11 @@ onmessage = event => {
       delete msg.png;
     }
     pendingResult = msg;
-    status.textContent = '回传结果…';
+    render();
+    void flushResult();
   }
 };
 
-setInterval(tick, 750);
-tick();
+void pollLoop();
 </script>
 </html>

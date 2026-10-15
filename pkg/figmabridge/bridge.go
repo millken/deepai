@@ -23,12 +23,19 @@ const (
 	listenAddr     = "127.0.0.1:43187"
 	requestMaxByte = 8 << 20
 	pollFreshSecs  = 30
-	// delivered 无结果且持续断连超此时长 → Submit 时自动转待核实（与重启恢复同终态，免重启）
-	reapDisconnect = 5 * time.Minute
+	// delivered 无结果的自动核销阈值：领取它的面板会话静默超过 orphanAfter（面板关闭/重开），
+	// 或交付超过 execTimeout（脚本挂死）。核销写入「结果未知」失败结果并释放单飞。
+	orphanAfter = 60 * time.Second
+	execTimeout = 10 * time.Minute
 	// 终态证据保留期：桥启动时清理更早的 run 目录；待核实与在途任务是恢复协议的权威证据，永不清。
 	runsRetention = 7 * 24 * time.Hour
 	waitInterval  = 250 * time.Millisecond
 )
+
+// pollHold 是 wait:true 长轮询的最长挂起时间，须小于插件侧请求超时。
+// 长轮询让面板的请求链不经过定时器：Figma 窗口转入后台后 Chromium 会把
+// setInterval 节流到每分钟一次，短轮询因此周期性跌出 pollFreshSecs 判定断连。
+var pollHold = 20 * time.Second
 
 type Job struct {
 	ID           string `json:"id"`
@@ -38,7 +45,18 @@ type Job struct {
 	NodeID       string `json:"nodeId"`
 	State        string `json:"state"`
 	SubmittedAt  string `json:"submittedAt"`
+	DeliveredAt  string `json:"deliveredAt,omitempty"`
+	DeliveredTo  string `json:"deliveredTo,omitempty"` // 领取任务的面板会话；旧版面板为空
 	FinishedAt   string `json:"finishedAt,omitempty"`
+
+	deliveredAt time.Time
+	verifies    []string // inspect 任务提交时待核实的核销任务；该 inspect 成功即解除
+}
+
+type panelSession struct {
+	lastSeen time.Time
+	waiting  int
+	busy     bool // 最近一次轮询为执行期心跳
 }
 
 type JobResult struct {
@@ -60,6 +78,7 @@ type StatusReport struct {
 	Binding      *Binding `json:"binding,omitempty"`
 	Active       *Job     `json:"activeJob,omitempty"`
 	Unresolved   []string `json:"unresolvedJobs,omitempty"`
+	Unverified   []string `json:"expiredUnverifiedJobs,omitempty"`
 	ManifestPath string   `json:"manifestPath,omitempty"`
 }
 
@@ -74,6 +93,10 @@ type Bridge struct {
 	jobs       map[string]*Job
 	unresolved map[string]bool
 	lastPoll   time.Time
+	waiters    int           // 挂起中的长轮询数：>0 即面板在线
+	wake       chan struct{} // 有新任务入队时关闭并替换，唤醒挂起的长轮询
+	sessions   map[string]*panelSession
+	unverified map[string]bool // 已核销、尚未经 inspect 核实的任务：阻断普通写入
 }
 
 var (
@@ -90,6 +113,7 @@ func New(dir string, binding Binding, token string) (*Bridge, error) {
 	b := &Bridge{
 		dir: dir, token: token, binding: binding,
 		jobs: map[string]*Job{}, unresolved: map[string]bool{},
+		wake: make(chan struct{}), sessions: map[string]*panelSession{}, unverified: map[string]bool{},
 	}
 	if err := b.recoverRuns(); err != nil {
 		return nil, err
@@ -179,6 +203,7 @@ func Init(rawURL string) (*Bridge, error) {
 // 内存绑定、插件与 binding.json 同步更新，任一失败整体回滚。
 func (b *Bridge) Retarget(binding Binding) error {
 	b.mu.Lock()
+	b.expireStaleLocked()
 	if b.binding.FileKey == binding.FileKey && b.binding.NodeID == binding.NodeID {
 		b.mu.Unlock()
 		return nil
@@ -194,6 +219,10 @@ func (b *Bridge) Retarget(binding Binding) error {
 	if len(b.unresolved) > 0 {
 		b.mu.Unlock()
 		return fmt.Errorf("存在结果未知任务，需先核实并 ack 后才能切换目标")
+	}
+	if len(b.unverified) > 0 {
+		b.mu.Unlock()
+		return fmt.Errorf("存在已核销、结果未知的任务，需先用 inspect:true 核实成功后才能切换目标")
 	}
 	old := b.binding
 	b.binding = binding
@@ -255,6 +284,10 @@ func (b *Bridge) recoverRuns() error {
 			return fmt.Errorf("任务记录损坏 %s：%w", jpath, err)
 		}
 		if _, err := os.Stat(filepath.Join(b.runDir(id), "result.json")); err == nil {
+			if job.State == "expired" {
+				b.jobs[job.ID] = &job
+				b.unverified[job.ID] = true
+			}
 			continue
 		}
 		switch job.State {
@@ -291,6 +324,9 @@ func (b *Bridge) pruneRuns() {
 		_, statErr := os.Stat(filepath.Join(dir, "result.json"))
 		hasResult := statErr == nil
 		if !hasResult && job.State != "cancelled" && job.State != "acknowledged" {
+			continue
+		}
+		if job.State == "expired" {
 			continue
 		}
 		finished := job.FinishedAt
@@ -345,15 +381,87 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Client    string `json:"client"`
 		Heartbeat bool   `json:"heartbeat"` // 执行期心跳：只刷新连接新鲜度，不领取任务
+		Wait      bool   `json:"wait"`      // 长轮询：无任务时挂起至多 pollHold，入队即返回
+		Session   string `json:"session"`   // 面板实例 ID（每次打开面板随机生成）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		reply(w, http.StatusBadRequest, map[string]any{"error": "请求体无效"})
 		return
 	}
+	if len(body.Session) > 64 {
+		reply(w, http.StatusBadRequest, map[string]any{"error": "会话 ID 无效"})
+		return
+	}
+	var hold <-chan time.Time
+	var wake <-chan struct{}
+	if body.Wait {
+		timer := time.NewTimer(pollHold)
+		defer timer.Stop()
+		hold = timer.C
+		b.mu.Lock()
+		b.touchLocked(body.Session, 1)
+		// 心跳不查队列、只等通道：在计入挂起的同一把锁内取通道，此后的入队必能唤醒它。
+		wake = b.wake
+		b.mu.Unlock()
+		defer func() {
+			b.mu.Lock()
+			b.touchLocked(body.Session, -1)
+			b.mu.Unlock()
+		}()
+	}
+	for {
+		// 面板已断开就不再领取：否则任务被标 delivered 却无人执行。
+		if r.Context().Err() != nil {
+			return
+		}
+		delivery, next, err := b.takeJob(body.Heartbeat, body.Session)
+		if !body.Heartbeat || wake == nil {
+			wake = next
+		}
+		if err != nil {
+			reply(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if delivery != nil || hold == nil {
+			reply(w, http.StatusOK, delivery)
+			return
+		}
+		select {
+		case <-wake:
+			// 心跳轮询被唤醒即返回空：心跳不领取，面板执行完会中止在途心跳、改发领取轮询。
+			if body.Heartbeat {
+				reply(w, http.StatusOK, nil)
+				return
+			}
+		case <-hold:
+			reply(w, http.StatusOK, nil)
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// takeJob 刷新心跳并领取一个 queued 任务（heartbeat 不领取）；无任务时返回
+// nil 与当前唤醒通道，供长轮询等待下一次入队。
+func (b *Bridge) takeJob(heartbeat bool, session string) (map[string]any, <-chan struct{}, error) {
 	b.mu.Lock()
-	b.lastPoll = time.Now()
+	defer b.mu.Unlock()
+	b.touchLocked(session, 0)
+	if s := b.sessions[session]; s != nil {
+		s.busy = heartbeat
+	}
+	if !heartbeat && session != "" {
+		// 同一面板发来领取轮询 = 它已空闲：交给它的 delivered 任务已丢失（回传被放弃或交付响应丢失）。
+		for _, job := range b.jobs {
+			if job.State == "delivered" && job.DeliveredTo == session && !b.unresolved[job.ID] {
+				b.expireJobLocked(job, "面板已空闲但未回传该任务结果")
+			}
+		}
+	}
+	b.expireStaleLocked()
 	var deliver *Job
-	if !body.Heartbeat {
+	if !heartbeat {
 		for _, job := range b.jobs {
 			if job.State == "queued" {
 				deliver = job
@@ -361,35 +469,138 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	var code []byte
-	if deliver != nil {
-		// 先读脚本再标记交付：读失败时任务留在 queued，可重新领取。
-		var err error
-		code, err = os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
-		if err != nil {
-			b.mu.Unlock()
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "脚本读取失败：" + err.Error()})
-			return
-		}
-		deliver.State = "delivered"
-		if err := writeJSONAtomic(filepath.Join(b.runDir(deliver.ID), "job.json"), *deliver, 0o600); err != nil {
-			deliver.State = "queued"
-			b.mu.Unlock()
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "任务落盘失败：" + err.Error()})
-			return
-		}
-	}
-	b.mu.Unlock()
 	if deliver == nil {
-		reply(w, http.StatusOK, nil)
-		return
+		return nil, b.wake, nil
 	}
-	reply(w, http.StatusOK, map[string]any{
+	// 先读脚本再标记交付：读失败时任务留在 queued，可重新领取。
+	code, err := os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("脚本读取失败：%w", err)
+	}
+	now := time.Now()
+	deliver.State, deliver.DeliveredTo, deliver.DeliveredAt, deliver.deliveredAt = "delivered", session, nowISO(), now
+	if err := writeJSONAtomic(filepath.Join(b.runDir(deliver.ID), "job.json"), *deliver, 0o600); err != nil {
+		deliver.State, deliver.DeliveredTo, deliver.DeliveredAt, deliver.deliveredAt = "queued", "", "", time.Time{}
+		return nil, nil, fmt.Errorf("任务落盘失败：%w", err)
+	}
+	return map[string]any{
 		"id":           deliver.ID,
 		"code":         string(code),
 		"targetNodeId": deliver.TargetNodeID,
 		"binding":      map[string]string{"fileKey": b.binding.FileKey, "nodeId": b.binding.NodeID},
-	})
+	}, nil, nil
+}
+
+// connectedLocked：有挂起的长轮询，或最近一次轮询在 within 之内。
+func (b *Bridge) connectedLocked(within time.Duration) bool {
+	return b.waiters > 0 || (!b.lastPoll.IsZero() && time.Since(b.lastPoll) < within)
+}
+
+// touchLocked 记录一次轮询活动；delta 为挂起长轮询计数的增减。
+func (b *Bridge) touchLocked(session string, delta int) {
+	now := time.Now()
+	b.lastPoll = now
+	b.waiters += delta
+	if session == "" {
+		return
+	}
+	s := b.sessions[session]
+	if s == nil {
+		s = &panelSession{}
+		b.sessions[session] = s
+	}
+	s.lastSeen = now
+	s.waiting += delta
+}
+
+// expireStaleLocked 自动核销失联/超时的 delivered 任务，并回收静默会话。
+// 恢复现场的 unresolved 任务走 inspect+ack 协议，不在此处理。
+func (b *Bridge) expireStaleLocked() {
+	for _, job := range b.jobs {
+		if job.State != "delivered" || b.unresolved[job.ID] {
+			continue
+		}
+		if !job.deliveredAt.IsZero() && time.Since(job.deliveredAt) > execTimeout {
+			b.expireJobLocked(job, fmt.Sprintf("交付超过 %.0f 分钟未回传（脚本可能挂起）", execTimeout.Minutes()))
+			continue
+		}
+		var alive bool
+		if job.DeliveredTo == "" {
+			alive = b.connectedLocked(orphanAfter)
+		} else if s := b.sessions[job.DeliveredTo]; s != nil {
+			alive = s.waiting > 0 || time.Since(s.lastSeen) < orphanAfter
+		}
+		if !alive {
+			b.expireJobLocked(job, fmt.Sprintf("领取任务的插件面板已断开超过 %.0f 秒", orphanAfter.Seconds()))
+		}
+	}
+	for id, s := range b.sessions {
+		if s.waiting == 0 && time.Since(s.lastSeen) > orphanAfter {
+			delete(b.sessions, id)
+		}
+	}
+}
+
+// expireJobLocked 把 delivered 任务核销为 expired：先写「结果未知」的失败
+// result.json 再改状态；落盘失败则保持 delivered，下次检查重试。迟到的真实
+// 回传仍会被接收并覆盖此结果（见 handleComplete）。
+func (b *Bridge) expireJobLocked(job *Job, reason string) {
+	finished := nowISO()
+	result := JobResult{
+		ID: job.ID, OK: false, ExecStarted: true, FinishedAt: finished,
+		Error: "自动核销：" + reason + "。脚本可能已部分执行，结果未知，普通写入已阻断——先用 inspect:true 只读核实文档现状（成功即自动放行），不要直接重复提交同一修改",
+	}
+	if err := writeJSONAtomic(filepath.Join(b.runDir(job.ID), "result.json"), result, 0o600); err != nil {
+		return
+	}
+	expired := *job
+	expired.State, expired.FinishedAt = "expired", finished
+	if err := writeJSONAtomic(filepath.Join(b.runDir(job.ID), "job.json"), expired, 0o600); err != nil {
+		return
+	}
+	*job = expired
+	b.unverified[job.ID] = true
+}
+
+// busyExpiredLocked 返回仍在其原面板上执行（会话存活且在心跳）的已核销任务：
+// 此时面板不领新任务，新提交只会堵在 queued 占住单飞。
+func (b *Bridge) busyExpiredLocked() string {
+	executing := map[string]bool{}
+	for _, job := range b.jobs {
+		if job.State == "delivered" {
+			executing[job.DeliveredTo] = true
+		}
+	}
+	for _, job := range b.jobs {
+		// 该面板已领走更新的任务：它在忙的是那个任务，交给单飞判断。
+		if job.State != "expired" || job.DeliveredTo == "" || executing[job.DeliveredTo] {
+			continue
+		}
+		if s := b.sessions[job.DeliveredTo]; s != nil && s.busy && (s.waiting > 0 || time.Since(s.lastSeen) < orphanAfter) {
+			return job.ID
+		}
+	}
+	return ""
+}
+
+// markVerifiedLocked 解除核销阻断并落盘为 verified（迟到回传走 handleComplete 的终态）。
+func (b *Bridge) markVerifiedLocked(id string) {
+	delete(b.unverified, id)
+	job := b.jobs[id]
+	if job == nil || job.State != "expired" {
+		return
+	}
+	verified := *job
+	verified.State = "verified"
+	if writeJSONAtomic(filepath.Join(b.runDir(id), "job.json"), verified, 0o600) == nil {
+		*job = verified
+	}
+}
+
+func (b *Bridge) expireStale() {
+	b.mu.Lock()
+	b.expireStaleLocked()
+	b.mu.Unlock()
 }
 
 func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
@@ -416,10 +627,11 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Lock()
 	job := b.jobs[msg.ID]
-	complete := job != nil && job.State == "delivered"
+	// expired 也接收：迟到的真实结果比核销时的「结果未知」更权威。
+	complete := job != nil && (job.State == "delivered" || job.State == "expired")
 	if complete {
-		// 回传到达即面板存活：刷新心跳，避免紧随其后的 Submit 因陈旧 lastPoll
-		// 误触发假死收割。unresolved 的解除见下方终态锁（result.json 落盘后）。
+		// 回传到达即面板存活：刷新心跳，避免旧版面板（无会话 ID）的任务因陈旧
+		// lastPoll 被误核销。unresolved 的解除见下方终态锁（result.json 落盘后）。
 		b.lastPoll = time.Now()
 	}
 	b.mu.Unlock()
@@ -461,18 +673,29 @@ func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
 		}
 		result.Preview = strings.Join(names, ",")
 	}
+	b.mu.Lock()
+	// 与自动核销同锁写 result.json，避免两者交错落盘造成结果与状态不一致。
+	if job.State != "delivered" && job.State != "expired" {
+		b.mu.Unlock()
+		reply(w, http.StatusConflict, map[string]any{"error": "任务不在待回传状态"})
+		return
+	}
 	// 先 result 后 job：任一缺失即视为未完成，恢复扫描据此阻断。
 	if err := writeJSONAtomic(filepath.Join(b.runDir(job.ID), "result.json"), result, 0o600); err != nil {
+		b.mu.Unlock()
 		reply(w, http.StatusInternalServerError, map[string]any{"error": "结果落盘失败：" + err.Error()})
 		return
 	}
-	b.mu.Lock()
 	job.State = map[bool]string{true: "done", false: "failed"}[msg.OK]
 	job.FinishedAt = result.FinishedAt
-	// 迟到回传解除待核实：必须与终态同锁、且在 result.json 落盘成功之后——
-	// 提前 delete 会留出无锁窗口（png 解码与两次落盘都在锁外），下一次 Submit
-	// 的假死收割把 id 收回去，已回传成功的任务反而被「结果未知」挡住。
+	// 迟到回传解除待核实：必须与终态同锁、且在 result.json 落盘成功之后。
 	delete(b.unresolved, msg.ID)
+	delete(b.unverified, msg.ID)
+	if job.Inspect && msg.OK {
+		for _, id := range job.verifies {
+			b.markVerifiedLocked(id)
+		}
+	}
 	err = writeJSONAtomic(filepath.Join(b.runDir(job.ID), "job.json"), *job, 0o600)
 	b.mu.Unlock()
 	if err != nil {
@@ -499,15 +722,12 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		return nil, fmt.Errorf("目标节点 ID 需形如 1:2（收到 %q）", targetNodeID)
 	}
 	b.mu.Lock()
-	// 假死收割：面板断连超阈值且 delivered 无结果，Submit 时自动转待核实。
-	// 心跳修复后存活面板在执行期也轮询，lastPoll 陈旧即面板真亡；免重启即可走
-	// inspect+ack 解锁（此前唯一出路是重启 deepai，而重启会杀掉会话——真实死锁）。
-	if !b.lastPoll.IsZero() && time.Since(b.lastPoll) > reapDisconnect {
-		for _, job := range b.jobs {
-			if job.State == "delivered" && !b.unresolved[job.ID] {
-				b.unresolved[job.ID] = true
-			}
-		}
+	b.expireStaleLocked()
+	if id := b.busyExpiredLocked(); id != "" {
+		b.mu.Unlock()
+		return nil, &SubmitError{Msg: fmt.Sprintf(
+			"任务 %s 已核销但插件面板仍在执行它（脚本可能挂起），面板此时不领新任务：等待其回传后用 result %s 读回，或在 Figma 中关闭并重开插件面板，约 %.0f 秒后再提交 inspect:true 核实", id, id, orphanAfter.Seconds()),
+			Unresolved: []string{id}}
 	}
 	if len(b.unresolved) > 0 && !inspectOnly {
 		ids := make([]string, 0, len(b.unresolved))
@@ -517,6 +737,16 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		b.mu.Unlock()
 		return nil, &SubmitError{Msg: fmt.Sprintf(
 			"上次任务 %s 结果未知，已阻断新写入：请用 figma run（inspect:true）提交只读核实脚本并等待完成，再用 figma ack <job_id> <inspect_job_id> <核实说明> 解锁", strings.Join(ids, ", ")),
+			Unresolved: ids}
+	}
+	if len(b.unverified) > 0 && !inspectOnly {
+		ids := make([]string, 0, len(b.unverified))
+		for id := range b.unverified {
+			ids = append(ids, id)
+		}
+		b.mu.Unlock()
+		return nil, &SubmitError{Msg: fmt.Sprintf(
+			"任务 %s 已自动核销、结果未知，已阻断新写入：先用 figma run（inspect:true）只读核实文档现状，核实成功后即自动放行；不要直接重复提交同一修改", strings.Join(ids, ", ")),
 			Unresolved: ids}
 	}
 	for _, job := range b.jobs {
@@ -536,6 +766,11 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		FileKey: b.binding.FileKey, NodeID: b.binding.NodeID,
 		State: "queued", SubmittedAt: nowISO(),
 	}
+	if inspectOnly {
+		for id := range b.unverified {
+			job.verifies = append(job.verifies, id)
+		}
+	}
 	dir := b.runDir(job.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		b.mu.Unlock()
@@ -550,6 +785,8 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		return nil, err
 	}
 	b.jobs[job.ID] = job
+	close(b.wake)
+	b.wake = make(chan struct{})
 	b.mu.Unlock()
 	return job, nil
 }
@@ -567,23 +804,27 @@ type WaitOutcome struct {
 func (b *Bridge) Wait(ctx context.Context, id string, timeout time.Duration) WaitOutcome {
 	deadline := time.Now().Add(timeout)
 	for {
+		b.expireStale()
 		if result, err := b.Result(id); err == nil {
 			job, _ := b.JobByID(id)
-			return WaitOutcome{WaitStatus: "completed", Job: job, Result: result}
+			outcome := WaitOutcome{WaitStatus: "completed", Job: job, Result: result}
+			if job.State == "expired" {
+				outcome.Instruction = fmt.Sprintf("任务 %s 已自动核销、结果未知：普通写入已阻断，先用 run（inspect:true）只读核实文档现状，成功后自动放行；不要直接重复提交同一修改", id)
+			}
+			return outcome
 		}
 		if time.Now().After(deadline) {
 			job, _ := b.JobByID(id)
 			instr := fmt.Sprintf("任务 %s 未在超时内回传（未被取消）：用 result %s 读回，或稍后再试；不要重复提交同一修改", id, id)
 			// 面板断连是超时最常见根因。job.State 为空（磁盘读失败）时不猜断连分支，
 			// 落回通用提示，避免拼出「断开（）」。delivered 断连不会重放：handlePoll
-			// 只下发 queued；面板 iframe 活着时下次轮询成功会自行回传 pendingResult；
-			// 面板已关则执行现场没了——断连超阈值后由下一次 run 的假死收割转待核实
-			// （免重启），recoverRuns 仅作进程重启后的兑底，两者终态一致。
+			// 只下发 queued；面板 iframe 活着时会自行回传 pendingResult；面板已关则
+			// 执行现场没了——领取会话静默超过 orphanAfter 后自动核销为失败（结果未知）。
 			if st := b.Status(); !st.Connected && (job.State == "queued" || job.State == "delivered") {
 				if job.State == "queued" {
 					instr = fmt.Sprintf("插件面板未连接，任务 %s 已入队未被领取：重开插件面板后会自动执行，届时用 result %s 读回；不要重复提交", id, id)
 				} else {
-					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则下次轮询自动回传，稍后用 result %s 读回；若断连持续超过 %.0f 分钟，下一次 figma run 会把该任务转为待核实（普通写入会被挡、inspect:true 可进），用 inspect+ack 解锁，无需重启 deepai", id, id, reapDisconnect.Minutes())
+					instr = fmt.Sprintf("插件面板在任务 %s 执行期间断开：任务不会被重放——面板仍开着则会自动回传，稍后用 result %s 读回；面板断开超过 %.0f 秒会自动核销为失败（结果未知），届时先用 inspect:true 只读核实文档现状再继续", id, id, orphanAfter.Seconds())
 				}
 			}
 			return WaitOutcome{WaitStatus: "timeout", Job: job, Instruction: instr}
@@ -701,11 +942,12 @@ func (b *Bridge) History() []Job {
 func (b *Bridge) Status() StatusReport {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.expireStaleLocked()
 	report := StatusReport{
 		Port:         b.port,
 		Binding:      &b.binding,
 		ManifestPath: b.manifest,
-		Connected:    !b.lastPoll.IsZero() && time.Since(b.lastPoll) < pollFreshSecs*time.Second,
+		Connected:    b.connectedLocked(pollFreshSecs * time.Second),
 	}
 	if !b.lastPoll.IsZero() {
 		report.LastPollAgo = time.Since(b.lastPoll).Round(time.Millisecond).String()
@@ -717,6 +959,9 @@ func (b *Bridge) Status() StatusReport {
 		}
 		if b.unresolved[job.ID] {
 			report.Unresolved = append(report.Unresolved, job.ID)
+		}
+		if b.unverified[job.ID] {
+			report.Unverified = append(report.Unverified, job.ID)
 		}
 	}
 	return report
