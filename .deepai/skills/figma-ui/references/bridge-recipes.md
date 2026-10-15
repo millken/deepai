@@ -358,7 +358,7 @@ return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', va
 
 核对完复原:`const col = (await figma.variables.getLocalVariableCollectionsAsync()).find(c => c.name === 'Tokens'); target.clearExplicitVariableModeForCollection(col); return null`。文字绑定可用 `t.setBoundVariable('fontSize', v)`(亦支持 lineHeight / letterSpacing / fontWeight / fontFamily)。
 
-### 实战坑与批量配方(V2HUB TOKEN 轮实测,45 屏/6 组件集验证)
+### 实战坑与批量配方(45 屏/6 组件集全量绑定实测验证)
 
 **四条 API 坑**(上示代码之外):
 
@@ -376,13 +376,17 @@ return await target.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', va
 **批量绑定配方**(整个组件集按 hex→token 映射,白字消歧):
 
 ```js
+const cols = await figma.variables.getLocalVariableCollectionsAsync();
+const col = cols.find(c => c.name === 'X');                 // ← 换成本项目集合名
+const varsAll = await figma.variables.getLocalVariablesAsync();   // 集合对象没有 .variables,从这里取
+const LV = {}; for (const v of varsAll) if (v.variableCollectionId === col.id) LV[v.name] = v;
 const hx = c => '#' + [c.r, c.g, c.b].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('').toUpperCase();
 const boundVarOf = p => p && p.boundVariables && p.boundVariables.color && p.boundVariables.color.id;
-const L2V = { '#F2F4F7':'bg', '#4F46E5':'accent', '#EEF2FF':'accentSoft', '#111827':'title', '#4B5563':'body', '#9CA3AF':'caption', '#E5E7EB':'border', '#EF4444':'like' };
-const stats = { ok: 0, skip: 0 };
+const L2V = { '#F2F4F7':'bg', '#4F46E5':'accent', '#EEF2FF':'accentSoft', /* …按本项目 token 表替换 hex(Light 值)→token 名… */ };
+const stats = { ok: 0, skip: 0, fail: 0 };
 for (const sid of ['984:15997' /* …全部组件集 id… */]) {
   const set = await figma.getNodeByIdAsync(sid);
-  for (const n of [set, ...set.findAll(() => true)]) {          // ③ 含根扫描
+  for (const n of [set, ...set.findAll(() => true)]) {          // 含根扫描(findAll 不含节点自身)
     for (const field of ['fills', 'strokes']) {
       let paints; try { paints = n[field]; } catch (e) { continue; }   // INSTANCE 内部不可写
       if (!Array.isArray(paints) || !paints.length) continue;
@@ -393,24 +397,31 @@ for (const sid of ['984:15997' /* …全部组件集 id… */]) {
         let name = L2V[hex];
         if (hex === '#FFFFFF') name = (n.type === 'TEXT' || field === 'strokes') ? 'onAccent' : 'surface';  // 白字消歧
         if (!name || !LV[name]) return p;
-        touched = true; stats.ok++;
-        return figma.variables.setBoundVariableForPaint(p, 'color', LV[name]);   // ② 返回新 paint
+        touched = true;
+        return figma.variables.setBoundVariableForPaint(p, 'color', LV[name]);   // 返回新 paint 回写
       });
-      if (touched) { try { n[field] = next; } catch (e) {} }     // 实例写失败静默,组件源才是权威
+      if (touched) {
+        try { n[field] = next; stats.ok++; }    // 写入成功才计数(按节点字段,不按 paint 虚计)
+        catch (e) { stats.fail++; }             // 实例写失败计入 fail,组件源才是权威
+      }
     }
   }
 }
-return stats;   // ok=实际绑定数,skip=已绑跳过;终验再跑一轮含根扫描,残余应 0
+return stats;   // ok=成功写入的节点字段数;终验再跑一轮含根扫描,未绑的 token 色 solid 残余应 0
 ```
 
 **单模式受限的替代结构**(免费版 addMode 抛错时):建两个单模式集合
 `X`(Light)+ `X Dark`(同名 token),组件绑 Light 集;深色预览用 **demo 屏**而非切 mode:
 
 ```js
-const DMAP = { '#F2F4F7':'#111827', '#FFFFFF':'#1F2937', '#4F46E5':'#818CF8', /* … */ };
+const hx = c => '#' + [c.r, c.g, c.b].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('').toUpperCase();
+const rgb = h => ({ r: parseInt(h.slice(1,3),16)/255, g: parseInt(h.slice(3,5),16)/255, b: parseInt(h.slice(5,7),16)/255 });
+const DMAP = { '#F2F4F7':'#111827', '#FFFFFF':'#1F2937', '#4F46E5':'#818CF8', /* …按本项目 token 表替换… */ };
 const demo = target.clone();
 demo.name = target.name.replace(' / V3', ' Dark (demo)');
-for (const inst of demo.findAll(n => n.type === 'INSTANCE')) { try { inst.detachInstance(); } catch (e) {} }  // 正名 detachInstance,非 detach_instance
+let guard = 0;   // detach 会暴露内层实例,循环到无实例为止;guard 防个别 detach 失败时死循环
+while (demo.findAll(n => n.type === 'INSTANCE').length && guard++ < 10)
+  for (const inst of demo.findAll(n => n.type === 'INSTANCE')) { try { inst.detachInstance(); } catch (e) {} }  // 正名 detachInstance,非 detach_instance
 const repaint = n => { for (const f of ['fills','strokes']) {
   let ps; try { ps = n[f]; } catch (e) { return; }
   if (!Array.isArray(ps)) return;
@@ -418,7 +429,8 @@ const repaint = n => { for (const f of ['fills','strokes']) {
   const nx = ps.map(p => { if (!p || p.type!=='SOLID' || !p.color) return p;
     const hex = hx(p.color); let to = DMAP[hex];
     if (hex === '#FFFFFF') to = (n.type==='TEXT' || f==='strokes') ? '#FFFFFF' : '#1F2937';
-    if (!to) return p; t = true; return { type:'SOLID', color: rgb(to) }; });
+    if (!to) return p; t = true;
+    return Object.assign({}, p, { color: rgb(to) }); });   // 保留 opacity/visible/blendMode 等原 paint 属性
   if (t) { try { n[f] = nx; } catch (e) {} } } };
 repaint(demo);                                    // 根不在 findAll 里,单独涂
 for (const n of demo.findAll(() => true)) repaint(n);
@@ -723,17 +735,20 @@ function checkIcon(n) {
     err(n, 'iconBBox', '矢量联合框 ' + r1(u.width) + '×' + r1(u.height) + ' 长边未充满图标框 ' + r1(n.width) + '×' + r1(n.height) + ' 的 60%(疑似 arc 畸变导入)');
 }
 
-// 圆形小按钮(≤40 方形圆角≥半)内的手摆文本图标(‹ ↗ ⋯ ⌕ ⚙ ♥ ☆ + › 等):
-// 文字字形在行框内天然偏移,32 盒手摆 y 近似必偏(实测 ‹ y=6 差 1px 仍被点名)。
-// 应换贝塞尔 SVG 按 (盒宽-图标宽)/2 居中;检查器拦「圆钮内 TEXT 单字符大号」。
-const GLYPH_ICONS = /^([‹›⌕⚙↗⋯♥☆★✈✉🌐🗂📦⚖ⓘ↻❓🔒·+])$/;
+// 圆形小按钮(24–48 方形,圆角≥半)内的手摆文本图标(‹ › ⌕ ⚙ ↗ ⋯ ♥ ☆ × ✕ ← → 等):
+// 文字字形在行框内天然偏移,无法精确居中(手摆 y 近似必偏,实测多轮反馈)。
+// 应换贝塞尔 SVG 按 (盒宽-图标宽)/2 落位;检查器拦「圆钮内 TEXT 单字符图标」。
+const GLYPH_ICONS = /^([‹›⌕⚙↗⋯♥☆★✈✉🌐🗂📦⚖ⓘ↻❓🔒·+×✕←→])$/u;
 function checkGlyphIcon(n) {
-  if (n.type !== 'FRAME' || Math.abs(n.width - n.height) > 1 || n.width < 24 || n.width > 48) return;
-  if (n.cornerRadius < n.width / 2 - 1) return;
+  if (n.type !== 'FRAME' && n.type !== 'COMPONENT' && n.type !== 'INSTANCE') return;
+  if (Math.abs(n.width - n.height) > 1 || n.width < 24 || n.width > 48) return;
+  const r = get(n, 'cornerRadius');
+  if (typeof r !== 'number' || r < n.width / 2 - 1) return;   // 四角不一致时是 figma.mixed(Symbol),typeof 守卫防比较抛错
   const txt = n.children.filter(c => c.type === 'TEXT')[0];
   if (!txt) return;
-  if (GLYPH_ICONS.test(txt.characters.trim()) && txt.fontSize >= 11)
-    err(n, 'glyphIcon', '圆钮内手摆文本图标「' + txt.characters.trim() + '」(字形在行框内偏移,无法精确居中)——换贝塞尔 SVG 按 (盒宽−图标宽)/2 落位');
+  const ch = txt.characters.trim().replace(/\uFE0F/g, '');    // 剥 VS16(⚙️→⚙),否则正则不匹配
+  if (GLYPH_ICONS.test(ch) && txt.fontSize >= 11)
+    err(n, 'glyphIcon', '圆钮内手摆文本图标「' + ch + '」(字形在行框内偏移,无法精确居中)——换贝塞尔 SVG 按 (盒宽−图标宽)/2 落位');
 }
 
 function checkVariants(set) {
