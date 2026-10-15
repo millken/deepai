@@ -227,7 +227,7 @@ func FigmaTool() models.Tool {
 		Description: "Drive native Figma editing via deepai's embedded local bridge (Figma Desktop plugin polls this process). JS is the interface: submit Figma Plugin-API scripts executed as (figma, target) on the bound frame subtree; results (output + before/after structure snapshots + optional preview.png) persist on disk as evidence. " +
 			"Standard snippets: read structure = run {code:'return null'} then read the before snapshot; screenshot = run {code:'return await target.exportAsync({format:\\\"PNG\\\"})'} — the result carries an absolute preview.png path. " +
 			"Actions: init(url) bind a frame link (with node-id) and emit the plugin manifest; doctor/status bridge health and connection; run(code, node?, inspect?, timeout?) submit and wait (single-flight; inspect:true is the read-only verification pass allowed during an unresolved block); result(job_id)/history read evidence; ack(job_id, inspect_job_id, note) release an unresolved job after a completed verification run. " +
-			"Discipline: jobs are never replayed — on timeout read the job back (result); a delivered job with no result blocks new writes until a completed inspect:true run + ack.",
+			"Discipline: jobs are never replayed — on timeout read the job back (result). A delivered job whose plugin panel vanished (>60s) or stalled (>10min) is auto-expired as ok:false with unknown outcome: verify the document with an inspect:true run before writing again, never blindly resubmit. A delivered job left over from a deepai restart blocks new writes until a completed inspect:true run + ack.",
 		Groups: []string{"builtin"},
 		InputSchema: map[string]any{
 			"type": "object",

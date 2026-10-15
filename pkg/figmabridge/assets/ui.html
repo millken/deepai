@@ -37,6 +37,9 @@ async function request(route, body, timeoutMs) {
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const backoff = failures => Math.min(5000, 500 * 2 ** Math.min(failures, 4));
 
+// 面板实例 ID：桥据此判断领取任务的面板是否仍在（重开面板即新会话），失联任务自动核销。
+const session = Array.from(crypto.getRandomValues(new Uint8Array(16)), v => v.toString(16).padStart(2, '0')).join('');
+
 let online = false;
 let authFailed = false;
 let busy = false;
@@ -109,7 +112,7 @@ async function pollLoop() {
   for (let failures = 0; ; ) {
     try {
       // 未连上时先发不挂起的探测，连上即刻刷新面板状态。
-      const job = await request('/poll', { client: 'deepai-plugin', heartbeat: busy, wait: online }, POLL_TIMEOUT_MS);
+      const job = await request('/poll', { client: 'deepai-plugin', session, heartbeat: busy, wait: online }, POLL_TIMEOUT_MS);
       online = true;
       authFailed = false;
       failures = 0;
