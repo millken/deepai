@@ -119,8 +119,10 @@ func TestAskOptions_ArrowSelectAndEnterSubmits(t *testing.T) {
 	m.Update(key("enter"))
 	select {
 	case r := <-reply:
-		if r.value != "gamma" {
-			t.Fatalf("submitted %q, want gamma", r.value)
+		// The picker submits the option NUMBER, resolved by AskQuestion's
+		// existing mapping (see TestResolveAskAnswer).
+		if r.value != "3" {
+			t.Fatalf("submitted %q, want 3", r.value)
 		}
 	default:
 		t.Fatal("Enter with a highlighted option should submit it")
@@ -135,10 +137,84 @@ func TestAskOptions_TypedAnswerWins(t *testing.T) {
 	reply := make(chan inputResult, 1)
 	m.Update(askQuestionMsg{question: "Pick", options: []string{"a", "b"}, reply: reply})
 	m.Update(key("down"))
-	m.ta.SetValue("custom")
+	if m.askSel != 0 {
+		t.Fatalf("down should highlight the first option, got %d", m.askSel)
+	}
+	m.Update(key("x"))
+	if m.askSel != -1 || strings.Contains(m.askHeader, "▸") {
+		t.Fatalf("typing should drop the highlight; askSel=%d header=%q", m.askSel, m.askHeader)
+	}
 	m.Update(key("enter"))
-	if r := <-reply; r.value != "custom" {
+	if r := <-reply; r.value != "x" {
 		t.Fatalf("typed answer should win over the highlight, got %q", r.value)
+	}
+}
+
+// An option whose text is itself an in-range number must still resolve to the
+// highlighted option, not to the option at that index.
+func TestResolveAskAnswer(t *testing.T) {
+	opts := []string{"No", "1"}
+	m := newTUIModel(BannerInfo{})
+	reply := make(chan inputResult, 1)
+	m.Update(askQuestionMsg{question: "Proceed?", options: opts, reply: reply})
+	m.Update(key("down"))
+	m.Update(key("down"))
+	m.Update(key("enter"))
+	if got := resolveAskAnswer((<-reply).value, opts); got != "1" {
+		t.Fatalf("highlighting option \"1\" resolved to %q", got)
+	}
+	for in, want := range map[string]string{"1": "No", " 2 ": "1", "3": "3", "maybe": "maybe", "": ""} {
+		if got := resolveAskAnswer(in, opts); got != want {
+			t.Errorf("resolveAskAnswer(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A clock tick queued by the previous turn must not keep renewing once a wait
+// starts its own chain — that ran the whole CI wait at double rate.
+func TestTicks_StaleChainDiesOnRestart(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.Update(turnStartMsg{turn: 1, input: "hi"})
+	stale := elapsedTickMsg{gen: m.tickGen}
+	m.Update(turnEndMsg{})
+	m.Update(waitStartMsg{reason: "Waiting for CI"})
+
+	if _, cmd := m.Update(stale); cmd != nil {
+		t.Fatal("stale-generation tick should not reschedule")
+	}
+	if _, cmd := m.Update(elapsedTickMsg{gen: m.tickGen}); cmd == nil {
+		t.Fatal("current-generation tick should reschedule")
+	}
+}
+
+func TestToolEndLine_ErrorStaysOnOneRow(t *testing.T) {
+	m := newTUIModel(BannerInfo{})
+	m.width = 50
+	line := m.toolEndLine(agent.AgentEvent{
+		Type:      agent.AgentEventToolCallEnd,
+		ToolEvent: &agent.ToolCallEvent{Name: "bash", Error: "exit status 1\nstderr: " + strings.Repeat("boom ", 30)},
+	})
+	if strings.Contains(line, "\n") || lipgloss.Width(line) > m.width {
+		t.Fatalf("error line should be one row within %d cols: %q", m.width, line)
+	}
+}
+
+func TestStatusLines_FitNarrowTerminal(t *testing.T) {
+	m := newTUIModel(BannerInfo{Model: "some-rather-long-model-name", ContextWindow: 1000})
+	m.lastUsage = &agent.Usage{InputTokens: 700}
+	m.Update(turnStartMsg{turn: 1, input: "hi"})
+	m.handleAgentEvent(agent.AgentEvent{Type: agent.AgentEventToolCallStart, ToolCall: &models.ToolCall{Name: "a_very_long_tool_name_here"}})
+	m.setSubagentLineWithInfo("t1", "task", "coder")
+	for _, w := range []int{80, 40, 10, 1} {
+		m.width = w
+		for name, line := range map[string]string{"busy": m.busyStatus(), "footer": m.idleFooter()} {
+			if lipgloss.Width(line) > w {
+				t.Errorf("width %d: %s line is %d cols: %q", w, name, lipgloss.Width(line), line)
+			}
+		}
+		if got := m.fitLine(strings.Repeat("x", 100), 0); lipgloss.Width(got) > w {
+			t.Errorf("width %d: fitLine produced %d cols", w, lipgloss.Width(got))
+		}
 	}
 }
 

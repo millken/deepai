@@ -204,16 +204,24 @@ func (t *TUI) AskQuestion(ctx context.Context, question string, options []string
 	if r.err != nil {
 		return "", r.err
 	}
-	answer := strings.TrimSpace(r.value)
+	return resolveAskAnswer(r.value, options), nil
+}
+
+// resolveAskAnswer maps a submitted answer onto the ask's options: a number in
+// 1..len(options) selects that option, anything else is a free-form answer.
+// The arrow-key picker submits the number too, so an option whose own text is
+// such a number (["No", "1"]) still resolves to the one that was highlighted.
+func resolveAskAnswer(value string, options []string) string {
+	answer := strings.TrimSpace(value)
 	if answer == "" {
-		return "", nil
+		return ""
 	}
 	if len(options) > 0 {
 		if idx, err := strconv.Atoi(answer); err == nil && idx >= 1 && idx <= len(options) {
-			return options[idx-1], nil
+			return options[idx-1]
 		}
 	}
-	return answer, nil
+	return answer
 }
 
 // --- history persistence (delegated to the embedded helper) ---
@@ -278,7 +286,7 @@ type askQuestionMsg struct {
 }
 
 type remoteInputMsg struct{ text string }
-type elapsedTickMsg struct{}
+type elapsedTickMsg struct{ gen int }
 
 // exitDisarmMsg expires an armed Ctrl+C exit. seq ties it to the arming that
 // scheduled it, so a stale timer cannot disarm a newer press.
@@ -321,6 +329,9 @@ type tuiModel struct {
 	// the session.
 	exitArmed  bool
 	exitArmSeq int
+
+	// tickGen is the generation of the live clock chain; see startTicks.
+	tickGen int
 
 	// markdown rendering
 	renderMD   bool                  // render AI output as markdown (toggle with ctrl+r)
@@ -519,6 +530,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
+		// The spinner rejects a tick from a superseded chain (stale tag) by
+		// returning no cmd; stepping the subagent frames on it anyway would
+		// spin them at double speed whenever two chains briefly overlap.
+		if cmd == nil {
+			return m, nil
+		}
 		// Step the subagent spinners on the same ~10fps clock as the main one.
 		// They used to advance on the 1s elapsed tick, which is slow enough
 		// that a fan-out reads as frozen rather than working.
@@ -541,7 +558,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case elapsedTickMsg:
-		if m.ticking() {
+		if msg.gen == m.tickGen && m.ticking() {
 			if m.agentActive {
 				m.elapsed = time.Since(m.turnStart)
 			}
@@ -558,18 +575,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, commit(msg.text)
 
 	case waitStartMsg:
-		wasTicking := m.ticking()
 		m.waitActive = true
 		m.waitReason = msg.reason
 		m.waitStart = time.Now()
 		m.inputVisible = false
-		cmds := []tea.Cmd{commit(m.styles.Dim.Render("  ⌛ " + msg.reason + " — Ctrl+C 停止等待"))}
-		// The live wait line needs the clocks running; only start them when no
-		// turn already drives them, or two tick chains would double the rate.
-		if !wasTicking {
-			cmds = append(cmds, m.sp.Tick, m.elapsedTick())
-		}
-		return m, tea.Batch(cmds...)
+		return m, tea.Batch(commit(m.styles.Dim.Render("  ⌛ "+msg.reason+" — Ctrl+C 停止等待")), m.startTicks())
 
 	case waitEndMsg:
 		m.waitActive = false
@@ -592,7 +602,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnStartMsg:
-		wasTicking := m.ticking()
 		m.turn = msg.turn
 		m.turnStart = time.Now()
 		m.elapsed = 0
@@ -601,10 +610,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.aiPartial = ""
 		m.activeTools = nil
 		userLine := fmt.Sprintf("%s %s", m.styles.UserPrompt.Render("›"), msg.input)
-		if wasTicking {
-			return m, commit(userLine)
-		}
-		return m, tea.Batch(commit(userLine), m.sp.Tick, m.elapsedTick())
+		return m, tea.Batch(commit(userLine), m.startTicks())
 
 	case agentEventMsg:
 		return m, m.handleAgentEvent(msg.evt)
@@ -703,6 +709,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.inputVisible {
 		var cmd tea.Cmd
 		m.ta, cmd = m.ta.Update(msg)
+		m.syncAskSelection()
 		return m, cmd
 	}
 	return m, nil
@@ -829,11 +836,12 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.ta, cmd = m.ta.Update(msg)
 			m.updateSuggestions()
+			m.syncAskSelection()
 			return m, cmd
 		}
 		val := m.ta.Value()
 		if m.askActive && strings.TrimSpace(val) == "" && m.askSel >= 0 && m.askSel < len(m.askOptions) {
-			m.submitInput(inputResult{value: m.askOptions[m.askSel]})
+			m.submitInput(inputResult{value: strconv.Itoa(m.askSel + 1)})
 			return m, nil
 		}
 		// Allow submit with empty text if there are pending images.
@@ -890,6 +898,7 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.ta, cmd = m.ta.Update(msg)
 		m.updateSuggestions()
+		m.syncAskSelection()
 		return m, cmd
 	}
 	return m, nil
@@ -913,6 +922,15 @@ func (m *tuiModel) moveAskSelection(delta int) bool {
 	}
 	m.askHeader = m.renderAskHeader()
 	return true
+}
+
+// syncAskSelection drops the option highlight once the answer box has text:
+// Enter submits the typed text then, and a lingering ▸ would claim otherwise.
+func (m *tuiModel) syncAskSelection() {
+	if m.askActive && m.askSel >= 0 && m.ta.Value() != "" {
+		m.askSel = -1
+		m.askHeader = m.renderAskHeader()
+	}
 }
 
 // tryPasteClipboardImage attempts to read an image from the system clipboard.
@@ -1100,16 +1118,16 @@ func suggestionWindow(n, sel, limit int) (int, int) {
 
 // lineBudget is the display width a single committed or live line may use
 // before it is truncated. Falls back to the historical 120 columns until the
-// first WindowSizeMsg arrives.
+// first WindowSizeMsg arrives. Never wider than the screen, however narrow:
+// a floor above the real width would silently void the one-row guarantee.
 func (m *tuiModel) lineBudget() int {
 	if m.width <= 0 {
 		return 120
 	}
-	w := m.width - 1
-	if w < 20 {
-		w = 20
+	if m.width <= 1 {
+		return 1
 	}
-	return w
+	return m.width - 1
 }
 
 // fitLine truncates s (raw, no ANSI) so that, after reserved columns of
@@ -1119,11 +1137,35 @@ func (m *tuiModel) fitLine(s string, reserved int) string {
 	if lipgloss.Width(s) <= limit {
 		return s
 	}
+	if limit <= 1 {
+		return truncateWidth(s, max(limit, 0))
+	}
 	return truncateWidth(s, limit-1) + "…"
 }
 
+// fitStyled is fitLine for a line that already carries ANSI styling (the
+// busy and footer lines are assembled from differently styled parts).
+func (m *tuiModel) fitStyled(s string) string {
+	return lipgloss.NewStyle().MaxWidth(m.lineBudget()).Render(s)
+}
+
+func collapseSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// startTicks (re)starts the spinner and the once-a-second clock. A tick from
+// the previous chain may still be queued — a turn ending and a CI wait
+// starting are usually well under a second apart — so the clock chain is
+// generation-tagged and a stale tick dies instead of renewing alongside the
+// new one. The spinner deduplicates its own chains by tag.
+func (m *tuiModel) startTicks() tea.Cmd {
+	m.tickGen++
+	return tea.Batch(m.sp.Tick, m.elapsedTick())
+}
+
 func (m *tuiModel) elapsedTick() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return elapsedTickMsg{} })
+	gen := m.tickGen
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return elapsedTickMsg{gen: gen} })
 }
 
 // flushPartial returns the styled trailing assistant line (if any) for commit
@@ -1740,18 +1782,15 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 		}
 		diff = m.renderToolDiff(te.Name, te.Arguments, data)
 	}
+	// Errors and previews are hints, not the full result: keep them on one row
+	// so multi-line output (most often an error's) doesn't break the
+	// transcript's tree shape.
 	if te.Error != "" {
-		detail += " " + te.Error
+		detail += " " + collapseSpace(te.Error)
 	} else if diff == "" && te.ResultPreview != "" {
-		// A preview is a hint, not the result: keep it on one row so a
-		// multi-line output doesn't break the transcript's tree shape.
-		preview := strings.Join(strings.Fields(te.ResultPreview), " ")
-		detail += " → " + preview
+		detail += " → " + collapseSpace(te.ResultPreview)
 	}
-	line := fmt.Sprintf("  ⎿ %s %s%s", icon, te.Name, detail)
-	if te.Error == "" {
-		line = m.fitLine(line, 0)
-	}
+	line := m.fitLine(fmt.Sprintf("  ⎿ %s %s%s", icon, te.Name, detail), 0)
 	if useErr {
 		return m.styles.Error.Render(line)
 	}
@@ -1961,7 +2000,7 @@ func (m *tuiModel) busyStatus() string {
 	if len(m.subagentTasks) > 0 && !m.taskMode {
 		parts = append(parts, m.styles.Dim.Render("· ctrl+t tasks"))
 	}
-	return "  " + strings.Join(parts, " ")
+	return m.fitStyled("  " + strings.Join(parts, " "))
 }
 
 // busyLabel names what the main agent is doing right now: the tool(s) it is
@@ -1986,8 +2025,8 @@ func (m *tuiModel) waitStatus() string {
 	if reason == "" {
 		reason = "Waiting"
 	}
-	label := m.fitLine(fmt.Sprintf("%s… %s · ctrl+c to stop", reason, formatDuration(time.Since(m.waitStart), false)), 4)
-	return "  " + m.sp.View() + " " + m.styles.Dim.Render(label)
+	label := fmt.Sprintf("%s… %s · ctrl+c to stop", reason, formatDuration(time.Since(m.waitStart), false))
+	return m.fitStyled("  " + m.sp.View() + " " + m.styles.Dim.Render(label))
 }
 
 // liveTail bounds the streaming preview to the last n terminal ROWS. Counting
@@ -2020,7 +2059,7 @@ func (m *tuiModel) contextGauge() string {
 
 func (m *tuiModel) idleFooter() string {
 	if m.exitArmed {
-		return m.styles.SeverityWarn.Render("  Press Ctrl+C again to exit (Ctrl+D also exits)")
+		return m.fitStyled(m.styles.SeverityWarn.Render("  Press Ctrl+C again to exit (Ctrl+D also exits)"))
 	}
 	mode := "code"
 	if m.planMode {
@@ -2038,7 +2077,7 @@ func (m *tuiModel) idleFooter() string {
 	if ctx := m.contextGauge(); ctx != "" {
 		footer += " " + ctx
 	}
-	return footer
+	return m.fitStyled(footer)
 }
 
 // renderPendingImages shows a summary line for clipboard-attached images.
