@@ -39,8 +39,6 @@ const tokensCss = [
   'html[data-theme="dark"] {',
   ...tks.map(k => `  --${kebab(k)}: ${TOKENS[k].dark};`),
   '}',
-  'html[data-theme="auto"] {',
-  '}',
   '@media (prefers-color-scheme: dark) {',
   '  html[data-theme="auto"] {',
   ...tks.map(k => `    --${kebab(k)}: ${TOKENS[k].dark};`),
@@ -129,6 +127,20 @@ const topicCard = ([author, time, title, node, replies, likes, letter, color]) =
     </article>`;
 
 // 类型化渲染器注册表:新屏类型在此加一个函数即可
+// IR 优先、assets 兜底:屏数据先查 IR.screens(桥上 extract 的实况),缺失才用 assets 默认。
+// 这使「Figma 改一处 → 重跑 extract → html 单行 diff」在模板内即可跑通(README 增量验证)。
+const irSectionTexts = (name, sec) => {
+  const scr = IR.screens && IR.screens[name];
+  const found = scr && scr.secs && scr.secs.find(x => x.name === sec);
+  return (found && found.texts) || [];
+};
+const irCardTitles = name => irSectionTexts(name, 'list').filter(t => t.size === 16).map(t => t.t);
+const mergeIR = (name, d) => {
+  const titles = irCardTitles(name);
+  if (!titles.length || !d.cards) return d;
+  return { ...d, cards: d.cards.map((c, i) => { if (titles[i] === undefined) return c; const a = c.slice(); a[2] = titles[i]; return a; }) };
+};
+
 const RENDERERS = {
   feed: d => [
     status(),
@@ -152,8 +164,9 @@ fs.writeFileSync(path.join(DIST, 'base.css'), '/* codegen 确定性生成 — �
 
 for (const name of Object.keys(DEFAULTS).sort()) {
   const d = DEFAULTS[name];
-  const render = RENDERERS[d.type];
-  const parts = render ? render(d) : [`<!-- 未注册类型: ${d.type} -->`];
+  const dd = mergeIR(name, d);
+  const render = RENDERERS[dd.type];
+  const parts = render ? render(dd) : [`<!-- 未注册类型: ${d.type} -->`];
   const html = `<!DOCTYPE html>
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -165,9 +178,9 @@ for (const name of Object.keys(DEFAULTS).sort()) {
 <link rel="stylesheet" href="../components.css">
 </head>
 <body>
-<main class="screen">
+<div class="screen">
 ${parts.join('\n')}
-</main>
+</div>
 </body>
 </html>
 `;

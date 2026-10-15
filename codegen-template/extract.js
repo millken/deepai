@@ -8,7 +8,8 @@
 // (不要深度递归屏级实例子树——场景代理会抛 TypeError,实测坑)。
 
 await figma.loadAllPagesAsync();
-const page = figma.root.children.find(p => p.name === 'V3 Redesign');  // ← 换成项目页面名
+let page = figma.root.children.find(p => p.name === 'V3 Redesign');  // ← 换成项目页面名
+if (!page) return { error: '未找到目标页面「V3 Redesign」,可用: ' + figma.root.children.map(p => p.name).join(', ') };
 
 // 防御式属性读取:只用于【属性】——方法(findAll 等)会被 typeof 误杀,必须直调+try/catch
 const safe = (o, k) => { try { const v = o[k]; return typeof v === 'function' ? undefined : v; } catch (e) { return undefined; } };
@@ -33,7 +34,7 @@ const txt = n => {
   const s = safe(n, 'fontSize');
   const r = ref(f0);
   return { t: safe(n, 'characters'), size: typeof s === 'number' ? s : null,
-    w: fn && fn.style === 'Bold' ? 700 : fn && fn.style === 'Medium' ? 500 : 400, c: r };
+    w: ({ Bold: 700, SemiBold: 600, Medium: 500, Light: 300 })[fn && fn.style] || 400, c: r };
 };
 const box = n => {
   const o = {};
@@ -43,7 +44,7 @@ const box = n => {
   if (typeof r === 'number' && r) o.r = r;
   const f0 = Array.isArray(safe(n, 'fills')) ? n.fills[0] : null;
   const rr = ref(f0);
-  if (rr && (f0.visible === undefined || f0.visible !== false)) o.fill = rr;
+  if (rr && f0.visible !== false) o.fill = rr;
   return o;
 };
 
@@ -60,7 +61,7 @@ const tree = n => {
       o.dir = lm === 'HORIZONTAL' ? 'h' : 'v';
       const g = safe(n, 'itemSpacing'); if (g) o.gap = g;
       const ps = [safe(n, 'paddingTop'), safe(n, 'paddingRight'), safe(n, 'paddingBottom'), safe(n, 'paddingLeft')];
-      if (ps.every(x => x)) o.pad = ps;
+      if (ps.every(x => typeof x === 'number') && ps.some(x => x)) o.pad = ps;  // 含 0 保留(如 [14,14,0,14]),全 0 才省略
     }
     const ks = safe(n, 'children');
     if (Array.isArray(ks) && ks.length) o.c = ks.map(k => { try { return tree(k); } catch (e) { return { k: 'ERR' }; } });
@@ -69,14 +70,16 @@ const tree = n => {
   return { k: nm, t: ty };
 };
 
-// ===== ① 组件集(每集独立 try;SETS 的 key 即 codegen 的 CSS 前缀) =====
+// ===== ① 组件集(取集包 try 找不到标 err;每变体独立 try,坏节点不炸整跑;SETS 的 key 即 codegen 的 CSS 前缀) =====
 const comps = {};
 for (const [key, sid] of Object.entries({
   // ← 换成项目组件集 node-id(构建时记录;node-id 复制粘贴会变,长期以图层名为键维护)
   topicList: '985:16094',
   button: '990:16295',
 })) {
-  const set = await figma.getNodeByIdAsync(sid);
+  let set = null;
+  try { set = await figma.getNodeByIdAsync(sid); } catch (e) { set = null; }
+  if (!set) { comps[key] = [{ v: sid, err: 'set-not-found' }]; continue; }
   const vs = safe(set, 'type') === 'COMPONENT_SET' ? set.children : [set];
   comps[key] = vs.map(v => { try { return { v: safe(v, 'name'), n: tree(v) }; } catch (e) { return { v: safe(v, 'name'), err: true }; } });
 }

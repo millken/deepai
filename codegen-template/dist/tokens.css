@@ -23,8 +23,6 @@ html[data-theme="dark"] {
   --surface: #1F2937;
   --title: #F9FAFB;
 }
-html[data-theme="auto"] {
-}
 @media (prefers-color-scheme: dark) {
   html[data-theme="auto"] {
     --accent: #818CF8;

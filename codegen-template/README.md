@@ -60,7 +60,7 @@ deepai 的 figma 工具 `run` 参数,返回值 `{ ir: {...} }` 落盘到 `ir/des
 
 ## 团队公约
 
-- **禁止手改 `dist/`**:手调写回 Figma(单一事实源)或走 assets;特殊覆写用
-  `*.override.css` 组合层;
+- **禁止手改 `dist/`**:手调写回 Figma(单一事实源)或走 assets;特殊覆写用 `*.override.css` 组合层,
+  **放在 `dist/` 之外**(如 codegen-template 根目录)——`codegen.js` 开头 `fs.rmSync(DIST)` 会清空整个 dist/,override 放里面会被删;
 - IR/产物不含时间戳/绝对路径等挥发性字段(确定性四要素之一);
 - 生成器本身进 git:改模板 = 改 codegen.js,同样可 diff 可审。
