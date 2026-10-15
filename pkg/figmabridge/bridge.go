@@ -30,6 +30,11 @@ const (
 	waitInterval  = 250 * time.Millisecond
 )
 
+// pollHold 是 wait:true 长轮询的最长挂起时间，须小于插件侧请求超时。
+// 长轮询让面板的请求链不经过定时器：Figma 窗口转入后台后 Chromium 会把
+// setInterval 节流到每分钟一次，短轮询因此周期性跌出 pollFreshSecs 判定断连。
+var pollHold = 20 * time.Second
+
 type Job struct {
 	ID           string `json:"id"`
 	TargetNodeID string `json:"targetNodeId,omitempty"`
@@ -74,6 +79,8 @@ type Bridge struct {
 	jobs       map[string]*Job
 	unresolved map[string]bool
 	lastPoll   time.Time
+	waiters    int           // 挂起中的长轮询数：>0 即面板在线
+	wake       chan struct{} // 有新任务入队时关闭并替换，唤醒挂起的长轮询
 }
 
 var (
@@ -90,6 +97,7 @@ func New(dir string, binding Binding, token string) (*Bridge, error) {
 	b := &Bridge{
 		dir: dir, token: token, binding: binding,
 		jobs: map[string]*Job{}, unresolved: map[string]bool{},
+		wake: make(chan struct{}),
 	}
 	if err := b.recoverRuns(); err != nil {
 		return nil, err
@@ -345,15 +353,65 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Client    string `json:"client"`
 		Heartbeat bool   `json:"heartbeat"` // 执行期心跳：只刷新连接新鲜度，不领取任务
+		Wait      bool   `json:"wait"`      // 长轮询：无任务时挂起至多 pollHold，入队即返回
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		reply(w, http.StatusBadRequest, map[string]any{"error": "请求体无效"})
 		return
 	}
+	var hold <-chan time.Time
+	if body.Wait {
+		timer := time.NewTimer(pollHold)
+		defer timer.Stop()
+		hold = timer.C
+		b.mu.Lock()
+		b.waiters++
+		b.mu.Unlock()
+		defer func() {
+			b.mu.Lock()
+			b.waiters--
+			b.lastPoll = time.Now()
+			b.mu.Unlock()
+		}()
+	}
+	for {
+		// 面板已断开就不再领取：否则任务被标 delivered 却无人执行。
+		if r.Context().Err() != nil {
+			return
+		}
+		delivery, wake, err := b.takeJob(body.Heartbeat)
+		if err != nil {
+			reply(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if delivery != nil || hold == nil {
+			reply(w, http.StatusOK, delivery)
+			return
+		}
+		select {
+		case <-wake:
+			// 心跳轮询被唤醒即返回：面板可能已执行完，需以 heartbeat:false 重新领取。
+			if body.Heartbeat {
+				reply(w, http.StatusOK, nil)
+				return
+			}
+		case <-hold:
+			reply(w, http.StatusOK, nil)
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// takeJob 刷新心跳并领取一个 queued 任务（heartbeat 不领取）；无任务时返回
+// nil 与当前唤醒通道，供长轮询等待下一次入队。
+func (b *Bridge) takeJob(heartbeat bool) (map[string]any, <-chan struct{}, error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.lastPoll = time.Now()
 	var deliver *Job
-	if !body.Heartbeat {
+	if !heartbeat {
 		for _, job := range b.jobs {
 			if job.State == "queued" {
 				deliver = job
@@ -361,35 +419,30 @@ func (b *Bridge) handlePoll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	var code []byte
-	if deliver != nil {
-		// 先读脚本再标记交付：读失败时任务留在 queued，可重新领取。
-		var err error
-		code, err = os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
-		if err != nil {
-			b.mu.Unlock()
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "脚本读取失败：" + err.Error()})
-			return
-		}
-		deliver.State = "delivered"
-		if err := writeJSONAtomic(filepath.Join(b.runDir(deliver.ID), "job.json"), *deliver, 0o600); err != nil {
-			deliver.State = "queued"
-			b.mu.Unlock()
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "任务落盘失败：" + err.Error()})
-			return
-		}
-	}
-	b.mu.Unlock()
 	if deliver == nil {
-		reply(w, http.StatusOK, nil)
-		return
+		return nil, b.wake, nil
 	}
-	reply(w, http.StatusOK, map[string]any{
+	// 先读脚本再标记交付：读失败时任务留在 queued，可重新领取。
+	code, err := os.ReadFile(filepath.Join(b.runDir(deliver.ID), "script.js"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("脚本读取失败：%w", err)
+	}
+	deliver.State = "delivered"
+	if err := writeJSONAtomic(filepath.Join(b.runDir(deliver.ID), "job.json"), *deliver, 0o600); err != nil {
+		deliver.State = "queued"
+		return nil, nil, fmt.Errorf("任务落盘失败：%w", err)
+	}
+	return map[string]any{
 		"id":           deliver.ID,
 		"code":         string(code),
 		"targetNodeId": deliver.TargetNodeID,
 		"binding":      map[string]string{"fileKey": b.binding.FileKey, "nodeId": b.binding.NodeID},
-	})
+	}, nil, nil
+}
+
+// connectedLocked：有挂起的长轮询，或最近一次轮询在 within 之内。
+func (b *Bridge) connectedLocked(within time.Duration) bool {
+	return b.waiters > 0 || (!b.lastPoll.IsZero() && time.Since(b.lastPoll) < within)
 }
 
 func (b *Bridge) handleComplete(w http.ResponseWriter, r *http.Request) {
@@ -502,7 +555,7 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 	// 假死收割：面板断连超阈值且 delivered 无结果，Submit 时自动转待核实。
 	// 心跳修复后存活面板在执行期也轮询，lastPoll 陈旧即面板真亡；免重启即可走
 	// inspect+ack 解锁（此前唯一出路是重启 deepai，而重启会杀掉会话——真实死锁）。
-	if !b.lastPoll.IsZero() && time.Since(b.lastPoll) > reapDisconnect {
+	if !b.lastPoll.IsZero() && !b.connectedLocked(reapDisconnect) {
 		for _, job := range b.jobs {
 			if job.State == "delivered" && !b.unresolved[job.ID] {
 				b.unresolved[job.ID] = true
@@ -550,6 +603,8 @@ func (b *Bridge) Submit(code, targetNodeID string, inspectOnly bool) (*Job, erro
 		return nil, err
 	}
 	b.jobs[job.ID] = job
+	close(b.wake)
+	b.wake = make(chan struct{})
 	b.mu.Unlock()
 	return job, nil
 }
@@ -705,7 +760,7 @@ func (b *Bridge) Status() StatusReport {
 		Port:         b.port,
 		Binding:      &b.binding,
 		ManifestPath: b.manifest,
-		Connected:    !b.lastPoll.IsZero() && time.Since(b.lastPoll) < pollFreshSecs*time.Second,
+		Connected:    b.connectedLocked(pollFreshSecs * time.Second),
 	}
 	if !b.lastPoll.IsZero() {
 		report.LastPollAgo = time.Since(b.lastPoll).Round(time.Millisecond).String()

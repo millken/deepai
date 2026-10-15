@@ -2,6 +2,7 @@ package figmabridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -555,5 +556,102 @@ func TestBridge_PruneRuns(t *testing.T) {
 	}
 	if _, err := b.Submit("write", "", false); err == nil || !strings.Contains(err.Error(), "inspect") {
 		t.Fatalf("unresolved must survive prune and block writes: %v", err)
+	}
+}
+
+func longPoll(b *Bridge, ctx context.Context, body string) <-chan *httptest.ResponseRecorder {
+	done := make(chan *httptest.ResponseRecorder, 1)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "/poll", strings.NewReader(body))
+	req.Header.Set("X-Session-Token", "testtoken")
+	go func() {
+		rec := httptest.NewRecorder()
+		b.ServeHTTP(rec, req)
+		done <- rec
+	}()
+	return done
+}
+
+func waitForWaiters(t *testing.T, b *Bridge, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b.mu.Lock()
+		got := b.waiters
+		b.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters = %d, want %d", got, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// 长轮询：挂起期间即视为在线（即便 lastPoll 已陈旧——后台节流下面板仍活着），
+// 入队立即唤醒并交付。
+func TestBridge_LongPollDeliversOnSubmit(t *testing.T) {
+	b := newTestBridge(t)
+	done := longPoll(b, t.Context(), `{"client":"p1","wait":true}`)
+	waitForWaiters(t, b, 1)
+	b.mu.Lock()
+	b.lastPoll = time.Now().Add(-reapDisconnect - time.Minute)
+	b.mu.Unlock()
+	if !b.Status().Connected {
+		t.Fatal("held long poll must count as connected")
+	}
+	job, err := b.Submit("return 1", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rec := <-done:
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), job.ID) {
+			t.Fatalf("long poll = %d %s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit must wake the held poll")
+	}
+	waitForWaiters(t, b, 0)
+	if !b.Status().Connected {
+		t.Fatal("returning long poll must refresh lastPoll")
+	}
+}
+
+func TestBridge_LongPollHoldTimeout(t *testing.T) {
+	old := pollHold
+	pollHold = 50 * time.Millisecond
+	t.Cleanup(func() { pollHold = old })
+	b := newTestBridge(t)
+	rec := <-longPoll(b, t.Context(), `{"client":"p1","wait":true}`)
+	if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) != "null" {
+		t.Fatalf("hold timeout = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// 执行期心跳也挂起：入队唤醒后返回空、不领取任务。
+func TestBridge_LongPollHeartbeatNoDelivery(t *testing.T) {
+	b := newTestBridge(t)
+	done := longPoll(b, t.Context(), `{"client":"p1","heartbeat":true,"wait":true}`)
+	waitForWaiters(t, b, 1)
+	job, _ := b.Submit("x", "", false)
+	rec := <-done
+	if strings.TrimSpace(rec.Body.String()) != "null" || job.State != "queued" {
+		t.Fatalf("heartbeat long poll delivered: %s (state %s)", rec.Body.String(), job.State)
+	}
+}
+
+// 面板关闭（请求取消）后不得再领取任务，挂起计数归零。
+func TestBridge_LongPollClientGone(t *testing.T) {
+	b := newTestBridge(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := longPoll(b, ctx, `{"client":"p1","wait":true}`)
+	waitForWaiters(t, b, 1)
+	cancel()
+	<-done
+	waitForWaiters(t, b, 0)
+	job, _ := b.Submit("x", "", false)
+	if job.State != "queued" {
+		t.Fatalf("cancelled poll must not take jobs: %s", job.State)
 	}
 }
