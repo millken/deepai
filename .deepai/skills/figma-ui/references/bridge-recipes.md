@@ -226,7 +226,7 @@ const icon = (name, color, size = 24) => figma.createNodeFromSvg(
 | my | `M12 11 C13.93 11 15.5 9.43 15.5 7.5 C15.5 5.57 13.93 4 12 4 C10.07 4 8.5 5.57 8.5 7.5 C8.5 9.43 10.07 11 12 11 Z M5 20 C5 16.15 8.25 13 12 13 C15.75 13 19 16.15 19 20` |
 | publish | `M12 20 H5 C3.9 20 3 19.1 3 18 V5 C3 3.9 3.9 3 5 3 H12 M8.5 15.5 L17.5 6.5 C18.33 5.67 19.67 5.67 20.5 6.5 C21.33 7.33 21.33 8.67 20.5 9.5 L11.5 18.5 L7 20 Z` |
 | back | `M14 6 L8 12 L14 18` |
-| share | `M7 17 L17 7 M9 7 H17 V15` |
+| external | `M7 17 L17 7 M9 7 H17 V15`(外链箭头 ↗) |
 | more | `M5 12 L5.01 12 M12 12 L12.01 12 M19 12 L19.01 12` |
 | search | `M10.5 17 C14.09 17 17 14.09 17 10.5 C17 6.91 14.09 4 10.5 4 C6.91 4 4 6.91 4 10.5 C4 14.09 6.91 17 10.5 17 Z M15 15 L20 20` |
 | gear | `M12 15.5 C13.93 15.5 15.5 13.93 15.5 12 C15.5 10.07 13.93 8.5 12 8.5 C10.07 8.5 8.5 10.07 8.5 12 C8.5 13.93 10.07 15.5 12 15.5 Z M12 2.8 L13.4 5.2 L16.2 4.6 L16.6 7.4 L19.2 8.6 L18 11.1 L19.6 13.4 L17.4 15.2 L17.8 18 L15 18.7 L13.8 21.2 L11.3 20.3 L9 21.7 L7.3 19.5 L4.5 19.3 L4.2 16.5 L2 14.9 L3.1 12.3 L2.2 9.7 L4.7 8.3 L5.3 5.5 L8.1 5.7 L10 3.7 Z` |
@@ -237,7 +237,9 @@ const icon = (name, color, size = 24) => figma.createNodeFromSvg(
 | wrench | `M14.7 6.3 L16.3 7.9 L17.7 6.5 L21.47 2.73 C18.6 0.9 14.7 1.3 12.2 3.8 C10 6 9.4 9.2 10.6 11.9 L3.9 18.6 C3.1 19.4 3.1 20.6 3.9 21.4 C4.7 22.2 5.9 22.2 6.7 21.4 L13.4 14.7 C16.1 15.9 19.3 15.3 21.5 13.1 C19.6 14.2 17.2 14.2 15.4 13.1 L14 11.7 C13 10.7 13 9.1 14 8.1` |
 | spin | `M12 3 C17 3 21 7 21 12 C21 17 17 21 12 21 C7 21 3 17 3 12` |
 
-loading 场景直接用 `spin`(圆心留缺口即旋转指示);色值传 hex,图标盒内按 `(盒宽−图标宽)/2` 落位(§6 居中正解)。
+loading 场景直接用 `spin`(圆环留缺口即旋转指示);色值传 hex,图标盒内按 `(盒宽−图标宽)/2` 落位(§6 居中正解)。
+
+两条已知限制:① `wrench` 末段止于 `14 8.1` 未闭回起点(开口扳手形态,缺口即扳手开口,属有意为之;若项目要闭口扳手自行补 `Z` 前的回程线段),且其控制点 y=0.9 略超 1–23 安全区——导入后以 after 快照目视核对;② `more` 用 0.01px 线段 + round cap 画三点,导入后**矢量高度为 0**,§8 `iconBBox` 会因「无 VECTOR 包围盒」跳过它(不会误报,但也不检查)——若需受检可改用三个小圆(Ellipse)拼装。
 
 ## 4. 构建辅助(写 Figma 时整段贴在脚本开头)
 
@@ -586,29 +588,6 @@ walk(target);
 return { total, examples: issues, fontSizes: [...sizes].sort((a, b) => a - b), rawColors: [...raw].slice(0, 24) };
 ```
 
-### 同构屏指纹组反查(批量修复前必跑,防变体漏修)
-
-实测教训:修复清单只写了 `My-Profile`,漏了同构变体 `My-Profile-NoTopic`——两屏资料卡完全同构,一处漏修一处返工。**凡批量修复/调整,先跑指纹分组,同组屏一并处理**:
-
-```js
-await figma.loadAllPagesAsync();
-const page = figma.root.children.find(p => p.name === 'V3 Redesign');   // ← 目标页
-const boards = page.children.filter(c => c.width >= 300).sort((a, b) => a.x - b.x || a.y - b.y);
-const groups = new Map();
-for (const b of boards) {
-  // 指纹 = 尺寸 + 前 30 条文案(各截 20 字符):同内容变体/深浅主题归并为一组
-  const texts = b.findAll(n => n.type === 'TEXT').map(t => t.characters).filter(s => s && s.trim()).slice(0, 30).map(s => s.slice(0, 20));
-  const fp = Math.round(b.width) + 'x' + Math.round(b.height) + '|' + texts.join('¶');
-  if (!groups.has(fp)) groups.set(fp, []);
-  groups.get(fp).push(b.name);
-}
-// 待修屏 → 反查同组变体:修它之前,同组的其它屏必须进同一修复清单
-const variantsOf = name => { for (const g of groups.values()) if (g.includes(name)) return g; return [name]; };
-return { groups: [...groups.values()], variantsOf: variantsOf('My-Profile') };  // ← 换成待修屏名
-```
-
-确定性要点:画板按 `(x,y)` 排序后分组;指纹只取尺寸+文案(不含 node-id,复制粘贴会变);重复执行输出一致。典型输出:`["My-Profile", "My-Profile-NoTopic"]`——修复命令对两屏都要跑。
-
 | 项 | 对代码转换的影响 | 修法 |
 |---|---|---|
 | `noAutoLayout` / `group` | 只能绝对定位还原,响应式失效 | 转 Frame + auto-layout |
@@ -618,6 +597,39 @@ return { groups: [...groups.values()], variantsOf: variantsOf('My-Profile') };  
 | `defaultName` | 代码命名无语义 | 英文语义命名(`Header`、`Price`、`UserProfileCard`) |
 | `fixedTextBox` | 文案变长溢出 | `textAutoResize` 改 HEIGHT 或 WIDTH_AND_HEIGHT |
 | `fontSizes` 超过 6–7 档 | 字阶混乱 | 收敛到字阶表 |
+### 同构屏指纹组反查(批量修复前必跑,防变体漏修)
+
+实测教训:修复清单只写了 `My-Profile`,漏了同构变体 `My-Profile-NoTopic`——两屏资料卡完全同构,一处漏修一处返工。**凡批量修复/调整,先跑指纹分组,同组屏一并处理**。
+
+口径先说清:严格相等指纹只归并「内容**完全相同**的主题/状态变体」(深浅主题、纯交互态);
+像 `My-Profile-NoTopic` 这类**内容有差异**的变体(缺失的话题文案会落进前 30 条文本),
+严格指纹抓不到——所以分组用「同尺寸 + 文案集合 Jaccard ≥ 0.7」的相似度,再加名称前缀兜底:
+
+```js
+await figma.loadAllPagesAsync();
+const page = figma.root.children.find(p => p.name === 'V3 Redesign');   // ← 目标页
+const boards = page.children.filter(c => c.type === 'FRAME' && c.width >= 300)   // 限 FRAME,排除 Section/大 Group
+  .sort((a, b) => a.x - b.x || a.y - b.y);
+const textsOf = b => new Set(b.findAll(n => n.type === 'TEXT').map(t => t.characters).filter(s => s && s.trim()).slice(0, 30));
+const jaccard = (a, b) => { let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
+const sizeOf = b => Math.round(b.width) + 'x' + Math.round(b.height);
+// 分组:同尺寸且 Jaccard≥0.7 归同组(顺序并查集)
+const groups = [];
+for (const b of boards) {
+  const t = textsOf(b);
+  const g = groups.find(G => sizeOf(G[0]) === sizeOf(b) && jaccard(textsOf(G[0]), t) >= 0.7);
+  if (g) g.push(b.name); else groups.push([b.name]);
+}
+// 待修屏 → 反查同组;名称前缀兜底(相似度漏检时,NoTopic/NoFound 类命名习惯仍能抓到)
+const variantsOf = name => {
+  const g = groups.find(G => G.includes(name));
+  const prefix = boards.filter(b => b.name.startsWith(name) && b.name !== name).map(b => b.name);
+  return [...new Set([...(g || [name]), ...prefix])];
+};
+return { groups, variantsOf: variantsOf('My-Profile') };   // ← 换成待修屏名
+```
+
+确定性要点:画板按 `(x,y)` 排序后顺序并查集;指纹只取尺寸+文案集合(不含 node-id,复制粘贴会变);重复执行输出一致。Jaccard 阈值 0.7 为 V2HUB 实测有效值(同构变体间 ≥0.75,无关屏间 <0.2),项目文案密度差异大时可先打印 `groups` 再调。典型输出:`["My-Profile", "My-Profile-NoTopic"]`——修复命令对两屏都要跑。
 
 ## 8. 量测验收(每次构建/修改后必跑,error 清零才算完成)
 
@@ -866,18 +878,23 @@ return {
 
 ## 9. 流程走读(多屏交付后,按真实用户路径找断点)
 
-多屏项目(≥10 屏)交付前必跑:静态检查(lint/量测)证明「每屏做对了」,走读证明「屏与屏连得起来」。实测:V2HUB 44 屏 lint 全绿,走读仍揪出 3 个孤儿屏 + 2 处导航不一致——两类检查互补,缺一不可。
+多屏项目(≥10 屏)交付前必跑:静态检查(lint/量测)证明「每屏做对了」,走读证明「屏与屏连得起来」。实测:V2HUB 45 屏(44 屏 V2 归并重构 + 走读补建 Compose 屏)lint 全绿,走读仍揪出 3 个孤儿屏 + 2 处导航不一致——两类检查互补,缺一不可。
 
 ### 第一步:导航摘要(只读,每屏一行)
 
 ```js
 await figma.loadAllPagesAsync();
-const page = figma.root.children.find(p => p.name === 'V3 Redesign');   // ← 目标页
+// ==== 项目常量(复用到别的项目时必须改这四项,否则摘要静默失真——如激活 tab 全为 null)====
+const PAGE_NAME = 'V3 Redesign';        // ← 目标页名
+const SCREEN_SUFFIX = ' / V3';          // ← 屏命名后缀(去后缀取屏名)
+const ACCENT = { r: 0x4F / 255, b: 0xE5 / 255 };  // ← 激活态 accent 色(#4F46E5),探测激活 tab 用
+const CTA_WORDS = ['去登陆', '刷新', '重试', '全部已读', '发表主题'];  // ← 项目关键 CTA 词表
+const page = figma.root.children.find(p => p.name === PAGE_NAME);
 const summary = [];
 for (const s of page.children) {
-  if (s.type !== 'FRAME' || !s.name.endsWith(' / V3')) continue;       // ← 命名规则换项目的
+  if (s.type !== 'FRAME' || !s.name.endsWith(SCREEN_SUFFIX)) continue;
   const secs = s.children.filter(c => c.type === 'FRAME' || c.type === 'INSTANCE');
-  const top = secs[1];                                                  // 第 2 分区 = header/navbar(status 之后)
+  const top = secs[1];   // 约定:第 2 分区 = header/navbar(status 之后);无 status 的屏改 secs[0]
   const topTexts = top ? top.findAll(n => n.type === 'TEXT').map(t => t.characters.slice(0, 8)).slice(0, 3) : [];
   const tabInst = s.children.find(c => c.type === 'INSTANCE' && c.name === 'Tabbar');
   const bottom = s.children.find(c => c.name === 'bottom');
@@ -887,11 +904,11 @@ for (const s of page.children) {
   if (tabInst) {                                                        // 激活 tab = accent 色的 10px 标签
     for (const l of tabInst.findAll(n => n.type === 'TEXT' && n.fontSize === 10)) {
       const f = l.fills[0] && l.fills[0].color;
-      if (f && Math.abs(f.r - 0x4F / 255) < 0.02 && Math.abs(f.b - 0xE5 / 255) < 0.03) { activeTab = l.characters; break; }
+      if (f && Math.abs(f.r - ACCENT.r) < 0.02 && Math.abs(f.b - ACCENT.b) < 0.03) { activeTab = l.characters; break; }
     }
   }
-  const btns = s.findAll(n => n.type === 'TEXT' && ['去登陆', '刷新', '重试', '全部已读', '发表主题'].some(k => n.characters.includes(k))).map(n => n.characters.slice(0, 8));
-  summary.push({ name: s.name.slice(0, -5), top: top ? top.name + '(' + topTexts.join(',') + ')' : null, bottomKind, activeTab, btns });
+  const btns = s.findAll(n => n.type === 'TEXT' && CTA_WORDS.some(k => n.characters.includes(k))).map(n => n.characters.slice(0, 8));
+  summary.push({ name: s.name.slice(0, -SCREEN_SUFFIX.length), top: top ? top.name + '(' + topTexts.join(',') + ')' : null, bottomKind, activeTab, btns });
 }
 return summary;
 ```
