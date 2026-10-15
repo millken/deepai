@@ -30,6 +30,8 @@ func key(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl}
 	case "ctrl+x":
 		return tea.KeyPressMsg{Code: 'x', Mod: tea.ModCtrl}
+	case "ctrl+c":
+		return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
 	}
 	panic("unmapped key " + s)
 }

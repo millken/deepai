@@ -280,6 +280,14 @@ type askQuestionMsg struct {
 type remoteInputMsg struct{ text string }
 type elapsedTickMsg struct{}
 
+// exitDisarmMsg expires an armed Ctrl+C exit. seq ties it to the arming that
+// scheduled it, so a stale timer cannot disarm a newer press.
+type exitDisarmMsg struct{ seq int }
+
+// exitConfirmWindow is how long a first Ctrl+C at an empty prompt stays armed
+// waiting for the second press that actually exits.
+const exitConfirmWindow = 2 * time.Second
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -296,9 +304,23 @@ type tuiModel struct {
 	agentActive  bool // agent running -> show spinner/elapsed
 	waitActive   bool // REPL-side wait (CI poll) -> Ctrl+C routes to InterruptCh
 	waitReason   string
-	askActive    bool   // currently asking a tool question
-	askHeader    string // rendered question + options shown above the input
-	aiPartial    string // accumulated streamed assistant text (rendered on flush)
+	waitStart    time.Time
+	askActive    bool     // currently asking a tool question
+	askHeader    string   // rendered question + options shown above the input
+	askQuestion  string   // question text of the active ask
+	askOptions   []string // numbered choices of the active ask
+	askSel       int      // highlighted choice (-1: none, Enter submits typed text)
+	aiPartial    string   // accumulated streamed assistant text (rendered on flush)
+
+	// activeTools lists the main agent's in-flight tool calls by name, so the
+	// busy line can say what it is waiting on instead of a bare "Working…".
+	activeTools []string
+
+	// exitArmed is set by a first Ctrl+C at an empty prompt; only a second
+	// press within exitConfirmWindow exits, so a stray keystroke can't end
+	// the session.
+	exitArmed  bool
+	exitArmSeq int
 
 	// markdown rendering
 	renderMD   bool                  // render AI output as markdown (toggle with ctrl+r)
@@ -459,6 +481,7 @@ func newTUIModel(status BannerInfo) *tuiModel {
 		ta:            ta,
 		sp:            sp,
 		histIdx:       -1,
+		askSel:        -1,
 		model:         status.Model,
 		interruptCh:   make(chan struct{}, 1),
 		cancelTaskCh:  make(chan string, 8),
@@ -491,7 +514,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		// Drop ticks (and stop rescheduling) when idle so the spinner loop ends
 		// between turns instead of redrawing the prompt forever.
-		if !m.agentActive {
+		if !m.ticking() {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -511,9 +534,17 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.history = msg.items
 		return m, nil
 
+	case exitDisarmMsg:
+		if msg.seq == m.exitArmSeq {
+			m.exitArmed = false
+		}
+		return m, nil
+
 	case elapsedTickMsg:
-		if m.agentActive {
-			m.elapsed = time.Since(m.turnStart)
+		if m.ticking() {
+			if m.agentActive {
+				m.elapsed = time.Since(m.turnStart)
+			}
 			// The subagent spinners step on the spinner tick (see
 			// spinner.TickMsg above); this tick only advances the clocks. It
 			// still has to fire once a second even when nothing else changes,
@@ -527,10 +558,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, commit(msg.text)
 
 	case waitStartMsg:
+		wasTicking := m.ticking()
 		m.waitActive = true
 		m.waitReason = msg.reason
+		m.waitStart = time.Now()
 		m.inputVisible = false
-		return m, commit(m.styles.Dim.Render("  ⌛ " + msg.reason + " — Ctrl+C 停止等待"))
+		cmds := []tea.Cmd{commit(m.styles.Dim.Render("  ⌛ " + msg.reason + " — Ctrl+C 停止等待"))}
+		// The live wait line needs the clocks running; only start them when no
+		// turn already drives them, or two tick chains would double the rate.
+		if !wasTicking {
+			cmds = append(cmds, m.sp.Tick, m.elapsedTick())
+		}
+		return m, tea.Batch(cmds...)
 
 	case waitEndMsg:
 		m.waitActive = false
@@ -553,13 +592,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnStartMsg:
+		wasTicking := m.ticking()
 		m.turn = msg.turn
 		m.turnStart = time.Now()
 		m.elapsed = 0
 		m.agentActive = true
 		m.inputVisible = false
 		m.aiPartial = ""
+		m.activeTools = nil
 		userLine := fmt.Sprintf("%s %s", m.styles.UserPrompt.Render("›"), msg.input)
+		if wasTicking {
+			return m, commit(userLine)
+		}
 		return m, tea.Batch(commit(userLine), m.sp.Tick, m.elapsedTick())
 
 	case agentEventMsg:
@@ -571,6 +615,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case turnEndMsg:
 		m.lastUsage = msg.usage
 		m.agentActive = false
+		m.activeTools = nil
 		var lines []string
 		if f := m.flushPartial(); f != "" {
 			lines = append(lines, f)
@@ -587,6 +632,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case interruptedMsg:
 		m.agentActive = false
+		m.activeTools = nil
 		var lines []string
 		if f := m.flushPartial(); f != "" {
 			lines = append(lines, f)
@@ -612,8 +658,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case requestInputMsg:
 		m.inputReply = msg.reply
 		m.inputVisible = true
-		m.askActive = false
-		m.askHeader = ""
+		m.clearAsk()
+		m.exitArmed = false
 		m.histIdx = -1
 		m.ta.SetValue("")
 		m.ta.Focus()
@@ -624,7 +670,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputReply = msg.reply
 		m.inputVisible = true
 		m.askActive = true
-		m.askHeader = m.renderAskHeader(msg.question, msg.options)
+		m.askQuestion = msg.question
+		m.askOptions = msg.options
+		m.askSel = -1
+		m.askHeader = m.renderAskHeader()
 		m.ta.SetValue("")
 		m.ta.Focus()
 		// Deliberately NOT feedQueuedRemote: a reply queued before this ask
@@ -667,7 +716,11 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 	}
-	switch msg.String() {
+	key := msg.String()
+	if key != "ctrl+c" {
+		m.exitArmed = false
+	}
+	switch key {
 	case "ctrl+t":
 		if len(m.subagentTasks) == 0 {
 			return m, nil
@@ -699,10 +752,18 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case m.inputVisible:
 			if strings.TrimSpace(m.ta.Value()) != "" {
 				m.ta.SetValue("")
+				m.suggestions = nil
+				m.suggestIdx = 0
 				return m, nil
 			}
-			m.submitInput(inputResult{err: errInterrupted})
-			return m, nil
+			if m.exitArmed {
+				m.submitInput(inputResult{err: errInterrupted})
+				return m, nil
+			}
+			m.exitArmed = true
+			m.exitArmSeq++
+			seq := m.exitArmSeq
+			return m, tea.Tick(exitConfirmWindow, func(time.Time) tea.Msg { return exitDisarmMsg{seq: seq} })
 		}
 		return m, nil
 
@@ -771,6 +832,10 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		val := m.ta.Value()
+		if m.askActive && strings.TrimSpace(val) == "" && m.askSel >= 0 && m.askSel < len(m.askOptions) {
+			m.submitInput(inputResult{value: m.askOptions[m.askSel]})
+			return m, nil
+		}
 		// Allow submit with empty text if there are pending images.
 		if !m.askActive && strings.TrimSpace(val) == "" && len(m.pendingImages) == 0 {
 			return m, nil
@@ -784,6 +849,9 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "up":
 		if n := len(m.suggestions); n > 0 {
 			m.suggestIdx = (m.suggestIdx - 1 + n) % n
+			return m, nil
+		}
+		if m.moveAskSelection(-1) {
 			return m, nil
 		}
 		if m.inputVisible && !m.askActive && !strings.Contains(m.ta.Value(), "\n") && len(m.history) > 0 {
@@ -801,6 +869,9 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "down":
 		if n := len(m.suggestions); n > 0 {
 			m.suggestIdx = (m.suggestIdx + 1) % n
+			return m, nil
+		}
+		if m.moveAskSelection(1) {
 			return m, nil
 		}
 		if m.inputVisible && !m.askActive && m.histIdx >= 0 {
@@ -822,6 +893,26 @@ func (m *tuiModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	return m, nil
+}
+
+// moveAskSelection steps the highlighted choice of an active ask. It only
+// engages while the answer box is empty, so arrows still move the cursor
+// through a typed multi-line answer. Reports whether the key was consumed.
+func (m *tuiModel) moveAskSelection(delta int) bool {
+	n := len(m.askOptions)
+	if !m.askActive || n == 0 || m.ta.Value() != "" {
+		return false
+	}
+	switch {
+	case m.askSel < 0 && delta > 0:
+		m.askSel = 0
+	case m.askSel < 0:
+		m.askSel = n - 1
+	default:
+		m.askSel = (m.askSel + delta + n) % n
+	}
+	m.askHeader = m.renderAskHeader()
+	return true
 }
 
 // tryPasteClipboardImage attempts to read an image from the system clipboard.
@@ -885,13 +976,25 @@ func (m *tuiModel) submitInput(r inputResult) {
 		m.inputReply = nil
 	}
 	m.inputVisible = false
-	m.askActive = false
-	m.askHeader = ""
+	m.clearAsk()
+	m.exitArmed = false
 	m.ta.SetValue("")
 	m.suggestions = nil
 	m.suggestIdx = 0
 	m.pendingImages = nil
 }
+
+func (m *tuiModel) clearAsk() {
+	m.askActive = false
+	m.askHeader = ""
+	m.askQuestion = ""
+	m.askOptions = nil
+	m.askSel = -1
+}
+
+// ticking reports whether something on screen needs the spinner and the
+// once-a-second clock: an agent turn or a REPL-side wait.
+func (m *tuiModel) ticking() bool { return m.agentActive || m.waitActive }
 
 // feedQueuedRemote submits the oldest queued remote reply to a JUST-ARRIVED
 // REPL prompt (the requestInputMsg handler calls it after wiring the reply
@@ -910,11 +1013,15 @@ func (m *tuiModel) recordHistory(val string) {
 	if strings.TrimSpace(val) == "" {
 		return
 	}
+	m.histIdx = -1
+	// Re-running the previous input must not cost an extra Up per repeat.
+	if len(m.history) > 0 && m.history[0] == val {
+		return
+	}
 	m.history = append([]string{val}, m.history...)
 	if len(m.history) > maxHistory {
 		m.history = m.history[:maxHistory]
 	}
-	m.histIdx = -1
 }
 
 // updateSuggestions recomputes the slash-command popup from the current input.
@@ -950,21 +1057,69 @@ func (m *tuiModel) applySuggestion() {
 	m.suggestIdx = 0
 }
 
+// maxSuggestionLines caps the slash-command popup. A bare "/" matches every
+// command, which would otherwise shove the prompt up by two dozen rows.
+const maxSuggestionLines = 8
+
 // renderSuggestions draws the slash-command popup, highlighting the selection.
+// When the matches exceed maxSuggestionLines, a window scrolls with the
+// selection and a footer shows the position.
 func (m *tuiModel) renderSuggestions() string {
-	var b strings.Builder
-	for i, c := range m.suggestions {
-		line := fmt.Sprintf("  /%s  %s", padRight(c.Name, 10), c.Desc)
+	start, end := suggestionWindow(len(m.suggestions), m.suggestIdx, maxSuggestionLines)
+	var lines []string
+	for i := start; i < end; i++ {
+		c := m.suggestions[i]
+		line := m.fitLine(fmt.Sprintf("  /%s  %s", padRight(c.Name, 10), c.Desc), 1)
 		if i == m.suggestIdx {
-			b.WriteString(m.styles.Highlight.Render("▸" + line))
+			lines = append(lines, m.styles.Highlight.Render("▸"+line))
 		} else {
-			b.WriteString(m.styles.Dim.Render(" " + line))
-		}
-		if i < len(m.suggestions)-1 {
-			b.WriteString("\n")
+			lines = append(lines, m.styles.Dim.Render(" "+line))
 		}
 	}
-	return b.String()
+	if n := len(m.suggestions); end-start < n {
+		lines = append(lines, m.styles.Dim.Render(fmt.Sprintf("   ↑↓ %d/%d · Tab complete · Esc dismiss", m.suggestIdx+1, n)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// suggestionWindow returns the [start, end) slice of n items to show so that
+// sel stays visible within at most limit rows.
+func suggestionWindow(n, sel, limit int) (int, int) {
+	if n <= limit {
+		return 0, n
+	}
+	start := sel - limit/2
+	if start < 0 {
+		start = 0
+	}
+	if start+limit > n {
+		start = n - limit
+	}
+	return start, start + limit
+}
+
+// lineBudget is the display width a single committed or live line may use
+// before it is truncated. Falls back to the historical 120 columns until the
+// first WindowSizeMsg arrives.
+func (m *tuiModel) lineBudget() int {
+	if m.width <= 0 {
+		return 120
+	}
+	w := m.width - 1
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// fitLine truncates s (raw, no ANSI) so that, after reserved columns of
+// prefix the caller adds, it still fits the terminal on one row.
+func (m *tuiModel) fitLine(s string, reserved int) string {
+	limit := m.lineBudget() - reserved
+	if lipgloss.Width(s) <= limit {
+		return s
+	}
+	return truncateWidth(s, limit-1) + "…"
 }
 
 func (m *tuiModel) elapsedTick() tea.Cmd {
@@ -1016,6 +1171,9 @@ func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
 		return nil
 
 	case agent.AgentEventToolCallStart:
+		if name, _ := toolEventNamePreview(evt); name != "" {
+			m.activeTools = append(m.activeTools, name)
+		}
 		line := m.toolStartLine(evt)
 		if line == "" {
 			return nil
@@ -1023,6 +1181,9 @@ func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
 		return m.commitWithFlush(line)
 
 	case agent.AgentEventToolCallEnd:
+		if name, _ := toolEventNamePreview(evt); name != "" {
+			m.finishActiveTool(name)
+		}
 		line := m.toolEndLine(evt)
 		if line == "" {
 			return nil
@@ -1470,6 +1631,18 @@ func (m *tuiModel) setSubagentLineWithInfo(taskID, description, agentType string
 	})
 }
 
+// finishActiveTool drops one in-flight call of the named tool. Parallel calls
+// of the same tool are indistinguishable by name, and which one ended does not
+// matter to the busy line — only how many remain.
+func (m *tuiModel) finishActiveTool(name string) {
+	for i, t := range m.activeTools {
+		if t == name {
+			m.activeTools = append(m.activeTools[:i], m.activeTools[i+1:]...)
+			return
+		}
+	}
+}
+
 // commitWithFlush commits the trailing assistant partial (if any) before the
 // given line, preserving output order.
 func (m *tuiModel) commitWithFlush(line string) tea.Cmd {
@@ -1515,9 +1688,7 @@ func (m *tuiModel) bashCommandBlock(cmd string) string {
 			break
 		}
 		// Truncate raw text (no ANSI yet) so width math and highlighting stay correct.
-		if lipgloss.Width(ln) > 120 {
-			ln = truncateWidth(ln, 117) + "..."
-		}
+		ln = m.fitLine(ln, lipgloss.Width("  │ "))
 		b.WriteString("\n")
 		b.WriteString(bar)
 		b.WriteString(highlightShellLine(ln))
@@ -1572,13 +1743,15 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	if te.Error != "" {
 		detail += " " + te.Error
 	} else if diff == "" && te.ResultPreview != "" {
-		preview := te.ResultPreview
-		if lipgloss.Width(preview) > 120 {
-			preview = truncateWidth(preview, 117) + "..."
-		}
+		// A preview is a hint, not the result: keep it on one row so a
+		// multi-line output doesn't break the transcript's tree shape.
+		preview := strings.Join(strings.Fields(te.ResultPreview), " ")
 		detail += " → " + preview
 	}
 	line := fmt.Sprintf("  ⎿ %s %s%s", icon, te.Name, detail)
+	if te.Error == "" {
+		line = m.fitLine(line, 0)
+	}
 	if useErr {
 		return m.styles.Error.Render(line)
 	}
@@ -1593,17 +1766,53 @@ func (m *tuiModel) statsLine() string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("Turn %d", m.turn))
 	if m.lastUsage != nil {
-		parts = append(parts, fmt.Sprintf("%d in / %d out", m.lastUsage.InputTokens, m.lastUsage.OutputTokens))
+		parts = append(parts, fmt.Sprintf("%s in / %s out", formatTokensPrecise(m.lastUsage.InputTokens), formatTokensPrecise(m.lastUsage.OutputTokens)))
 	}
-	parts = append(parts, fmt.Sprintf("%.1fs", time.Since(m.turnStart).Seconds()))
+	parts = append(parts, formatDuration(time.Since(m.turnStart), true))
 	return m.styles.Stats.Render("  " + strings.Join(parts, " · "))
 }
 
-func (m *tuiModel) renderAskHeader(question string, options []string) string {
+// formatTokensPrecise is formatTokenCount with one decimal below 100k, for the
+// per-turn stats where "1k" vs "1.9k" is a real difference.
+func formatTokensPrecise(n int) string {
+	switch {
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 100_000:
+		return strconv.FormatFloat(float64(n)/1000, 'f', 1, 64) + "k"
+	default:
+		return formatTokenCount(n)
+	}
+}
+
+// formatDuration renders "8.4s" / "42s" / "3m07s" / "1h02m". tenths keeps one
+// decimal under a minute, for the final stats line where short turns matter.
+func formatDuration(d time.Duration, tenths bool) string {
+	switch {
+	case d < time.Minute && tenths:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+func (m *tuiModel) renderAskHeader() string {
 	var b strings.Builder
-	b.WriteString(m.styles.Highlight.Render("  ? " + question))
-	for i, opt := range options {
-		b.WriteString(fmt.Sprintf("\n    %d. %s", i+1, opt))
+	b.WriteString(m.styles.Highlight.Render("  ? " + m.askQuestion))
+	for i, opt := range m.askOptions {
+		line := fmt.Sprintf("%d. %s", i+1, opt)
+		if i == m.askSel {
+			b.WriteString("\n" + m.styles.Highlight.Render("  ▸ "+line))
+		} else {
+			b.WriteString("\n    " + line)
+		}
+	}
+	if len(m.askOptions) > 0 {
+		b.WriteString("\n" + m.styles.Dim.Render("  ↑↓ select · Enter confirm · or type a number / your own answer"))
 	}
 	return b.String()
 }
@@ -1632,13 +1841,16 @@ func (m *tuiModel) View() tea.View {
 	// so a long message doesn't blow up the live region; the full message is
 	// markdown-rendered into scrollback on completion.
 	if m.aiPartial != "" {
-		b.WriteString(m.styles.Assistant.Render(tailLines(m.aiPartial, 16)))
+		b.WriteString(m.styles.Assistant.Render(m.liveTail(m.aiPartial, 16)))
 		b.WriteString("\n")
 	}
 
 	// Status line.
 	if m.agentActive {
 		b.WriteString(m.busyStatus())
+		b.WriteString("\n")
+	} else if m.waitActive {
+		b.WriteString(m.waitStatus())
 		b.WriteString("\n")
 	}
 
@@ -1737,16 +1949,55 @@ func (m *tuiModel) busyStatus() string {
 	}
 	parts := []string{
 		m.sp.View(),
-		m.styles.Dim.Render(fmt.Sprintf("Working… %.0fs", elapsed.Seconds())),
+		m.styles.Dim.Render(fmt.Sprintf("%s %s", m.busyLabel(), formatDuration(elapsed, false))),
 	}
-	if m.lastUsage != nil {
-		parts = append(parts, m.styles.Dim.Render(fmt.Sprintf("· %d tok", m.lastUsage.OutputTokens)))
-	}
+	// lastUsage is the PREVIOUS turn's usage until this turn ends, so its
+	// output-token count says nothing about the work in progress; only the
+	// context fill (input side) is still a fair approximation.
 	if ctx := m.contextGauge(); ctx != "" {
 		parts = append(parts, ctx)
 	}
 	parts = append(parts, m.styles.Dim.Render("· ctrl+c to interrupt"))
+	if len(m.subagentTasks) > 0 && !m.taskMode {
+		parts = append(parts, m.styles.Dim.Render("· ctrl+t tasks"))
+	}
 	return "  " + strings.Join(parts, " ")
+}
+
+// busyLabel names what the main agent is doing right now: the tool(s) it is
+// waiting on, the reply it is streaming, or (before either) thinking.
+func (m *tuiModel) busyLabel() string {
+	switch n := len(m.activeTools); {
+	case n == 1:
+		return "Running " + m.activeTools[0] + "…"
+	case n > 1:
+		return fmt.Sprintf("Running %s +%d…", m.activeTools[0], n-1)
+	case m.aiPartial != "":
+		return "Responding…"
+	default:
+		return "Thinking…"
+	}
+}
+
+// waitStatus is the live line for a REPL-side wait (CI poll), so a minutes-long
+// wait visibly ticks instead of reading as a hung prompt.
+func (m *tuiModel) waitStatus() string {
+	reason := m.waitReason
+	if reason == "" {
+		reason = "Waiting"
+	}
+	label := m.fitLine(fmt.Sprintf("%s… %s · ctrl+c to stop", reason, formatDuration(time.Since(m.waitStart), false)), 4)
+	return "  " + m.sp.View() + " " + m.styles.Dim.Render(label)
+}
+
+// liveTail bounds the streaming preview to the last n terminal ROWS. Counting
+// logical lines is not enough: one long paragraph wraps to many rows and
+// would push the prompt off-screen just the same.
+func (m *tuiModel) liveTail(s string, n int) string {
+	if m.width > 0 {
+		s = lipgloss.Wrap(s, m.lineBudget(), "")
+	}
+	return tailLines(s, n)
 }
 
 // contextGauge renders the context-window fill as a colored "· ctx N%", warning
@@ -1768,6 +2019,9 @@ func (m *tuiModel) contextGauge() string {
 }
 
 func (m *tuiModel) idleFooter() string {
+	if m.exitArmed {
+		return m.styles.SeverityWarn.Render("  Press Ctrl+C again to exit (Ctrl+D also exits)")
+	}
 	mode := "code"
 	if m.planMode {
 		mode = "plan"
