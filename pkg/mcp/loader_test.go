@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,7 +140,7 @@ func TestLoad_RegistersToolsAndReports(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // isolate from any real global config
 	proj := t.TempDir()
 	writeConfig(t, filepath.Join(proj, ".mcp.json"),
-		`{"mcpServers":{"mock":{"command":"go","args":["run","../../cmd/mcp-example/main.go"]}}}`)
+		fmt.Sprintf(`{"mcpServers":{"mock":{"command":%q}}}`, mcpExamplePath()))
 
 	reg := tools.NewRegistry()
 	closers, report := Load(context.Background(), reg, proj)
@@ -215,7 +216,7 @@ func TestLoadWithServers_ConnectsExtra(t *testing.T) {
 	proj := t.TempDir()
 	reg := tools.NewRegistry()
 	extra := map[string]ServerConfig{
-		"mock": {Command: "go", Args: []string{"run", "../../cmd/mcp-example/main.go"}},
+		"mock": {Command: mcpExamplePath()},
 	}
 	closers, report := LoadWithServers(context.Background(), reg, proj, extra)
 	defer func() {

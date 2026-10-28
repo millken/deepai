@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -145,12 +146,34 @@ func LoadWithServers(ctx context.Context, registry *tools.Registry, workdir stri
 	return closers, buildReport(loaded, failed, badFiles)
 }
 
-// loadServers connects each server, lists its tools, and registers them. It is
-// the shared connect loop used by both Load and LoadWithServers. Per-server
-// failures are collected into failed (not returned as an error); the caller
-// folds them into the report.
+// loadServers registers every server's tools. Warm path: a fingerprint-valid
+// cache supplies the schemas instantly and the live connection is dialed in
+// the background (lazyclient), so startup does not wait on subprocess
+// launches or TLS handshakes. Cold path (first run or config changed):
+// synchronous connect + tools/list, whose result is written back to the
+// cache for the next session. Per-server failures are collected into failed
+// (not returned as an error); the caller folds them into the report.
 func loadServers(ctx context.Context, registry *tools.Registry, servers map[string]ServerConfig) (closers []func(), loaded, failed []string) {
-	for name, sc := range servers {
+	// Deterministic order: map iteration would randomize which server wins a
+	// cross-server tool-name collision and the report line order.
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		sc := servers[name]
+		fp := serverFingerprint(name, sc)
+		if cached, ok := loadCachedTools(name, fp); ok {
+			lazy := registerCached(ctx, registry, name, sc, cached, func(c *Client) {
+				reconcileTools(ctx, name, fp, c)
+			})
+			closers = append(closers, lazy.Close)
+			loaded = append(loaded, fmt.Sprintf("%s (%d cached)", name, len(cached)))
+			continue
+		}
+
 		c, connectErr := connectServer(ctx, name, sc)
 		if connectErr != nil {
 			slog.Warn("mcp server connect failed", "server", name, "err", connectErr)
@@ -161,7 +184,7 @@ func loadServers(ctx context.Context, registry *tools.Registry, servers map[stri
 		// transport), so bounding it is safe and cannot affect the connection
 		// lifetime — unlike Start, which must keep the long-lived session ctx.
 		listCtx, cancel := context.WithTimeout(ctx, mcpListTimeout)
-		serverTools, listErr := c.Tools(listCtx)
+		serverTools, cacheEntries, listErr := c.ToolsAndCache(listCtx)
 		cancel()
 		if listErr != nil {
 			_ = c.Close()
@@ -169,6 +192,7 @@ func loadServers(ctx context.Context, registry *tools.Registry, servers map[stri
 			failed = append(failed, fmt.Sprintf("%s: list tools: %v", name, listErr))
 			continue
 		}
+		saveCachedTools(name, fp, cacheEntries)
 		client := c // capture for closer
 		closers = append(closers, func() { _ = client.Close() })
 		for _, t := range serverTools {
@@ -179,6 +203,78 @@ func loadServers(ctx context.Context, registry *tools.Registry, servers map[stri
 		loaded = append(loaded, name)
 	}
 	return closers, loaded, failed
+}
+
+// registerCached registers cache-sourced tools bound to a lazyClient, which
+// dials the server in the background and re-dials on first call if that
+// failed. The registered shape mirrors Client.ToolsAndCache exactly (name
+// prefix, groups) so warm and cold sessions present identical tools.
+func registerCached(ctx context.Context, registry *tools.Registry, name string, sc ServerConfig, cached []cachedTool, postConnect func(*Client)) *lazyClient {
+	lazy := startLazyClient(ctx, name, sc, postConnect)
+	for _, t := range cached {
+		tool := models.Tool{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+			Groups:      []string{"mcp", name},
+			Handler:     lazy.handlerFor(t.Remote),
+		}
+		if regErr := registry.Register(tool); regErr != nil {
+			slog.Warn("mcp tool register failed", "server", name, "tool", t.Name, "err", regErr)
+		}
+	}
+	return lazy
+}
+
+// reconcileTools re-lists tools after a lazy (re)dial and rewrites the cache
+// when the server's tool set drifted from what was cached (typical for
+// @latest stdio servers). Registration is NOT mutated mid-session — the
+// running agent's tool snapshot must stay stable — so drift is surfaced via
+// the warn log and takes effect next session.
+func reconcileTools(ctx context.Context, name, fingerprint string, c *Client) {
+	listCtx, cancel := context.WithTimeout(ctx, mcpListTimeout)
+	defer cancel()
+	_, fresh, err := c.ToolsAndCache(listCtx)
+	if err != nil {
+		slog.Warn("mcp background tools/list failed; keeping cached schemas", "server", name, "err", err)
+		return
+	}
+	if old, ok := loadCachedTools(name, fingerprint); ok && cachedEqual(old, fresh) {
+		return
+	}
+	saveCachedTools(name, fingerprint, fresh)
+	slog.Warn("mcp server tool set changed; cache refreshed (effective next session)", "server", name)
+}
+
+// cachedEqual compares cache entries by Remote name, order-insensitively —
+// tools/list order is not part of the contract, and an order shuffle must not
+// be reported as drift (which would rewrite the cache and warn every warm
+// start). InputSchema is a map[string]any, compared via its canonical JSON
+// encoding. Duplicated Remote names fall back to positional comparison and
+// at worst cause a redundant rewrite, never a false "unchanged".
+func cachedEqual(a, b []cachedTool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	bByRemote := make(map[string]cachedTool, len(b))
+	for _, t := range b {
+		bByRemote[t.Remote] = t
+	}
+	for _, t := range a {
+		other, ok := bByRemote[t.Remote]
+		if !ok {
+			return false
+		}
+		if t.Name != other.Name || t.Description != other.Description {
+			return false
+		}
+		as, _ := json.Marshal(t.InputSchema)
+		bs, _ := json.Marshal(other.InputSchema)
+		if string(as) != string(bs) {
+			return false
+		}
+	}
+	return true
 }
 
 // expandServerConfig applies ${VAR} env expansion to every string field. Disk
