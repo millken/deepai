@@ -111,32 +111,51 @@ func (c *Client) Close() error {
 	return c.client.Close()
 }
 
-func (c *Client) Tools(ctx context.Context) ([]models.Tool, error) {
+// ToolsAndCache lists the server's tools in two shapes at once: as
+// models.Tool ready for registration, and as the persistable cache subset
+// (which keeps the server-side name — the registered name is prefixed and
+// one-way, so the remote name must be captured here or it is unrecoverable
+// from the cache). Handlers are live closures bound to this client.
+func (c *Client) ToolsAndCache(ctx context.Context) ([]models.Tool, []cachedTool, error) {
 	if c == nil || c.client == nil {
-		return nil, fmt.Errorf("mcp client is not connected")
+		return nil, nil, fmt.Errorf("mcp client is not connected")
 	}
 
 	result, err := c.client.ListTools(ctx, mcpproto.ListToolsRequest{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tools := make([]models.Tool, 0, len(result.Tools))
+	cache := make([]cachedTool, 0, len(result.Tools))
 	for _, tool := range result.Tools {
 		toolName := tool.Name
 		if c.name != "" {
 			toolName = c.name + "__" + toolName
 		}
 		toolName = toolNameSanitizer.ReplaceAllString(toolName, "_")
+		schema := rawSchema(tool)
+		desc := strings.TrimSpace(tool.Description)
 		tools = append(tools, models.Tool{
 			Name:        toolName,
-			Description: strings.TrimSpace(tool.Description),
-			InputSchema: rawSchema(tool),
+			Description: desc,
+			InputSchema: schema,
 			Groups:      []string{"mcp", c.name},
 			Handler:     c.handler(tool.Name),
 		})
+		cache = append(cache, cachedTool{
+			Name:        toolName,
+			Description: desc,
+			InputSchema: schema,
+			Remote:      tool.Name,
+		})
 	}
-	return tools, nil
+	return tools, cache, nil
+}
+
+func (c *Client) Tools(ctx context.Context) ([]models.Tool, error) {
+	tools, _, err := c.ToolsAndCache(ctx)
+	return tools, err
 }
 
 func (c *Client) handler(remoteName string) models.ToolHandler {
