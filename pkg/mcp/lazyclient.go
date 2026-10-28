@@ -8,6 +8,12 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
+// dialBudget bounds total dial attempts per session: the background dial at
+// startup plus at most one synchronous redial on first use. A dead server
+// must fail fast afterwards instead of paying a fresh handshake timeout on
+// every tool call.
+const dialBudget = 2
+
 // lazyClient owns one MCP server connection that is established in the
 // background instead of blocking REPL startup: warm-cache sessions register
 // tools from the local cache and dial concurrently, so a slow TLS handshake
@@ -16,46 +22,52 @@ import (
 // dial, or — after a failed background dial — redials once synchronously so
 // a transient startup failure is not permanent for the whole session.
 //
-// ctx discipline: connectServer binds the ctx it receives to the transport
-// lifetime (stdio binds its subprocess), so every dial MUST use the
-// long-lived session ctx captured here, never a per-call ctx; a caller's ctx
-// only bounds how long get() waits.
+// ctx discipline: a dial binds its ctx to the transport lifetime (stdio
+// binds its subprocess), so dials MUST use dialCtx — derived from the
+// long-lived session ctx, never a per-call ctx — and Close cancels it to
+// abort an in-flight dial (killing its subprocess) instead of waiting out
+// the handshake timeout. A caller's ctx only bounds how long get() waits.
 type lazyClient struct {
 	name        string
 	sc          ServerConfig
-	sessionCtx  context.Context
-	postConnect func(*Client) // cache reconcile after a successful dial; may be nil
+	dialCtx     context.Context    // derived from the session ctx; cancelled by Close
+	dialCancel  context.CancelFunc // aborts any in-flight dial
+	postConnect func(*Client)      // cache reconcile after a successful dial; may be nil
 
-	mu      sync.Mutex
-	client  *Client
-	lastErr error
-	closed  bool
-	dialing bool          // an attempt is in flight
-	current chan struct{} // closed when the in-flight attempt finishes
+	mu       sync.Mutex
+	client   *Client
+	lastErr  error
+	closed   bool
+	dialing  bool          // an attempt is in flight
+	attempts int           // dial attempts consumed against dialBudget
+	current  chan struct{} // closed when the in-flight attempt finishes
 }
 
 func startLazyClient(ctx context.Context, name string, sc ServerConfig, postConnect func(*Client)) *lazyClient {
-	lc := &lazyClient{name: name, sc: sc, sessionCtx: ctx, postConnect: postConnect}
+	dialCtx, dialCancel := context.WithCancel(ctx)
+	lc := &lazyClient{name: name, sc: sc, dialCtx: dialCtx, dialCancel: dialCancel, postConnect: postConnect}
 	lc.startAttempt()
 	return lc
 }
 
-// startAttempt launches a dial goroutine. Idempotent: if an attempt is
-// already in flight or a client is connected, it does nothing — concurrent
-// get() callers on a dead server must not spawn one subprocess each, and
-// the loser's client would leak unclosed.
+// startAttempt launches a dial goroutine. Idempotent: it does nothing when
+// closed, when an attempt is already in flight, when a client is connected,
+// or when the session dial budget is spent — concurrent get() callers on a
+// dead server must not spawn one subprocess each, and the loser's client
+// would leak unclosed.
 func (lc *lazyClient) startAttempt() {
 	lc.mu.Lock()
-	if lc.closed || lc.dialing || lc.client != nil {
+	if lc.closed || lc.dialing || lc.client != nil || lc.attempts >= dialBudget {
 		lc.mu.Unlock()
 		return
 	}
 	done := make(chan struct{})
 	lc.dialing = true
+	lc.attempts++
 	lc.current = done
 	lc.mu.Unlock()
 	go func() {
-		c, err := connectServer(lc.sessionCtx, lc.name, lc.sc)
+		c, err := connectServer(lc.dialCtx, lc.name, lc.sc)
 		lc.mu.Lock()
 		lc.dialing = false
 		if lc.closed {
@@ -76,7 +88,6 @@ func (lc *lazyClient) startAttempt() {
 }
 
 func (lc *lazyClient) get(ctx context.Context) (*Client, error) {
-	redials := 0
 	for {
 		lc.mu.Lock()
 		switch {
@@ -96,15 +107,16 @@ func (lc *lazyClient) get(ctx context.Context) (*Client, error) {
 				return nil, fmt.Errorf("mcp server %q connect: %w", lc.name, ctx.Err())
 			}
 		default:
+			// No client and no dial in flight: the previous attempt failed.
 			err := lc.lastErr
-			lc.mu.Unlock()
-			if redials >= 1 {
+			if lc.attempts >= dialBudget {
+				lc.mu.Unlock()
 				if err == nil {
 					err = fmt.Errorf("connection lost")
 				}
 				return nil, fmt.Errorf("mcp server %q connect: %w", lc.name, err)
 			}
-			redials++
+			lc.mu.Unlock()
 			lc.startAttempt()
 		}
 	}
@@ -116,6 +128,10 @@ func (lc *lazyClient) Close() {
 	c := lc.client
 	lc.client = nil
 	lc.mu.Unlock()
+	// Cancel first: an in-flight dial's subprocess is bound to dialCtx and
+	// must die now, not at the handshake timeout; then close the published
+	// client (if any).
+	lc.dialCancel()
 	if c != nil {
 		_ = c.Close()
 	}

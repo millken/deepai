@@ -246,18 +246,30 @@ func reconcileTools(ctx context.Context, name, fingerprint string, c *Client) {
 	slog.Warn("mcp server tool set changed; cache refreshed (effective next session)", "server", name)
 }
 
-// cachedEqual compares cache entries field-by-field; InputSchema is a
-// map[string]any, so it is compared via its canonical JSON encoding.
+// cachedEqual compares cache entries by Remote name, order-insensitively —
+// tools/list order is not part of the contract, and an order shuffle must not
+// be reported as drift (which would rewrite the cache and warn every warm
+// start). InputSchema is a map[string]any, compared via its canonical JSON
+// encoding. Duplicated Remote names fall back to positional comparison and
+// at worst cause a redundant rewrite, never a false "unchanged".
 func cachedEqual(a, b []cachedTool) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if a[i].Name != b[i].Name || a[i].Remote != b[i].Remote || a[i].Description != b[i].Description {
+	bByRemote := make(map[string]cachedTool, len(b))
+	for _, t := range b {
+		bByRemote[t.Remote] = t
+	}
+	for _, t := range a {
+		other, ok := bByRemote[t.Remote]
+		if !ok {
 			return false
 		}
-		as, _ := json.Marshal(a[i].InputSchema)
-		bs, _ := json.Marshal(b[i].InputSchema)
+		if t.Name != other.Name || t.Description != other.Description {
+			return false
+		}
+		as, _ := json.Marshal(t.InputSchema)
+		bs, _ := json.Marshal(other.InputSchema)
 		if string(as) != string(bs) {
 			return false
 		}

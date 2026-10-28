@@ -154,3 +154,31 @@ func TestLoad_WarmCacheDeadServerRegistersButFailsCalls(t *testing.T) {
 		t.Fatal("expected a dial failure error from a dead server")
 	}
 }
+
+// Review C3: an empty tool list is a legal cache state — a server that
+// removed all its tools must overwrite the stale cache, and the next
+// session must see zero tools instead of ghosts.
+func TestCachedTools_EmptyListRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	fp := "fp-empty"
+	saveCachedTools("e", fp, []cachedTool{})
+	got, ok := loadCachedTools("e", fp)
+	if !ok || len(got) != 0 {
+		t.Fatalf("empty cache must be a hit with zero tools: ok=%v got=%+v", ok, got)
+	}
+}
+
+// Review C3: tools/list order is not part of the contract; equal sets in a
+// different order must not be reported as drift (which would rewrite the
+// cache and warn on every warm start).
+func TestCachedEqual_OrderInsensitive(t *testing.T) {
+	a := []cachedTool{{Name: "x__a", Remote: "a"}, {Name: "x__b", Remote: "b"}}
+	b := []cachedTool{{Name: "x__b", Remote: "b"}, {Name: "x__a", Remote: "a"}}
+	if !cachedEqual(a, b) {
+		t.Fatal("same tools in different order must compare equal")
+	}
+	b[0].Description = "changed"
+	if cachedEqual(a, b) {
+		t.Fatal("a real field change must still be detected")
+	}
+}

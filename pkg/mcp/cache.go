@@ -76,8 +76,10 @@ func cachePath(name string) string {
 }
 
 // loadCachedTools returns the cached tool set only when the file is parseable,
-// format-current, fingerprint-matching, and every entry carries a remote name;
-// anything else is a miss (the caller falls back to connecting synchronously).
+// format-current, and fingerprint-matching. An explicitly EMPTY tool list is
+// a hit: a server that removed all its tools must blank the cache, not leave
+// ghosts for the next session. A missing remote name on any entry is a miss
+// (the caller falls back to connecting synchronously).
 func loadCachedTools(name, fingerprint string) ([]cachedTool, bool) {
 	p := cachePath(name)
 	if p == "" || fingerprint == "" {
@@ -92,7 +94,7 @@ func loadCachedTools(name, fingerprint string) ([]cachedTool, bool) {
 		slog.Warn("mcp tool cache unreadable; ignoring", "path", p, "err", err)
 		return nil, false
 	}
-	if cf.Version != cacheFormatVersion || cf.Fingerprint != fingerprint || len(cf.Tools) == 0 {
+	if cf.Version != cacheFormatVersion || cf.Fingerprint != fingerprint {
 		return nil, false
 	}
 	for _, t := range cf.Tools {
@@ -105,7 +107,7 @@ func loadCachedTools(name, fingerprint string) ([]cachedTool, bool) {
 
 func saveCachedTools(name, fingerprint string, ts []cachedTool) {
 	p := cachePath(name)
-	if p == "" || fingerprint == "" || len(ts) == 0 {
+	if p == "" || fingerprint == "" {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
