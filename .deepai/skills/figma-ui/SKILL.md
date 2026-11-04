@@ -11,6 +11,7 @@ Figma data is ground truth — never guess values that the file can tell you.
 
 参考文件(按需读):
 - [bridge-recipes.md](references/bridge-recipes.md) — 原生桥 JS 配方:取数(含变量名)、token 表、SVG 导出、构建辅助、variables 绑定、按规格构建组件、交付体检、**量测验收**
+- [bridge-pitfalls.md](references/bridge-pitfalls.md) — 原生桥实战坑谱(24 屏项目全历程沉淀):API 可用性矩阵(insertBefore/getVariableByIdAsync 不可用等)、枚举值陷阱、布局/组件/变量坑与可靠代码模式(幂等/保序插入/探针先行/SolidPaint 兜底)、MCP 选路——**报错连续两次同因时必读**
 - [component-specs.md](references/component-specs.md) — Button/Input 尺寸规格与验收不变量(搭控件前必读)
 - [tailwind-v4-map.md](../figma-tailwind/references/tailwind-v4-map.md) — Figma 属性 → Tailwind v4 映射与刻度(目标项目用 Tailwind 时必读;非 Tailwind 项目也可作为 CSS 语义对照)
 
