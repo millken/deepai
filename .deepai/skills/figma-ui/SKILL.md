@@ -91,6 +91,8 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 
 > **交付分档(前置判断,非步骤)**:一次性原型/探索可直接手写;长期维护的项目页面(≥10 屏/多主题/多人协作)走**确定性生成管线**——extract→IR+assets→codegen 三段式,Figma 改一处→git diff 单文件单行,双跑逐字节一致;架构/四要素/落地 checklist/可运行模板见 [docs/figma-codegen.md](../../../docs/figma-codegen.md) 与仓库内 `codegen-template/`。
 
+**代码硬规范(强制,违反任一条即重写)**:① 语义化标签——容器按角色选 `<nav>/<main>/<section>/<header>/<ul>` 等,严禁全篇 `<div>`;② 绝对禁止 `position: absolute`,布局一律 Flexbox 弹性实现——Figma 中绝对定位或无 auto-layout 的区块按坐标推断行列后仍以 flex 表达,flex 确实无法表达的浮层场景如实向用户说明取舍,不得静默改用 absolute;③ 类名反映组件含义(如 `header-nav`、`price-card`),禁止乱码/哈希后缀;④ 生成代码时只返回代码本身,不附解释(验收量测报告不受此限)。`get_design_context` 返回的参考代码违反任一条时,重写而非照抄。
+
 1. **先读项目,再读设计**:确认框架与样式方案(package.json、`@import "tailwindcss"` 即 v4、CSS Modules 等)、
    现有 token 文件、现有组件库。设计里的 INSTANCE(取数输出 `component` + `props`)优先映射到已有组件,
    props 直接对应变体属性(`variant=secondary` → `variant="secondary"`);官方远程可先查
@@ -103,7 +105,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
    - Auto Layout → flex/grid;`FILL` → 弹性(`flex: 1` / stretch),`HUG` → 内容自适应,`FIXED` → 固定尺寸;
      屏幕级宽度(375/390/1440)是样稿尺寸,实现用流式宽度 + max-width。
    - Figma 默认 MIN 对齐,CSS flex 默认 stretch——对齐方式显式写出。
-   - `absolute` 只用于角标/浮层/装饰;父级无 auto-layout 的区块按坐标推断行列,不要整片绝对定位。
+   - 父级无 auto-layout 的区块按坐标推断行列;产出布局一律 Flexbox,禁止 `position: absolute`(见上方代码硬规范)。
    - `asset:'svg'` 的节点导出 SVG 内联(recipes §3),单色图标改 `currentColor`;位图导出 PNG 2x。
    - 文本按角色选语义标签(标题层级、`button`、`label`、`a`),不按字号猜;`maxLines` → 截断/行数限制。
    - 同一组件的 Mobile/Desktop 两张画板 → 一套响应式代码(断点),不要写两份。
@@ -207,6 +209,7 @@ URL 解析(通用):`fileKey` = `/design/` 后段;`?node-id=1-2` → `1:2`(破折
 - Never invent image URLs — only ones returned by the tools.
 - Never guess values a tool can answer (spacing, color, radius, font).
 - 官方远程:one `figma__get_design_context` per node subtree,相关节点合并调用(限流)。
+- 代码产出受 Workflow A「代码硬规范」约束(语义标签 / 禁 absolute / 语义类名 / 只出代码),任一违反视为未完成,重写后再交付。
 - 写 Figma:确定性编辑(`run` / `figma__use_figma`)优先于生成式,除非用户要想法。
 - UI aesthetics/iconography rules come from super-frontend-design; this skill
   supplies the ground-truth data. Compose both when building UI.
