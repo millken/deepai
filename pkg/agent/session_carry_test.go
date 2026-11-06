@@ -381,7 +381,6 @@ func TestSessionCarry_SkillPersistsAcrossRuns(t *testing.T) {
 		Tools:         reg2,
 		Session:       session,
 		MemoryService: svc,
-		InjectMemory:  true,
 	})
 	a2.AppendSystemPrompt(catalogMarker + "\n- some-other-skill: does something")
 

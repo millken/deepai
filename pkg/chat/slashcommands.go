@@ -18,7 +18,7 @@ var slashCommands = []slashCmd{
 	{"save", "Save session metadata"},
 	{"undo", "Undo last turn"},
 	{"compact", "Compact context now"},
-	{"refine", "Refine durable memory (/refine [undo|rollback <id>|list|status|on|off]); recalled only if memory_inject is on"},
+	{"refine", "Refine memory now (/refine [undo|rollback <id>|list|status|on|off])"},
 	{"review", "Adversarially review recent edits (/review [on|off|status])"},
 	{"mission", "Run a task design→review→implement→review (/mission <task>|abort|status)"},
 	{"pr", "PR review pipeline (/pr [status|review|resume|merge|abort <n>])"},

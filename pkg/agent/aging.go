@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
 )
@@ -101,52 +100,11 @@ func opensUserTurn(msg models.Message) bool {
 	return msg.Role == models.RoleHuman && msg.Metadata[metaAgentInjected] != "true"
 }
 
-// headTailSnip separates the kept head from the kept tail inside one budget.
-const headTailSnip = "\n[...snip...]\n"
-
 // truncateRuneSafe cuts s to at most n bytes without splitting a multi-byte
 // UTF-8 rune (backing up to the nearest rune start). Slicing by raw byte index
 // would emit invalid UTF-8 for CJK content, which strict providers reject.
 func truncateRuneSafe(s string, n int) string {
 	return models.TruncateBytes(s, n)
-}
-
-// headTailKeep returns s unchanged when it already fits. Otherwise it keeps
-// about 70% of the budget from the start and the rest from the end, with
-// headTailSnip between them, and the result is at most budget bytes. For
-// ASCII input that exceeds budget (and a budget large enough for the marker)
-// the result is exactly budget bytes, which the aging length tests rely on.
-// A budget too small for a head, a tail, and the marker falls back to a
-// head-only cut.
-func headTailKeep(s string, budget int) string {
-	if budget <= 0 {
-		return ""
-	}
-	if len(s) <= budget {
-		return s
-	}
-	if budget < len(headTailSnip)+2 {
-		return truncateRuneSafe(s, budget)
-	}
-	remain := budget - len(headTailSnip)
-	headBudget := remain * 70 / 100
-	if headBudget < 1 {
-		headBudget = 1
-	}
-	tailBudget := remain - headBudget
-	if tailBudget < 1 {
-		tailBudget = 1
-		headBudget = remain - tailBudget
-	}
-	head := truncateRuneSafe(s, headBudget)
-	tailStart := len(s) - tailBudget
-	if tailStart < len(head) {
-		return truncateRuneSafe(s, budget)
-	}
-	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
-		tailStart++
-	}
-	return head + headTailSnip + s[tailStart:]
 }
 
 // budgetForAge returns the byte cap for the given age: the value of the largest
@@ -293,10 +251,7 @@ func buildPromptView(messages []models.Message, cfg *AgingConfig, contextWindow 
 			}
 			budget := cfg.toolResultBudget(age, toolName)
 			if budget > 0 && len(msg.Content) > budget {
-				// Head+tail, not head-only: bash/grep failures and "N more
-				// matches" footers sit at the end. The payload stays within
-				// budget; the hint is appended outside it, same as before.
-				msg.Content = headTailKeep(msg.Content, budget) + agedToolHint(toolName, age)
+				msg.Content = truncateRuneSafe(msg.Content, budget) + agedToolHint(toolName, age)
 			}
 		case models.RoleAI: // T4 (only Content; ToolCalls untouched)
 			budget := cfg.conversationBudget(age)

@@ -79,11 +79,6 @@ type ReplConfig struct {
 	// MemoryRefineInterval is the gate cadence in turns, already resolved by the
 	// caller (see commands.resolveRefineInterval); 0 means "no gate".
 	MemoryRefineInterval int
-	// MemoryInject opts into cross-session memory on the hot path: automatic
-	// extraction, preference extraction, the compaction flush, and injecting
-	// recalled facts into every turn. Default off. /refine still writes the
-	// store either way; facts stay out of the prompt until this is set.
-	MemoryInject bool
 
 	// ReviewAfterEdit enables the adversarial post-edit review gate
 	// (docs/ADVERSARIAL_REVIEW_DESIGN.md). Default off — the gate blocks the
@@ -153,10 +148,10 @@ type ReplConfig struct {
 }
 
 // fallbackExtractInterval is the turn cadence for unconditional async memory
-// extraction — the behaviour used when the auto-refine gate is switched off
-// AND memory_inject is on. Set to 5: covers a typical short exchange in one
-// batch while keeping LLM extraction cost bounded. With memory_inject on,
-// compaction also flushes synchronously. With it off, nothing on this path runs.
+// extraction — the behaviour used when the auto-refine gate is switched off.
+// Set to 5: covers a typical short exchange in one batch while keeping LLM
+// extraction cost bounded. Compaction always flushes synchronously, so facts
+// are never lost across the context boundary.
 const fallbackExtractInterval = 5
 
 // memoryScheduleMode is what a finished turn should queue for memory.
@@ -171,13 +166,6 @@ const (
 	// REPL did before the gate existed.
 	memoryScheduleUnconditional
 )
-
-// memoryHotPathOn reports whether automatic memory extraction, preference
-// extraction, and prompt injection are enabled. Manual /refine does not
-// consult this; it always writes the store when the user asks.
-func memoryHotPathOn(cfg ReplConfig) bool {
-	return cfg.MemoryInject
-}
 
 // memoryScheduleFor decides what a finished turn should queue.
 //
@@ -1672,7 +1660,6 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		MemoryService:     r.cfg.MemoryService,
 		MemoryExtractor:   r.cfg.MemoryExtractor,
 		MemoryUserID:      r.cfg.WorkDir,
-		InjectMemory:      r.cfg.MemoryInject,
 		ImageDetail:       r.currentImageDetail(),
 		AgentCatalog:      r.cfg.AgentCatalog,
 		Session:           r.carry,
@@ -1937,20 +1924,19 @@ EventLoop:
 		go r.generateTitle(sessionID, firstUserMsg)
 	}
 
-	// Schedule memory work for this turn, only when memory_inject is on.
-	// Automatic extraction and the compaction flush are the cross-session
-	// hot path; they do not help the working set (that is the session
-	// ledger). /refine still runs when the user asks, regardless of this flag.
+	// Schedule memory work for this turn.
 	//
-	// The throttle keeps LLM extraction cost bounded. With auto-refine on,
-	// the gate decides whether a checkpoint is worth extracting; with it off,
-	// the unconditional extraction below is the pre-gate behaviour.
+	// The throttle keeps LLM extraction cost bounded; compaction performs a
+	// synchronous flush ([pkg/agent/react.go] CancelPendingUpdates+UpdateWith),
+	// so nothing is lost between checkpoints. With auto-refine on, the gate
+	// decides whether a checkpoint is worth extracting at all; with it off, the
+	// unconditional extraction below is exactly the pre-gate behaviour.
 	userScopeKey := ""
 	if uid := strings.TrimSpace(r.cfg.WorkDir); uid != "" {
 		userScopeKey = memory.UserScope(uid).Key()
 	}
 
-	if memoryHotPathOn(r.cfg) && r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
+	if r.cfg.MemoryService != nil && r.cfg.MemoryExtractor != nil {
 		switch memoryScheduleFor(r.turn, r.cfg.MemoryRefineInterval, r.autoRefineEnabled()) {
 		case memoryScheduleRefine:
 			// One gate call decides for both scopes; ScheduleRefine queues a job
@@ -1972,7 +1958,7 @@ EventLoop:
 	// fact" rule work across sessions. Under the session key every new
 	// session started from an empty document and re-learned the same
 	// preferences as fresh facts with fresh ids.
-	if memoryHotPathOn(r.cfg) && r.cfg.MemoryService != nil && r.cfg.PreferenceExtractor != nil {
+	if r.cfg.MemoryService != nil && r.cfg.PreferenceExtractor != nil {
 		prefScopeKey := userScopeKey
 		if prefScopeKey == "" {
 			prefScopeKey = r.sess.ID

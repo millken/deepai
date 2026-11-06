@@ -286,28 +286,45 @@ func formatTodoNote(hasTodoTool bool, todos []builtin.TodoItem) string {
 	return b.String()
 }
 
-// buildTurnInjection assembles the trailing volatile message: the date, the
-// todo list, the mission charter, the session working set, and — only when
-// InjectMemory is set — the user- and session-scope memory blocks. Those
-// blocks are already wrapped by pkg/memory/prompt.go. The date line is
-// always present, so the message always exists.
+// buildTurnInjection assembles the per-Run volatile-content injection: the
+// current date plus (when a memory service is configured) the user- and
+// session-scope memory injections, each already self-wrapped by
+// pkg/memory/prompt.go (buildInjectionWithIDs wraps them in
+// "<memory-context>...[System note: recalled memory, not new user
+// input.]...</memory-context>"). Returns a single RoleHuman message with a
+// STABLE SHAPE across every call: the date line is always present, so the
+// message always exists — only its total byte length varies with whether
+// memory is configured and what it contains.
 //
-// Memory text is loaded once per active-skill segment and cached
-// (memoryInjection). The session brief is rendered from the ledger on every
-// call, including after a tool result, so a long Run still names the files
-// and failures compaction is about to drop. The injection is not part of
-// canonical history, so rebuilding it does not change the prefix of the
-// next request (system prompt, tool schemas, transcript).
+// M4-2 design (see task-22-brief.md): computed ONCE per Run, at Run start,
+// from the runMessages present at that moment (see Run's call site in
+// react.go) — memory extraction runs on an async 5-turn cadence elsewhere,
+// so recomputing this per REQUEST inside the turn loop would buy nothing
+// while costing prefix stability (every request before this trailing message
+// would otherwise still be re-scored against a shifting relevance context).
+// Subagents (no MemoryService) fall through the nil check below and get a
+// date-only injection — same mechanism, no special-casing.
 //
 // The memory fence (activeSource = "skill:"+name, for cross-skill fact
-// penalization) is evaluated from a.ActiveSkill() when the cache is filled.
-// At Run start that is "" unless a carried SessionCarry already has a skill.
-// applySkillResult drops the cache when the active skill changes, so the
-// next rebuild loads under the new source. That recompute is prefix-cache
-// free for the same reason as the brief rebuild: the injection is trailing
-// and is not stored in the transcript. The system-prompt prefix is a
-// separate matter — removeAppliedSkillBody + AppendSystemPrompt already
-// replace the skill body in place on that same turn.
+// penalization) is evaluated here from a.ActiveSkill() at the moment this is
+// called. At Run start that is "" for a session-less Run (nothing carried),
+// but M4-3 (task-23-brief.md) can seed it non-empty from a carried
+// SessionCarry — a skill loaded in a PREVIOUS Run sharing that session is
+// already active when THIS Run's very first buildTurnInjection call happens,
+// so the fence applies from request one, not just from a mid-Run load
+// onward. Either way, "once per Run" is really "once per activeSource
+// segment", not a hard one-shot: toolexec.go's applySkillResult calls this
+// AGAIN immediately after a.activeSkill.Store(name) whenever a "skill" tool
+// call changes it mid-Run, so the injection IS re-fenced starting with the
+// very next request after a skill loads — see the call site there for why
+// that recompute is prefix-cache-free (removeAppliedSkillBody +
+// AppendSystemPrompt already invalidated the prefix that same turn, by
+// replacing the previous skill's body with the new one — see
+// removeAppliedSkillBody's doc comment for why the body is replaced in
+// place instead of the older, now-removed approach of stripping the skill
+// catalog out of the prompt on first load). Only genuinely per-request
+// recomputation (once per REQUEST rather than once per activeSource change)
+// is what this function avoids.
 func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMessages []models.Message) models.Message {
 	var b strings.Builder
 	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))
@@ -331,60 +348,27 @@ func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMes
 		b.WriteString(charter)
 	}
 
-	// Cross-session memory is opt-in and cached for the Run. The session
-	// brief is last on purpose: it is the part a coding turn should attend
-	// to, and it is recomputed as tools finish. Rebuilding this message does
-	// not bust the prefix cache — the injection is not part of canonical
-	// history, so the next request's prefix is still system + transcript.
-	if mem := a.memoryInjection(ctx, sessionID, runMessages); mem != "" {
-		b.WriteString("\n\n")
-		b.WriteString(mem)
-	}
-	if a.ledger != nil {
-		if brief := a.ledger.render(); brief != "" {
-			b.WriteString("\n\n")
-			b.WriteString(brief)
+	if a.memoryService != nil {
+		activeSource := ""
+		if skillName := a.ActiveSkill(); skillName != "" {
+			activeSource = "skill:" + skillName
+		}
+		relevanceContext := recentConversationContext(runMessages)
+		if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
+			if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
+				b.WriteString("\n\n")
+				b.WriteString(userMem)
+			}
+		}
+		if strings.TrimSpace(sessionID) != "" {
+			if sessionMem := a.memoryService.InjectWithContext(ctx, sessionID, relevanceContext, activeSource); sessionMem != "" {
+				b.WriteString("\n\n")
+				b.WriteString(sessionMem)
+			}
 		}
 	}
 
 	return models.Message{Role: models.RoleHuman, Content: b.String()}
-}
-
-// memoryInjection returns the cached cross-session memory block. The cache
-// is invalidated when the active skill changes (the memory fence depends on
-// it). With InjectMemory off this never touches the store.
-func (a *Agent) memoryInjection(ctx context.Context, sessionID string, runMessages []models.Message) string {
-	if a == nil || !a.injectMemory || a.memoryService == nil {
-		return ""
-	}
-	if !a.memoryBlockReady {
-		a.memoryBlock = a.renderMemoryInjection(ctx, sessionID, runMessages)
-		a.memoryBlockReady = true
-	}
-	return a.memoryBlock
-}
-
-func (a *Agent) renderMemoryInjection(ctx context.Context, sessionID string, runMessages []models.Message) string {
-	var b strings.Builder
-	activeSource := ""
-	if skillName := a.ActiveSkill(); skillName != "" {
-		activeSource = "skill:" + skillName
-	}
-	relevanceContext := recentConversationContext(runMessages)
-	if uid := strings.TrimSpace(a.memoryUserID); uid != "" {
-		if userMem := a.memoryService.InjectScopeWithContext(ctx, memory.UserScope(uid), relevanceContext, activeSource); userMem != "" {
-			b.WriteString(userMem)
-		}
-	}
-	if sid := strings.TrimSpace(sessionID); sid != "" {
-		if sessionMem := a.memoryService.InjectWithContext(ctx, sid, relevanceContext, activeSource); sessionMem != "" {
-			if b.Len() > 0 {
-				b.WriteString("\n\n")
-			}
-			b.WriteString(sessionMem)
-		}
-	}
-	return b.String()
 }
 
 // appendTurnInjection returns a NEW slice — view is never mutated — with

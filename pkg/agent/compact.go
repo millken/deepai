@@ -113,14 +113,15 @@ func (a *Agent) maybeCompact(ctx context.Context, sessionID string, turn int, ru
 			before := len(runMessages)
 			compacted, didCompact := compactMessages(runMessages, a.compactionKeepTail)
 			if didCompact {
-				// Optional synchronous memory flush, only when cross-session
-				// memory is opted in (AgentConfig.InjectMemory). It is an LLM
-				// extraction of up to 30s that stores durable biography, not
-				// the files and failures compaction is about to drop — those
-				// live on the session ledger. Gated on didCompact so a trigger
-				// turn that finds nothing left to compact does not pay for a
-				// flush that will not run.
-				if a.injectMemory && a.memoryService != nil && a.memoryExtractor != nil {
+				// Flush memory synchronously before compaction to guarantee no
+				// data loss. This blocks while the LLM extracts, but compaction
+				// is infrequent and losing information is worse than the
+				// latency cost. Moved inside didCompact (rather than gated only
+				// on ratio >= threshold) so a trigger turn where
+				// compactMessages finds nothing left to compact — already at
+				// the head/tail floor — doesn't still pay a 30s-timeout flush
+				// for a compaction that's not going to happen.
+				if a.memoryService != nil && a.memoryExtractor != nil {
 					// Cancel any queued update for this session so the
 					// stale async job won't overwrite our sync flush.
 					a.memoryService.CancelPendingUpdates(sessionID)
@@ -386,12 +387,7 @@ func summarizeOldToolResult(msg models.Message) string {
 	// truncateRuneSafe, not a raw byte slice: cutting mid-rune emits invalid
 	// UTF-8, which strict providers reject outright (same reason aging.go uses
 	// it — CJK tool output makes this the common case, not the edge case).
-	// Keep the tail as well as the head. Exit codes and compiler errors are
-	// at the end of tool output; a head-only cut of compactToolResultKeep
-	// bytes dropped them and the model re-ran the command to see a failure
-	// it already had. The wrapper stays the same so isSummarizedToolResult
-	// still recognizes this output and the function stays idempotent.
-	content := headTailKeep(msg.Content, compactToolResultKeep)
+	content := truncateRuneSafe(msg.Content, compactToolResultKeep)
 	return fmt.Sprintf("%s%s, %s...]", summarizedToolResultPrefix, toolName, content)
 }
 

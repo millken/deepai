@@ -14,25 +14,6 @@ import (
 // written back into the canonical history (and the session DB), so it is gone
 // for good. It also never reports "nothing left to compact", so the stall guard
 // never engages and every later turn wraps again.
-func TestSummarizeOldToolResult_KeepsTail(t *testing.T) {
-	msg := models.Message{
-		Role:       models.RoleTool,
-		Content:    strings.Repeat("A", 2000) + "FAIL_TAIL",
-		ToolResult: &models.ToolResult{ToolName: "bash", Status: models.CallStatusCompleted},
-	}
-	got := summarizeOldToolResult(msg)
-	if !strings.Contains(got, "FAIL_TAIL") {
-		t.Fatalf("compaction dropped the failure tail: %q", got)
-	}
-	if !strings.HasPrefix(got, summarizedToolResultPrefix) {
-		t.Fatalf("summary lost its marker: %q", got)
-	}
-	again := summarizeOldToolResult(models.Message{Role: models.RoleTool, Content: got, ToolResult: msg.ToolResult})
-	if again != got {
-		t.Fatalf("summarizing a summary changed it:\n got %q\nagain %q", got, again)
-	}
-}
-
 func TestCompactMessages_IsIdempotent(t *testing.T) {
 	msgs := []models.Message{
 		{ID: "sys", SessionID: "s1", Role: models.RoleSystem, Content: "system"},

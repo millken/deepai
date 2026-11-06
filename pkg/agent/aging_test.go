@@ -261,41 +261,6 @@ func TestBuildPromptView_UTF8SafeTruncation(t *testing.T) {
 	}
 }
 
-func TestHeadTailKeep_PreservesTailInsideBudget(t *testing.T) {
-	body := strings.Repeat("A", 5000) + "EXIT_CODE_99"
-	got := headTailKeep(body, 300)
-	if len(got) != 300 {
-		t.Fatalf("ASCII head/tail should fill the budget exactly, got %d", len(got))
-	}
-	if !strings.HasPrefix(got, "AAAA") || !strings.Contains(got, "EXIT_CODE_99") {
-		t.Fatalf("head or tail missing: %q", got)
-	}
-	if !utf8.ValidString(got) {
-		t.Fatal("head/tail result is not valid UTF-8")
-	}
-}
-
-func TestBuildPromptView_KeepsAgedToolTail(t *testing.T) {
-	// bash age-1 budget is 4096. A head-only cut would keep only A's and
-	// drop the exit marker that actually decides the next action.
-	body := strings.Repeat("A", 9000) + "EXIT_CODE_99"
-	msgs := []models.Message{
-		human("q1"),
-		aiTools(""),
-		toolMsg("bash", body),
-		human("q2"),
-		aiTools(""),
-		toolMsg("bash", "small"),
-	}
-	out := buildPromptView(msgs, t1Config(), 0)
-	if !strings.Contains(out[2].Content, "EXIT_CODE_99") {
-		t.Fatalf("aged bash result dropped the tail: %q", out[2].Content[len(out[2].Content)-80:])
-	}
-	if !strings.Contains(out[2].Content, "re-call bash") {
-		t.Fatal("aged bash result missing the re-call hint")
-	}
-}
-
 func TestBudgetForAge_StepFunction(t *testing.T) {
 	b := map[int]int{1: 8192, 2: 2048, 3: 300}
 	cases := map[int]int{0: 0, 1: 8192, 2: 2048, 3: 300, 5: 300}
