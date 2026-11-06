@@ -1,0 +1,343 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/millken/deepai/pkg/llm"
+	"github.com/millken/deepai/pkg/models"
+)
+
+// DefaultKeepFullTurns is the number of recent user turns sent verbatim.
+// Older turns are left out of the provider request and consolidated by a
+// background model into one session summary. The current turn counts as one
+// of these ten; tool schemas travel on the request's tools field, not as
+// another copy of the dialogue. Zero on AgentConfig disables the window
+// (tests and one-shot callers). The REPL resolves an absent config value to
+// this default.
+const DefaultKeepFullTurns = 10
+
+// metaSessionSummary marks the synthetic message that carries the session
+// summary. It must not open a user turn: counting it would age or re-window
+// the real dialogue around a message the model did not write.
+const metaSessionSummary = "session_summary"
+
+const sessionSummaryTimeout = 60 * time.Second
+
+const sessionSummarySystemPrompt = `You consolidate older turns of a coding session into one session summary for the main model.
+The summary replaces those turns in its prompt. Keep only what the next turns need:
+- the user's goals and constraints
+- files read or changed, with paths
+- decisions and why
+- unresolved errors, including the error text
+- attempts that failed
+Drop file dumps, repeated tool output, and chatter.
+When a previous summary is included, merge the new turns into it. Do not drop an unresolved item unless a later turn resolved it.
+Return only the summary text.`
+
+// SessionSummarizer turns older dialogue into the session summary. The
+// implementation is a separate model call and must not run on the
+// interactive turn's critical path.
+type SessionSummarizer interface {
+	Summarize(ctx context.Context, previousSummary, transcript string) (string, error)
+}
+
+// sessionSummary is the consolidated text of user turns that have fallen
+// out of the verbatim window. It is shared across the single-use Agents of
+// one conversation (see SessionCarry) and is written from a background
+// goroutine, so unlike the rest of the carry it has its own lock.
+type sessionSummary struct {
+	mu      sync.Mutex
+	text    string
+	covered int // user turns [0, covered) included in text
+	flight  uint64
+	nextID  uint64
+}
+
+func (s *sessionSummary) snapshot() (text string, covered int, busy bool) {
+	if s == nil {
+		return "", 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.text, s.covered, s.flight != 0
+}
+
+// begin starts a job that will cover user turns [0, boundary). It fails
+// when a job is already running or the boundary is already covered, so two
+// turns cannot publish over each other.
+func (s *sessionSummary) begin(boundary int) (id uint64, previous string, ok bool) {
+	if s == nil || boundary <= 0 {
+		return 0, "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flight != 0 || boundary <= s.covered {
+		return 0, "", false
+	}
+	s.nextID++
+	s.flight = s.nextID
+	return s.flight, s.text, true
+}
+
+// complete publishes a job's summary. A stale id (the job was aborted, or a
+// newer job holds the flight) is ignored so a slow model cannot overwrite a
+// newer consolidation.
+func (s *sessionSummary) complete(id uint64, text string, coveredTo int) bool {
+	if s == nil || id == 0 {
+		return false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || coveredTo <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flight != id || coveredTo < s.covered {
+		return false
+	}
+	s.flight = 0
+	s.text = text
+	s.covered = coveredTo
+	return true
+}
+
+func (s *sessionSummary) abort(id uint64) {
+	if s == nil || id == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flight == id {
+		s.flight = 0
+	}
+}
+
+// turnStarts lists the index of each message that opens a user turn.
+func turnStarts(msgs []models.Message) []int {
+	var starts []int
+	for i, m := range msgs {
+		if opensUserTurn(m) {
+			starts = append(starts, i)
+		}
+	}
+	return starts
+}
+
+// splitKept returns how many leading user turns fall outside the verbatim
+// window and the messages that stay. keep <= 0 or a short transcript returns
+// the messages unchanged and a zero boundary.
+func splitKept(msgs []models.Message, keep int) (boundary int, kept []models.Message) {
+	if keep <= 0 {
+		return 0, msgs
+	}
+	starts := turnStarts(msgs)
+	if len(starts) <= keep {
+		return 0, msgs
+	}
+	boundary = len(starts) - keep
+	return boundary, msgs[starts[boundary]:]
+}
+
+func messagesForTurns(msgs []models.Message, from, to int) []models.Message {
+	starts := turnStarts(msgs)
+	if from < 0 {
+		from = 0
+	}
+	if to > len(starts) {
+		to = len(starts)
+	}
+	if from >= to || len(starts) == 0 {
+		return nil
+	}
+	end := len(msgs)
+	if to < len(starts) {
+		end = starts[to]
+	}
+	out := make([]models.Message, end-starts[from])
+	copy(out, msgs[starts[from]:end])
+	return out
+}
+
+// sessionSummaryMessage is RoleHuman on purpose. Both provider mappers drop
+// a RoleSystem message that sits inside the message list; only
+// ChatRequest.SystemPrompt becomes the system message. opensUserTurn ignores
+// this message so it is not itself a user turn.
+func sessionSummaryMessage(text string, covered, boundary int, summaryEnabled bool) models.Message {
+	var b strings.Builder
+	if covered > 0 {
+		fmt.Fprintf(&b, "[Session summary of user turns 1–%d. Later turns follow in full. This is a consolidation of the dialogue, not a new user request.]\n", covered)
+		if strings.TrimSpace(text) != "" {
+			b.WriteString(strings.TrimSpace(text))
+			b.WriteString("\n")
+		}
+	}
+	if covered < boundary {
+		if summaryEnabled {
+			fmt.Fprintf(&b, "[User turns %d–%d are still being consolidated in the background and are not in this prompt.]\n", covered+1, boundary)
+		} else {
+			fmt.Fprintf(&b, "[User turns 1–%d are omitted from this prompt. Session summary is off.]\n", boundary)
+		}
+	}
+	return models.Message{
+		Role:     models.RoleHuman,
+		Content:  b.String(),
+		Metadata: map[string]string{metaSessionSummary: "true"},
+	}
+}
+
+// windowPromptView is the provider view of a transcript: one session-summary
+// message, then the last keepFullTurns user turns in full. Canonical
+// messages are not modified. keepFullTurns <= 0 returns view unchanged.
+func (a *Agent) windowPromptView(view []models.Message) []models.Message {
+	if a == nil || a.keepFullTurns <= 0 {
+		return view
+	}
+	boundary, kept := splitKept(view, a.keepFullTurns)
+	if boundary <= 0 {
+		return view
+	}
+	text, covered, _ := a.summary.snapshot()
+	if covered > boundary {
+		covered = boundary
+	}
+	head := sessionSummaryMessage(text, covered, boundary, a.summarizer != nil)
+	out := make([]models.Message, 0, 1+len(kept))
+	out = append(out, head)
+	out = append(out, kept...)
+	return out
+}
+
+// maybeStartSessionSummary kicks a background consolidation of the user
+// turns that no longer fit in the verbatim window. It returns immediately.
+// The job reads a rendered transcript, not the live message slice, and
+// publishes only if it is still the in-flight job when it finishes.
+func (a *Agent) maybeStartSessionSummary(ctx context.Context, msgs []models.Message) {
+	if a == nil || a.keepFullTurns <= 0 || a.summarizer == nil || a.summary == nil {
+		return
+	}
+	boundary, _ := splitKept(msgs, a.keepFullTurns)
+	if boundary <= 0 {
+		return
+	}
+	id, previous, ok := a.summary.begin(boundary)
+	if !ok {
+		return
+	}
+	// begin does not change covered. Re-read it so the span starts where the
+	// published summary ends. Nothing else can complete while this id holds
+	// the flight.
+	_, covered, _ := a.summary.snapshot()
+	span := messagesForTurns(msgs, covered, boundary)
+	transcript := renderSummaryTranscript(span)
+	go func() {
+		jobCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSummaryTimeout)
+		defer cancel()
+		text, err := a.summarizer.Summarize(jobCtx, previous, transcript)
+		if err != nil {
+			a.logger.Warn("session summary failed", "err", err)
+			a.summary.abort(id)
+			return
+		}
+		if !a.summary.complete(id, text, boundary) {
+			a.summary.abort(id)
+		}
+	}()
+}
+
+func renderSummaryTranscript(msgs []models.Message) string {
+	const perMessage = 2000
+	const totalCap = 48 * 1024
+	var b strings.Builder
+	for _, m := range msgs {
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		content = clipTail(content, perMessage)
+		fmt.Fprintf(&b, "%s: %s\n", m.Role, content)
+	}
+	out := b.String()
+	if len(out) <= totalCap {
+		return out
+	}
+	out = out[len(out)-totalCap:]
+	for len(out) > 0 && !utf8.RuneStart(out[0]) {
+		out = out[1:]
+	}
+	return "[…earlier transcript truncated…]\n" + out
+}
+
+func clipTail(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	tail := s[len(s)-n:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return "[…truncated…] " + tail
+}
+
+type llmSessionSummarizer struct {
+	provider llm.LLMProvider
+	model    string
+}
+
+// NewLLMSessionSummarizer returns a summarizer that calls provider.Chat.
+// model is the provider's model name, not the REPL alias.
+func NewLLMSessionSummarizer(provider llm.LLMProvider, model string) SessionSummarizer {
+	if provider == nil {
+		return nil
+	}
+	return llmSessionSummarizer{provider: provider, model: model}
+}
+
+func (s llmSessionSummarizer) Summarize(ctx context.Context, previousSummary, transcript string) (string, error) {
+	if s.provider == nil {
+		return "", fmt.Errorf("session summarizer has no provider")
+	}
+	var b strings.Builder
+	if strings.TrimSpace(previousSummary) != "" {
+		b.WriteString("Previous summary:\n")
+		b.WriteString(strings.TrimSpace(previousSummary))
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Turns to consolidate:\n")
+	if strings.TrimSpace(transcript) == "" {
+		b.WriteString("(empty)\n")
+	} else {
+		b.WriteString(transcript)
+	}
+	maxTokens := 2048
+	resp, err := s.provider.Chat(ctx, llm.ChatRequest{
+		Model:        s.model,
+		SystemPrompt: sessionSummarySystemPrompt,
+		Messages: []models.Message{{
+			Role:    models.RoleHuman,
+			Content: b.String(),
+		}},
+		MaxTokens: &maxTokens,
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(resp.Message.Content), nil
+}
+
+// ResolveKeepFullTurns maps a config value to the verbatim-window size.
+// 0 means the default. Negative disables the window (the provider sees the
+// full transcript).
+func ResolveKeepFullTurns(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v == 0 {
+		return DefaultKeepFullTurns
+	}
+	return v
+}

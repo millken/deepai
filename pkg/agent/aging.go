@@ -95,9 +95,13 @@ type AgingConfig struct {
 // older material age slightly faster.
 const metaAgentInjected = "agent_injected"
 
-// opensUserTurn reports whether msg starts a new user turn for aging purposes.
+// opensUserTurn reports whether msg starts a new user turn for aging and for
+// the verbatim window. Agent-injected hints and the session-summary message
+// are RoleHuman but are not user turns.
 func opensUserTurn(msg models.Message) bool {
-	return msg.Role == models.RoleHuman && msg.Metadata[metaAgentInjected] != "true"
+	return msg.Role == models.RoleHuman &&
+		msg.Metadata[metaAgentInjected] != "true" &&
+		msg.Metadata[metaSessionSummary] != "true"
 }
 
 // truncateRuneSafe cuts s to at most n bytes without splitting a multi-byte

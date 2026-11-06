@@ -610,6 +610,12 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 
 记忆的提取 / 合并 / 回滚链路见 [`docs/REFINE_DESIGN.md`](docs/REFINE_DESIGN.md)。
 
+### 会话上下文
+
+长会话发给主模型的不是整段记录。默认保留最近 10 个用户轮次的原文；更早的轮次由一个便宜模型在后台合并成会话摘要。大块工具输出写到 `~/.deepai/offload/`，提示词里只留短引用和尾部，需要全文时用 `recall_output` 读回。
+
+这和上面的长期记忆是两件事。细节见 [`docs/session-context.md`](docs/session-context.md)。
+
 ---
 
 ## 沙箱与安全

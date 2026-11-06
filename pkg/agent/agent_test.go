@@ -1132,9 +1132,8 @@ func (p *parallelRepeatLoopProviderOffload) Stream(ctx context.Context, req llm.
 // through the normal path must still get shrunk to the offload stub, not
 // persisted at full size.
 func TestParallelBreaker_FatalTailAppendAppliesOffload(t *testing.T) {
-	// Many short lines (not one giant line) so buildOffloadedContent's
-	// head+tail truncation actually shrinks the content, rather than just
-	// wrapping a single line in a header that's larger than the original.
+	// Many short lines so the offload stub is smaller than the original,
+	// rather than a header wrapped around one giant line.
 	bigContent := strings.Repeat("line of filler text\n", (offloadThresholdBytes/20)+200)
 	reg := tools.NewRegistry()
 	if err := reg.Register(models.Tool{
@@ -1730,7 +1729,7 @@ func (p *offloadTestProvider) Stream(ctx context.Context, req llm.ChatRequest) (
 
 // TestOffload_LargeResultWrittenToDisk verifies that a tool result exceeding
 // the offload threshold (24KB) is written to disk and replaced in-context with
-// a compact reference containing first/last 50 lines.
+// a short ref plus a tail preview. The full body stays on disk.
 func TestOffload_LargeResultWrittenToDisk(t *testing.T) {
 	tmpDir := t.TempDir()
 	offloadDir := tmpDir + "/offload"
@@ -1785,10 +1784,18 @@ func TestOffload_LargeResultWrittenToDisk(t *testing.T) {
 	if !strings.Contains(toolMsg.Content, "[offloaded:") {
 		t.Fatalf("expected [offloaded:] marker in content, got first 200 chars: %q", toolMsg.Content[:min(200, len(toolMsg.Content))])
 	}
-	// Content should be much smaller than the original 30KB.
-	// First+last 50 lines at ~145 chars/line ≈ 14.5KB, which is expected.
-	if len(toolMsg.Content) > 20000 {
-		t.Fatalf("offloaded content too large: %d bytes (expected <20KB)", len(toolMsg.Content))
+	// The prompt keeps a short tail, not the first 50 lines.
+	if len(toolMsg.Content) > 4000 {
+		t.Fatalf("offloaded content too large: %d bytes (expected a short ref plus tail)", len(toolMsg.Content))
+	}
+	if !strings.Contains(toolMsg.Content, "ref:") || !strings.Contains(toolMsg.Content, "recall_output") {
+		t.Fatalf("offload stub missing ref or recall hint: %q", toolMsg.Content)
+	}
+	if strings.Contains(toolMsg.Content, "line 000:") {
+		t.Fatalf("offload stub inlined the head of the output: %q", toolMsg.Content[:min(200, len(toolMsg.Content))])
+	}
+	if !strings.Contains(toolMsg.Content, "line 199:") {
+		t.Fatalf("offload stub dropped the tail: %q", toolMsg.Content)
 	}
 	// The full output should be on disk.
 	entries, err := os.ReadDir(offloadDir)

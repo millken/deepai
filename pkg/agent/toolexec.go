@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/subagent"
@@ -73,7 +74,8 @@ func appendToolResultMessage(runMessages []models.Message, sessionID string, res
 
 // offloadIfNeeded checks if a tool result exceeds the offload threshold.
 // If so, it writes the full content to a file under offloadDir and replaces
-// result.Content with a compact reference (path + first/last 50 lines).
+// result.Content with a short ref plus a tail preview. The model reads the
+// full body back with recall_output.
 // Returns true if offload occurred. Errors during file write are logged but
 // non-fatal — the result stays in-context (degraded but functional).
 // A handler that set models.ToolDataNoOffload in Data opts its result out —
@@ -89,7 +91,8 @@ func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bo
 	if v, ok := result.Data[models.ToolDataOffloaded].(bool); ok && v {
 		return true
 	}
-	if offloadDir == "" || len(result.Content) <= offloadThresholdBytes {
+	limit := a.offloadLimit()
+	if offloadDir == "" || limit <= 0 || len(result.Content) <= limit {
 		return false
 	}
 	if v, ok := result.Data[models.ToolDataNoOffload].(bool); ok && v {
@@ -119,34 +122,58 @@ func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bo
 	return true
 }
 
-// buildOffloadedContent creates the in-context replacement for an offloaded
-// result: a reference header, first 50 lines, last 50 lines, and an omission
-// notice for the middle.
-func buildOffloadedContent(original, toolName, offloadPath string) string {
+func (a *Agent) offloadLimit() int {
+	if a == nil || a.offloadBytes == 0 {
+		return offloadThresholdBytes
+	}
+	if a.offloadBytes < 0 {
+		return 0
+	}
+	return a.offloadBytes
+}
+
+// buildOffloadedContent is the in-context replacement for an offloaded
+// result. The header prefix and the saved path are stable: callers and the
+// UI match on them. The body is only a short tail so a failure or an
+// exit_code at the end of a command stays visible; the rest is fetched with
+// recall_output.
+func buildOffloadedContent(original, _, offloadPath string) string {
 	lines := strings.Split(original, "\n")
-	totalLines := len(lines)
+	id := strings.TrimSuffix(filepath.Base(offloadPath), ".txt")
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "[offloaded: full output (%d bytes, %d lines) saved to %s]\n",
-		len(original), totalLines, offloadPath)
-
-	const headLimit = 50
-	const tailLimit = 50
-
-	if totalLines <= headLimit+tailLimit {
-		// Content fits in head+tail, include everything (still offloaded for recovery).
-		b.WriteString("\n")
-		b.WriteString(original)
-		return b.String()
+		len(original), len(lines), offloadPath)
+	fmt.Fprintf(&b, "ref: %s\n", id)
+	b.WriteString("The body is not in this prompt. Call recall_output with this ref when you need it.\n")
+	if tail := offloadPreview(original); tail != "" {
+		b.WriteString("--- tail ---\n")
+		b.WriteString(tail)
+		if !strings.HasSuffix(tail, "\n") {
+			b.WriteString("\n")
+		}
 	}
-
-	b.WriteString("\n--- first 50 lines ---\n")
-	b.WriteString(strings.Join(lines[:headLimit], "\n"))
-	fmt.Fprintf(&b, "\n\n... (%d lines omitted) ...\n\n", totalLines-headLimit-tailLimit)
-	b.WriteString("--- last 50 lines ---\n")
-	b.WriteString(strings.Join(lines[totalLines-tailLimit:], "\n"))
-
 	return b.String()
+}
+
+// offloadPreview keeps the end of a tool result: bash JSON puts exit_code
+// last, and compiler errors usually land there too.
+func offloadPreview(s string) string {
+	const maxLines = 15
+	const maxBytes = 800
+	lines := strings.Split(s, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	tail := strings.Join(lines, "\n")
+	if len(tail) <= maxBytes {
+		return tail
+	}
+	tail = tail[len(tail)-maxBytes:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return tail
 }
 
 func newToolCallEvent(call models.ToolCall, result *models.ToolResult) *ToolCallEvent {

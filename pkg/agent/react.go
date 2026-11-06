@@ -22,6 +22,16 @@ import (
 	builtin "github.com/millken/deepai/pkg/tools/builtin"
 )
 
+// DefaultOffloadDir is where large tool results are written when
+// AgentConfig.OffloadDir is empty. recall_output reads this same directory.
+func DefaultOffloadDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".deepai", "offload")
+}
+
 // defaultStreamIdleTimeout bounds the max silence BETWEEN chunks of a single
 // streaming request (not the total request time — see Agent.streamIdleTimeout).
 // Generous relative to any real provider's chunk cadence, so it only trips on
@@ -201,9 +211,19 @@ type Agent struct {
 	// instead of the user (AgentConfig.DeferPlanApproval).
 	deferPlanApproval bool
 
-	// offloadDir is where tool results exceeding offloadThresholdBytes are
+	// offloadDir is where tool results exceeding the offload threshold are
 	// written to disk. Empty = offload disabled.
 	offloadDir string
+	// offloadBytes overrides offloadThresholdBytes. 0 keeps the default.
+	// Negative disables offload.
+	offloadBytes int
+
+	// keepFullTurns is how many recent user turns stay verbatim in the
+	// provider request. 0 disables the window. The REPL resolves an absent
+	// config value to DefaultKeepFullTurns; a zero AgentConfig does not.
+	keepFullTurns int
+	summarizer    SessionSummarizer
+	summary       *sessionSummary
 
 	// imageDetail controls vision detail level ("low"/"high") for image
 	// attachments in ChatRequest.
@@ -261,9 +281,11 @@ func New(cfg AgentConfig) *Agent {
 	// subagent) get offload without each passing it explicitly.
 	offloadDir := cfg.OffloadDir
 	if offloadDir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			offloadDir = filepath.Join(home, ".deepai", "offload")
-		}
+		offloadDir = DefaultOffloadDir()
+	}
+	keepFullTurns := cfg.KeepFullTurns
+	if keepFullTurns < 0 {
+		keepFullTurns = 0
 	}
 	a := &Agent{
 		llm:                 cfg.LLMProvider,
@@ -294,6 +316,9 @@ func New(cfg AgentConfig) *Agent {
 		userInteraction:     cfg.UserInteraction,
 		workDir:             cfg.WorkDir,
 		offloadDir:          offloadDir,
+		offloadBytes:        cfg.OffloadBytes,
+		keepFullTurns:       keepFullTurns,
+		summarizer:          cfg.Summarizer,
 		imageDetail:         cfg.ImageDetail,
 		nonInteractive:      cfg.NonInteractive,
 		agentCatalog:        cfg.AgentCatalog,
@@ -307,6 +332,16 @@ func New(cfg AgentConfig) *Agent {
 		a.readTracker = cfg.Session.readTracker
 	} else {
 		a.readTracker = tools.NewReadTracker()
+	}
+	if keepFullTurns > 0 {
+		if cfg.Session != nil {
+			if cfg.Session.summary == nil {
+				cfg.Session.summary = &sessionSummary{}
+			}
+			a.summary = cfg.Session.summary
+		} else {
+			a.summary = &sessionSummary{}
+		}
 	}
 
 	// M4-3: prime the compaction anchor/stall bookkeeping from the carried
@@ -554,6 +589,10 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 	// appendTurnInjection instead of BuildSystemPrompt baking volatile
 	// content into the request prefix.
 	a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
+	// Older turns are consolidated off the interactive path. The request
+	// below already windows whatever summary is published; a job that
+	// finishes during this Run shows up on the next request.
+	a.maybeStartSessionSummary(ctx, runMessages)
 
 	usage := &Usage{}
 	// breaker holds all circuit-breaker state (validation-failure loop and

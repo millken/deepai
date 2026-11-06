@@ -100,6 +100,11 @@ type SessionCarry struct {
 	// leaveMission), under the same single-goroutine contract as every other
 	// field here.
 	missionCharter string
+
+	// summary is the consolidation of user turns that have left the verbatim
+	// window. It is the one field written from a background goroutine, and
+	// it guards itself. /clear and /new replace the carry, which drops it.
+	summary *sessionSummary
 }
 
 // NewSessionCarry returns a zero-value SessionCarry, ready to be passed as

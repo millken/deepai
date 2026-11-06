@@ -30,8 +30,8 @@ const (
 	// the context beyond any provider's practical limit.
 	maxToolContentBytes = 50_000
 	// offloadThresholdBytes is the size above which a tool result is written
-	// to disk and replaced in-context with a summary + first/last 50 lines.
-	// Per design doc §9 (l0_source_guard.offload_threshold_bytes).
+	// to disk and replaced in-context with a short ref plus a tail preview.
+	// AgentConfig.OffloadBytes overrides it; 0 keeps this default.
 	offloadThresholdBytes = 24 * 1024
 )
 
@@ -87,6 +87,15 @@ func (a *Agent) maybeCompact(ctx context.Context, sessionID string, turn int, ru
 	// inconclusive result.
 	if a.compactionStalled && len(runMessages) >= a.compactionStalledAt+a.compactionKeepTail {
 		a.setCompactionStall(false, a.compactionStalledAt)
+	}
+
+	// The verbatim window replaces proactive compaction. Measuring the full
+	// transcript here would flush durable memory and rewrite history the
+	// summary job still reads. A provider overflow still compacts through
+	// compactOnOverflow.
+	if a.keepFullTurns > 0 {
+		promptView = a.windowPromptView(promptView)
+		return runMessages, appendTurnInjection(promptView, a.turnInjection)
 	}
 
 	// Context compaction: compress old messages when approaching context window.
