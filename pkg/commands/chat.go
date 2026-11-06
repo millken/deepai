@@ -372,6 +372,7 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		MemoryService:        memService,
 		MemoryAutoRefine:     !cfg.MemoryAutoRefineDisabled,
 		MemoryRefineInterval: resolveRefineInterval(cfg.MemoryRefineInterval),
+		MemoryInject:         cfg.MemoryInject,
 		MemoryExtractor:      memExtractor,
 		PreferenceExtractor:  prefExtractor,
 		SessionRepo:          sessStore,

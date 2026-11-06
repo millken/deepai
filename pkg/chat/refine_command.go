@@ -225,17 +225,25 @@ func (r *ChatRepl) refineStatusText() string {
 		state = "on"
 	}
 	interval := r.effectiveExtractInterval()
+	var base string
 	if r.refineOverride == nil {
-		return fmt.Sprintf("auto-refine: %s (from config); memory extraction every %d turns", state, interval)
+		base = fmt.Sprintf("auto-refine: %s (from config); memory extraction every %d turns", state, interval)
+	} else {
+		// Show both layers: the override is session-only, so a restart returns to the
+		// configured default and the user should be able to see that coming.
+		configured := "off"
+		if r.cfg.MemoryAutoRefine {
+			configured = "on"
+		}
+		base = fmt.Sprintf("auto-refine: %s for this session (config default: %s); memory extraction every %d turns",
+			state, configured, interval)
 	}
-	// Show both layers: the override is session-only, so a restart returns to the
-	// configured default and the user should be able to see that coming.
-	configured := "off"
-	if r.cfg.MemoryAutoRefine {
-		configured = "on"
+	// Automatic extraction runs only when injection is on. Say so, or status
+	// reads as if facts are being recalled into the prompt when they are not.
+	if memoryHotPathOn(r.cfg) {
+		return base + "; prompt injection on"
 	}
-	return fmt.Sprintf("auto-refine: %s for this session (config default: %s); memory extraction every %d turns",
-		state, configured, interval)
+	return base + "; prompt injection off (set memory_inject: true to extract and recall facts)"
 }
 
 func (r *ChatRepl) refineListText(ctx context.Context) string {
@@ -292,6 +300,9 @@ func (r *ChatRepl) runManualRefine(ctx context.Context) {
 		default:
 			r.ui.Info(fmt.Sprintf("  %s scope: +%d ~%d -%d  (%s)", scope.label, added, updated, removed, record.ID))
 		}
+	}
+	if !r.cfg.MemoryInject {
+		r.ui.Info("  Saved in the memory store. Prompt injection is off; set memory_inject: true before these facts are recalled into later turns.")
 	}
 }
 

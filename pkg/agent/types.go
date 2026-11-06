@@ -113,10 +113,16 @@ type AgentConfig struct {
 	// buckets, per-tool result sizes). nil = disabled (zero overhead).
 	Metrics MetricsSink
 
-	// Memory integration
-	MemoryService   *memory.Service  // used for Inject into system prompt
+	// Memory integration. The service stays wired so /refine and the memory
+	// tool can read and write the store. InjectMemory is the hot-path opt-in:
+	// prompt injection, the synchronous compaction flush, and (at the REPL)
+	// automatic extraction. Default off — recalled biography did not keep
+	// long coding sessions coherent, and it spent tokens at the end of every
+	// request. The session working set does not consult this flag.
+	MemoryService   *memory.Service
 	MemoryExtractor memory.Extractor // per-request extractor (matches the LLM model of the current request)
 	MemoryUserID    string           // user ID for cross-session UserScope memory (empty = disabled)
+	InjectMemory    bool
 
 	// User interaction (e.g. ask_clarification tool)
 	UserInteraction tools.UserInteraction // nil = non-interactive, tools proceed without user input

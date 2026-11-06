@@ -398,6 +398,7 @@ func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 		SystemPrompt:  "base",
 		MemoryService: svc,
 		MemoryUserID:  uid,
+		InjectMemory:  true,
 	})
 
 	msgs := []models.Message{{Role: models.RoleHuman, Content: "how do I deploy zephyr?"}}
@@ -414,6 +415,16 @@ func TestBuildSystemPrompt_InjectsProjectMemory(t *testing.T) {
 	bare := New(AgentConfig{SystemPrompt: "base"})
 	if got := bare.buildTurnInjection(ctx, "session-xyz", msgs); strings.Contains(got.Content, "deploy-zephyr script") {
 		t.Fatalf("bare agent (no MemoryService) should not inject memory, but did:\n%s", got.Content)
+	}
+
+	// Default is opt-in: a configured store is not recalled unless InjectMemory is set.
+	off := New(AgentConfig{
+		SystemPrompt:  "base",
+		MemoryService: svc,
+		MemoryUserID:  uid,
+	})
+	if got := off.buildTurnInjection(ctx, "session-xyz", msgs); strings.Contains(got.Content, "deploy-zephyr script") {
+		t.Fatalf("memory injection must stay off unless InjectMemory is set, got:\n%s", got.Content)
 	}
 }
 

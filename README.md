@@ -1,8 +1,8 @@
 # DeepAI
 
-一个基于 Go 的 AI 编码助手，采用 ReAct（Reasoning + Acting）模式，内置多 LLM 提供商支持、子代理（subagent）编排、工具调用、技能（skill）系统、MCP 集成、会话持久化与长期记忆。
+一个基于 Go 的 AI 编码助手，采用 ReAct（Reasoning + Acting）模式，内置多 LLM 提供商支持、子代理（subagent）编排、工具调用、技能（skill）系统、MCP 集成、会话持久化与单会话上下文。
 
-DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对外提供会话能力。它把"大模型 + 工具 + 沙箱 + 记忆"组合成一个可扩展、可插拔的智能体运行时。
+DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对外提供会话能力。它把"大模型 + 工具 + 沙箱 + 会话上下文"组合成一个可扩展、可插拔的智能体运行时。
 
 ---
 
@@ -42,7 +42,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - **Claude 插件兼容**：发现并加载 Claude Code 风格的插件包（skills、agents、commands、MCP servers）。
 - **MCP 集成**：通过 `.mcp.json` 连接任意外部 MCP 服务器（stdio / SSE / HTTP），自动注册为工具。
 - **会话持久化**：SQLite 存储会话历史，支持恢复、续聊、导出、重命名、清理、统计。
-- **长期记忆**：跨会话的用户偏好与事实记忆，LLM 自动抽取，注入系统提示。
+- **会话工作集**：长会话里记住正在改的文件和最近的失败，不靠跨会话记忆。跨会话记忆默认不注入，`memory_inject: true` 才打开。
 - **沙箱隔离**：Landlock → bubblewrap（bwrap）→ direct 三级降级，限制 bash 与文件操作的作用域。
 - **Token 效率**：可选的工具结果老化（T1）、对话压缩（T4）、Phase 0 指标采集，用于优化长会话成本。
 - **交互式 TUI**：基于 bubbletea 的终端界面，语法高亮、Markdown 渲染、斜杠命令、会话选择器。
@@ -61,7 +61,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
                ▼                                     ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    pkg/agent (ReAct 引擎)                     │
-│  系统提示构建 → LLM 调用 → 工具调用 → 上下文压缩 → 记忆注入    │
+│  系统提示构建 → LLM 调用 → 工具调用 → 上下文压缩 → 工作集注入  │
 └──────┬────────────────┬───────────────┬──────────────┬───────┘
        │                │               │              │
        ▼                ▼               ▼              ▼
@@ -597,18 +597,23 @@ DeepAI 是 MCP（Model Context Protocol）客户端，可连接任意外部 MCP 
 
 可选配置 `database_url` 指向 Postgres，用于网关多用户场景。
 
+### 单会话上下文
+
+长 REPL 会话的连贯性来自三件事，都发生在这一次会话里：
+
+- **保留**：最近一轮的工具结果原文不动；mission 章程（`.deepai/missions/`）继续挂在每轮末尾的注入里。
+- **压缩**：上下文变满之后，旧工具结果按工具预算做头尾截断（失败信息通常在尾部），再不够才启发式压缩历史。路径和最近的失败另记在工作集里，不靠被截短的工具原文。
+- **工作集**：`SessionCarry` 上的会话账本记录当前目标、最近碰过的文件、最近几次失败，渲染进每轮末尾的注入。它不进系统提示，所以不破坏前缀缓存；`/clear` 会把它和会话一起丢掉。
+
 ### 长期记忆
 
-DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
+跨会话的用户记忆（偏好、事实、反馈）仍在 `pkg/memory`，SQLite 存储、`/refine`、rollback 都还在。它默认**不**进入热路径：
 
-- **自动抽取**：每轮对话后，LLM 抽取值得记住的事实与偏好。
-- **注入**：相关记忆在下次对话时注入系统提示。
-- **作用域**：支持全局（`UserScope`）与项目级记忆。
-- **偏好调度**：`PreferenceScheduler` 管理偏好的应用与冲突解决。
+- 不自动抽取，不在压缩前同步调用 LLM，也不把事实注入提示词。
+- 配置 `memory_inject: true` 后恢复原来的自动抽取、压缩 flush 和注入。
+- 手动 `/refine` 在开关关闭时照常写入；`/refine status` 会说明这些事实目前不会被回忆进提示词。
 
-记忆与偏好存储复用同一个 SQLite 数据库。
-
-记忆的提取 / 合并 / 回滚链路见 [`docs/REFINE_DESIGN.md`](docs/REFINE_DESIGN.md)。
+设计与取舍见 [`docs/session-context.md`](docs/session-context.md)。提取 / 合并 / 回滚链路见 [`docs/REFINE_DESIGN.md`](docs/REFINE_DESIGN.md)。
 
 ---
 
@@ -750,7 +755,8 @@ go run ./cmd/deepai/help -d ./docs/cmd
 | [`SKILL_DESIGN.md`](docs/SKILL_DESIGN.md) | 技能系统设计 | 已实现 |
 | [`CLAUDE_PLUGIN_COMMANDS_GUIDE.md`](docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md) | Claude 风格 slash 命令的编写与安装 | 使用指南 |
 | [`DOCX_TOOLS_DESIGN.md`](docs/DOCX_TOOLS_DESIGN.md) | `.docx` 读取 / 编辑 / 排版工具层 | 已实现 |
-| [`REFINE_DESIGN.md`](docs/REFINE_DESIGN.md) | 记忆 refine：review gate、`/refine`、rollback | 已实现 |
+| [`session-context.md`](docs/session-context.md) | 单会话工作集；跨会话记忆改为 opt-in | 已实现 |
+| [`REFINE_DESIGN.md`](docs/REFINE_DESIGN.md) | 记忆 refine：review gate、`/refine`、rollback | 已实现（热路径默认关） |
 | [`context-compression-design.md`](docs/context-compression-design.md) | 上下文分层压缩（迟滞阈值、分工具预算、源头防护） | 已实现 |
 | [`PI_HARNESS_ADOPTION_DESIGN.md`](docs/PI_HARNESS_ADOPTION_DESIGN.md) | 吸纳 pi harness 优点的调研与设计 | 草案 |
 | [`AUTONOMOUS_MULTI_AGENT.md`](docs/AUTONOMOUS_MULTI_AGENT.md) | 2026-06 的自治协同评估（§9 编排层已删除，见文首勘误） | 历史 |

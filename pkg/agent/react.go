@@ -144,10 +144,21 @@ type Agent struct {
 	// since a skill load is rare, not a per-request event.
 	turnInjection models.Message
 
-	// Memory integration
-	memoryService   *memory.Service
-	memoryExtractor memory.Extractor
-	memoryUserID    string
+	// Memory integration. injectMemory is the hot-path opt-in
+	// (AgentConfig.InjectMemory): when false, memory is not loaded into the
+	// turn injection and compaction does not block on an extraction.
+	// memoryBlock caches that text for the Run so rebuilding the injection
+	// after a tool result (session brief) does not Load the store again.
+	injectMemory     bool
+	memoryService    *memory.Service
+	memoryExtractor  memory.Extractor
+	memoryUserID     string
+	memoryBlock      string
+	memoryBlockReady bool
+	// ledger is the single-session working set rendered into the turn
+	// injection. When a SessionCarry is set, this pointer is the carry's
+	// ledger, so it survives the per-turn Agent churn and compaction.
+	ledger *sessionLedger
 
 	// Skill tracking for memory source tagging
 	activeSkill atomic.Value // stores string
@@ -288,6 +299,7 @@ func New(cfg AgentConfig) *Agent {
 		compactionKeepTail:  resolveCompactionKeepTail(cfg.CompactionKeepTail),
 		aging:               cfg.Aging,
 		metrics:             cfg.Metrics,
+		injectMemory:        cfg.InjectMemory,
 		memoryService:       cfg.MemoryService,
 		memoryExtractor:     cfg.MemoryExtractor,
 		memoryUserID:        cfg.MemoryUserID,
@@ -305,8 +317,15 @@ func New(cfg AgentConfig) *Agent {
 			cfg.Session.readTracker = tools.NewReadTracker()
 		}
 		a.readTracker = cfg.Session.readTracker
+		if cfg.Session.ledger != nil {
+			a.ledger = cfg.Session.ledger
+		} else {
+			a.ledger = &sessionLedger{}
+			cfg.Session.ledger = a.ledger
+		}
 	} else {
 		a.readTracker = tools.NewReadTracker()
+		a.ledger = &sessionLedger{}
 	}
 
 	// M4-3: prime the compaction anchor/stall bookkeeping from the carried
@@ -546,13 +565,15 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 
 	runMessages := append([]models.Message(nil), messages...)
 
-	// M4-2: compute the per-Run turn injection (date + memory) exactly ONCE,
-	// from the runMessages present at Run start — see buildTurnInjection's
-	// doc comment for the full rationale (prefix stability + the async
-	// memory-extraction cadence making intra-run recomputation pointless).
-	// Every (re)build of the provider view below appends this via
-	// appendTurnInjection instead of BuildSystemPrompt baking volatile
-	// content into the request prefix.
+	// Fold the transcript into the session working set before the first
+	// request, so a resumed or carried session still names the files in play
+	// even after an earlier compaction. The memory half of the injection is
+	// still computed once per active-skill segment (see buildTurnInjection);
+	// later tool results rebuild the injection only to refresh the brief,
+	// and that rebuild reuses the cached memory block.
+	if a.ledger != nil {
+		a.ledger.absorb(runMessages)
+	}
 	a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
 
 	usage := &Usage{}

@@ -1,5 +1,7 @@
 # Refine 功能设计文档
 
+> **2026-11 热路径**：自动提取、压缩前同步 flush、以及把事实注入每轮提示词，默认关闭，由配置 `memory_inject: true` 打开。`/refine` 仍写入同一存储；注入关闭时这些事实不会进入提示词。单会话连贯性改由会话工作集负责，见 [`session-context.md`](session-context.md)。
+
 > 在现有 memory 提取链路（`ExtractUpdate` → `Merge`）之上，增加 auto-refine review gate、手动 `/refine`、rollback、refinement 历史。
 >
 > 参考实现：`prime-agent` 的 `packages/coding-agent/src/core/refinement/refinement.ts`。

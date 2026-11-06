@@ -345,6 +345,7 @@ func TestCompactionTrigger_StalledCompactionFiresOnce(t *testing.T) {
 		ContextWindow:   100,
 		MemoryService:   memSvc,
 		MemoryExtractor: extractor,
+		InjectMemory:    true,
 	})
 
 	_, events := runAndCollectEvents(t, a, "sess-metering-stall", []models.Message{

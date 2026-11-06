@@ -2,6 +2,16 @@ package chat
 
 import "testing"
 
+func TestMemoryHotPathDefaultsOff(t *testing.T) {
+	t.Parallel()
+	if memoryHotPathOn(ReplConfig{MemoryAutoRefine: true}) {
+		t.Fatal("cross-session memory must stay off the hot path unless memory_inject is set")
+	}
+	if !memoryHotPathOn(ReplConfig{MemoryInject: true}) {
+		t.Fatal("memory_inject: true must enable the hot path")
+	}
+}
+
 func TestMemoryScheduleFor(t *testing.T) {
 	t.Parallel()
 

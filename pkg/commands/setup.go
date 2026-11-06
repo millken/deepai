@@ -66,7 +66,16 @@ type Config struct {
 	// MemoryRefineInterval is the turn cadence for the auto-refine gate. 0 (or
 	// absent) means "use the default"; a negative value disables auto-refine.
 	// Always read it through resolveRefineInterval, never directly.
+	// Ignored on the hot path unless MemoryInject is set.
 	MemoryRefineInterval int `yaml:"memory_refine_interval,omitempty"`
+	// MemoryInject turns cross-session memory back on for the hot path:
+	// automatic extraction, preference extraction, the synchronous compaction
+	// flush, and injecting recalled facts into every turn. Default off.
+	// /refine still works without it and writes the same store; the facts
+	// are not placed in the prompt until this is true. Single-session
+	// coherence is the session working set, not this store — see
+	// docs/session-context.md.
+	MemoryInject bool `yaml:"memory_inject,omitempty"`
 
 	// ReviewAfterEdit enables the adversarial post-edit review gate
 	// (docs/ADVERSARIAL_REVIEW_DESIGN.md): after a turn that edited files,

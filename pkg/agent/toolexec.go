@@ -396,6 +396,13 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		b.a.applyTodoResult(b.ctx, b.sessionID, result, b.runMessages)
 	}
 
+	// Note before offload so a large bash result still contributes its
+	// exit code. The brief rides the trailing injection, which is rebuilt
+	// only when the note actually changed something.
+	if b.a.noteSessionTool(call, result) {
+		b.a.turnInjection = b.a.buildTurnInjection(b.ctx, b.sessionID, b.runMessages)
+	}
+
 	addSubagentUsage(b.usage, result)
 	offloaded := b.a.offloadIfNeeded(&result, b.a.offloadDir)
 	b.runMessages = appendToolResultMessage(b.runMessages, b.sessionID, result)
@@ -525,6 +532,9 @@ func (a *Agent) applySkillResult(ctx context.Context, sessionID string, result m
 		}
 	}
 	if activeSourceChanged {
+		// The memory fence depends on the active skill. Drop the cached
+		// block so this rebuild loads it again under the new source.
+		a.memoryBlockReady = false
 		a.turnInjection = a.buildTurnInjection(ctx, sessionID, runMessages)
 	}
 }
@@ -567,14 +577,28 @@ func (a *Agent) applyTodoResult(ctx context.Context, sessionID string, result mo
 // edited-file attribution, because these edits really executed and the
 // review gate must not under-report them. calls[i] pairs with results[i].
 func (b *toolBatchState) appendRemaining(calls []models.ToolCall, results []models.ToolResult) {
+	changed := false
 	for i := range results {
 		addSubagentUsage(b.usage, results[i])
+		if i < len(calls) && b.a.noteSessionTool(calls[i], results[i]) {
+			changed = true
+		}
 		b.a.offloadIfNeeded(&results[i], b.a.offloadDir)
 		if i < len(calls) {
 			b.a.recordEditedFile(calls[i], results[i])
 		}
 		b.runMessages = appendToolResultMessage(b.runMessages, b.sessionID, results[i])
 	}
+	if changed {
+		b.a.turnInjection = b.a.buildTurnInjection(b.ctx, b.sessionID, b.runMessages)
+	}
+}
+
+func (a *Agent) noteSessionTool(call models.ToolCall, result models.ToolResult) bool {
+	if a == nil || a.ledger == nil {
+		return false
+	}
+	return a.ledger.note(call, result, result.Content, false)
 }
 
 // appendSynthesizedRefusals appends synthesized "not executed" placeholder

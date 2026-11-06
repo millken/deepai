@@ -100,6 +100,13 @@ type SessionCarry struct {
 	// leaveMission), under the same single-goroutine contract as every other
 	// field here.
 	missionCharter string
+
+	// ledger is the single-session working set (files in play, recent
+	// failures, latest objective). Shared by pointer with Agent.ledger.
+	// In-memory only: a process restart rebuilds what the surviving
+	// transcript still contains. /clear replaces the whole carry, which
+	// drops the ledger with everything else.
+	ledger *sessionLedger
 }
 
 // NewSessionCarry returns a zero-value SessionCarry, ready to be passed as

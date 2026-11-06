@@ -180,6 +180,7 @@ func TestTurnInjection_PresenceAndPosition(t *testing.T) {
 		Tools:         reg,
 		Model:         "m",
 		MemoryService: svc,
+		InjectMemory:  true,
 	})
 
 	result, err := a.Run(context.Background(), sessionID, []models.Message{
@@ -298,6 +299,7 @@ func TestTurnInjection_OncePerRun(t *testing.T) {
 		Model:         "m",
 		MemoryService: svc,
 		MemoryUserID:  uid,
+		InjectMemory:  true,
 		// ContextWindow left at 0 (disabled) so the compaction trigger (and
 		// its own synchronous memory flush, which also calls storage.Load via
 		// UpdateWith) never fires and confounds the count this test isolates.
@@ -384,6 +386,7 @@ func TestTurnInjection_RecomputesFenceOnSkillLoadMidRun(t *testing.T) {
 		Tools:         reg,
 		Model:         "m",
 		MemoryService: svc,
+		InjectMemory:  true,
 	})
 
 	if _, err := a.Run(context.Background(), sessionID, []models.Message{
