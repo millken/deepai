@@ -570,6 +570,155 @@ func (p *chatOnlyProvider) Stream(context.Context, llm.ChatRequest) (<-chan llm.
 	return nil, fmt.Errorf("stream should not be used for the session summary")
 }
 
+func TestRenderSummaryTranscript_KeepsHumanHeadAndToolTail(t *testing.T) {
+	goal := "GOAL: ship the migration before Friday"
+	tail := "ENDCONSTRAINT: do not touch pkg/legacy"
+	middle := "HUMAN_MIDDLE_TOKEN"
+	human := goal + "\n" + strings.Repeat("a", 4000) + middle + strings.Repeat("b", 8000) + "\n" + tail
+	toolMiddle := "TOOL_MIDDLE_TOKEN"
+	tool := "RAN: go test ./pkg/agent\n" + strings.Repeat("log ", 400) + toolMiddle + strings.Repeat(" log", 2000) + "\nFAIL_TAIL"
+	out := renderSummaryTranscript([]models.Message{
+		{Role: models.RoleHuman, Content: human},
+		{Role: models.RoleTool, Content: tool},
+	})
+	if len(out) > summaryTranscriptCap {
+		t.Fatalf("transcript is %d bytes, cap is %d", len(out), summaryTranscriptCap)
+	}
+	for _, want := range []string{goal, tail, "RAN: go test ./pkg/agent", "FAIL_TAIL"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summarizer input missing %q\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, middle) || strings.Contains(out, toolMiddle) {
+		t.Fatal("summarizer input kept the middle of a long message")
+	}
+}
+
+func TestRenderSummaryTranscript_BudgetKeepsEarlyGoals(t *testing.T) {
+	const n = 40
+	msgs := make([]models.Message, 0, n)
+	for i := 0; i < n; i++ {
+		goal := fmt.Sprintf("GOAL-%02d: keep this opening", i)
+		body := goal + "\n" + strings.Repeat("x", 6000) + "LATE_MIDDLE_TOKEN" + strings.Repeat("y", 6000)
+		msgs = append(msgs, models.Message{Role: models.RoleHuman, Content: body})
+		msgs = append(msgs, models.Message{Role: models.RoleTool, Content: strings.Repeat("dump ", 3000) + "OLD_TOOL_TAIL"})
+	}
+	out := renderSummaryTranscript(msgs)
+	if len(out) > summaryTranscriptCap {
+		t.Fatalf("transcript is %d bytes, cap is %d", len(out), summaryTranscriptCap)
+	}
+	if !strings.Contains(out, "GOAL-00: keep this opening") {
+		t.Fatal("the first dropped turn's goal was cut from the summarizer input")
+	}
+	if !strings.Contains(out, fmt.Sprintf("GOAL-%02d: keep this opening", n-1)) {
+		t.Fatal("the last dropped turn's goal was cut while shrinking heads")
+	}
+	if strings.Contains(out, "LATE_MIDDLE_TOKEN") {
+		t.Fatal("budget shrink kept the middle of a user turn")
+	}
+}
+
+func TestSessionSummary_EchoesEarlyGoal(t *testing.T) {
+	goal := "GOAL: ship the migration before Friday"
+	human := goal + "\n" + strings.Repeat("a", 5000) + "HUMAN_MIDDLE_TOKEN" + strings.Repeat("b", 8000) + "\nENDCONSTRAINT: do not touch pkg/legacy"
+	echo := &echoSummarizer{}
+	a := New(AgentConfig{
+		LLMProvider:   &promptCaptureProvider{},
+		Tools:         tools.NewRegistry(),
+		KeepFullTurns: 1,
+		Summarizer:    echo,
+		Session:       NewSessionCarry(),
+	})
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: human},
+		{Role: models.RoleTool, Content: "RAN: go test ./pkg/agent\n" + strings.Repeat("log ", 800) + "\nFAIL_TAIL"},
+		{Role: models.RoleHuman, Content: "current turn"},
+	}
+	if _, err := a.Run(context.Background(), "s1", msgs); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var text string
+	for {
+		var busy bool
+		text, _, busy = a.summary.snapshot()
+		if strings.Contains(text, goal) && !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("published summary = %q", text)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := echo.transcript()
+	if !strings.Contains(got, goal) || !strings.Contains(got, "FAIL_TAIL") || !strings.Contains(got, "ENDCONSTRAINT") {
+		t.Fatalf("summarizer input = %s", got)
+	}
+	if strings.Contains(got, "HUMAN_MIDDLE_TOKEN") {
+		t.Fatal("summarizer input included the middle of the dropped turn")
+	}
+	if !strings.Contains(text, goal) || !strings.Contains(text, "FAIL_TAIL") {
+		t.Fatalf("echoed summary dropped the goal or the failure tail: %s", text)
+	}
+}
+
+func TestSessionSummary_PanicAbortsFlight(t *testing.T) {
+	a := New(AgentConfig{
+		LLMProvider:   &promptCaptureProvider{},
+		Tools:         tools.NewRegistry(),
+		KeepFullTurns: 1,
+		Summarizer:    panicSummarizer{},
+		Session:       NewSessionCarry(),
+	})
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "turn-1"},
+		{Role: models.RoleHuman, Content: "turn-2"},
+	}
+	if _, err := a.Run(context.Background(), "s1", msgs); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, _, busy := a.summary.snapshot()
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("summary flight stayed set after the background job panicked")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	id, _, ok := a.summary.begin(1)
+	if !ok {
+		t.Fatal("a later summary could not start")
+	}
+	a.summary.abort(id)
+}
+
+type echoSummarizer struct {
+	mu  sync.Mutex
+	got string
+}
+
+func (e *echoSummarizer) Summarize(_ context.Context, _, transcript string) (string, error) {
+	e.mu.Lock()
+	e.got = transcript
+	e.mu.Unlock()
+	return transcript, nil
+}
+
+func (e *echoSummarizer) transcript() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.got
+}
+
+type panicSummarizer struct{}
+
+func (panicSummarizer) Summarize(context.Context, string, string) (string, error) {
+	panic("summary boom")
+}
+
 func joinContents(msgs []models.Message) string {
 	var b strings.Builder
 	for _, m := range msgs {

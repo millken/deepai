@@ -264,6 +264,14 @@ func (a *Agent) maybeStartSessionSummary(ctx context.Context, msgs []models.Mess
 	span := messagesForTurns(msgs, covered, boundary)
 	transcript := renderSummaryTranscript(span)
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if a.logger != nil {
+					a.logger.Error("session summary panicked", "err", fmt.Sprint(rec))
+				}
+				a.summary.abort(id)
+			}
+		}()
 		jobCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSummaryTimeout)
 		defer cancel()
 		text, err := a.summarizer.Summarize(jobCtx, previous, transcript)
@@ -278,38 +286,192 @@ func (a *Agent) maybeStartSessionSummary(ctx context.Context, msgs []models.Mess
 	}()
 }
 
+// Summary-input budgets. The cheap model does not see canonical history
+// verbatim. User turns keep a long head, because goals and constraints are
+// stated there, plus a shorter tail. Tool and assistant messages keep a
+// shorter head and a longer tail, because failures and exit codes land at
+// the end. The whole transcript stays within summaryTranscriptCap. Under
+// pressure the oldest tool bodies go first, then user-turn tails. User-turn
+// heads are kept, and if they still do not fit they are shortened together
+// rather than dropping the earliest turns.
+const (
+	summaryTranscriptCap = 48 * 1024
+	summaryHumanHead     = 2400
+	summaryHumanTail     = 800
+	summaryOtherHead     = 700
+	summaryOtherTail     = 1500
+)
+
 func renderSummaryTranscript(msgs []models.Message) string {
-	const perMessage = 2000
-	const totalCap = 48 * 1024
-	var b strings.Builder
+	items := make([]summaryItem, 0, len(msgs))
 	for _, m := range msgs {
 		content := strings.TrimSpace(m.Content)
 		if content == "" {
 			continue
 		}
-		content = clipTail(content, perMessage)
-		fmt.Fprintf(&b, "%s: %s\n", m.Role, content)
+		items = append(items, summaryItem{role: m.Role, text: content})
 	}
-	out := b.String()
-	if len(out) <= totalCap {
-		return out
-	}
-	out = out[len(out)-totalCap:]
-	for len(out) > 0 && !utf8.RuneStart(out[0]) {
-		out = out[1:]
-	}
-	return "[…earlier transcript truncated…]\n" + out
+	return fitSummaryItems(items, summaryTranscriptCap)
 }
 
-func clipTail(s string, n int) string {
-	if n <= 0 || len(s) <= n {
+type summaryItem struct {
+	role models.Role
+	text string
+}
+
+func fitSummaryItems(items []summaryItem, cap int) string {
+	if cap <= 0 || len(items) == 0 {
+		return ""
+	}
+	heads := make([]int, len(items))
+	tails := make([]int, len(items))
+	for i, it := range items {
+		if it.role == models.RoleHuman {
+			heads[i] = summaryHumanHead
+			tails[i] = summaryHumanTail
+		} else {
+			heads[i] = summaryOtherHead
+			tails[i] = summaryOtherTail
+		}
+	}
+	for {
+		out := renderSummaryItems(items, heads, tails)
+		if len(out) <= cap {
+			return out
+		}
+		if shrinkOldestNonHuman(items, heads, tails) {
+			continue
+		}
+		if zeroOldestHumanTail(items, tails) {
+			continue
+		}
+		fair := fairHumanHead(countHumans(items), cap)
+		if fair <= 0 {
+			return clipPrefix(out, cap)
+		}
+		shrunk := false
+		for i, it := range items {
+			if it.role == models.RoleHuman && heads[i] > fair {
+				heads[i] = fair
+				shrunk = true
+			}
+		}
+		if !shrunk {
+			return clipPrefix(out, cap)
+		}
+	}
+}
+
+func renderSummaryItems(items []summaryItem, heads, tails []int) string {
+	var b strings.Builder
+	for i, it := range items {
+		body := clipHeadTail(it.text, heads[i], tails[i])
+		if body == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "%s: %s\n", it.role, body)
+	}
+	return b.String()
+}
+
+func shrinkOldestNonHuman(items []summaryItem, heads, tails []int) bool {
+	for i, it := range items {
+		if it.role == models.RoleHuman {
+			continue
+		}
+		if heads[i] > 0 {
+			heads[i] = 0
+			return true
+		}
+		if tails[i] > 0 {
+			tails[i] = 0
+			return true
+		}
+	}
+	return false
+}
+
+func zeroOldestHumanTail(items []summaryItem, tails []int) bool {
+	for i, it := range items {
+		if it.role == models.RoleHuman && tails[i] > 0 {
+			tails[i] = 0
+			return true
+		}
+	}
+	return false
+}
+
+func countHumans(items []summaryItem) int {
+	n := 0
+	for _, it := range items {
+		if it.role == models.RoleHuman {
+			n++
+		}
+	}
+	return n
+}
+
+// fairHumanHead is the per-turn head budget that lets every user turn keep
+// its beginning inside cap, including the role label and the omission marker.
+func fairHumanHead(n, cap int) int {
+	if n <= 0 || cap <= 0 {
+		return 0
+	}
+	overhead := len("human: \n[…omitted…]\n")
+	b := (cap / n) - overhead
+	if b < 0 {
+		return 0
+	}
+	return b
+}
+
+func clipHeadTail(s string, headN, tailN int) string {
+	if headN < 0 {
+		headN = 0
+	}
+	if tailN < 0 {
+		tailN = 0
+	}
+	if s == "" || (headN == 0 && tailN == 0) {
+		return ""
+	}
+	if len(s) <= headN+tailN {
 		return s
 	}
-	tail := s[len(s)-n:]
-	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
-		tail = tail[1:]
+	head := clipPrefix(s, headN)
+	tail := clipSuffix(s, tailN)
+	switch {
+	case head == "":
+		return "[…omitted…]\n" + tail
+	case tail == "":
+		return head + "\n[…omitted…]"
+	default:
+		return head + "\n[…omitted…]\n" + tail
 	}
-	return "[…truncated…] " + tail
+}
+
+func clipPrefix(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		if n <= 0 {
+			return ""
+		}
+		return s
+	}
+	return truncateRuneSafe(s, n)
+}
+
+func clipSuffix(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		if n <= 0 {
+			return ""
+		}
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
 }
 
 type llmSessionSummarizer struct {
