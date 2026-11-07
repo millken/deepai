@@ -574,15 +574,20 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	summary.EndedAt = time.Now().UTC()
 	t.summary = summary
 
+	// turn_end goes out while s.turn is still t: a Send racing Done() must
+	// not get its turn_start onto either bus ahead of this turn's end.
+	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
 	s.mu.Lock()
+	s.bus.publish(endEvt)
+	m.global.publish(endEvt)
 	s.turn = nil
 	s.mu.Unlock()
 	close(t.done)
-
-	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
-	s.bus.publish(endEvt)
-	m.global.publish(endEvt)
+	afterTurnDone()
 }
+
+// afterTurnDone is a test hook run once a turn's Done() has fired.
+var afterTurnDone = func() {}
 
 // holdLock keeps the session lock (acquired in Send) fresh until the
 // returned func releases it.
