@@ -168,7 +168,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
-	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "auth", token != "", "web", !f.noWeb)
+	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "db", rt.DB, "auth", token != "", "web", !f.noWeb)
 	if !f.noWeb {
 		url := "http://" + displayAddr(addr) + "/"
 		if token != "" {

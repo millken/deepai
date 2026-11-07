@@ -23,12 +23,12 @@
  │ pkg/bot.Manager（会话与任务编排，传输无关）         │
  │  会话加载/创建/删除 · 每会话单 turn · 取消          │
  │  事件总线(带 seq + 回放缓冲) · ask_clarification 路由│
- │  会话锁(与 CLI 互斥) · 空闲卸载                     │
+ │  会话锁(多 bot 进程互斥) · 空闲卸载                 │
  └──────────┬────────────────────────────┬───────────┘
             │ Runtime / Conversation      │ Store
             ▼                             ▼
  ┌──────────────────────────┐  ┌──────────────────────────┐
- │ pkg/bot.AgentRuntime      │  │ SQLite 会话库 (与 CLI 共享) │
+ │ pkg/bot.AgentRuntime      │  │ SQLite ~/.deepai/bot/bot.db │
  │  pkg/agent ReAct 引擎      │  │ 或 MemoryStore(--ephemeral)│
  │  工具/技能/插件/MCP/记忆   │  └──────────────────────────┘
  │  每会话沙箱 + SessionCarry │
@@ -51,7 +51,7 @@
 
 ## 2. 核心概念
 
-- **Session（会话）**：一段对话。复用 CLI 的会话表（`source = 'bot'`），因此 `deepai session list` 能看到 bot 会话，`deepai -r <id>` 能在终端里接着聊，反之亦然。
+- **Session（会话）**：一段对话，持久化在 bot 专用库 `~/.deepai/bot/bot.db`。与 CLI 的会话库分开：`deepai session list` 看不到 bot 会话，`deepai -r` 也不能续聊它们，反之亦然。
 - **Turn（轮次）**：一次"用户消息 → agent 完成"。**每个会话同时只跑一个 turn**；并发发送返回 `409 busy`。turn 属于 bot 而不是请求：客户端断开不会取消它。
 - **Event（事件）**：turn 期间发生的一切，统一信封，带会话内单调递增的 `seq`。
 - **Question（提问）**：agent 调 `ask_clarification` 时，turn 挂起并广播 `question` 事件，任一客户端回答即恢复。未回答的问题出现在 `SessionInfo.pending`，晚连上的客户端也能看到。
@@ -189,13 +189,21 @@ bot 能执行 bash、改文件，等同于把一个 shell 暴露出去，所以�
 
 ---
 
-## 5. 与 CLI 共存
+## 5. 存储与 CLI 的关系
 
-- **共享 SQLite**（`~/.deepai/deepai.db`）：DSN 与 REPL 完全一致（WAL、`busy_timeout`、`_txlock=immediate`）。
-- **会话锁**：turn 运行期间 bot 持有该会话的单写者锁（每 20s 心跳，远小于 60s 失效阈值），结束即释放。CLI 正在使用的会话，bot 发送会得到 `409 session_locked`；bot 正在跑的会话，CLI `-r` 会看到被锁，可用 `--fork` 分叉。
-- **工作目录**：一个 bot 进程服务一个工作目录（`--workdir`，默认启动目录），与 REPL "一个进程一个项目"的模型一致；记忆的 user scope 也按工作目录划分。多项目就起多个 bot（不同端口）。
-- **会话按工作目录隔离**：会话库是全机共享的，bot 只列出、只打开 `cwd` 等于自己 `--workdir` 的会话（同目录下的 CLI 会话也在内，可以在控制台里接着聊）。其它目录的会话 id 一律按不存在处理（`404 not_found`），以免在错误的目录里执行工具。没有记录 `cwd` 的旧会话不在任何 bot 的范围内，仍可用 CLI 打开。
+| 与 CLI 共享 | 与 CLI 分开 |
+|---|---|
+| `~/.deepai/config.yaml`、`~/.deepai/.env`（模型与凭证） | 会话与 transcript：CLI 在 `~/.deepai/deepai.db`，bot 在 `~/.deepai/bot/bot.db` |
+| 工作目录上的 `DEEPAI.md`、技能、插件、`.mcp.json` 发现 | 长期记忆：bot 存在 `bot.db`，scope 为 `bot:default`，与 CLI 按工作目录划分的记忆没有共享行 |
+| | 会话锁：只在 bot 进程之间生效，与 CLI 无关 |
+
+- **独立 SQLite**：`~/.deepai/bot/bot.db`，DSN 习惯与 REPL 相同（WAL、`foreign_keys`、`busy_timeout`、`_txlock=immediate`），表结构与 CLI 会话库同形，长期记忆表也建在这里。bot 进程从不打开 `deepai.db`。
+- **工作目录**：一个 bot 进程服务一个工作目录（`--workdir`，默认启动目录），工具在该目录执行。多项目就起多个 bot（不同端口），它们共用同一个 `bot.db`。
+- **会话按工作目录隔离**：bot 只列出、只打开 `cwd` 等于自己 `--workdir` 的会话。其它目录的 bot 进程创建的会话 id 一律按不存在处理（`404 not_found`），以免在错误的目录里执行工具。
+- **会话锁**：turn 运行期间 bot 持有该会话的单写者锁（每 20s 心跳，远小于 60s 失效阈值），结束即释放，防止两个 bot 进程同时写同一会话。
 - **每会话沙箱**：`~/.deepai/bot/sandbox/session-*`，会话卸载或删除时清理。
+
+多 Bot（同进程多个人格，`bots` 表与 `sessions.bot_id` 同样在 `bot.db` 中）见 [BOT_MULTI_DESIGN.md](BOT_MULTI_DESIGN.md)。
 
 ---
 
@@ -227,7 +235,7 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 慢订阅者直接断开 + `gap` | 发布端永不阻塞，一个卡住的客户端不会拖慢 agent |
 | 工具完整结果不进事件流 | 大文件读取会淹没所有客户端；`result_preview` 足够渲染，完整内容在 transcript |
 | WebSocket 用 `golang.org/x/net/websocket` | 已是直接依赖，不新增模块；传输层隔离在 `ws.go`，需要时可换 `coder/websocket` |
-| 复用 CLI 会话库而非独立存储 | 终端和 bot 无缝互通；锁机制已经存在 |
+| 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat` |
 | 内嵌单文件控制台 | 开箱可用，也是协议的活文档；正式 GUI/App 可独立开发 |
 
 ---

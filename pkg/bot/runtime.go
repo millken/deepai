@@ -56,13 +56,13 @@ type TurnOutput struct {
 	LLMTurns    int
 }
 
-// Store persists sessions. The CLI's SQLite store (chat.SQLiteSessionStore)
-// satisfies it, so bot sessions show up in `deepai session list` and can be
-// resumed with `deepai -r <id>`, and vice versa.
+// Store persists sessions. In production it is chat.SQLiteSessionStore over
+// the bot's own database (~/.deepai/bot/bot.db); the CLI's deepai.db is never
+// opened, so bot and CLI sessions, memory and locks are fully separate.
 //
-// The store is shared by every project on the machine, while a bot serves
-// one working directory: the Manager only lists and opens sessions created
-// in its WorkDir, through ListRecentInDir and InDir.
+// bot.db is one file per user, shared by every deepai-bot process, while a
+// bot serves one working directory: the Manager only lists and opens
+// sessions created in its WorkDir, through ListRecentInDir and InDir.
 type Store interface {
 	Create(opts models.CreateOpts) (*models.Session, error)
 	Load(id string) (*models.Session, error)
@@ -78,8 +78,8 @@ type Store interface {
 }
 
 // Locker is the optional single-writer lock a Store may offer; the SQLite
-// store does. While a turn runs the Manager holds the session's lock so a
-// CLI process resuming the same session cannot interleave writes.
+// store does. While a turn runs the Manager holds the session's lock so
+// another deepai-bot process on the same bot.db cannot interleave writes.
 type Locker interface {
 	AcquireSessionLock(sessionID string, owner models.LockOwner, force bool) error
 	RefreshSessionLock(sessionID string, owner models.LockOwner) error

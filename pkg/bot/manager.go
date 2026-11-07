@@ -25,8 +25,7 @@ var (
 	ErrClosed          = errors.New("bot is shutting down")
 )
 
-// SessionSource is the `source` column bot-created sessions get in the
-// shared SQLite store, next to the CLI's "cli".
+// SessionSource is the `source` column bot-created sessions get in bot.db.
 const SessionSource = "bot"
 
 // lockRefreshInterval keeps a turn's session lock well inside the store's

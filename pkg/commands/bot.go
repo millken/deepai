@@ -29,27 +29,36 @@ type BotOptions struct {
 	Model string
 	// MaxToolCalls caps executed tool calls per turn (0 = unlimited).
 	MaxToolCalls int
-	// Ephemeral keeps sessions in memory instead of the shared SQLite
-	// database, and disables long-term memory.
+	// Ephemeral keeps sessions in memory instead of bot.db, and disables
+	// long-term memory.
 	Ephemeral bool
 }
 
 // BotRuntime is the agent side of deepai-bot, configured from
 // ~/.deepai/config.yaml exactly like the interactive REPL: same models,
-// tools, skills, plugins, MCP servers, DEEPAI.md instructions, memory and
-// session database.
+// tools, skills, plugins, MCP servers and DEEPAI.md instructions. Sessions
+// and memory live in BotDB, not in the CLI's database.
 type BotRuntime struct {
 	Runtime *bot.AgentRuntime
 	Store   bot.Store
 	WorkDir string
+	// DB is the database path, empty when ephemeral.
+	DB string
 	// Close releases MCP servers and the database. Call it after the
 	// bot.Manager has been closed.
 	Close func()
 }
 
-// BotHome is the directory deepai-bot keeps its pid file, log and token in.
+// BotHome is the directory deepai-bot keeps its database, pid file, log and
+// token in.
 func BotHome() string {
 	return filepath.Join(Home(), "bot")
+}
+
+// BotDB is deepai-bot's own SQLite database (sessions and long-term memory).
+// It is separate from the CLI's DBFile.
+func BotDB() string {
+	return filepath.Join(BotHome(), "bot.db")
 }
 
 // LoadEnvFile loads ~/.deepai/.env so providers can read API keys, as the
@@ -203,15 +212,20 @@ func NewBotRuntime(ctx context.Context, opts BotOptions) (_ *BotRuntime, err err
 	}
 
 	var store bot.Store
+	var dbPath string
 	if opts.Ephemeral {
 		store = bot.NewMemoryStore()
 	} else {
 		if err := EnsureHome(); err != nil {
 			return nil, err
 		}
-		// Same DSN as runChat: the bot and CLI processes share this file,
-		// so _txlock=immediate and busy_timeout matter even more here.
-		dsn := DBFile() + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
+		if err := os.MkdirAll(BotHome(), 0o700); err != nil {
+			return nil, err
+		}
+		// Every deepai-bot process (one per workdir) shares bot.db, so
+		// _txlock=immediate and busy_timeout matter as they do for the CLI.
+		dbPath = BotDB()
+		dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("open database: %w", err)
@@ -237,5 +251,5 @@ func NewBotRuntime(ctx context.Context, opts BotOptions) (_ *BotRuntime, err err
 	if err != nil {
 		return nil, err
 	}
-	return &BotRuntime{Runtime: rt, Store: store, WorkDir: workDir, Close: closeAll}, nil
+	return &BotRuntime{Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, Close: closeAll}, nil
 }
