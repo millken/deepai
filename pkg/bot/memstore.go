@@ -17,11 +17,16 @@ type MemoryStore struct {
 	mu       sync.Mutex
 	sessions map[string]*models.Session
 	messages map[string][]models.Message
+	cwd      map[string]string
 }
 
 // NewMemoryStore returns an empty MemoryStore.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{sessions: map[string]*models.Session{}, messages: map[string][]models.Message{}}
+	return &MemoryStore{
+		sessions: map[string]*models.Session{},
+		messages: map[string][]models.Message{},
+		cwd:      map[string]string{},
+	}
 }
 
 func (s *MemoryStore) Create(opts models.CreateOpts) (*models.Session, error) {
@@ -42,6 +47,7 @@ func (s *MemoryStore) Create(opts models.CreateOpts) (*models.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[sess.ID] = sess
+	s.cwd[sess.ID] = opts.CWD
 	cp := *sess
 	return &cp, nil
 }
@@ -75,13 +81,16 @@ func (s *MemoryStore) AppendMessage(sessionID string, msg models.Message) error 
 	return nil
 }
 
-func (s *MemoryStore) ListRecent(limit int) ([]models.SessionMeta, error) {
+func (s *MemoryStore) ListRecentInDir(cwd string, limit int) ([]models.SessionMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]models.SessionMeta, 0, len(s.sessions))
 	for id, sess := range s.sessions {
+		if cwd != "" && s.cwd[id] != cwd {
+			continue
+		}
 		out = append(out, models.SessionMeta{
-			ID: id, Title: sess.Title, MsgCount: len(s.messages[id]),
+			ID: id, Title: sess.Title, CWD: s.cwd[id], MsgCount: len(s.messages[id]),
 			CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt,
 		})
 	}
@@ -90,6 +99,15 @@ func (s *MemoryStore) ListRecent(limit int) ([]models.SessionMeta, error) {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) InDir(id, cwd string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[id]; !ok {
+		return false, fmt.Errorf("session %s not found", id)
+	}
+	return s.cwd[id] != "" && s.cwd[id] == cwd, nil
 }
 
 func (s *MemoryStore) Rename(id, title string) error {

@@ -46,7 +46,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - **沙箱隔离**：Landlock → bubblewrap（bwrap）→ direct 三级降级，限制 bash 与文件操作的作用域。
 - **Token 效率**：可选的工具结果老化（T1）、对话压缩（T4）、Phase 0 指标采集，用于优化长会话成本。
 - **交互式 TUI**：基于 bubbletea 的终端界面，语法高亮、Markdown 渲染、斜杠命令、会话选择器。
-- **常驻 Bot 服务**：`deepai-bot` 把 agent 作为后台服务运行，以 REST / SSE / NDJSON / WebSocket 提供会话、流式事件、断线续传、远程回答提问与打断，内置 Web 控制台；与 CLI 共享配置和会话库（见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)）。
+- **常驻 Bot 服务**：`deepai-bot` 把 agent 作为后台服务运行，以 REST / SSE / NDJSON / WebSocket 提供会话、流式事件、断线续传、远程回答提问与打断，内置 Web 控制台；与 CLI 共享配置与技能，会话和记忆存放在独立的 `~/.deepai/bot/bot.db`（见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)）。
 
 ---
 
@@ -663,7 +663,7 @@ make build-bot
 ./bin/deepai-bot stop
 ```
 
-任务属于 bot 而非请求：客户端断开不会中断任务，重连后按 `seq` 续传事件；`ask_clarification` 会推送给客户端回答。bot 会话写入与 CLI 相同的会话库，`deepai -r <id>` 可在终端接着聊。用法见 [`cmd/deepai-bot/README.md`](cmd/deepai-bot/README.md)，协议与设计见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)。
+任务属于 bot 而非请求：客户端断开不会中断任务，重连后按 `seq` 续传事件；`ask_clarification` 会推送给客户端回答。bot 的会话和长期记忆存放在独立的 `~/.deepai/bot/bot.db`，与 CLI 的会话库互不相通。用法见 [`cmd/deepai-bot/README.md`](cmd/deepai-bot/README.md)，协议与设计见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)。
 
 ---
 

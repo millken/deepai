@@ -23,12 +23,12 @@
  │ pkg/bot.Manager（会话与任务编排，传输无关）         │
  │  会话加载/创建/删除 · 每会话单 turn · 取消          │
  │  事件总线(带 seq + 回放缓冲) · ask_clarification 路由│
- │  会话锁(多客户端互斥) · 空闲卸载                    │
+ │  会话锁(多 bot 进程互斥) · 空闲卸载                 │
  └──────────┬────────────────────────────┬───────────┘
             │ Runtime / Conversation      │ Store
             ▼                             ▼
  ┌──────────────────────────┐  ┌──────────────────────────┐
- │ pkg/bot.AgentRuntime      │  │ SQLite 会话库 (~/.deepai/bot/bot.db) │
+ │ pkg/bot.AgentRuntime      │  │ SQLite ~/.deepai/bot/bot.db │
  │  pkg/agent ReAct 引擎      │  │ 或 MemoryStore(--ephemeral)│
  │  工具/技能/插件/MCP/记忆   │  └──────────────────────────┘
  │  每会话沙箱 + SessionCarry │
@@ -38,7 +38,7 @@
 | 层 | 位置 | 职责 |
 |----|------|------|
 | 入口 | `cmd/deepai-bot` | 参数、token、守护进程（`start/stop/status`）、优雅退出 |
-| 装配 | `pkg/commands/bot.go` | 从 `~/.deepai/config.yaml` 构建运行时，**与 REPL 同源**：模型注册表、工具、技能、Claude 插件、MCP、`DEEPAI.md`、记忆、SQLite |
+| 装配 | `cmd/deepai-bot/runtime.go` | 从 `~/.deepai/config.yaml` 构建运行时，**与 REPL 同源**：模型注册表、工具、技能、Claude 插件、MCP、`DEEPAI.md`；会话与记忆在独立的 `bot.db`。`pkg/commands` 不为 bot 改动，所需的少量内部逻辑在此镜像 |
 | 编排 | `pkg/bot/manager.go` | 会话生命周期、turn 执行、持久化、会话锁、提问路由 |
 | 事件 | `pkg/bot/bus.go` | 每会话一条事件总线 + 一条全局生命周期总线 |
 | 运行时 | `pkg/bot/agentruntime.go` | `pkg/agent` 适配：每 turn 新建 `agent.Agent`，事件翻译 |
@@ -51,7 +51,7 @@
 
 ## 2. 核心概念
 
-- **Session（会话）**：一段对话，持久化在 bot 专用库。v1 单 Bot 阶段若实现仍与 CLI 共用 `deepai.db`，见下文 §5；**多 Bot 路线**（[`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)）改为独立 `bot.db`，与 CLI 会话互不列举、不可 `deepai -r` 续聊。
+- **Session（会话）**：一段对话，持久化在 bot 专用库 `~/.deepai/bot/bot.db`。与 CLI 的会话库分开：`deepai session list` 看不到 bot 会话，`deepai -r` 也不能续聊它们，反之亦然。同进程多 Bot（`bot_id`）见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
 - **Turn（轮次）**：一次"用户消息 → agent 完成"。**每个会话同时只跑一个 turn**；并发发送返回 `409 busy`。turn 属于 bot 而不是请求：客户端断开不会取消它。
 - **Event（事件）**：turn 期间发生的一切，统一信封，带会话内单调递增的 `seq`。
 - **Question（提问）**：agent 调 `ask_clarification` 时，turn 挂起并广播 `question` 事件，任一客户端回答即恢复。未回答的问题出现在 `SessionInfo.pending`，晚连上的客户端也能看到。
@@ -111,7 +111,7 @@ turn 的结束状态：`cancelled` 是客户端调用 cancel 或 bot 关闭；`t
 |------|------|------|
 | GET | `/healthz` | 存活探针 |
 | GET | `/v1/info` | 版本、工作目录、模型列表、默认模型 |
-| GET | `/v1/sessions?limit=50` | 会话列表（合并内存中的运行状态） |
+| GET | `/v1/sessions?limit=50` | 本工作目录的会话列表（合并内存中的运行状态），见 §5 |
 | POST | `/v1/sessions` | 创建 `{"title"?, "model"?}` |
 | GET | `/v1/sessions/{id}` | `{session, messages}`：状态 + 完整 transcript |
 | PATCH | `/v1/sessions/{id}` | 改名 `{"title"}` |
@@ -189,14 +189,21 @@ bot 能执行 bash、改文件，等同于把一个 shell 暴露出去，所以�
 
 ---
 
-## 5. 与 CLI 共存
+## 5. 存储与 CLI 的关系
 
-> **多 Bot 设计修订**：[`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) 规定 bot 使用独立 `~/.deepai/bot/bot.db`，与 CLI **不共享**会话/记忆/锁；仍共享 `config.yaml`、`.env` 与 workdir 上的技能/MCP 发现。落地多 Bot 时实现应跟随该文档；本节下列条目描述 **#40 当前单 Bot 实现意图**，供对照迁移。
+| 与 CLI 共享 | 与 CLI 分开 |
+|---|---|
+| `~/.deepai/config.yaml`、`~/.deepai/.env`（模型与凭证） | 会话与 transcript：CLI 在 `~/.deepai/deepai.db`，bot 在 `~/.deepai/bot/bot.db` |
+| 工作目录上的 `DEEPAI.md`、技能、插件、`.mcp.json` 发现 | 长期记忆：bot 存在 `bot.db`，scope 为 `bot:default`，与 CLI 按工作目录划分的记忆没有共享行 |
+| | 会话锁：只在 bot 进程之间生效，与 CLI 无关 |
 
-- **SQLite（#40 实现）**：与 REPL 共用 `~/.deepai/deepai.db`（WAL、`busy_timeout`、`_txlock=immediate`）。**多 Bot 目标库**：`~/.deepai/bot/bot.db`（仅 bot 会话与 bot 记忆）。
-- **会话锁（#40）**：turn 期间 bot 在共享库上对会话加锁，与 CLI 互斥。**多 Bot**：锁仅在 `bot.db` 内、多 HTTP/WS 客户端之间生效，与 CLI 无关。
-- **工作目录**：一个 bot 进程一个 `--workdir`；CLI 与 bot 可在同一目录各跑各的会话。多项目仍多进程（不同端口）。
+- **独立 SQLite**：`~/.deepai/bot/bot.db`，DSN 习惯与 REPL 相同（WAL、`foreign_keys`、`busy_timeout`、`_txlock=immediate`），表结构与 CLI 会话库同形，长期记忆表也建在这里。bot 进程从不打开 `deepai.db`。
+- **工作目录**：一个 bot 进程服务一个工作目录（`--workdir`，默认启动目录），工具在该目录执行。多项目就起多个 bot（不同端口），它们共用同一个 `bot.db`。
+- **会话按工作目录隔离**：bot 只列出、只打开 `cwd` 等于自己 `--workdir` 的会话。其它目录的 bot 进程创建的会话 id 一律按不存在处理（`404 not_found`），以免在错误的目录里执行工具。
+- **会话锁**：turn 运行期间 bot 持有该会话的单写者锁（每 20s 心跳，远小于 60s 失效阈值），结束即释放，防止两个 bot 进程同时写同一会话。
 - **每会话沙箱**：`~/.deepai/bot/sandbox/session-*`，会话卸载或删除时清理。
+
+多 Bot（同进程多个人格，`bots` 表与 `sessions.bot_id` 同样在 `bot.db` 中）见 [BOT_MULTI_DESIGN.md](BOT_MULTI_DESIGN.md)。
 
 ---
 
@@ -228,7 +235,7 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 慢订阅者直接断开 + `gap` | 发布端永不阻塞，一个卡住的客户端不会拖慢 agent |
 | 工具完整结果不进事件流 | 大文件读取会淹没所有客户端；`result_preview` 足够渲染，完整内容在 transcript |
 | WebSocket 用 `golang.org/x/net/websocket` | 已是直接依赖，不新增模块；传输层隔离在 `ws.go`，需要时可换 `coder/websocket` |
-| #40：复用 CLI 会话库 | 早期单 Bot 便于互通；**多 Bot 见 BOT_MULTI_DESIGN：独立 bot.db** |
+| 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat`；多 `bot_id` 见 BOT_MULTI_DESIGN |
 | 内嵌单文件控制台 | 开箱可用，也是协议的活文档；正式 GUI/App 可独立开发 |
 
 ---

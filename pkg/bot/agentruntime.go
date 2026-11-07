@@ -24,9 +24,14 @@ import (
 // ignore ctx. A var so tests can shorten it.
 var orphanWait = 10 * time.Second
 
+// DefaultMemoryUserID scopes the bot's long-term memory. It lives in bot.db
+// and never shares rows with the CLI's workdir-keyed memory; with multiple
+// bots each gets "bot:<id>" (docs/BOT_MULTI_DESIGN.md).
+const DefaultMemoryUserID = "bot:default"
+
 // AgentRuntimeConfig is everything the production Runtime needs. The
 // deepai-bot command fills it from ~/.deepai/config.yaml the same way the
-// interactive REPL is configured (pkg/commands/bot.go).
+// interactive REPL is configured (cmd/deepai-bot/runtime.go).
 type AgentRuntimeConfig struct {
 	Models *llm.ModelRegistry
 	Tools  *tools.Registry
@@ -45,7 +50,10 @@ type AgentRuntimeConfig struct {
 
 	MemoryService   *memory.Service
 	MemoryExtractor memory.Extractor
-	AgentCatalog    []agent.AgentInfo
+	// MemoryUserID is the long-term memory scope; empty = DefaultMemoryUserID.
+	MemoryUserID string
+
+	AgentCatalog []agent.AgentInfo
 
 	KeepFullTurns          int
 	SessionSummaryDisabled bool
@@ -69,6 +77,9 @@ func NewAgentRuntime(cfg AgentRuntimeConfig) (*AgentRuntime, error) {
 	}
 	if cfg.Tools == nil {
 		cfg.Tools = tools.NewRegistry()
+	}
+	if strings.TrimSpace(cfg.MemoryUserID) == "" {
+		cfg.MemoryUserID = DefaultMemoryUserID
 	}
 	if strings.TrimSpace(cfg.SandboxBaseDir) == "" {
 		cfg.SandboxBaseDir = filepath.Join(os.TempDir(), "deepai-bot-sandbox")
@@ -152,7 +163,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		WorkDir:         cfg.WorkDir,
 		MemoryService:   cfg.MemoryService,
 		MemoryExtractor: cfg.MemoryExtractor,
-		MemoryUserID:    cfg.WorkDir,
+		MemoryUserID:    cfg.MemoryUserID,
 		ImageDetail:     "low",
 		AgentCatalog:    cfg.AgentCatalog,
 		Session:         carry,

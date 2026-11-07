@@ -25,8 +25,7 @@ var (
 	ErrClosed          = errors.New("bot is shutting down")
 )
 
-// SessionSource is the `source` column bot-created sessions get in the
-// shared SQLite store, next to the CLI's "cli".
+// SessionSource is the `source` column bot-created sessions get in bot.db.
 const SessionSource = "bot"
 
 // lockRefreshInterval keeps a turn's session lock well inside the store's
@@ -37,7 +36,9 @@ const lockRefreshInterval = 20 * time.Second
 type Options struct {
 	Runtime Runtime
 	Store   Store
-	// WorkDir is recorded on created sessions (the store's cwd column).
+	// WorkDir is recorded on created sessions (the store's cwd column) and
+	// scopes the Manager to them: sessions from other directories are
+	// neither listed nor opened (ErrNotFound). Empty disables scoping.
 	WorkDir string
 	// ReplayEvents bounds each session's replay buffer (default
 	// DefaultReplayEvents).
@@ -196,7 +197,7 @@ func (m *Manager) ListSessions(limit int) ([]SessionInfo, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	metas, err := m.opts.Store.ListRecent(limit)
+	metas, err := m.opts.Store.ListRecentInDir(m.opts.WorkDir, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -573,15 +574,20 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	summary.EndedAt = time.Now().UTC()
 	t.summary = summary
 
+	// turn_end goes out while s.turn is still t: a Send racing Done() must
+	// not get its turn_start onto either bus ahead of this turn's end.
+	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
 	s.mu.Lock()
+	s.bus.publish(endEvt)
+	m.global.publish(endEvt)
 	s.turn = nil
 	s.mu.Unlock()
 	close(t.done)
-
-	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
-	s.bus.publish(endEvt)
-	m.global.publish(endEvt)
+	afterTurnDone()
 }
+
+// afterTurnDone is a test hook run once a turn's Done() has fired.
+var afterTurnDone = func() {}
 
 // holdLock keeps the session lock (acquired in Send) fresh until the
 // returned func releases it.
@@ -643,6 +649,18 @@ func (m *Manager) load(id string) (*session, error) {
 	}
 	if s := m.sessions[id]; s != nil {
 		return s, nil
+	}
+	if m.opts.WorkDir != "" {
+		ok, err := m.opts.Store.InDir(id, m.opts.WorkDir)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrNotFound
+		}
 	}
 	rec, err := m.opts.Store.Load(id)
 	if err != nil {

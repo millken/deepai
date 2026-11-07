@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/bot"
-	"github.com/millken/deepai/pkg/commands"
 	"github.com/millken/deepai/pkg/logs"
 	"github.com/spf13/cobra"
 )
@@ -71,7 +70,7 @@ func newRootCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the build version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(commands.BuildVersion())
+			fmt.Println(buildVersion())
 		},
 	})
 	root.CompletionOptions.HiddenDefaultCmd = true
@@ -102,7 +101,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	if cleanup, err := logs.Setup(logs.Config{Level: level, StderrLevel: level}); err == nil {
 		defer cleanup()
 	}
-	commands.LoadEnvFile()
+	loadEnvFile()
 
 	token, err := resolveToken(f)
 	if err != nil {
@@ -122,7 +121,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	// stay up until the last turn has been cancelled and persisted.
 	rtCtx, stopRuntime := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopRuntime()
-	rt, err := commands.NewBotRuntime(rtCtx, commands.BotOptions{
+	rt, err := newBotRuntime(rtCtx, botOptions{
 		WorkDir:      f.workDir,
 		Model:        f.model,
 		MaxToolCalls: f.maxToolCalls,
@@ -160,7 +159,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	}
 
 	addr := ln.Addr().String()
-	if err := writeState(daemonState{PID: os.Getpid(), Addr: addr, StartedAt: time.Now().UTC(), Version: commands.BuildVersion(), WorkDir: rt.WorkDir}); err != nil {
+	if err := writeState(daemonState{PID: os.Getpid(), Addr: addr, StartedAt: time.Now().UTC(), Version: buildVersion(), WorkDir: rt.WorkDir}); err != nil {
 		slog.Warn("write state file", "err", err)
 	}
 	defer removeState(os.Getpid())
@@ -168,7 +167,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
-	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "auth", token != "", "web", !f.noWeb)
+	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "db", rt.DB, "auth", token != "", "web", !f.noWeb)
 	if !f.noWeb {
 		url := "http://" + displayAddr(addr) + "/"
 		if token != "" {
@@ -220,7 +219,7 @@ func resolveToken(f serveFlags) (string, error) {
 	return loadOrCreateToken(false)
 }
 
-func tokenFile() string { return filepath.Join(commands.BotHome(), "token") }
+func tokenFile() string { return filepath.Join(botHome(), "token") }
 
 func loadOrCreateToken(rotate bool) (string, error) {
 	if !rotate {
@@ -235,7 +234,7 @@ func loadOrCreateToken(rotate bool) (string, error) {
 		return "", err
 	}
 	t := hex.EncodeToString(buf)
-	if err := os.MkdirAll(commands.BotHome(), 0o700); err != nil {
+	if err := os.MkdirAll(botHome(), 0o700); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(tokenFile(), []byte(t+"\n"), 0o600); err != nil {

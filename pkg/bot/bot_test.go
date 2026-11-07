@@ -326,6 +326,54 @@ func TestBusLagAndGap(t *testing.T) {
 	}
 }
 
+func TestManagerScopedToWorkDir(t *testing.T) {
+	store := NewMemoryStore()
+	newM := func(dir string) *Manager {
+		m, err := NewManager(Options{Runtime: &fakeRuntime{}, Store: store, WorkDir: dir, IdleTimeout: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = m.Close(context.Background()) })
+		return m
+	}
+	a, b := newM("/proj/a"), newM("/proj/b")
+
+	mine, _ := a.CreateSession(CreateSessionRequest{Title: "a"})
+	theirs, _ := b.CreateSession(CreateSessionRequest{Title: "b"})
+	cli, err := store.Create(models.CreateOpts{CWD: "/proj/a", Source: "cli"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := a.ListSessions(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, s := range list {
+		ids[s.ID] = true
+	}
+	if len(list) != 2 || !ids[mine.ID] || !ids[cli.ID] {
+		t.Fatalf("list = %+v, want only this workdir's sessions (%s, %s)", list, mine.ID, cli.ID)
+	}
+
+	if _, _, err := a.GetSession(cli.ID); err != nil {
+		t.Fatalf("CLI session in the same workdir: %v", err)
+	}
+	if _, _, err := a.GetSession(theirs.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if _, err := a.Send(theirs.ID, SendRequest{Content: "hi"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("send to other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if err := a.DeleteSession(theirs.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := b.GetSession(theirs.ID); err != nil {
+		t.Fatalf("owner lost its session: %v", err)
+	}
+}
+
 func TestManagerDropsEventsAfterTurnEnd(t *testing.T) {
 	m, _, rt := newTestManager(t)
 	rt.release = make(chan struct{})
@@ -751,4 +799,66 @@ func TestTranslateAgentEvent(t *testing.T) {
 	if !ok || e.Error == nil || e.Error.Message != "x" {
 		t.Fatalf("error = %+v", e)
 	}
+}
+
+// turn_end must be the last event of its turn even when the next Send
+// lands the instant Turn.Done() fires.
+func TestManagerTurnEndPrecedesNextTurn(t *testing.T) {
+	// Registered before newTestManager so it runs after m.Close has
+	// waited for every turn goroutine.
+	t.Cleanup(func() { afterTurnDone = func() {} })
+	m, _, _ := newTestManager(t)
+	info, _ := m.CreateSession(CreateSessionRequest{})
+	sub, _, _, _ := m.Subscribe(info.ID, -1)
+	defer sub.Close()
+	gsub, _, _ := m.SubscribeAll(-1)
+	defer gsub.Close()
+
+	next := make(chan *Turn, 1)
+	var once sync.Once
+	afterTurnDone = func() {
+		once.Do(func() {
+			turn, err := m.Send(info.ID, SendRequest{Content: "second"})
+			if err != nil {
+				t.Errorf("send from Done: %v", err)
+				close(next)
+				return
+			}
+			next <- turn
+			<-turn.Done()
+		})
+	}
+
+	first, err := m.Send(info.ID, SendRequest{Content: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTurn(t, first)
+	second, ok := <-next
+	if !ok {
+		t.FailNow()
+	}
+	waitTurn(t, second)
+
+	check := func(name string, c <-chan Event) {
+		var order []string
+		for len(order) < 4 {
+			select {
+			case e := <-c:
+				if e.Type == EventTurnStart || e.Type == EventTurnEnd {
+					order = append(order, string(e.Type)+":"+e.TurnID)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s: got %v", name, order)
+			}
+		}
+		want := []string{"turn_start:" + first.ID, "turn_end:" + first.ID, "turn_start:" + second.ID, "turn_end:" + second.ID}
+		for i := range want {
+			if order[i] != want[i] {
+				t.Fatalf("%s order = %v, want %v", name, order, want)
+			}
+		}
+	}
+	check("session", sub.C)
+	check("global", gsub.C)
 }

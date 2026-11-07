@@ -129,3 +129,14 @@ func TestAgentConversationAbandonedRunStopsEmitting(t *testing.T) {
 		t.Fatalf("events emitted after RunTurn returned: %+v", late)
 	}
 }
+
+func TestAgentRuntimeMemoryScopeIsNotWorkDir(t *testing.T) {
+	reg := llm.NewSingleModelRegistry("test", "m", "")
+	rt, err := NewAgentRuntime(AgentRuntimeConfig{Models: reg, WorkDir: "/proj/a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.cfg.MemoryUserID != DefaultMemoryUserID {
+		t.Fatalf("MemoryUserID = %q, want %q", rt.cfg.MemoryUserID, DefaultMemoryUserID)
+	}
+}

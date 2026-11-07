@@ -2,7 +2,7 @@
 
 把 deepai agent 作为**常驻后台服务**运行：会话与任务常驻在 bot 进程中，Web / GUI / App / IM 适配器等客户端通过 HTTP、SSE、NDJSON、WebSocket 控制它。设计与完整协议见 [`docs/BOT_DESIGN.md`](../../docs/BOT_DESIGN.md)。
 
-配置与 `deepai` 完全共用：`~/.deepai/config.yaml`（模型）、`~/.deepai/.env`（API key）、`DEEPAI.md`、技能、插件、`.mcp.json`、会话库与长期记忆。先用 `deepai setup` 配好模型即可。
+配置与 `deepai` 共用：`~/.deepai/config.yaml`（模型）、`~/.deepai/.env`（API key）、`DEEPAI.md`、技能、插件、`.mcp.json`。会话和长期记忆存放在 bot 自己的 `~/.deepai/bot/bot.db`，与 CLI 的会话库分开（`deepai -r` 不能续聊 bot 会话）。先用 `deepai setup` 配好模型即可。
 
 ## 构建
 
@@ -33,11 +33,11 @@ deepai-bot token [--rotate]        # 查看/轮换访问令牌
 | `--max-tool-calls` | 0（不限） | 每轮工具调用上限 |
 | `--turn-timeout` | 0（不限） | 单轮超时；超时的 turn 以 `turn_end` status `timed_out` 结束 |
 | `--idle-timeout` | 30m | 空闲会话卸载（释放沙箱） |
-| `--ephemeral` | off | 会话只存内存，不写 SQLite、不用长期记忆 |
+| `--ephemeral` | off | 会话只存内存，不写 `bot.db`、不用长期记忆 |
 | `--cors-origin` | — | 允许跨域访问的前端 origin（可重复，`*` 为任意） |
 | `--no-web` | off | 不提供内置 Web 控制台 |
 
-文件位置：`~/.deepai/bot/bot.json`（运行状态）、`bot.log`（`start` 模式日志）、`token`、`sandbox/`。
+文件位置：`~/.deepai/bot/bot.db`（会话与长期记忆）、`bot.json`（运行状态）、`bot.log`（`start` 模式日志）、`token`、`sandbox/`。
 
 ## 快速调用
 

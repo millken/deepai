@@ -2,7 +2,7 @@
 
 > 状态：设计草案（仅文档，无实现）  
 > 基线：PR #40 / `cursor/deepai-bot-server-56e1`（单进程 `deepai-bot` + `Manager` 多会话）  
-> 参考：`docs/BOT_DESIGN.md`（#40 仍写「共享 `deepai.db`」——**本设计修订该取舍**，见 §1.2）；灵感来自 OpenMausBot 的「Bot 为一等公民」。
+> 参考：`docs/BOT_DESIGN.md`（#40 已实现独立 `bot.db` 与 cwd 隔离，见 §5）；本设计在同库上叠加多 `bot_id`；灵感来自 OpenMausBot。
 
 ---
 
@@ -10,7 +10,7 @@
 
 #40 的 `deepai-bot` 是**常驻 Agent 服务**，但仍是**单人格**：一个进程、一个 `workdir`、一套全局 system prompt，所有会话共用同一默认模型与记忆画像。
 
-本设计在**同一个 `deepai-bot` 进程**内引入**可注册的多个 Bot（人格）**，并明确 **Bot 与 CLI 在存储上分离**（Mil / owner 决策，2026-11-07）。
+本设计在**同一个 `deepai-bot` 进程**内引入**可注册的多个 Bot（人格）**，在 #40 已采用的 **`~/.deepai/bot/bot.db`**（与 CLI 分离）之上扩展 `bots` 表与 `sessions.bot_id`。
 
 ### 1.1 成功形态（读完应能开工）
 
@@ -23,16 +23,16 @@
 | 持久化 | **独立** `~/.deepai/bot/bot.db`（bots + sessions + messages + 记忆表） |
 | 与 CLI | **不共享**会话/历史/记忆；无 `deepai -r` 续聊 bot 会话 |
 
-### 1.2 与 #40 / CLI 的关系（修订共享库）
+### 1.2 与 #40 / CLI 的关系
 
 | 共享（仍同源） | 不共享（各自独立） |
 |----------------|-------------------|
 | `~/.deepai/config.yaml`、`.env` / API 密钥 | `~/.deepai/deepai.db`（CLI） vs `~/.deepai/bot/bot.db`（bot） |
 | 技能 / Claude 插件 / MCP **发现**（按进程 `workdir`） | 会话 transcript、`deepai session list` 中的 bot 行 |
 | 进程级工具注册表、`DEEPAI.md` 等**项目级** system 基底 | 长期记忆行：CLI 用 workdir key，bot 用 `bot.db` 内 `bot:<id>` scope，**永不共用行** |
-| ReAct 引擎、`pkg/agent` 语义 | 跨进程 **session_lock**（仅 bot 库内多客户端互斥） |
+| ReAct 引擎、`pkg/agent` 语义 | `bot.db` 内 **session_lock**（多 bot 进程 / 多客户端互斥，与 CLI 无关） |
 
-#40 文档与当前实现若仍指向「共享 SQLite、`deepai -r` 互通」，在落地多 Bot 时应随实现 PR **改为独立 `bot.db`**；`docs/BOT_DESIGN.md` §5 / §7 已加指向本节的简短说明。
+单 Bot 阶段记忆 user scope 为 `bot:default`（#40）；多 Bot 实现为每人格 `bot:<id>`，仍只写在 `bot.db`，不与 CLI workdir 记忆混用。
 
 ### 1.3 评审收口（PR #42：mibral + Cursor）
 
@@ -171,7 +171,7 @@ flowchart TB
 | CLI 长期记忆 | 仍在 `deepai.db`；**无迁移、无 remap、无共享行** |
 | 沙箱 | `~/.deepai/bot/sandbox/session-*` |
 
-自 `#40` 共享库时代升级的 bot：**不**把 CLI workdir 记忆拷贝进 bot；若曾把 bot 会话写在 `deepai.db`，可用一次性 **导入工具**（实现 PR）复制 `source=bot` 行到 `bot.db`，记忆可选择不迁或仅迁 bot 库内已有事实。
+若存在极早期「bot 会话写在 `deepai.db`」的安装，可用一次性 **导入工具**（实现 PR）迁到 `bot.db`；**不** remap CLI workdir 记忆。
 
 ### 4.4 `enabled=false`
 
@@ -234,7 +234,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_bot_cwd_updated
 -- messages / session_locks / memory_* ：与现有 schema 对齐，建在 bot.db
 ```
 
-新建库不存在 `ALTER … REFERENCES` 问题。从 #40 共用库升级：实现侧提供迁移，**不**改 `deepai.db` 里 CLI 数据。
+多 Bot 迁移在既有 **`bot.db`** 上增表/增列（`CREATE bots`、`sessions.bot_id` 等），与 #40 schema 兼容；**不**打开 `deepai.db`。
 
 ### 5.3 Bot 作用域（方案 A：全局库 + cwd 过滤）
 
@@ -322,7 +322,7 @@ type BotSessionStore interface { /* 同 bot.Store，Create 带 BotID + CWD */ }
 |------|------|
 | #40 客户端只用扁平 `/v1/sessions` | 仅见 **default** bot、**本进程 cwd** 的会话（数据在 `bot.db`） |
 | `deepai -r <id>` | **不支持** bot 会话；CLI 只读 `deepai.db` |
-| 从 #40 共用 `deepai.db` 升级 | 一次性导入 bot 会话到 `bot.db`（可选工具）；CLI 库不动 |
+| 已有 #40 `bot.db` | 迁移加 `bots` / `bot_id`；历史会话默认 `default` |
 | `--ephemeral` | 无 `bot.db` 落盘；单 `default` bot |
 
 ---
@@ -336,12 +336,12 @@ Channel、Chief、Computers、人格包导入导出、每 bot token、每 bot wo
 ## 10. 实现检查清单
 
 - [ ] `BotDB()` + schema 迁移（bots、sessions、memory 全在 bot.db）
-- [ ] `NewBotRuntime` 不再 `Open(deepai.db)`（除非迁移工具只读）
+- [ ] 确认 `NewBotRuntime` 仅写 `bot.db`（#40 已满足；旧 deepai.db 导入为可选）
 - [ ] `Fleet`、嵌套 + 扁平 API、扁平跨 bot **404**
 - [ ] `DELETE` / `force` / `enabled` 语义与测试
 - [ ] `ListRecent` 按 `cwd` 过滤
 - [ ] `SessionInfo.bot_id`（及实现 PR 按需：`/v1/events` 过滤）
-- [ ] 同步修订 `BOT_DESIGN.md` 实现 PR 中的架构图与 §2 Session 描述（§5 共享库已标注 superseded）
+- [ ] 与 `BOT_DESIGN.md` §5 表述一致（独立 `bot.db`、cwd 过滤）
 
 ---
 
