@@ -33,9 +33,11 @@ jobs:
           for target in $TARGETS; do
             os=${target%/*}
             arch=${target#*/}
-            output=dist/deepai-${VERSION}-${os}-${arch}
-            [ "$os" = "windows" ] && output=${output}.exe
-            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X github.com/millken/deepai/pkg/commands.Version=${VERSION}" -o "$output" ./cmd/deepai
+            for bin in deepai deepai-bot; do
+              output=dist/${bin}-${VERSION}-${os}-${arch}
+              [ "$os" = "windows" ] && output=${output}.exe
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X github.com/millken/deepai/pkg/commands.Version=${VERSION}" -o "$output" ./cmd/${bin}
+            done
           done
 
       - name: Make tarballs

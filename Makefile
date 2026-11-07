@@ -1,4 +1,4 @@
-.PHONY: build install build-proxy test lint
+.PHONY: build install build-bot install-bot build-proxy test lint
 
 # Build the project
 build:
@@ -16,6 +16,15 @@ build:
 install: build
 	mkdir -p ~/.local/bin
 	install -m 755 ./bin/deepai ~/.local/bin/deepai
+
+# Build the bot server (resident HTTP / SSE / WebSocket service)
+build-bot:
+	mkdir -p bin
+	go build -o ./bin/deepai-bot ./cmd/deepai-bot
+
+install-bot: build-bot
+	mkdir -p ~/.local/bin
+	install -m 755 ./bin/deepai-bot ~/.local/bin/deepai-bot
 
 # Build the proxy server
 build-proxy:
