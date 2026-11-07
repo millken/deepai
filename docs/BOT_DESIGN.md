@@ -235,7 +235,7 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 
 1. **消息队列 / 插话**：运行中发送的消息排队，或作为"steer"注入下一步。
 2. **IM 渠道适配器**（Telegram / Slack / 飞书 / 企业微信）：作为 `Manager` 的另一个客户端，映射 "聊天线程 ↔ 会话"、"按钮 ↔ question 选项"。
-3. **定时任务 / Webhook 触发**：cron 或 GitHub 事件创建 turn，结果推送到渠道。
+3. **定时任务 / Webhook 触发**：cron 或 GitHub 事件创建 turn，结果推送到渠道。定时任务设计见 [BOT_SCHEDULER_DESIGN.md](BOT_SCHEDULER_DESIGN.md)。
 4. **多工作目录 / 多项目**：会话级 workdir，需要按会话构建工具注册表。
 5. **多用户与细粒度权限**：多 token、只读 token、按会话授权；审计日志。
 6. **附件**：图片/文件上传（`models.MessageImage` 已支持），对应 `@path` 引用。
