@@ -56,9 +56,10 @@ type TurnOutput struct {
 	LLMTurns    int
 }
 
-// Store persists sessions. In production it is chat.SQLiteSessionStore over
-// the bot's own database (~/.deepai/bot/bot.db); the CLI's deepai.db is never
-// opened, so bot and CLI sessions, memory and locks are fully separate.
+// Store persists sessions. In production it is pkg/chat's SQLite session
+// store over the bot's own database (~/.deepai/bot/bot.db), wrapped in
+// pkg/commands; the CLI's deepai.db is never opened, so bot and CLI
+// sessions, memory and locks are fully separate.
 //
 // bot.db is one file per user, shared by every deepai-bot process, while a
 // bot serves one working directory: the Manager only lists and opens

@@ -13,7 +13,6 @@ import (
 	"github.com/dnsoa/go/env"
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/bot"
-	"github.com/millken/deepai/pkg/chat"
 	"github.com/millken/deepai/pkg/claudeplugin"
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
@@ -104,6 +103,11 @@ func NewBotRuntime(ctx context.Context, opts BotOptions) (_ *BotRuntime, err err
 	}
 	if workDir, err = filepath.Abs(workDir); err != nil {
 		return nil, err
+	}
+	// The session store records cwd symlink-resolved; scoping compares
+	// against this exact string.
+	if resolved, err := filepath.EvalSymlinks(workDir); err == nil {
+		workDir = resolved
 	}
 
 	var closers []func()
@@ -231,7 +235,7 @@ func NewBotRuntime(ctx context.Context, opts BotOptions) (_ *BotRuntime, err err
 			return nil, fmt.Errorf("open database: %w", err)
 		}
 		closers = append(closers, func() { _ = db.Close() })
-		sessStore := chat.NewSQLiteSessionStoreFromDB(db)
+		sessStore := newBotSessionStore(db)
 		if err := sessStore.Migrate(); err != nil {
 			return nil, fmt.Errorf("migrate session schema: %w", err)
 		}

@@ -499,41 +499,6 @@ func (s *SQLiteSessionStore) ListRecent(limit int) ([]models.SessionMeta, error)
 	return scanSessionMetas(rows)
 }
 
-// ListRecentInDir is ListRecent restricted to sessions whose cwd is cwd,
-// matched the same way as LatestInDir. An empty cwd lists every session.
-func (s *SQLiteSessionStore) ListRecentInDir(cwd string, limit int) ([]models.SessionMeta, error) {
-	if cwd == "" {
-		return s.ListRecent(limit)
-	}
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := s.db.Query(`
-		SELECT s.id, s.title, s.cwd, COUNT(m.id) AS msg_count, s.created_at, s.updated_at
-		FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
-		WHERE s.cwd = ? OR s.cwd = ?
-		GROUP BY s.id ORDER BY s.updated_at DESC, s.id DESC LIMIT ?
-	`, normalizeCWD(cwd), cwd, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list sessions in dir: %w", err)
-	}
-	defer rows.Close()
-	return scanSessionMetas(rows)
-}
-
-// InDir reports whether session id was created in cwd, matched the same way
-// as LatestInDir. A missing session is an error.
-func (s *SQLiteSessionStore) InDir(id, cwd string) (bool, error) {
-	var got sql.NullString
-	if err := s.db.QueryRow(`SELECT cwd FROM sessions WHERE id = ?`, id).Scan(&got); err != nil {
-		if err == sql.ErrNoRows {
-			return false, fmt.Errorf("session %s not found", id)
-		}
-		return false, fmt.Errorf("session cwd: %w", err)
-	}
-	return got.String != "" && (got.String == normalizeCWD(cwd) || got.String == cwd), nil
-}
-
 // ---------------------------------------------------------------------------
 // Search (FTS5)
 // ---------------------------------------------------------------------------
