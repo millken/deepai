@@ -326,6 +326,54 @@ func TestBusLagAndGap(t *testing.T) {
 	}
 }
 
+func TestManagerScopedToWorkDir(t *testing.T) {
+	store := NewMemoryStore()
+	newM := func(dir string) *Manager {
+		m, err := NewManager(Options{Runtime: &fakeRuntime{}, Store: store, WorkDir: dir, IdleTimeout: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = m.Close(context.Background()) })
+		return m
+	}
+	a, b := newM("/proj/a"), newM("/proj/b")
+
+	mine, _ := a.CreateSession(CreateSessionRequest{Title: "a"})
+	theirs, _ := b.CreateSession(CreateSessionRequest{Title: "b"})
+	cli, err := store.Create(models.CreateOpts{CWD: "/proj/a", Source: "cli"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := a.ListSessions(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, s := range list {
+		ids[s.ID] = true
+	}
+	if len(list) != 2 || !ids[mine.ID] || !ids[cli.ID] {
+		t.Fatalf("list = %+v, want only this workdir's sessions (%s, %s)", list, mine.ID, cli.ID)
+	}
+
+	if _, _, err := a.GetSession(cli.ID); err != nil {
+		t.Fatalf("CLI session in the same workdir: %v", err)
+	}
+	if _, _, err := a.GetSession(theirs.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if _, err := a.Send(theirs.ID, SendRequest{Content: "hi"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("send to other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if err := a.DeleteSession(theirs.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete other workdir's session: err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := b.GetSession(theirs.ID); err != nil {
+		t.Fatalf("owner lost its session: %v", err)
+	}
+}
+
 func TestManagerDropsEventsAfterTurnEnd(t *testing.T) {
 	m, _, rt := newTestManager(t)
 	rt.release = make(chan struct{})

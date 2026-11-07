@@ -452,6 +452,56 @@ func TestNewSQLiteSessionStore_SetsBusyTimeout(t *testing.T) {
 // LatestInDir — acceptance point 6
 // ---------------------------------------------------------------------------
 
+func TestListRecentInDirAndInDir(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	a1, err := store.Create(models.CreateOpts{CWD: "/proj/a", Source: "bot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, err := store.Create(models.CreateOpts{CWD: "/proj/a/", Source: "cli"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.Create(models.CreateOpts{CWD: "/proj/b", Source: "bot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := store.Create(models.CreateOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metas, err := store.ListRecentInDir("/proj/a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, m := range metas {
+		got[m.ID] = true
+	}
+	if len(metas) != 2 || !got[a1.ID] || !got[a2.ID] {
+		t.Fatalf("ListRecentInDir(/proj/a) = %+v, want %s and %s", metas, a1.ID, a2.ID)
+	}
+	if all, _ := store.ListRecentInDir("", 10); len(all) != 4 {
+		t.Fatalf("ListRecentInDir(\"\") = %d sessions, want 4", len(all))
+	}
+
+	for _, c := range []struct {
+		id   string
+		want bool
+	}{{a1.ID, true}, {a2.ID, true}, {b.ID, false}, {legacy.ID, false}} {
+		ok, err := store.InDir(c.id, "/proj/a")
+		if err != nil || ok != c.want {
+			t.Errorf("InDir(%s, /proj/a) = %v, %v; want %v", c.id, ok, err, c.want)
+		}
+	}
+	if _, err := store.InDir("nope", "/proj/a"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("InDir(missing) err = %v, want not found", err)
+	}
+}
+
 func TestLatestInDir_ScopesByCWD(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()

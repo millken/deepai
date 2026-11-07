@@ -56,15 +56,23 @@ type TurnOutput struct {
 	LLMTurns    int
 }
 
-// Store persists sessions. models.SessionRepository (the SQLite store the
-// CLI uses) satisfies it, so bot sessions show up in `deepai session list`
-// and can be resumed with `deepai -r <id>`, and vice versa.
+// Store persists sessions. The CLI's SQLite store (chat.SQLiteSessionStore)
+// satisfies it, so bot sessions show up in `deepai session list` and can be
+// resumed with `deepai -r <id>`, and vice versa.
+//
+// The store is shared by every project on the machine, while a bot serves
+// one working directory: the Manager only lists and opens sessions created
+// in its WorkDir, through ListRecentInDir and InDir.
 type Store interface {
 	Create(opts models.CreateOpts) (*models.Session, error)
 	Load(id string) (*models.Session, error)
 	LoadMessages(id string) ([]models.Message, error)
 	AppendMessage(sessionID string, msg models.Message) error
-	ListRecent(limit int) ([]models.SessionMeta, error)
+	// ListRecentInDir lists sessions created in cwd, newest first; an empty
+	// cwd lists all of them.
+	ListRecentInDir(cwd string, limit int) ([]models.SessionMeta, error)
+	// InDir reports whether session id was created in cwd.
+	InDir(id, cwd string) (bool, error)
 	Rename(id, title string) error
 	Delete(id string) error
 }

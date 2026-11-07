@@ -37,7 +37,9 @@ const lockRefreshInterval = 20 * time.Second
 type Options struct {
 	Runtime Runtime
 	Store   Store
-	// WorkDir is recorded on created sessions (the store's cwd column).
+	// WorkDir is recorded on created sessions (the store's cwd column) and
+	// scopes the Manager to them: sessions from other directories are
+	// neither listed nor opened (ErrNotFound). Empty disables scoping.
 	WorkDir string
 	// ReplayEvents bounds each session's replay buffer (default
 	// DefaultReplayEvents).
@@ -196,7 +198,7 @@ func (m *Manager) ListSessions(limit int) ([]SessionInfo, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	metas, err := m.opts.Store.ListRecent(limit)
+	metas, err := m.opts.Store.ListRecentInDir(m.opts.WorkDir, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -643,6 +645,18 @@ func (m *Manager) load(id string) (*session, error) {
 	}
 	if s := m.sessions[id]; s != nil {
 		return s, nil
+	}
+	if m.opts.WorkDir != "" {
+		ok, err := m.opts.Store.InDir(id, m.opts.WorkDir)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrNotFound
+		}
 	}
 	rec, err := m.opts.Store.Load(id)
 	if err != nil {

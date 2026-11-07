@@ -111,7 +111,7 @@ turn 的结束状态：`cancelled` 是客户端调用 cancel 或 bot 关闭；`t
 |------|------|------|
 | GET | `/healthz` | 存活探针 |
 | GET | `/v1/info` | 版本、工作目录、模型列表、默认模型 |
-| GET | `/v1/sessions?limit=50` | 会话列表（合并内存中的运行状态） |
+| GET | `/v1/sessions?limit=50` | 本工作目录的会话列表（合并内存中的运行状态），见 §5 |
 | POST | `/v1/sessions` | 创建 `{"title"?, "model"?}` |
 | GET | `/v1/sessions/{id}` | `{session, messages}`：状态 + 完整 transcript |
 | PATCH | `/v1/sessions/{id}` | 改名 `{"title"}` |
@@ -194,6 +194,7 @@ bot 能执行 bash、改文件，等同于把一个 shell 暴露出去，所以�
 - **共享 SQLite**（`~/.deepai/deepai.db`）：DSN 与 REPL 完全一致（WAL、`busy_timeout`、`_txlock=immediate`）。
 - **会话锁**：turn 运行期间 bot 持有该会话的单写者锁（每 20s 心跳，远小于 60s 失效阈值），结束即释放。CLI 正在使用的会话，bot 发送会得到 `409 session_locked`；bot 正在跑的会话，CLI `-r` 会看到被锁，可用 `--fork` 分叉。
 - **工作目录**：一个 bot 进程服务一个工作目录（`--workdir`，默认启动目录），与 REPL "一个进程一个项目"的模型一致；记忆的 user scope 也按工作目录划分。多项目就起多个 bot（不同端口）。
+- **会话按工作目录隔离**：会话库是全机共享的，bot 只列出、只打开 `cwd` 等于自己 `--workdir` 的会话（同目录下的 CLI 会话也在内，可以在控制台里接着聊）。其它目录的会话 id 一律按不存在处理（`404 not_found`），以免在错误的目录里执行工具。没有记录 `cwd` 的旧会话不在任何 bot 的范围内，仍可用 CLI 打开。
 - **每会话沙箱**：`~/.deepai/bot/sandbox/session-*`，会话卸载或删除时清理。
 
 ---
