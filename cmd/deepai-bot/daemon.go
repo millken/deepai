@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/millken/deepai/pkg/commands"
 	"github.com/spf13/cobra"
 )
 
@@ -25,11 +24,11 @@ type daemonState struct {
 	WorkDir   string    `json:"work_dir,omitempty"`
 }
 
-func stateFile() string { return filepath.Join(commands.BotHome(), "bot.json") }
-func logFile() string   { return filepath.Join(commands.BotHome(), "bot.log") }
+func stateFile() string { return filepath.Join(botHome(), "bot.json") }
+func logFile() string   { return filepath.Join(botHome(), "bot.log") }
 
 func writeState(st daemonState) error {
-	if err := os.MkdirAll(commands.BotHome(), 0o700); err != nil {
+	if err := os.MkdirAll(botHome(), 0o700); err != nil {
 		return err
 	}
 	data, _ := json.MarshalIndent(st, "", "  ")
@@ -78,7 +77,7 @@ func runStart(ctx context.Context, f serveFlags) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(commands.BotHome(), 0o700); err != nil {
+	if err := os.MkdirAll(botHome(), 0o700); err != nil {
 		return err
 	}
 	logf, err := os.OpenFile(logFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)

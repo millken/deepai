@@ -113,9 +113,44 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 		return fmt.Errorf("no provider configured")
 	}
 
-	modelRegistry, err := buildModelRegistry(cfg, modelOverride)
-	if err != nil {
-		return err
+	// Build the model registry: explicit multi-model config takes precedence;
+	// otherwise fall back to the top-level provider/model (backward compat).
+	var modelRegistry *llm.ModelRegistry
+	if len(cfg.Models) > 0 {
+		// Resolve the default model alias from -m override or config Model.
+		// Accept alias name, bare model name, or provider/model ref.
+		defaultName := resolveDefaultAlias(cfg.Models, modelOverride, cfg.Model)
+		modelRegistry, err = llm.NewModelRegistry(cfg.Models, defaultName)
+		if err != nil {
+			return fmt.Errorf("build model registry: %w", err)
+		}
+
+		// If -m specified a bare model name not in the registry, inject it as a
+		// temporary entry under the top-level provider so the session can use it.
+		if modelOverride != "" && !modelRegistry.Has(modelOverride) {
+			def, _ := modelRegistry.Resolve(defaultName)
+			provider := def.Provider
+			if provider == "" {
+				provider = cfg.Provider
+			}
+			tmpReg, err2 := llm.NewModelRegistry(append(cfg.Models, llm.ModelDef{
+				Name: modelOverride, Provider: provider, Model: modelOverride, BaseURL: cfg.BaseURL,
+			}), modelOverride)
+			if err2 != nil {
+				return fmt.Errorf("build model registry with -m override: %w", err2)
+			}
+			modelRegistry = tmpReg
+		}
+	} else {
+		// Backward compat: single provider/model from top-level config.
+		modelName := cfg.Model
+		if modelOverride != "" {
+			modelName = modelOverride
+		}
+		if modelName == "" {
+			modelName = "default"
+		}
+		modelRegistry = llm.NewSingleModelRegistry(cfg.Provider, modelName, cfg.BaseURL)
 	}
 
 	// Safety floor: when the user has not configured a context window, the
@@ -370,47 +405,6 @@ func runChat(ctx context.Context, query, resume string, continueLast, continueAn
 	}
 
 	return repl.Run(ctx)
-}
-
-// buildModelRegistry builds the model registry from config: explicit
-// multi-model config takes precedence; otherwise it falls back to the
-// top-level provider/model (backward compat). modelOverride is the -m flag.
-func buildModelRegistry(cfg Config, modelOverride string) (*llm.ModelRegistry, error) {
-	if len(cfg.Models) > 0 {
-		// Resolve the default model alias from -m override or config Model.
-		// Accept alias name, bare model name, or provider/model ref.
-		defaultName := resolveDefaultAlias(cfg.Models, modelOverride, cfg.Model)
-		modelRegistry, err := llm.NewModelRegistry(cfg.Models, defaultName)
-		if err != nil {
-			return nil, fmt.Errorf("build model registry: %w", err)
-		}
-
-		// If -m specified a bare model name not in the registry, inject it as a
-		// temporary entry under the top-level provider so the session can use it.
-		if modelOverride != "" && !modelRegistry.Has(modelOverride) {
-			def, _ := modelRegistry.Resolve(defaultName)
-			provider := def.Provider
-			if provider == "" {
-				provider = cfg.Provider
-			}
-			tmpReg, err := llm.NewModelRegistry(append(cfg.Models, llm.ModelDef{
-				Name: modelOverride, Provider: provider, Model: modelOverride, BaseURL: cfg.BaseURL,
-			}), modelOverride)
-			if err != nil {
-				return nil, fmt.Errorf("build model registry with -m override: %w", err)
-			}
-			return tmpReg, nil
-		}
-		return modelRegistry, nil
-	}
-	modelName := cfg.Model
-	if modelOverride != "" {
-		modelName = modelOverride
-	}
-	if modelName == "" {
-		modelName = "default"
-	}
-	return llm.NewSingleModelRegistry(cfg.Provider, modelName, cfg.BaseURL), nil
 }
 
 // registerChatTools returns the subagent pool so the REPL can cancel a single

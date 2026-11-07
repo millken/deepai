@@ -31,7 +31,7 @@ const DefaultMemoryUserID = "bot:default"
 
 // AgentRuntimeConfig is everything the production Runtime needs. The
 // deepai-bot command fills it from ~/.deepai/config.yaml the same way the
-// interactive REPL is configured (pkg/commands/bot.go).
+// interactive REPL is configured (cmd/deepai-bot/runtime.go).
 type AgentRuntimeConfig struct {
 	Models *llm.ModelRegistry
 	Tools  *tools.Registry

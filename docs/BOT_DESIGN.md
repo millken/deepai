@@ -38,7 +38,7 @@
 | 层 | 位置 | 职责 |
 |----|------|------|
 | 入口 | `cmd/deepai-bot` | 参数、token、守护进程（`start/stop/status`）、优雅退出 |
-| 装配 | `pkg/commands/bot.go` | 从 `~/.deepai/config.yaml` 构建运行时，**与 REPL 同源**：模型注册表、工具、技能、Claude 插件、MCP、`DEEPAI.md`、记忆、SQLite |
+| 装配 | `cmd/deepai-bot/runtime.go` | 从 `~/.deepai/config.yaml` 构建运行时，**与 REPL 同源**：模型注册表、工具、技能、Claude 插件、MCP、`DEEPAI.md`；会话与记忆在独立的 `bot.db`。`pkg/commands` 不为 bot 改动，所需的少量内部逻辑在此镜像 |
 | 编排 | `pkg/bot/manager.go` | 会话生命周期、turn 执行、持久化、会话锁、提问路由 |
 | 事件 | `pkg/bot/bus.go` | 每会话一条事件总线 + 一条全局生命周期总线 |
 | 运行时 | `pkg/bot/agentruntime.go` | `pkg/agent` 适配：每 turn 新建 `agent.Agent`，事件翻译 |
