@@ -19,6 +19,7 @@ const subscriberBuffer = 1024
 // bus fans events out to subscribers and keeps a bounded replay buffer.
 type bus struct {
 	mu     sync.Mutex
+	base   int64 // seq before the first event of this bus
 	seq    int64
 	ring   []Event
 	start  int // index of the oldest event in ring once it has wrapped
@@ -27,11 +28,16 @@ type bus struct {
 	closed bool
 }
 
-func newBus(replay int) *bus {
+func newBus(replay int) *bus { return newBusAt(replay, 0) }
+
+// newBusAt starts numbering after base, so cursors handed out by an earlier
+// bus of the same session (base > every seq it issued) are recognisable as
+// stale instead of aliasing this bus's events.
+func newBusAt(replay int, base int64) *bus {
 	if replay <= 0 {
 		replay = DefaultReplayEvents
 	}
-	return &bus{ring: make([]Event, 0, replay), subs: map[*Subscription]struct{}{}}
+	return &bus{base: base, seq: base, ring: make([]Event, 0, replay), subs: map[*Subscription]struct{}{}}
 }
 
 // Subscription is a live feed of a bus.
@@ -98,10 +104,14 @@ func (b *bus) publish(evt Event) Event {
 
 // subscribe registers a subscriber and returns the buffered events with
 // Seq > since. Registration and the backlog snapshot happen under one lock,
-// so no event can fall between the backlog and the live feed. gap is true
-// when events after since have already been evicted from the buffer; the
-// client should then reload the session transcript instead of relying on
-// the replay alone. since < 0 means "live only, no backlog".
+// so no event can fall between the backlog and the live feed. since < 0
+// means "live only, no backlog"; since == 0 means "from the first event".
+//
+// gap is true whenever the backlog cannot be the exact continuation of the
+// client's cursor: events after since were evicted, or since is
+// ahead of this bus (the session was unloaded and reloaded, and a fresh
+// bus restarted at seq 1). The client should reload the transcript and
+// resubscribe from the session's current last_seq.
 func (b *bus) subscribe(since int64) (sub *Subscription, backlog []Event, gap bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -116,7 +126,14 @@ func (b *bus) subscribe(since int64) (sub *Subscription, backlog []Event, gap bo
 		return sub, nil, false
 	}
 	ordered := b.orderedLocked()
-	if len(ordered) > 0 && since < ordered[0].Seq-1 {
+	if since == 0 {
+		since = b.base
+	}
+	switch {
+	case since < 0, since == b.seq:
+	case since > b.seq:
+		gap = true
+	case len(ordered) == 0 || since < ordered[0].Seq-1:
 		gap = true
 	}
 	for _, e := range ordered {

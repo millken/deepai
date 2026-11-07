@@ -31,7 +31,7 @@ deepai-bot token [--rotate]        # 查看/轮换访问令牌
 | `-w, --workdir` | 当前目录 | agent 的工作目录 |
 | `-m, --model` | 配置中的默认模型 | 默认模型别名 |
 | `--max-tool-calls` | 0（不限） | 每轮工具调用上限 |
-| `--turn-timeout` | 0（不限） | 单轮超时 |
+| `--turn-timeout` | 0（不限） | 单轮超时；超时的 turn 以 `turn_end` status `timed_out` 结束 |
 | `--idle-timeout` | 30m | 空闲会话卸载（释放沙箱） |
 | `--ephemeral` | off | 会话只存内存，不写 SQLite、不用长期记忆 |
 | `--cors-origin` | — | 允许跨域访问的前端 origin（可重复，`*` 为任意） |

@@ -66,6 +66,7 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	seqFloor map[string]int64 // last seq of sessions unloaded by the janitor
 	closed   bool
 	stopJan  chan struct{}
 }
@@ -124,6 +125,7 @@ func NewManager(opts Options) (*Manager, error) {
 		cancelAll: cancel,
 		global:    newBus(opts.ReplayEvents),
 		sessions:  map[string]*session{},
+		seqFloor:  map[string]int64{},
 		stopJan:   make(chan struct{}),
 	}
 	if opts.IdleTimeout > 0 {
@@ -264,6 +266,7 @@ func (m *Manager) DeleteSession(id string) error {
 	}
 	m.mu.Lock()
 	delete(m.sessions, id)
+	delete(m.seqFloor, id)
 	m.mu.Unlock()
 	if conv != nil {
 		_ = conv.Close()
@@ -415,13 +418,13 @@ func (m *Manager) Answer(id, questionID, answer string) error {
 		return err
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	t := s.turn
 	var pq *pendingQuestion
 	if t != nil {
 		pq = t.questions[questionID]
 		delete(t.questions, questionID)
 	}
-	s.mu.Unlock()
 	if pq == nil {
 		return ErrUnknownQuestion
 	}
@@ -509,10 +512,17 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 
 	stopRefresh := m.holdLock(s.id)
 
+	// Publishing under s.mu orders every turn event before the s.turn = nil
+	// below, so nothing a Runtime emits late (e.g. from an abandoned run)
+	// can appear after this turn's turn_end.
 	emit := func(evt Event) {
 		evt.SessionID = s.id
 		evt.TurnID = t.id
-		s.bus.publish(evt)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.turn == t {
+			s.bus.publish(evt)
+		}
 	}
 	out, runErr := conv.RunTurn(ctx, TurnInput{
 		SessionID:   s.id,
@@ -532,8 +542,11 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	}
 	switch {
 	case runErr == nil:
-	case ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled):
+	case errors.Is(ctx.Err(), context.Canceled):
 		summary.Status = TurnCancelled
+	case errors.Is(ctx.Err(), context.DeadlineExceeded), errors.Is(runErr, context.DeadlineExceeded):
+		summary.Status = TurnTimedOut
+		summary.Error = runErr.Error()
 	default:
 		summary.Status = TurnFailed
 		summary.Error = runErr.Error()
@@ -660,7 +673,7 @@ func (m *Manager) load(id string) (*session, error) {
 		updatedAt: orNow(rec.UpdatedAt, now),
 		messages:  msgs,
 		lastUsed:  now,
-		bus:       newBus(m.opts.ReplayEvents),
+		bus:       newBusAt(m.opts.ReplayEvents, m.reloadBaseLocked(id)),
 	}
 	m.sessions[id] = s
 	return s, nil
@@ -686,6 +699,16 @@ func (m *Manager) janitor() {
 	}
 }
 
+// reloadBaseLocked picks where a session loaded from the store resumes its
+// event numbering. Clients may still hold cursors from the bus that served
+// it before it was unloaded, or from a previous bot process; starting at the
+// current time in microseconds (and never below this process's last seq for
+// it) keeps every such cursor below the new range, so Subscribe reports a
+// gap instead of silently replaying from the wrong place.
+func (m *Manager) reloadBaseLocked(id string) int64 {
+	return max(time.Now().UnixMicro(), m.seqFloor[id])
+}
+
 func (m *Manager) evictIdle(before time.Time) {
 	m.mu.Lock()
 	var victims []*session
@@ -696,6 +719,7 @@ func (m *Manager) evictIdle(before time.Time) {
 		if idle {
 			victims = append(victims, s)
 			delete(m.sessions, id)
+			m.seqFloor[id] = s.bus.lastSeq()
 		}
 	}
 	m.mu.Unlock()
@@ -755,10 +779,9 @@ func (ti *turnInteraction) AskQuestion(ctx context.Context, question string, opt
 		return "", ErrNotRunning
 	}
 	ti.t.questions[pq.q.ID] = pq
-	ti.s.mu.Unlock()
-
 	q := pq.q
 	ti.s.bus.publish(Event{SessionID: ti.s.id, TurnID: ti.t.id, Type: EventQuestion, Question: &q})
+	ti.s.mu.Unlock()
 
 	select {
 	case ans, ok := <-pq.answer:

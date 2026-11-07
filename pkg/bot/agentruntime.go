@@ -21,8 +21,8 @@ import (
 
 // orphanWait is how long a cancelled turn waits for agent.Run to return
 // before abandoning it, matching the REPL's defensive bound for tools that
-// ignore ctx.
-const orphanWait = 10 * time.Second
+// ignore ctx. A var so tests can shorten it.
+var orphanWait = 10 * time.Second
 
 // AgentRuntimeConfig is everything the production Runtime needs. The
 // deepai-bot command fills it from ~/.deepai/config.yaml the same way the
@@ -164,8 +164,9 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		a.AppendSystemPrompt(cfg.SystemPrompt)
 	}
 
+	gate := &emitGate{emit: in.Emit}
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-		in.Emit(Event{Type: EventSubagent, Subagent: &evt})
+		gate.send(Event{Type: EventSubagent, Subagent: &evt})
 	})
 
 	forwarded := make(chan struct{})
@@ -173,7 +174,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		defer close(forwarded)
 		for evt := range a.Events() {
 			if out, ok := translateAgentEvent(ctx, evt); ok {
-				in.Emit(out)
+				gate.send(out)
 			}
 		}
 	}()
@@ -195,8 +196,12 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		select {
 		case out = <-done:
 		case <-time.After(orphanWait):
-			// The abandoned Run still owns carry; never share a
-			// SessionCarry between two live agents.
+			// The abandoned Run keeps going in the background. Its
+			// events must not outlive this turn (the Manager is about to
+			// publish turn_end), and it still owns carry: never share a
+			// SessionCarry between two live agents. The forwarder keeps
+			// draining a.Events() into the closed gate until Run returns.
+			gate.close()
 			c.mu.Lock()
 			c.carry = agent.NewSessionCarry()
 			c.mu.Unlock()
@@ -232,6 +237,28 @@ func (c *agentConversation) summarizer(model string) agent.SessionSummarizer {
 		return nil
 	}
 	return agent.NewLLMSessionSummarizer(provider, name)
+}
+
+// emitGate forwards events until closed. close waits out any send in
+// flight, so once it returns no event of this turn can reach Emit again.
+type emitGate struct {
+	mu     sync.Mutex
+	closed bool
+	emit   func(Event)
+}
+
+func (g *emitGate) send(e Event) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.closed {
+		g.emit(e)
+	}
+}
+
+func (g *emitGate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
 }
 
 // translateAgentEvent maps the agent's event stream onto the wire protocol.

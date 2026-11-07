@@ -77,8 +77,12 @@ type TurnStatus string
 
 const (
 	TurnCompleted TurnStatus = "completed"
+	// TurnCancelled: a client called Cancel, or the bot is shutting down.
 	TurnCancelled TurnStatus = "cancelled"
-	TurnFailed    TurnStatus = "failed"
+	// TurnTimedOut: the turn hit a deadline — the bot's --turn-timeout or
+	// the agent's own request_timeout / stream-idle watchdog.
+	TurnTimedOut TurnStatus = "timed_out"
+	TurnFailed   TurnStatus = "failed"
 )
 
 // TurnSummary is carried by turn_end and returned by a blocking send.

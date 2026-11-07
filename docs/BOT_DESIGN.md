@@ -80,7 +80,7 @@
 | `compact` | `compact` | 上下文压缩统计 |
 | `question` / `question_answered` | `question` | ask_clarification |
 | `error` | `error` | 非致命错误（取消引起的错误不重复上报） |
-| `turn_end` | `turn`（status: `completed/cancelled/failed`、最终输出、usage、工具调用数）、`usage` | 一定会到达 |
+| `turn_end` | `turn`（status: `completed/cancelled/timed_out/failed`、最终输出、usage、工具调用数）、`usage` | 一定会到达，且是该 turn 的最后一个事件 |
 | `gap` | — | seq=0，合成事件：请求的事件已被逐出回放缓冲或客户端落后被断开 → 重新拉 transcript 后从 `last_seq` 订阅 |
 | `heartbeat` | — | seq=0，NDJSON/WS 保活（SSE 用注释行） |
 
@@ -94,6 +94,10 @@
 - WebSocket：`{"op":"subscribe","session_id":"…","since":<seq>}`。
 
 注册订阅与取回放在同一把锁内完成，回放和实时流之间不会漏事件。发布永不阻塞：订阅者缓冲（1024）满了就被断开并收到 `gap`，bot 本身不会被慢客户端拖住。
+
+只要回放不能精确接上客户端的游标就报 `gap`：`since` 之后的事件已被逐出，或 `since` 超过了当前总线（会话被空闲回收后重新加载、或 bot 重启过）。会话从存储重新加载时，seq 从当前时间（微秒）起编号，保证旧游标一定落在新区间之前而被识别出来；因此 seq 只保证单调递增，不保证连续，客户端应把它当作不透明的游标。`since=0` 表示「从当前总线的第一条事件开始」。
+
+turn 的结束状态：`cancelled` 是客户端调用 cancel 或 bot 关闭；`timed_out` 是触到截止时间（`--turn-timeout`，或 agent 自身的 `request_timeout`）；其余错误为 `failed`。取消后若工具不响应 ctx，bot 最多等 10s 便放弃该次运行并结束 turn，之后那次运行再产生的任何事件都会被丢弃，不会出现在 `turn_end` 之后。
 
 ---
 

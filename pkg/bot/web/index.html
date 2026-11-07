@@ -294,6 +294,7 @@
       case "turn_end": {
         const t = e.turn || {};
         if (t.status === "cancelled") note("已停止");
+        else if (t.status === "timed_out") note("已超时：" + (t.error || ""), "err");
         else if (t.status === "failed") note("失败：" + (t.error || ""), "err");
         else if (t.usage) note(`tokens ${t.usage.input_tokens || 0} in / ${t.usage.output_tokens || 0} out · ${t.tool_calls} tool calls`);
         state.turnEl = null; setRunning(false); break;

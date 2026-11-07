@@ -20,12 +20,17 @@ import (
 // fakeRuntime answers each turn according to the user's message:
 //
 //	"block"  — waits for cancellation
+//	"orphan" — waits for cancellation, then emits once more after release
 //	"ask"    — asks a question and echoes the answer
 //	"fail"   — returns an error
 //	anything else — streams "echo: <msg>" in two deltas
 type fakeRuntime struct {
 	mu     sync.Mutex
 	closed int
+	// release unblocks the background emitter of an "orphan" turn;
+	// lateEmitted is closed once it has called Emit.
+	release     chan struct{}
+	lateEmitted chan struct{}
 }
 
 func (f *fakeRuntime) Info() Info {
@@ -55,6 +60,16 @@ func (c *fakeConv) RunTurn(ctx context.Context, in TurnInput) (*TurnOutput, erro
 		return &TurnOutput{Messages: msgs, FinalOutput: text, Usage: &agent.Usage{InputTokens: 3, OutputTokens: 2}, LLMTurns: 1}
 	}
 	switch last {
+	case "orphan":
+		// Models a run abandoned after cancel: something it started keeps
+		// emitting after RunTurn has returned.
+		go func() {
+			<-c.rt.release
+			in.Emit(Event{Type: EventTextDelta, Text: "late"})
+			close(c.rt.lateEmitted)
+		}()
+		<-ctx.Done()
+		return &TurnOutput{Messages: in.Messages}, ctx.Err()
 	case "block":
 		<-ctx.Done()
 		return &TurnOutput{Messages: in.Messages}, ctx.Err()
@@ -308,6 +323,132 @@ func TestBusLagAndGap(t *testing.T) {
 	_, backlog, gap := b.subscribe(0)
 	if !gap || len(backlog) != 4 || backlog[0].Seq != int64(subscriberBuffer-2) {
 		t.Fatalf("gap=%v backlog=%d first=%d", gap, len(backlog), backlog[0].Seq)
+	}
+}
+
+func TestManagerDropsEventsAfterTurnEnd(t *testing.T) {
+	m, _, rt := newTestManager(t)
+	rt.release = make(chan struct{})
+	rt.lateEmitted = make(chan struct{})
+	info, _ := m.CreateSession(CreateSessionRequest{})
+	sub, _, _, _ := m.Subscribe(info.ID, -1)
+	defer sub.Close()
+
+	turn, _ := m.Send(info.ID, SendRequest{Content: "orphan"})
+	_ = m.Cancel(info.ID)
+	collectUntil(t, sub, EventTurnEnd)
+	waitTurn(t, turn)
+	before := m.mustBusSeq(t, info.ID)
+
+	close(rt.release)
+	<-rt.lateEmitted
+	select {
+	case e := <-sub.C:
+		t.Fatalf("event after turn_end: %+v", e)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if after := m.mustBusSeq(t, info.ID); after != before {
+		t.Fatalf("bus seq moved %d -> %d after turn_end", before, after)
+	}
+}
+
+func (m *Manager) mustBusSeq(t *testing.T, id string) int64 {
+	t.Helper()
+	s, err := m.load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.bus.lastSeq()
+}
+
+func TestManagerTimeoutStatus(t *testing.T) {
+	m, err := NewManager(Options{Runtime: &fakeRuntime{}, IdleTimeout: -1, TurnTimeout: 30 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+	info, _ := m.CreateSession(CreateSessionRequest{})
+	turn, _ := m.Send(info.ID, SendRequest{Content: "block"})
+	if sum := waitTurn(t, turn); sum.Status != TurnTimedOut || sum.Error == "" {
+		t.Fatalf("summary = %+v, want timed_out", sum)
+	}
+}
+
+func TestManagerGapAfterReload(t *testing.T) {
+	m, _, _ := newTestManager(t)
+	info, _ := m.CreateSession(CreateSessionRequest{})
+	waitTurn(t, must(m.Send(info.ID, SendRequest{Content: "hi"})))
+	cursor := m.mustBusSeq(t, info.ID)
+
+	sub, backlog, gap, _ := m.Subscribe(info.ID, cursor)
+	sub.Close()
+	if gap || len(backlog) != 0 {
+		t.Fatalf("caught-up cursor: gap=%v backlog=%d", gap, len(backlog))
+	}
+
+	m.evictIdle(time.Now().Add(time.Hour))
+	sub, backlog, gap, err := m.Subscribe(info.ID, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub.Close()
+	if m.mustBusSeq(t, info.ID) <= cursor {
+		t.Fatal("reloaded bus must number past every cursor of the old one")
+	}
+	if !gap || len(backlog) != 0 {
+		t.Fatalf("cursor %d on reloaded session: gap=%v backlog=%d, want gap", cursor, gap, len(backlog))
+	}
+	sub, backlog, gap, _ = m.Subscribe(info.ID, 0)
+	sub.Close()
+	if gap || len(backlog) != 0 {
+		t.Fatalf("since=0 on a fresh bus: gap=%v backlog=%d", gap, len(backlog))
+	}
+
+	// A fresh bus that has since published must still flag the stale cursor.
+	waitTurn(t, must(m.Send(info.ID, SendRequest{Content: "again"})))
+	sub, _, gap, _ = m.Subscribe(info.ID, cursor)
+	sub.Close()
+	if !gap {
+		t.Fatalf("stale cursor %d ahead of reloaded bus (seq %d) must report a gap", cursor, m.mustBusSeq(t, info.ID))
+	}
+}
+
+func TestBusGapRulesWithBase(t *testing.T) {
+	b := newBusAt(8, 100)
+	b.publish(Event{Type: EventTextDelta})
+	b.publish(Event{Type: EventTextDelta})
+	for _, c := range []struct {
+		since int64
+		gap   bool
+		n     int
+	}{{0, false, 2}, {100, false, 2}, {101, false, 1}, {102, false, 0}, {5, true, 2}, {99, true, 2}, {103, true, 0}} {
+		_, backlog, gap := b.subscribe(c.since)
+		if gap != c.gap || len(backlog) != c.n {
+			t.Errorf("since=%d: gap=%v n=%d, want gap=%v n=%d", c.since, gap, len(backlog), c.gap, c.n)
+		}
+	}
+}
+
+func TestBusGapRules(t *testing.T) {
+	b := newBus(4)
+	if _, _, gap := b.subscribe(3); !gap {
+		t.Fatal("empty bus, since>0: want gap")
+	}
+	for i := 0; i < 6; i++ {
+		b.publish(Event{Type: EventTextDelta})
+	}
+	cases := []struct {
+		since int64
+		gap   bool
+		n     int
+	}{
+		{-1, false, 0}, {0, true, 4}, {1, true, 4}, {2, false, 4}, {5, false, 1}, {6, false, 0}, {7, true, 0},
+	}
+	for _, c := range cases {
+		_, backlog, gap := b.subscribe(c.since)
+		if gap != c.gap || len(backlog) != c.n {
+			t.Errorf("since=%d: gap=%v n=%d, want gap=%v n=%d", c.since, gap, len(backlog), c.gap, c.n)
+		}
 	}
 }
 
