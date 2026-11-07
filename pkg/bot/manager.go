@@ -223,7 +223,7 @@ func (m *Manager) GetSession(id string) (SessionInfo, []models.Message, error) {
 		return SessionInfo{}, nil, err
 	}
 	s.mu.Lock()
-	msgs := append([]models.Message(nil), s.messages...)
+	msgs := append(make([]models.Message, 0, len(s.messages)), s.messages...)
 	s.mu.Unlock()
 	return s.info(), msgs, nil
 }

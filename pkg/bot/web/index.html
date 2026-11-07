@@ -139,7 +139,7 @@
         const p = state.pending.get(msg.id); if (!p) return;
         state.pending.delete(msg.id);
         msg.ok ? p.resolve(msg.data) : p.reject(msg.error || { message: "error" });
-      } else if (msg.kind === "event") onEvent(msg.event);
+      } else if (msg.kind === "event") msg.sub === "*" ? onLifecycle(msg.event) : onEvent(msg.event);
     };
     ws.onclose = async () => {
       setConn("bad");
@@ -206,7 +206,7 @@
 
   function drawTranscript(messages) {
     let aiEl = null;
-    for (const m of messages) {
+    for (const m of messages || []) {
       if (m.role === "human") { addMsg("human", "你").bubble.innerHTML = render(m.content); aiEl = null; }
       else if (m.role === "ai") {
         if (!aiEl) aiEl = addMsg("ai", "DeepAI");
@@ -243,16 +243,22 @@
     if (!state.turnEl) { state.turnEl = addMsg("ai", "DeepAI"); state.turnText = null; }
     return state.turnEl;
   }
-  function onEvent(e) {
-    if (!e) return;
-    if (!e.session_id || e.type === "session_created" || e.type === "session_deleted") {
-      if (e.type === "session_created" || e.type === "session_deleted") refreshSessions().catch(() => {});
-    }
-    if (e.type === "turn_start" || e.type === "turn_end") {
+  // The "*" feed only drives the sidebar; its seq counter is separate from
+  // every session's, so it must never touch a session's resume cursor.
+  function onLifecycle(e) {
+    if (!e || e.type === "heartbeat") return;
+    if (e.type === "session_created" || e.type === "session_deleted" || e.type === "turn_end") {
+      refreshSessions().then(() => {
+        const s = state.sessions.get(state.current);
+        if (s) $("title").textContent = s.title || s.id;
+      }).catch(() => {});
+    } else if (e.type === "turn_start") {
       const s = state.sessions.get(e.session_id);
-      if (s) { s.status = e.type === "turn_start" ? "running" : "idle"; if (e.type === "turn_end") s.msg_count = (s.msg_count || 0) + 2; drawSessions(); }
+      if (s) { s.status = "running"; drawSessions(); }
     }
-    if (e.session_id !== state.current || e.type === "heartbeat") return;
+  }
+  function onEvent(e) {
+    if (!e || e.session_id !== state.current || e.type === "heartbeat") return;
     if (e.seq) {
       if (e.seq <= (state.lastSeq.get(e.session_id) || 0)) return;
       state.lastSeq.set(e.session_id, e.seq);

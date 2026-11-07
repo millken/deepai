@@ -134,6 +134,9 @@ func TestManagerTurnStreamsAndPersists(t *testing.T) {
 	if info.Model != "fake" {
 		t.Fatalf("model = %q, want default", info.Model)
 	}
+	if _, msgs, _ := m.GetSession(info.ID); msgs == nil {
+		t.Fatal("new session transcript must be an empty array, not null")
+	}
 	sub, _, _, err := m.Subscribe(info.ID, -1)
 	if err != nil {
 		t.Fatal(err)
@@ -516,6 +519,7 @@ func TestServerWebSocket(t *testing.T) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	var events []Event
+	var info SessionInfo
 	call := func(req WSRequest) WSMessage {
 		t.Helper()
 		if err := websocket.JSON.Send(conn, req); err != nil {
@@ -527,6 +531,9 @@ func TestServerWebSocket(t *testing.T) {
 				t.Fatal(err)
 			}
 			if msg.Kind == "event" {
+				if msg.Sub != info.ID {
+					t.Fatalf("event %s tagged sub=%q, want %q", msg.Event.Type, msg.Sub, info.ID)
+				}
 				events = append(events, *msg.Event)
 				continue
 			}
@@ -541,7 +548,6 @@ func TestServerWebSocket(t *testing.T) {
 		t.Fatalf("create: %+v", reply.Error)
 	}
 	raw, _ := json.Marshal(reply.Data)
-	var info SessionInfo
 	_ = json.Unmarshal(raw, &info)
 
 	if r := call(WSRequest{ID: "2", Op: "subscribe", SessionID: info.ID}); !r.OK {

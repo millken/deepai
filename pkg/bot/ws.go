@@ -36,9 +36,14 @@ type WSRequest struct {
 
 // WSMessage is a server → client WebSocket frame: either a reply to a
 // request (Kind "reply") or a pushed event (Kind "event").
+//
+// Sub names the subscription an event belongs to ("*" for the lifecycle
+// feed, else the session id). Each feed has its own Seq counter, so clients
+// must track their resume cursor per Sub.
 type WSMessage struct {
 	Kind  string    `json:"kind"`
 	ID    string    `json:"id,omitempty"`
+	Sub   string    `json:"sub,omitempty"`
 	OK    bool      `json:"ok,omitempty"`
 	Data  any       `json:"data,omitempty"`
 	Error *apiError `json:"error,omitempty"`
@@ -220,18 +225,19 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 	if sessionID == "*" {
 		sessionID = ""
 	}
+	push := func(e Event) { c.send(ctx, WSMessage{Kind: "event", Sub: key, Event: &e}) }
 	go func() {
 		if gap {
-			c.send(ctx, WSMessage{Kind: "event", Event: &Event{Type: EventGap, SessionID: sessionID}})
+			push(Event{Type: EventGap, SessionID: sessionID})
 		}
-		for i := range backlog {
-			c.send(ctx, WSMessage{Kind: "event", Event: &backlog[i]})
+		for _, e := range backlog {
+			push(e)
 		}
 		for e := range sub.C {
-			c.send(ctx, WSMessage{Kind: "event", Event: &e})
+			push(e)
 		}
 		if sub.Lagged() {
-			c.send(ctx, WSMessage{Kind: "event", Event: &Event{Type: EventGap, SessionID: sessionID}})
+			push(Event{Type: EventGap, SessionID: sessionID})
 		}
 	}()
 	return nil
