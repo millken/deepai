@@ -52,6 +52,7 @@ type AgentRuntimeConfig struct {
 	MemoryExtractor memory.Extractor
 	// MemoryUserID is the long-term memory scope; empty = DefaultMemoryUserID.
 	MemoryUserID string
+
 	AgentCatalog []agent.AgentInfo
 
 	KeepFullTurns          int
