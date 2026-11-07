@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/schedule"
 )
 
 //go:embed web
@@ -36,6 +37,10 @@ type ServerOptions struct {
 	// headers). Empty disables auth; the deepai-bot command only allows that
 	// on a loopback listener.
 	Token string
+	// Schedules is the (optional) timed-task service. Nil means the feature
+	// is disabled: every schedule endpoint returns 404 and the tool is not
+	// registered (docs/BOT_SCHEDULER_DESIGN.md §11).
+	Schedules *schedule.Service
 	// AllowedOrigins lists browser origins (scheme://host[:port]) that may
 	// call the API cross-origin, e.g. a separately hosted web client. "*"
 	// allows any origin. The bot's own web console is always same-origin.
@@ -47,10 +52,11 @@ type ServerOptions struct {
 
 // Server is the bot's http.Handler.
 type Server struct {
-	opts ServerOptions
-	m    *Manager
-	log  *slog.Logger
-	mux  *http.ServeMux
+	opts      ServerOptions
+	m         *Manager
+	schedules *schedule.Service
+	log       *slog.Logger
+	mux       *http.ServeMux
 }
 
 // NewServer builds the handler. Routes are documented in docs/BOT_DESIGN.md.
@@ -59,7 +65,7 @@ func NewServer(opts ServerOptions) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{opts: opts, m: opts.Manager, log: log, mux: http.NewServeMux()}
+	s := &Server{opts: opts, m: opts.Manager, schedules: opts.Schedules, log: log, mux: http.NewServeMux()}
 
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -76,6 +82,22 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("GET /v1/sessions/{id}/events", s.auth(s.handleSessionEvents))
 	s.mux.Handle("GET /v1/events", s.auth(s.handleGlobalEvents))
 	s.mux.Handle("GET /v1/ws", s.auth(s.handleWS))
+
+	// schedule endpoints (handlers report 404 when Schedules is nil)
+	s.mux.Handle("GET /v1/schedules", s.auth(s.handleListSchedules))
+	s.mux.Handle("POST /v1/schedules", s.auth(s.handleCreateSchedule))
+	s.mux.Handle("GET /v1/schedules/{id}", s.auth(s.handleGetSchedule))
+	s.mux.Handle("PATCH /v1/schedules/{id}", s.auth(s.handlePatchSchedule))
+	s.mux.Handle("DELETE /v1/schedules/{id}", s.auth(s.handleDeleteSchedule))
+	s.mux.Handle("POST /v1/schedules/{id}/pause", s.auth(s.handlePauseSchedule))
+	s.mux.Handle("POST /v1/schedules/{id}/resume", s.auth(s.handleResumeSchedule))
+	s.mux.Handle("POST /v1/schedules/{id}/approve", s.auth(s.handleApproveSchedule))
+	s.mux.Handle("POST /v1/schedules/{id}/run", s.auth(s.handleRunSchedule))
+	s.mux.Handle("POST /v1/schedules/{id}/skip", s.auth(s.handleSkipSchedule))
+	s.mux.Handle("GET /v1/schedules/{id}/runs", s.auth(s.handleListRuns))
+	s.mux.Handle("GET /v1/runs/{id}", s.auth(s.handleGetRun))
+	s.mux.Handle("POST /v1/runs/{id}/cancel", s.auth(s.handleCancelRun))
+	s.mux.Handle("POST /v1/schedule/validate", s.auth(s.handleValidateSchedule))
 
 	if !opts.DisableWebUI {
 		sub, _ := fs.Sub(webFS, "web")
@@ -472,7 +494,11 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 // WebSocket transport reuses the codes.
 func errorStatus(err error) (int, string) {
 	var locked *models.ErrSessionLocked
+	var schedErr *schedule.Error
 	switch {
+	case errors.As(err, &schedErr), errors.Is(err, schedule.ErrNotFound),
+		errors.Is(err, schedule.ErrConflict), errors.Is(err, schedule.ErrBusy):
+		return schedule.HTTPStatus(err), string(schedule.ErrorCode(err))
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrBusy):

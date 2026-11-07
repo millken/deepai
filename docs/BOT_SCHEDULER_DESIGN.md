@@ -419,7 +419,7 @@ P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
 
 ### 7.3 实现位置
 
-回答时钟和自动回答由 bot 层的 `scheduleDispatcher` 实现：它在定时触发的 turn 上包一层 `UserInteraction`（与现有 `turnInteraction` 组合），并通过 `Service.UpdateRun` 回写 `waiting_input`/`running`/`auto_answers`。调度循环不参与等待（4.1），`pkg/agent` 不需要修改。
+回答时钟和自动回答由 bot 层的 `scheduleDispatcher` 实现：Manager 在 `turnInteraction` 上暴露 `turnHooks`（`QuestionAsked` / `QuestionSettled` / `TurnEnded`），调度器为每个定时 turn 注入 `scheduleQuestionHooks`，负责每个提问的回答时钟、`assume` 自动回答、`auto_answers` 计数，并通过 `Service.UpdateRunInteraction` 回写 `waiting_input` ↔ `running`。执行时钟的 `Pause()` / `Resume()` 由 Manager 在提问时统一处理（对所有 turn 生效），因此定时 turn 不需要包一层 `UserInteraction`，`pkg/agent` 也不需要修改。调度循环不参与等待（4.1）。
 
 ## 8. 内置工具 `schedule`
 
@@ -437,7 +437,11 @@ P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
   "timezone": "Asia/Taipei",              // 缺省 schedule.timezone → 系统时区
   "session_mode": "dedicated",
   "notify": "always",
-  "timeout": "30m",
+  "timeout": "30m",                       // 执行时长上限，等待回答期间暂停
+  "answer_timeout": "30m",                // 每个提问的等待上限
+  "on_answer_timeout": "assume",          // assume | fail
+  "max_auto_answers": 3,
+  "max_tool_calls": 0,                    // 0 = 沿用 bot 配置
   "end_at": null, "max_runs": null,
   "request_id": "…",                      // run_now 幂等键，缺省由工具按 turn_id 生成
   "limit": 20                             // list/runs
@@ -602,6 +606,28 @@ schedule:
 | **P3** | 单任务工具白名单；运行中 steer（需 `pkg/agent` 配合）；任务链（A 完成后触发 B）；按结果条件通知 |
 
 **测试策略**：`Scheduler` 依赖可注入的 `Clock` 接口（`Now()`、`After(d)`），测试中用假时钟推进时间，不 sleep；Dispatcher 用假实现记录调用；bot 层集成测试复用现有 `fakeRuntime`。
+
+### 12.1 P1 实现状态（2026-11-07，已全部完成）
+
+| 已落地 | 位置 |
+|---|---|
+| 模型、`Store` 接口、内存 + SQLite 存储与迁移（含 `UNIQUE(schedule_id, slot)` / `request_id`、租约、version、历史清理） | `pkg/schedule/{types,trigger,store,store_sqlite}.go` |
+| `once` / `interval` 触发、任务级时区、`cron` 明确拒绝、槽位唯一与 skip 占槽 | `pkg/schedule/trigger.go`、`service.go` |
+| `Service`（CRUD / pause / resume / approve / skip / run_now / cancel / validate / finish / 启动恢复 / 每日上限 / `UpdateRunInteraction`） | `pkg/schedule/service.go` |
+| 非阻塞 `Scheduler`（最小堆 + 单定时器 + kick、overlap、并发、会话忙排队、queue_deadline、租约与备用模式） | `pkg/schedule/scheduler.go` |
+| `schedule` 工具（`action` 全套、`ask` 确认不留半成品、嵌套限制、返回当前时间与 `next_runs`、无人值守参数） | `pkg/schedule/tool.go`、`api.go` |
+| REST（§9.2 全部路径）、WS（§9.3 全部 ops）、6 类全局 `schedule_*` 事件 | `pkg/bot/schedule_http.go`、`protocol.go`、`server.go`、`ws.go` |
+| `bot.scheduleDispatcher`：`Manager.SendWithOptions` → 普通 turn → `turn_end` 回写 `FinishRun`；`dedicated/new/origin` 会话；`bot_shutdown` / `answer_timeout` / `replaced` 映射 | `pkg/bot/{schedule,schedule_questions}.go`、`manager.go` |
+| §7.2 可暂停 `turnClock`（剩余额度 + 引用计数 `Pause/Resume` + `WithCancelCause`）与 `cancel_source`（client / shutdown / scheduler）；执行额度 = `min(Schedule.timeout, --turn-timeout)` | `pkg/bot/{turnclock,manager,protocol}.go` |
+| §7.1 `waiting_input`、`answer_timeout`、`assume` 自动回答（`question_answered.auto`）、`max_auto_answers` 上限、客户端回答后恢复 `running` | `pkg/bot/schedule_questions.go` |
+| 单任务 `max_tool_calls`（`TurnInput` per-turn 覆盖，不改 `pkg/agent`） | `pkg/bot/{runtime,agentruntime,schedule}.go` |
+| 装配：`schedule:` 配置段、`--no-schedule`、工具注册、调度器启停、系统提示注入当前时间、优雅关闭顺序 | `cmd/deepai-bot/{schedule,runtime,serve}.go`、`pkg/commands/setup.go` |
+
+**说明与后续**：
+
+1. 备用进程只写库不执行；`run_now` / 修改 / `cancel_requested_at` 由租约持有者在下一次同步 tick（≤ 20s）重载后生效，响应统一带 `scheduler: "standby"`。
+2. 按 §12 属 **P2**：`notify` 与 `pkg/hook` 的三个新事件（含 `schedule_ask` 推送）、Web 控制台任务页签、`misfire=run_once` 补跑、自写 cron。
+3. `answer_timeout` 到期后 `assume` 自动回答会写回 `auto_answers`，`fail` / 次数用尽时以 `cancel_source=scheduler` 取消 turn，Run 记 `failed(error_code=answer_timeout)`；等待回答期间执行时钟暂停，不会误判 `timed_out`。
 
 ## 13. 关键取舍
 

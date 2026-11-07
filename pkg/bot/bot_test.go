@@ -27,6 +27,9 @@ import (
 type fakeRuntime struct {
 	mu     sync.Mutex
 	closed int
+	// lastMaxToolCalls records the per-turn override the Manager passed to
+	// RunTurn (0 = use the bot-wide limit).
+	lastMaxToolCalls int
 	// release unblocks the background emitter of an "orphan" turn;
 	// lateEmitted is closed once it has called Emit.
 	release     chan struct{}
@@ -52,6 +55,9 @@ func (c *fakeConv) Close() error {
 }
 
 func (c *fakeConv) RunTurn(ctx context.Context, in TurnInput) (*TurnOutput, error) {
+	c.rt.mu.Lock()
+	c.rt.lastMaxToolCalls = in.MaxToolCalls
+	c.rt.mu.Unlock()
 	last := in.Messages[len(in.Messages)-1].Content
 	reply := func(text string) *TurnOutput {
 		msgs := append(append([]models.Message(nil), in.Messages...), models.Message{

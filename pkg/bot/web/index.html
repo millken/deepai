@@ -289,7 +289,7 @@
       }
       case "compact": note("上下文已压缩"); break;
       case "question": showQuestion(e.question); break;
-      case "question_answered": document.querySelectorAll(`[data-q="${e.question.id}"]`).forEach((el) => { el.innerHTML = `<b>已回答：</b>${esc(e.question.answer)}`; }); break;
+      case "question_answered": document.querySelectorAll(`[data-q="${e.question.id}"]`).forEach((el) => { el.innerHTML = `<b>${e.question.auto ? "已自动回答" : "已回答"}：</b>${esc(e.question.answer)}`; }); break;
       case "error": note("错误：" + ((e.error && e.error.message) || ""), "err"); break;
       case "turn_end": {
         const t = e.turn || {};
