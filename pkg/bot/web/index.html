@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepAI Bot</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --panel2: #1d222b; --border: #2a313c;
+    --text: #e6e9ef; --muted: #8b95a5; --accent: #6aa7ff; --accent2: #3d7be0;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; display: flex; }
+  button { font: inherit; color: inherit; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+  button.danger { border-color: var(--err); color: var(--err); }
+  select, input, textarea { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  aside { width: 272px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  .brand { padding: 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
+  .brand b { font-size: 15px; letter-spacing: .3px; }
+  .conn { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--err); } .dot.run { background: var(--warn); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  #sessions { flex: 1; overflow-y: auto; padding: 8px; }
+  .sess { padding: 9px 10px; border-radius: 8px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+  .sess:hover { background: var(--panel2); }
+  .sess.active { background: #22324d; }
+  .sess .t { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .n { font-size: 11px; color: var(--muted); }
+  .side-foot { padding: 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+  .side-foot button { flex: 1; }
+
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 860px; width: 100%; margin: 0 auto; }
+  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .bubble { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.human .bubble { background: #1a2740; border-color: #27406b; }
+  .bubble pre { background: #0b0d11; border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow-x: auto; white-space: pre; margin: 8px 0; }
+  .bubble code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  .tools { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+  .tool { font: 12px ui-monospace, Menlo, Consolas, monospace; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+  .tool summary { cursor: pointer; list-style: none; }
+  .tool .st-ok { color: var(--ok); } .tool .st-err { color: var(--err); } .tool .st-run { color: var(--warn); }
+  .tool pre { white-space: pre-wrap; max-height: 240px; overflow: auto; margin: 6px 0 2px; color: var(--text); }
+  .note { font-size: 12px; color: var(--muted); text-align: center; }
+  .err { color: var(--err); }
+  .question { border: 1px solid var(--warn); background: #2a2310; border-radius: var(--radius); padding: 12px 14px; }
+  .question .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .question .free { display: flex; gap: 8px; margin-top: 10px; }
+  .question .free input { flex: 1; }
+
+  footer { border-top: 1px solid var(--border); padding: 14px 20px; }
+  .composer { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  .composer textarea { flex: 1; resize: none; min-height: 44px; max-height: 220px; padding: 11px 12px; }
+  .empty { margin: auto; text-align: center; color: var(--muted); }
+  .empty h2 { color: var(--text); font-weight: 600; }
+
+  #auth { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; }
+  #auth .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px; width: 420px; display: flex; flex-direction: column; gap: 12px; }
+  #auth code { color: var(--accent); }
+  @media (max-width: 720px) { aside { display: none; } }
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand"><b>DeepAI Bot</b><span class="conn"><span id="connDot" class="dot"></span><span id="connText">offline</span></span></div>
+  <div id="sessions"></div>
+  <div class="side-foot"><button class="primary" id="newBtn">+ 新会话</button></div>
+</aside>
+<main>
+  <header>
+    <h1 id="title">—</h1>
+    <select id="model" title="模型"></select>
+    <button id="cancelBtn" class="danger" disabled>停止</button>
+  </header>
+  <div id="log"><div class="empty"><h2>DeepAI Bot</h2><p>选择或新建一个会话开始。</p></div></div>
+  <footer>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+      <button class="primary" id="sendBtn" disabled>发送</button>
+    </div>
+  </footer>
+</main>
+<div id="auth"><div class="card">
+  <b>需要访问令牌</b>
+  <span class="note" style="text-align:left">运行 <code>deepai-bot token</code> 获取令牌。</span>
+  <input id="tokenInput" type="password" placeholder="token">
+  <button class="primary" id="tokenBtn">连接</button>
+</div></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    ws: null, reqId: 0, pending: new Map(), retry: 0,
+    sessions: new Map(), current: null, lastSeq: new Map(),
+    running: false, turnEl: null, turnText: null, toolEls: new Map(), info: null,
+  };
+
+  const hash = new URLSearchParams(location.hash.slice(1));
+  if (hash.get("token")) { localStorage.setItem("deepai-bot-token", hash.get("token")); history.replaceState(null, "", location.pathname); }
+  const token = () => localStorage.getItem("deepai-bot-token") || "";
+
+  function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+  function render(text) {
+    return esc(text).replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${code}</code></pre>`)
+      .replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  }
+  function scroll() { const l = $("log"); l.scrollTop = l.scrollHeight; }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/v1/ws?token=${encodeURIComponent(token())}`);
+    state.ws = ws;
+    setConn("connecting");
+    ws.onopen = async () => {
+      state.retry = 0; setConn("ok");
+      try {
+        state.info = await call({ op: "info" });
+        fillModels();
+        await call({ op: "subscribe", session_id: "*" });
+        await refreshSessions();
+        if (state.current) await openSession(state.current, true);
+      } catch (e) { console.error(e); }
+    };
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.kind === "reply") {
+        const p = state.pending.get(msg.id); if (!p) return;
+        state.pending.delete(msg.id);
+        msg.ok ? p.resolve(msg.data) : p.reject(msg.error || { message: "error" });
+      } else if (msg.kind === "event") onEvent(msg.event);
+    };
+    ws.onclose = async () => {
+      setConn("bad");
+      for (const p of state.pending.values()) p.reject({ message: "disconnected" });
+      state.pending.clear();
+      const ok = await fetch("/v1/info", { headers: { Authorization: "Bearer " + token() } }).then((r) => r.status !== 401).catch(() => true);
+      if (!ok) { $("auth").style.display = "flex"; return; }
+      setTimeout(connect, Math.min(10000, 500 * 2 ** state.retry++));
+    };
+  }
+  function call(req) {
+    return new Promise((resolve, reject) => {
+      if (!state.ws || state.ws.readyState !== 1) return reject({ message: "not connected" });
+      req.id = String(++state.reqId);
+      state.pending.set(req.id, { resolve, reject });
+      state.ws.send(JSON.stringify(req));
+    });
+  }
+  function setConn(s) {
+    $("connDot").className = "dot " + (s === "ok" ? "ok" : s === "bad" ? "bad" : "");
+    $("connText").textContent = s === "ok" ? "online" : s === "bad" ? "offline" : "connecting…";
+  }
+  function fillModels() {
+    const sel = $("model"); sel.innerHTML = "";
+    for (const m of state.info.models || []) {
+      const o = document.createElement("option"); o.value = m.name; o.textContent = m.name; sel.appendChild(o);
+    }
+  }
+
+  async function refreshSessions() {
+    const { sessions } = await call({ op: "list_sessions", limit: 100 });
+    state.sessions = new Map(sessions.map((s) => [s.id, s]));
+    drawSessions();
+  }
+  function drawSessions() {
+    const box = $("sessions"); box.innerHTML = "";
+    for (const s of state.sessions.values()) {
+      const el = document.createElement("div");
+      el.className = "sess" + (s.id === state.current ? " active" : "");
+      el.innerHTML = `<span class="dot ${s.status === "running" ? "run" : ""}"></span><span class="t">${esc(s.title || s.id)}</span><span class="n">${s.msg_count || 0}</span>`;
+      el.onclick = () => openSession(s.id);
+      box.appendChild(el);
+    }
+  }
+
+  async function openSession(id, resume) {
+    if (state.current && state.current !== id) call({ op: "unsubscribe", session_id: state.current }).catch(() => {});
+    state.current = id; drawSessions();
+    const { session, messages } = await call({ op: "get_session", session_id: id });
+    state.sessions.set(id, session);
+    $("title").textContent = session.title || session.id;
+    if (session.model) $("model").value = session.model;
+    $("log").innerHTML = "";
+    state.turnEl = null; state.toolEls.clear();
+    drawTranscript(messages);
+    setRunning(session.status === "running");
+    // Replay the running turn's events (if any) from the buffer, then go live.
+    const since = session.status === "running" ? 0 : session.last_seq;
+    state.lastSeq.set(id, since);
+    await call({ op: "subscribe", session_id: id, since });
+    for (const q of session.pending || []) showQuestion(q);
+    $("input").disabled = false; $("input").focus();
+  }
+
+  function drawTranscript(messages) {
+    let aiEl = null;
+    for (const m of messages) {
+      if (m.role === "human") { addMsg("human", "你").bubble.innerHTML = render(m.content); aiEl = null; }
+      else if (m.role === "ai") {
+        if (!aiEl) aiEl = addMsg("ai", "DeepAI");
+        if (m.content) { const b = document.createElement("div"); b.className = "bubble"; b.innerHTML = render(m.content); aiEl.root.appendChild(b); }
+        for (const tc of m.tool_calls || []) aiEl.tools.appendChild(toolEl(tc.name, "completed", "", JSON.stringify(tc.arguments || {})));
+      }
+    }
+    scroll();
+  }
+  function addMsg(role, who) {
+    const root = document.createElement("div"); root.className = "msg " + role;
+    root.innerHTML = `<div class="who">${who}</div>`;
+    const tools = document.createElement("div"); tools.className = "tools";
+    const bubble = document.createElement("div"); bubble.className = "bubble";
+    root.appendChild(tools);
+    if (role === "human") root.appendChild(bubble);
+    $("log").appendChild(root);
+    return { root, tools, bubble };
+  }
+  function toolEl(name, status, preview, args) {
+    const d = document.createElement("details"); d.className = "tool";
+    setTool(d, name, status, preview, args);
+    return d;
+  }
+  function setTool(d, name, status, preview, args) {
+    const cls = status === "failed" ? "st-err" : status === "running" || status === "pending" ? "st-run" : "st-ok";
+    const mark = cls === "st-err" ? "✗" : cls === "st-run" ? "…" : "✓";
+    d.innerHTML = `<summary><span class="${cls}">${mark}</span> ${esc(name)}</summary>` +
+      (args ? `<pre>${esc(args)}</pre>` : "") + (preview ? `<pre>${esc(preview)}</pre>` : "");
+  }
+  function note(text, cls) { const n = document.createElement("div"); n.className = "note " + (cls || ""); n.textContent = text; $("log").appendChild(n); scroll(); }
+
+  function ensureTurn() {
+    if (!state.turnEl) { state.turnEl = addMsg("ai", "DeepAI"); state.turnText = null; }
+    return state.turnEl;
+  }
+  function onEvent(e) {
+    if (!e) return;
+    if (!e.session_id || e.type === "session_created" || e.type === "session_deleted") {
+      if (e.type === "session_created" || e.type === "session_deleted") refreshSessions().catch(() => {});
+    }
+    if (e.type === "turn_start" || e.type === "turn_end") {
+      const s = state.sessions.get(e.session_id);
+      if (s) { s.status = e.type === "turn_start" ? "running" : "idle"; if (e.type === "turn_end") s.msg_count = (s.msg_count || 0) + 2; drawSessions(); }
+    }
+    if (e.session_id !== state.current || e.type === "heartbeat") return;
+    if (e.seq) {
+      if (e.seq <= (state.lastSeq.get(e.session_id) || 0)) return;
+      state.lastSeq.set(e.session_id, e.seq);
+    }
+    switch (e.type) {
+      case "gap": openSession(state.current, true); break;
+      case "turn_start":
+        if (!state.optimistic) addMsg("human", "你").bubble.innerHTML = render(e.text);
+        state.optimistic = false; state.turnEl = null; setRunning(true); scroll(); break;
+      case "text_delta": {
+        const t = ensureTurn();
+        if (!state.turnText) { state.turnText = document.createElement("div"); state.turnText.className = "bubble"; state.turnText.dataset.raw = ""; t.root.appendChild(state.turnText); }
+        state.turnText.dataset.raw += e.text; state.turnText.innerHTML = render(state.turnText.dataset.raw); scroll(); break;
+      }
+      case "tool_call_start": case "tool_call_end": {
+        const t = ensureTurn(); state.turnText = null;
+        const tool = e.tool || {}; let el = state.toolEls.get(tool.id);
+        const status = e.type === "tool_call_start" ? "running" : tool.status;
+        const args = tool.arguments_text || (tool.arguments ? JSON.stringify(tool.arguments) : "");
+        if (!el) { el = toolEl(tool.name, status, tool.result_preview || tool.error, args); state.toolEls.set(tool.id, el); t.root.appendChild(el); }
+        else setTool(el, tool.name, status, tool.result_preview || tool.error, args);
+        scroll(); break;
+      }
+      case "subagent": {
+        const s = e.subagent || {};
+        if (s.type === "task_started" || s.type === "task_completed" || s.type === "task_failed") note(`子代理 ${s.agent_type || ""} ${s.description || ""} · ${s.type.replace("task_", "")}`);
+        break;
+      }
+      case "compact": note("上下文已压缩"); break;
+      case "question": showQuestion(e.question); break;
+      case "question_answered": document.querySelectorAll(`[data-q="${e.question.id}"]`).forEach((el) => { el.innerHTML = `<b>已回答：</b>${esc(e.question.answer)}`; }); break;
+      case "error": note("错误：" + ((e.error && e.error.message) || ""), "err"); break;
+      case "turn_end": {
+        const t = e.turn || {};
+        if (t.status === "cancelled") note("已停止");
+        else if (t.status === "failed") note("失败：" + (t.error || ""), "err");
+        else if (t.usage) note(`tokens ${t.usage.input_tokens || 0} in / ${t.usage.output_tokens || 0} out · ${t.tool_calls} tool calls`);
+        state.turnEl = null; setRunning(false); break;
+      }
+    }
+  }
+  function showQuestion(q) {
+    if (document.querySelector(`[data-q="${q.id}"]`)) return;
+    const box = document.createElement("div"); box.className = "msg";
+    const card = document.createElement("div"); card.className = "question"; card.dataset.q = q.id;
+    card.innerHTML = `<div><b>DeepAI 想确认：</b>${render(q.text)}</div>`;
+    const answer = (a) => call({ op: "answer", session_id: state.current, question_id: q.id, answer: a }).catch((e) => note(e.message, "err"));
+    if (q.options && q.options.length) {
+      const opts = document.createElement("div"); opts.className = "opts";
+      for (const o of q.options) { const b = document.createElement("button"); b.textContent = o; b.onclick = () => answer(o); opts.appendChild(b); }
+      card.appendChild(opts);
+    }
+    const free = document.createElement("div"); free.className = "free";
+    const inp = document.createElement("input"); inp.placeholder = "输入回答…";
+    const ok = document.createElement("button"); ok.textContent = "回答"; ok.className = "primary";
+    ok.onclick = () => inp.value.trim() && answer(inp.value.trim());
+    inp.onkeydown = (ev) => { if (ev.key === "Enter") ok.onclick(); };
+    free.append(inp, ok); card.appendChild(free);
+    box.appendChild(card); $("log").appendChild(box); scroll();
+  }
+  function setRunning(r) {
+    state.running = r;
+    $("cancelBtn").disabled = !r;
+    $("sendBtn").disabled = r || !state.current;
+  }
+
+  async function send() {
+    const text = $("input").value.trim();
+    if (!text || !state.current || state.running) return;
+    $("input").value = ""; autosize();
+    const empty = $("log").querySelector(".empty"); if (empty) empty.remove();
+    addMsg("human", "你").bubble.innerHTML = render(text); scroll();
+    state.optimistic = true; setRunning(true);
+    try { await call({ op: "send", session_id: state.current, content: text, model: $("model").value }); }
+    catch (e) { state.optimistic = false; note("发送失败：" + e.message, "err"); setRunning(false); }
+  }
+  function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(220, t.scrollHeight) + "px"; }
+
+  $("sendBtn").onclick = send;
+  $("input").addEventListener("input", () => { autosize(); $("sendBtn").disabled = state.running || !state.current; });
+  $("input").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); send(); } });
+  $("cancelBtn").onclick = () => call({ op: "cancel", session_id: state.current }).catch((e) => note(e.message, "err"));
+  $("newBtn").onclick = async () => {
+    try { const s = await call({ op: "create_session", model: $("model").value }); state.sessions.set(s.id, s); await openSession(s.id); }
+    catch (e) { note("创建失败：" + e.message, "err"); }
+  };
+  $("tokenBtn").onclick = () => { localStorage.setItem("deepai-bot-token", $("tokenInput").value.trim()); $("auth").style.display = "none"; connect(); };
+
+  connect();
+})();
+</script>
+</body>
+</html>
