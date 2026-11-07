@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -297,6 +299,114 @@ func TestLLMSessionSummarizer_UsesSeparateChat(t *testing.T) {
 	}
 }
 
+func TestRecallOutput_StaysInPromptAfterOffload(t *testing.T) {
+	dir := t.TempDir()
+	body := strings.Repeat("RECALLED_BODY_", (maxToolContentBytes/len("RECALLED_BODY_"))+8)
+	if len(body) <= maxToolContentBytes || len(body) <= offloadThresholdBytes {
+		t.Fatalf("fixture is %d bytes, want above both caps", len(body))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "call-recall.txt"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := tools.NewRegistry()
+	if err := reg.Register(builtin.RecallOutputTool(dir)); err != nil {
+		t.Fatal(err)
+	}
+	p := &recallThenStopProvider{}
+	a := New(AgentConfig{
+		LLMProvider:  p,
+		Tools:        reg,
+		OffloadDir:   dir,
+		OffloadBytes: 64,
+	})
+	result, err := a.Run(context.Background(), "s1", []models.Message{
+		{Role: models.RoleHuman, Content: "need the full output"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	for _, m := range result.Messages {
+		if m.Role == models.RoleTool {
+			stored = m.Content
+			break
+		}
+	}
+	if stored != body {
+		t.Fatalf("stored tool content = %d bytes, want the full %d (offload or the 50KB cap rewrote the recall)", len(stored), len(body))
+	}
+	if strings.Contains(stored, "[offloaded:") || strings.Contains(stored, "[truncated:") {
+		t.Fatal("recalled body was stubbed or truncated")
+	}
+	follow := p.followUp()
+	if !strings.Contains(joinContents(follow), "RECALLED_BODY_") || strings.Contains(joinContents(follow), "[offloaded:") {
+		t.Fatal("the next provider request did not contain the recalled body")
+	}
+	if !strings.Contains(joinContents(follow), body) {
+		t.Fatal("the next provider request clipped the recalled body")
+	}
+}
+
+func TestWindow_KeptTurnsAreNotAged(t *testing.T) {
+	big := strings.Repeat("X", 8000)
+	var msgs []models.Message
+	msgs = append(msgs,
+		models.Message{Role: models.RoleHuman, Content: "turn-1"},
+		models.Message{Role: models.RoleTool, Content: big, ToolResult: &models.ToolResult{CallID: "c1", ToolName: "bash", Content: big}},
+		models.Message{Role: models.RoleHuman, Content: "turn-2"},
+		models.Message{Role: models.RoleAI, Content: strings.Repeat("B", 2000)},
+		models.Message{Role: models.RoleTool, Content: big, ToolResult: &models.ToolResult{CallID: "c2", ToolName: "bash", Content: big}},
+		models.Message{Role: models.RoleHuman, Content: "turn-3"},
+	)
+	aging := &AgingConfig{Enabled: true, MinContextPressure: 0}
+
+	windowed := &promptCaptureProvider{}
+	a := New(AgentConfig{LLMProvider: windowed, KeepFullTurns: 2, Aging: aging})
+	if _, err := a.Run(context.Background(), "s1", msgs); err != nil {
+		t.Fatal(err)
+	}
+	got := joinContents(windowed.snapshot()[0].messages)
+	if strings.Contains(got, "turn-1") {
+		t.Fatal("window kept a dropped turn")
+	}
+	if strings.Count(got, "X") < len(big) {
+		t.Fatal("kept turn's tool result was aged inside the window")
+	}
+	if strings.Contains(got, "re-call bash") {
+		t.Fatal("aging hint landed inside the verbatim window")
+	}
+
+	aged := &promptCaptureProvider{}
+	full := New(AgentConfig{LLMProvider: aged, Aging: aging})
+	if _, err := full.Run(context.Background(), "s1", msgs); err != nil {
+		t.Fatal(err)
+	}
+	fullText := joinContents(aged.snapshot()[0].messages)
+	if !strings.Contains(fullText, "re-call bash") {
+		t.Fatal("window off: expected aging to still trim the previous turn's tool result")
+	}
+}
+
+func TestCompactOnOverflow_DoesNotRewriteUnsentHistory(t *testing.T) {
+	huge := strings.Repeat("OLDDATA", 4000)
+	var msgs []models.Message
+	for i := 0; i < 6; i++ {
+		msgs = append(msgs,
+			models.Message{Role: models.RoleHuman, Content: fmt.Sprintf("old-%d", i)},
+			models.Message{Role: models.RoleTool, Content: huge, ToolResult: &models.ToolResult{CallID: fmt.Sprintf("c%d", i), ToolName: "bash", Content: huge}},
+		)
+	}
+	msgs = append(msgs, models.Message{Role: models.RoleHuman, Content: "current-turn"})
+	a := New(AgentConfig{KeepFullTurns: 1})
+	out, ok := a.compactOnOverflow(msgs, "sys", 1, "test")
+	if ok {
+		t.Fatal("compaction shrunk history the window does not send")
+	}
+	if !strings.Contains(joinContents(out), "OLDDATA") {
+		t.Fatal("unsent history was rewritten")
+	}
+}
+
 func TestOffloadStub_RecallRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	a := New(AgentConfig{OffloadBytes: 64, OffloadDir: dir})
@@ -389,6 +499,44 @@ func (p *promptCaptureProvider) snapshot() []promptCapture {
 	out := make([]promptCapture, len(p.reqs))
 	copy(out, p.reqs)
 	return out
+}
+
+type recallThenStopProvider struct {
+	n    int
+	next []models.Message
+}
+
+func (p *recallThenStopProvider) Chat(context.Context, llm.ChatRequest) (llm.ChatResponse, error) {
+	return llm.ChatResponse{}, nil
+}
+
+func (p *recallThenStopProvider) Stream(_ context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
+	p.n++
+	snap := append([]models.Message(nil), req.Messages...)
+	callN := p.n
+	ch := make(chan llm.StreamChunk, 1)
+	go func() {
+		defer close(ch)
+		if callN == 1 {
+			ch <- llm.StreamChunk{
+				ToolCalls: []models.ToolCall{{
+					ID:        "call-recall",
+					Name:      "recall_output",
+					Arguments: map[string]any{"ref": "call-recall"},
+				}},
+				Stop: "tool_calls",
+				Done: true,
+			}
+			return
+		}
+		p.next = snap
+		ch <- llm.StreamChunk{Message: &models.Message{Role: models.RoleAI, Content: "done"}, Done: true}
+	}()
+	return ch, nil
+}
+
+func (p *recallThenStopProvider) followUp() []models.Message {
+	return p.next
 }
 
 type gateSummarizer struct {

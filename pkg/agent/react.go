@@ -780,7 +780,10 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		// yet include a.turnInjection — maybeCompact appends it (via
 		// appendTurnInjection) to both its internal estimate and its returned
 		// view, exactly once, whether or not compaction actually fires.
-		promptView := buildPromptView(runMessages, a.aging, a.contextWindow)
+		// With the verbatim window on, kept turns are not aged. Aging the
+		// dropped prefix is pointless: windowPromptView replaces it with
+		// the session summary. See promptViewForRequest.
+		promptView := a.promptViewForRequest(runMessages)
 
 		// Unstall check + threshold-triggered compaction (memory flush,
 		// escalating retry, stall bookkeeping) — see maybeCompact.

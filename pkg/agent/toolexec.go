@@ -48,6 +48,12 @@ func toolMessageContent(result models.ToolResult) string {
 	if result.Error != "" {
 		s = result.Error
 	}
+	// recall_output's contract is the full stored body. The 50KB store cap
+	// would clip it again after offload was skipped, so the model would
+	// still not see what it just fetched.
+	if result.ToolName == "recall_output" {
+		return s
+	}
 	if len(s) > maxToolContentBytes {
 		// Rune-safe: this string goes into runMessages, the next provider
 		// request and the session database. A raw byte cut leaves a fragment
@@ -93,6 +99,12 @@ func (a *Agent) offloadIfNeeded(result *models.ToolResult, offloadDir string) bo
 	}
 	limit := a.offloadLimit()
 	if offloadDir == "" || limit <= 0 || len(result.Content) <= limit {
+		return false
+	}
+	// recall_output exists to bring a stored body back into the prompt.
+	// Name check as well as the flag: a wrapper that drops Data must not
+	// turn the recall into another stub.
+	if result.ToolName == "recall_output" {
 		return false
 	}
 	if v, ok := result.Data[models.ToolDataNoOffload].(bool); ok && v {

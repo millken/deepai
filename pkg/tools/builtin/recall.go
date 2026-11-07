@@ -41,7 +41,15 @@ func RecallOutputTool(dir string) models.Tool {
 			if err != nil {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("recall_output: %w", err)
 			}
-			return models.ToolResult{CallID: call.ID, ToolName: call.Name, Content: string(data)}, nil
+			// The point of this call is to put the body back in the prompt.
+			// ToolDataNoOffload keeps offloadIfNeeded from immediately
+			// replacing it with another stub.
+			return models.ToolResult{
+				CallID:   call.ID,
+				ToolName: call.Name,
+				Content:  string(data),
+				Data:     map[string]any{models.ToolDataNoOffload: true},
+			}, nil
 		},
 	}
 }

@@ -190,6 +190,35 @@ func sessionSummaryMessage(text string, covered, boundary int, summaryEnabled bo
 	}
 }
 
+// promptViewForRequest is the transcript before the session window and the
+// turn injection. Aging stays on only when the window is off. Inside the
+// window the kept turns are sent verbatim, which is what the keep-window
+// setting means; turns outside it are replaced by the session summary
+// rather than by an aged stub.
+func (a *Agent) promptViewForRequest(messages []models.Message) []models.Message {
+	if a != nil && a.keepFullTurns > 0 {
+		return messages
+	}
+	var cfg *AgingConfig
+	window := 0
+	if a != nil {
+		cfg = a.aging
+		window = a.contextWindow
+	}
+	return buildPromptView(messages, cfg, window)
+}
+
+// providerTranscriptView is the message list a request sends, minus the
+// trailing turn injection. compactOnOverflow uses it so a compaction is
+// accepted only when it shrinks that list.
+func (a *Agent) providerTranscriptView(messages []models.Message) []models.Message {
+	view := a.promptViewForRequest(messages)
+	if a != nil && a.keepFullTurns > 0 {
+		view = a.windowPromptView(view)
+	}
+	return view
+}
+
 // windowPromptView is the provider view of a transcript: one session-summary
 // message, then the last keepFullTurns user turns in full. Canonical
 // messages are not modified. keepFullTurns <= 0 returns view unchanged.
