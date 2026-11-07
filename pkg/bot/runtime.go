@@ -58,7 +58,7 @@ type TurnOutput struct {
 
 // Store persists sessions. In production it is pkg/chat's SQLite session
 // store over the bot's own database (~/.deepai/bot/bot.db), wrapped in
-// pkg/commands; the CLI's deepai.db is never opened, so bot and CLI
+// cmd/deepai-bot; the CLI's deepai.db is never opened, so bot and CLI
 // sessions, memory and locks are fully separate.
 //
 // bot.db is one file per user, shared by every deepai-bot process, while a
