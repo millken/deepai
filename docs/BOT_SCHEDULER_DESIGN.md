@@ -68,10 +68,11 @@
 ```go
 // pkg/schedule
 type Dispatcher interface {
-    // Fire 启动一次执行并立即返回；最终状态通过 Service.FinishRun 回写。
+    // Fire 启动一次执行并立即返回，不得等待执行或任何锁；最终状态通过
+    // Service.FinishRun 回写。目标会话忙时返回 ErrBusy，Run 留在 pending。
     Fire(ctx context.Context, sch Schedule, run Run) (sessionID, turnID string, err error)
-    // Cancel 中止一次正在执行的 Run。
-    Cancel(run Run) error
+    // Cancel 只发出取消，立即返回；结束仍经由 FinishRun。
+    Cancel(run Run, reason CancelReason) error
 }
 
 type Observer interface { // bot 用它把变化发到全局事件流
@@ -90,26 +91,33 @@ type Observer interface { // bot 用它把变化发到全局事件流
 | `name` | string | 显示名，必填，≤ 80 字 |
 | `prompt` | string | 每次触发发给模型的指令，必填，≤ 8 KB |
 | `trigger` | Trigger | 见 3.3 |
+| `timezone` | string | IANA 时区名，`once`/`interval`/`cron` 共用，见 3.3；缺省 `schedule.timezone` → 系统时区，创建时固化写入 |
 | `session_mode` | enum | `dedicated`（默认）/ `new` / `origin`，见第 6 节 |
 | `session_id` | string | `dedicated` 模式下的固定会话（首次运行时惰性创建） |
 | `model` | string | 空 = bot 默认模型 |
-| `timeout` | duration | 单次运行上限，默认 30m，上限 4h；超时 → Run `timed_out` |
+| `timeout` | duration | 单次运行的**执行时长**上限，默认 30m，上限 4h；不含排队时间和等待回答的时间（7.2）；超时 → Run `timed_out` |
 | `max_tool_calls` | int | 0 = 沿用 bot 配置 |
-| `overlap` | enum | 上一次未结束时：`skip`（默认）/ `queue` / `replace` |
+| `overlap` | enum | 上一次未结束时：`skip`（默认）/ `queue` / `replace`，见 4.2 |
 | `misfire` | enum | 停机期间错过的触发：`run_once`（默认，合并补跑一次）/ `skip` |
 | `misfire_grace` | duration | 超过此宽限的错过触发一律 `missed`；默认 1h（一次性）/ 一个周期（周期性，最多 24h） |
-| `answer_timeout` | duration | 无人值守时 `ask_clarification` 的等待上限，默认 30m，见第 7 节 |
+| `answer_timeout` | duration | 无人值守时每个提问的等待上限，默认 30m，见第 7 节 |
 | `on_answer_timeout` | enum | `assume`（默认，让模型按最合理假设继续）/ `fail` |
-| `notify` | enum | `always`（默认）/ `on_failure` / `never` |
+| `max_auto_answers` | int | 单次 Run 内 `assume` 自动回答的次数上限，默认 3；用尽后再超时按 `fail` 处理 |
+| `notify` | enum | `always`（默认）/ `on_failure` / `never`，见第 10 节 |
 | `end_at` / `max_runs` | time / int | 周期任务终止条件，可空 |
-| `state` | enum | `pending_approval` / `active` / `paused` / `completed` / `deleted` |
+| `state` | enum | `active` / `paused` / `pending_approval` / `completed` / `deleted` |
 | `created_by` | object | `{kind: "model"|"user", session_id, turn_id, client}` |
-| `next_run_at` | time | 冗余，便于列表与启动恢复；`paused` 时仍计算但不触发 |
+| `next_run_at` | time | 下一个计划槽位（3.2.1）；`paused`/`pending_approval` 时为空 |
 | `last_run` | RunSummary | 最近一次的 `{id, status, ended_at}` |
 | `run_count` | int | 已执行次数（不含 `skipped`/`missed`） |
 | `created_at` / `updated_at` | time | |
 
-`completed`：一次性任务执行完、或周期任务到达 `end_at`/`max_runs`。`deleted` 为软删除，保留 30 天供查看历史 Run，之后清理。
+**状态迁移**：
+
+- `completed`：一次性任务执行完、或周期任务到达 `end_at`/`max_runs`。
+- `deleted`：软删除，保留 30 天供查看历史 Run，之后清理。
+- `pause`：清空 `next_run_at`；已在执行的 Run 不受影响；排队中（`pending`）的 Run 记为 `skipped`（`reason=paused`）。暂停期间的槽位不产生任何 Run。
+- `resume`：从"现在"起重算 `next_run_at`（第一个 `> now` 的槽位），**不走 misfire 补跑**——暂停期间不执行是用户的明确意图。一次性任务若 `at` 已过，resume 返回错误 `time_in_past`，需 `update` 新时间。
 
 ### 3.2 Run（一次执行）
 
@@ -117,40 +125,72 @@ type Observer interface { // bot 用它把变化发到全局事件流
 |---|---|
 | `id` | `run_` + 随机 hex |
 | `schedule_id`、`seq` | 所属任务、第几次 |
-| `scheduled_for` | 计划时间；`started_at` / `ended_at` 实际时间 |
-| `trigger` | `timer` / `misfire` / `manual`（run_now） |
+| `trigger` | `timer` / `misfire` / `manual`（run_now）/ `skip` |
+| `slot` | 计划槽位（3.2.1）；`manual` 为空 |
+| `scheduled_for` | 意图执行时间：有槽位时等于 `slot`，`manual` 为请求时刻 |
+| `request_id` | `manual` 的幂等键（客户端或工具生成），可空 |
+| `coalesced` | `misfire` 补跑合并掉的槽位数 |
+| `queued_reason` | `pending` 时为何未开始：`overlap` / `concurrency` / `session_busy` |
+| `queue_deadline` | 排队截止时间，过了仍未开始 → `skipped` |
 | `session_id`、`turn_id` | 执行所在会话与 turn，客户端据此订阅执行过程 |
 | `status` | 见下 |
+| `auto_answers` | 本次 Run 已自动回答的提问数 |
+| `cancel_requested_at` | 取消请求（来自本进程或备用进程，4.4） |
+| `started_at` / `ended_at` | 实际开始 / 结束时间 |
 | `output` | 最终回复（截断至 16 KB；全文在会话 transcript） |
-| `error`、`usage`、`tool_calls` | 来自 `turn_end` |
+| `error`、`error_code`、`usage`、`tool_calls` | 来自 `turn_end` 或调度器 |
 
 ```
 pending ──► running ──┬──► completed
-   │                  ├──► failed
-   │                  ├──► timed_out
-   │                  └──► cancelled
-   │        ▲   │
-   │        │   ▼
-   │     waiting_input      （模型调用 ask_clarification，等待回答）
-   │
-   ├──► skipped   （overlap=skip，或任务已暂停）
+   │          ▲  │    ├──► failed
+   │          │  ▼    ├──► timed_out
+   │     waiting_input└──► cancelled
+   │     （等待回答）
+   ├──► skipped   （overlap=skip / 排队超时 / 暂停 / 用户 skip）
    └──► missed    （停机错过且超出宽限 / misfire=skip）
 ```
 
 终态与 `turn_end` 一一对应（`completed/cancelled/timed_out/failed`），只多了调度器自己的 `pending/waiting_input/skipped/missed`。
 
-### 3.3 Trigger
+`cancelled` 只表示**有意**的取消：客户端取消（`cancel_run` 或对会话 cancel），或 `overlap=replace` 被新一次顶替（`error_code=replaced`）。其余中断都算失败：bot 关闭 → `failed`（`error_code=bot_shutdown`）；提问无人回答 → `failed`（`error_code=answer_timeout`，7.1）。为此 `TurnSummary` 增加 `cancel_source: "client" | "shutdown" | "scheduler"`，Manager 在 Cancel / Close / 调度器取消时分别设置，调度器再结合自己记录的原因映射到 Run 状态。
+
+#### 3.2.1 槽位与唯一约束
+
+**槽位（slot）**是触发规则算出的计划时刻，精确到秒：`once` 为 `at`；`interval` 为 `start_at + k·every`；`cron` 为匹配的整分钟。唯一约束只加在槽位上：
+
+```sql
+UNIQUE(schedule_id, slot)      -- slot 为 NULL（manual）时不参与，SQLite 允许多个 NULL
+UNIQUE(schedule_id, request_id)
+```
+
+| trigger | `slot` | `scheduled_for` | 唯一性 |
+|---|---|---|---|
+| `timer` | 计划槽位 | = slot | 槽位唯一：同一槽位只会触发一次 |
+| `misfire` | 被补跑的**最近一个**错过槽位 | = slot | 同上；合并掉的较早槽位数记入 `coalesced`，不单独建 Run |
+| `skip` | 被跳过的**下一个**未来槽位 | = slot | 插入一条 `skipped` Run 占住该槽位，再推进 `next_run_at`；启动恢复看到槽位已占用，不会再补跑 |
+| `manual` | 空 | 请求时刻 | 不与任何槽位冲突，与 timer 同一分钟也允许；重复请求靠 `request_id` 去重（返回已有 Run） |
+
+`next_run_at` = 第一个 `> now` 且**未被占用**的槽位。连续 `skip` 两次即占住接下来两个槽位。
+
+`missed` 同样占住它所代表的槽位（停机错过、超出宽限时，为最近一个错过槽位写一条 `missed`，较早的记入 `coalesced`）。
+
+### 3.3 Trigger 与时区
 
 ```jsonc
 {"type": "once",     "at": "2026-11-07T22:00:00+08:00"}
-{"type": "once",     "in": "2h"}                                  // 创建时换算成 at
-{"type": "interval", "every": "6h", "start_at": "2026-11-08T09:00:00+08:00"}
-{"type": "cron",     "expr": "0 22 * * *", "tz": "Asia/Taipei"}
+{"type": "once",     "at": "2026-11-07T22:00"}          // 无偏移：按任务 timezone 解释
+{"type": "once",     "in": "2h"}                         // 创建时换算成 at
+{"type": "interval", "every": "6h", "start_at": "2026-11-08T09:00"}
+{"type": "cron",     "expr": "0 22 * * *"}               // 按任务 timezone 匹配
 ```
 
-- 所有时间存储为 UTC，`tz` 只用于 cron 计算与展示；`tz` 缺省取 bot 配置 `schedule.timezone`，再退到系统时区。
-- `once.at` 必须带时区偏移；不带偏移的按任务 `tz` 解释。早于"现在 − 1 分钟"拒绝。
-- `interval.every` 最小值 = `schedule.min_interval`（默认 5m）；cron 两次触发间隔同样受此约束（校验时检查未来 10 次）。
+- 时区只有一处：Schedule 的 `timezone` 字段。触发规则本身不带时区。
+- 所有时刻存储为 UTC；`timezone` 用于：解释无偏移的 `at`/`start_at`、cron 匹配、展示。
+- 带偏移的 `at`/`start_at` 按偏移解释，与 `timezone` 无关。
+- 修改 `timezone` 视同修改 `trigger`（重算 `next_run_at`，`ask` 模式下需确认）。
+- `once.at` 早于"现在 − 1 分钟"拒绝（`time_in_past`）。
+- `interval.every` 最小值 = `schedule.min_interval`（默认 5m）；cron 两次触发间隔同样受此约束（校验时检查未来 10 次）。`start_at` 缺省 = 创建时刻 + `every`。
+- **P1 不支持 `cron`**：创建时返回 `trigger_not_supported`，提示"cron 将在后续版本提供，请改用 interval 或 once"。
 
 ### 3.4 SQLite 表
 
@@ -162,11 +202,12 @@ CREATE TABLE schedules (
   name TEXT NOT NULL,
   prompt TEXT NOT NULL,
   trigger_json TEXT NOT NULL,
+  timezone TEXT NOT NULL,
   options_json TEXT NOT NULL,          -- session_mode/timeout/overlap/misfire/notify/...
   session_id TEXT,
   state TEXT NOT NULL,
   created_by_json TEXT NOT NULL,
-  next_run_at INTEGER,                 -- unix ms, NULL = 不再触发
+  next_run_at INTEGER,                 -- unix ms, NULL = 当前不会触发
   run_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -179,12 +220,19 @@ CREATE TABLE schedule_runs (
   schedule_id TEXT NOT NULL REFERENCES schedules(id),
   seq INTEGER NOT NULL,
   trigger TEXT NOT NULL,
+  slot INTEGER,                        -- NULL = manual
   scheduled_for INTEGER NOT NULL,
+  request_id TEXT,
+  coalesced INTEGER NOT NULL DEFAULT 0,
+  queued_reason TEXT, queue_deadline INTEGER,
   started_at INTEGER, ended_at INTEGER,
   session_id TEXT, turn_id TEXT,
   status TEXT NOT NULL,
-  output TEXT, error TEXT, usage_json TEXT,
-  UNIQUE(schedule_id, scheduled_for)   -- 同一计划时间只会有一个 Run：防重复触发
+  auto_answers INTEGER NOT NULL DEFAULT 0,
+  cancel_requested_at INTEGER,
+  output TEXT, error TEXT, error_code TEXT, usage_json TEXT,
+  UNIQUE(schedule_id, slot),
+  UNIQUE(schedule_id, request_id)
 );
 CREATE INDEX schedule_runs_by_schedule ON schedule_runs(schedule_id, seq DESC);
 CREATE INDEX schedule_runs_active ON schedule_runs(status) WHERE status IN ('pending','running','waiting_input');
@@ -194,48 +242,108 @@ CREATE TABLE schedule_lease (
   owner TEXT NOT NULL,                 -- pid@host#start
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE schedule_meta (           -- 单行；每次写 schedules/schedule_runs 时 version+1
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL
+);
 ```
 
 Run 历史按任务保留最近 200 条（可配置），超出的在 janitor 中清理。
 
 ## 4. 调度器
 
-### 4.1 调度循环
+### 4.1 调度循环：永不阻塞
 
-单个 goroutine：内存中按 `next_run_at` 排序的最小堆 + 一个 `time.Timer`。任务增删改、暂停/恢复时通过 channel 唤醒并重算等待时长；不轮询。为防系统休眠/时钟跳变，定时器最长等待 1 分钟后重新检查一次。
+单个 goroutine，内存中一个按时刻排序的最小堆 + 一个 `time.Timer`。堆里只有两类条目：
 
-触发一次的步骤：
+- **槽位到期**：某任务的 `next_run_at`；
+- **排队截止**：某个 `pending` Run 的 `queue_deadline`。
 
-1. **事务内**：插入 Run（`pending`，`UNIQUE(schedule_id, scheduled_for)` 冲突即说明已触发过，直接跳过）；推进 `next_run_at`；一次性任务置为不再触发。
-2. 检查 `overlap`：该任务有活跃 Run 时，`skip` → Run 记 `skipped`；`queue` → 等前一次结束（最多 `timeout`，超出记 `skipped`）；`replace` → 取消前一次后继续。
-3. 调用 `Dispatcher.Fire`，成功后 Run → `running`，记录 `session_id/turn_id`。
-4. bot 在该 turn 的 `turn_end` 回调里调用 `Service.FinishRun`，写入终态、输出、usage；按 `notify` 发 hook 通知；检查 `end_at/max_runs` 决定是否 `completed`。
+循环体只做"取出到期条目 → 一个短事务 → 调一次非阻塞的 `tryStart`"，**不 sleep、不 Wait、不等任何业务事件**。等待前一次结束、等并发槽、等会话空闲，全部表示为 Run 停在 `pending`，由事件驱动重试。
 
-**先持久化再触发**：进程在第 1 步与第 4 步之间崩溃，最多丢失一次执行（启动时标记失败），绝不会重复执行。
+唤醒来源（统一投递到循环的 `kick` channel，循环内串行处理，无需额外加锁）：
 
-### 4.2 启动恢复
+| 来源 | 动作 |
+|---|---|
+| 定时器到期 | 处理到期的槽位 / 排队截止 |
+| 任务增删改、pause/resume/approve/skip | 重建该任务的堆条目 |
+| `Service.FinishRun`（任一 Run 结束） | 对该任务、以及所有 `queued_reason=concurrency` 的 Run 调 `tryStart` |
+| bot 全局流上任一会话的 `turn_end` | 对 `queued_reason=session_busy` 且目标为该会话的 Run 调 `tryStart` |
+| 租约同步 tick（4.4，20s） | `schedule_meta.version` 变了就全量重载堆；处理 `cancel_requested_at` |
+| 兜底 | 定时器最长 1 分钟必醒一次，防系统休眠 / 时钟跳变 |
 
-1. 获取租约（4.3），拿不到则调度器不启动（只提供只读接口）并记录警告。
-2. 把 `pending/running/waiting_input` 的 Run 标为 `failed`，`error = "bot restarted"`。
-3. 对每个 `active` 任务，若 `next_run_at < now`：
-   - 超出 `misfire_grace` 或 `misfire=skip` → 为最近一次错过的时间记一条 `missed` Run；
-   - 否则 `run_once` → 立即补跑一次（`trigger=misfire`），多次错过只合并成一次；
+**槽位到期**：
+
+1. 事务内插入 Run（`trigger=timer`，`status=pending`，`slot=scheduled_for=槽位`）；`UNIQUE(schedule_id, slot)` 冲突说明已触发过，跳过。推进 `next_run_at` 到下一个未占用槽位；一次性任务置空。
+2. 按 `overlap` 决定（该任务已有 `running`/`waiting_input` 的 Run 时）：
+   - `skip`：新 Run 直接记 `skipped`（`reason=overlap`）。
+   - `queue`：新 Run 保持 `pending`（`queued_reason=overlap`，`queue_deadline = slot + timeout`）。每个任务**最多一个**排队 Run；已有排队 Run 时，新的记 `skipped`（`reason=coalesced_into=<排队 run_id>`）。
+   - `replace`：对前一次调 `Dispatcher.Cancel`（非阻塞，只发出取消），新 Run 保持 `pending`（`queued_reason=overlap`）；前一次的 `FinishRun` 到来时自然被 `tryStart` 启动。
+3. 否则直接 `tryStart(run)`。
+
+**`tryStart(run)`**（非阻塞，可被任意唤醒源重复调用，幂等）：
+
+1. 该任务仍有活跃 Run → 保持 `pending`（`overlap`），返回。
+2. 全局活跃数 ≥ `max_concurrent_runs` → 保持 `pending`（`concurrency`），返回。多个排队 Run 按 `scheduled_for` 先后出队。
+3. 调 `Dispatcher.Fire`。它内部只做 `Manager.Send`，该调用本身立即返回 Turn，不等执行。
+   - 返回 `ErrBusy`（目标会话正有 turn，或 CLI 持有会话锁）→ 保持 `pending`（`session_busy`），返回。
+   - 其它错误 → Run 记 `failed`（`error_code=dispatch_failed`）。
+   - 成功 → Run → `running`，记录 `session_id/turn_id/started_at`。
+4. **排队截止**到期仍为 `pending` → `skipped`（`reason=queue_timeout`）。
+
+**结束**：bot 在该 turn 的 `turn_end` 回调里调 `Service.FinishRun`：写入终态、输出、usage；按 `notify` 发通知（第 10 节）；检查 `end_at/max_runs` 决定是否 `completed`；然后 kick 循环。
+
+**先持久化再触发**：进程在插入 Run 与 `FinishRun` 之间崩溃，最多丢失一次执行（启动时标记失败），绝不会重复执行。
+
+### 4.2 overlap 小结
+
+| 策略 | 新槽位到期而上一次仍在跑 | 何时真正开始 |
+|---|---|---|
+| `skip`（默认） | 新 Run 记 `skipped` | — |
+| `queue` | 新 Run `pending`；最多排一个，多余的 `skipped` | 上一次 `FinishRun` 后由 `tryStart` 启动；超过 `queue_deadline` 未开始 → `skipped` |
+| `replace` | 取消上一次，新 Run `pending` | 上一次结束（`cancelled`）后启动 |
+
+`run_now`（manual）同样受 overlap 约束，但不记 `skipped`：`skip` 策略下直接返回 `409 run_in_progress`；`queue`/`replace` 下返回 `pending` 的 Run。
+
+### 4.3 启动恢复
+
+1. 尝试获取租约（4.4）。拿不到 → 进入**备用**模式，不执行以下步骤。
+2. `running`/`waiting_input` 的 Run → `failed`（`error_code=bot_restarted`）。
+3. `pending` 的 Run：未过 `queue_deadline` 的保留并重新排队；已过的 → `skipped`（`queue_timeout`）。
+4. 对每个 `active` 任务，若 `next_run_at < now`（错过的槽位均未被占用）：
+   - 最近一个错过槽位在 `misfire_grace` 内且 `misfire=run_once` → 为它建 `trigger=misfire` 的 Run 并 `tryStart`，其余记入 `coalesced`；
+   - 否则为最近一个错过槽位写 `missed`，其余记入 `coalesced`；
    - 然后从 `now` 起重算 `next_run_at`。
-4. 建堆，进入循环。
+5. 建堆，进入循环。
 
-### 4.3 单实例租约
+### 4.4 单实例租约与备用模式
 
-同一个库只允许一个调度器在跑（避免两个 bot 进程重复触发）：`schedule_lease` 单行记录，持有者每 20s 续约、过期时间 60s；过期可被接管。与现有会话锁的参数一致。`UNIQUE(schedule_id, scheduled_for)` 是第二道保险。
+同一个库只允许一个进程**执行**任务：`schedule_lease` 单行记录，持有者每 20s 续约、60s 过期；过期可被接管（与会话锁参数一致）。`UNIQUE(schedule_id, slot)` 是第二道保险。
 
-### 4.4 并发与资源
+**没拿到租约的进程（备用）照常读写库，只是不 Fire**：
 
-- 全局并发上限 `schedule.max_concurrent_runs`（默认 2）；超出的 Run 保持 `pending` 排队，不计入超时。
-- 每个任务单次运行受 `timeout` 和 `max_tool_calls` 约束；超时由 `Manager` 现有的 turn 超时机制落为 `timed_out`。
-- 全局活跃任务数上限 `schedule.max_schedules`（默认 50）；单任务每日运行上限 `schedule.max_runs_per_day`（默认 48）。
+| 操作 | 备用进程中的行为 |
+|---|---|
+| 列表 / 详情 / 历史 | 正常 |
+| 创建 / 修改 / 暂停 / 恢复 / 删除 / 批准 / skip | 正常写库并 `version+1`；持有者在下一次同步 tick（≤ 20s）重载后生效 |
+| `run_now` | 插入 `manual` 的 `pending` Run；由持有者在同步时启动 |
+| `cancel_run` | 写 `cancel_requested_at`；持有者在同步时对该 Run 调 `Dispatcher.Cancel` |
+| 观察执行过程 | Run 在持有者进程的会话里执行，事件流只在持有者那里；备用进程返回的 Run 带 `executor`（持有者地址），客户端应连到持有者观看 |
+
+所有调度相关响应（含工具返回）都带 `"scheduler": "active" | "standby"`。备用模式下工具结果额外附一句提示："任务已保存，将由另一个 deepai-bot 实例（pid@host）执行"，避免模型误以为已在本实例生效。备用进程每 20s 尝试抢租约，持有者退出 60s 内自动接管（按 4.3 恢复）。
+
+### 4.5 并发与资源
+
+- 全局并发上限 `schedule.max_concurrent_runs`（默认 2），超出的 Run 以 `pending(concurrency)` 排队（4.1）；排队时间不计入 `timeout`。
+- 每个任务单次运行受 `timeout`（7.2）和 `max_tool_calls` 约束。
+- 全局活跃任务数上限 `schedule.max_schedules`（默认 50）；单任务每日运行上限 `schedule.max_runs_per_day`（默认 48，`manual` 也计入）。
 
 ## 5. cron 规则（自写）
 
 只实现确定需要的子集，规则写死、行为可预测；不支持的写法在创建时报错并给出提示，由模型改写。
+
+P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
 
 **格式**：5 字段 `分 时 日 月 周`，空格分隔。
 
@@ -254,7 +362,7 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 **语义约定**：
 
 - **日与周**：两者都不是 `*` 时为"或"（与 Vixie cron 一致，例如 `0 9 1 * MON` = 每月 1 号和每个周一）；任一为 `*` 时只看另一个。
-- **时区**：按任务 `tz` 的本地时间匹配。
+- **时区**：按 Schedule 的 `timezone`（3.3）的本地时间匹配。
 - **夏令时**：落在"跳过的那一小时"里的时刻，顺延到跳变后的第一分钟触发一次；落在"重复的那一小时"里的时刻，只在第一次出现时触发。（`Asia/Taipei` 无夏令时，但规则需对所有时区成立。）
 - **找下一次**：从"当前分钟 + 1"开始按字段逐级跳进（月不匹配跳到下月 1 日 0 点，以此类推），最多向前搜索 5 年，找不到（如 `0 0 31 2 *`）在创建时报错。
 - **校验输出**：解析成功后返回人类可读描述（"每天 22:00（Asia/Taipei）"）和未来 3 次触发时间，供模型向用户复述。
@@ -279,19 +387,39 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 
   消息 `Metadata` 带 `schedule_id`、`run_id`、`source=schedule`，客户端据此渲染成"定时触发"样式。
 - `dedicated` 会话被用户删除时，下次运行自动重建；会话上下文的增长由现有的压缩/摘要机制处理。
-- **目标会话正忙**（用户正在该会话里聊天，或 CLI 持有会话锁）：视为 overlap，按 `overlap` 策略处理；`origin` 模式下默认改为 `queue`。
+- **目标会话正忙**（用户正在该会话里聊天，或 CLI 持有会话锁）：这不是任务自身的重叠，不看 `overlap`；Run 以 `pending(session_busy)` 排队，该会话 `turn_end` 后由 `tryStart` 启动，`queue_deadline = slot + timeout`（4.1）。
 
 ## 7. 无人值守与提问
 
-定时运行时用户大概率不在。模型调用 `ask_clarification` 时：
+定时运行时用户大概率不在，模型调用 `ask_clarification` 不能把 turn 永远挂住，也不能让"还在等用户回答"被算成超时。
 
-1. Run → `waiting_input`；会话流照常发出 `question` 事件；全局流发出 `schedule_run_updated`；hook 推送"任务「每日工作总结」需要你回答：…"。
+### 7.1 流程
+
+1. 模型提问 → Run → `waiting_input`；会话流照常发出 `question` 事件；全局流发出 `schedule_run_updated`；hook 推送"任务「每日工作总结」需要你回答：…"（第 10 节）。
 2. 任意客户端用现有的 `answer` 接口回答 → Run 回到 `running`，turn 继续。
-3. 超过 `answer_timeout` 无人回答：
-   - `assume`：自动回答"用户暂时无法回应。请按最合理的假设继续完成任务，并在结果中列出你做的假设。"
-   - `fail`：取消该 turn，Run 记 `failed`，`error = "no answer within 30m"`。
+3. 某个提问超过 `answer_timeout` 无人回答：
+   - `on_answer_timeout=assume` 且 `auto_answers < max_auto_answers`：以 bot 身份自动回答"用户暂时无法回应。请按最合理的假设继续完成任务，并在结果中列出你做的假设。"；`question_answered` 事件带 `auto: true`；`auto_answers+1`；Run 回到 `running`。
+   - 否则（`fail`，或自动回答次数已用尽）：以 `cancel_source=scheduler` 取消该 turn，Run 记 `failed`（`error_code=answer_timeout`，`error="no answer within 30m"`）。
 
-实现上由 bot 在调度触发的 turn 上包一层 `UserInteraction`（与现有 `turnInteraction` 组合），不需要改 `pkg/agent`。
+### 7.2 时钟：等待回答时暂停执行超时
+
+一个 Run 涉及三个时长，互不叠加：
+
+| 时钟 | 计时区间 | 到期结果 |
+|---|---|---|
+| 排队（`queue_deadline`） | `pending` 期间 | `skipped(queue_timeout)` |
+| 执行（`timeout`） | `running` 期间；**`waiting_input` 期间暂停** | `timed_out` |
+| 回答（`answer_timeout`） | 每个提问从发出到被回答 | 见 7.1 第 3 步 |
+
+- **执行时钟可暂停**：Manager 的 turn 超时从 `context.WithTimeout` 改为"剩余额度 + 定时器"的 `turnClock`，提供 `Pause()`/`Resume()`（引用计数：有任一提问未答即暂停，全部答完才恢复，覆盖子代理并发提问）。到期时以 `context.WithCancelCause` 取消，cause 为 `context.DeadlineExceeded`；状态映射改看 `context.Cause(ctx)`，结果仍是 `timed_out`。
+- **同一时刻只有一个时钟能取消 turn**：`waiting_input` 时执行时钟已暂停，只有回答时钟在走；回答后回答时钟停止，执行时钟从剩余额度继续。因此不会出现"用户还没答就 `timed_out`"，也不会双重取消。
+- 用户在 `waiting_input` 期间 `cancel_run` → 停掉所有时钟，Run 记 `cancelled`。
+- **生效范围**：暂停规则对所有 turn 生效，包括交互会话里的 `--turn-timeout`（这是对 #40 Manager 行为的一处修改，交互 turn 不做自动回答）。
+- **两个上限同时存在时**：定时 turn 的执行额度 = `min(Schedule.timeout, --turn-timeout)`（后者为 0 表示不限）；通过 Manager 的内部 Send 选项传入，不暴露给普通客户端。
+
+### 7.3 实现位置
+
+回答时钟和自动回答由 bot 层的 `scheduleDispatcher` 实现：它在定时触发的 turn 上包一层 `UserInteraction`（与现有 `turnInteraction` 组合），并通过 `Service.UpdateRun` 回写 `waiting_input`/`running`/`auto_answers`。调度循环不参与等待（4.1），`pkg/agent` 不需要修改。
 
 ## 8. 内置工具 `schedule`
 
@@ -305,11 +433,13 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
   "id": "sch_…",                          // get/update/pause/resume/delete/run_now/runs
   "name": "每日工作总结",                   // create/update
   "prompt": "汇总今天在本仓库的提交、PR 和未完成事项，按项目分组，最后列出明天的优先事项",
-  "trigger": {"type": "cron", "expr": "0 22 * * *", "tz": "Asia/Taipei"},
+  "trigger": {"type": "cron", "expr": "0 22 * * *"},
+  "timezone": "Asia/Taipei",              // 缺省 schedule.timezone → 系统时区
   "session_mode": "dedicated",
   "notify": "always",
   "timeout": "30m",
   "end_at": null, "max_runs": null,
+  "request_id": "…",                      // run_now 幂等键，缺省由工具按 turn_id 生成
   "limit": 20                             // list/runs
 }
 ```
@@ -320,13 +450,15 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 {
   "id": "sch_3f9a1c",
   "state": "active",
+  "scheduler": "active",
+  "timezone": "Asia/Taipei",
   "summary": "每天 22:00（Asia/Taipei）",
   "next_runs": ["2026-11-07T22:00:00+08:00", "2026-11-08T22:00:00+08:00", "2026-11-09T22:00:00+08:00"],
   "session_mode": "dedicated"
 }
 ```
 
-校验失败返回结构化错误（`invalid_cron`、`interval_too_short`、`time_in_past`、`limit_exceeded`、`not_allowed_in_scheduled_run`…）和修正提示，由模型自行改正重试。
+校验失败返回结构化错误（`invalid_cron`、`trigger_not_supported`、`invalid_timezone`、`interval_too_short`、`time_in_past`、`limit_exceeded`、`not_allowed_in_scheduled_run`、`confirmation_not_received`、`run_in_progress`…）和修正提示，由模型自行改正重试。
 
 ### 8.3 确认策略（`schedule.confirm`，默认 `ask`）
 
@@ -334,10 +466,12 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 |---|---|---|
 | 交互 turn 中创建**周期**任务 | 工具内调用 `AskQuestion`，原文展示名称、规则描述、未来 3 次时间、prompt，选项「确认创建 / 取消」；确认才写入为 `active` | 直接 `active` |
 | 交互 turn 中创建**一次性**任务 | 直接 `active`（用户刚提出，且执行前可随时取消） | 直接 `active` |
-| `update` 修改 `trigger` 或 `prompt` | 同创建周期任务 | 直接生效 |
+| `update` 修改 `trigger`、`timezone` 或 `prompt` | 同创建周期任务 | 直接生效 |
 | 定时运行中调用 `create` | 拒绝（`not_allowed_in_scheduled_run`），可通过 `schedule.allow_nested` 放开，放开后也只能进入 `pending_approval` | 同左 |
 
 `pending_approval` 的任务由用户在客户端批准（`POST /v1/schedules/{id}/approve`）或拒绝（删除）。
+
+**确认不留半成品**：`ask` 流程是"校验 → `AskQuestion` → 用户确认 → 再次校验 → 单个事务写入"。确认之前库里没有任何记录；用户选择取消、turn 被取消、或超过 `schedule.confirm_timeout`（默认 10m）未确认，工具都直接返回 `confirmation_not_received`，不写库。确认后的再次校验用于处理等待期间的变化（一次性任务时间已过、任务数已达上限等），失败则返回对应错误。`update` 同理：确认前不修改原任务。
 
 ### 8.4 模型需要的上下文
 
@@ -384,14 +518,14 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 | DELETE | `/v1/schedules/{id}` | 删除；有活跃 Run 时 `?cancel=true` 才允许 |
 | POST | `/v1/schedules/{id}/pause` · `/resume` | 暂停 / 恢复 |
 | POST | `/v1/schedules/{id}/approve` | 批准 `pending_approval` |
-| POST | `/v1/schedules/{id}/run` | 立即执行一次（`trigger=manual`，受 overlap 约束） |
-| POST | `/v1/schedules/{id}/skip` | 跳过下一次 |
+| POST | `/v1/schedules/{id}/run` | 立即执行一次（`trigger=manual`，受 overlap 约束，见 4.2）；可带 `request_id` 幂等 |
+| POST | `/v1/schedules/{id}/skip` | 跳过下一次（插入 `skipped` Run 占住该槽位，见 3.2.1） |
 | GET | `/v1/schedules/{id}/runs?limit=20` | 历史 Run |
 | GET | `/v1/runs/{id}` | Run 详情 |
 | POST | `/v1/runs/{id}/cancel` | 中止 Run（内部即会话 cancel → `cancelled`） |
 | POST | `/v1/schedule/validate` | 只校验触发规则，返回描述与未来 N 次时间（客户端编辑器用） |
 
-鉴权、Origin/Host 校验、JSON content-type 要求与现有接口一致。
+鉴权、Origin/Host 校验、JSON content-type 要求与现有接口一致。备用模式（4.4）下所有接口照常可用，响应带 `scheduler: "standby"`。
 
 ### 9.3 WebSocket ops
 
@@ -425,6 +559,16 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 | `schedule_ask` | Run 进入 `waiting_input` | `「每日工作总结」需要你回答：<问题>` |
 | `schedule_approval` | 出现 `pending_approval` 任务 | `模型请求创建任务「…」：每天 22:00` |
 
+`notify` 的含义：
+
+| 设置 | 推送 `schedule_run_end` 的终态 |
+|---|---|
+| `always` | `completed`、`failed`、`timed_out`、`missed`、`cancelled` |
+| `on_failure` | `failed`（含 `answer_timeout`、`bot_restarted`、`bot_shutdown`）、`timed_out`、`missed` |
+| `never` | 不推送 |
+
+`cancelled` 是用户主动操作，不算失败；`skipped` 是策略的预期结果，任何设置都不推送。`schedule_ask` 和 `schedule_approval` 需要人处理，除 `never` 外总是推送。
+
 `Event` 增加可选字段 `schedule_id`、`run_id`，便于 webhook 端做深链接。bot 当前尚未接入 `pkg/hook`，P2 一并接入（同时覆盖 BOT_DESIGN.md 后续路线第 8 条）。
 
 ## 11. 配置
@@ -435,6 +579,7 @@ schedule:
   enabled: true              # false = 不注册工具、不启动调度器（接口返回 404）
   timezone: Asia/Taipei      # 缺省 = 系统时区
   confirm: ask               # ask | auto
+  confirm_timeout: 10m
   allow_nested: false        # 定时运行中是否允许创建任务（仍需批准）
   min_interval: 5m
   max_schedules: 50
@@ -443,6 +588,7 @@ schedule:
   run_history: 200
   default_timeout: 30m
   default_answer_timeout: 30m
+  default_max_auto_answers: 3
 ```
 
 `deepai-bot serve` 另加 `--no-schedule` 临时关闭。
@@ -451,8 +597,8 @@ schedule:
 
 | 阶段 | 内容 |
 |---|---|
-| **P1** | `pkg/schedule`：模型、存储与迁移、`once`/`interval` 触发、`Service`、`Scheduler`（含租约、先持久化再触发、overlap、并发上限）；`schedule` 工具（含 `ask` 确认、嵌套限制）；系统提示注入当前时间；`bot.scheduleDispatcher`；REST + WS + 全局事件；单元测试 + 用假 Dispatcher/假时钟的调度测试 |
-| **P2** | 自写 cron（第 5 节）及表驱动测试；启动恢复与 misfire；`waiting_input` 与 `answer_timeout`；`pkg/hook` 接入 bot 与三个新事件；Web 控制台任务页签；文档与 E2E（mock LLM） |
+| **P1** | `pkg/schedule`：模型、存储与迁移、`once`/`interval` 触发（`cron` 明确拒绝）、任务级 `timezone`、槽位与唯一约束、`Service`、非阻塞 `Scheduler`（overlap、并发、会话忙排队）、租约与备用模式、启动恢复第 1–3 步（错过的槽位只记 `missed`）；`schedule` 工具（`ask` 确认、嵌套限制）；系统提示注入当前时间；`bot.scheduleDispatcher`；Manager 可暂停的 `turnClock` 与 `cancel_source`；`waiting_input` 与 `answer_timeout`；REST + WS + 全局事件；单元测试 + 假 Dispatcher/假时钟的调度测试 |
+| **P2** | 自写 cron（第 5 节）及表驱动测试；misfire 补跑（`run_once`）；`pkg/hook` 接入 bot 与三个新事件；Web 控制台任务页签；文档与 E2E（mock LLM） |
 | **P3** | 单任务工具白名单；运行中 steer（需 `pkg/agent` 配合）；任务链（A 完成后触发 B）；按结果条件通知 |
 
 **测试策略**：`Scheduler` 依赖可注入的 `Clock` 接口（`Now()`、`After(d)`），测试中用假时钟推进时间，不 sleep；Dispatcher 用假实现记录调用；bot 层集成测试复用现有 `fakeRuntime`。
@@ -465,7 +611,25 @@ schedule:
 | 单个 `schedule` 工具 + `action` | 少占上下文；与 `task` 工具一致 |
 | 服务端规范化并回显未来时间 | 模型算时间容易错，让服务端算、模型复述、用户确认 |
 | 自写 cron 子集 | 零新依赖；规则写死、可完整测试；不支持的写法明确报错而不是猜 |
-| 先持久化再触发 + 唯一约束 | 宁可漏一次（可见、可补跑），不重复执行（可能有副作用） |
+| 先持久化再触发 + 槽位唯一约束 | 宁可漏一次（可见、可补跑），不重复执行（可能有副作用） |
+| 调度循环永不阻塞，等待全部表示为 `pending` | 一个任务排队不会拖住其它任务；所有等待都可见、可持久化、可恢复 |
+| 等待回答时暂停执行超时 | 无人值守时提问很常见，不能把"等人"算成"执行太慢" |
+| 备用进程可写库、不执行 | 多实例下模型创建任务不会静默失败；执行仍只有一个进程 |
 | `dedicated` 默认 | 周期任务大多需要参考往次结果；上下文增长由现有压缩处理 |
 | 周期任务默认需确认 | 周期任务会无人值守地反复执行，代价高；一次性任务风险低且执行前可取消 |
 | 只在 bot 内 | CLI 是前台交互进程，无法保证到点时还在运行；两者独立，避免共享调度状态 |
+
+## 附录：评审修订记录
+
+| 评审意见（#41） | 修订位置 |
+|---|---|
+| `overlap=queue` 不能堵调度 goroutine | 4.1 重写为非阻塞循环 + `tryStart`；4.2 overlap 小结；2.1 `Dispatcher` 约束 |
+| `answer_timeout` 与 turn `timeout` 的关系 | 7.2：等待回答时暂停执行时钟，同一时刻只有一个时钟能取消 turn |
+| `UNIQUE` 与 `run_now` / `skip` | 3.2.1：唯一约束改加在 `slot` 上；manual 无槽位 + `request_id` 幂等；skip 插 `skipped` 占槽 |
+| 无租约时的"只读" | 4.4：备用进程照常读写库、不执行；响应带 `scheduler` 字段 |
+| 任务级时区 | 3.1 / 3.3：Schedule 增加 `timezone`，三种触发共用，触发规则不再带 `tz` |
+| `assume` 轮次上限 | 3.1 `max_auto_answers`、7.1 |
+| 确认超时不留半成品 | 8.3 |
+| `on_failure` 的范围 | 第 10 节表格；3.2 `cancel_source` |
+| P1 拒绝 `cron` | 3.3、第 5 节、第 12 节 |
+| resume 时 `next_run_at` 已过 | 3.1 状态迁移：从现在重算，不走 misfire |
