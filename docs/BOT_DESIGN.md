@@ -51,7 +51,7 @@
 
 ## 2. 核心概念
 
-- **Session（会话）**：一段对话，持久化在 bot 专用库 `~/.deepai/bot/bot.db`。与 CLI 的会话库分开：`deepai session list` 看不到 bot 会话，`deepai -r` 也不能续聊它们，反之亦然。
+- **Session（会话）**：一段对话，持久化在 bot 专用库 `~/.deepai/bot/bot.db`。与 CLI 的会话库分开：`deepai session list` 看不到 bot 会话，`deepai -r` 也不能续聊它们，反之亦然。同进程多 Bot（`bot_id`）见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
 - **Turn（轮次）**：一次"用户消息 → agent 完成"。**每个会话同时只跑一个 turn**；并发发送返回 `409 busy`。turn 属于 bot 而不是请求：客户端断开不会取消它。
 - **Event（事件）**：turn 期间发生的一切，统一信封，带会话内单调递增的 `seq`。
 - **Question（提问）**：agent 调 `ask_clarification` 时，turn 挂起并广播 `question` 事件，任一客户端回答即恢复。未回答的问题出现在 `SessionInfo.pending`，晚连上的客户端也能看到。
@@ -235,13 +235,14 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 慢订阅者直接断开 + `gap` | 发布端永不阻塞，一个卡住的客户端不会拖慢 agent |
 | 工具完整结果不进事件流 | 大文件读取会淹没所有客户端；`result_preview` 足够渲染，完整内容在 transcript |
 | WebSocket 用 `golang.org/x/net/websocket` | 已是直接依赖，不新增模块；传输层隔离在 `ws.go`，需要时可换 `coder/websocket` |
-| 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat` |
+| 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat`；多 `bot_id` 见 BOT_MULTI_DESIGN |
 | 内嵌单文件控制台 | 开箱可用，也是协议的活文档；正式 GUI/App 可独立开发 |
 
 ---
 
 ## 8. 后续路线
 
+0. **多 Bot 人格（同进程）**：在单一 `deepai-bot` 内注册多个 Bot（名称、指令、默认模型、隔离记忆），会话归属 `bot_id`；详见 [`docs/BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
 1. **消息队列 / 插话**：运行中发送的消息排队，或作为"steer"注入下一步。
 2. **IM 渠道适配器**（Telegram / Slack / 飞书 / 企业微信）：作为 `Manager` 的另一个客户端，映射 "聊天线程 ↔ 会话"、"按钮 ↔ question 选项"。
 3. **定时任务 / Webhook 触发**：cron 或 GitHub 事件创建 turn，结果推送到渠道。
