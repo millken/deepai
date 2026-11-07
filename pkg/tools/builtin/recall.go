@@ -14,6 +14,9 @@ import (
 const (
 	// recallDefaultBytes is the page size when limit is omitted or zero.
 	recallDefaultBytes = 32 * 1024
+	// recallMinBytes is the smallest page. A smaller limit is raised so a
+	// multi-byte character cannot make the next offset stay put.
+	recallMinBytes = 256
 	// recallMaxBytes is the hard per-call cap. A larger limit is clamped.
 	recallMaxBytes = 64 * 1024
 )
@@ -26,7 +29,7 @@ func RecallOutputTool(dir string) models.Tool {
 		Name: "recall_output",
 		Description: "Read a tool result that was stored outside the prompt. " +
 			"Pass ref from the [offloaded: ...] stub (the id, not a guessed path). " +
-			"Each call returns at most 64 KiB (default 32 KiB). " +
+			"Each call returns at most 64 KiB (default 32 KiB, at least 256 bytes). " +
 			"When the notice says bytes remain, call again with its offset.",
 		Groups:       []string{"builtin"},
 		ParallelSafe: true,
@@ -43,7 +46,7 @@ func RecallOutputTool(dir string) models.Tool {
 				},
 				"limit": map[string]any{
 					"type":        "integer",
-					"description": "Maximum bytes to return. Default 32768. Values above 65536 are clamped.",
+					"description": "Maximum bytes to return. Default 32768. Values below 256 are raised to 256. Values above 65536 are clamped.",
 				},
 			},
 			"required": []any{"ref"},
@@ -113,8 +116,9 @@ func intArg(args map[string]any, key string) int {
 
 // recallPage returns at most recallMaxBytes of data starting at offset, plus
 // a notice when the caller needs another call to see the rest. A zero limit
-// uses recallDefaultBytes. A complete read from the start has an empty notice
-// so a small file is returned unchanged.
+// uses recallDefaultBytes. A positive limit below recallMinBytes is raised
+// so the next offset always moves forward. A complete read from the start
+// has an empty notice so a small file is returned unchanged.
 func recallPage(data []byte, offset, limit int) (chunk, notice string) {
 	total := len(data)
 	if offset < 0 {
@@ -129,6 +133,9 @@ func recallPage(data []byte, offset, limit int) (chunk, notice string) {
 	if limit <= 0 {
 		limit = recallDefaultBytes
 	}
+	if limit < recallMinBytes {
+		limit = recallMinBytes
+	}
 	if limit > recallMaxBytes {
 		limit = recallMaxBytes
 	}
@@ -138,6 +145,14 @@ func recallPage(data []byte, offset, limit int) (chunk, notice string) {
 	} else {
 		for end > offset && !utf8.RuneStart(data[end]) {
 			end--
+		}
+	}
+	// A limit smaller than the rune at offset used to walk end back onto
+	// offset, so the next-chunk notice pointed at the same place.
+	if end == offset && offset < total {
+		end = offset + 1
+		for end < total && !utf8.RuneStart(data[end]) {
+			end++
 		}
 	}
 	chunk = string(data[offset:end])

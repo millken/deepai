@@ -93,9 +93,10 @@ func (a *Agent) maybeCompact(ctx context.Context, sessionID string, turn int, ru
 	// Measuring the full transcript here would flush durable memory and
 	// rewrite text the summary job still reads. The sent view is still
 	// checked: guardWindowPressure trims non-current tool bodies inside the
-	// window (and drops oldest kept turns if that is not enough) without
-	// touching runMessages. A provider overflow still compacts through
-	// compactOnOverflow.
+	// window, drops oldest kept turns if that is not enough, and trims older
+	// tool pairs inside the current turn when that turn alone is over budget.
+	// None of that touches runMessages. A provider overflow still compacts
+	// through compactOnOverflow.
 	if a.keepFullTurns > 0 {
 		promptView = a.guardWindowPressure(a.windowPromptView(promptView), systemPrompt)
 		return runMessages, appendTurnInjection(promptView, a.turnInjection)

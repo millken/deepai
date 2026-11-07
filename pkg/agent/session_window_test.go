@@ -396,6 +396,63 @@ func TestWindow_PressureTrimsBeforeFirstRequest(t *testing.T) {
 	}
 }
 
+func TestWindow_CurrentTurnPressureTrimsBeforeFirstRequest(t *testing.T) {
+	toolBody := func(tag string) string {
+		return strings.Repeat(tag, 12*1024) + "ERR_" + tag
+	}
+	var msgs []models.Message
+	msgs = append(msgs, models.Message{Role: models.RoleHuman, Content: "CURRENT_TURN_OK"})
+	for i, tag := range []string{"A", "B", "C", "D"} {
+		body := toolBody(tag)
+		msgs = append(msgs, models.Message{
+			Role:       models.RoleTool,
+			Content:    body,
+			ToolResult: &models.ToolResult{CallID: fmt.Sprintf("c%d", i), ToolName: "bash", Content: body},
+		})
+	}
+	p := &promptCaptureProvider{}
+	a := New(AgentConfig{
+		LLMProvider:    p,
+		Tools:          tools.NewRegistry(),
+		KeepFullTurns:  10,
+		ContextWindow:  6000,
+		SystemPrompt:   "sys",
+		NonInteractive: true,
+	})
+	result, err := a.Run(context.Background(), "s1", msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("provider calls = %d, want the first request to fit without an overflow retry", len(got))
+	}
+	est := estimateTokens(got[0].messages, got[0].system, 0) + a.toolSchemaTokens()
+	if est >= a.windowBudget() {
+		t.Fatalf("first request is %d tokens, budget %d", est, a.windowBudget())
+	}
+	blob := joinContents(got[0].messages)
+	if !strings.Contains(blob, "CURRENT_TURN_OK") {
+		t.Fatal("current user message was trimmed")
+	}
+	for _, tag := range []string{"A", "B", "C", "D"} {
+		if !strings.Contains(blob, "ERR_"+tag) {
+			t.Fatalf("sent view dropped the tail of tool %s", tag)
+		}
+	}
+	if strings.Count(blob, "A") >= 12*1024 {
+		t.Fatal("an early tool result in the current turn was sent in full")
+	}
+	latest := toolBody("D")
+	if !strings.Contains(blob, latest) {
+		t.Fatal("the latest tool result was trimmed while older calls could absorb the pressure")
+	}
+	stored := joinContents(result.Messages)
+	if strings.Count(stored, "A") < 12*1024 || !strings.Contains(stored, latest) {
+		t.Fatal("canonical history was rewritten while trimming the current turn")
+	}
+}
+
 func TestWindow_KeptTurnsAreNotAged(t *testing.T) {
 	big := strings.Repeat("X", 8000)
 	var msgs []models.Message

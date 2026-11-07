@@ -55,9 +55,27 @@ func TestRecallOutput_PagesByOffset(t *testing.T) {
 	if len(page) > recallMaxBytes {
 		t.Fatalf("page is %d bytes, hard cap is %d", len(page), recallMaxBytes)
 	}
-	narrow := call(map[string]any{"ref": "big", "limit": float64(128)})
-	if !strings.HasPrefix(narrow, strings.Repeat("A", 128)) || !strings.Contains(narrow, "offset 128") {
-		t.Fatalf("limit=128 page = %.160q", narrow)
+	narrow := call(map[string]any{"ref": "big", "limit": float64(512)})
+	if !strings.HasPrefix(narrow, strings.Repeat("A", 512)) || !strings.Contains(narrow, "offset 512") {
+		t.Fatalf("limit=512 page = %.160q", narrow)
+	}
+}
+
+func TestRecallPage_TinyLimitAdvances(t *testing.T) {
+	body := strings.Repeat("中", 100) + strings.Repeat("文", 100)
+	first, notice := recallPage([]byte(body), 0, 1)
+	if first == "" || !strings.HasPrefix(first, "中") || strings.Contains(first, "文") {
+		t.Fatalf("tiny limit returned %q", first)
+	}
+	if !strings.Contains(notice, "Next chunk starts at offset 255") {
+		t.Fatalf("notice did not advance past the first rune: %q", notice)
+	}
+	second, notice2 := recallPage([]byte(body), 255, 1)
+	if !strings.Contains(second, "文") {
+		t.Fatalf("second page did not advance: %q", second)
+	}
+	if !strings.Contains(notice2, "Next chunk starts at offset 510") {
+		t.Fatalf("second notice stayed on the same offset: %q", notice2)
 	}
 }
 

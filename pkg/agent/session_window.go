@@ -231,15 +231,21 @@ func (a *Agent) sentTranscript(messages []models.Message, systemPrompt string) [
 	return view
 }
 
-// windowToolFloor is the shortest tail left on a non-current tool or
-// assistant message when the window itself is over the context threshold.
+// windowToolFloor is the shortest tail left on a tool or assistant message
+// when the window itself is over the context threshold.
 const windowToolFloor = 300
 
+// currentTurnVerbatimPairs is how many trailing assistant/tool groups in the
+// current turn stay whole while older calls in that turn are trimmed.
+const currentTurnVerbatimPairs = 2
+
 // guardWindowPressure keeps the view that will be sent under the compaction
-// threshold. It copies before editing. Canonical messages, and the current
-// user turn, are left unchanged. Non-current tool and assistant bodies
-// inside the window are trimmed first; if that is not enough, the oldest
-// kept turns are left out of this request only.
+// threshold. It copies before editing. Canonical messages are left unchanged.
+// Non-current tool and assistant bodies are trimmed first; if that is not
+// enough, the oldest kept turns are left out of this request. If the current
+// turn alone is still over budget, older assistant/tool groups inside that
+// turn are trimmed too. The latest groups stay verbatim until keeping them
+// would itself miss the budget.
 func (a *Agent) guardWindowPressure(view []models.Message, systemPrompt string) []models.Message {
 	if a == nil || a.contextWindow <= 0 || !a.windowExceeds(view, systemPrompt) {
 		return view
@@ -253,7 +259,11 @@ func (a *Agent) guardWindowPressure(view []models.Message, systemPrompt string) 
 	if !a.windowExceeds(view, systemPrompt) {
 		return view
 	}
-	return a.dropOldestKeptTurns(view, systemPrompt)
+	view = a.dropOldestKeptTurns(view, systemPrompt)
+	if !a.windowExceeds(view, systemPrompt) {
+		return view
+	}
+	return a.trimCurrentTurnBodies(view, systemPrompt)
 }
 
 func (a *Agent) windowBudget() int {
@@ -328,10 +338,119 @@ func (a *Agent) clipKeptToolBodies(view []models.Message) {
 
 func (a *Agent) shrinkKeptBodies(view []models.Message, systemPrompt string) {
 	current := currentTurnStart(view)
+	var idxs []int
+	for i := 0; i < current && i < len(view); i++ {
+		if view[i].Role == models.RoleTool || view[i].Role == models.RoleAI {
+			idxs = append(idxs, i)
+		}
+	}
+	a.shrinkBodies(view, idxs, systemPrompt)
+}
+
+// trimCurrentTurnBodies trims tool and assistant bodies inside the current
+// user turn on the sent copy. The user message is left whole. The newest
+// assistant/tool groups stay verbatim while dropping older ones is enough;
+// they are trimmed only when the request would still miss the budget.
+func (a *Agent) trimCurrentTurnBodies(view []models.Message, systemPrompt string) []models.Message {
+	current := currentTurnStart(view)
+	groups := currentTurnGroups(view, current)
+	if len(groups) == 0 {
+		return view
+	}
+	protect := currentTurnVerbatimPairs
+	if protect > len(groups) {
+		protect = len(groups)
+	}
+	for {
+		var clip []int
+		for g := 0; g < len(groups)-protect; g++ {
+			clip = append(clip, groups[g]...)
+		}
+		a.clipMessagesToPressureBudget(view, clip)
+		if !a.windowExceeds(view, systemPrompt) {
+			return view
+		}
+		a.shrinkBodies(view, clip, systemPrompt)
+		if !a.windowExceeds(view, systemPrompt) || protect == 0 {
+			return view
+		}
+		protect--
+	}
+}
+
+// currentTurnGroups splits the current turn into assistant/tool groups,
+// oldest first. A group starts at each assistant message and includes the
+// tool results that follow it. A tool result with no preceding assistant
+// message is its own group.
+func currentTurnGroups(view []models.Message, current int) [][]int {
+	var groups [][]int
+	var cur []int
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		groups = append(groups, cur)
+		cur = nil
+	}
+	for i := current; i < len(view); i++ {
+		switch view[i].Role {
+		case models.RoleAI:
+			flush()
+			cur = []int{i}
+		case models.RoleTool:
+			if len(cur) == 0 || view[cur[0]].Role != models.RoleAI {
+				flush()
+				cur = []int{i}
+				flush()
+				continue
+			}
+			cur = append(cur, i)
+		}
+	}
+	flush()
+	return groups
+}
+
+func (a *Agent) clipMessagesToPressureBudget(view []models.Message, idxs []int) {
+	cfg := a.aging
+	if cfg == nil {
+		cfg = &AgingConfig{}
+	}
+	for _, i := range idxs {
+		if i < 0 || i >= len(view) {
+			continue
+		}
+		msg := &view[i]
+		var budget int
+		switch msg.Role {
+		case models.RoleTool:
+			toolName := ""
+			if msg.ToolResult != nil {
+				toolName = msg.ToolResult.ToolName
+			}
+			budget = cfg.toolResultBudget(1, toolName)
+		case models.RoleAI:
+			budget = cfg.conversationBudget(2)
+			if budget <= 0 {
+				budget = 500
+			}
+		default:
+			continue
+		}
+		if budget > 0 && len(msg.Content) > budget {
+			msg.Content = "[…trimmed to fit the context window…]\n" + clipSuffix(msg.Content, budget)
+		}
+	}
+}
+
+func (a *Agent) shrinkBodies(view []models.Message, idxs []int, systemPrompt string) {
 	for a.windowExceeds(view, systemPrompt) {
 		idx := -1
 		best := windowToolFloor
-		for i := 0; i < current && i < len(view); i++ {
+		for _, i := range idxs {
+			if i < 0 || i >= len(view) {
+				continue
+			}
 			if view[i].Role != models.RoleTool && view[i].Role != models.RoleAI {
 				continue
 			}
