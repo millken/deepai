@@ -80,6 +80,19 @@ type ReplConfig struct {
 	// caller (see commands.resolveRefineInterval); 0 means "no gate".
 	MemoryRefineInterval int
 
+	// KeepFullTurns is the verbatim window, already resolved. 0 means the
+	// provider sees the full transcript.
+	KeepFullTurns int
+	// SessionSummaryDisabled turns off the background consolidation. The
+	// window still applies when KeepFullTurns is positive.
+	SessionSummaryDisabled bool
+	// SessionSummaryModel is the model alias for the background consolidation.
+	// Empty uses the chat model of the current turn.
+	SessionSummaryModel string
+	// ToolOffloadBytes overrides the tool-result offload threshold. 0 keeps
+	// the default. Negative disables offload.
+	ToolOffloadBytes int
+
 	// ReviewAfterEdit enables the adversarial post-edit review gate
 	// (docs/ADVERSARIAL_REVIEW_DESIGN.md). Default off — the gate blocks the
 	// turn synchronously and spends reviewer tokens, so it is an explicit
@@ -1591,6 +1604,26 @@ func mainAgentMaxTokens() *int {
 	return &n
 }
 
+// sessionSummarizer is the background model for turns that have left the
+// verbatim window. It is resolved per turn so /model and session_summary_model
+// apply to the next turn. A resolution failure leaves the window in place
+// without a summary rather than blocking the turn.
+func (r *ChatRepl) sessionSummarizer() agent.SessionSummarizer {
+	if r.cfg.SessionSummaryDisabled || r.cfg.KeepFullTurns <= 0 || r.cfg.ModelRegistry == nil {
+		return nil
+	}
+	alias := r.cfg.SessionSummaryModel
+	if alias == "" {
+		alias = r.currentModel
+	}
+	provider, modelName, err := r.cfg.ModelRegistry.ProviderFor(alias)
+	if err != nil {
+		slog.Warn("session summary model", "alias", alias, "err", err)
+		return nil
+	}
+	return agent.NewLLMSessionSummarizer(provider, modelName)
+}
+
 func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []models.MessageImage, continuation bool) error {
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
 		r.ui.RenderSubagentEvent(evt)
@@ -1663,6 +1696,9 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 		ImageDetail:       r.currentImageDetail(),
 		AgentCatalog:      r.cfg.AgentCatalog,
 		Session:           r.carry,
+		KeepFullTurns:     r.cfg.KeepFullTurns,
+		OffloadBytes:      r.cfg.ToolOffloadBytes,
+		Summarizer:        r.sessionSummarizer(),
 	}
 
 	runAgent := agent.New(agentCfg)

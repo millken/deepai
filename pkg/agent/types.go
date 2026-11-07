@@ -167,6 +167,21 @@ type AgentConfig struct {
 	// OffloadDir is where tool results exceeding the offload threshold are
 	// written to disk. Empty = auto-derive ~/.deepai/offload in New().
 	OffloadDir string
+	// OffloadBytes is the size above which a tool result is stored on disk
+	// and replaced in the prompt by a short ref. 0 keeps offloadThresholdBytes.
+	// Negative disables offload.
+	OffloadBytes int
+
+	// KeepFullTurns is how many recent user turns are sent verbatim. Older
+	// turns are replaced by the session summary. 0 disables the window so
+	// existing callers and subagents keep the full transcript. The REPL
+	// resolves an absent config value to DefaultKeepFullTurns.
+	KeepFullTurns int
+	// Summarizer consolidates turns that have fallen out of the window. The
+	// call runs in the background and must not use the interactive model's
+	// streaming request. nil leaves the window in place with a note that
+	// those turns are not summarized.
+	Summarizer SessionSummarizer
 
 	// ImageDetail controls the vision detail level for image attachments.
 	// "low" (default, ~170 tokens/image) or "high" (multi-tile, finer detail).

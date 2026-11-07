@@ -468,17 +468,15 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 	// copy was correctly invalidated.
 	a.setTokenAnchor(0, 0)
 
-	// Measure the same aged VIEW + turn injection the main compaction trigger
-	// (and the request that just overflowed — maybeCompact appends
-	// a.turnInjection to every view it hands to Run) actually sends, not raw
-	// canonical bytes — compactMessages below still mutates and returns
-	// canonical messages. Without the injection here, "before" would
-	// under-count relative to what actually overflowed; since it is the same
-	// constant-per-Run message on both sides of the comparison, omitting it
-	// wouldn't change which candidate tail wins, but including it keeps this
-	// reactive path's absolute numbers (logged below) consistent with the
-	// proactive trigger's.
-	before := a.estimateContextTokens(appendTurnInjection(buildPromptView(runMessages, a.aging, a.contextWindow), a.turnInjection), systemPrompt)
+	// Measure the view the request actually sent (sentTranscript) plus
+	// the turn injection maybeCompact appends. When the verbatim window is
+	// on, that view is the summary plus the kept turns, not the canonical
+	// transcript and not an aged copy of it. Compacting history the provider
+	// did not see can shrink a canonical estimate while leaving the request
+	// unchanged; accepting that result would rewrite runMessages for a retry
+	// that sends the same bytes. The injection is on both sides so it does
+	// not change which tail wins, and the logged numbers match the request.
+	before := a.estimateContextTokens(appendTurnInjection(a.sentTranscript(runMessages, systemPrompt), a.turnInjection), systemPrompt)
 	for _, tail := range []int{a.compactionKeepTail, 4, 2} {
 		if tail <= 0 {
 			continue
@@ -487,7 +485,7 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 		if !didCompact {
 			continue
 		}
-		after := a.estimateContextTokens(appendTurnInjection(buildPromptView(compacted, a.aging, a.contextWindow), a.turnInjection), systemPrompt)
+		after := a.estimateContextTokens(appendTurnInjection(a.sentTranscript(compacted, systemPrompt), a.turnInjection), systemPrompt)
 		if after < before {
 			a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "tail", tail, "before_tokens", before, "after_tokens", after)
 			return compacted, true

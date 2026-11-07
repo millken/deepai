@@ -68,6 +68,23 @@ type Config struct {
 	// Always read it through resolveRefineInterval, never directly.
 	MemoryRefineInterval int `yaml:"memory_refine_interval,omitempty"`
 
+	// SessionKeepTurns is how many recent user turns stay verbatim in the
+	// provider request. 0 or absent means the default (10). Negative sends
+	// the full transcript. Always read through agent.ResolveKeepFullTurns.
+	SessionKeepTurns int `yaml:"session_keep_turns,omitempty"`
+	// SessionSummaryDisabled turns off the background model that consolidates
+	// turns older than the window. The window still drops those turns and
+	// says they were not summarized. Set session_keep_turns negative to send
+	// the full transcript.
+	SessionSummaryDisabled bool `yaml:"session_summary_disabled,omitempty"`
+	// SessionSummaryModel is the model alias for that background call. Empty
+	// uses the chat model of the current turn, still as a separate request.
+	SessionSummaryModel string `yaml:"session_summary_model,omitempty"`
+	// ToolOffloadBytes is the size above which a tool result is stored on
+	// disk and replaced in the prompt by a short ref. 0 or absent means
+	// 24 KiB. Negative disables offload.
+	ToolOffloadBytes int `yaml:"tool_offload_bytes,omitempty"`
+
 	// ReviewAfterEdit enables the adversarial post-edit review gate
 	// (docs/ADVERSARIAL_REVIEW_DESIGN.md): after a turn that edited files,
 	// an independent correctness-reviewer subagent reviews the changes and
