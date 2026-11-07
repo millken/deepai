@@ -89,12 +89,15 @@ func (a *Agent) maybeCompact(ctx context.Context, sessionID string, turn int, ru
 		a.setCompactionStall(false, a.compactionStalledAt)
 	}
 
-	// The verbatim window replaces proactive compaction. Measuring the full
-	// transcript here would flush durable memory and rewrite history the
-	// summary job still reads. A provider overflow still compacts through
+	// The verbatim window replaces proactive compaction of canonical history.
+	// Measuring the full transcript here would flush durable memory and
+	// rewrite text the summary job still reads. The sent view is still
+	// checked: guardWindowPressure trims non-current tool bodies inside the
+	// window (and drops oldest kept turns if that is not enough) without
+	// touching runMessages. A provider overflow still compacts through
 	// compactOnOverflow.
 	if a.keepFullTurns > 0 {
-		promptView = a.windowPromptView(promptView)
+		promptView = a.guardWindowPressure(a.windowPromptView(promptView), systemPrompt)
 		return runMessages, appendTurnInjection(promptView, a.turnInjection)
 	}
 

@@ -209,12 +209,177 @@ func (a *Agent) promptViewForRequest(messages []models.Message) []models.Message
 }
 
 // providerTranscriptView is the message list a request sends, minus the
-// trailing turn injection. compactOnOverflow uses it so a compaction is
-// accepted only when it shrinks that list.
+// trailing turn injection and minus in-window pressure trimming.
+// compactOnOverflow uses sentTranscript so a compaction is accepted only
+// when it shrinks the bytes that were actually sent.
 func (a *Agent) providerTranscriptView(messages []models.Message) []models.Message {
 	view := a.promptViewForRequest(messages)
 	if a != nil && a.keepFullTurns > 0 {
 		view = a.windowPromptView(view)
+	}
+	return view
+}
+
+// sentTranscript is the provider message list before the turn injection,
+// including the in-window trim applied when that view is over the
+// compaction threshold.
+func (a *Agent) sentTranscript(messages []models.Message, systemPrompt string) []models.Message {
+	view := a.providerTranscriptView(messages)
+	if a != nil && a.keepFullTurns > 0 {
+		view = a.guardWindowPressure(view, systemPrompt)
+	}
+	return view
+}
+
+// windowToolFloor is the shortest tail left on a non-current tool or
+// assistant message when the window itself is over the context threshold.
+const windowToolFloor = 300
+
+// guardWindowPressure keeps the view that will be sent under the compaction
+// threshold. It copies before editing. Canonical messages, and the current
+// user turn, are left unchanged. Non-current tool and assistant bodies
+// inside the window are trimmed first; if that is not enough, the oldest
+// kept turns are left out of this request only.
+func (a *Agent) guardWindowPressure(view []models.Message, systemPrompt string) []models.Message {
+	if a == nil || a.contextWindow <= 0 || !a.windowExceeds(view, systemPrompt) {
+		return view
+	}
+	view = append([]models.Message(nil), view...)
+	a.clipKeptToolBodies(view)
+	if !a.windowExceeds(view, systemPrompt) {
+		return view
+	}
+	a.shrinkKeptBodies(view, systemPrompt)
+	if !a.windowExceeds(view, systemPrompt) {
+		return view
+	}
+	return a.dropOldestKeptTurns(view, systemPrompt)
+}
+
+func (a *Agent) windowBudget() int {
+	threshold := a.compactionThreshold
+	if threshold <= 0 {
+		threshold = defaultCompactionThreshold
+	}
+	budget := int(threshold * float64(a.contextWindow))
+	if budget < 1 {
+		return 1
+	}
+	return budget
+}
+
+func (a *Agent) windowExceeds(view []models.Message, systemPrompt string) bool {
+	if a == nil || a.contextWindow <= 0 {
+		return false
+	}
+	sent := appendTurnInjection(view, a.turnInjection)
+	est := estimateTokens(sent, systemPrompt, 0) + a.toolSchemaTokens()
+	return est >= a.windowBudget()
+}
+
+func currentTurnStart(msgs []models.Message) int {
+	starts := turnStarts(msgs)
+	if len(starts) == 0 {
+		return len(msgs)
+	}
+	return starts[len(starts)-1]
+}
+
+func (a *Agent) clipKeptToolBodies(view []models.Message) {
+	cfg := a.aging
+	if cfg == nil {
+		cfg = &AgingConfig{}
+	}
+	current := currentTurnStart(view)
+	starts := turnStarts(view)
+	for i := 0; i < current && i < len(view); i++ {
+		msg := &view[i]
+		if msg.Role != models.RoleTool && msg.Role != models.RoleAI {
+			continue
+		}
+		age := 0
+		for _, s := range starts {
+			if s > i {
+				age++
+			}
+		}
+		if age < 1 {
+			age = 1
+		}
+		var budget int
+		if msg.Role == models.RoleTool {
+			toolName := ""
+			if msg.ToolResult != nil {
+				toolName = msg.ToolResult.ToolName
+			}
+			budget = cfg.toolResultBudget(age, toolName)
+		} else {
+			budget = cfg.conversationBudget(age)
+			if budget <= 0 {
+				budget = 500
+			}
+		}
+		if budget > 0 && len(msg.Content) > budget {
+			// Keep the tail: bash exit status and compiler errors sit there.
+			msg.Content = "[…trimmed to fit the context window…]\n" + clipSuffix(msg.Content, budget)
+		}
+	}
+}
+
+func (a *Agent) shrinkKeptBodies(view []models.Message, systemPrompt string) {
+	current := currentTurnStart(view)
+	for a.windowExceeds(view, systemPrompt) {
+		idx := -1
+		best := windowToolFloor
+		for i := 0; i < current && i < len(view); i++ {
+			if view[i].Role != models.RoleTool && view[i].Role != models.RoleAI {
+				continue
+			}
+			if n := len(view[i].Content); n > best {
+				best = n
+				idx = i
+			}
+		}
+		if idx < 0 {
+			return
+		}
+		next := len(view[idx].Content) / 2
+		if next < windowToolFloor {
+			next = windowToolFloor
+		}
+		repl := "[…trimmed to fit the context window…]\n" + clipSuffix(view[idx].Content, next)
+		if len(repl) >= len(view[idx].Content) {
+			repl = clipSuffix(view[idx].Content, windowToolFloor)
+		}
+		if len(repl) >= len(view[idx].Content) {
+			return
+		}
+		view[idx].Content = repl
+	}
+}
+
+func (a *Agent) dropOldestKeptTurns(view []models.Message, systemPrompt string) []models.Message {
+	const note = "[A kept turn was left out of this request so it would fit the context window. The turn is still in session history.]\n"
+	for a.windowExceeds(view, systemPrompt) {
+		starts := turnStarts(view)
+		if len(starts) <= 1 {
+			return view
+		}
+		prefix := append([]models.Message(nil), view[:starts[0]]...)
+		if len(prefix) > 0 && prefix[len(prefix)-1].Metadata[metaSessionSummary] == "true" {
+			prefix[len(prefix)-1].Content += note
+		} else {
+			prefix = append(prefix, models.Message{
+				Role:     models.RoleHuman,
+				Content:  note,
+				Metadata: map[string]string{metaSessionSummary: "true"},
+			})
+		}
+		next := append(prefix, view[starts[1]:]...)
+		if len(turnStarts(next)) >= len(starts) {
+			return view
+		}
+		view = next
 	}
 	return view
 }

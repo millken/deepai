@@ -48,9 +48,9 @@ func toolMessageContent(result models.ToolResult) string {
 	if result.Error != "" {
 		s = result.Error
 	}
-	// recall_output's contract is the full stored body. The 50KB store cap
-	// would clip it again after offload was skipped, so the model would
-	// still not see what it just fetched.
+	// recall_output already capped its page. Skipping the 50KB store cap
+	// keeps that page, including the next-offset notice, intact. The cap
+	// inside the tool is what bounds a multi-megabyte recall.
 	if result.ToolName == "recall_output" {
 		return s
 	}
@@ -157,7 +157,7 @@ func buildOffloadedContent(original, _, offloadPath string) string {
 	fmt.Fprintf(&b, "[offloaded: full output (%d bytes, %d lines) saved to %s]\n",
 		len(original), len(lines), offloadPath)
 	fmt.Fprintf(&b, "ref: %s\n", id)
-	b.WriteString("The body is not in this prompt. Call recall_output with this ref when you need it.\n")
+	b.WriteString("The body is not in this prompt. Call recall_output with this ref when you need it. Each call returns at most 64 KiB; pass the offset from a truncated result to continue.\n")
 	if tail := offloadPreview(original); tail != "" {
 		b.WriteString("--- tail ---\n")
 		b.WriteString(tail)

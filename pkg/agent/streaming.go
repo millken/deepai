@@ -468,7 +468,7 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 	// copy was correctly invalidated.
 	a.setTokenAnchor(0, 0)
 
-	// Measure the view the request actually sent (providerTranscriptView) plus
+	// Measure the view the request actually sent (sentTranscript) plus
 	// the turn injection maybeCompact appends. When the verbatim window is
 	// on, that view is the summary plus the kept turns, not the canonical
 	// transcript and not an aged copy of it. Compacting history the provider
@@ -476,7 +476,7 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 	// unchanged; accepting that result would rewrite runMessages for a retry
 	// that sends the same bytes. The injection is on both sides so it does
 	// not change which tail wins, and the logged numbers match the request.
-	before := a.estimateContextTokens(appendTurnInjection(a.providerTranscriptView(runMessages), a.turnInjection), systemPrompt)
+	before := a.estimateContextTokens(appendTurnInjection(a.sentTranscript(runMessages, systemPrompt), a.turnInjection), systemPrompt)
 	for _, tail := range []int{a.compactionKeepTail, 4, 2} {
 		if tail <= 0 {
 			continue
@@ -485,7 +485,7 @@ func (a *Agent) compactOnOverflow(runMessages []models.Message, systemPrompt str
 		if !didCompact {
 			continue
 		}
-		after := a.estimateContextTokens(appendTurnInjection(a.providerTranscriptView(compacted), a.turnInjection), systemPrompt)
+		after := a.estimateContextTokens(appendTurnInjection(a.sentTranscript(compacted, systemPrompt), a.turnInjection), systemPrompt)
 		if after < before {
 			a.logger.Warn("compacting after "+where+" context overflow", "turn", turn, "tail", tail, "before_tokens", before, "after_tokens", after)
 			return compacted, true

@@ -332,18 +332,67 @@ func TestRecallOutput_StaysInPromptAfterOffload(t *testing.T) {
 			break
 		}
 	}
-	if stored != body {
-		t.Fatalf("stored tool content = %d bytes, want the full %d (offload or the 50KB cap rewrote the recall)", len(stored), len(body))
+	if len(stored) >= len(body) || len(stored) > 64*1024+400 {
+		t.Fatalf("stored tool content = %d bytes, body = %d; recall must return a capped page", len(stored), len(body))
+	}
+	if !strings.HasPrefix(stored, "RECALLED_BODY_") {
+		t.Fatalf("page does not start at the beginning of the file: %.80q", stored)
+	}
+	if !strings.Contains(stored, "Next chunk starts at offset") {
+		t.Fatalf("capped page missing the next-offset notice: %.200q", stored)
 	}
 	if strings.Contains(stored, "[offloaded:") || strings.Contains(stored, "[truncated:") {
-		t.Fatal("recalled body was stubbed or truncated")
+		t.Fatal("recalled page was stubbed or clipped again by the store cap")
 	}
-	follow := p.followUp()
-	if !strings.Contains(joinContents(follow), "RECALLED_BODY_") || strings.Contains(joinContents(follow), "[offloaded:") {
-		t.Fatal("the next provider request did not contain the recalled body")
+	follow := joinContents(p.followUp())
+	if !strings.Contains(follow, "RECALLED_BODY_") || !strings.Contains(follow, "Next chunk starts at offset") {
+		t.Fatal("the next provider request did not contain the recalled page")
 	}
-	if !strings.Contains(joinContents(follow), body) {
-		t.Fatal("the next provider request clipped the recalled body")
+	if strings.Contains(follow, "[offloaded:") || strings.Contains(follow, body) {
+		t.Fatal("the next provider request inlined the whole file or an offload stub")
+	}
+}
+
+func TestWindow_PressureTrimsBeforeFirstRequest(t *testing.T) {
+	old := strings.Repeat("Q", 12000) + "ERR_TAIL"
+	msgs := []models.Message{
+		{Role: models.RoleHuman, Content: "turn-1"},
+		{Role: models.RoleTool, Content: old, ToolResult: &models.ToolResult{CallID: "c1", ToolName: "bash", Content: old}},
+		{Role: models.RoleHuman, Content: "turn-2"},
+		{Role: models.RoleTool, Content: old, ToolResult: &models.ToolResult{CallID: "c2", ToolName: "bash", Content: old}},
+		{Role: models.RoleHuman, Content: "CURRENT_TURN_OK"},
+		{Role: models.RoleTool, Content: "CURRENT_TOOL_FULL", ToolResult: &models.ToolResult{CallID: "c3", ToolName: "bash", Content: "CURRENT_TOOL_FULL"}},
+	}
+	p := &promptCaptureProvider{}
+	a := New(AgentConfig{
+		LLMProvider:    p,
+		Tools:          tools.NewRegistry(),
+		KeepFullTurns:  3,
+		ContextWindow:  2500,
+		SystemPrompt:   "sys",
+		NonInteractive: true,
+	})
+	result, err := a.Run(context.Background(), "s1", msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("provider calls = %d, want the first request to fit without an overflow retry", len(got))
+	}
+	est := estimateTokens(got[0].messages, got[0].system, 0) + a.toolSchemaTokens()
+	if est >= a.windowBudget() {
+		t.Fatalf("first request is %d tokens, budget %d", est, a.windowBudget())
+	}
+	blob := joinContents(got[0].messages)
+	if strings.Count(blob, "Q") >= 12000 {
+		t.Fatal("an older tool body was sent in full")
+	}
+	if !strings.Contains(blob, "ERR_TAIL") || !strings.Contains(blob, "CURRENT_TURN_OK") || !strings.Contains(blob, "CURRENT_TOOL_FULL") {
+		t.Fatalf("trim dropped the error tail or the current turn: %s", blob)
+	}
+	if strings.Count(joinContents(result.Messages), "Q") < 24000 {
+		t.Fatal("canonical history was rewritten while trimming the view")
 	}
 }
 

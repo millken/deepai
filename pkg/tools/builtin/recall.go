@@ -6,8 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/models"
+)
+
+const (
+	// recallDefaultBytes is the page size when limit is omitted or zero.
+	recallDefaultBytes = 32 * 1024
+	// recallMaxBytes is the hard per-call cap. A larger limit is clamped.
+	recallMaxBytes = 64 * 1024
 )
 
 // RecallOutputTool reads a tool result that was written out of the prompt.
@@ -16,9 +24,10 @@ import (
 func RecallOutputTool(dir string) models.Tool {
 	return models.Tool{
 		Name: "recall_output",
-		Description: "Read the full content of a tool result that was stored outside the prompt. " +
+		Description: "Read a tool result that was stored outside the prompt. " +
 			"Pass ref from the [offloaded: ...] stub (the id, not a guessed path). " +
-			"Use this when the stub's tail is not enough.",
+			"Each call returns at most 64 KiB (default 32 KiB). " +
+			"When the notice says bytes remain, call again with its offset.",
 		Groups:       []string{"builtin"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -27,6 +36,14 @@ func RecallOutputTool(dir string) models.Tool {
 				"ref": map[string]any{
 					"type":        "string",
 					"description": "Offload id from the stub, or the absolute path named there.",
+				},
+				"offset": map[string]any{
+					"type":        "integer",
+					"description": "Byte offset to start at. Default 0. Use the offset from a previous truncated result.",
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Maximum bytes to return. Default 32768. Values above 65536 are clamped.",
 				},
 			},
 			"required": []any{"ref"},
@@ -41,13 +58,14 @@ func RecallOutputTool(dir string) models.Tool {
 			if err != nil {
 				return models.ToolResult{CallID: call.ID, ToolName: call.Name}, fmt.Errorf("recall_output: %w", err)
 			}
-			// The point of this call is to put the body back in the prompt.
-			// ToolDataNoOffload keeps offloadIfNeeded from immediately
-			// replacing it with another stub.
+			chunk, notice := recallPage(data, intArg(call.Arguments, "offset"), intArg(call.Arguments, "limit"))
+			// The page is what this call asked to bring into the prompt.
+			// ToolDataNoOffload keeps offloadIfNeeded from replacing the
+			// page with another stub. The page size is already capped.
 			return models.ToolResult{
 				CallID:   call.ID,
 				ToolName: call.Name,
-				Content:  string(data),
+				Content:  chunk + notice,
 				Data:     map[string]any{models.ToolDataNoOffload: true},
 			}, nil
 		},
@@ -78,4 +96,59 @@ func recallOutputPath(dir, ref string) (string, error) {
 		return "", fmt.Errorf("recall_output: ref escapes the offload directory")
 	}
 	return path, nil
+}
+
+func intArg(args map[string]any, key string) int {
+	switch v := args[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+// recallPage returns at most recallMaxBytes of data starting at offset, plus
+// a notice when the caller needs another call to see the rest. A zero limit
+// uses recallDefaultBytes. A complete read from the start has an empty notice
+// so a small file is returned unchanged.
+func recallPage(data []byte, offset, limit int) (chunk, notice string) {
+	total := len(data)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	for offset < total && !utf8.RuneStart(data[offset]) {
+		offset++
+	}
+	if limit <= 0 {
+		limit = recallDefaultBytes
+	}
+	if limit > recallMaxBytes {
+		limit = recallMaxBytes
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	} else {
+		for end > offset && !utf8.RuneStart(data[end]) {
+			end--
+		}
+	}
+	chunk = string(data[offset:end])
+	if end >= total && offset == 0 {
+		return chunk, ""
+	}
+	remain := total - end
+	if remain > 0 {
+		notice = fmt.Sprintf("\n[recall_output: bytes %d-%d of %d. %d bytes remain. Next chunk starts at offset %d.]\n", offset, end, total, remain, end)
+	} else {
+		notice = fmt.Sprintf("\n[recall_output: bytes %d-%d of %d. End of output.]\n", offset, end, total)
+	}
+	return chunk, notice
 }
