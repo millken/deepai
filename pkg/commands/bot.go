@@ -60,7 +60,7 @@ func LoadEnvFile() {
 	}
 }
 
-// Version reports the build version shared by deepai and deepai-bot.
+// BuildVersion reports the build version shared by deepai and deepai-bot.
 func BuildVersion() string { return version() }
 
 // NewBotRuntime builds the bot's agent runtime. ctx bounds MCP server

@@ -46,7 +46,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 - **沙箱隔离**：Landlock → bubblewrap（bwrap）→ direct 三级降级，限制 bash 与文件操作的作用域。
 - **Token 效率**：可选的工具结果老化（T1）、对话压缩（T4）、Phase 0 指标采集，用于优化长会话成本。
 - **交互式 TUI**：基于 bubbletea 的终端界面，语法高亮、Markdown 渲染、斜杠命令、会话选择器。
-- **HTTP 网关**：把 agent 能力作为 REST/SSE 服务暴露，支持多用户、多会话、Postgres 持久化。
+- **常驻 Bot 服务**：`deepai-bot` 把 agent 作为后台服务运行，以 REST / SSE / NDJSON / WebSocket 提供会话、流式事件、断线续传、远程回答提问与打断，内置 Web 控制台；与 CLI 共享配置和会话库（见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)）。
 
 ---
 
@@ -55,7 +55,7 @@ DeepAI 在终端中以交互式 REPL 运行，也可作为 HTTP 网关服务对�
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      用户入口                                │
-│   deepai (REPL TUI)                              Gateway HTTP │
+│   deepai (REPL TUI)          deepai-bot (HTTP/SSE/WebSocket) │
 └──────────────┬─────────────────────────────────────┬────────┘
                │                                     │
                ▼                                     ▼
@@ -652,6 +652,21 @@ DeepAI 维护跨会话的用户记忆（偏好、事实、反馈）：
 
 ---
 
+## 常驻 Bot 服务
+
+`cmd/deepai-bot` 是独立的可执行文件，把同一套 agent 运行时作为常驻后台服务运行，客户端（Web / GUI / App / IM 适配器）通过 HTTP、SSE、NDJSON 或 WebSocket 控制它：
+
+```bash
+make build-bot
+./bin/deepai-bot start -w ~/code/proj   # 后台运行，打印 Web 控制台地址
+./bin/deepai-bot status
+./bin/deepai-bot stop
+```
+
+任务属于 bot 而非请求：客户端断开不会中断任务，重连后按 `seq` 续传事件；`ask_clarification` 会推送给客户端回答。bot 会话写入与 CLI 相同的会话库，`deepai -r <id>` 可在终端接着聊。用法见 [`cmd/deepai-bot/README.md`](cmd/deepai-bot/README.md)，协议与设计见 [`docs/BOT_DESIGN.md`](docs/BOT_DESIGN.md)。
+
+---
+
 ## API 代理（开发调试）
 
 > 早前的 HTTP/SSE 网关服务（`pkg/gateway`）已移除（未接入主 CLI，无命令注册它）。
@@ -672,10 +687,12 @@ deepai/
 │   ├── deepai/              # 主 CLI 入口（REPL）
 │   │   ├── main.go
 │   │   └── help/            # 文档生成工具
+│   ├── deepai-bot/          # 常驻 Bot 服务入口（serve/start/stop/status）
 │   ├── proxy/               # LLM API 调试代理
 │   └── mcp-example/         # MCP 服务器示例
 ├── pkg/
 │   ├── agent/               # ReAct 引擎、子代理执行器、配置、老化、指标
+│   ├── bot/                 # Bot 服务：会话编排、事件总线、HTTP/SSE/WS、Web 控制台
 │   ├── chat/                # REPL TUI、会话、斜杠命令、渲染
 │   ├── commands/            # cobra 命令（chat/setup/session/plugin/version）
 │   ├── llm/                 # LLM 提供商抽象与实现（openai/anthropic）
@@ -709,6 +726,7 @@ deepai/
 
 ```bash
 make build              # 构建 ./bin/deepai
+make build-bot          # 构建 ./bin/deepai-bot
 make build-proxy        # 构建 ./bin/proxy
 make install            # 构建并安装到 ~/.local/bin
 ```
@@ -754,6 +772,7 @@ go run ./cmd/deepai/help -d ./docs/cmd
 | [`REVIEW_EVAL_DESIGN.md`](docs/REVIEW_EVAL_DESIGN.md) | reviewer 的离线评测基线（检出率 / 假阳性率 / 成本） | 设计 |
 | [`AGENT_CAPABILITY_DESIGN.md`](docs/AGENT_CAPABILITY_DESIGN.md) | 角色能力（M5）：可执行知识、产出契约、验证手段 | 设计 |
 | [`SKILL_DESIGN.md`](docs/SKILL_DESIGN.md) | 技能系统设计 | 已实现 |
+| [`BOT_DESIGN.md`](docs/BOT_DESIGN.md) | 常驻 Bot 服务 `deepai-bot`：架构、事件协议、REST/SSE/WS API、安全模型 | 已实现 |
 | [`CLAUDE_PLUGIN_COMMANDS_GUIDE.md`](docs/CLAUDE_PLUGIN_COMMANDS_GUIDE.md) | Claude 风格 slash 命令的编写与安装 | 使用指南 |
 | [`DOCX_TOOLS_DESIGN.md`](docs/DOCX_TOOLS_DESIGN.md) | `.docx` 读取 / 编辑 / 排版工具层 | 已实现 |
 | [`REFINE_DESIGN.md`](docs/REFINE_DESIGN.md) | 记忆 refine：review gate、`/refine`、rollback | 已实现 |
