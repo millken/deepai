@@ -517,7 +517,7 @@ func TestOffloadStub_RecallRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	a := New(AgentConfig{OffloadBytes: 64, OffloadDir: dir})
 	var body strings.Builder
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 400; i++ {
 		fmt.Fprintf(&body, "HEADLINE %d\n", i)
 	}
 	body.WriteString("FAIL_TAIL\n")
