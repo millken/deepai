@@ -233,6 +233,7 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 
 ## 8. 后续路线
 
+0. **多 Bot 人格（同进程）**：在单一 `deepai-bot` 内注册多个 Bot（名称、指令、默认模型、隔离记忆），会话归属 `bot_id`；详见 [`docs/BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
 1. **消息队列 / 插话**：运行中发送的消息排队，或作为"steer"注入下一步。
 2. **IM 渠道适配器**（Telegram / Slack / 飞书 / 企业微信）：作为 `Manager` 的另一个客户端，映射 "聊天线程 ↔ 会话"、"按钮 ↔ question 选项"。
 3. **定时任务 / Webhook 触发**：cron 或 GitHub 事件创建 turn，结果推送到渠道。
