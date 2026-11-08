@@ -272,14 +272,63 @@ func confirm(ctx context.Context, cfg Config, verb, name, prompt string, v Valid
 	if err != nil {
 		return NewError(CodeConfirmationMissing, "confirmation not received: %v", err)
 	}
-	a := strings.ToLower(strings.TrimSpace(answer))
-	if strings.Contains(a, "取消") || strings.Contains(a, "cancel") || strings.Contains(a, "no") {
+	confirmed, denied := classifyConfirmation(answer)
+	if denied {
 		return NewError(CodeConfirmationMissing, "user cancelled the confirmation")
 	}
-	if a == "" || (!strings.Contains(a, "确认") && !strings.Contains(a, "confirm") && !strings.Contains(a, "yes") && !strings.Contains(a, "创建") && !strings.Contains(a, "ok")) {
+	if !confirmed {
 		return NewError(CodeConfirmationMissing, "confirmation not received: answer %q was not a confirmation", answer)
 	}
 	return nil
+}
+
+// classifyConfirmation interprets a free-text answer to the confirmation
+// question. Exact option values win, then explicit phrases; English words
+// are matched whole ("note"/"no problem, go ahead" must not be mistaken for
+// "no"). Anything ambiguous stays unconfirmed, so a task is never created
+// by accident.
+func classifyConfirmation(answer string) (confirmed, denied bool) {
+	a := strings.ToLower(strings.TrimSpace(answer))
+	if a == "" {
+		return false, false
+	}
+	switch a {
+	case "取消", "cancel", "no", "n", "nope", "不用", "不要", "算了", "别创建":
+		return false, true
+	case "确认创建", "确认", "确定", "创建", "同意", "confirm", "yes", "y", "ok", "okay", "sure", "go ahead", "proceed":
+		return true, false
+	}
+	for _, p := range []string{"取消", "不要创建", "不用创建", "别创建", "算了"} {
+		if strings.Contains(a, p) {
+			return false, true
+		}
+	}
+	if hasWord(a, "cancel") || strings.Contains(a, "don't create") || strings.Contains(a, "do not create") {
+		return false, true
+	}
+	for _, p := range []string{"确认", "创建", "同意", "确定"} {
+		if strings.Contains(a, p) {
+			return true, false
+		}
+	}
+	for _, w := range []string{"yes", "ok", "okay", "sure", "confirm", "proceed", "go", "ahead"} {
+		if hasWord(a, w) {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// hasWord splits ASCII words (Chinese phrases are handled with Contains).
+func hasWord(s, word string) bool {
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) {
+		if f == word {
+			return true
+		}
+	}
+	return false
 }
 
 func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID string) (CreateInput, error) {

@@ -86,6 +86,11 @@ type Service struct {
 	dispatcher Dispatcher
 	kick       func()
 	mode       string // "active" | "standby"
+
+	// deferred holds interrupted Runs whose recovery was postponed because
+	// the previous lease holder may still be executing them (run ID → the
+	// time after which they must be reconciled). Guarded by mu.
+	deferred map[string]time.Time
 }
 
 // ServiceOption configures optional collaborators.
@@ -139,7 +144,10 @@ func NewService(store Store, cfg Config, opts ...ServiceOption) (*Service, error
 	if cfg.DefaultMaxAutoAnswers <= 0 {
 		cfg.DefaultMaxAutoAnswers = d.DefaultMaxAutoAnswers
 	}
-	s := &Service{store: store, cfg: cfg, clock: RealClock(), log: slog.Default(), mode: "active"}
+	s := &Service{
+		store: store, cfg: cfg, clock: RealClock(), log: slog.Default(),
+		mode: "active", deferred: map[string]time.Time{},
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -374,6 +382,20 @@ func (s *Service) Pause(ctx context.Context, id string) (Schedule, error) {
 	return s.Decorate(v), nil
 }
 
+// checkOnceNotPast rejects activating a one-shot whose trigger time has
+// elapsed: firstFreeSlotLocked would return nil, leaving the task active
+// forever with no Run and no completion (review M1).
+func (s *Service) checkOnceNotPast(v Schedule, now time.Time) error {
+	if v.Trigger.Type != TriggerOnce {
+		return nil
+	}
+	at, ok, err := v.Trigger.nextAfter(now.Add(-time.Nanosecond))
+	if err != nil || !ok || !at.After(now) {
+		return NewError(CodeTimeInPast, "the scheduled time has passed; update the task with a new 'at'")
+	}
+	return nil
+}
+
 // Resume recomputes the next slot from "now"; paused slots are not replayed.
 func (s *Service) Resume(ctx context.Context, id string) (Schedule, error) {
 	s.mu.Lock()
@@ -386,11 +408,8 @@ func (s *Service) Resume(ctx context.Context, id string) (Schedule, error) {
 		return Schedule{}, NewError(CodeInvalidState, "schedule %s is %s, not paused", id, v.State)
 	}
 	now := s.now()
-	if v.Trigger.Type == TriggerOnce {
-		at, _, parseErr := v.Trigger.nextAfter(now.Add(-time.Nanosecond))
-		if parseErr != nil || !at.After(now) {
-			return Schedule{}, NewError(CodeTimeInPast, "the scheduled time has passed; update the task with a new 'at'")
-		}
+	if err := s.checkOnceNotPast(v, now); err != nil {
+		return Schedule{}, err
 	}
 	v.State = StateActive
 	v.NextRunAt = s.firstFreeSlotLocked(ctx, v, now)
@@ -414,6 +433,9 @@ func (s *Service) Approve(ctx context.Context, id string) (Schedule, error) {
 		return Schedule{}, NewError(CodeInvalidState, "schedule %s is %s, not pending_approval", id, v.State)
 	}
 	now := s.now()
+	if err := s.checkOnceNotPast(v, now); err != nil {
+		return Schedule{}, err
+	}
 	v.State = StateActive
 	v.NextRunAt = s.firstFreeSlotLocked(ctx, v, now)
 	v.UpdatedAt = now
@@ -712,8 +734,9 @@ func (s *Service) SetSessionID(ctx context.Context, id, sessionID string) error 
 // ─────────────────── scheduler-facing operations ───────────────────
 
 // FireSlot is called by the Scheduler when a task's next_run_at is due. It
-// persists the Run first and only then calls the Dispatcher, so a crash can
-// lose a run but can never duplicate one.
+// persists the Run first and only then calls the Dispatcher; tryStartLocked
+// additionally reserves the Run as running before the turn starts, so a
+// crash can lose a run but can never duplicate one.
 func (s *Service) FireSlot(ctx context.Context, id string, slot time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -737,7 +760,9 @@ func (s *Service) FireSlot(ctx context.Context, id string, slot time.Time) error
 			Trigger: FireTimer, Slot: &slot, ScheduledFor: slot,
 			Status: RunSkipped, ErrorCode: "limit_exceeded", EndedAt: &now,
 		}
-		_ = s.insertRunLocked(ctx, limitRun)
+		if insErr := s.insertRunLocked(ctx, limitRun); insErr != nil && !errors.Is(insErr, ErrConflict) {
+			s.log.Warn("schedule: record limit_exceeded run", "schedule", id, "err", insErr)
+		}
 		v.NextRunAt = s.firstFreeSlotLocked(ctx, v, slot)
 		v.UpdatedAt = now
 		_ = s.updateScheduleLocked(ctx, v, ChangeUpdated)
@@ -749,7 +774,14 @@ func (s *Service) FireSlot(ctx context.Context, id string, slot time.Time) error
 		Trigger: FireTimer, Slot: &slot, ScheduledFor: slot, Status: RunPending,
 	}
 	if err := s.insertRunLocked(ctx, r); err != nil {
-		return nil // another process won the slot; UNIQUE did its job
+		if errors.Is(err, ErrConflict) {
+			return nil // another process won the slot; UNIQUE did its job
+		}
+		// Only a UNIQUE conflict means "already done". A disk/lock failure
+		// must be visible: swallowing it leaves the slot due forever with no
+		// log trace (review L1).
+		s.log.Warn("schedule: insert run", "schedule", id, "err", err)
+		return err
 	}
 	v.NextRunAt = s.firstFreeSlotLocked(ctx, v, slot)
 	v.UpdatedAt = now
@@ -843,10 +875,31 @@ func (s *Service) ProcessCancelRequests(ctx context.Context) error {
 // Recover runs at startup: interrupted Runs become failed, expired queues
 // become skipped, and missed slots are recorded (never replayed in P1).
 func (s *Service) Recover(ctx context.Context) error {
+	return s.recoverWithGrace(ctx, 0)
+}
+
+// RecoverAfterTakeover is used when a standby process acquires an expired
+// lease. The previous holder may still be alive (a transient renew error),
+// so Runs started within leaseTTL + their execution timeout are deferred
+// instead of being declared dead while their turn is still in flight
+// (review H1).
+func (s *Service) RecoverAfterTakeover(ctx context.Context, leaseTTL time.Duration) error {
+	return s.recoverWithGrace(ctx, leaseTTL)
+}
+
+func (s *Service) recoverWithGrace(ctx context.Context, leaseTTL time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deferred == nil {
+		s.deferred = map[string]time.Time{}
+	}
 	now := s.now()
 	for _, r := range s.findRunsLocked(ctx, RunFilter{Statuses: activeStatuses}) {
+		if deadline, ok := s.interruptedDeadlineLocked(ctx, r, now, leaseTTL); ok {
+			s.deferred[r.ID] = deadline
+			continue
+		}
+		delete(s.deferred, r.ID)
 		r.Status, r.ErrorCode, r.Error = RunFailed, "bot_restarted", "bot restarted while run was active"
 		r.EndedAt = timePtr(now)
 		if err := s.updateRunLocked(ctx, r); err != nil {
@@ -900,6 +953,51 @@ func (s *Service) Recover(ctx context.Context) error {
 		if err := s.updateScheduleLocked(ctx, v, ChangeUpdated); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// interruptedDeadlineLocked reports whether an interrupted Run may still be
+// owned by a live lease holder, and when it must be reconciled if not. A Run
+// without StartedAt has no anchor and is reconciled immediately.
+func (s *Service) interruptedDeadlineLocked(ctx context.Context, r Run, now time.Time, leaseTTL time.Duration) (time.Time, bool) {
+	if leaseTTL <= 0 || r.StartedAt == nil {
+		return time.Time{}, false
+	}
+	grace := leaseTTL
+	if v, err := s.store.GetSchedule(ctx, r.ScheduleID); err == nil {
+		grace += s.timeoutOf(v)
+	}
+	deadline := r.StartedAt.Add(grace)
+	return deadline, deadline.After(now)
+}
+
+// Reconcile fails deferred interrupted Runs whose grace period has expired.
+// The lease holder calls it on every sync tick; a late FinishRun wins
+// because terminal Runs are skipped.
+func (s *Service) Reconcile(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.deferred) == 0 {
+		return nil
+	}
+	now := s.now()
+	for id, deadline := range s.deferred {
+		if deadline.After(now) {
+			continue
+		}
+		r, err := s.store.GetRun(ctx, id)
+		if err != nil || r.Status.Terminal() {
+			delete(s.deferred, id)
+			continue
+		}
+		r.Status, r.ErrorCode, r.Error = RunFailed, "bot_restarted", "bot restarted while run was active"
+		r.EndedAt = timePtr(now)
+		if err := s.updateRunLocked(ctx, r); err != nil {
+			return err
+		}
+		delete(s.deferred, id)
+		s.finishEffectsLocked(ctx, r)
 	}
 	return nil
 }
@@ -1153,17 +1251,33 @@ func (s *Service) tryStartLocked(ctx context.Context, r Run, v Schedule) {
 	} else if s.globalActiveLocked(ctx) >= s.cfg.MaxConcurrentRuns {
 		r.QueuedReason = "concurrency"
 	} else {
+		// Reserve the Run as "running" BEFORE starting the turn. If the
+		// process dies between Fire and the final write, recovery sees a
+		// running (not pending) Run and cannot replay the same message into
+		// the dedicated session. The quiet write avoids a spurious
+		// run_started event when Fire then returns ErrBusy (review M3).
+		origDeadline := r.QueueDeadline
+		r.Status, r.StartedAt = RunRunning, &now
+		r.QueuedReason, r.QueueDeadline = "", nil
+		if err := s.store.UpdateRun(ctx, r); err != nil {
+			s.log.Warn("schedule: reserve run before dispatch", "run", r.ID, "err", err)
+			return
+		}
 		sid, tid, err := s.dispatcher.Fire(ctx, v, r)
 		switch {
 		case err == nil:
-			r.Status, r.StartedAt, r.SessionID, r.TurnID = RunRunning, &now, sid, tid
-			r.QueuedReason, r.QueueDeadline = "", nil
-			if v.Options.SessionMode == SessionDedicated && v.SessionID == "" && sid != "" {
+			r.SessionID, r.TurnID = sid, tid
+			// The Dispatcher recreates a deleted dedicated session lazily;
+			// pin the new ID on EVERY run, not just the first one, so the
+			// next trigger does not start from a stale session again
+			// (review H2).
+			if v.Options.SessionMode == SessionDedicated && sid != "" && v.SessionID != sid {
 				v.SessionID, v.UpdatedAt = sid, now
 				_ = s.updateScheduleLocked(ctx, v, ChangeUpdated)
 			}
 		case errors.Is(err, ErrBusy):
-			r.QueuedReason = "session_busy"
+			r.Status, r.StartedAt = RunPending, nil
+			r.QueuedReason, r.QueueDeadline = "session_busy", origDeadline
 		default:
 			r.Status, r.EndedAt = RunFailed, &now
 			r.Error, r.ErrorCode = err.Error(), "dispatch_failed"

@@ -159,27 +159,36 @@ func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, ru
 		d.mu.Lock()
 		reason := sr.cancelReason
 		d.mu.Unlock()
-		failure := hooks.failureReason()
-		switch {
-		case failure != "" && out.Status == schedule.RunCancelled:
-			out.Status, out.ErrorCode = schedule.RunFailed, "answer_timeout"
-			out.Error = failure
-		case (sum != nil && sum.CancelSource == string(cancelSourceShutdown)) ||
-			(d.m.Closing() && out.Status == schedule.RunCancelled):
-			out.Status, out.ErrorCode = schedule.RunFailed, "bot_shutdown"
-			out.Error = "bot shut down while the run was active"
-		case reason == schedule.CancelReplaced && out.Status == schedule.RunCancelled:
-			out.ErrorCode = "replaced"
-			out.Error = "replaced by a newer run"
-		}
-		if out.Status == schedule.RunTimedOut && out.Error == "" {
-			out.Error = "run exceeded " + timeout.String()
-		}
+		out = finalizeOutcome(out, sum, d.m.Closing(), hooks.failureReason(), reason, timeout)
 		if _, err := d.svc.FinishRun(context.Background(), run.ID, out); err != nil {
 			d.log.Warn("bot: finish schedule run", "run", run.ID, "err", err)
 		}
 	}()
 	return sessionID, turn.ID, nil
+}
+
+// finalizeOutcome attributes a cancelled turn to its first cause. A genuine
+// shutdown cancellation carries cancel_source=shutdown; only an unattributed
+// cancellation that happens while the Manager is closing falls back to
+// bot_shutdown, so a client cancellation started before the shutdown keeps
+// its cancelled state (review L4).
+func finalizeOutcome(out schedule.Outcome, sum *TurnSummary, closing bool, failure string, reason schedule.CancelReason, timeout time.Duration) schedule.Outcome {
+	switch {
+	case failure != "" && out.Status == schedule.RunCancelled:
+		out.Status, out.ErrorCode, out.Error = schedule.RunFailed, "answer_timeout", failure
+	case sum != nil && sum.CancelSource == string(cancelSourceShutdown):
+		out.Status, out.ErrorCode = schedule.RunFailed, "bot_shutdown"
+		out.Error = "bot shut down while the run was active"
+	case sum != nil && sum.CancelSource == "" && closing && out.Status == schedule.RunCancelled:
+		out.Status, out.ErrorCode = schedule.RunFailed, "bot_shutdown"
+		out.Error = "bot shut down while the run was active"
+	case reason == schedule.CancelReplaced && out.Status == schedule.RunCancelled:
+		out.ErrorCode, out.Error = "replaced", "replaced by a newer run"
+	}
+	if out.Status == schedule.RunTimedOut && out.Error == "" {
+		out.Error = "run exceeded " + timeout.String()
+	}
+	return out
 }
 
 func runTimeout(s string) time.Duration {

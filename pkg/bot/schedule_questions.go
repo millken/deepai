@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -43,6 +44,10 @@ type scheduleQuestionHooks struct {
 	reserved    int // auto-answers decided but not yet settled
 	closed      bool
 	failure     string // non-empty when answer_timeout ended the run
+
+	// write is updateLocked by default. Tests replace it to slow down a
+	// Service write and expose interleavings between concurrent questions.
+	write func(schedule.RunStatus, int)
 }
 
 func newScheduleQuestionHooks(d *ScheduleDispatcher, svc *schedule.Service, sch schedule.Schedule, run schedule.Run, sessionID string) *scheduleQuestionHooks {
@@ -59,7 +64,7 @@ func newScheduleQuestionHooks(d *ScheduleDispatcher, svc *schedule.Service, sch 
 	if maxAuto <= 0 {
 		maxAuto = cfg.DefaultMaxAutoAnswers
 	}
-	return &scheduleQuestionHooks{
+	h := &scheduleQuestionHooks{
 		d:              d,
 		svc:            svc,
 		runID:          run.ID,
@@ -69,6 +74,8 @@ func newScheduleQuestionHooks(d *ScheduleDispatcher, svc *schedule.Service, sch 
 		maxAutoAnswers: maxAuto,
 		pending:        map[string]*answerWaiter{},
 	}
+	h.write = h.updateLocked
+	return h
 }
 
 // setSessionID pins the session actually used (Fire may have had to recreate
@@ -81,8 +88,8 @@ func (h *scheduleQuestionHooks) setSessionID(id string) {
 
 func (h *scheduleQuestionHooks) QuestionAsked(q Question) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.closed {
-		h.mu.Unlock()
 		return
 	}
 	w := &answerWaiter{}
@@ -91,9 +98,11 @@ func (h *scheduleQuestionHooks) QuestionAsked(q Question) {
 	// The callback needs h.mu, which we still hold, so even a zero-duration
 	// timer cannot observe a half-registered waiter.
 	w.timer = time.AfterFunc(h.answerTimeout, func() { h.onAnswerTimeout(q.ID) })
-	h.mu.Unlock()
 	if first {
-		h.update(schedule.RunWaitingInput, 0)
+		// The status write shares the critical section with the pending-map
+		// mutation: two concurrent questions can never persist a stale
+		// "running" after a newer "waiting_input" (review M4).
+		h.writeLocked(schedule.RunWaitingInput, 0)
 	}
 }
 
@@ -150,13 +159,14 @@ func (h *scheduleQuestionHooks) onAnswerTimeout(qid string) {
 }
 
 // settle stops a question's answer clock, records an auto-answer and moves
-// the Run back to running once every outstanding question is resolved.
+// the Run back to running once every outstanding question is resolved. The
+// whole decision plus its Service write is serialized with h.mu.
 func (h *scheduleQuestionHooks) settle(qid string, auto bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	w := h.pending[qid]
 	delete(h.pending, qid)
 	if w == nil {
-		h.mu.Unlock()
 		return
 	}
 	if w.timer != nil {
@@ -172,19 +182,34 @@ func (h *scheduleQuestionHooks) settle(qid string, auto bool) {
 			delta = 1
 		}
 	}
-	last := len(h.pending) == 0
-	h.mu.Unlock()
 	status := schedule.RunStatus("")
-	if last {
+	// Once a timeout decided to fail the run, the ctx.Done unwinding of
+	// AskQuestion must not emit a misleading "running" transition.
+	if len(h.pending) == 0 && h.failure == "" {
 		status = schedule.RunRunning
 	}
-	h.update(status, delta)
+	h.writeLocked(status, delta)
 }
 
-func (h *scheduleQuestionHooks) update(status schedule.RunStatus, autoDelta int) {
+// writeLocked dispatches the (possibly injected) status write. Callers hold
+// h.mu; the production writer never calls back into the hooks.
+func (h *scheduleQuestionHooks) writeLocked(status schedule.RunStatus, autoDelta int) {
+	if h.write == nil {
+		h.write = h.updateLocked
+	}
+	h.write(status, autoDelta)
+}
+
+// updateLocked persists the Run interaction state. It must run under h.mu so
+// the order of status writes matches the order of pending-map changes.
+func (h *scheduleQuestionHooks) updateLocked(status schedule.RunStatus, autoDelta int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := h.svc.UpdateRunInteraction(ctx, h.runID, status, autoDelta); err != nil {
-		h.d.log.Warn("bot: update scheduled run interaction", "run", h.runID, "err", err)
+		log := slog.Default()
+		if h.d != nil && h.d.log != nil {
+			log = h.d.log
+		}
+		log.Warn("bot: update scheduled run interaction", "run", h.runID, "err", err)
 	}
 }

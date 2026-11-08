@@ -629,6 +629,23 @@ schedule:
 2. 按 §12 属 **P2**：`notify` 与 `pkg/hook` 的三个新事件（含 `schedule_ask` 推送）、Web 控制台任务页签、`misfire=run_once` 补跑、自写 cron。
 3. `answer_timeout` 到期后 `assume` 自动回答会写回 `auto_answers`，`fail` / 次数用尽时以 `cancel_source=scheduler` 取消 turn，Run 记 `failed(error_code=answer_timeout)`；等待回答期间执行时钟暂停，不会误判 `timed_out`。
 
+### 12.2 PR #43 评审 round 1 修复（2026-11-08）
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| H1 | `RenewLease` 瞬时错误即降级 standby，接管方 `Recover` 判死仍在执行的 Run（双跑） | `syncLease` 区分 `err`（租约未到期则保持 active、下个 sync 重试）、`ok=false`（确认被接管才降级）与"错误持续超过 leaseTTL"；新增 `RecoverAfterTakeover` / `Reconcile`：接管时按 `StartedAt + leaseTTL + 任务 timeout` 给在跑的 Run 宽限期，到期后由租约持有者补判死，迟到的 `FinishRun` 优先 |
+| H2 | dedicated 会话被删后重建的新会话不回写 Schedule，每轮泄漏一个会话 | `tryStartLocked` 回写条件改为 `SessionMode==dedicated && sid != "" && v.SessionID != sid`，Fire 返回的新 ID 每轮都会固定下来 |
+| M1 | 激活已过期的 `once` → active 且 `NextRunAt=nil` 死端 | `Approve` 复用 `checkOnceNotPast`（与 `Resume` 一致），返回 `time_in_past` |
+| M2 | standby 堆顶已到期 → `delay=0` 热自旋 | standby 下 delay 施加 1s 下限，接管仍由 sync tick 驱动 |
+| M3 | 先 Fire 后落 `running`，崩溃后 pending Run 被重放 | Fire 前静默预写 `running`（含 `StartedAt`），`ErrBusy` 回滚 pending 并保留原 deadline；恢复只判死、不重放 |
+| M4 | 并发提问 `waiting_input`/`running` 回写乱序 | `scheduleQuestionHooks` 的状态写入与 pending map 变更同处 `h.mu` 临界区 |
+| L1 | `FireSlot` 吞掉一切落库错误 | 只吞 `ErrConflict`，其余记 Warn 并返回错误 |
+| L2 | `Contains(a, "no")` 把肯定回答误判为取消 | `classifyConfirmation`：选项值精确匹配 + 英文整词/短语匹配，歧义回答仍不创建 |
+| L3 | `answer_timeout(fail)` 后 settle 仍写一次 `running` | `h.failure` 非空时 settle 不回写 running |
+| L4 | `Closing()` 兜底把关停窗口内的客户端取消误标 `bot_shutdown` | `finalizeOutcome` 仅在 `cancel_source` 为空且正在关闭时才兜底 |
+
+回归测试集中在 `pkg/schedule/review_test.go` 与 `pkg/bot/review_test.go`。
+
 ## 13. 关键取舍
 
 | 取舍 | 理由 |

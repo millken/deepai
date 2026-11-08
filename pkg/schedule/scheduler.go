@@ -14,6 +14,10 @@ const (
 	defaultLeaseTTL     = 60 * time.Second
 	defaultSyncInterval = 20 * time.Second
 	defaultMaxWake      = time.Minute
+
+	// A standby process rebuilds its heap so it can take over quickly, but a
+	// slot that is already due must not spin the loop with a zero delay.
+	standbyMinDelay = time.Second
 )
 
 // SchedulerOptions configures the Scheduler.
@@ -46,6 +50,12 @@ type Scheduler struct {
 	once    sync.Once
 	mu      sync.Mutex
 	started bool
+
+	// lastRenew is the local time of the last successful lease renewal. It is
+	// written by Start (before the loop starts) and by the loop goroutine
+	// only, so no extra lock is needed. A transient renewal error must not
+	// make us stop firing while the lease we already own is still valid.
+	lastRenew time.Time
 }
 
 // NewScheduler builds a Scheduler. The Service's Dispatcher and kick callback
@@ -90,12 +100,14 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	s.svc.SetDispatcher(s.dispatcher)
 	s.svc.SetKick(s.Kick)
 	if s.lease != nil {
-		ok, err := s.lease.AcquireLease(ctx, s.owner, s.clock.Now(), s.clock.Now().Add(s.leaseTTL))
+		now := s.clock.Now()
+		ok, err := s.lease.AcquireLease(ctx, s.owner, now, now.Add(s.leaseTTL))
 		if err != nil {
 			return fmt.Errorf("acquire schedule lease: %w", err)
 		}
 		if ok {
 			s.svc.setMode("active")
+			s.lastRenew = now
 		} else {
 			s.svc.setMode("standby")
 			s.log.Info("schedule: another deepai-bot holds the lease; standby mode")
@@ -155,6 +167,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 				delay = d
 			}
 		}
+		if s.svc.Mode() != "active" && delay < standbyMinDelay {
+			delay = standbyMinDelay
+		}
 		timer := s.clock.After(delay)
 		syncTick := s.clock.After(s.syncEvery)
 		select {
@@ -203,16 +218,30 @@ func (s *Scheduler) syncLease(ctx context.Context) {
 	now := s.clock.Now()
 	if s.svc.Mode() == "active" {
 		ok, err := s.lease.RenewLease(ctx, s.owner, now.Add(s.leaseTTL))
-		if err != nil || !ok {
-			s.svc.setMode("standby")
-			s.log.Warn("schedule: lost lease; standby mode", "err", err)
+		if err == nil && ok {
+			s.lastRenew = now
+			// A standby bot may have written cancel_requested_at while we hold
+			// the lease; relay it and reload the heap on the next iteration.
+			if err := s.svc.ProcessCancelRequests(ctx); err != nil {
+				s.log.Warn("schedule: process cancel requests", "err", err)
+			}
+			// Runs whose recovery was deferred during a takeover are
+			// reconciled once their original owner's grace period expires.
+			if err := s.svc.Reconcile(ctx); err != nil {
+				s.log.Warn("schedule: reconcile interrupted runs", "err", err)
+			}
 			return
 		}
-		// A standby bot may have written cancel_requested_at while we hold
-		// the lease; relay it and reload the heap on the next iteration.
-		if err := s.svc.ProcessCancelRequests(ctx); err != nil {
-			s.log.Warn("schedule: process cancel requests", "err", err)
+		if err != nil && now.Sub(s.lastRenew) < s.leaseTTL {
+			// SQLITE_BUSY, a brief disk lock, etc. We still own the lease
+			// until it expires, so keep firing and retry on the next sync.
+			// Downgrading here would let a standby process take over and
+			// execute the same slot while our turn is still running.
+			s.log.Warn("schedule: renew lease failed; retrying while lease is valid", "err", err)
+			return
 		}
+		s.svc.setMode("standby")
+		s.log.Warn("schedule: lost lease; standby mode", "confirmed_takeover", err == nil && !ok, "err", err)
 		return
 	}
 	ok, err := s.lease.AcquireLease(ctx, s.owner, now, now.Add(s.leaseTTL))
@@ -222,8 +251,12 @@ func (s *Scheduler) syncLease(ctx context.Context) {
 	}
 	if ok {
 		s.svc.setMode("active")
+		s.lastRenew = now
 		s.log.Info("schedule: lease acquired; active mode")
-		if err := s.svc.Recover(ctx); err != nil {
+		// The previous holder may still be alive (a transient renew error),
+		// so its recently started Runs get a grace window instead of being
+		// declared dead immediately (design §4.2).
+		if err := s.svc.RecoverAfterTakeover(ctx, s.leaseTTL); err != nil {
 			s.log.Warn("schedule: recovery after takeover", "err", err)
 		}
 		s.Kick()
