@@ -102,7 +102,7 @@ func TestLoad_ColdPopulatesCacheThenWarmServesIt(t *testing.T) {
 	reg2 := tools.NewRegistry()
 	closers2, report2 := Load(context.Background(), reg2, proj)
 	defer runClosers(closers2)
-	if !strings.Contains(report2, "1 loaded (mock (1 cached))") {
+	if !strings.Contains(report2, "1 loaded (mock (2 cached))") {
 		t.Fatalf("warm report should mark cache use: %q", report2)
 	}
 	tool := reg2.Get("mock__test-tool")

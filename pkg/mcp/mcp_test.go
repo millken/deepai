@@ -113,3 +113,49 @@ func TestConnectStdio_WithExampleServer(t *testing.T) {
 	}
 	_ = os.Stdout
 }
+
+// A tool-level error (CallToolResult.isError=true) must carry the server's
+// detail text on the returned error — the model only sees what lands in the
+// error string here. A generic "mcp tool X returned an error" wrapper hid
+// net::ERR_CONNECTION_REFUSED behind an identical message four times in one
+// session, sending the debugging down the wrong path (the MCP client itself
+// was fine; the target server was down).
+func TestCallTool_IsErrorSurfacesDetail(t *testing.T) {
+	ctx := context.Background()
+	client, err := ConnectStdio(ctx, "mock", "go", nil, "run", "../../cmd/mcp-example/main.go")
+	if err != nil {
+		t.Fatalf("ConnectStdio failed: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	tools, err := client.Tools(ctx)
+	if err != nil {
+		t.Fatalf("Tools failed: %v", err)
+	}
+	var handler func(ctx context.Context, call models.ToolCall) (models.ToolResult, error)
+	for _, tt := range tools {
+		if strings.HasSuffix(tt.Name, "fail-tool") {
+			handler = tt.Handler
+			break
+		}
+	}
+	if handler == nil {
+		t.Fatalf("expected to find fail-tool in tools")
+	}
+
+	call := models.ToolCall{ID: "1", Name: "fail-tool", Arguments: map[string]any{}, Status: models.CallStatusPending}
+	res, err := handler(ctx, call)
+	if err == nil {
+		t.Fatalf("expected an error from a failing tool call")
+	}
+	if !strings.Contains(err.Error(), "net::ERR_CONNECTION_REFUSED") {
+		t.Fatalf("error must surface the server-side detail, got: %v", err)
+	}
+	if res.Status != models.CallStatusFailed {
+		t.Fatalf("expected failed status, got: %v", res.Status)
+	}
+	if !strings.Contains(res.Error, "net::ERR_CONNECTION_REFUSED") {
+		t.Fatalf("result.Error must keep the detail too, got: %v", res.Error)
+	}
+}
