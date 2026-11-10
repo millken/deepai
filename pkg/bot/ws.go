@@ -20,7 +20,8 @@ const wsMaxFrame = 4 << 20
 //
 // Ops: ping, info, list_sessions, create_session, get_session,
 // delete_session, rename_session, subscribe, unsubscribe, send, cancel,
-// answer. subscribe with session_id "*" follows the bot-wide lifecycle feed.
+// answer, plus the schedule_* ops in schedule_http.go. subscribe with
+// session_id "*" follows the bot-wide lifecycle feed.
 type WSRequest struct {
 	ID         string `json:"id,omitempty"`
 	Op         string `json:"op"`
@@ -32,6 +33,12 @@ type WSRequest struct {
 	QuestionID string `json:"question_id,omitempty"`
 	Answer     string `json:"answer,omitempty"`
 	Limit      int    `json:"limit,omitempty"`
+
+	// Schedule ops (docs/BOT_SCHEDULER_DESIGN.md §9.3). Params mirrors the
+	// REST body; ScheduleID/RunID keep ids out of the correlation ID field.
+	ScheduleID string         `json:"schedule_id,omitempty"`
+	RunID      string         `json:"run_id,omitempty"`
+	Params     map[string]any `json:"params,omitempty"`
 }
 
 // WSMessage is a server → client WebSocket frame: either a reply to a
@@ -189,6 +196,10 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 	case "answer":
 		c.reply(ctx, req, nil, m.Answer(req.SessionID, req.QuestionID, req.Answer))
 	default:
+		if data, handled, err := c.s.handleScheduleWS(ctx, req); handled {
+			c.reply(ctx, req, data, err)
+			return
+		}
 		c.reply(ctx, req, nil, fmt.Errorf("unknown op %q", req.Op))
 	}
 }

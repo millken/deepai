@@ -158,6 +158,30 @@ type Config struct {
 	// /model command can switch between them and subagents can select per-task.
 	// When empty, the top-level Provider/Model fields are used as the sole model.
 	Models []llm.ModelDef `yaml:"models,omitempty"`
+
+	// Schedule configures deepai-bot's timed tasks. Only the bot reads it;
+	// the CLI never registers the tool or opens the schedule tables.
+	// See docs/BOT_SCHEDULER_DESIGN.md §11.
+	Schedule ScheduleYAML `yaml:"schedule,omitempty"`
+}
+
+// ScheduleYAML is the `schedule:` section of ~/.deepai/config.yaml. Durations
+// are strings parsed by the bot; a nil Enabled means the documented default
+// (on), so `enabled: false` can turn the feature off.
+type ScheduleYAML struct {
+	Enabled               *bool  `yaml:"enabled,omitempty"`
+	Timezone              string `yaml:"timezone,omitempty"`
+	Confirm               string `yaml:"confirm,omitempty"`
+	ConfirmTimeout        string `yaml:"confirm_timeout,omitempty"`
+	AllowNested           bool   `yaml:"allow_nested,omitempty"`
+	MinInterval           string `yaml:"min_interval,omitempty"`
+	MaxSchedules          int    `yaml:"max_schedules,omitempty"`
+	MaxConcurrentRuns     int    `yaml:"max_concurrent_runs,omitempty"`
+	MaxRunsPerDay         int    `yaml:"max_runs_per_day,omitempty"`
+	RunHistory            int    `yaml:"run_history,omitempty"`
+	DefaultTimeout        string `yaml:"default_timeout,omitempty"`
+	DefaultAnswerTimeout  string `yaml:"default_answer_timeout,omitempty"`
+	DefaultMaxAutoAnswers int    `yaml:"default_max_auto_answers,omitempty"`
 }
 
 // applyTokenEfficiencyEnv bridges config.yaml token-efficiency settings to the
