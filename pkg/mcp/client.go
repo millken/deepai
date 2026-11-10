@@ -14,6 +14,22 @@ import (
 	"github.com/millken/deepai/pkg/models"
 )
 
+// firstText extracts the first text block from an MCP tool-result payload —
+// the human-readable error detail a server puts next to isError=true.
+func firstText(content []mcpproto.Content) string {
+	for _, c := range content {
+		if t, ok := c.(mcpproto.TextContent); ok {
+			if s := strings.TrimSpace(t.Text); s != "" {
+				if len(s) > 500 {
+					return s[:500] + "…"
+				}
+				return s
+			}
+		}
+	}
+	return "no detail provided"
+}
+
 type Client struct {
 	name   string
 	client *mcpclient.Client
@@ -194,7 +210,12 @@ func (c *Client) handler(remoteName string) models.ToolHandler {
 		if result.IsError {
 			toolResult.Status = models.CallStatusFailed
 			toolResult.Error = string(content)
-			return toolResult, fmt.Errorf("mcp tool %s returned an error", remoteName)
+			// The error string is what the model actually sees — a generic
+			// wrapper here hid net::ERR_* codes (and any other server-side
+			// detail) behind an identical message, sending debugging after the
+			// MCP client when the target was simply unreachable. Surface the
+			// text content; keep the tool name as a prefix for log greppability.
+			return toolResult, fmt.Errorf("mcp tool %s returned an error: %s", remoteName, firstText(result.Content))
 		}
 		return toolResult, nil
 	}

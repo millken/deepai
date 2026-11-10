@@ -75,9 +75,32 @@ func handleRequest(request JSONRPCRequest) JSONRPCResponse {
 					"name":        "test-tool",
 					"inputSchema": map[string]any{"type": "object"},
 				},
+				{
+					"name":        "fail-tool",
+					"inputSchema": map[string]any{"type": "object"},
+				},
 			},
 		}
 	case "tools/call":
+		var params struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(request.Params, &params)
+		if params.Name == "fail-tool" {
+			// A tool-level error: CallToolResult with isError=true. The client
+			// must surface the content (e.g. net::ERR_ codes from a browser)
+			// instead of a generic "returned an error" wrapper.
+			response.Result = map[string]any{
+				"content": []map[string]any{
+					{
+						"type": "text",
+						"text": "net::ERR_CONNECTION_REFUSED at http://127.0.0.1:8931/index.html",
+						},
+				},
+				"isError": true,
+			}
+			return response
+		}
 		response.Result = map[string]any{
 			"content": []map[string]any{
 				{
