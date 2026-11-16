@@ -54,6 +54,55 @@ func TestApplyTokenEfficiencyEnv_NoopWhenUnconfigured(t *testing.T) {
 	}
 }
 
+// Criterion 29, config half: run_code: true bridges to DEEPAI_RUN_CODE=1
+// (explicit env wins), false/absent must not set it.
+func TestApplyTokenEfficiencyEnv_RunCode(t *testing.T) {
+	t.Run("config enables", func(t *testing.T) {
+		t.Setenv("DEEPAI_RUN_CODE", "")
+		os.Unsetenv("DEEPAI_RUN_CODE")
+
+		applyTokenEfficiencyEnv(Config{RunCode: true})
+
+		if got := os.Getenv("DEEPAI_RUN_CODE"); got != "1" {
+			t.Errorf("DEEPAI_RUN_CODE = %q, want 1", got)
+		}
+	})
+	t.Run("env wins over config", func(t *testing.T) {
+		t.Setenv("DEEPAI_RUN_CODE", "0")
+
+		applyTokenEfficiencyEnv(Config{RunCode: true})
+
+		if got := os.Getenv("DEEPAI_RUN_CODE"); got != "0" {
+			t.Errorf("env should win: DEEPAI_RUN_CODE = %q", got)
+		}
+	})
+	t.Run("default off", func(t *testing.T) {
+		t.Setenv("DEEPAI_RUN_CODE", "")
+		os.Unsetenv("DEEPAI_RUN_CODE")
+
+		applyTokenEfficiencyEnv(Config{})
+
+		if _, set := os.LookupEnv("DEEPAI_RUN_CODE"); set {
+			t.Error("false config must not set DEEPAI_RUN_CODE")
+		}
+	})
+}
+
+// run_code YAML field round-trips through LoadConfig.
+func TestConfig_RunCodeYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("provider: anthropic\nrun_code: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RunCode {
+		t.Error("run_code: true did not load into Config.RunCode")
+	}
+}
+
 func TestConfig_TokenFieldsYAMLRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	yaml := "provider: anthropic\ntoken_metrics: \"1\"\ntoken_aging: true\n"

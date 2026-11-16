@@ -56,6 +56,12 @@ type Config struct {
 	// when set, takes precedence.
 	TokenAging bool `yaml:"token_aging,omitempty"`
 
+	// RunCode enables the run_code scripted tool orchestration tool
+	// (docs/RUN_CODE_DESIGN.md §7.1) for the CLI main agent. Opt-in, default
+	// off; the bot runtime never registers it. The DEEPAI_RUN_CODE env var,
+	// when set, takes precedence.
+	RunCode bool `yaml:"run_code,omitempty"`
+
 	// MemoryAutoRefineDisabled turns off the auto-refine review gate. The field is
 	// named for the disabled state on purpose: a plain bool cannot express a
 	// default of true, since an absent key and an explicit false both unmarshal
@@ -169,6 +175,9 @@ func applyTokenEfficiencyEnv(cfg Config) {
 	}
 	if cfg.TokenAging && os.Getenv("DEEPAI_TOKEN_AGING") == "" {
 		os.Setenv("DEEPAI_TOKEN_AGING", "1")
+	}
+	if cfg.RunCode && os.Getenv("DEEPAI_RUN_CODE") == "" {
+		os.Setenv("DEEPAI_RUN_CODE", "1")
 	}
 }
 

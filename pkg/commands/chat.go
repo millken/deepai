@@ -18,6 +18,7 @@ import (
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/runcode"
 	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
@@ -465,7 +466,26 @@ func registerChatTools(registry *tools.Registry, modelRegistry *llm.ModelRegistr
 	// injection and is never carried anywhere or aggregated into the
 	// parent's view.
 	mustRegisterTool(registry, builtin.TodoWriteTool())
+	// run_code is opt-in (RUN_CODE_DESIGN §7.1): DEEPAI_RUN_CODE=1 (or config
+	// run_code: true, bridged to the env at startup) registers it for the CLI
+	// main agent only — the bot runtime's registerTools never includes it.
+	// Registration alone grants nothing to subagents: selectSubagentTools
+	// strips it unless a role's tools: selector names it explicitly.
+	if runCodeEnabled() {
+		mustRegisterTool(registry, runcode.RunCodeTool())
+	}
 	return subPool
+}
+
+// runCodeEnabled resolves the DEEPAI_RUN_CODE gate the same way the other
+// DEEPAI_* toggles resolve: any non-empty truthy value enables.
+func runCodeEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("DEEPAI_RUN_CODE"))
+	switch strings.ToLower(v) {
+	case "", "0", "false", "no", "off":
+		return false
+	}
+	return true
 }
 
 // subagentMaxTokens returns a fresh pointer to agent.ResolveMaxOutputTokens()

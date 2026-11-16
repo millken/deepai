@@ -201,8 +201,40 @@ func (s *SessionCarry) RecordEditedFile(path string) {
 // pair through here (via handleResult, plus appendRemaining for a fatal
 // parallel batch's already-computed tail) or the review gate under-reports
 // this run's modifications.
+//
+// run_code forwards its script's landed writes via Data["edited_paths"]
+// (RUN_CODE_DESIGN §4.5): nested calls bypass this bookkeeping layer, so the
+// outer result is the only carrier. That branch MUST run before the completed
+// check — a script that wrote a file and then threw still wrote the file, and
+// the review gate must see it.
 func (a *Agent) recordEditedFile(call models.ToolCall, result models.ToolResult) {
-	if a.session == nil || result.Status != models.CallStatusCompleted {
+	if a.session == nil {
+		return
+	}
+	if result.ToolName == "run_code" {
+		var paths []string
+		switch v := result.Data["edited_paths"].(type) {
+		case []string:
+			paths = v
+		case []any:
+			for _, p := range v {
+				if s, ok := p.(string); ok {
+					paths = append(paths, s)
+				}
+			}
+		}
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
+			if abs, err := filepath.Abs(path); err == nil {
+				path = abs
+			}
+			a.session.RecordEditedFile(path)
+		}
+		return
+	}
+	if result.Status != models.CallStatusCompleted {
 		return
 	}
 	switch result.ToolName {

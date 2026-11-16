@@ -1,6 +1,6 @@
 # run_code：脚本化工具编排 — 设计稿（供评审）
 
-> 状态：**草案 v3，未实施；可进入 Phase 0 spike**。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
+> 状态：**Phase 0 spike 已完成（go，2026-11-16，见 §3.3 实测）；Phase 1 MVP 已实现**（`pkg/runcode` + `pkg/tools/dispatch.go` + `recordEditedFile` 转发 + `DEEPAI_RUN_CODE` 开关 + TUI 预览），默认关，仅 CLI 主代理。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
 > 目标：新增一个 `run_code` 工具，让模型用一段 JavaScript 在一次工具调用里编排多次现有工具调用（检索 → 过滤 → 读取 → 修改 → 验证），**只把脚本的返回值送回上下文**。
 > 不在本文范围：符号图 / callers-callees 索引（另立设计）、持久化 REPL 会话、多租户隔离。
 > 背景材料：一份关于 Claude Code Code Mode 的外部讨论记录（未入库）。本文只把它当作问题线索，方案按 deepai 现有代码重新推导；两者的差异见 §11。
@@ -125,6 +125,22 @@ type Engine interface {
 | S5 | 二进制体积增量 | 记录数值（预期数 MB，接受） |
 
 S2 不通过时的降级：宿主函数改为同步，额外提供 `tools.all([[name, args], ...])` 批量原语由 Go 侧并发——API 形状变了，提示词跟着变，但其余设计不动。
+
+#### 实测结果（2026-11-16，Apple Silicon / Go 1.26 / fastschema/qjs v0.0.6）
+
+| # | 结果 | 数值 |
+|---|---|---|
+| S1 | **通过** | 共享 wazero 编译缓存下新建 runtime+context ×100：p50=1.93ms、p90=2.35ms、max=3.64ms（阈值 30ms；首次含编译预热约 0.4s，不计） |
+| S2 | **通过** | 宿主函数仅登记请求即返回 id，工具在 Eval 交还控制权后由驱动批次执行；`Promise.all` 三路调用墙钟重叠（TestSpikeS2_DrainThenBatch 以起止时间断言） |
+| S3 | **有偏差，按 watchdog 模式通过** | 见下 |
+| S4 | **通过** | 256MiB 限下 1GiB 字符串分配抛 `RangeError: invalid string length`，经 Run 分类为 `outcome=memory`，宿主无 panic/OOM |
+| S5 | **接受** | 引擎前 92,300,882 B → 引擎后 98,028,642 B，增量 **+5,727,760 B（≈5.5 MiB）**，符合「数 MB，接受」预期 |
+
+**S3 偏差与两个库级发现**（实现时实证，升级 `fastschema/qjs` 或换引擎时须复评）：
+
+1. **抢占缺失**：qjs 的 C shim 把 interrupt handler 编译掉了（`qjswasm/helpers.c` 中被注释），`Option.MaxExecutionTime` 为 no-op；`CloseOnContextDone` 只在 wasm↔host 调用边界生效。纯 JS 死循环在单次 wasm 调用内**不可抢占**（实测 VM 卡死 >3s、goroutine 泄漏）。
+2. **处置**：`Run` 采用 watchdog——VM 驱动在内层 goroutine，外层 select 预算定时器，超时立即返回（实测预算 1s 后 ≈10ms 内返回，满足「100ms 内返回」）。代价：被弃的驱动 goroutine 仅在纯 JS 自旋场景泄漏（每次此类超时泄一个），且该 goroutine 不可抢占会阻塞宿主下一次 GC 的 stop-the-world。测试中以子进程隔离（`GOGC=off`）承纳（`engine_test.go` `runInWedgeChild`）。
+3. **use-after-free**：wasm 侧 `QJS_JSONStringify` 在 pack 指针后立即 `JS_FreeCString`，Go 侧任何跨内存 `Value.JSONStringify()` 读到的都是已释放内存（实测同一坏字节重试 8 次不变，非竞态）。处置：脚本返回值与宿主函数参数都在 **VM 内部** `JSON.stringify`，宿主经 `String()`（`QJS_ToCString` 不 free）读纯字符串。
 
 ---
 
@@ -456,7 +472,7 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
 3. **`present_file`**：v1 继续排除（§4.3）。
 4. **默认开启判据**：三条同时满足——完成率不降、输入 token 降 ≥ 25%、轮数不升；eval 含「写到一半失败后恢复」与「结论带 `file:line`」两类（§9）。
 
-不在本文范围（评审确认）：符号索引、bot 多租户、持久 REPL、`fastschema/qjs` 的供应链细节。S1–S5 的数值待 spike 填写。
+不在本文范围（评审确认）：符号索引、bot 多租户、持久 REPL、`fastschema/qjs` 的供应链细节。S1–S5 数值已实测并写回 §3.3。
 
 ---
 
@@ -479,3 +495,4 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
   - §6.3：`writes:` 移到末尾、单行 ≤ 600 字节，使 offload 尾部预览（15 行 / 800 B）必然保留它；无写入输出 `writes: none`。
   - §4.5：`run_code` 分支须置于 `recordEditedFile` 的 completed 检查之前（自查发现，v2 写法会让 failed 脚本漏账）。
   - F1：影响栏与 §4.4 对齐为 `{status, text, data}`。
+- v4（2026-11-16）：Phase 0 spike 实测写回（§3.3：S1/S2/S4 通过、S3 按 watchdog 模式通过并记录 goroutine 泄漏与 GC 阻塞偏差、S5 +5.5 MiB；另记 qjs 库 use-after-free 与抢占缺失两个发现）；Phase 1 MVP 落地：`pkg/runcode`（engine/qjs/schedule/journal/convert/output/tool）、`pkg/tools/dispatch.go`、`runOneTool` 调用时注入、`recordEditedFile` 的 `edited_paths` 转发（位于 completed 检查之前）、`DEEPAI_RUN_CODE`/config `run_code:` 开关（仅 CLI 注册）、TUI 脚本预览与 `writes:` 行。

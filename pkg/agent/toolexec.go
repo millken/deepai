@@ -287,6 +287,12 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 	toolCtx := tools.WithSandbox(ctx, a.sandbox)
 	toolCtx = tools.WithThreadID(toolCtx, sessionID)
 	toolCtx = tools.WithReadTracker(toolCtx, a.readTracker)
+	// Nested-execution mirror (run_code): capture the CURRENT registry and
+	// concurrency cap at call time, so plan mode swaps and subagent allowlists
+	// seen by a nested tools.<name> are whatever a.tools holds right now.
+	if a.tools != nil {
+		toolCtx = tools.WithDispatch(toolCtx, &tools.Dispatch{Registry: a.tools, MaxConcurrency: a.maxToolConcurrency})
+	}
 	// Window-aware handlers (code_map include_content) size their output
 	// budget against the actual model window instead of a global constant —
 	// a 1M-window model can afford a far larger pull than a 128k one.
