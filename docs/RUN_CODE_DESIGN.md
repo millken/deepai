@@ -1,6 +1,6 @@
 # run_code：脚本化工具编排 — 设计稿（供评审）
 
-> 状态：**草案 v2，未实施**。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），见文末「修订记录」。日期 2026-11-16。
+> 状态：**草案 v3，未实施；可进入 Phase 0 spike**。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
 > 目标：新增一个 `run_code` 工具，让模型用一段 JavaScript 在一次工具调用里编排多次现有工具调用（检索 → 过滤 → 读取 → 修改 → 验证），**只把脚本的返回值送回上下文**。
 > 不在本文范围：符号图 / callers-callees 索引（另立设计）、持久化 REPL 会话、多租户隔离。
 > 背景材料：一份关于 Claude Code Code Mode 的外部讨论记录（未入库）。本文只把它当作问题线索，方案按 deepai 现有代码重新推导；两者的差异见 §11。
@@ -62,8 +62,8 @@ grep → (模型) → read_file ×N → (模型) → 判断 → edit_file ×M �
 
 | # | 事实 | 位置 | 对设计的影响 |
 |---|---|---|---|
-| F1 | 工具接口是 `Handler(ctx, ToolCall) (ToolResult, error)`；`ToolResult` 有文本 `Content` 和结构化 `Data` | `pkg/models/message.go:212-238` | 脚本拿到的返回值 = `{text, data}`，无需解析文本 |
-| F2 | 结构化结果的位置不统一：`grep` 在 `Data.matches`（Go 结构体切片 `[]grepMatch`，不是 map）；`bash` 的 JSON `{stdout, stderr, exit_code}` 在 `Content`、`Data` 为空；`glob` 的 JSON **数组**在 `Content`；`read_file` 的 `Data` 只有 `start_line`，hashline 前缀只在文本里 | `grep.go:158`、`bash.go:65`、`file.go:304`、`file.go:246` | 返回值转换必须对 `Data` 做 JSON 往返，并在 `Data` 为空时解析任意 JSON 值（§4.4） |
+| F1 | 工具接口是 `Handler(ctx, ToolCall) (ToolResult, error)`；`ToolResult` 有文本 `Content` 和结构化 `Data` | `pkg/models/message.go:212-238` | 脚本拿到的返回值 = `{status, text, data}`（§4.4），无需解析文本 |
+| F2 | 结构化结果的位置不统一：`grep` 在 `Data.matches`（Go 结构体切片 `[]grepMatch`，不是 map）；`bash` 的 JSON `{stdout, stderr, exit_code}` 在 `Content`、`Data` 为空；`glob` 的 JSON **数组**在 `Content`；`read_file` 的文本结果 **`Data` 为空**（只有二进制文件带 `{binary, bytes}`），hashline 前缀只在 `Content` 里 | `grep.go:158`、`bash.go:65`、`file.go:304`、`file.go:48-54` | 返回值转换必须对 `Data` 做 JSON 往返，并在 `Data` 为空时解析任意 JSON 值（§4.4） |
 | F2b | `bash` **非零退出仍是 `completed`**，只有超时才置 `Status=failed` | `bash.go:66-72` | 「命令失败」不能映射为 reject，否则 `go test` 失败会被脚本当作成功（§4.4） |
 | F2c | `edit_file` / `write_file` 的成功目标由 `recordEditedFile` 记入会话，mission 评审门按 `EditedFiles()` 取评审范围；该记账**只在 `toolBatchState` 层**做 | `session_carry.go:204`、`toolexec.go:471/613`、`mission_implement.go:294` | 嵌套调用不经过这一层，写入必须由 `run_code` 的结果转发（§4.5） |
 | F2d | 顶层并发上限 `defaultMaxToolConcurrency = 10`，可由 `DEEPAI_MAX_TOOL_CONCURRENCY` 覆盖 | `react.go:45-58` | 脚本内复用同一限额，不另设常量（§5） |
@@ -236,7 +236,7 @@ Execute 返回 err，或 result.Status == failed：
 | `recordEditedFile`（`toolexec.go:471/613`）→ mission 评审范围 | `edit_file`、`write_file` | **转发**：见下 |
 | offload、消息历史、metrics、UI 事件 | 全部 | 不对嵌套结果做；只对 `run_code` 自身结果做（F9）；嵌套调用的度量走 §7.3 |
 
-转发 `recordEditedFile`：`run_code` 结果的 `Data["edited_paths"]` 列出脚本内 `edit_file` / `write_file` 中状态为 **completed 或 interrupted** 的目标路径（failed 的编辑没有产生改动，与 `recordEditedFile` 现行规则一致；interrupted 可能已落盘，宁可多评不可漏评）。`recordEditedFile` 增加一个分支：`result.ToolName == "run_code"` 时遍历 `edited_paths` 逐个 `RecordEditedFile`，**不看 `run_code` 自身的 Status**——脚本 failed 时前面的写入同样已落盘，同样要进评审。
+转发 `recordEditedFile`：`run_code` 结果的 `Data["edited_paths"]` 列出脚本内 `edit_file` / `write_file` 中状态为 **completed 或 interrupted** 的目标路径（failed 的编辑没有产生改动，与 `recordEditedFile` 现行规则一致；interrupted 可能已落盘，宁可多评不可漏评）。`recordEditedFile` 增加一个分支：`result.ToolName == "run_code"` 时遍历 `edited_paths` 逐个 `RecordEditedFile`，**不看 `run_code` 自身的 Status**——脚本 failed 时前面的写入同样已落盘，同样要进评审。注意现有函数入口即 `if result.Status != completed { return }`（`session_carry.go:205`），**`run_code` 分支必须放在这条检查之前**，否则 failed 脚本的写入仍会漏账。`Data` 在 `runOneTool` 的任何路径下都被保留，且 handler 不返回 err（§6.2），`edited_paths` 一定送达。
 
 已知盲区与顶层一致：通过 `bash`（`sed -i`、`go generate`）产生的改动今天也不进 `EditedFiles()`，本设计不扩大也不修复它；`writes:` 摘要（§6.3）会把这类调用列出来。
 
@@ -285,13 +285,22 @@ const [a, b, c] = await Promise.all([
 
 ### 6.2 失败分类
 
-| 情况 | `run_code` 结果 | 给模型的内容 |
-|---|---|---|
-| 正常 return | completed | return 值 + logs + 调用摘要 |
-| 工具 reject 且被 catch | completed | 同上（是否算失败由脚本决定） |
-| 未捕获异常 / 语法错误 | **failed** | 错误 + 行号 + 已完成调用的 journal（**含已落盘的写操作**） |
-| 脚本预算超时 / 调用数超限 / 内存超限 | **failed** | 原因 + journal |
-| 父 ctx 被取消（用户 Ctrl-C、轮次中断） | **cancelled** | 沿用顶层取消路径；journal 仍随结果返回 |
+| 情况 | `Status` | `Data.outcome` | 给模型的内容 |
+|---|---|---|---|
+| 正常 return | completed | `ok` | return 值 + logs + 调用摘要 |
+| 工具 reject 且被 catch | completed | `ok` | 同上（是否算失败由脚本决定） |
+| 未捕获异常 / 语法错误 | **failed** | `error` | 错误 + 行号 + journal 摘要（**含已落盘的写操作**） |
+| 脚本预算超时 / 调用数超限 / 内存超限 | **failed** | `timeout` / `call_limit` / `memory` | 原因 + journal 摘要 |
+| 父 ctx 被取消（用户 Ctrl-C、轮次中断） | **failed** | `cancelled` | 「被取消」+ journal 摘要 |
+
+`models.CallStatus` 只有 pending / running / completed / failed（`message.go:36-39`），没有 cancelled；「取消」与「超时」靠 `Data.outcome` 区分，文本首行也写明，不新增状态值。
+
+**返回约定：handler 一律 `return result, nil`**，失败也不返回 `error`。原因有二：
+
+1. `runOneTool` 在 `err != nil` 时重建结果（`toolexec.go:300-314`）：`Status` 改写为 failed、`Error` 换成 err 文本、**`Content` 丢弃**，只保留 `Data`。若 handler 以 err 报告取消或超时，模型看到的只剩一句错误，`writes:` 与 journal 摘要全部丢失。
+2. `toolMessageContent` 在 `Error` 非空时展示 `Error` **而不是** `Content`（`toolexec.go:46-50`）。因此失败时 `Error` 必须承载完整渲染文本（与 `Content` 相同），沿用 `bash` 超时分支的既有约定（`bash.go:67-73`）。
+
+失败文本不经 offload（offload 只作用于 `Content`），所以失败渲染有总长上限 16 KiB：超出时先截 logs，再截 return 值预览；`writes:` 行不参与截断（自身上限见 §6.3）。
 
 **超时与取消分开判定**。handler 内建子 ctx：
 
@@ -301,9 +310,10 @@ defer cancel()
 // 嵌套工具与 wazero 模块都用 scriptCtx
 ...
 switch {
-case parentCtx.Err() != nil:            // 用户/上层取消 → cancelled
-case errors.Is(scriptCtx.Err(), context.DeadlineExceeded): // 脚本预算耗尽 → failed + journal
+case parentCtx.Err() != nil:                                // outcome = cancelled
+case errors.Is(scriptCtx.Err(), context.DeadlineExceeded): // outcome = timeout
 }
+return result, nil // 两种情况都不返回 err
 ```
 
 先检查父 ctx：两者同时到期时按「取消」处理，不把用户中断误报为脚本超时。
@@ -312,16 +322,22 @@ case errors.Is(scriptCtx.Err(), context.DeadlineExceeded): // 脚本预算耗尽
 
 ### 6.3 输出格式
 
-`Content`（进上下文）：
+`Content`（成功时进上下文；失败时同一文本写入 `Error`）：
 
 ```
 run_code ok — 9 tool calls in 2.4s (grep×3, read_file×4, edit_file×1, bash×1)
-writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/tools/..." [completed]
 result:
 {"fixed": 1, "skipped": [{"file": "...", "line": 88, "why": "..."}], "tests": "ok"}
 logs:
 checked 14 candidates
+writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/tools/..." [completed]
 ```
+
+**`writes:` 固定放在末尾**。`run_code` 结果超过 offload 阈值时，进上下文的是 `offloadPreview` 保留的**尾部**（最后 15 行、至多 800 字节，`toolexec.go:173`）；`Data` 不进上下文。放在开头的 `writes:` 会在 offload 后消失，正好是最需要它的大结果场景。为保证它完整落在预览里：
+
+- `writes:` 渲染为**单行**，上限 600 字节；超出时保留前若干项并以 `… +k more (N writes total)` 收尾，计数始终可见
+- 无写操作时输出 `writes: none`，让「没写」与「被截掉」可区分
+- 首行摘要（调用数、耗时）在大结果时会被 offload 掉，可接受：完整内容可经 `recall_output` 取回
 
 `Data`（不进上下文，供 UI / 指标）：
 
@@ -330,6 +346,7 @@ checked 14 candidates
   "script":  "<原文>",
   "journal": [{"seq":1,"tool":"grep","args_preview":"…≤200B","status":"completed","ms":41,"bytes":3120,"write":false}, …],
                                    // status ∈ running | completed | failed | interrupted
+  "outcome": "ok",              // ok | error | timeout | call_limit | memory | cancelled（§6.2）
   "edited_paths": ["/abs/pkg/tools/builtin/grep.go"],   // §4.5，顶层 recordEditedFile 消费
   "return_bytes": 412,
   "log_bytes": 22,
@@ -404,11 +421,12 @@ checked 14 candidates
 |---|---|
 | 能力等价 | 受限注册表下调用未授权工具 → reject；plan mode 注册表下 `edit_file` 不可见；排除集每项都 reject |
 | 调用路径 | 嵌套 `edit_file` 未读文件 → StaleReadError；嵌套调用 ID 带父前缀；schema 校验错误原样回传 |
-| 返回值契约 | `bash` 退出码 1 → resolve，`data.exit_code === 1`、`status === "completed"`；`bash` 超时 → reject，`.text` 非空；`grep` → `data.matches[0]` 是含 `file/line/content/hash` 的普通对象；`glob` → `data` 是数组；`read_file` → `data.start_line` 存在且 `text` 含 `N:hhhhhh` 前缀；内部标记键不出现在 `data` |
+| 返回值契约 | `bash` 退出码 1 → resolve，`data.exit_code === 1`、`status === "completed"`；`bash` 超时 → reject，`.text` 非空；`grep` → `data.matches[0]` 是含 `file/line/content/hash` 的普通对象；`glob` → `data` 是数组；`read_file`（文本文件）→ `data === null` 且 `text` 含 `N:hhhhhh` 前缀；`read_file`（二进制）→ `data.binary === true`；内部标记键不出现在 `data` |
 | 副作用转发 | 脚本内成功的 `edit_file` / `write_file` 出现在 `EditedFiles()`；脚本在写入后抛异常（failed）时同样出现；被超时打断的写入（interrupted）出现；failed 的 `edit_file` 不出现 |
 | 调度 | `Promise.all` 三个只读调用同批并发（计时 / 计数断言）；两个写调用按发起顺序执行，第二个能看到第一个的效果；读写混合时切段与 `partitionToolCalls` 一致（同一输入表驱动两边） |
 | 限额 | 死循环超时；调用数超限后后续调用全部 reject；内存超限；log 截断；return 超 1 MiB 报错；并发上限随 `DEEPAI_MAX_TOOL_CONCURRENCY` 变化 |
-| 失败语义 | 第 3 次调用后抛异常 → failed，journal 含前两次写操作；脚本预算到期时正在跑的 `bash` → journal 为 interrupted 且出现在 `writes:`；父 ctx 取消 → cancelled（不是 failed）；父子同时到期 → cancelled |
+| 失败语义 | 第 3 次调用后抛异常 → failed，journal 含前两次写操作；脚本预算到期时正在跑的 `bash` → journal 为 interrupted 且出现在 `writes:`；父 ctx 取消 → `Status=failed`、`outcome=cancelled`（不是 `timeout`）；父子同时到期 → `cancelled`；所有失败路径 handler 都返回 `err == nil`，且模型可见文本（`Error`）末行是 `writes:` |
+| 输出布局 | 构造超过 offload 阈值的 return 值，断言 offload 预览（`offloadPreview`）含完整 `writes:` 行；`writes:` 超 600 字节时以 `+k more` 收尾且计数正确；无写入时为 `writes: none` |
 | 输出 | Content 格式 golden；大 return 走 offload 后 `recall_output` 可取回 |
 | 回归防护 | 表驱动列出「效果在 `toolBatchState` 而非 handler 内落地」的工具及其副作用（`skill`/`todo_write` → apply*Result；`task`/`invoke_acp_agent` → `addSubagentUsage`；`edit_file`/`write_file` → `recordEditedFile`）。断言每项要么在排除集，要么在 §4.5 的转发表里。表本身维护在 `toolBatchState` 旁边，新增分支不更新表即测试失败 |
 
@@ -448,10 +466,16 @@ checked 14 candidates
 - v2（2026-11-16）：响应 PR #45 评审。
   - **H1 返回值契约**：§2 补 F2/F2b（结构化结果位置不统一、bash 非零退出仍为 completed）；§4.1 描述改为 `{status, text, data}`，写明「命令失败不 reject、看 `data.exit_code`」；§4.4 对 `Data` 做 JSON 往返，`Data` 为空时解析任意 JSON 值，reject 仅限工具层失败并保留 `text`。
   - **H2 评审门漏账**：§2 补 F2c；新增 §4.5，嵌套调用不进 `handleResult`，由 `run_code` 结果的 `edited_paths` 转发给 `recordEditedFile`，脚本 failed 时同样记账；§6.2 journal 在执行前记 `running`，终止时标 `interrupted` 并列入 `writes:`。
-  - M1 取消：§6.2 用 `WithTimeout` 子 ctx 区分「脚本超时 → failed」与「父 ctx 取消 → cancelled」。
+  - M1 取消：§6.2 用 `WithTimeout` 子 ctx 区分「脚本超时」与「父 ctx 取消」。
   - M2 排除集测试：§4.3 / §10 判据改为「效果在 `toolBatchState` 落地的工具」。
   - M3 R3：去掉 `git_auto_commit` 兜底的说法。
   - M4 hashline：§4.1 写清 grep 的 hash 在 `data.matches[].hash`，`read_file` 的 hash 只在文本前缀。
   - M5 并发：§5 / §6.1 复用 `maxToolConcurrency`（默认 10，`DEEPAI_MAX_TOOL_CONCURRENCY`）。
   - M6 范围：§7.1 去掉 reviewer 首批候选。
   - §12 四问改为已定决策。
+- v3（2026-11-16）：响应 PR #45 复审（无 High）。
+  - F2 / §10：`file.go:246` 的 `start_line` 属于 `write_file`；`read_file` 文本结果 `Data` 为空，测试改为 `data === null` 且 `text` 含 hash 前缀。
+  - §6.2：handler 一律 `return result, nil`——`runOneTool` 遇 err 会丢弃 `Content`；失败时 `Error` 承载完整渲染文本（`toolMessageContent` 优先展示 `Error`，沿用 bash 超时约定）。`CallStatus` 无 cancelled，取消与超时以 `Data.outcome` 区分；失败文本不经 offload，设 16 KiB 上限。
+  - §6.3：`writes:` 移到末尾、单行 ≤ 600 字节，使 offload 尾部预览（15 行 / 800 B）必然保留它；无写入输出 `writes: none`。
+  - §4.5：`run_code` 分支须置于 `recordEditedFile` 的 completed 检查之前（自查发现，v2 写法会让 failed 脚本漏账）。
+  - F1：影响栏与 §4.4 对齐为 `{status, text, data}`。
