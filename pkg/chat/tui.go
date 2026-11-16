@@ -1706,6 +1706,13 @@ func (m *tuiModel) toolStartLine(evt agent.AgentEvent) string {
 			return m.bashCommandBlock(cmd)
 		}
 	}
+	// run_code scripts get the same block treatment, dim and unhighlighted:
+	// the user must see what the script does before its writes land (§7.2).
+	if name == "run_code" {
+		if script := toolEventArgString(evt, "script"); strings.TrimSpace(script) != "" {
+			return m.runCodeScriptBlock(script)
+		}
+	}
 	if preview != "" {
 		return m.styles.ToolCall.Render(fmt.Sprintf("  ⚙ %s(%s)…", name, preview))
 	}
@@ -1743,6 +1750,32 @@ func (m *tuiModel) bashCommandBlock(cmd string) string {
 	return b.String()
 }
 
+// runCodeScriptBlock renders a "⚙ run_code" header followed by the script,
+// one dim bar-prefixed line per source line — same shape as the bash block,
+// no syntax highlighting (RUN_CODE_DESIGN §7.2 Phase 1).
+func (m *tuiModel) runCodeScriptBlock(script string) string {
+	lines := strings.Split(strings.TrimRight(script, "\n"), "\n")
+	var b strings.Builder
+	b.WriteString(m.styles.ToolCall.Render("  ⚙ run_code"))
+	bar := m.styles.Dim.Render("  │ ")
+	shown := 0
+	for _, ln := range lines {
+		if shown >= maxToolCmdLines {
+			break
+		}
+		ln = m.fitLine(ln, lipgloss.Width("  │ "))
+		b.WriteString("\n")
+		b.WriteString(bar)
+		b.WriteString(m.styles.Dim.Render(ln))
+		shown++
+	}
+	if more := len(lines) - shown; more > 0 {
+		b.WriteString("\n")
+		b.WriteString(m.styles.Dim.Render(fmt.Sprintf("  … (%d more lines)", more)))
+	}
+	return b.String()
+}
+
 // toolEventCommand extracts the "command" argument from a bash tool-call event,
 // handling both the ToolEvent and ToolCall carriers.
 func toolEventCommand(evt agent.AgentEvent) string {
@@ -1754,6 +1787,20 @@ func toolEventCommand(evt agent.AgentEvent) string {
 		args = evt.ToolCall.Arguments
 	}
 	s, _ := args["command"].(string)
+	return s
+}
+
+// toolEventArgString extracts a string argument from a tool-call event,
+// handling both the ToolEvent and ToolCall carriers.
+func toolEventArgString(evt agent.AgentEvent, key string) string {
+	var args map[string]any
+	switch {
+	case evt.ToolEvent != nil:
+		args = evt.ToolEvent.Arguments
+	case evt.ToolCall != nil:
+		args = evt.ToolCall.Arguments
+	}
+	s, _ := args[key].(string)
 	return s
 }
 
@@ -1792,13 +1839,50 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 	}
 	line := m.fitLine(fmt.Sprintf("  ⎿ %s %s%s", icon, te.Name, detail), 0)
 	if useErr {
-		return m.styles.Error.Render(line)
+		rendered := m.styles.Error.Render(line)
+		if te.Name == "run_code" {
+			if w := runCodeWritesLine(te); w != "" {
+				rendered += "\n" + m.styles.Dim.Render("  "+w)
+			}
+		}
+		return rendered
 	}
 	rendered := m.styles.ToolResult.Render(line)
 	if diff != "" {
 		rendered += "\n" + diff
 	}
+	// run_code: surface the writes: summary as its own row — what the script
+	// wrote must be visible in the transcript even when the preview truncates
+	// (RUN_CODE_DESIGN §7.2).
+	if te.Name == "run_code" {
+		if w := runCodeWritesLine(te); w != "" {
+			rendered += "\n" + m.styles.Dim.Render("  "+w)
+		}
+	}
 	return rendered
+}
+
+// runCodeWritesLine pulls the "writes: …" summary out of a run_code result's
+// rendered text (Content on success, Error on failure) — by contract it is
+// the final line and survives every truncation (§6.3).
+func runCodeWritesLine(te *agent.ToolCallEvent) string {
+	src := ""
+	if te.Result != nil {
+		src = te.Result.Content
+		if src == "" {
+			src = te.Result.Error
+		}
+	}
+	if src == "" {
+		src = te.Error
+	}
+	var found string
+	for _, ln := range strings.Split(src, "\n") {
+		if strings.HasPrefix(ln, "writes:") {
+			found = ln
+		}
+	}
+	return found
 }
 
 func (m *tuiModel) statsLine() string {

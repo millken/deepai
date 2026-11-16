@@ -91,6 +91,94 @@ func TestRecordEditedFile(t *testing.T) {
 	}
 }
 
+// Criteria 17/18/19: run_code forwards the paths its script actually wrote
+// via Data["edited_paths"]; the run_code branch must sit BEFORE the completed
+// check so a FAILED script's already-landed writes still reach the review gate.
+func TestRecordEditedFileRunCodeForwarding(t *testing.T) {
+	abs := func(p string) string {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			t.Fatalf("abs(%q): %v", p, err)
+		}
+		return a
+	}
+
+	tests := []struct {
+		name   string
+		status models.CallStatus
+		paths  []string
+		want   []string
+	}{
+		{
+			name:   "completed run_code paths recorded",
+			status: models.CallStatusCompleted,
+			paths:  []string{"/tmp/x/a.go", "rel/b.go"},
+			// EditedFiles() returns sorted paths; the abs cwd prefix sorts before /tmp.
+			want: []string{abs("rel/b.go"), "/tmp/x/a.go"},
+		},
+		{
+			name:   "failed run_code still records landed writes",
+			status: models.CallStatusFailed,
+			paths:  []string{"/tmp/x/c.go"},
+			want:   []string{"/tmp/x/c.go"},
+		},
+		{
+			name:   "empty edited_paths ignored",
+			status: models.CallStatusCompleted,
+			paths:  nil,
+			want:   nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &Agent{session: NewSessionCarry()}
+			data := map[string]any{"outcome": "ok"}
+			if tt.paths != nil {
+				data["edited_paths"] = tt.paths
+			}
+			a.recordEditedFile(models.ToolCall{ID: "c1", Name: "run_code"}, models.ToolResult{
+				CallID: "c1", ToolName: "run_code", Status: tt.status, Data: data,
+			})
+			got := a.session.EditedFiles()
+			if len(got) != len(tt.want) {
+				t.Fatalf("EditedFiles() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("EditedFiles() = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// Non-string entries in edited_paths are skipped, not fatal.
+func TestRecordEditedFileRunCodeSkipsNonStrings(t *testing.T) {
+	a := &Agent{session: NewSessionCarry()}
+	a.recordEditedFile(models.ToolCall{ID: "c1", Name: "run_code"}, models.ToolResult{
+		CallID: "c1", ToolName: "run_code", Status: models.CallStatusFailed,
+		Data: map[string]any{"edited_paths": []any{"/tmp/x/ok.go", 42, nil}},
+	})
+	got := a.session.EditedFiles()
+	if len(got) != 1 || got[0] != "/tmp/x/ok.go" {
+		t.Fatalf("EditedFiles() = %v, want [/tmp/x/ok.go]", got)
+	}
+}
+
+// Review H1 pin: a run_code result with NIL Data (schema-validation failure,
+// missing script) flows through recordEditedFile without panic — Go map
+// reads on a nil map return the zero value; the run_code branch must stay
+// that safe. Executable proof, not just the language rule.
+func TestRecordEditedFileRunCodeNilDataSafe(t *testing.T) {
+	a := &Agent{session: NewSessionCarry()}
+	a.recordEditedFile(models.ToolCall{ID: "c1", Name: "run_code"}, models.ToolResult{
+		CallID: "c1", ToolName: "run_code", Status: models.CallStatusFailed,
+	})
+	if got := a.session.EditedFiles(); len(got) != 0 {
+		t.Fatalf("EditedFiles() = %v, want empty", got)
+	}
+}
+
 func TestRecordEditedFileNilSessionIsNoop(t *testing.T) {
 	a := &Agent{} // no carried session (e.g. subagent runs)
 	a.recordEditedFile(
