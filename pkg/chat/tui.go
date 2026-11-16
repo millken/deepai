@@ -1213,6 +1213,14 @@ func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
 		return nil
 
 	case agent.AgentEventToolCallStart:
+		// Nested run_code child events (ParentID set) render indented and
+		// never touch the top-level tool bookkeeping (§7.2 Phase 2).
+		if te := evt.ToolEvent; te != nil && te.ParentID != "" {
+			if line := m.nestedToolLine(te, true); line != "" {
+				return m.commitWithFlush(line)
+			}
+			return nil
+		}
 		if name, _ := toolEventNamePreview(evt); name != "" {
 			m.activeTools = append(m.activeTools, name)
 		}
@@ -1223,6 +1231,12 @@ func (m *tuiModel) handleAgentEvent(evt agent.AgentEvent) tea.Cmd {
 		return m.commitWithFlush(line)
 
 	case agent.AgentEventToolCallEnd:
+		if te := evt.ToolEvent; te != nil && te.ParentID != "" {
+			if line := m.nestedToolLine(te, false); line != "" {
+				return m.commitWithFlush(line)
+			}
+			return nil
+		}
 		if name, _ := toolEventNamePreview(evt); name != "" {
 			m.finishActiveTool(name)
 		}
@@ -1860,6 +1874,27 @@ func (m *tuiModel) toolEndLine(evt agent.AgentEvent) string {
 		}
 	}
 	return rendered
+}
+
+// nestedToolLine renders one run_code child event (§7.2 Phase 2): indented
+// one level deeper than the outer ⚙/⎿ lines, dim, so the transcript shows
+// the script's calls as a subtree under the run_code block — same tree shape
+// subagent visibility uses. isStart picks the ⚙/⎿ glyph pair.
+func (m *tuiModel) nestedToolLine(te *agent.ToolCallEvent, isStart bool) string {
+	if te == nil {
+		return ""
+	}
+	if isStart {
+		return m.styles.Dim.Render(fmt.Sprintf("    ⚙ %s [%s]…", te.Name, te.ID))
+	}
+	detail := ""
+	if te.DurationMS > 0 {
+		detail = fmt.Sprintf(" (%dms)", te.DurationMS)
+	}
+	if te.Error != "" {
+		detail += " " + collapseSpace(te.Error)
+	}
+	return m.styles.Dim.Render(fmt.Sprintf("    ⎿ %s%s", te.Name, detail))
 }
 
 // runCodeWritesLine pulls the "writes: …" summary out of a run_code result's

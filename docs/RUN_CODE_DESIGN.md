@@ -1,6 +1,6 @@
 # run_code：脚本化工具编排 — 设计稿（供评审）
 
-> 状态：**Phase 0 spike 已完成（go，2026-11-16，见 §3.3 实测）；Phase 1 MVP 已实现**（`pkg/runcode` + `pkg/tools/dispatch.go` + `recordEditedFile` 转发 + `DEEPAI_RUN_CODE` 开关 + TUI 预览），默认关，仅 CLI 主代理。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
+> 状态：**Phase 0 spike 已完成（go，2026-11-16，见 §3.3 实测）；Phase 1 MVP 与 Phase 2 可见性/度量已实现**（Phase 1：`pkg/runcode` + `pkg/tools/dispatch.go` + `recordEditedFile` 转发 + `DEEPAI_RUN_CODE` 开关 + TUI 预览；Phase 2：`ParentID` 嵌套子事件 + TUI 缩进 + §7.3 指标 + 会话记录脚本原文），默认关，仅 CLI 主代理。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
 > 目标：新增一个 `run_code` 工具，让模型用一段 JavaScript 在一次工具调用里编排多次现有工具调用（检索 → 过滤 → 读取 → 修改 → 验证），**只把脚本的返回值送回上下文**。
 > 不在本文范围：符号图 / callers-callees 索引（另立设计）、持久化 REPL 会话、多租户隔离。
 > 背景材料：一份关于 Claude Code Code Mode 的外部讨论记录（未入库）。本文只把它当作问题线索，方案按 deepai 现有代码重新推导；两者的差异见 §11。
@@ -384,11 +384,13 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
 脚本里做的写操作不能只藏在 Data 里。分两步：
 
 - **Phase 1**：TUI 渲染 `run_code` 时展示脚本前几行 + 调用摘要行（`writes:` 一行始终可见）；完整脚本与 journal 可展开查看
-- **Phase 2**：嵌套调用作为 `run_code` 的子事件发出（`ToolCallEvent` 增加 `ParentID`），TUI 缩进显示，与子代理可见性（`SUBAGENT_VISIBILITY_DESIGN.md`）同一套展示层
+- **Phase 2（已实现，2026-11-16）**：嵌套调用作为 `run_code` 的子事件发出（`ToolCallEvent` 增加 `ParentID`），TUI 缩进显示，与子代理可见性（`SUBAGENT_VISIBILITY_DESIGN.md`）同一套展示层。实现：journal 生命周期（running/completed/failed/interrupted）经 ctx 注入的 `tools.NestedEventSink` 发射，agent 侧适配为带 `ParentID` 的 AgentEvent（interrupted 映射为 failed end + 说明文本）；TUI 按 ParentID 分流缩进渲染且不污染顶层 activeTools 记账
 
 ### 7.3 指标
 
 开启 `DEEPAI_TOKEN_METRICS` 时，每次 `run_code` 记录：脚本长度、嵌套调用数与分布、墙钟、return 字节数、**嵌套结果总字节数**（= 没进上下文的字节数，是本功能收益的直接度量）。
+
+> **已实现（2026-11-16）**：`ToolResultMetric` 扩展 `script_bytes`/`nested_calls`/`nested_bytes`/`rc_outcome` 四字段，`handleResult` 对 run_code 结果从 `Data`（journal 两种形态均兼容）填充；墙钟走既有 `duration_ms`、return 字节数走既有 `result_bytes`，不重复设字段。会话记录侧：`Data["script"]` 随 `tool_result` JSON 列落库（roundtrip 测试钉住）。
 
 ---
 
@@ -418,7 +420,7 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
 - `recordEditedFile` 增加 `run_code` 分支，消费 `edited_paths`（§4.5）
 - TUI：脚本预览 + 调用摘要 + `writes:` 行
 
-**Phase 2 — 可见性与度量**
+**Phase 2 — 可见性与度量（已完成，2026-11-16）**
 嵌套子事件（`ParentID`）；§7.3 指标；会话记录里保存脚本原文便于复盘。
 
 **Phase 3 — 评估与扩展**
@@ -496,3 +498,4 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
   - §4.5：`run_code` 分支须置于 `recordEditedFile` 的 completed 检查之前（自查发现，v2 写法会让 failed 脚本漏账）。
   - F1：影响栏与 §4.4 对齐为 `{status, text, data}`。
 - v4（2026-11-16）：Phase 0 spike 实测写回（§3.3：S1/S2/S4 通过、S3 按 watchdog 模式通过并记录 goroutine 泄漏与 GC 阻塞偏差、S5 +5.5 MiB；另记 qjs 库 use-after-free 与抢占缺失两个发现）；Phase 1 MVP 落地：`pkg/runcode`（engine/qjs/schedule/journal/convert/output/tool）、`pkg/tools/dispatch.go`、`runOneTool` 调用时注入、`recordEditedFile` 的 `edited_paths` 转发（位于 completed 检查之前）、`DEEPAI_RUN_CODE`/config `run_code:` 开关（仅 CLI 注册）、TUI 脚本预览与 `writes:` 行。
+- v5（2026-11-16）：Phase 2 落地：`pkg/tools/nested_event.go`（NestedToolEvent/NestedEventSink ctx 注入，与 WithDispatch 同模式）；journal 于 begin/finish/中断三点发射事件（中断由 Run 快照侧发射）；`ToolCallEvent.ParentID` + agent 适配器（runOneTool 内仅对 run_code 挂 sink，两条调度路径天然共用；interrupted → failed end + 说明）；TUI ParentID 分流缩进渲染、隔离 activeTools；§7.3 指标四字段入 ToolResultMetric；session `tool_result` 落库脚本原文（roundtrip 钉住）。
