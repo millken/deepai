@@ -137,3 +137,43 @@ func TestExecuteBatchSerialOrderAndPoison(t *testing.T) {
 		}
 	}
 }
+
+// Review H2: once the script budget has expired, executeBatch must not START
+// any further request — an unstarted edit_file must never land on disk after
+// the watchdog already returned. Gated requests settle as rejections with NO
+// journal entry (nothing started, nothing may have landed).
+func TestExecuteBatchGatesOnExpiredBudget(t *testing.T) {
+	host := newEchoHost()
+	host.declare("edit_file", true, false)
+	host.declare("grep", true, true)
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	jrn := newJournal()
+	batch := []vmRequest{
+		{id: 0, name: "edit_file", argsJSON: `{"step":"one"}`, started: true},
+		{id: 1, name: "grep", argsJSON: `{}`, parallel: true, started: true},
+		{id: 2, name: "grep", argsJSON: `{}`, parallel: true, started: true},
+		{id: 3, name: "edit_file", argsJSON: `{"step":"two"}`, started: true},
+	}
+	items := executeBatch(expired, host, jrn, batch, 1)
+
+	host.mu.Lock()
+	calls := append([]string(nil), host.calls...)
+	host.mu.Unlock()
+	if len(calls) != 0 {
+		t.Fatalf("expired budget still executed: %v", calls)
+	}
+	if entries := jrn.snapshot(false); len(entries) != 0 {
+		t.Fatalf("gated requests must leave no journal entries: %+v", entries)
+	}
+	for i, it := range items {
+		if it.ok {
+			t.Fatalf("items[%d] resolved, want gated rejection", i)
+		}
+		if !strings.Contains(it.valueJSON, "budget") {
+			t.Fatalf("items[%d] rejection = %q, want budget message", i, it.valueJSON)
+		}
+	}
+}

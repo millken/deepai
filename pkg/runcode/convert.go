@@ -80,9 +80,16 @@ func (h *registryHost) Call(ctx context.Context, name string, args map[string]an
 	// Bash nonzero exits stay completed (F2b) — "command failed" must not
 	// read as "call failed" (§4.4); reject is only for tool-layer failures.
 	if err != nil || res.Status == models.CallStatusFailed {
+		// err and Error are usually paired (executeWithSandbox guarantees
+		// Error on the err path), but a handler MAY return failed + empty
+		// Error + nil err (figma's failure shape) — dereferencing err there
+		// panics on the driver goroutine, where no recover sits.
 		msg := res.Error
-		if msg == "" {
+		if msg == "" && err != nil {
 			msg = err.Error()
+		}
+		if msg == "" {
+			msg = "tool " + name + " reported failure without detail"
 		}
 		return HostResult{Err: msg, Tool: name, Status: string(res.Status), Text: res.Content, Data: toJSONValue(res.Data)}
 	}

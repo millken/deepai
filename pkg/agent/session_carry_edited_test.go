@@ -165,6 +165,20 @@ func TestRecordEditedFileRunCodeSkipsNonStrings(t *testing.T) {
 	}
 }
 
+// Review H1 pin: a run_code result with NIL Data (schema-validation failure,
+// missing script) flows through recordEditedFile without panic — Go map
+// reads on a nil map return the zero value; the run_code branch must stay
+// that safe. Executable proof, not just the language rule.
+func TestRecordEditedFileRunCodeNilDataSafe(t *testing.T) {
+	a := &Agent{session: NewSessionCarry()}
+	a.recordEditedFile(models.ToolCall{ID: "c1", Name: "run_code"}, models.ToolResult{
+		CallID: "c1", ToolName: "run_code", Status: models.CallStatusFailed,
+	})
+	if got := a.session.EditedFiles(); len(got) != 0 {
+		t.Fatalf("EditedFiles() = %v, want empty", got)
+	}
+}
+
 func TestRecordEditedFileNilSessionIsNoop(t *testing.T) {
 	a := &Agent{} // no carried session (e.g. subagent runs)
 	a.recordEditedFile(

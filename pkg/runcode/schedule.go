@@ -59,6 +59,11 @@ func rejectSettle(r vmRequest) settleItem {
 // segments fan out capped at maxConcurrency, serial requests run alone. Every
 // executed call is journaled running BEFORE the call and finalized after
 // (§6.2). Settlements come back in the batch's original request order.
+// The script budget gates STARTS at three points (segment head, serial
+// request head, after a parallel worker acquires its slot): once expired,
+// remaining requests settle as rejections WITHOUT executing or journaling —
+// an unstarted write must never land after the watchdog has already returned
+// (it would be invisible to edited_paths and the review gate).
 func executeBatch(scriptCtx context.Context, host Host, jrn *journal, batch []vmRequest, maxConcurrency int) []settleItem {
 	items := make([]settleItem, len(batch))
 	for i, r := range batch {
@@ -69,10 +74,21 @@ func executeBatch(scriptCtx context.Context, host Host, jrn *journal, batch []vm
 	if maxConcurrency <= 0 {
 		maxConcurrency = 10
 	}
+	budgetGated := func(i int) bool {
+		if scriptCtx.Err() == nil {
+			return false
+		}
+		items[i] = settleItem{
+			id:        batch[i].id,
+			valueJSON: mustJSON(map[string]any{"message": "script budget expired before this call started", "tool": batch[i].name}),
+			ok:        false,
+		}
+		return true
+	}
 	for _, seg := range partition(batch) {
 		if !seg.parallel || seg.end-seg.start == 1 {
 			for i := seg.start; i < seg.end; i++ {
-				if batch[i].poison != "" {
+				if batch[i].poison != "" || budgetGated(i) {
 					continue
 				}
 				items[i] = runOne(scriptCtx, host, jrn, batch[i])
@@ -88,6 +104,19 @@ func executeBatch(scriptCtx context.Context, host Host, jrn *journal, batch []vm
 			}
 			go func(i int) {
 				sem <- struct{}{}
+				// Re-check AFTER acquiring the slot: a sibling worker that
+				// finished past the deadline must not be followed by a fresh
+				// write start that only existed because a slot freed up.
+				if scriptCtx.Err() != nil {
+					items[i] = settleItem{
+						id:        batch[i].id,
+						valueJSON: mustJSON(map[string]any{"message": "script budget expired before this call started", "tool": batch[i].name}),
+						ok:        false,
+					}
+					<-sem
+					done <- struct{}{}
+					return
+				}
 				items[i] = runOne(scriptCtx, host, jrn, batch[i])
 				<-sem
 				done <- struct{}{}
