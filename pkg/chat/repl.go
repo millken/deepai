@@ -1768,15 +1768,13 @@ func (r *ChatRepl) runTurn(ctx context.Context, userInput string, images []model
 			lastUsage = evt.Usage
 		}
 		r.ui.RenderEvent(evt)
-		// Collect tool call names for distribution tracking.
+		// Collect tool call names for distribution tracking. Nested
+		// run_code child events (ParentID set) are the SCRIPT's calls, not
+		// the model's own choices — recording them would rewrite the
+		// preference distribution and trip toolShift for a turn where the
+		// model made exactly one choice (review M2).
 		if evt.Type == agent.AgentEventToolCallStart {
-			name := ""
-			if evt.ToolEvent != nil {
-				name = evt.ToolEvent.Name
-			} else if evt.ToolCall != nil {
-				name = evt.ToolCall.Name
-			}
-			if name != "" {
+			if name := turnToolCallName(evt); name != "" {
 				turnToolCalls = append(turnToolCalls, memory.ToolCallInfo{Name: name})
 			}
 		}

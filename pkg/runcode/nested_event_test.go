@@ -87,6 +87,11 @@ func TestNestedEventsSuccessAndFailure(t *testing.T) {
 			t.Fatalf("failed event lost the error text: %+v", e)
 		}
 	}
+	for i := range evts {
+		if evts[i].Seq != i/2+1 {
+			t.Fatalf("seq not per-call: %+v", evts)
+		}
+	}
 }
 
 // On a watchdog abort, still-running calls fire interrupted from the snapshot
@@ -149,6 +154,30 @@ func TestNestedEventsLateFinishAfterAbortIsSilent(t *testing.T) {
 	jrn.finish(e, JournalCompleted, 12, 100, "")
 	if evts := rec.snapshot(); len(evts) != 2 {
 		t.Fatalf("late finish emitted after abort: %+v", evts)
+	}
+}
+
+// Review M1 pin: after the watchdog aborts (snapshot(true) ran), a LATE
+// begin from the abandoned driver must NOT emit running — the outer result
+// already went out without this entry; a parentless trailing ⚙ would never
+// get an end line.
+func TestNestedEventsBeginAfterAbortIsSilent(t *testing.T) {
+	rec := newEventRecorder()
+	jrn := newJournal(rec.sink)
+
+	jrn.begin("a", nil, false)
+	jrn.snapshot(true) // abort: a → interrupted + event
+
+	jrn.begin("b", nil, false) // late arrival — must stay silent
+
+	evts := rec.snapshot()
+	if len(evts) != 2 {
+		t.Fatalf("late begin emitted after abort: %+v", evts)
+	}
+	for _, e := range evts {
+		if e.Tool == "b" {
+			t.Fatalf("late begin leaked an event: %+v", evts)
+		}
 	}
 }
 

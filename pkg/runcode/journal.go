@@ -43,7 +43,12 @@ func (j *journal) emit(e *JournalEntry, status JournalStatus, errText string) {
 	})
 }
 
-// begin appends a running entry and returns it for finalization.
+// begin appends a running entry and returns it for finalization. Events
+// fire UNDER the journal lock: begin/finish/snapshot must not interleave a
+// state transition with its event, or an abort landing in the gap emits
+// interrupted-before-running (review M1). A late begin after the abort still
+// records the entry but stays silent — the outer result already went out
+// without it, and a trailing parentless ⚙ would never get an end line.
 func (j *journal) begin(tool string, args map[string]any, write bool) *JournalEntry {
 	e := &JournalEntry{
 		Tool:   tool,
@@ -52,29 +57,34 @@ func (j *journal) begin(tool string, args map[string]any, write bool) *JournalEn
 		args:   args,
 	}
 	j.mu.Lock()
+	defer j.mu.Unlock()
 	e.Seq = len(j.entries) + 1
 	j.entries = append(j.entries, e)
-	j.mu.Unlock()
-	j.emit(e, JournalRunning, "")
+	if !j.aborted {
+		j.emit(e, JournalRunning, "")
+	}
 	return e
 }
 
 func (j *journal) finish(e *JournalEntry, status JournalStatus, ms int64, bytes int, errText string) {
 	j.mu.Lock()
+	defer j.mu.Unlock()
 	// Post-abort arrival: an abandoned batch worker finishing after the
 	// watchdog already snapshotted this entry as interrupted. The entry is
 	// still finalized (a later snapshot shows what actually happened), but
 	// NO event fires — the model already saw "interrupted"; a trailing
 	// "completed" for the same call would contradict the journal the
-	// returned result carries.
-	aborted := j.aborted
+	// returned result carries. Emitting under the same lock keeps the
+	// aborted check and the emit atomic against snapshot(true).
+	if j.aborted {
+		e.Status = status
+		e.MS = ms
+		e.Bytes = bytes
+		return
+	}
 	e.Status = status
 	e.MS = ms
 	e.Bytes = bytes
-	j.mu.Unlock()
-	if aborted {
-		return
-	}
 	j.emit(e, status, errText)
 }
 

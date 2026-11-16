@@ -1894,7 +1894,10 @@ func (m *tuiModel) nestedToolLine(te *agent.ToolCallEvent, isStart bool) string 
 	if te.Error != "" {
 		detail += " " + collapseSpace(te.Error)
 	}
-	return m.styles.Dim.Render(fmt.Sprintf("    ⎿ %s%s", te.Name, detail))
+	// The nested ID suffix distinguishes parallel same-tool calls (two
+	// edit_file ends in one batch): the start line already shows it, so the
+	// end line must too or the pairs cannot be matched (review Low #2).
+	return m.styles.Dim.Render(fmt.Sprintf("    ⎿ %s [%s]%s", te.Name, te.ID, detail))
 }
 
 // runCodeWritesLine pulls the "writes: …" summary out of a run_code result's
