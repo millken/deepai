@@ -751,6 +751,12 @@ type runRecord struct {
 	// the tool-call distribution: unlike duration/tokens, a timed-out run
 	// with recovered stats DOES count there.
 	HasStats bool `json:"has_stats"`
+	// RunCodeArm records which Phase 3 arm produced this run (PR #48 review
+	// M5): the completion/token/turns gates must key on this EXPLICIT marker,
+	// not on a fingerprint diff — a prompt change between two unarmed runs
+	// also changes the fingerprint and must never be judged as a run_code
+	// A->B decision.
+	RunCodeArm bool `json:"run_code_arm"`
 }
 
 // runEvalCases runs every case × opts.Runs sequentially — cases and runs
@@ -777,7 +783,14 @@ func runEvalCases(ctx context.Context, pool evalTaskPool, repoRoot string, evalT
 	for _, c := range cases {
 		caseOpts := opts
 		if opts.RunCodeArm {
-			caseOpts.ToolSelectors = armToolSelectors(c.Manifest.AgentType, repoRoot, true)
+			selectors, err := armToolSelectors(c.Manifest.AgentType, repoRoot, true)
+			if err != nil {
+				// Fail loud (PR #48 review): a silent nil here would run an
+				// unarmed B arm whose fingerprint equals A's, and the
+				// default-on criteria would be skipped unnoticed.
+				return records, fmt.Errorf("case %s/%s: %w", c.AgentType, c.ID, err)
+			}
+			caseOpts.ToolSelectors = selectors
 		}
 		fingerprint, err := caseFingerprint(c.Manifest.AgentType, repoRoot, evalTools, skillReg, caseOpts.ToolSelectors)
 		if err != nil {
@@ -788,6 +801,7 @@ func runEvalCases(ctx context.Context, pool evalTaskPool, repoRoot string, evalT
 			if err != nil {
 				return records, fmt.Errorf("case %s/%s run %d: %w", c.AgentType, c.ID, run, err)
 			}
+			rec.RunCodeArm = caseOpts.RunCodeArm
 			records = append(records, rec)
 			if onRun != nil {
 				if err := onRun(rec); err != nil {
@@ -1670,11 +1684,14 @@ func computeFingerprint(systemPrompt string) string {
 // ---------------------------------------------------------------------------
 
 type roleSummary struct {
-	AgentType      string `json:"agent_type"`
-	Fingerprint    string `json:"fingerprint"`
-	Cases          int    `json:"cases"`
-	Runs           int    `json:"runs"`
-	DispatchedRuns int    `json:"dispatched_runs"`
+	AgentType   string `json:"agent_type"`
+	Fingerprint string `json:"fingerprint"`
+	// RunCodeArm derives from this role's records: true when ANY run in the
+	// role carried the arm marker (see runRecord.RunCodeArm).
+	RunCodeArm     bool `json:"run_code_arm"`
+	Cases          int  `json:"cases"`
+	Runs           int  `json:"runs"`
+	DispatchedRuns int  `json:"dispatched_runs"`
 	// AssertionPassRate/Fail/Skip are diagnostic only (see
 	// docs/AGENT_CAPABILITY_DESIGN.md §8's "废弃‘整体断言通过率’作为达标线"):
 	// reported for continuity with the M5-2 baseline, no longer a gate.
@@ -1745,11 +1762,15 @@ type roleSummary struct {
 }
 
 type evalSummary struct {
-	GeneratedAt string        `json:"generated_at"`
-	Model       string        `json:"model"`
-	Runs        int           `json:"runs"`
-	Timeout     string        `json:"timeout"`
-	Roles       []roleSummary `json:"roles"`
+	GeneratedAt string `json:"generated_at"`
+	Model       string `json:"model"`
+	Runs        int    `json:"runs"`
+	Timeout     string `json:"timeout"`
+	// RunCodeArm: true when any record carried the Phase 3 B-arm marker —
+	// compare gates the run_code default-on criteria on the arm pair
+	// (!before.RunCodeArm && after.RunCodeArm), never on fingerprint diff.
+	RunCodeArm bool          `json:"run_code_arm"`
+	Roles      []roleSummary `json:"roles"`
 }
 
 // buildEvalSummary aggregates records into one roleSummary per agent_type.
@@ -1805,12 +1826,18 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		var fileEditFail int
 		var tokensSum, durationSum float64
 		var inputTokensSum float64
+		var inputTokensRuns int
 		var completedRuns int
+		var attemptedRuns int
 		var llmTurnsSamples []int
 		var toolCallsSamples []int
 		var budgetExhaustedRuns int
+		roleArm := false
 		for _, r := range recs {
 			caseSet[r.Case] = true
+			if r.RunCodeArm {
+				roleArm = true
+			}
 			// Collected unconditionally on r.HasStats, ahead of the
 			// dispatch-error continue below — see the function doc for why
 			// the tool-call distribution deliberately does NOT exclude a
@@ -1827,9 +1854,16 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 			if r.Error != "" {
 				rs.DispatchErrors++
+				// H1 (PR #48 review): an errored run is an INCOMPLETE run. It must
+				// stay in the completion-rate denominator — arm B turning assertion
+				// failures into agent errors would otherwise shrink the denominator
+				// and RAISE CompletionRate while the gate stays blind. attemptedRuns
+				// (dispatched + errored) is that denominator.
+				attemptedRuns++
 				continue // see the function doc: a timeout contributes nothing else
 			}
 			rs.DispatchedRuns++
+			attemptedRuns++
 			// Gated on r.NoWritesDeclared: a write_violation only counts as
 			// a no_writes VIOLATION for a case whose manifest actually
 			// declares no_writes: true. A batch-editing case (coder/*) sets
@@ -1841,7 +1875,13 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 			tokensSum += float64(r.Tokens)
 			durationSum += float64(r.DurationMS)
-			inputTokensSum += float64(r.InputTokens)
+			// M3: only runs whose provider actually reported input tokens feed
+			// the average — a zero-usage sample would deflate it and bias the
+			// "-25%" gate toward a free pass.
+			if r.InputTokens > 0 {
+				inputTokensSum += float64(r.InputTokens)
+				inputTokensRuns++
+			}
 			// Phase 3 完成率：一个 dispatched run 仅当其所有断言全部 pass 才算
 			// completed（fail 任何一个即非 completed；skipped 不影响）。
 			runClean := true
@@ -1889,6 +1929,7 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 		}
 		rs.Cases = len(caseSet)
+		rs.RunCodeArm = roleArm
 		rs.AssertionPassRate = ratio(totalPass, totalPass+totalFail)
 		rs.AssertionFailRate = ratio(totalFail, totalPass+totalFail)
 		rs.AssertionSkipRate = ratio(totalSkip, totalPass+totalFail+totalSkip)
@@ -1903,9 +1944,9 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			rs.AvgDurationMS = durationSum / float64(rs.DispatchedRuns)
 		}
 		rs.CompletedRuns = completedRuns
-		rs.CompletionRate = ratio(completedRuns, rs.DispatchedRuns)
-		if rs.DispatchedRuns > 0 {
-			rs.AvgInputTokens = inputTokensSum / float64(rs.DispatchedRuns)
+		rs.CompletionRate = ratio(completedRuns, attemptedRuns)
+		if inputTokensRuns > 0 {
+			rs.AvgInputTokens = inputTokensSum / float64(inputTokensRuns)
 		}
 		if len(llmTurnsSamples) > 0 {
 			var turnSum float64
@@ -1923,11 +1964,19 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		roles = append(roles, rs)
 	}
 
+	anyArm := false
+	for _, r := range roles {
+		if r.RunCodeArm {
+			anyArm = true
+			break
+		}
+	}
 	return evalSummary{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Model:       model,
 		Runs:        runs,
 		Timeout:     timeout,
+		RunCodeArm:  anyArm,
 		Roles:       roles,
 	}
 }
@@ -2300,10 +2349,12 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 		}
 		fmt.Fprintf(&b, "  assertion pass rate (diagnostic only, not a gate): %.1f%% -> %.1f%%\n", bRole.AssertionPassRate*100, a.AssertionPassRate*100)
 
-		// Phase 3: the run_code default-on gates render only for a genuine
-		// A->B pair (differing fingerprints). An A/A pair must not be judged
-		// as if a run_code decision were on the table.
-		if bRole.Fingerprint != "" && bRole.Fingerprint != a.Fingerprint {
+		// Phase 3 (PR #48 review M5): the run_code default-on gates key on
+		// the EXPLICIT arm marker — before unarmed, after armed. A prompt
+		// change between two unarmed runs also changes the fingerprint and
+		// must never be judged as a run_code A->B decision; B vs B equally
+		// not.
+		if !before.RunCodeArm && after.RunCodeArm && !bRole.RunCodeArm && a.RunCodeArm {
 			if appendRunCodeCriteria(&b, bRole, a) {
 				isFail = true
 			}

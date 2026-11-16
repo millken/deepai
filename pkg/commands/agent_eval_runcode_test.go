@@ -63,17 +63,29 @@ func hasToolName(tools []models.Tool, name string) bool {
 }
 
 // armToolSelectors: nil on the A arm; the profile's DefaultTools plus
-// run_code on the B arm; nil (no restriction override) for a profile with no
-// DefaultTools — overriding an empty list with ["run_code"] would restrict
-// the subagent to ONLY run_code.
+// run_code on the B arm; nil (no restriction override) for a profile with
+// no DefaultTools — overriding an empty list with ["run_code"] would
+// restrict the subagent to ONLY run_code (a nil selector set means
+// SelectSubagentTools' no-restriction path, the correct B arm for an
+// unrestricted profile: everything, run_code included).
+// Resolution failure FAILS LOUD (PR #48 review): a silent nil with the arm
+// gate on would run an unarmed B arm whose fingerprint equals A's and skip
+// the criteria without anyone noticing.
 func TestArmToolSelectors(t *testing.T) {
 	t.Run("arm off is nil", func(t *testing.T) {
-		if got := armToolSelectors("coder", t.TempDir(), false); got != nil {
+		got, err := armToolSelectors("coder", t.TempDir(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
 			t.Fatalf("A arm selectors = %v, want nil", got)
 		}
 	})
 	t.Run("coder B arm adds run_code to DefaultTools", func(t *testing.T) {
-		got := armToolSelectors("coder", t.TempDir(), true)
+		got, err := armToolSelectors("coder", t.TempDir(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got == nil {
 			t.Fatal("B arm selectors = nil")
 		}
@@ -86,6 +98,11 @@ func TestArmToolSelectors(t *testing.T) {
 			}
 		}
 	})
+	t.Run("unresolvable agent type fails loud", func(t *testing.T) {
+		if _, err := armToolSelectors("no-such-agent-type", t.TempDir(), true); err == nil {
+			t.Fatal("unresolvable profile with arm on must return an error, not a silent nil")
+		}
+	})
 }
 
 func containsStr(list []string, s string) bool {
@@ -95,6 +112,15 @@ func containsStr(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func mustArmSelectors(t *testing.T, agentType, repoRoot string) []string {
+	t.Helper()
+	got, err := armToolSelectors(agentType, repoRoot, true)
+	if err != nil {
+		t.Fatalf("armToolSelectors(%s): %v", agentType, err)
+	}
+	return got
 }
 
 // The A/B arms must be distinguishable in the fingerprint: the system prompt
@@ -118,7 +144,7 @@ func TestCaseFingerprintDistinguishesArms(t *testing.T) {
 	if aFP != sameA {
 		t.Fatal("same arm fingerprint not stable")
 	}
-	bFP, err := caseFingerprint("coder", repoRoot, bTools, nil, armToolSelectors("coder", repoRoot, true))
+	bFP, err := caseFingerprint("coder", repoRoot, bTools, nil, mustArmSelectors(t, "coder", repoRoot))
 	if err != nil {
 		t.Fatalf("B arm fingerprint: %v", err)
 	}
@@ -147,10 +173,17 @@ func TestBuildEvalSummaryRunCodeMetrics(t *testing.T) {
 			},
 		},
 		{
-			// dispatch timeout: contributes to neither completion nor token
-			// averages, but its recovered stats DO count for the turns
-			// distribution (the right-tail sample).
+			// Dispatch/agent failure (timeout with recovered stats): H1 — it
+			// MUST count in the completion-rate denominator, or arm B turning
+			// assertion failures into agent errors would RAISE the completion
+			// rate by shrinking the denominator while the gate stays blind.
 			AgentType: "coder", Case: "c2", Run: 1, Error: "timeout", LLMTurns: 30, HasStats: true,
+		},
+		{
+			// Dispatched and clean but usage was never reported (InputTokens
+			// 0): M3 — it must NOT deflate the input-token average.
+			AgentType: "coder", Case: "c3", Run: 1, LLMTurns: 5, HasStats: true,
+			Assertions: []assertionResult{{Name: "mentions:x", Status: "pass"}},
 		},
 	}
 	s := buildEvalSummary("m", 1, "5m", records)
@@ -158,17 +191,31 @@ func TestBuildEvalSummaryRunCodeMetrics(t *testing.T) {
 		t.Fatalf("roles = %d", len(s.Roles))
 	}
 	r := s.Roles[0]
-	if r.DispatchedRuns != 2 {
+	if r.DispatchedRuns != 3 {
 		t.Fatalf("DispatchedRuns = %d", r.DispatchedRuns)
 	}
-	if r.CompletedRuns != 1 || r.CompletionRate != 0.5 {
-		t.Fatalf("CompletedRuns=%d CompletionRate=%v, want 1 / 0.5", r.CompletedRuns, r.CompletionRate)
+	// Completion: 2 clean of 4 ATTEMPTED (3 dispatched + 1 errored) — an
+	// agent failure is an incomplete run, never a denominator shrink.
+	if r.CompletedRuns != 2 || r.CompletionRate != 0.5 {
+		t.Fatalf("CompletedRuns=%d CompletionRate=%v, want 2 / 0.5 (errored run in denominator)", r.CompletedRuns, r.CompletionRate)
 	}
+	// Input tokens average over the two runs that HAVE usage (1000, 3000).
 	if r.AvgInputTokens != 2000 {
-		t.Fatalf("AvgInputTokens = %v, want 2000", r.AvgInputTokens)
+		t.Fatalf("AvgInputTokens = %v, want 2000 (zero-usage sample excluded)", r.AvgInputTokens)
 	}
-	if r.AvgLLMTurns != (8.0+12.0+30.0)/3 {
-		t.Fatalf("AvgLLMTurns = %v, want %v (stats runs incl. timeout)", r.AvgLLMTurns, (8.0+12.0+30.0)/3)
+	if r.AvgLLMTurns != (8.0+12.0+30.0+5.0)/4 {
+		t.Fatalf("AvgLLMTurns = %v, want %v (stats runs incl. timeout)", r.AvgLLMTurns, (8.0+12.0+30.0+5.0)/4)
+	}
+	// Arm marker derives from the records (M5): summary and role rows both.
+	if s.RunCodeArm || r.RunCodeArm {
+		t.Fatal("arm marker derived true from unarmed records")
+	}
+	for i := range records {
+		records[i].RunCodeArm = true
+	}
+	s2 := buildEvalSummary("m", 1, "5m", records)
+	if !s2.RunCodeArm || !s2.Roles[0].RunCodeArm {
+		t.Fatal("arm marker not derived from armed records")
 	}
 }
 
@@ -177,16 +224,22 @@ func TestBuildEvalSummaryRunCodeMetrics(t *testing.T) {
 // run_code decision were being judged.
 func TestRenderEvalCompareRunCodeCriteria(t *testing.T) {
 	base := evalSummary{
-		GeneratedAt: "t0", Model: "m", Runs: 3, Timeout: "5m",
+		GeneratedAt: "t0", Model: "m", Runs: 3, Timeout: "5m", RunCodeArm: false,
 		Roles: []roleSummary{{
-			AgentType: "coder", Fingerprint: "aaaa",
+			AgentType: "coder", Fingerprint: "aaaa", RunCodeArm: false,
 			DispatchedRuns: 9, CompletionRate: 0.9, CompletedRuns: 8,
 			AvgInputTokens: 10000, AvgLLMTurns: 10,
 		}},
 	}
+	armed := func(s evalSummary) evalSummary {
+		out := deepCopySummary(s)
+		out.RunCodeArm = true
+		out.Roles[0].RunCodeArm = true
+		return out
+	}
 
 	t.Run("25pct cut passes all three", func(t *testing.T) {
-		after := deepCopySummary(base)
+		after := armed(base)
 		after.GeneratedAt = "t1"
 		after.Roles[0].Fingerprint = "bbbb"
 		after.Roles[0].CompletionRate = 0.9
@@ -207,7 +260,7 @@ func TestRenderEvalCompareRunCodeCriteria(t *testing.T) {
 	})
 
 	t.Run("regressions fail", func(t *testing.T) {
-		after := deepCopySummary(base)
+		after := armed(base)
 		after.Roles[0].Fingerprint = "bbbb"
 		after.Roles[0].CompletionRate = 0.7  // down
 		after.Roles[0].AvgInputTokens = 9000 // only 10% cut
@@ -221,15 +274,32 @@ func TestRenderEvalCompareRunCodeCriteria(t *testing.T) {
 		}
 	})
 
-	t.Run("A/A pair skips the section", func(t *testing.T) {
+	t.Run("same arm with different fingerprints skips the section", func(t *testing.T) {
+		// M5: a prompt change (A -> A') also changes the fingerprint — the
+		// gates must key on the EXPLICIT arm marker, not on fingerprint diff.
 		after := deepCopySummary(base)
 		after.GeneratedAt = "t1"
+		after.Roles[0].Fingerprint = "cccc"
 		out, err := renderEvalCompare(base, after)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if strings.Contains(out, "run_code default-on criteria") {
-			t.Fatalf("A/A comparison printed the run_code gates:\n%s", out)
+			t.Fatalf("A/A' comparison printed the run_code gates:\n%s", out)
+		}
+	})
+
+	t.Run("armed-before pair skips the section", func(t *testing.T) {
+		// B vs B (both armed) is also not an A->B decision.
+		after := armed(base)
+		before := armed(base)
+		before.GeneratedAt = "t-1"
+		out, err := renderEvalCompare(before, after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out, "run_code default-on criteria") {
+			t.Fatalf("B/B comparison printed the run_code gates:\n%s", out)
 		}
 	})
 }

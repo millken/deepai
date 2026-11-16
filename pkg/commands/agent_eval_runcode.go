@@ -29,24 +29,36 @@ func evalRunCodeArm(cfg Config) bool {
 }
 
 // armToolSelectors returns the B arm's task-level tool selectors: the
-// profile's DefaultTools plus run_code. nil when the arm is off, and when
-// the profile declares no DefaultTools — overriding an empty list with
-// ["run_code"] would restrict that subagent to ONLY run_code.
-func armToolSelectors(agentType, repoRoot string, armOn bool) []string {
+// profile's DefaultTools plus run_code. nil, nil when the arm is off, and
+// when the profile declares no DefaultTools — overriding an empty list with
+// ["run_code"] would restrict that subagent to ONLY run_code (a nil
+// selector set means SelectSubagentTools' no-restriction path, the correct
+// B arm for an unrestricted profile: everything, run_code included).
+// A profile that fails to RESOLVE fails loud: a silent nil with the arm gate
+// on would run an unarmed B arm whose fingerprint equals A's, and the
+// default-on criteria would be skipped without anyone noticing (PR #48
+// review).
+func armToolSelectors(agentType, repoRoot string, armOn bool) ([]string, error) {
 	if !armOn {
-		return nil
+		return nil, nil
 	}
 	profileCfg, problems, resolved := agent.ResolveAgentTypeConfig(agent.AgentType(agentType), repoRoot, nil)
-	if !resolved || len(problems) > 0 || len(profileCfg.DefaultTools) == 0 {
-		return nil
+	if !resolved {
+		return nil, fmt.Errorf("run_code B arm: agent type %q not resolved (problems: %s)", agentType, strings.Join(problems, "; "))
+	}
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("run_code B arm: agent type %q: %s", agentType, strings.Join(problems, "; "))
+	}
+	if len(profileCfg.DefaultTools) == 0 {
+		return nil, nil
 	}
 	out := append([]string(nil), profileCfg.DefaultTools...)
 	for _, n := range out {
 		if n == "run_code" {
-			return out
+			return out, nil
 		}
 	}
-	return append(out, "run_code")
+	return append(out, "run_code"), nil
 }
 
 // appendRunCodeCriteria renders the three default-on gates (§9: 完成率不降、
