@@ -12,6 +12,7 @@ import (
 
 	"github.com/fastschema/qjs"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 // jsMemoryLimit is the WASM linear-memory cap (§6.1): 256 MiB.
@@ -155,7 +156,9 @@ func (e qjsEngine) Run(ctx context.Context, script string, host Host, lim Limits
 	if lim.Timeout <= 0 {
 		lim.Timeout = 120 * time.Second
 	}
-	jrn := newJournal()
+	// Nested events (§7.2 Phase 2) flow through the ctx-injected sink — the
+	// same injection pattern as WithDispatch; the Engine interface stays put.
+	jrn := newJournal(tools.NestedEventSinkFromContext(ctx))
 	logs := &cappedWriter{limit: 8 << 10}
 	resCh := make(chan vmResult, 1)
 	preludeDone := make(chan error, 1)

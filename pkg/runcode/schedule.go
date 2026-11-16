@@ -143,7 +143,7 @@ func runOne(scriptCtx context.Context, host Host, jrn *journal, r vmRequest) set
 	ms := time.Since(t0).Milliseconds()
 
 	if res.Err != "" {
-		jrn.finish(entry, JournalFailed, ms, len(res.Text))
+		jrn.finish(entry, JournalFailed, ms, len(res.Text), res.Err)
 		return settleItem{
 			id: r.id,
 			valueJSON: mustJSON(map[string]any{
@@ -161,7 +161,7 @@ func runOne(scriptCtx context.Context, host Host, jrn *journal, r vmRequest) set
 		"data":   res.Data,
 	}
 	envJSON := mustJSON(value)
-	jrn.finish(entry, JournalCompleted, ms, len(envJSON))
+	jrn.finish(entry, JournalCompleted, ms, len(envJSON), "")
 	return settleItem{id: r.id, valueJSON: envJSON, ok: true}
 }
 

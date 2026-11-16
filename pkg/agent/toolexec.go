@@ -293,6 +293,12 @@ func (a *Agent) runOneTool(ctx context.Context, sessionID string, call models.To
 	if a.tools != nil {
 		toolCtx = tools.WithDispatch(toolCtx, &tools.Dispatch{Registry: a.tools, MaxConcurrency: a.maxToolConcurrency})
 	}
+	// run_code only: surface each nested call as a ParentID child event
+	// (§7.2 Phase 2). The sink adapts onto a.emit — non-blocking and
+	// lock-guarded, safe from the engine's batch worker goroutines.
+	if call.Name == "run_code" {
+		toolCtx = tools.WithNestedEventSink(toolCtx, a.nestedEventSink(sessionID, call.ID))
+	}
 	// Window-aware handlers (code_map include_content) size their output
 	// budget against the actual model window instead of a global constant —
 	// a 1M-window model can afford a far larger pull than a 128k one.
@@ -450,7 +456,7 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 		filePath := extractPathFromArgs(result.ToolName, call.Arguments)
 		durationMs := result.Duration.Milliseconds()
 
-		b.a.metrics.RecordToolResult(ToolResultMetric{
+		metric := ToolResultMetric{
 			Turn:        b.turn,
 			ToolName:    result.ToolName,
 			ResultBytes: len(result.Content),
@@ -458,7 +464,11 @@ func (b *toolBatchState) handleResult(call models.ToolCall, result models.ToolRe
 			Path:        filePath,
 			Offloaded:   offloaded,
 			DurationMs:  durationMs,
-		})
+		}
+		if result.ToolName == "run_code" {
+			fillRunCodeMetrics(&metric, result.Data)
+		}
+		b.a.metrics.RecordToolResult(metric)
 	}
 	toolMessage := b.runMessages[len(b.runMessages)-1]
 	b.emit(AgentEvent{

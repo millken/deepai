@@ -79,7 +79,7 @@ func TestExecuteBatchRespectsConcurrencyCap(t *testing.T) {
 	for i, n := range []string{"a", "b", "c", "d", "e", "f"} {
 		reqs = append(reqs, vmRequest{id: i, name: n, parallel: true, started: true})
 	}
-	items := executeBatch(context.Background(), host, newJournal(), reqs, 2)
+	items := executeBatch(context.Background(), host, newJournal(nil), reqs, 2)
 	if len(items) != 6 {
 		t.Fatalf("items=%d", len(items))
 	}
@@ -104,7 +104,7 @@ func TestExecuteBatchSerialOrderAndPoison(t *testing.T) {
 		order = append(order, step)
 		return HostResult{Status: "completed"}
 	}
-	jrn := newJournal()
+	jrn := newJournal(nil)
 	reqs := []vmRequest{
 		{id: 0, name: "write_file", argsJSON: `{"step":"one"}`, started: true},
 		{id: 1, poison: "tool not available in run_code: task"},
@@ -150,7 +150,7 @@ func TestExecuteBatchGatesOnExpiredBudget(t *testing.T) {
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	jrn := newJournal()
+	jrn := newJournal(nil)
 	batch := []vmRequest{
 		{id: 0, name: "edit_file", argsJSON: `{"step":"one"}`, started: true},
 		{id: 1, name: "grep", argsJSON: `{}`, parallel: true, started: true},

@@ -121,7 +121,7 @@ func TestSpikeS2_DrainThenBatch(t *testing.T) {
 	}
 	evalReturned := time.Now()
 
-	jrn := newJournal()
+	jrn := newJournal(nil)
 	settle := c.Global().GetPropertyStr("__rcSettle")
 	items := executeBatch(context.Background(), h, jrn, reqs, 10)
 	for _, it := range items {

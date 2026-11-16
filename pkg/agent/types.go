@@ -292,8 +292,11 @@ const (
 )
 
 type ToolCallEvent struct {
-	ID            string             `json:"id"`
-	Name          string             `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// ParentID is set on run_code's nested child events (§7.2 Phase 2):
+	// the outer run_code ToolCall.ID. Empty on top-level calls.
+	ParentID      string             `json:"parent_id,omitempty"`
 	Arguments     map[string]any     `json:"arguments,omitempty"`
 	ArgumentsText string             `json:"arguments_text,omitempty"`
 	Status        models.CallStatus  `json:"status"`

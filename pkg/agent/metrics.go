@@ -64,6 +64,13 @@ type ToolResultMetric struct {
 	Path       string `json:"path,omitempty"`        // file path for file-based tools
 	Offloaded  bool   `json:"offloaded,omitempty"`   // whether result was offloaded to disk
 	DurationMs int64  `json:"duration_ms,omitempty"` // tool execution duration in milliseconds
+	// run_code §7.3 (Phase 2): the direct measure of what one scripted run
+	// kept OUT of context — nested results' total bytes vs the script's own
+	// return. Zero on every other tool.
+	ScriptBytes int    `json:"script_bytes,omitempty"` // script source length
+	NestedCalls int    `json:"nested_calls,omitempty"` // nested tool call count
+	NestedBytes int    `json:"nested_bytes,omitempty"` // nested results' total bytes (kept out of context)
+	Outcome     string `json:"rc_outcome,omitempty"`   // ok|error|timeout|call_limit|memory|cancelled
 }
 
 // MetricsSink receives Phase 0 measurements. Implementations must be safe for
