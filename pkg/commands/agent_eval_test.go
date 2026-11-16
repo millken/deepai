@@ -1208,7 +1208,7 @@ func TestComputeFingerprint_OneByteChangeChangesFingerprint(t *testing.T) {
 func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing.T) {
 	repoRoot := t.TempDir()
 	evalTools := evalToolCandidates(Config{})
-	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (builtin): %v", err)
 	}
@@ -1220,7 +1220,7 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte("system_prompt: |\n  a totally different constitution\n"), 0o644); err != nil {
 		t.Fatalf("write override yaml: %v", err)
 	}
-	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (override): %v", err)
 	}
@@ -1238,7 +1238,7 @@ func TestCaseFingerprint_ProjectYAMLOverrideWinsAndChangesFingerprint(t *testing
 func TestCaseFingerprint_ProjectMDOverrideWinsAndChangesFingerprint(t *testing.T) {
 	repoRoot := t.TempDir()
 	evalTools := evalToolCandidates(Config{})
-	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	builtinFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (builtin): %v", err)
 	}
@@ -1251,7 +1251,7 @@ func TestCaseFingerprint_ProjectMDOverrideWinsAndChangesFingerprint(t *testing.T
 	if err := os.WriteFile(filepath.Join(agentsDir, "architect.md"), []byte(mdContent), 0o644); err != nil {
 		t.Fatalf("write override md: %v", err)
 	}
-	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	overrideFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (override): %v", err)
 	}
@@ -1293,7 +1293,7 @@ func TestCaseFingerprint_ProjectYAMLOutputSchemaOverride(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(withSchema), 0o644); err != nil {
 		t.Fatalf("write override yaml: %v", err)
 	}
-	withSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	withSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (with schema): %v", err)
 	}
@@ -1302,7 +1302,7 @@ func TestCaseFingerprint_ProjectYAMLOutputSchemaOverride(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentsDir, "architect.yaml"), []byte(withoutSchema), 0o644); err != nil {
 		t.Fatalf("write override yaml: %v", err)
 	}
-	withoutSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil)
+	withoutSchemaFP, err := caseFingerprint("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (without schema): %v", err)
 	}
@@ -1329,7 +1329,7 @@ func TestCaseFingerprint_ProjectYAMLUnknownOutputSchemaErrors(t *testing.T) {
 		t.Fatalf("write yaml: %v", err)
 	}
 
-	if _, err := caseFingerprint("architect", repoRoot, evalToolCandidates(Config{}), nil); err == nil {
+	if _, err := caseFingerprint("architect", repoRoot, evalToolCandidates(Config{}), nil, nil); err == nil {
 		t.Fatal("expected error for unknown output_schema name, got nil")
 	}
 }
@@ -1378,7 +1378,7 @@ func TestCaseFingerprint_ProjectSkillBodyChangeMovesFingerprint(t *testing.T) {
 	if warnings := skillRegBefore.LoadAllReported(repoRoot, nil); len(warnings) > 0 {
 		t.Logf("skill load warnings (before): %v", warnings)
 	}
-	fpBefore, err := caseFingerprint("architect", repoRoot, evalTools, skillRegBefore)
+	fpBefore, err := caseFingerprint("architect", repoRoot, evalTools, skillRegBefore, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (before): %v", err)
 	}
@@ -1388,7 +1388,7 @@ func TestCaseFingerprint_ProjectSkillBodyChangeMovesFingerprint(t *testing.T) {
 	if warnings := skillRegAfter.LoadAllReported(repoRoot, nil); len(warnings) > 0 {
 		t.Logf("skill load warnings (after): %v", warnings)
 	}
-	fpAfter, err := caseFingerprint("architect", repoRoot, evalTools, skillRegAfter)
+	fpAfter, err := caseFingerprint("architect", repoRoot, evalTools, skillRegAfter, nil)
 	if err != nil {
 		t.Fatalf("caseFingerprint (after): %v", err)
 	}
@@ -1551,7 +1551,7 @@ func TestCaseFingerprint_EquivalentToRealDispatchedSubagentSystemPrompt(t *testi
 	// gate for the new role.
 	for _, agentType := range []string{"architect", "researcher", "analyst", "product-manager", "tester", "coder"} {
 		t.Run(agentType, func(t *testing.T) {
-			harnessPrompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg)
+			harnessPrompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg, nil)
 			if err != nil {
 				t.Fatalf("resolveEvalSubagentPrompt: %v", err)
 			}
@@ -1612,7 +1612,7 @@ func TestCaseFingerprint_ToolRestrictionAppliesToTheAssembledPrompt(t *testing.T
 
 	evalTools := evalToolCandidates(Config{})
 
-	restrictedPrompt, err := resolveEvalSubagentPrompt("architect", repoRoot, evalTools, nil)
+	restrictedPrompt, err := resolveEvalSubagentPrompt("architect", repoRoot, evalTools, nil, nil)
 	if err != nil {
 		t.Fatalf("resolveEvalSubagentPrompt: %v", err)
 	}
@@ -2075,8 +2075,8 @@ func TestRealAgentCasesCorpus_LoadsAndMaterializesCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadEvalCases: %v", err)
 	}
-	if len(cases) != 18 {
-		t.Fatalf("len(cases) = %d, want 18 (5 original agent types x 3 cases, plus coder x 3 added for the M6 batch-editing corpus)", len(cases))
+	if len(cases) != 21 {
+		t.Fatalf("len(cases) = %d, want 21 (5 original agent types x 3 cases, plus coder x 3 for the M6 batch-editing corpus and x 3 for the run_code Phase 3 corpus)", len(cases))
 	}
 
 	wantAgentTypes := map[string]int{}
@@ -2109,9 +2109,16 @@ func TestRealAgentCasesCorpus_LoadsAndMaterializesCleanly(t *testing.T) {
 		}
 		cleanup()
 	}
-	for _, agentType := range []string{"architect", "product-manager", "researcher", "analyst", "tester", "coder"} {
-		if wantAgentTypes[agentType] != 3 {
-			t.Errorf("agent_type %s: %d cases, want 3", agentType, wantAgentTypes[agentType])
+	wantCaseCount := map[string]int{}
+	for _, at := range []string{"architect", "product-manager", "researcher", "analyst", "tester", "coder"} {
+		wantCaseCount[at] = 3
+	}
+	// coder carries two corpora: the M6 batch-editing cases and the run_code
+	// Phase 3 A/B cases (filter-then-edit / recover-midway / cite-file-line).
+	wantCaseCount["coder"] = 6
+	for agentType, want := range wantCaseCount {
+		if wantAgentTypes[agentType] != want {
+			t.Errorf("agent_type %s: %d cases, want %d", agentType, wantAgentTypes[agentType], want)
 		}
 	}
 }

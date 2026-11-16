@@ -1,0 +1,17 @@
+id: cite-file-line
+agent_type: coder
+task: >
+  pkg/gate/ 和 pkg/pool/ 两个目录共四个文件。找出其中所有「调用方可能忽略
+  返回值」的函数定义（即定义处注释里写了 Callers/返回值 语义的函数），
+  逐个核对。在最终答复里用 `文件路径:行号` 的形式列出每一个这样的函数
+  定义所在位置（行号从 1 开始数，pkg/gate/close.go 第 1 行是 `package gate`），
+  以及该函数当前是否存在被忽略调用的风险。不要修改任何文件。
+tags: [go, coder, run-code]
+expect:
+  - mentions:
+      # file:line citations — the case's whole point: intermediate results
+      # staying out of context must not cost the model its citable locations.
+      - "close.go:"
+      - "release.go:"
+  - no_writes: true
+  - tool_calls_max: 30

@@ -1,6 +1,6 @@
 # run_code：脚本化工具编排 — 设计稿（供评审）
 
-> 状态：**Phase 0 spike 已完成（go，2026-11-16，见 §3.3 实测）；Phase 1 MVP 与 Phase 2 可见性/度量已实现**（Phase 1：`pkg/runcode` + `pkg/tools/dispatch.go` + `recordEditedFile` 转发 + `DEEPAI_RUN_CODE` 开关 + TUI 预览；Phase 2：`ParentID` 嵌套子事件 + TUI 缩进 + §7.3 指标 + 会话记录脚本原文），默认关，仅 CLI 主代理。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
+> 状态：**Phase 0 spike 已完成（go，2026-11-16，见 §3.3 实测）；Phase 1 MVP 与 Phase 2 可见性/度量已实现；Phase 3 harness 已实现**（A/B 双臂 + 三判据 compare + 三例非快乐路径 corpus），A/B 基线数据待真实模型跑出。默认关，仅 CLI 主代理。v2 响应 PR #45 评审（High ×2、Medium ×6、§12 四问已定），v3 响应复审（Medium ×3、Low ×1），见文末「修订记录」。日期 2026-11-16。
 > 目标：新增一个 `run_code` 工具，让模型用一段 JavaScript 在一次工具调用里编排多次现有工具调用（检索 → 过滤 → 读取 → 修改 → 验证），**只把脚本的返回值送回上下文**。
 > 不在本文范围：符号图 / callers-callees 索引（另立设计）、持久化 REPL 会话、多租户隔离。
 > 背景材料：一份关于 Claude Code Code Mode 的外部讨论记录（未入库）。本文只把它当作问题线索，方案按 deepai 现有代码重新推导；两者的差异见 §11。
@@ -423,13 +423,15 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
 **Phase 2 — 可见性与度量（已完成，2026-11-16）**
 嵌套子事件（`ParentID`）；§7.3 指标；会话记录里保存脚本原文便于复盘。
 
-**Phase 3 — 评估与扩展**
+**Phase 3 — 评估与扩展（harness 已实现，2026-11-16；A/B 基线数据待真实模型跑出）**
 - 在 `eval/` 选一组任务，A/B 对比开关：完成率、模型轮数、输入 token、墙钟。任务集**必须覆盖非快乐路径**：
   - 快乐路径：批量 rename、检索后过滤、改完跑测试
   - **写到一半失败**：脚本在第 k 次写入后失败，下一轮模型须根据 journal / `writes:` 正确恢复（不重复已完成的写，不遗漏未完成的）
   - **结论必须带 `file:line`**：检查模型是否因中间结果不在上下文而丢失可引用的位置
 - 默认开启的判据（评审已定，**三条同时满足**）：完成率不降；输入 token 下降 ≥ 25%；模型轮数不升
 - 按结果再单独决定：其他代理类型是否带 `run_code`；放进 `planToolNames`（只读集自动成立）；是否需要跨调用持久状态
+
+> **已实现（2026-11-16，harness 侧）**：A/B 双臂复用 `deepai eval agents` —— 臂 A 直接跑，臂 B 同门开关（`DEEPAI_RUN_CODE=1` / config `run_code:`）重跑同一 corpus；`run_code` 经 task 级工具选择器（`task.Config.Tools` 覆盖 `DefaultTools`，profile 列表 + `run_code`）注入被测子代理，**不改任何生产 AgentTypeConfig**。指纹在系统提示词之外叠加哈希 selected 工具名（run_code 不触发任何 gated 提示段，双臂提示词逐字节相同，不加工具名则 compare 会把真 A/B 误判为 unchanged）。`roleSummary` 新增 `completed_runs/completion_rate/avg_input_tokens/avg_llm_turns`（完成率 = dispatched 且断言全 pass；轮数与工具调用分布同分母，含超时样本）；`compare` 对指纹不同的真实 A/B 对输出三判据门（完成率 ≥ before、输入 token 降幅 ≥ 25%、轮数 ≤ before），A/A 对不渲染。新 corpus 三例（`eval/agent-cases/coder/`）：`filter-then-edit`（检索后过滤改名，排除同名诱饵）、`recover-midway`（读门失败后恢复，含前缀诱饵标识符）、`cite-file-line`（结论须带 `文件:行` 引用，no_writes）。墙钟走既有 avg-duration 门不重复设门。任务为工具中立措辞，两臂同一 fixture。
 
 ---
 
@@ -499,3 +501,4 @@ writes: edit_file pkg/tools/builtin/grep.go [completed]; bash "go test ./pkg/too
   - F1：影响栏与 §4.4 对齐为 `{status, text, data}`。
 - v4（2026-11-16）：Phase 0 spike 实测写回（§3.3：S1/S2/S4 通过、S3 按 watchdog 模式通过并记录 goroutine 泄漏与 GC 阻塞偏差、S5 +5.5 MiB；另记 qjs 库 use-after-free 与抢占缺失两个发现）；Phase 1 MVP 落地：`pkg/runcode`（engine/qjs/schedule/journal/convert/output/tool）、`pkg/tools/dispatch.go`、`runOneTool` 调用时注入、`recordEditedFile` 的 `edited_paths` 转发（位于 completed 检查之前）、`DEEPAI_RUN_CODE`/config `run_code:` 开关（仅 CLI 注册）、TUI 脚本预览与 `writes:` 行。
 - v5（2026-11-16）：Phase 2 落地：`pkg/tools/nested_event.go`（NestedToolEvent/NestedEventSink ctx 注入，与 WithDispatch 同模式）；journal 于 begin/finish/中断三点发射事件（中断由 Run 快照侧发射）；`ToolCallEvent.ParentID` + agent 适配器（runOneTool 内仅对 run_code 挂 sink，两条调度路径天然共用；interrupted → failed end + 说明）；TUI ParentID 分流缩进渲染、隔离 activeTools；§7.3 指标四字段入 ToolResultMetric；session `tool_result` 落库脚本原文（roundtrip 钉住）。
+- v6（2026-11-16）：Phase 3 harness 落地：`agent_eval_runcode.go`（arm 门控/选择器/指纹工具名分量/compare 三判据）；`runRecord.InputTokens`、`roleSummary` 四新字段与聚合；`dispatchEvalTask` 穿 task 级工具选择器；corpus +3 coder case（filter-then-edit / recover-midway / cite-file-line，覆盖设计要求的检索过滤、失败恢复、file:line 引用三类）。默认开启判据的最终判定待 A/B 基线数据。
