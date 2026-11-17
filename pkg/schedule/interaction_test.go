@@ -112,7 +112,7 @@ func TestAnswerTimeoutParamsFromMap(t *testing.T) {
 		"answer_timeout":    "8m",
 		"on_answer_timeout": "assume",
 		"max_auto_answers":  float64(4),
-	}, cfg)
+	}, cfg, "")
 	if err != nil {
 		t.Fatal(err)
 	}

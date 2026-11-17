@@ -17,8 +17,10 @@ func CreateInputFromMap(m map[string]any, cfg Config, sessionID, turnID string) 
 }
 
 // PatchFromMap decodes a partial update from a REST/WS body.
-func PatchFromMap(m map[string]any, cfg Config) (Patch, error) {
-	p, _, _, err := patchFromArgs(m, cfg)
+// PatchFromMap decodes a partial update. origTZ is the target schedule's own
+// timezone ("" when unknown); see patchFromArgs for the end_at precedence.
+func PatchFromMap(m map[string]any, cfg Config, origTZ string) (Patch, error) {
+	p, _, _, err := patchFromArgs(m, cfg, origTZ)
 	return p, err
 }
 

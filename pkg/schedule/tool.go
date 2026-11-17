@@ -153,22 +153,27 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 
 	case "update":
 		id := strArg(args, "id")
-		p, tr, tz, err := patchFromArgs(args, cfg)
+		// base is fetched BEFORE the patch: its Timezone feeds patchFromArgs'
+		// naive end_at interpretation (round-3 L1) and its Trigger/Name/Prompt
+		// feed the confirmation preview below.
+		base, err := svc.Get(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		if cfg.Confirm == "ask" && (p.Trigger != nil || p.Timezone != nil || p.Prompt != nil) && parentScheduleID == "" {
-			base, err := svc.Get(ctx, id)
-			if err != nil {
-				return nil, err
-			}
-			useTZ, useTR := base.Timezone, base.Trigger
-			if tz != nil {
-				useTZ = *tz
-			}
-			if tr != nil {
-				useTR = *tr
-			}
+		p, tr, tz, err := patchFromArgs(args, cfg, base.Timezone)
+		if err != nil {
+			return nil, err
+		}
+		useTZ, useTR := base.Timezone, base.Trigger
+		if tz != nil {
+			useTZ = *tz
+		}
+		if tr != nil {
+			useTR = *tr
+		}
+		// Only PERIODIC rules confirm (design §0, mirroring create): a once
+		// task's one-shot edit must not block the turn on a dialog.
+		if cfg.Confirm == "ask" && useTR.IsPeriodic() && (p.Trigger != nil || p.Timezone != nil || p.Prompt != nil) && parentScheduleID == "" {
 			v, err := svc.Validate(ctx, useTR, useTZ, 3)
 			if err != nil {
 				return nil, err
@@ -179,6 +184,16 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 			}
 			if err := confirm(ctx, cfg, "修改任务", base.Name, prompt, v); err != nil {
 				return nil, err
+			}
+			// Re-validate after the user took time to answer (mirror create):
+			// the rule's resolved form must reflect the confirmation moment,
+			// not the pre-dialog snapshot (round-3 L2).
+			v, err = svc.Validate(ctx, useTR, useTZ, 3)
+			if err != nil {
+				return nil, err
+			}
+			if p.Trigger != nil {
+				p.Trigger = &v.Trigger
 			}
 		}
 		sch, err := svc.Update(ctx, id, p)
@@ -268,7 +283,13 @@ func confirm(ctx context.Context, cfg Config, verb, name, prompt string, v Valid
 	timeout := cfg.ConfirmTimeout
 	askCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	answer, err := ui.AskQuestion(askCtx, question, []string{"确认创建", "取消"})
+	// The confirm button mirrors the action (round-3 L2): 「确认修改」 for an
+	// update dialog, 「确认创建」 otherwise — classifyConfirmation accepts both.
+	confirmLabel := "确认创建"
+	if strings.Contains(verb, "修改") {
+		confirmLabel = "确认修改"
+	}
+	answer, err := ui.AskQuestion(askCtx, question, []string{confirmLabel, "取消"})
 	if err != nil {
 		return NewError(CodeConfirmationMissing, "confirmation not received: %v", err)
 	}
@@ -295,7 +316,7 @@ func classifyConfirmation(answer string) (confirmed, denied bool) {
 	switch a {
 	case "取消", "cancel", "no", "n", "nope", "不用", "不要", "算了", "别创建":
 		return false, true
-	case "确认创建", "确认", "确定", "创建", "同意", "confirm", "yes", "y", "ok", "okay", "sure", "go ahead", "proceed":
+	case "确认创建", "确认修改", "确认", "确定", "创建", "同意", "confirm", "yes", "y", "ok", "okay", "sure", "go ahead", "proceed":
 		return true, false
 	}
 	for _, p := range []string{"取消", "不要创建", "不用创建", "别创建", "算了"} {
@@ -367,7 +388,12 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 	}, nil
 }
 
-func patchFromArgs(args map[string]any, cfg Config) (Patch, *Trigger, *string, error) {
+// patchFromArgs builds a Patch from tool/REST/WS arguments. origTZ is the
+// schedule's OWN timezone (empty when unknown): a naive end_at (no offset)
+// is interpreted patch-timezone-first, then in origTZ, and only then in the
+// global config default — the timezone of record is the Schedule's field
+// (design §3.3, round-3 L1).
+func patchFromArgs(args map[string]any, cfg Config, origTZ string) (Patch, *Trigger, *string, error) {
 	var p Patch
 	if v, ok := args["name"]; ok {
 		p.Name = ptrString(strArg(map[string]any{"v": v}, "v"))
@@ -400,7 +426,13 @@ func patchFromArgs(args map[string]any, cfg Config) (Patch, *Trigger, *string, e
 		if v == nil || strArg(map[string]any{"v": v}, "v") == "" {
 			p.ClearEndAt = true
 		} else {
-			tz := cfg.ConfiguredTimezone()
+			tz := origTZ
+			if p.Timezone != nil {
+				tz = *p.Timezone
+			}
+			if tz == "" {
+				tz = cfg.ConfiguredTimezone()
+			}
 			t, err := timeArg(v, tz)
 			if err != nil {
 				return p, p.Trigger, p.Timezone, err

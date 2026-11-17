@@ -823,7 +823,11 @@ func (s *Service) FireSlot(ctx context.Context, id string, slot time.Time) error
 			return err
 		}
 	}
-	if r.Status == RunPending {
+	// An overlap-queued run (QueuedReason set by the branch above) already
+	// knows an active run exists — tryStartLocked could only re-derive the
+	// same queued reason and rewrite the row it was just given (round-3 M1
+	// cleanup). Only runs that may actually start take the call.
+	if r.Status == RunPending && r.QueuedReason == "" {
 		s.tryStartLocked(ctx, r, v)
 	}
 	s.kickLocked()

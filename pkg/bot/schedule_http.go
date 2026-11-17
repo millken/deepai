@@ -151,7 +151,11 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	patch, err := schedule.PatchFromMap(body, svc.Config())
+	origTZ := ""
+	if cur, err := svc.Get(r.Context(), r.PathValue("id")); err == nil {
+		origTZ = cur.Timezone
+	}
+	patch, err := schedule.PatchFromMap(body, svc.Config(), origTZ)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -352,7 +356,11 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		sch, err := svc.Create(ctx, in)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "update_schedule":
-		patch, err := schedule.PatchFromMap(params, svc.Config())
+		origTZ := ""
+		if cur, err := svc.Get(ctx, id); err == nil {
+			origTZ = cur.Timezone
+		}
+		patch, err := schedule.PatchFromMap(params, svc.Config(), origTZ)
 		if err != nil {
 			return nil, true, err
 		}

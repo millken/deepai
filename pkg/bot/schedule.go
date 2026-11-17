@@ -21,7 +21,54 @@ func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
 	svc.SetObserver(&scheduleObserver{m: m, last: map[string]schedule.RunStatus{}})
 	d := NewScheduleDispatcher(m, svc)
 	svc.SetDispatcher(d)
+	go d.watchTurnEnd()
 	return d
+}
+
+// watchTurnEnd wakes TryStartPending whenever ANY session's turn ends
+// (design §4.1): a Run queued as session_busy behind a busy target session
+// starts the moment that turn finishes, instead of waiting for the
+// Scheduler's next timer sweep (up to maxWake = 1m away) — round-3 M1. The
+// Manager's global bus closes on shutdown, ending this loop; it is
+// deliberately NOT on d.wg because it persists nothing Wait must drain. A
+// lagged subscription re-subscribes from the last seen Seq: a missed
+// turn_end only delays the wake to the scheduler's periodic sweep, never
+// correctness.
+func (d *ScheduleDispatcher) watchTurnEnd() {
+	var since int64 = -1
+	for {
+		sub, backlog, gap := d.m.SubscribeAll(since)
+		if !gap {
+			for _, e := range backlog {
+				if e.Seq > since {
+					since = e.Seq
+				}
+				if e.Type == EventTurnEnd {
+					d.wakePending()
+				}
+			}
+		}
+		for e := range sub.C {
+			if e.Seq > since {
+				since = e.Seq
+			}
+			if e.Type == EventTurnEnd {
+				d.wakePending()
+			}
+		}
+		if !sub.Lagged() {
+			return // bus closed: shutdown
+		}
+	}
+}
+
+func (d *ScheduleDispatcher) wakePending() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.svc.TryStartPending(ctx); err != nil {
+		d.log.Warn("schedule: wake pending on turn_end", "err", err)
+	}
+	d.svc.Kick()
 }
 
 // scheduleObserver publishes schedule_* events on the global "*" bus. The
