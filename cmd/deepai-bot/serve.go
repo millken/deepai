@@ -16,6 +16,7 @@ import (
 
 	"github.com/millken/deepai/pkg/bot"
 	"github.com/millken/deepai/pkg/logs"
+	"github.com/millken/deepai/pkg/schedule"
 	"github.com/spf13/cobra"
 )
 
@@ -34,6 +35,7 @@ type serveFlags struct {
 	turnTimeout  time.Duration
 	idleTimeout  time.Duration
 	verbose      bool
+	noSchedule   bool
 }
 
 func newRootCmd() *cobra.Command {
@@ -90,6 +92,7 @@ func registerServeFlags(cmd *cobra.Command, f *serveFlags) {
 	fl.BoolVar(&f.noWeb, "no-web", false, "Do not serve the built-in web console")
 	fl.DurationVar(&f.turnTimeout, "turn-timeout", 0, "Abort a turn after this long (0 = no limit)")
 	fl.DurationVar(&f.idleTimeout, "idle-timeout", 30*time.Minute, "Unload a session after this long without activity")
+	fl.BoolVar(&f.noSchedule, "no-schedule", false, "Disable timed tasks (do not register the schedule tool or start the scheduler)")
 	fl.BoolVarP(&f.verbose, "verbose", "v", false, "Debug logging")
 }
 
@@ -122,10 +125,11 @@ func runServe(ctx context.Context, f serveFlags) error {
 	rtCtx, stopRuntime := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopRuntime()
 	rt, err := newBotRuntime(rtCtx, botOptions{
-		WorkDir:      f.workDir,
-		Model:        f.model,
-		MaxToolCalls: f.maxToolCalls,
-		Ephemeral:    f.ephemeral,
+		WorkDir:         f.workDir,
+		Model:           f.model,
+		MaxToolCalls:    f.maxToolCalls,
+		Ephemeral:       f.ephemeral,
+		DisableSchedule: f.noSchedule,
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -145,11 +149,29 @@ func runServe(ctx context.Context, f serveFlags) error {
 		return err
 	}
 
+	// The scheduler starts only after the Manager exists: Fire needs a
+	// Manager to Send a turn into a session.
+	var sched *schedule.Scheduler
+	var disp *bot.ScheduleDispatcher
+	if rt.Schedule != nil {
+		disp = bot.AttachSchedule(mgr, rt.Schedule)
+		var lease schedule.LeaseStore
+		if l, ok := rt.ScheduleStore.(schedule.LeaseStore); ok {
+			lease = l
+		}
+		sched = schedule.NewScheduler(rt.Schedule, disp, schedule.SchedulerOptions{Lease: lease})
+		if err := sched.Start(rtCtx); err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("start scheduler: %w", err)
+		}
+	}
+
 	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
 	defer cancelHandlers()
 	srv := &http.Server{
 		Handler: bot.NewServer(bot.ServerOptions{
 			Manager:        mgr,
+			Schedules:      rt.Schedule,
 			Token:          token,
 			AllowedOrigins: f.corsOrigins,
 			DisableWebUI:   f.noWeb,
@@ -167,7 +189,8 @@ func runServe(ctx context.Context, f serveFlags) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
-	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "db", rt.DB, "auth", token != "", "web", !f.noWeb)
+	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "db", rt.DB,
+		"auth", token != "", "web", !f.noWeb, "schedule", rt.Schedule != nil)
 	if !f.noWeb {
 		url := "http://" + displayAddr(addr) + "/"
 		if token != "" {
@@ -192,6 +215,15 @@ func runServe(ctx context.Context, f serveFlags) error {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
+	// Stop accepting new fires before cancelling turns, then let the
+	// turn_end callbacks write their final Run states before db.Close.
+	if sched != nil {
+		sctx, stopSched := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := sched.Stop(sctx); err != nil {
+			slog.Warn("scheduler shutdown", "err", err)
+		}
+		stopSched()
+	}
 	// Cancel running turns and let them persist before the streams that
 	// report them are torn down, so connected clients receive turn_end.
 	mctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -199,6 +231,13 @@ func runServe(ctx context.Context, f serveFlags) error {
 		slog.Warn("turns still running at shutdown", "err", err)
 	}
 	cancel()
+	if disp != nil {
+		wctx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := disp.Wait(wctx); err != nil {
+			slog.Warn("schedule run callbacks still pending at shutdown", "err", err)
+		}
+		cancelWait()
+	}
 	cancelHandlers()
 	<-shutdownDone
 	return nil

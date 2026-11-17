@@ -23,6 +23,7 @@ import (
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/tools"
 	"github.com/millken/deepai/pkg/tools/builtin"
@@ -40,6 +41,8 @@ type botOptions struct {
 	// Ephemeral keeps sessions in memory instead of bot.db, and disables
 	// long-term memory.
 	Ephemeral bool
+	// DisableSchedule turns off timed tasks for this process (--no-schedule).
+	DisableSchedule bool
 }
 
 // botRuntime is the agent side of deepai-bot, configured from
@@ -52,6 +55,10 @@ type botRuntime struct {
 	WorkDir string
 	// DB is the database path, empty when ephemeral.
 	DB string
+	// Schedule is nil when timed tasks are disabled.
+	Schedule       *schedule.Service
+	ScheduleStore  schedule.Store
+	ScheduleConfig schedule.Config
 	// Close releases MCP servers and the database. Call it after the
 	// bot.Manager has been closed.
 	Close func()
@@ -237,6 +244,7 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 
 	var store bot.Store
 	var dbPath string
+	var db *sql.DB
 	if opts.Ephemeral {
 		store = bot.NewMemoryStore()
 	} else {
@@ -250,7 +258,7 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		// _txlock=immediate and busy_timeout matter as they do for the CLI.
 		dbPath = botDB()
 		dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
-		db, err := sql.Open("sqlite", dsn)
+		db, err = sql.Open("sqlite", dsn)
 		if err != nil {
 			return nil, fmt.Errorf("open database: %w", err)
 		}
@@ -271,11 +279,29 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		rtCfg.MemoryExtractor = memClient
 	}
 
+	// Timed tasks live in the same bot.db (or in memory with --ephemeral).
+	// Only the bot registers the tool; the CLI never opens these tables.
+	schedCfg := scheduleConfig(cfg)
+	var schedSvc *schedule.Service
+	var schedStore schedule.Store
+	if !opts.DisableSchedule {
+		schedSvc, schedStore, schedCfg, err = newScheduleService(registry, cfg, db)
+		if err != nil {
+			return nil, err
+		}
+		if schedSvc != nil {
+			rtCfg.SystemPromptSuffix = func() string { return currentTimeNote(schedCfg) }
+		}
+	}
+
 	rt, err := bot.NewAgentRuntime(rtCfg)
 	if err != nil {
 		return nil, err
 	}
-	return &botRuntime{Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, Close: closeAll}, nil
+	return &botRuntime{
+		Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, Close: closeAll,
+		Schedule: schedSvc, ScheduleStore: schedStore, ScheduleConfig: schedCfg,
+	}, nil
 }
 
 // The helpers below mirror unexported counterparts in pkg/commands (the

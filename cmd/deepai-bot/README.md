@@ -36,8 +36,9 @@ deepai-bot token [--rotate]        # 查看/轮换访问令牌
 | `--ephemeral` | off | 会话只存内存，不写 `bot.db`、不用长期记忆 |
 | `--cors-origin` | — | 允许跨域访问的前端 origin（可重复，`*` 为任意） |
 | `--no-web` | off | 不提供内置 Web 控制台 |
+| `--no-schedule` | off | 关闭定时任务（不注册 `schedule` 工具、不启动调度器，接口返回 404） |
 
-文件位置：`~/.deepai/bot/bot.db`（会话与长期记忆）、`bot.json`（运行状态）、`bot.log`（`start` 模式日志）、`token`、`sandbox/`。
+文件位置：`~/.deepai/bot/bot.db`（会话、长期记忆和定时任务）、`bot.json`（运行状态）、`bot.log`（`start` 模式日志）、`token`、`sandbox/`。
 
 ## 快速调用
 
@@ -57,6 +58,45 @@ curl -s -H "$H" -H 'Content-Type: application/json' \
 # 断线后续传
 curl -N -H "$H" "$B/v1/sessions/$SID/events?since=42"
 ```
+
+## 定时任务
+
+`deepai-bot` 常驻时会注册一个 `schedule` 工具，模型可以自己创建一次性 / 周期任务；每个触发就是往某个会话里发一条消息、跑一个普通 turn，执行过程用现有的会话事件流观看。设计见 [`docs/BOT_SCHEDULER_DESIGN.md`](../../docs/BOT_SCHEDULER_DESIGN.md)。
+
+```yaml
+# ~/.deepai/config.yaml（缺省值即下列值）
+schedule:
+  enabled: true
+  timezone: Asia/Taipei     # 缺省 = 系统时区
+  confirm: ask              # 交互轮次里创建周期任务需用户确认；auto = 直接生效
+  min_interval: 5m
+  max_concurrent_runs: 2
+  max_schedules: 50
+  default_timeout: 30m            # 单次执行的时长上限（等待回答时不计时）
+  default_answer_timeout: 30m     # 无人值守时每个提问的等待上限
+  default_max_auto_answers: 3     # 单次运行最多自动回答几次
+```
+
+```bash
+# 用户直接创建（不走确认）
+curl -s -H "$H" -H 'Content-Type: application/json' \
+  -d '{"name":"检查 CI","prompt":"查看最近一次 CI 结果并总结","trigger":{"type":"once","in":"2h"},"timezone":"UTC"}' \
+  $B/v1/schedules | jq .
+
+curl -s -H "$H" "$B/v1/schedules?state=active" | jq .        # 列表
+curl -s -X POST -H "$H" $B/v1/schedules/sch_xxx/run | jq .    # 立即跑一次
+curl -N -H "$H" "$B/v1/events?since=0"                        # 全局 schedule_* 事件
+```
+
+WS ops 为 `list_schedules` / `create_schedule` / `pause_schedule` / `run_schedule` / `cancel_run` 等，参数放在 `params`，id 放 `schedule_id` / `run_id`。拿到 `run.session_id` 后订阅该会话即可看执行过程。P1 只支持 `once` 与 `interval`，`cron` 会返回 `trigger_not_supported`。
+
+任务可带 `answer_timeout`、`on_answer_timeout`（`assume` 默认 / `fail`）、`max_auto_answers`、`max_tool_calls`、`timeout`。定时 turn 里模型调用 `ask_clarification` 时：
+
+- Run 转为 `waiting_input`，全局流发 `schedule_run_updated`，**执行时钟暂停**（不会把等人的时间算成 `timed_out`）；会话流照常发 `question`，可用现有的 `/answer` 或 WS `answer` 回答。
+- `answer_timeout` 内无人回答且策略为 `assume`、自动回答次数没用完时，bot 自动回答「请按最合理的假设继续……」，`question_answered` 事件带 `auto: true`，Run 的 `auto_answers` 加一并回到 `running`。
+- 策略为 `fail` 或次数用尽时，以 `cancel_source=scheduler` 取消 turn，Run 记 `failed`（`error_code=answer_timeout`）。客户端主动 `cancel_run` 则记 `cancelled`。
+
+`turn_end` 现在带 `cancel_source`（`client` / `shutdown` / `scheduler`），调度器据此区分主动取消、bot 关闭与超时失败。
 
 ## 交给 systemd 管理
 

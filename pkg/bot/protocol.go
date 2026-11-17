@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/subagent"
 )
 
@@ -33,6 +34,15 @@ const (
 	EventAnswered       EventType = "question_answered"
 	EventError          EventType = "error"
 	EventTurnEnd        EventType = "turn_end"
+
+	// Global schedule_* events (docs/BOT_SCHEDULER_DESIGN.md §9.1). They
+	// travel on the "*" bus; the execution itself stays on the session bus.
+	EventScheduleCreated     EventType = "schedule_created"
+	EventScheduleUpdated     EventType = "schedule_updated"
+	EventScheduleDeleted     EventType = "schedule_deleted"
+	EventScheduleRunStarted  EventType = "schedule_run_started"
+	EventScheduleRunUpdated  EventType = "schedule_run_updated"
+	EventScheduleRunFinished EventType = "schedule_run_finished"
 
 	// EventGap (seq 0) tells a client that events it asked for were evicted
 	// from the replay buffer or that it fell behind: reload the session
@@ -62,6 +72,8 @@ type Event struct {
 	Error    *agent.AgentError    `json:"error,omitempty"`
 	Turn     *TurnSummary         `json:"turn,omitempty"`
 	Session  *SessionInfo         `json:"session,omitempty"`
+	Schedule *schedule.Schedule   `json:"schedule,omitempty"`
+	Run      *schedule.Run        `json:"run,omitempty"`
 }
 
 // Question is an ask_clarification call waiting for a client to answer it.
@@ -70,6 +82,9 @@ type Question struct {
 	Text    string   `json:"text"`
 	Options []string `json:"options,omitempty"`
 	Answer  string   `json:"answer,omitempty"`
+	// Auto is true when the bot answered on the user's behalf because the
+	// scheduled run's answer_timeout elapsed (design §7.1).
+	Auto bool `json:"auto,omitempty"`
 }
 
 // TurnStatus is how a turn ended.
@@ -97,6 +112,9 @@ type TurnSummary struct {
 	LLMTurns    int          `json:"llm_turns"`
 	StartedAt   time.Time    `json:"started_at"`
 	EndedAt     time.Time    `json:"ended_at"`
+	// CancelSource is "client" | "shutdown" | "scheduler" for cancelled
+	// turns (design §3.2); the schedule Dispatcher maps it onto Run states.
+	CancelSource string `json:"cancel_source,omitempty"`
 }
 
 // SessionStatus is whether a session is currently running a turn.

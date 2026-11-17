@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/tools"
 )
 
 var (
@@ -88,11 +89,14 @@ type session struct {
 }
 
 type activeTurn struct {
-	id        string
-	cancel    context.CancelFunc
-	done      chan struct{}
-	summary   *TurnSummary
-	questions map[string]*pendingQuestion
+	id           string
+	cancel       context.CancelFunc
+	clock        *turnClock
+	hooks        turnHooks
+	maxToolCalls int
+	done         chan struct{}
+	summary      *TurnSummary
+	questions    map[string]*pendingQuestion
 }
 
 type pendingQuestion struct {
@@ -116,14 +120,16 @@ func NewManager(opts Options) (*Manager, error) {
 		log = slog.Default()
 	}
 	host, _ := os.Hostname()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	m := &Manager{
 		opts:      opts,
 		log:       log,
 		owner:     models.LockOwner{PID: os.Getpid(), Host: host},
 		startedAt: time.Now().UTC(),
 		baseCtx:   ctx,
-		cancelAll: cancel,
+		// The cause propagates to every turn's context, so turn_end can
+		// report cancel_source=shutdown (design §3.2).
+		cancelAll: func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
 		global:    newBus(opts.ReplayEvents),
 		sessions:  map[string]*session{},
 		seqFloor:  map[string]int64{},
@@ -297,9 +303,32 @@ func (t *Turn) Summary() *TurnSummary {
 	}
 }
 
+// SendOptions is the internal counterpart of SendRequest. Transports do not
+// expose it: only the schedule Dispatcher uses it to tag a turn as a
+// scheduled run (metadata for client rendering + ctx values for tools).
+type SendOptions struct {
+	Metadata   map[string]string
+	ScheduleID string
+	RunID      string
+	// Timeout is a per-turn execution budget. 0 means "use --turn-timeout";
+	// the effective budget is min(Timeout, --turn-timeout) when both are set
+	// (design §7.2). The clock pauses while the turn waits for an answer.
+	Timeout time.Duration
+	// MaxToolCalls overrides the bot-wide limit for this turn only.
+	MaxToolCalls int
+	// Hooks observes questions; scheduled turns use it for waiting_input /
+	// answer_timeout. It is deliberately unexported: transports must not set it.
+	Hooks turnHooks
+}
+
 // Send starts a turn and returns without waiting for it. Follow it with the
 // returned handle or a subscription.
 func (m *Manager) Send(id string, req SendRequest) (*Turn, error) {
+	return m.SendWithOptions(id, req, SendOptions{})
+}
+
+// SendWithOptions starts a turn with internal metadata (scheduled runs).
+func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) (*Turn, error) {
 	content := strings.TrimSpace(req.Content)
 	if content == "" {
 		return nil, ErrEmptyMessage
@@ -353,19 +382,22 @@ func (m *Manager) Send(id string, req SendRequest) (*Turn, error) {
 			return nil, err
 		}
 	}
-	var ctx context.Context
-	var cancel context.CancelFunc
-	if m.opts.TurnTimeout > 0 {
-		ctx, cancel = context.WithTimeout(m.baseCtx, m.opts.TurnTimeout)
-	} else {
-		ctx, cancel = context.WithCancel(m.baseCtx)
+	budget := opts.Timeout
+	if m.opts.TurnTimeout > 0 && (budget <= 0 || m.opts.TurnTimeout < budget) {
+		budget = m.opts.TurnTimeout
 	}
+	ctx, clock := newTurnClock(m.baseCtx, budget)
 	t := &activeTurn{
-		id:        "turn_" + randomHex(6),
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		questions: map[string]*pendingQuestion{},
+		id:           "turn_" + randomHex(6),
+		cancel:       clock.cancelPlain,
+		clock:        clock,
+		hooks:        opts.Hooks,
+		maxToolCalls: opts.MaxToolCalls,
+		done:         make(chan struct{}),
+		questions:    map[string]*pendingQuestion{},
 	}
+	ctx = tools.WithScheduleRun(ctx, opts.ScheduleID, opts.RunID)
+	ctx = tools.WithTurnID(ctx, t.id)
 	s.turn = t
 	s.lastUsed = time.Now().UTC()
 	userMsg := models.Message{
@@ -373,6 +405,7 @@ func (m *Manager) Send(id string, req SendRequest) (*Turn, error) {
 		SessionID: id,
 		Role:      models.RoleHuman,
 		Content:   content,
+		Metadata:  opts.Metadata,
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := m.opts.Store.AppendMessage(id, userMsg); err != nil {
@@ -394,10 +427,24 @@ func (m *Manager) Send(id string, req SendRequest) (*Turn, error) {
 	return &Turn{ID: t.id, t: t}, nil
 }
 
+// Closing reports whether Close has begun. The schedule Dispatcher uses it
+// to distinguish a shutdown cancellation from a deliberate client cancel.
+func (m *Manager) Closing() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
 // Cancel interrupts the session's running turn. The turn still ends with a
 // turn_end event (status "cancelled") once the agent has unwound and its
 // partial progress is persisted.
 func (m *Manager) Cancel(id string) error {
+	return m.cancelWithSource(id, cancelSourceClient)
+}
+
+// cancelWithSource lets the schedule Dispatcher attribute a cancellation to
+// the scheduler (answer_timeout / overlap=replace) instead of a client.
+func (m *Manager) cancelWithSource(id string, src cancelSource) error {
 	s, err := m.load(id)
 	if err != nil {
 		return err
@@ -408,18 +455,26 @@ func (m *Manager) Cancel(id string) error {
 	if t == nil {
 		return ErrNotRunning
 	}
-	t.cancel()
+	t.clock.CancelWithSource(src)
 	return nil
 }
 
 // Answer resolves a pending ask_clarification question.
 func (m *Manager) Answer(id, questionID, answer string) error {
+	return m.answer(id, questionID, answer, false)
+}
+
+// answerAuto resolves a question on behalf of the bot (unattended runs).
+func (m *Manager) answerAuto(id, questionID, answer string) error {
+	return m.answer(id, questionID, answer, true)
+}
+
+func (m *Manager) answer(id, questionID, answer string, auto bool) error {
 	s, err := m.load(id)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	t := s.turn
 	var pq *pendingQuestion
 	if t != nil {
@@ -427,12 +482,18 @@ func (m *Manager) Answer(id, questionID, answer string) error {
 		delete(t.questions, questionID)
 	}
 	if pq == nil {
+		s.mu.Unlock()
 		return ErrUnknownQuestion
 	}
 	pq.answer <- answer
 	q := pq.q
-	q.Answer = answer
+	q.Answer, q.Auto = answer, auto
 	s.bus.publish(Event{SessionID: id, TurnID: t.id, Type: EventAnswered, Question: &q})
+	hooks := t.hooks
+	s.mu.Unlock()
+	if hooks != nil {
+		hooks.QuestionSettled(questionID, answer, auto)
+	}
 	return nil
 }
 
@@ -526,13 +587,17 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		}
 	}
 	out, runErr := conv.RunTurn(ctx, TurnInput{
-		SessionID:   s.id,
-		TurnID:      t.id,
-		Model:       model,
-		Messages:    history,
-		Emit:        emit,
-		Interaction: &turnInteraction{m: m, s: s, t: t},
+		SessionID:    s.id,
+		TurnID:       t.id,
+		Model:        model,
+		Messages:     history,
+		Emit:         emit,
+		Interaction:  &turnInteraction{m: m, s: s, t: t},
+		MaxToolCalls: t.maxToolCalls,
 	})
+	if t.hooks != nil {
+		t.hooks.TurnEnded()
+	}
 
 	summary := &TurnSummary{ID: t.id, Status: TurnCompleted, Model: model, StartedAt: started}
 	if out != nil {
@@ -541,13 +606,23 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		summary.ToolCalls = out.ToolCalls
 		summary.LLMTurns = out.LLMTurns
 	}
+	// A pausable clock cancels the context with a cause; ctx.Err() is always
+	// context.Canceled, so the status comes from context.Cause (design §7.2).
+	cause := context.Cause(ctx)
 	switch {
+	case errors.Is(cause, context.DeadlineExceeded):
+		summary.Status = TurnTimedOut
+		summary.Error = "turn exceeded its execution budget"
+		if runErr != nil {
+			summary.Error = runErr.Error()
+		}
 	case runErr == nil:
-	case errors.Is(ctx.Err(), context.Canceled):
-		summary.Status = TurnCancelled
-	case errors.Is(ctx.Err(), context.DeadlineExceeded), errors.Is(runErr, context.DeadlineExceeded):
+	case errors.Is(runErr, context.DeadlineExceeded):
 		summary.Status = TurnTimedOut
 		summary.Error = runErr.Error()
+	case errors.Is(cause, context.Canceled), errors.Is(runErr, context.Canceled):
+		summary.Status = TurnCancelled
+		summary.CancelSource = stopSource(ctx)
 	default:
 		summary.Status = TurnFailed
 		summary.Error = runErr.Error()
@@ -798,8 +873,16 @@ func (ti *turnInteraction) AskQuestion(ctx context.Context, question string, opt
 	}
 	ti.t.questions[pq.q.ID] = pq
 	q := pq.q
+	// Freeze the execution budget before the question reaches clients: any
+	// unanswered question keeps the clock paused (reference counted).
+	ti.t.clock.Pause()
 	ti.s.bus.publish(Event{SessionID: ti.s.id, TurnID: ti.t.id, Type: EventQuestion, Question: &q})
+	hooks := ti.t.hooks
 	ti.s.mu.Unlock()
+	if hooks != nil {
+		hooks.QuestionAsked(q)
+	}
+	defer ti.t.clock.Resume()
 
 	select {
 	case ans, ok := <-pq.answer:
@@ -811,6 +894,9 @@ func (ti *turnInteraction) AskQuestion(ctx context.Context, question string, opt
 		ti.s.mu.Lock()
 		delete(ti.t.questions, pq.q.ID)
 		ti.s.mu.Unlock()
+		if hooks != nil {
+			hooks.QuestionSettled(pq.q.ID, "", false)
+		}
 		return "", ctx.Err()
 	}
 }
