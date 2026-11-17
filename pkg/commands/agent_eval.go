@@ -46,6 +46,7 @@ import (
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/runcode"
 	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
@@ -141,6 +142,10 @@ func runEvalAgentsCmd(ctx context.Context, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Phase 3 A/B: the arm rides the same gate as CLI registration
+	// (DEEPAI_RUN_CODE / config run_code:) — arm A is a plain run, arm B is
+	// the same corpus re-run with the gate on.
+	opts.RunCodeArm = evalRunCodeArm(cfg)
 	modelRegistry, modelAlias, err := buildEvalModelRegistry(cfg, agentEvalFlags.Model)
 	if err != nil {
 		return err
@@ -341,8 +346,14 @@ func newEvalToolRegistry(cfg Config) *tools.Registry {
 // compute the restricted tool set a real dispatched subagent would get —
 // see resolveEvalSubagentPrompt) so the two can never silently diverge on
 // what a case's agent_type has to select from.
+// run_code joins the candidates only when the Phase 3 arm gate is on
+// (evalRunCodeArm: DEEPAI_RUN_CODE / config run_code:) — the dispatch
+// registry, the assembled prompt and the fingerprint all move together.
 func evalToolCandidates(cfg Config) []models.Tool {
 	out := []models.Tool{builtin.BashTool(), clarification.AskClarificationToolWithMode(cfg.IsAutonomous())}
+	if evalRunCodeArm(cfg) {
+		out = append(out, runcode.RunCodeTool())
+	}
 	return append(out, builtin.FileTools()...)
 }
 
@@ -677,6 +688,15 @@ type evalOptions struct {
 	OutDir   string
 	Budget   int
 	Timeout  time.Duration
+	// RunCodeArm turns every case's dispatch into the Phase 3 B arm:
+	// per-agent-type selectors (DefaultTools + run_code) computed in
+	// runEvalCases via armToolSelectors.
+	RunCodeArm bool
+	// ToolSelectors, when non-nil, overrides each dispatched subagent's
+	// tool selection (task.Config.Tools > DefaultTools). Phase 3's B arm
+	// sets it to the profile's DefaultTools + run_code (armToolSelectors) so
+	// run_code reaches the subagent without touching production config.
+	ToolSelectors []string
 }
 
 type assertionResult struct {
@@ -694,6 +714,7 @@ type runRecord struct {
 	Assertions     []assertionResult `json:"assertions"`
 	Output         string            `json:"output"`
 	Tokens         int               `json:"tokens"`
+	InputTokens    int               `json:"input_tokens"` // provider prompt tokens; run_code's Phase 3 input-token gate reads this, not the total
 	DurationMS     int64             `json:"duration_ms"`
 	WriteViolation bool              `json:"write_violation"`
 	// NoWritesDeclared records whether THIS case's manifest actually
@@ -730,6 +751,12 @@ type runRecord struct {
 	// the tool-call distribution: unlike duration/tokens, a timed-out run
 	// with recovered stats DOES count there.
 	HasStats bool `json:"has_stats"`
+	// RunCodeArm records which Phase 3 arm produced this run (PR #48 review
+	// M5): the completion/token/turns gates must key on this EXPLICIT marker,
+	// not on a fingerprint diff — a prompt change between two unarmed runs
+	// also changes the fingerprint and must never be judged as a run_code
+	// A->B decision.
+	RunCodeArm bool `json:"run_code_arm"`
 }
 
 // runEvalCases runs every case × opts.Runs sequentially — cases and runs
@@ -754,15 +781,27 @@ type runRecord struct {
 func runEvalCases(ctx context.Context, pool evalTaskPool, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry, cases []evalCase, opts evalOptions, onRun func(runRecord) error) ([]runRecord, error) {
 	var records []runRecord
 	for _, c := range cases {
-		fingerprint, err := caseFingerprint(c.Manifest.AgentType, repoRoot, evalTools, skillReg)
+		caseOpts := opts
+		if opts.RunCodeArm {
+			selectors, err := armToolSelectors(c.Manifest.AgentType, repoRoot, true)
+			if err != nil {
+				// Fail loud (PR #48 review): a silent nil here would run an
+				// unarmed B arm whose fingerprint equals A's, and the
+				// default-on criteria would be skipped unnoticed.
+				return records, fmt.Errorf("case %s/%s: %w", c.AgentType, c.ID, err)
+			}
+			caseOpts.ToolSelectors = selectors
+		}
+		fingerprint, err := caseFingerprint(c.Manifest.AgentType, repoRoot, evalTools, skillReg, caseOpts.ToolSelectors)
 		if err != nil {
 			return records, fmt.Errorf("case %s/%s: fingerprint: %w", c.AgentType, c.ID, err)
 		}
 		for run := 1; run <= opts.Runs; run++ {
-			rec, err := runOneCase(ctx, pool, c, run, fingerprint, opts)
+			rec, err := runOneCase(ctx, pool, c, run, fingerprint, caseOpts)
 			if err != nil {
 				return records, fmt.Errorf("case %s/%s run %d: %w", c.AgentType, c.ID, run, err)
 			}
+			rec.RunCodeArm = caseOpts.RunCodeArm
 			records = append(records, rec)
 			if onRun != nil {
 				if err := onRun(rec); err != nil {
@@ -855,7 +894,7 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 		dispatchCtx, dispatchCancel = context.WithTimeout(ctx, opts.Timeout)
 		waitCtx, waitCancel = context.WithTimeout(ctx, opts.Timeout+evalWaitGrace(opts.Timeout))
 	}
-	task, dispatchErr := dispatchEvalTask(dispatchCtx, waitCtx, pool, c, contextFiles, opts.Budget)
+	task, dispatchErr := dispatchEvalTask(dispatchCtx, waitCtx, pool, c, contextFiles, opts.Budget, opts)
 	if dispatchCancel != nil {
 		dispatchCancel()
 	}
@@ -945,6 +984,10 @@ func runOneCase(ctx context.Context, pool evalTaskPool, c evalCase, run int, fin
 	rec.Output = task.Result
 	if task.Usage != nil {
 		rec.Tokens = task.Usage.TotalTokens
+		// Phase 3's token gate judges INPUT tokens (run_code's whole point is
+		// keeping intermediate results out of the prompt), so the provider's
+		// own prompt-token figure is recorded alongside the total.
+		rec.InputTokens = task.Usage.PromptTokens
 	}
 	applyRunStats(&rec, task.Stats)
 	rec.Assertions = evaluateCase(c.Manifest, task.Result, task.Stats, task.Usage, rec.WriteViolation, changed, worktree)
@@ -1022,7 +1065,7 @@ func evalWaitGrace(timeout time.Duration) time.Duration {
 // the M6 wall-clock grace on top, so a subagent that gracefully wraps up a
 // little past startCtx's deadline is still waited out instead of being
 // reported as a dispatch timeout.
-func dispatchEvalTask(startCtx, waitCtx context.Context, pool evalTaskPool, c evalCase, contextFiles []string, budget int) (task *subagent.Task, err error) {
+func dispatchEvalTask(startCtx, waitCtx context.Context, pool evalTaskPool, c evalCase, contextFiles []string, budget int, opts evalOptions) (task *subagent.Task, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic dispatching case %s/%s: %v", c.AgentType, c.ID, r)
@@ -1032,6 +1075,7 @@ func dispatchEvalTask(startCtx, waitCtx context.Context, pool evalTaskPool, c ev
 		AgentType:    c.Manifest.AgentType,
 		ContextFiles: contextFiles,
 		TokenBudget:  budget,
+		Tools:        opts.ToolSelectors,
 	})
 	if startErr != nil {
 		return nil, startErr
@@ -1526,7 +1570,7 @@ func toStringSlice(v any) []string {
 // pre-existing policy (see the M5-2/M5-3 history) of never letting a broken
 // project override in the corpus silently fingerprint the wrong (fallback)
 // prompt.
-func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry) (string, error) {
+func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry, extraSelectors []string) (string, error) {
 	at := agent.AgentType(agentType)
 	profileCfg, problems, typeResolved := agent.ResolveAgentTypeConfig(at, repoRoot, nil)
 	if !typeResolved {
@@ -1542,7 +1586,14 @@ func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.To
 	}
 	base = agent.AppendOutputSchemaPrompt(base, profileCfg.OutputSchema)
 
-	selected, err := agent.SelectSubagentTools(evalTools, profileCfg.DefaultTools)
+	selectors := profileCfg.DefaultTools
+	if extraSelectors != nil {
+		// Phase 3 B arm: task.Config.Tools (the eval's armToolSelectors)
+		// overrides the profile list — mirroring SubagentExecutor.Execute's
+		// task.Config.Tools > DefaultTools precedence.
+		selectors = extraSelectors
+	}
+	selected, err := agent.SelectSubagentTools(evalTools, selectors)
 	if err != nil {
 		return "", err
 	}
@@ -1599,12 +1650,22 @@ func resolveEvalSubagentPrompt(agentType, repoRoot string, evalTools []models.To
 // matching — see this function's own doc comment above for why: an
 // approximate fingerprint is worse than an honestly-narrow one that changes
 // when it should.
-func caseFingerprint(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry) (string, error) {
-	prompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg)
+func caseFingerprint(agentType, repoRoot string, evalTools []models.Tool, skillReg *skill.Registry, extraSelectors []string) (string, error) {
+	prompt, err := resolveEvalSubagentPrompt(agentType, repoRoot, evalTools, skillReg, extraSelectors)
 	if err != nil {
 		return "", err
 	}
-	return computeFingerprint(prompt), nil
+	// Hash the SELECTED tool names alongside the prompt: run_code changes
+	// the toolset without changing any prompt byte (none of the gated
+	// sections fire for it), so prompt-only hashing would call a real A/B
+	// pair "fingerprint unchanged" (Phase 3).
+	h := sha256.New()
+	h.Write([]byte(prompt))
+	for _, n := range fingerprintToolNames(agentType, repoRoot, evalTools, extraSelectors) {
+		h.Write([]byte(n))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8], nil
 }
 
 // computeFingerprint hashes the FULL assembled system prompt string (see
@@ -1623,11 +1684,14 @@ func computeFingerprint(systemPrompt string) string {
 // ---------------------------------------------------------------------------
 
 type roleSummary struct {
-	AgentType      string `json:"agent_type"`
-	Fingerprint    string `json:"fingerprint"`
-	Cases          int    `json:"cases"`
-	Runs           int    `json:"runs"`
-	DispatchedRuns int    `json:"dispatched_runs"`
+	AgentType   string `json:"agent_type"`
+	Fingerprint string `json:"fingerprint"`
+	// RunCodeArm derives from this role's records: true when ANY run in the
+	// role carried the arm marker (see runRecord.RunCodeArm).
+	RunCodeArm     bool `json:"run_code_arm"`
+	Cases          int  `json:"cases"`
+	Runs           int  `json:"runs"`
+	DispatchedRuns int  `json:"dispatched_runs"`
 	// AssertionPassRate/Fail/Skip are diagnostic only (see
 	// docs/AGENT_CAPABILITY_DESIGN.md §8's "废弃‘整体断言通过率’作为达标线"):
 	// reported for continuity with the M5-2 baseline, no longer a gate.
@@ -1683,6 +1747,14 @@ type roleSummary struct {
 	// "dispatched=0, budget exhausted=3" and cannot tell whether that's 3/3
 	// or 3/30 — DispatchedRuns is the wrong denominator for these three
 	// fields (see above), so it has to be reported separately.
+	// Phase 3 (run_code default-on criteria): completion = dispatched runs
+	// whose assertions ALL passed; AvgInputTokens over dispatched runs;
+	// AvgLLMTurns over HasStats runs (timeouts included — same denominator
+	// as ToolCallsP50, see above).
+	CompletedRuns       int     `json:"completed_runs"`
+	CompletionRate      float64 `json:"completion_rate"`
+	AvgInputTokens      float64 `json:"avg_input_tokens"`
+	AvgLLMTurns         float64 `json:"avg_llm_turns"`
 	StatsRuns           int     `json:"stats_runs"`
 	ToolCallsP50        float64 `json:"tool_calls_p50"`
 	ToolCallsMax        int     `json:"tool_calls_max"`
@@ -1690,11 +1762,15 @@ type roleSummary struct {
 }
 
 type evalSummary struct {
-	GeneratedAt string        `json:"generated_at"`
-	Model       string        `json:"model"`
-	Runs        int           `json:"runs"`
-	Timeout     string        `json:"timeout"`
-	Roles       []roleSummary `json:"roles"`
+	GeneratedAt string `json:"generated_at"`
+	Model       string `json:"model"`
+	Runs        int    `json:"runs"`
+	Timeout     string `json:"timeout"`
+	// RunCodeArm: true when any record carried the Phase 3 B-arm marker —
+	// compare gates the run_code default-on criteria on the arm pair
+	// (!before.RunCodeArm && after.RunCodeArm), never on fingerprint diff.
+	RunCodeArm bool          `json:"run_code_arm"`
+	Roles      []roleSummary `json:"roles"`
 }
 
 // buildEvalSummary aggregates records into one roleSummary per agent_type.
@@ -1749,15 +1825,28 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		var guardFail int
 		var fileEditFail int
 		var tokensSum, durationSum float64
+		var inputTokensSum float64
+		var inputTokensRuns int
+		var completedRuns int
+		var attemptedRuns int
+		var llmTurnsSamples []int
 		var toolCallsSamples []int
 		var budgetExhaustedRuns int
+		roleArm := false
 		for _, r := range recs {
 			caseSet[r.Case] = true
+			if r.RunCodeArm {
+				roleArm = true
+			}
 			// Collected unconditionally on r.HasStats, ahead of the
 			// dispatch-error continue below — see the function doc for why
 			// the tool-call distribution deliberately does NOT exclude a
 			// timeout the way duration/tokens/assertions do.
 			if r.HasStats {
+				// LLM turns share the tool-call distribution's denominator (every
+				// HasStats record, timeouts included): a run cut off mid-work is
+				// exactly the right-tail sample the Phase 3 turns gate needs.
+				llmTurnsSamples = append(llmTurnsSamples, r.LLMTurns)
 				toolCallsSamples = append(toolCallsSamples, r.ToolCalls)
 				if r.BudgetExhausted {
 					budgetExhaustedRuns++
@@ -1765,9 +1854,16 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 			if r.Error != "" {
 				rs.DispatchErrors++
+				// H1 (PR #48 review): an errored run is an INCOMPLETE run. It must
+				// stay in the completion-rate denominator — arm B turning assertion
+				// failures into agent errors would otherwise shrink the denominator
+				// and RAISE CompletionRate while the gate stays blind. attemptedRuns
+				// (dispatched + errored) is that denominator.
+				attemptedRuns++
 				continue // see the function doc: a timeout contributes nothing else
 			}
 			rs.DispatchedRuns++
+			attemptedRuns++
 			// Gated on r.NoWritesDeclared: a write_violation only counts as
 			// a no_writes VIOLATION for a case whose manifest actually
 			// declares no_writes: true. A batch-editing case (coder/*) sets
@@ -1779,6 +1875,25 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 			tokensSum += float64(r.Tokens)
 			durationSum += float64(r.DurationMS)
+			// M3: only runs whose provider actually reported input tokens feed
+			// the average — a zero-usage sample would deflate it and bias the
+			// "-25%" gate toward a free pass.
+			if r.InputTokens > 0 {
+				inputTokensSum += float64(r.InputTokens)
+				inputTokensRuns++
+			}
+			// Phase 3 完成率：一个 dispatched run 仅当其所有断言全部 pass 才算
+			// completed（fail 任何一个即非 completed；skipped 不影响）。
+			runClean := true
+			for _, a := range r.Assertions {
+				if a.Status == "fail" {
+					runClean = false
+					break
+				}
+			}
+			if runClean {
+				completedRuns++
+			}
 
 			for _, a := range r.Assertions {
 				switch a.Status {
@@ -1814,6 +1929,7 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			}
 		}
 		rs.Cases = len(caseSet)
+		rs.RunCodeArm = roleArm
 		rs.AssertionPassRate = ratio(totalPass, totalPass+totalFail)
 		rs.AssertionFailRate = ratio(totalFail, totalPass+totalFail)
 		rs.AssertionSkipRate = ratio(totalSkip, totalPass+totalFail+totalSkip)
@@ -1827,6 +1943,18 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 			rs.AvgTokens = tokensSum / float64(rs.DispatchedRuns)
 			rs.AvgDurationMS = durationSum / float64(rs.DispatchedRuns)
 		}
+		rs.CompletedRuns = completedRuns
+		rs.CompletionRate = ratio(completedRuns, attemptedRuns)
+		if inputTokensRuns > 0 {
+			rs.AvgInputTokens = inputTokensSum / float64(inputTokensRuns)
+		}
+		if len(llmTurnsSamples) > 0 {
+			var turnSum float64
+			for _, v := range llmTurnsSamples {
+				turnSum += float64(v)
+			}
+			rs.AvgLLMTurns = turnSum / float64(len(llmTurnsSamples))
+		}
 		rs.StatsRuns = len(toolCallsSamples)
 		rs.ToolCallsP50 = medianInt(toolCallsSamples)
 		if len(toolCallsSamples) > 0 {
@@ -1836,11 +1964,19 @@ func buildEvalSummary(model string, runs int, timeout string, records []runRecor
 		roles = append(roles, rs)
 	}
 
+	anyArm := false
+	for _, r := range roles {
+		if r.RunCodeArm {
+			anyArm = true
+			break
+		}
+	}
 	return evalSummary{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Model:       model,
 		Runs:        runs,
 		Timeout:     timeout,
+		RunCodeArm:  anyArm,
 		Roles:       roles,
 	}
 }
@@ -2212,6 +2348,17 @@ func renderEvalCompare(before, after evalSummary) (string, error) {
 			fmt.Fprintf(&b, "  avg tokens: %.0f -> %.0f\n", bRole.AvgTokens, a.AvgTokens)
 		}
 		fmt.Fprintf(&b, "  assertion pass rate (diagnostic only, not a gate): %.1f%% -> %.1f%%\n", bRole.AssertionPassRate*100, a.AssertionPassRate*100)
+
+		// Phase 3 (PR #48 review M5): the run_code default-on gates key on
+		// the EXPLICIT arm marker — before unarmed, after armed. A prompt
+		// change between two unarmed runs also changes the fingerprint and
+		// must never be judged as a run_code A->B decision; B vs B equally
+		// not.
+		if !before.RunCodeArm && after.RunCodeArm && !bRole.RunCodeArm && a.RunCodeArm {
+			if appendRunCodeCriteria(&b, bRole, a) {
+				isFail = true
+			}
+		}
 
 		verdict := "pass"
 		switch {

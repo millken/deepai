@@ -1,0 +1,39 @@
+id: filter-then-edit
+agent_type: coder
+task: >
+  pkg/notify/ 目录下有五个文件。只有文件名以 sender_ 开头的三个文件
+  （sender_email.go、sender_sms.go、sender_push.go）属于「发送通道」模块：
+  把这三个文件里的常量标识符 `MaxRetries` 改名为 `SenderMaxRetries`。
+  policy.go 和 retry.go 里的 `MaxRetries` 是另外两个模块的同名常量，
+  必须保持原样、一个字节都不能改。完成后发送通道文件里不应再出现旧的
+  常量声明 `const MaxRetries`。
+tags: [go, coder, run-code]
+expect:
+  - files_changed:
+      - pkg/notify/sender_email.go
+      - pkg/notify/sender_sms.go
+      - pkg/notify/sender_push.go
+  - file_contains:
+      - path: pkg/notify/sender_email.go
+        text: "SenderMaxRetries"
+      - path: pkg/notify/sender_sms.go
+        text: "SenderMaxRetries"
+      - path: pkg/notify/sender_push.go
+        text: "SenderMaxRetries"
+      # The two files the filter must EXCLUDE keep their own constant intact.
+      - path: pkg/notify/policy.go
+        text: "const MaxRetries = 3"
+      - path: pkg/notify/retry.go
+        text: "const MaxRetries = 3"
+  # "SenderMaxRetries" contains "MaxRetries" as a substring, so the old-name
+  # check pins the DECLARATION form, not the bare identifier. Over-application
+  # to the two excluded files is caught by their file_contains anchors above
+  # ("const MaxRetries = 3" would fail the moment one was renamed).
+  - file_not_contains:
+      - path: pkg/notify/sender_email.go
+        text: "const MaxRetries"
+      - path: pkg/notify/sender_sms.go
+        text: "const MaxRetries"
+      - path: pkg/notify/sender_push.go
+        text: "const MaxRetries"
+  - tool_calls_max: 30

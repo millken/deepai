@@ -1,0 +1,33 @@
+id: recover-midway
+agent_type: coder
+task: >
+  pkg/meter/ 三个文件里都有变量 `defaultWindow`（值不全相同：dial 和
+  registry 是 10s，gauge 是 30s）。把这三个文件里的标识符 `defaultWindow`
+  统一改名为 `stdWindow`，每个文件保持自己原有的值不变。注意：
+  registry.go 里的 `defaultWindowSize` 是另一个标识符，不是目标，必须保持
+  原样。编辑前需要先读文件：如果某次编辑因文件未读或内容不匹配而失败，
+  重新读取该文件后继续，直到三个文件全部改完，不要跳过任何一个。
+tags: [go, coder, run-code]
+expect:
+  - files_changed:
+      - pkg/meter/dial.go
+      - pkg/meter/gauge.go
+      - pkg/meter/registry.go
+  - file_contains:
+      - path: pkg/meter/dial.go
+        text: "stdWindow = 10 * time.Second"
+      - path: pkg/meter/gauge.go
+        text: "stdWindow = 30 * time.Second"
+      - path: pkg/meter/registry.go
+        text: "stdWindow = 10 * time.Second"
+      # The decoy identifier survives untouched.
+      - path: pkg/meter/registry.go
+        text: "const defaultWindowSize = 64"
+  - file_not_contains:
+      - path: pkg/meter/dial.go
+        text: "defaultWindow"
+      - path: pkg/meter/gauge.go
+        text: "defaultWindow"
+      - path: pkg/meter/registry.go
+        text: "var defaultWindow"
+  - tool_calls_max: 40
