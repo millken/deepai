@@ -36,15 +36,17 @@ type AgentRuntimeConfig struct {
 	Models *llm.ModelRegistry
 	Tools  *tools.Registry
 	// SystemPrompt is appended to every turn's system prompt (DEEPAI.md
-	// instructions, skill descriptions).
-	SystemPrompt    string
-	WorkDir         string
-	SandboxBaseDir  string
-	ContextWindow   int
-	ReasoningEffort string
-	Temperature     *float64
-	MaxToolCalls    int
-	MaxTokens       *int
+	// instructions, skill descriptions). SystemPromptSuffix is evaluated per
+	// turn for time-dependent context (the scheduler injects "current time").
+	SystemPrompt       string
+	SystemPromptSuffix func() string
+	WorkDir            string
+	SandboxBaseDir     string
+	ContextWindow      int
+	ReasoningEffort    string
+	Temperature        *float64
+	MaxToolCalls       int
+	MaxTokens          *int
 	// RequestTimeout bounds one agent run; 0 = unlimited.
 	RequestTimeout time.Duration
 
@@ -148,6 +150,11 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	carry := c.carry
 	c.mu.Unlock()
 
+	maxToolCalls := cfg.MaxToolCalls
+	if in.MaxToolCalls > 0 {
+		maxToolCalls = in.MaxToolCalls
+	}
+
 	a := agent.New(agent.AgentConfig{
 		LLMProvider:     provider,
 		Tools:           cfg.Tools,
@@ -155,7 +162,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		Model:           modelName,
 		ContextWindow:   contextWindow,
 		ReasoningEffort: effort,
-		MaxToolCalls:    cfg.MaxToolCalls,
+		MaxToolCalls:    maxToolCalls,
 		MaxTokens:       cfg.MaxTokens,
 		Temperature:     temperature,
 		RequestTimeout:  cfg.RequestTimeout,
@@ -173,6 +180,11 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	})
 	if cfg.SystemPrompt != "" {
 		a.AppendSystemPrompt(cfg.SystemPrompt)
+	}
+	if cfg.SystemPromptSuffix != nil {
+		if suffix := cfg.SystemPromptSuffix(); suffix != "" {
+			a.AppendSystemPrompt(suffix)
+		}
 	}
 
 	gate := &emitGate{emit: in.Emit}

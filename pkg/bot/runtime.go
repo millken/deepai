@@ -43,6 +43,9 @@ type TurnInput struct {
 	Emit func(Event)
 	// Interaction answers ask_clarification by asking connected clients.
 	Interaction tools.UserInteraction
+	// MaxToolCalls overrides the runtime-wide limit for this turn only.
+	// 0 means "use the bot configuration" (design §3.1 max_tool_calls).
+	MaxToolCalls int
 }
 
 // TurnOutput is what a finished (or interrupted) turn produced.

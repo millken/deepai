@@ -419,7 +419,7 @@ P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
 
 ### 7.3 实现位置
 
-回答时钟和自动回答由 bot 层的 `scheduleDispatcher` 实现：它在定时触发的 turn 上包一层 `UserInteraction`（与现有 `turnInteraction` 组合），并通过 `Service.UpdateRun` 回写 `waiting_input`/`running`/`auto_answers`。调度循环不参与等待（4.1），`pkg/agent` 不需要修改。
+回答时钟和自动回答由 bot 层的 `scheduleDispatcher` 实现：Manager 在 `turnInteraction` 上暴露 `turnHooks`（`QuestionAsked` / `QuestionSettled` / `TurnEnded`），调度器为每个定时 turn 注入 `scheduleQuestionHooks`，负责每个提问的回答时钟、`assume` 自动回答、`auto_answers` 计数，并通过 `Service.UpdateRunInteraction` 回写 `waiting_input` ↔ `running`。执行时钟的 `Pause()` / `Resume()` 由 Manager 在提问时统一处理（对所有 turn 生效），因此定时 turn 不需要包一层 `UserInteraction`，`pkg/agent` 也不需要修改。调度循环不参与等待（4.1）。
 
 ## 8. 内置工具 `schedule`
 
@@ -437,7 +437,11 @@ P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
   "timezone": "Asia/Taipei",              // 缺省 schedule.timezone → 系统时区
   "session_mode": "dedicated",
   "notify": "always",
-  "timeout": "30m",
+  "timeout": "30m",                       // 执行时长上限，等待回答期间暂停
+  "answer_timeout": "30m",                // 每个提问的等待上限
+  "on_answer_timeout": "assume",          // assume | fail
+  "max_auto_answers": 3,
+  "max_tool_calls": 0,                    // 0 = 沿用 bot 配置
   "end_at": null, "max_runs": null,
   "request_id": "…",                      // run_now 幂等键，缺省由工具按 turn_id 生成
   "limit": 20                             // list/runs
@@ -602,6 +606,45 @@ schedule:
 | **P3** | 单任务工具白名单；运行中 steer（需 `pkg/agent` 配合）；任务链（A 完成后触发 B）；按结果条件通知 |
 
 **测试策略**：`Scheduler` 依赖可注入的 `Clock` 接口（`Now()`、`After(d)`），测试中用假时钟推进时间，不 sleep；Dispatcher 用假实现记录调用；bot 层集成测试复用现有 `fakeRuntime`。
+
+### 12.1 P1 实现状态（2026-11-07，已全部完成）
+
+| 已落地 | 位置 |
+|---|---|
+| 模型、`Store` 接口、内存 + SQLite 存储与迁移（含 `UNIQUE(schedule_id, slot)` / `request_id`、租约、version、历史清理） | `pkg/schedule/{types,trigger,store,store_sqlite}.go` |
+| `once` / `interval` 触发、任务级时区、`cron` 明确拒绝、槽位唯一与 skip 占槽 | `pkg/schedule/trigger.go`、`service.go` |
+| `Service`（CRUD / pause / resume / approve / skip / run_now / cancel / validate / finish / 启动恢复 / 每日上限 / `UpdateRunInteraction`） | `pkg/schedule/service.go` |
+| 非阻塞 `Scheduler`（最小堆 + 单定时器 + kick、overlap、并发、会话忙排队、queue_deadline、租约与备用模式） | `pkg/schedule/scheduler.go` |
+| `schedule` 工具（`action` 全套、`ask` 确认不留半成品、嵌套限制、返回当前时间与 `next_runs`、无人值守参数） | `pkg/schedule/tool.go`、`api.go` |
+| REST（§9.2 全部路径）、WS（§9.3 全部 ops）、6 类全局 `schedule_*` 事件 | `pkg/bot/schedule_http.go`、`protocol.go`、`server.go`、`ws.go` |
+| `bot.scheduleDispatcher`：`Manager.SendWithOptions` → 普通 turn → `turn_end` 回写 `FinishRun`；`dedicated/new/origin` 会话；`bot_shutdown` / `answer_timeout` / `replaced` 映射 | `pkg/bot/{schedule,schedule_questions}.go`、`manager.go` |
+| §7.2 可暂停 `turnClock`（剩余额度 + 引用计数 `Pause/Resume` + `WithCancelCause`）与 `cancel_source`（client / shutdown / scheduler）；执行额度 = `min(Schedule.timeout, --turn-timeout)` | `pkg/bot/{turnclock,manager,protocol}.go` |
+| §7.1 `waiting_input`、`answer_timeout`、`assume` 自动回答（`question_answered.auto`）、`max_auto_answers` 上限、客户端回答后恢复 `running` | `pkg/bot/schedule_questions.go` |
+| 单任务 `max_tool_calls`（`TurnInput` per-turn 覆盖，不改 `pkg/agent`） | `pkg/bot/{runtime,agentruntime,schedule}.go` |
+| 装配：`schedule:` 配置段、`--no-schedule`、工具注册、调度器启停、系统提示注入当前时间、优雅关闭顺序 | `cmd/deepai-bot/{schedule,runtime,serve}.go`、`pkg/commands/setup.go` |
+
+**说明与后续**：
+
+1. 备用进程只写库不执行；`run_now` / 修改 / `cancel_requested_at` 由租约持有者在下一次同步 tick（≤ 20s）重载后生效，响应统一带 `scheduler: "standby"`。
+2. 按 §12 属 **P2**：`notify` 与 `pkg/hook` 的三个新事件（含 `schedule_ask` 推送）、Web 控制台任务页签、`misfire=run_once` 补跑、自写 cron。
+3. `answer_timeout` 到期后 `assume` 自动回答会写回 `auto_answers`，`fail` / 次数用尽时以 `cancel_source=scheduler` 取消 turn，Run 记 `failed(error_code=answer_timeout)`；等待回答期间执行时钟暂停，不会误判 `timed_out`。
+
+### 12.2 PR #43 评审 round 1 修复（2026-11-08）
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| H1 | `RenewLease` 瞬时错误即降级 standby，接管方 `Recover` 判死仍在执行的 Run（双跑） | `syncLease` 区分 `err`（租约未到期则保持 active、下个 sync 重试）、`ok=false`（确认被接管才降级）与"错误持续超过 leaseTTL"；新增 `RecoverAfterTakeover` / `Reconcile`：接管时按 `StartedAt + leaseTTL + 任务 timeout` 给在跑的 Run 宽限期，到期后由租约持有者补判死，迟到的 `FinishRun` 优先 |
+| H2 | dedicated 会话被删后重建的新会话不回写 Schedule，每轮泄漏一个会话 | `tryStartLocked` 回写条件改为 `SessionMode==dedicated && sid != "" && v.SessionID != sid`，Fire 返回的新 ID 每轮都会固定下来 |
+| M1 | 激活已过期的 `once` → active 且 `NextRunAt=nil` 死端 | `Approve` 复用 `checkOnceNotPast`（与 `Resume` 一致），返回 `time_in_past` |
+| M2 | standby 堆顶已到期 → `delay=0` 热自旋 | standby 下 delay 施加 1s 下限，接管仍由 sync tick 驱动 |
+| M3 | 先 Fire 后落 `running`，崩溃后 pending Run 被重放 | Fire 前静默预写 `running`（含 `StartedAt`），`ErrBusy` 回滚 pending 并保留原 deadline；恢复只判死、不重放 |
+| M4 | 并发提问 `waiting_input`/`running` 回写乱序 | `scheduleQuestionHooks` 的状态写入与 pending map 变更同处 `h.mu` 临界区 |
+| L1 | `FireSlot` 吞掉一切落库错误 | 只吞 `ErrConflict`，其余记 Warn 并返回错误 |
+| L2 | `Contains(a, "no")` 把肯定回答误判为取消 | `classifyConfirmation`：选项值精确匹配 + 英文整词/短语匹配，歧义回答仍不创建 |
+| L3 | `answer_timeout(fail)` 后 settle 仍写一次 `running` | `h.failure` 非空时 settle 不回写 running |
+| L4 | `Closing()` 兜底把关停窗口内的客户端取消误标 `bot_shutdown` | `finalizeOutcome` 仅在 `cancel_source` 为空且正在关闭时才兜底 |
+
+回归测试集中在 `pkg/schedule/review_test.go` 与 `pkg/bot/review_test.go`。
 
 ## 13. 关键取舍
 
