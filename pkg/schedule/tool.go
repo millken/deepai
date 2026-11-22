@@ -19,8 +19,9 @@ func Tool(svc *Service) models.Tool {
 		Description: "Create and manage timed tasks for this bot. One action per call. " +
 			"Triggers: {\"type\":\"once\",\"in\":\"2h\"} or {\"type\":\"once\",\"at\":\"2026-11-07T22:00\"} " +
 			"(a time without an offset is in the task's timezone), " +
-			"{\"type\":\"interval\",\"every\":\"6h\",\"start_at\":\"2026-11-08T09:00\"}. " +
-			"Prefer once.in for relative times. cron is NOT supported yet — use interval or once. " +
+			"{\"type\":\"interval\",\"every\":\"6h\",\"start_at\":\"2026-11-08T09:00\"}, " +
+			"{\"type\":\"cron\",\"expr\":\"0 22 * * *\"} (5 fields: min hour day month weekday; macros @hourly/@daily/@weekly/@monthly/@yearly; day supports L; no seconds/year/?/W/#/@reboot/@every). " +
+			"Prefer once.in for relative times. " +
 			"Every response includes the server's current time and the task's future trigger times: " +
 			"ALWAYS restate the summary and next_runs to the user after creating or updating a task. " +
 			"Periodic tasks created in an interactive turn require user confirmation first. " +
@@ -49,6 +50,7 @@ func Tool(svc *Service) models.Tool {
 				"model":             map[string]any{"type": "string"},
 				"overlap":           map[string]any{"type": "string", "enum": []any{OverlapSkip, OverlapQueue, OverlapReplace}},
 				"misfire":           map[string]any{"type": "string", "enum": []any{MisfireRunOnce, MisfireSkip}},
+				"misfire_grace":     map[string]any{"type": "string", "description": "grace window for misfire=run_once (e.g. 1h)"},
 				"end_at":            map[string]any{"type": "string"},
 				"max_runs":          map[string]any{"type": "integer"},
 				"request_id":        map[string]any{"type": "string", "description": "idempotency key for run_now"},
@@ -376,6 +378,7 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 			Timeout:         strArg(args, "timeout"),
 			Overlap:         strArg(args, "overlap"),
 			Misfire:         strArg(args, "misfire"),
+			MisfireGrace:    strArg(args, "misfire_grace"),
 			Notify:          strArg(args, "notify"),
 			AnswerTimeout:   strArg(args, "answer_timeout"),
 			OnAnswerTimeout: strArg(args, "on_answer_timeout"),
@@ -414,7 +417,7 @@ func patchFromArgs(args map[string]any, cfg Config, origTZ string) (Patch, *Trig
 	}
 	for key, dst := range map[string]**string{
 		"session_mode": &p.SessionMode, "model": &p.Model, "timeout": &p.Timeout,
-		"overlap": &p.Overlap, "misfire": &p.Misfire, "notify": &p.Notify,
+		"overlap": &p.Overlap, "misfire": &p.Misfire, "misfire_grace": &p.MisfireGrace, "notify": &p.Notify,
 		"answer_timeout": &p.AnswerTimeout, "on_answer_timeout": &p.OnAnswerTimeout,
 	} {
 		if v, ok := args[key]; ok {

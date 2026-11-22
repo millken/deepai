@@ -27,16 +27,21 @@ const (
 	EventPRAwaitingMerge  Kind = "pr_awaiting_merge"
 	EventIdle             Kind = "idle"
 	EventSessionEnd       Kind = "session_end"
+	EventScheduleRunEnd   Kind = "schedule_run_end"
+	EventScheduleAsk      Kind = "schedule_ask"
+	EventScheduleApproval Kind = "schedule_approval"
 )
 
-// Event is one observable REPL lifecycle moment. Message carries the
+// Event is one observable REPL/bot lifecycle moment. Message carries the
 // human-readable payload a chat notification will show verbatim.
 type Event struct {
-	Kind      Kind     `json:"kind"`
-	SessionID string   `json:"session_id"`
-	WorkDir   string   `json:"work_dir,omitempty"`
-	Message   string   `json:"message"`
-	Time      time.Time `json:"time"`
+	Kind       Kind      `json:"kind"`
+	SessionID  string    `json:"session_id"`
+	WorkDir    string    `json:"work_dir,omitempty"`
+	ScheduleID string    `json:"schedule_id,omitempty"`
+	RunID      string    `json:"run_id,omitempty"`
+	Message    string    `json:"message"`
+	Time       time.Time `json:"time"`
 }
 
 // Emitter is the outbound side. A nil Emitter (or nil *Dispatcher) must be a

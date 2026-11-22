@@ -2,10 +2,12 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/schedule"
 )
 
@@ -29,9 +31,12 @@ type answerWaiter struct {
 // Service writes from these callbacks are safe: every Service operation holds
 // its mutex only while starting a turn, never while waiting for one to end.
 type scheduleQuestionHooks struct {
-	d     *ScheduleDispatcher
-	svc   *schedule.Service
-	runID string
+	d            *ScheduleDispatcher
+	svc          *schedule.Service
+	scheduleID   string
+	scheduleName string
+	notify       string
+	runID        string
 
 	answerTimeout  time.Duration
 	onTimeout      string
@@ -67,6 +72,9 @@ func newScheduleQuestionHooks(d *ScheduleDispatcher, svc *schedule.Service, sch 
 	h := &scheduleQuestionHooks{
 		d:              d,
 		svc:            svc,
+		scheduleID:     sch.ID,
+		scheduleName:   sch.Name,
+		notify:         sch.Options.Notify,
 		runID:          run.ID,
 		sessionID:      sessionID,
 		answerTimeout:  answerTimeout,
@@ -103,6 +111,16 @@ func (h *scheduleQuestionHooks) QuestionAsked(q Question) {
 		// mutation: two concurrent questions can never persist a stale
 		// "running" after a newer "waiting_input" (review M4).
 		h.writeLocked(schedule.RunWaitingInput, 0)
+	}
+	if h.d != nil && h.d.m != nil && h.d.m.opts.Hook != nil && h.notify != schedule.NotifyNever {
+		h.d.m.opts.Hook.Fire(context.Background(), hook.Event{
+			Kind:       hook.EventScheduleAsk,
+			SessionID:  h.sessionID,
+			WorkDir:    h.d.m.opts.WorkDir,
+			ScheduleID: h.scheduleID,
+			RunID:      h.runID,
+			Message:    fmt.Sprintf("「%s」需要你回答：%s", h.scheduleName, truncateRunes(q.Text, 500)),
+		})
 	}
 }
 

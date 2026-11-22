@@ -10,15 +10,15 @@ import (
 // Schedule. Time strings without an offset are interpreted in the Schedule's
 // timezone; Normalize rewrites them to canonical UTC RFC3339 before storage.
 //
-// P1 supports once and interval only. cron is parsed far enough to reject it
-// with a helpful, stable error (docs/BOT_SCHEDULER_DESIGN.md §3.3).
+// Supports once, interval and a well-defined 5-field cron subset
+// (docs/BOT_SCHEDULER_DESIGN.md §3.3, §5).
 type Trigger struct {
 	Type    string `json:"type"`
 	At      string `json:"at,omitempty"`       // once: absolute time or local datetime
 	In      string `json:"in,omitempty"`       // once: relative duration, resolved at creation
 	Every   string `json:"every,omitempty"`    // interval: period
 	StartAt string `json:"start_at,omitempty"` // interval: first slot
-	Expr    string `json:"expr,omitempty"`     // cron (P2)
+	Expr    string `json:"expr,omitempty"`     // cron: 5-field expression or macro
 }
 
 // IsPeriodic reports whether the trigger fires more than once.
@@ -84,16 +84,42 @@ func (t *Trigger) Normalize(tz string, now time.Time, minInterval time.Duration,
 		t.At, t.In, t.Expr = "", "", ""
 
 	case TriggerCron:
-		return NewError(CodeTriggerNotSupported,
-			"cron triggers are not available yet; use once or interval instead (cron 将在后续版本提供，请改用 interval 或 once)")
+		spec, err := ParseCron(t.Expr)
+		if err != nil {
+			return err
+		}
+		if minInterval <= 0 {
+			minInterval = DefaultConfig().MinInterval
+		}
+		// Ensure the expression actually matches within 5 years and respects
+		// min_interval across the next 10 occurrences (design §3.3, §5).
+		first, ok := spec.Next(now, loc)
+		if !ok {
+			return NewError(CodeInvalidCron, "cron %q has no matching time within the next 5 years", t.Expr)
+		}
+		prev := first
+		for i := 1; i < 10; i++ {
+			next, ok := spec.Next(prev, loc)
+			if !ok {
+				break
+			}
+			if gap := next.Sub(prev); gap < minInterval {
+				return NewError(CodeIntervalTooShort, "cron %q fires %s apart, below the %s minimum", t.Expr, gap, minInterval)
+			}
+			prev = next
+		}
+		t.Type = TriggerCron
+		t.Expr = spec.expr
+		t.At, t.In, t.Every, t.StartAt = "", "", "", ""
 	default:
-		return NewError(CodeInvalidTrigger, "unknown trigger type %q (want once or interval)", t.Type)
+		return NewError(CodeInvalidTrigger, "unknown trigger type %q (want once, interval or cron)", t.Type)
 	}
 	return nil
 }
 
 // nextAfter returns the first planned slot strictly after `after`.
-func (t Trigger) nextAfter(after time.Time) (time.Time, bool, error) {
+// tz is used for cron matching; once and interval are already UTC.
+func (t Trigger) nextAfter(after time.Time, tz string) (time.Time, bool, error) {
 	switch t.Type {
 	case TriggerOnce:
 		at, err := time.Parse(time.RFC3339Nano, t.At)
@@ -125,19 +151,35 @@ func (t Trigger) nextAfter(after time.Time) (time.Time, bool, error) {
 			return time.Time{}, false, nil
 		}
 		return slot.UTC(), true, nil
+	case TriggerCron:
+		spec, err := ParseCron(t.Expr)
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		loc, err := Location(tz)
+		if err != nil {
+			loc = time.UTC
+		}
+		slot, ok := spec.Next(after, loc)
+		return slot, ok, nil
 	}
 	return time.Time{}, false, nil
 }
 
 // NextRuns returns the next n slots after `after`, in UTC.
-func (t Trigger) NextRuns(after time.Time, n int) []time.Time {
+// Pass optional timezone for cron rules (defaults to UTC if empty).
+func (t Trigger) NextRuns(after time.Time, n int, tz ...string) []time.Time {
 	if n <= 0 {
 		n = 3
+	}
+	zone := ""
+	if len(tz) > 0 {
+		zone = tz[0]
 	}
 	out := make([]time.Time, 0, n)
 	cur := after
 	for i := 0; i < n; i++ {
-		slot, ok, err := t.nextAfter(cur)
+		slot, ok, err := t.nextAfter(cur, zone)
 		if err != nil || !ok {
 			break
 		}
@@ -166,6 +208,9 @@ func (t Trigger) Summary(tz string) string {
 	case TriggerInterval:
 		return fmt.Sprintf("每 %s，从 %s 开始（%s）", t.Every, local(t.StartAt), tz)
 	case TriggerCron:
+		if spec, err := ParseCron(t.Expr); err == nil {
+			return spec.HumanSummary(tz)
+		}
 		return fmt.Sprintf("cron %s（%s）", t.Expr, tz)
 	}
 	return "未知触发规则"

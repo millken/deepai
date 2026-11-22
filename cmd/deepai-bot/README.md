@@ -88,7 +88,7 @@ curl -s -X POST -H "$H" $B/v1/schedules/sch_xxx/run | jq .    # 立即跑一次
 curl -N -H "$H" "$B/v1/events?since=0"                        # 全局 schedule_* 事件
 ```
 
-WS ops 为 `list_schedules` / `create_schedule` / `pause_schedule` / `run_schedule` / `cancel_run` 等，参数放在 `params`，id 放 `schedule_id` / `run_id`。拿到 `run.session_id` 后订阅该会话即可看执行过程。P1 只支持 `once` 与 `interval`，`cron` 会返回 `trigger_not_supported`。
+WS ops 为 `list_schedules` / `create_schedule` / `pause_schedule` / `run_schedule` / `cancel_run` 等，参数放在 `params`，id 放 `schedule_id` / `run_id`。拿到 `run.session_id` 后订阅该会话即可看执行过程。支持 `once`、`interval` 与 5 字段 `cron`（含 `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly` 与 `L`），内置 Web 控制台提供「任务」页签，并复用 `~/.deepai/config.yaml` 的 `notifications` 配置推送 `schedule_run_end` / `schedule_ask` / `schedule_approval` 通知。
 
 任务可带 `answer_timeout`、`on_answer_timeout`（`assume` 默认 / `fail`）、`max_auto_answers`、`max_tool_calls`、`timeout`。定时 turn 里模型调用 `ask_clarification` 时：
 

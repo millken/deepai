@@ -36,6 +36,7 @@ type Patch struct {
 	Timeout         *string
 	Overlap         *string
 	Misfire         *string
+	MisfireGrace    *string
 	Notify          *string
 	AnswerTimeout   *string
 	OnAnswerTimeout *string
@@ -211,7 +212,7 @@ func (s *Service) kickLocked() {
 // Decorate fills the computed fields a client expects on every response.
 func (s *Service) Decorate(v Schedule) Schedule {
 	v.Summary = v.Trigger.Summary(v.Timezone)
-	v.NextRuns = v.Trigger.NextRuns(s.now(), 3)
+	v.NextRuns = v.Trigger.NextRuns(s.now(), 3, v.Timezone)
 	return v
 }
 
@@ -389,7 +390,7 @@ func (s *Service) checkOnceNotPast(v Schedule, now time.Time) error {
 	if v.Trigger.Type != TriggerOnce {
 		return nil
 	}
-	at, ok, err := v.Trigger.nextAfter(now.Add(-time.Nanosecond))
+	at, ok, err := v.Trigger.nextAfter(now.Add(-time.Nanosecond), v.Timezone)
 	if err != nil || !ok || !at.After(now) {
 		return NewError(CodeTimeInPast, "the scheduled time has passed; update the task with a new 'at'")
 	}
@@ -500,7 +501,7 @@ func (s *Service) Validate(ctx context.Context, tr Trigger, tz string, n int) (V
 	return Validation{
 		Trigger: tr, Timezone: tz,
 		Summary:  tr.Summary(tz),
-		NextRuns: tr.NextRuns(s.now(), n),
+		NextRuns: tr.NextRuns(s.now(), n, tz),
 	}, nil
 }
 
@@ -931,28 +932,47 @@ func (s *Service) recoverWithGrace(ctx context.Context, leaseTTL time.Duration) 
 		count := 0
 		base := v.NextRunAt.Add(-time.Nanosecond)
 		for count < 10000 {
-			slot, ok, err := v.Trigger.nextAfter(base)
+			slot, ok, err := v.Trigger.nextAfter(base, v.Timezone)
 			if err != nil || !ok || slot.After(now) {
 				break
 			}
 			last, count, base = slot, count+1, slot
 		}
 		if count > 0 {
-			r := Run{
-				ID: newID("run_"), ScheduleID: v.ID, Seq: s.nextSeqLocked(ctx, v.ID),
-				Trigger: FireTimer, Slot: &last, ScheduledFor: last, Coalesced: count - 1,
-				Status: RunMissed, ErrorCode: "misfire_not_supported", EndedAt: &now,
-			}
-			if err := s.insertRunLocked(ctx, r); err != nil && !errors.Is(err, ErrConflict) {
-				return err
+			grace := s.misfireGraceOf(v, last)
+			withinGrace := now.Sub(last) <= grace
+			if v.Options.Misfire == MisfireRunOnce && withinGrace {
+				// Coalesce missed slots into a single misfire Run occupying
+				// `last`; Scheduler.Start's TryStartPending dispatches it.
+				r := Run{
+					ID: newID("run_"), ScheduleID: v.ID, Seq: s.nextSeqLocked(ctx, v.ID),
+					Trigger: FireMisfire, Slot: &last, ScheduledFor: last, Coalesced: count - 1,
+					Status: RunPending, QueueDeadline: timePtr(now.Add(s.timeoutOf(v))),
+				}
+				if err := s.insertRunLocked(ctx, r); err != nil && !errors.Is(err, ErrConflict) {
+					return err
+				}
+			} else {
+				errCode := "misfire_skip"
+				if v.Options.Misfire == MisfireRunOnce {
+					errCode = "misfire_grace_expired"
+				}
+				r := Run{
+					ID: newID("run_"), ScheduleID: v.ID, Seq: s.nextSeqLocked(ctx, v.ID),
+					Trigger: FireTimer, Slot: &last, ScheduledFor: last, Coalesced: count - 1,
+					Status: RunMissed, ErrorCode: errCode, EndedAt: &now,
+				}
+				if err := s.insertRunLocked(ctx, r); err != nil && !errors.Is(err, ErrConflict) {
+					return err
+				}
+				if v.Trigger.Type == TriggerOnce {
+					// A missed one-shot has no future slot; leaving it active
+					// would strand it forever.
+					v.State = StateCompleted
+				}
 			}
 		}
 		v.NextRunAt = s.firstFreeSlotLocked(ctx, v, now)
-		if v.Trigger.Type == TriggerOnce && count > 0 {
-			// A missed one-shot has no future slot; leaving it active would
-			// strand it forever.
-			v.State = StateCompleted
-		}
 		v.UpdatedAt = now
 		if err := s.updateScheduleLocked(ctx, v, ChangeUpdated); err != nil {
 			return err
@@ -1087,6 +1107,13 @@ func (s *Service) normalizeOptions(o Options, now time.Time) (Options, error) {
 	default:
 		return o, NewError(CodeBadRequest, "invalid misfire %q", o.Misfire)
 	}
+	if o.MisfireGrace != "" {
+		d, err := parsePositiveDuration(o.MisfireGrace)
+		if err != nil {
+			return o, NewError(CodeBadRequest, "invalid misfire_grace %q", o.MisfireGrace)
+		}
+		o.MisfireGrace = d.String()
+	}
 	switch o.Notify {
 	case NotifyAlways, NotifyOnFailure, NotifyNever:
 	default:
@@ -1145,6 +1172,9 @@ func applyPatch(o *Options, p Patch) {
 	if p.Misfire != nil {
 		o.Misfire = *p.Misfire
 	}
+	if p.MisfireGrace != nil {
+		o.MisfireGrace = *p.MisfireGrace
+	}
 	if p.Notify != nil {
 		o.Notify = *p.Notify
 	}
@@ -1180,11 +1210,47 @@ func (s *Service) timeoutOf(v Schedule) time.Duration {
 	return d
 }
 
+// misfireGraceOf returns the effective misfire grace window for v (design §3.1):
+// explicit misfire_grace if set; otherwise 1h for once, or one period (capped
+// at 24h) for interval/cron.
+func (s *Service) misfireGraceOf(v Schedule, ref time.Time) time.Duration {
+	if v.Options.MisfireGrace != "" {
+		if d, err := time.ParseDuration(v.Options.MisfireGrace); err == nil && d > 0 {
+			return d
+		}
+	}
+	const maxPeriodicGrace = 24 * time.Hour
+	switch v.Trigger.Type {
+	case TriggerOnce:
+		return time.Hour
+	case TriggerInterval:
+		if d, err := time.ParseDuration(v.Trigger.Every); err == nil && d > 0 {
+			if d > maxPeriodicGrace {
+				return maxPeriodicGrace
+			}
+			return d
+		}
+		return time.Hour
+	case TriggerCron:
+		if next, ok, err := v.Trigger.nextAfter(ref, v.Timezone); err == nil && ok {
+			d := next.Sub(ref)
+			if d > maxPeriodicGrace {
+				return maxPeriodicGrace
+			}
+			if d > 0 {
+				return d
+			}
+		}
+		return time.Hour
+	}
+	return time.Hour
+}
+
 // firstFreeSlotLocked finds the first slot after `after` that has no Run yet.
 func (s *Service) firstFreeSlotLocked(ctx context.Context, v Schedule, after time.Time) *time.Time {
 	cur := after
 	for i := 0; i < 1000; i++ {
-		slot, ok, err := v.Trigger.nextAfter(cur)
+		slot, ok, err := v.Trigger.nextAfter(cur, v.Timezone)
 		if err != nil || !ok {
 			return nil
 		}

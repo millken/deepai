@@ -190,7 +190,7 @@ UNIQUE(schedule_id, request_id)
 - 修改 `timezone` 视同修改 `trigger`（重算 `next_run_at`，`ask` 模式下需确认）。
 - `once.at` 早于"现在 − 1 分钟"拒绝（`time_in_past`）。
 - `interval.every` 最小值 = `schedule.min_interval`（默认 5m）；cron 两次触发间隔同样受此约束（校验时检查未来 10 次）。`start_at` 缺省 = 创建时刻 + `every`。
-- **P1 不支持 `cron`**：创建时返回 `trigger_not_supported`，提示"cron 将在后续版本提供，请改用 interval 或 once"。
+- **已支持 5 字段 `cron`**（P2 落地，见第 5 节）；不支持的语法（秒/年字段、`?`/`W`/`#`/`@reboot`/`@every`）在创建时返回 `invalid_cron` 并给出提示。
 
 ### 3.4 SQLite 表
 
@@ -343,7 +343,7 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 
 只实现确定需要的子集，规则写死、行为可预测；不支持的写法在创建时报错并给出提示，由模型改写。
 
-P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
+已在 P2 落地（`pkg/schedule/cron.go`）；P1 阶段曾对 `cron` 返回 `trigger_not_supported`，现已开放。
 
 **格式**：5 字段 `分 时 日 月 周`，空格分隔。
 
@@ -645,6 +645,16 @@ schedule:
 | L4 | `Closing()` 兜底把关停窗口内的客户端取消误标 `bot_shutdown` | `finalizeOutcome` 仅在 `cancel_source` 为空且正在关闭时才兜底 |
 
 回归测试集中在 `pkg/schedule/review_test.go` 与 `pkg/bot/review_test.go`。
+
+### 12.3 P2 实现状态（2026-11-22，已全部完成）
+
+| 已落地 | 位置 |
+|---|---|
+| 自写 5 字段 cron 解析与调度引擎（含宏、日 `L`、月/周英文名、Vixie 日/周「或」语义、DST 跳变/重复处理、5 年上限、`min_interval` 校验与中文摘要） | `pkg/schedule/cron.go`、`trigger.go`、`cron_test.go` |
+| `misfire=run_once` 补跑与 `misfire_grace`（默认 1h / 单周期≤24h），合并计数 `coalesced` 与超宽限 `missed` | `pkg/schedule/service.go`、`types.go`、`tool.go`、`cron_test.go` |
+| `pkg/hook` 接入 `deepai-bot`：`schedule_run_end`（按 `notify` 三策略过滤）、`schedule_ask`、`schedule_approval` 与可选 `schedule_id/run_id` 字段，同时接通交互 turn 的 `turn_end`/`ask` | `pkg/hook/hook.go`、`pkg/bot/{manager,schedule,schedule_questions}.go`、`cmd/deepai-bot/{runtime,serve}.go` |
+| Web 控制台「任务」页签（待批准置顶与红点、批准/拒绝、新建任务 + 规则预览、Run 历史、中止运行、点击跳转会话） | `pkg/bot/web/index.html` |
+| 端到端测试（假时钟 + Cron + `Scheduler` + `Manager` + REST + 自动回答 + 真实 `hook.Dispatcher` Webhook 回调） | `pkg/bot/schedule_hook_test.go` |
 
 ## 13. 关键取舍
 

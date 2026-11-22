@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -50,7 +51,9 @@ type Options struct {
 	IdleTimeout time.Duration
 	// TurnTimeout bounds one turn. 0 means no limit beyond Cancel.
 	TurnTimeout time.Duration
-	Logger      *slog.Logger
+	// Hook is an optional outbound notification emitter (pkg/hook).
+	Hook   hook.Emitter
+	Logger *slog.Logger
 }
 
 // Manager owns the bot's sessions. It is safe for concurrent use; every
@@ -658,6 +661,16 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	s.turn = nil
 	s.mu.Unlock()
 	close(t.done)
+	if m.opts.Hook != nil && t.hooks == nil {
+		// Interactive turn notification (scheduled turns emit schedule_run_end).
+		msg := hookSummary("Turn "+string(summary.Status), summary.FinalOutput, summary.Error)
+		m.opts.Hook.Fire(context.Background(), hook.Event{
+			Kind:      hook.EventTurnEnd,
+			SessionID: s.id,
+			WorkDir:   m.opts.WorkDir,
+			Message:   msg,
+		})
+	}
 	afterTurnDone()
 }
 
@@ -881,6 +894,13 @@ func (ti *turnInteraction) AskQuestion(ctx context.Context, question string, opt
 	ti.s.mu.Unlock()
 	if hooks != nil {
 		hooks.QuestionAsked(q)
+	} else if ti.m.opts.Hook != nil {
+		ti.m.opts.Hook.Fire(context.Background(), hook.Event{
+			Kind:      hook.EventAsk,
+			SessionID: ti.s.id,
+			WorkDir:   ti.m.opts.WorkDir,
+			Message:   "需要你回答：" + truncateRunes(q.Text, 500),
+		})
 	}
 	defer ti.t.clock.Resume()
 

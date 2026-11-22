@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content     TEXT DEFAULT '',
     tool_calls  TEXT DEFAULT '[]',
     tool_result TEXT DEFAULT '',
+    metadata    TEXT DEFAULT '',
     created_at  REAL NOT NULL,
     UNIQUE(session_id, seq)
 );
@@ -171,7 +172,37 @@ func (s *SQLiteSessionStore) Migrate() error {
 			return fmt.Errorf("init schema_version: %w", err)
 		}
 	}
+	// Backfill messages.metadata column for existing databases.
+	if err := s.ensureColumn("messages", "metadata", "TEXT DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate messages.metadata: %w", err)
+	}
 	return nil
+}
+
+func (s *SQLiteSessionStore) ensureColumn(table, column, colDef string) error {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, colDef))
+	return err
 }
 
 func (s *SQLiteSessionStore) Close() error {
@@ -271,7 +302,7 @@ func (s *SQLiteSessionStore) Load(id string) (*models.Session, error) {
 
 func (s *SQLiteSessionStore) LoadMessages(id string) ([]models.Message, error) {
 	rows, err := s.db.Query(`
-		SELECT id, session_id, role, content, tool_calls, tool_result, created_at
+		SELECT id, session_id, role, content, tool_calls, tool_result, metadata, created_at
 		FROM messages WHERE session_id = ? ORDER BY seq ASC
 	`, id)
 	if err != nil {
@@ -282,9 +313,9 @@ func (s *SQLiteSessionStore) LoadMessages(id string) ([]models.Message, error) {
 	var msgs []models.Message
 	for rows.Next() {
 		var m models.Message
-		var role, toolCalls, toolResult sql.NullString
+		var role, toolCalls, toolResult, metaJSON sql.NullString
 		var createdAt float64
-		if err := rows.Scan(&m.ID, &m.SessionID, &role, &m.Content, &toolCalls, &toolResult, &createdAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &role, &m.Content, &toolCalls, &toolResult, &metaJSON, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		m.Role = models.Role(role.String)
@@ -296,6 +327,12 @@ func (s *SQLiteSessionStore) LoadMessages(id string) ([]models.Message, error) {
 			var tr models.ToolResult
 			if err := json.Unmarshal([]byte(toolResult.String), &tr); err == nil {
 				m.ToolResult = &tr
+			}
+		}
+		if metaJSON.Valid && metaJSON.String != "" && metaJSON.String != "{}" {
+			var meta map[string]string
+			if err := json.Unmarshal([]byte(metaJSON.String), &meta); err == nil && len(meta) > 0 {
+				m.Metadata = meta
 			}
 		}
 		msgs = append(msgs, m)
@@ -377,11 +414,16 @@ func (s *SQLiteSessionStore) AppendMessage(sessionID string, msg models.Message)
 		b, _ := json.Marshal(msg.ToolResult)
 		toolResultJSON = string(b)
 	}
+	metaJSON := ""
+	if len(msg.Metadata) > 0 {
+		b, _ := json.Marshal(msg.Metadata)
+		metaJSON = string(b)
+	}
 
 	_, err = tx.Exec(`
-		INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, msg.ID, sessionID, seq, string(msg.Role), content, toolCallsJSON, toolResultJSON, unixFrac(msg.CreatedAt))
+		INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, msg.ID, sessionID, seq, string(msg.Role), content, toolCallsJSON, toolResultJSON, metaJSON, unixFrac(msg.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append message: %w", err)
 	}
@@ -1095,6 +1137,11 @@ func (s *SQLiteSessionStore) forkInto(origID, origTitle string, origMetadata map
 			b, _ := json.Marshal(m.ToolResult)
 			toolResultJSON = string(b)
 		}
+		metaJSON := ""
+		if len(m.Metadata) > 0 {
+			b, _ := json.Marshal(m.Metadata)
+			metaJSON = string(b)
+		}
 		// N4: ForkSessionFromMessages' caller (the REPL's in-memory
 		// r.sess.Messages) can contain a message runTurn built without
 		// ever setting CreatedAt (repl.go's userMsg) — AppendMessage
@@ -1112,9 +1159,9 @@ func (s *SQLiteSessionStore) forkInto(origID, origTitle string, origMetadata map
 		content := contentWithImagePlaceholder(m.Content, m.Images)
 		newMsgID := newID + "_" + nextSeqID()
 		_, err = tx.Exec(`
-			INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, newMsgID, newID, i+1, string(m.Role), content, toolCallsJSON, toolResultJSON, unixFrac(createdAt))
+			INSERT INTO messages (id, session_id, seq, role, content, tool_calls, tool_result, metadata, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, newMsgID, newID, i+1, string(m.Role), content, toolCallsJSON, toolResultJSON, metaJSON, unixFrac(createdAt))
 		if err != nil {
 			return nil, fmt.Errorf("copy message %d to forked session: %w", i, err)
 		}
