@@ -143,6 +143,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 		WorkDir:     rt.WorkDir,
 		IdleTimeout: f.idleTimeout,
 		TurnTimeout: f.turnTimeout,
+		Hook:        rt.Hook,
 	})
 	if err != nil {
 		_ = ln.Close()

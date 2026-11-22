@@ -176,6 +176,7 @@ type Options struct {
 	Timeout         string     `json:"timeout,omitempty"`
 	Overlap         string     `json:"overlap,omitempty"`
 	Misfire         string     `json:"misfire,omitempty"`
+	MisfireGrace    string     `json:"misfire_grace,omitempty"`
 	Notify          string     `json:"notify,omitempty"`
 	AnswerTimeout   string     `json:"answer_timeout,omitempty"`
 	OnAnswerTimeout string     `json:"on_answer_timeout,omitempty"`
@@ -281,6 +282,7 @@ const (
 	CodeNotFound              Code = "not_found"
 	CodeBadRequest            Code = "bad_request"
 	CodeInvalidTrigger        Code = "invalid_trigger"
+	CodeInvalidCron           Code = "invalid_cron"
 	CodeTriggerNotSupported   Code = "trigger_not_supported"
 	CodeInvalidTimezone       Code = "invalid_timezone"
 	CodeIntervalTooShort      Code = "interval_too_short"

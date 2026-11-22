@@ -646,6 +646,16 @@ schedule:
 
 回归测试集中在 `pkg/schedule/review_test.go` 与 `pkg/bot/review_test.go`。
 
+### 12.3 P2 实现状态（2026-11-22，已全部完成）
+
+| 已落地 | 位置 |
+|---|---|
+| 自写 5 字段 cron 解析与调度引擎（含宏、日 `L`、月/周英文名、Vixie 日/周「或」语义、DST 跳变/重复处理、5 年上限、`min_interval` 校验与中文摘要） | `pkg/schedule/cron.go`、`trigger.go`、`cron_test.go` |
+| `misfire=run_once` 补跑与 `misfire_grace`（默认 1h / 单周期≤24h），合并计数 `coalesced` 与超宽限 `missed` | `pkg/schedule/service.go`、`types.go`、`tool.go`、`cron_test.go` |
+| `pkg/hook` 接入 `deepai-bot`：`schedule_run_end`（按 `notify` 三策略过滤）、`schedule_ask`、`schedule_approval` 与可选 `schedule_id/run_id` 字段，同时接通交互 turn 的 `turn_end`/`ask` | `pkg/hook/hook.go`、`pkg/bot/{manager,schedule,schedule_questions}.go`、`cmd/deepai-bot/{runtime,serve}.go` |
+| Web 控制台「任务」页签（待批准置顶与红点、批准/拒绝、新建任务 + 规则预览、Run 历史、中止运行、点击跳转会话） | `pkg/bot/web/index.html` |
+| 端到端测试（假时钟 + Cron + `Scheduler` + `Manager` + REST + 自动回答 + 真实 `hook.Dispatcher` Webhook 回调） | `pkg/bot/schedule_hook_test.go` |
+
 ## 13. 关键取舍
 
 | 取舍 | 理由 |

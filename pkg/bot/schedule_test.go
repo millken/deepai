@@ -136,8 +136,11 @@ func TestScheduleREST(t *testing.T) {
 	if r := doJSON(t, "POST", base+"/v1/schedule/validate", "", `{"trigger":{"type":"interval","every":"1h"},"timezone":"UTC"}`, nil); r.StatusCode != http.StatusOK {
 		t.Fatalf("validate status = %d", r.StatusCode)
 	}
-	if r := doJSON(t, "POST", base+"/v1/schedule/validate", "", `{"trigger":{"type":"cron","expr":"0 22 * * *"}}`, nil); r.StatusCode != http.StatusBadRequest {
+	if r := doJSON(t, "POST", base+"/v1/schedule/validate", "", `{"trigger":{"type":"cron","expr":"0 22 * * *"}}`, nil); r.StatusCode != http.StatusOK {
 		t.Fatalf("cron validate status = %d", r.StatusCode)
+	}
+	if r := doJSON(t, "POST", base+"/v1/schedule/validate", "", `{"trigger":{"type":"cron","expr":"@reboot"}}`, nil); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid cron validate status = %d", r.StatusCode)
 	}
 	if r := doJSON(t, "POST", base+"/v1/schedules/"+id+"/pause", "", "", nil); r.StatusCode != http.StatusOK {
 		t.Fatalf("pause status = %d", r.StatusCode)

@@ -107,8 +107,16 @@ func TestTriggerNormalizeAndNextRuns(t *testing.T) {
 		}
 	}
 
-	if err := (&Trigger{Type: TriggerCron, Expr: "0 22 * * *"}).Normalize("UTC", testNow, time.Minute, false); ErrorCode(err) != CodeTriggerNotSupported {
-		t.Fatalf("cron err = %v", err)
+	cronTr := Trigger{Type: TriggerCron, Expr: "0 22 * * *"}
+	if err := cronTr.Normalize("Asia/Taipei", testNow, time.Minute, false); err != nil {
+		t.Fatalf("cron normalize err = %v", err)
+	}
+	cronRuns := cronTr.NextRuns(testNow, 2, "Asia/Taipei")
+	if len(cronRuns) != 2 || cronRuns[0].Format(time.RFC3339) != "2026-11-07T14:00:00Z" {
+		t.Fatalf("cron NextRuns = %v", cronRuns)
+	}
+	if err := (&Trigger{Type: TriggerCron, Expr: "0 0 31 2 *"}).Normalize("UTC", testNow, time.Minute, false); ErrorCode(err) != CodeInvalidCron {
+		t.Fatalf("impossible cron err = %v", err)
 	}
 	if err := (&Trigger{Type: TriggerInterval, Every: "1m"}).Normalize("UTC", testNow, 5*time.Minute, false); ErrorCode(err) != CodeIntervalTooShort {
 		t.Fatalf("min interval err = %v", err)
@@ -139,8 +147,8 @@ func TestServiceLifecycle(t *testing.T) {
 	if list, err := svc.List(ctx, "", 0); err != nil || len(list) != 1 {
 		t.Fatalf("list = %v, %v", list, err)
 	}
-	if _, err := svc.Validate(ctx, Trigger{Type: TriggerCron, Expr: "* * * * *"}, "UTC", 3); ErrorCode(err) != CodeTriggerNotSupported {
-		t.Fatalf("validate cron = %v", err)
+	if _, err := svc.Validate(ctx, Trigger{Type: TriggerCron, Expr: "0 0 0 * * *"}, "UTC", 3); ErrorCode(err) != CodeInvalidCron {
+		t.Fatalf("validate invalid 6-field cron = %v", err)
 	}
 
 	paused, err := svc.Pause(ctx, sch.ID)
@@ -385,10 +393,10 @@ func TestToolActionsAndConfirmation(t *testing.T) {
 	}
 
 	if _, err := call(map[string]any{
-		"action": "create", "name": "cron", "prompt": "x",
-		"trigger": map[string]any{"type": "cron", "expr": "0 22 * * *"},
-	}); ErrorCode(err) != CodeTriggerNotSupported {
-		t.Fatalf("cron tool err = %v", err)
+		"action": "create", "name": "bad-cron", "prompt": "x",
+		"trigger": map[string]any{"type": "cron", "expr": "@reboot"},
+	}); ErrorCode(err) != CodeInvalidCron {
+		t.Fatalf("invalid cron tool err = %v", err)
 	}
 
 	nested := tools.WithScheduleRun(ctx, "sch_parent", "run_parent")

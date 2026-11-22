@@ -19,6 +19,7 @@ import (
 	"github.com/millken/deepai/pkg/clarification"
 	"github.com/millken/deepai/pkg/claudeplugin"
 	"github.com/millken/deepai/pkg/commands"
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/mcp"
 	"github.com/millken/deepai/pkg/memory"
@@ -59,6 +60,8 @@ type botRuntime struct {
 	Schedule       *schedule.Service
 	ScheduleStore  schedule.Store
 	ScheduleConfig schedule.Config
+	// Hook delivers outbound notifications (nil when notifications are unconfigured).
+	Hook *hook.Dispatcher
 	// Close releases MCP servers and the database. Call it after the
 	// bot.Manager has been closed.
 	Close func()
@@ -294,6 +297,12 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		}
 	}
 
+	var hookDisp *hook.Dispatcher
+	if len(cfg.Notifications) > 0 {
+		hookDisp = hook.NewDispatcher(cfg.Notifications)
+		closers = append(closers, func() { hookDisp.WaitIdle(5 * time.Second) })
+	}
+
 	rt, err := bot.NewAgentRuntime(rtCfg)
 	if err != nil {
 		return nil, err
@@ -301,6 +310,7 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 	return &botRuntime{
 		Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, Close: closeAll,
 		Schedule: schedSvc, ScheduleStore: schedStore, ScheduleConfig: schedCfg,
+		Hook: hookDisp,
 	}, nil
 }
 

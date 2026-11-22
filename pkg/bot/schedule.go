@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/schedule"
 )
@@ -18,7 +19,7 @@ import (
 // one way (Service → bot-wide bus) and executions flow the other way
 // (Service → Dispatcher → Manager.Send on an ordinary session turn).
 func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
-	svc.SetObserver(&scheduleObserver{m: m, last: map[string]schedule.RunStatus{}})
+	svc.SetObserver(&scheduleObserver{m: m, svc: svc, last: map[string]schedule.RunStatus{}})
 	d := NewScheduleDispatcher(m, svc)
 	svc.SetDispatcher(d)
 	go d.watchTurnEnd()
@@ -76,6 +77,7 @@ func (d *ScheduleDispatcher) wakePending() {
 // subscribe to run.session_id and see the ordinary turn events.
 type scheduleObserver struct {
 	m    *Manager
+	svc  *schedule.Service
 	mu   sync.Mutex
 	last map[string]schedule.RunStatus
 }
@@ -89,6 +91,21 @@ func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.
 		typ = EventScheduleDeleted
 	}
 	o.m.global.publish(Event{Type: typ, Schedule: &sch, Time: time.Now().UTC()})
+
+	if kind == schedule.ChangeCreated && sch.State == schedule.StatePendingApproval &&
+		o.m.opts.Hook != nil && sch.Options.Notify != schedule.NotifyNever {
+		summary := sch.Summary
+		if summary == "" {
+			summary = sch.Trigger.Summary(sch.Timezone)
+		}
+		o.m.opts.Hook.Fire(context.Background(), hook.Event{
+			Kind:       hook.EventScheduleApproval,
+			SessionID:  sch.CreatedBy.SessionID,
+			WorkDir:    o.m.opts.WorkDir,
+			ScheduleID: sch.ID,
+			Message:    fmt.Sprintf("模型请求创建任务「%s」：%s", sch.Name, summary),
+		})
+	}
 }
 
 func (o *scheduleObserver) RunChanged(run schedule.Run) {
@@ -110,6 +127,96 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 		typ = EventScheduleRunStarted
 	}
 	o.m.global.publish(Event{Type: typ, Run: &run, Time: time.Now().UTC()})
+
+	if run.Status.Terminal() && o.m.opts.Hook != nil && o.svc != nil {
+		// Dispatch asynchronously: RunChanged is called while Service.mu is
+		// held, so we must NOT synchronously call back into Service.Get.
+		go o.notifyRunEnd(run)
+	}
+}
+
+func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sch, err := o.svc.Get(ctx, run.ScheduleID)
+	if err != nil {
+		return
+	}
+	if !shouldNotifyRunEnd(sch.Options.Notify, run.Status) {
+		return
+	}
+	msg := formatScheduleRunMessage(sch.Name, run)
+	o.m.opts.Hook.Fire(context.Background(), hook.Event{
+		Kind:       hook.EventScheduleRunEnd,
+		SessionID:  run.SessionID,
+		WorkDir:    o.m.opts.WorkDir,
+		ScheduleID: run.ScheduleID,
+		RunID:      run.ID,
+		Message:    msg,
+	})
+}
+
+// shouldNotifyRunEnd implements the notify policy matrix in design §10:
+//   - skipped: never notifies
+//   - never: never notifies
+//   - on_failure: failed, timed_out, missed
+//   - always (default): completed, failed, timed_out, missed, cancelled
+func shouldNotifyRunEnd(notify string, status schedule.RunStatus) bool {
+	if status == schedule.RunSkipped || notify == schedule.NotifyNever {
+		return false
+	}
+	switch notify {
+	case schedule.NotifyOnFailure:
+		return status == schedule.RunFailed || status == schedule.RunTimedOut || status == schedule.RunMissed
+	default: // NotifyAlways or empty
+		return status == schedule.RunCompleted || status == schedule.RunFailed ||
+			status == schedule.RunTimedOut || status == schedule.RunMissed || status == schedule.RunCancelled
+	}
+}
+
+func formatScheduleRunMessage(name string, run schedule.Run) string {
+	switch run.Status {
+	case schedule.RunCompleted:
+		if out := strings.TrimSpace(run.Output); out != "" {
+			return fmt.Sprintf("「%s」完成：%s", name, truncateRunes(out, 500))
+		}
+		return fmt.Sprintf("「%s」完成", name)
+	case schedule.RunFailed:
+		return fmt.Sprintf("「%s」失败：%s", name, truncateRunes(firstNonEmpty(run.Error, run.ErrorCode, "unknown error"), 500))
+	case schedule.RunTimedOut:
+		return fmt.Sprintf("「%s」超时：%s", name, truncateRunes(firstNonEmpty(run.Error, "timed_out"), 500))
+	case schedule.RunMissed:
+		return fmt.Sprintf("「%s」错过执行（%s）", name, firstNonEmpty(run.ErrorCode, "missed"))
+	case schedule.RunCancelled:
+		return fmt.Sprintf("「%s」已取消", name)
+	default:
+		return fmt.Sprintf("「%s」%s", name, run.Status)
+	}
+}
+
+func hookSummary(prefix, output, errText string) string {
+	body := firstNonEmpty(strings.TrimSpace(errText), strings.TrimSpace(output))
+	if body == "" {
+		return prefix
+	}
+	return prefix + "：" + truncateRunes(body, 500)
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ScheduleDispatcher implements schedule.Dispatcher by starting one ordinary
