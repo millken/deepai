@@ -218,6 +218,72 @@ func TestScheduleHookEvents(t *testing.T) {
 	}
 }
 
+// PR #49 round-2 L4: after a restart (fresh Manager + AttachSchedule over an
+// existing Store), deleting a pre-existing schedule while a run is active must
+// still deliver the cancelled schedule_run_end notification even though the
+// new process never saw ScheduleChanged for that schedule.
+func TestDeletePreExistingScheduleAfterRestartNotifiesRunEnd(t *testing.T) {
+	ctx := context.Background()
+	sharedStore := schedule.NewMemoryStore()
+	cfg := schedule.DefaultConfig()
+	cfg.Confirm = "auto"
+	cfg.Timezone = "UTC"
+
+	// Process 1 creates the schedule and exits.
+	svc1, err := schedule.NewService(sharedStore, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre, err := svc1.Create(ctx, schedule.CreateInput{
+		Name: "重启前任务", Prompt: "ask",
+		Trigger:  schedule.Trigger{Type: schedule.TriggerOnce, In: "1h"},
+		Timezone: "UTC",
+		Options:  schedule.Options{Notify: schedule.NotifyAlways, AnswerTimeout: "10s"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Process 2 starts fresh over the same store and attaches observer.
+	emitter := &recordingEmitter{}
+	m2, err := NewManager(Options{
+		Runtime: &questionRuntime{fakeRuntime: &fakeRuntime{}, questions: 1},
+		Store:   NewMemoryStore(),
+		WorkDir: "/tmp/restart",
+		Hook:    emitter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = m2.Close(cctx)
+	})
+
+	svc2, err := schedule.NewService(sharedStore, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	AttachSchedule(m2, svc2)
+
+	run, err := svc2.RunNow(ctx, pre.ID, "req-restart-del")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunStatus(t, svc2, run.ID, schedule.RunWaitingInput)
+
+	if _, err := svc2.Delete(ctx, pre.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waitRunStatus(t, svc2, run.ID, schedule.RunCancelled)
+
+	ev := emitter.waitFor(t, hook.EventScheduleRunEnd)
+	if ev.ScheduleID != pre.ID || ev.RunID != run.ID || !strings.Contains(ev.Message, "重启前任务") || !strings.Contains(ev.Message, "已取消") {
+		t.Fatalf("unexpected restart-delete run_end event = %+v", ev)
+	}
+}
+
 // End-to-end test: cron schedule created over REST -> real Scheduler with fake
 // clock fires when cron slot arrives -> fakeRuntime asks a question ->
 // auto-answer completes the run -> real hook.Dispatcher delivers webhook JSON.

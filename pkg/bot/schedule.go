@@ -19,7 +19,15 @@ import (
 // one way (Service → bot-wide bus) and executions flow the other way
 // (Service → Dispatcher → Manager.Send on an ordinary session turn).
 func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
-	svc.SetObserver(&scheduleObserver{m: m, svc: svc, last: map[string]schedule.RunStatus{}})
+	obs := &scheduleObserver{m: m, svc: svc, last: map[string]schedule.RunStatus{}, meta: map[string]scheduleMeta{}}
+	// Warm the metadata cache with existing schedules so a soft-delete
+	// immediately after restart still has name/notify for cancelled run_end hooks.
+	if list, err := svc.List(context.Background(), "", 0); err == nil {
+		for _, sch := range list {
+			obs.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+		}
+	}
+	svc.SetObserver(obs)
 	d := NewScheduleDispatcher(m, svc)
 	svc.SetDispatcher(d)
 	go d.watchTurnEnd()
