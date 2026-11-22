@@ -76,13 +76,27 @@ func (d *ScheduleDispatcher) wakePending() {
 // execution process itself is deliberately NOT mirrored here: clients
 // subscribe to run.session_id and see the ordinary turn events.
 type scheduleObserver struct {
-	m    *Manager
-	svc  *schedule.Service
-	mu   sync.Mutex
-	last map[string]schedule.RunStatus
+	m     *Manager
+	svc   *schedule.Service
+	mu    sync.Mutex
+	last  map[string]schedule.RunStatus
+	meta  map[string]scheduleMeta
+}
+
+type scheduleMeta struct {
+	name   string
+	notify string
 }
 
 func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.ChangeKind) {
+	if kind != schedule.ChangeDeleted && sch.ID != "" {
+		o.mu.Lock()
+		if o.meta == nil {
+			o.meta = map[string]scheduleMeta{}
+		}
+		o.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+		o.mu.Unlock()
+	}
 	typ := EventScheduleUpdated
 	switch kind {
 	case schedule.ChangeCreated:
@@ -136,16 +150,33 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 }
 
 func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
+	var name, notify string
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	sch, err := o.svc.Get(ctx, run.ScheduleID)
-	if err != nil {
+	if sch, err := o.svc.Get(ctx, run.ScheduleID); err == nil {
+		name, notify = sch.Name, sch.Options.Notify
+		o.mu.Lock()
+		if o.meta == nil {
+			o.meta = map[string]scheduleMeta{}
+		}
+		o.meta[run.ScheduleID] = scheduleMeta{name: name, notify: notify}
+		o.mu.Unlock()
+	} else {
+		// Fall back to cached metadata: Delete soft-deletes the schedule before
+		// this async goroutine runs, causing Get to return not_found.
+		o.mu.Lock()
+		cached, ok := o.meta[run.ScheduleID]
+		o.mu.Unlock()
+		if !ok {
+			o.m.log.Warn("bot: lookup schedule for run_end notification failed", "schedule", run.ScheduleID, "run", run.ID, "err", err)
+			return
+		}
+		name, notify = cached.name, cached.notify
+	}
+	if !shouldNotifyRunEnd(notify, run.Status) {
 		return
 	}
-	if !shouldNotifyRunEnd(sch.Options.Notify, run.Status) {
-		return
-	}
-	msg := formatScheduleRunMessage(sch.Name, run)
+	msg := formatScheduleRunMessage(name, run)
 	o.m.opts.Hook.Fire(context.Background(), hook.Event{
 		Kind:       hook.EventScheduleRunEnd,
 		SessionID:  run.SessionID,

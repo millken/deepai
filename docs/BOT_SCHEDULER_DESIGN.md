@@ -190,7 +190,7 @@ UNIQUE(schedule_id, request_id)
 - 修改 `timezone` 视同修改 `trigger`（重算 `next_run_at`，`ask` 模式下需确认）。
 - `once.at` 早于"现在 − 1 分钟"拒绝（`time_in_past`）。
 - `interval.every` 最小值 = `schedule.min_interval`（默认 5m）；cron 两次触发间隔同样受此约束（校验时检查未来 10 次）。`start_at` 缺省 = 创建时刻 + `every`。
-- **P1 不支持 `cron`**：创建时返回 `trigger_not_supported`，提示"cron 将在后续版本提供，请改用 interval 或 once"。
+- **已支持 5 字段 `cron`**（P2 落地，见第 5 节）；不支持的语法（秒/年字段、`?`/`W`/`#`/`@reboot`/`@every`）在创建时返回 `invalid_cron` 并给出提示。
 
 ### 3.4 SQLite 表
 
@@ -343,7 +343,7 @@ Run 历史按任务保留最近 200 条（可配置），超出的在 janitor �
 
 只实现确定需要的子集，规则写死、行为可预测；不支持的写法在创建时报错并给出提示，由模型改写。
 
-P2 提供；P1 对 `cron` 类型返回 `trigger_not_supported`（3.3）。
+已在 P2 落地（`pkg/schedule/cron.go`）；P1 阶段曾对 `cron` 返回 `trigger_not_supported`，现已开放。
 
 **格式**：5 字段 `分 时 日 月 周`，空格分隔。
 

@@ -187,6 +187,35 @@ func TestScheduleHookEvents(t *testing.T) {
 	if after := emitter.count(hook.EventScheduleRunEnd); after != beforeCount {
 		t.Fatalf("notify=never emitted run_end: before=%d after=%d", beforeCount, after)
 	}
+
+	// 4. deleting a schedule while a run is active still delivers cancelled run_end
+	// via cached metadata even after the schedule is soft-deleted (PR #49 L4).
+	delSch, err := svc.Create(ctx, schedule.CreateInput{
+		Name: "删前取消", Prompt: "ask",
+		Trigger:  schedule.Trigger{Type: schedule.TriggerOnce, In: "1h"},
+		Timezone: "UTC",
+		Options:  schedule.Options{Notify: schedule.NotifyAlways, AnswerTimeout: "10s"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delRun, err := svc.RunNow(ctx, delSch.ID, "req-del-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunStatus(t, svc, delRun.ID, schedule.RunWaitingInput)
+	beforeDel := emitter.count(hook.EventScheduleRunEnd)
+	if _, err := svc.Delete(ctx, delSch.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waitRunStatus(t, svc, delRun.ID, schedule.RunCancelled)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && emitter.count(hook.EventScheduleRunEnd) == beforeDel {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if emitter.count(hook.EventScheduleRunEnd) <= beforeDel {
+		t.Fatalf("deleting active schedule lost cancelled schedule_run_end notification")
+	}
 }
 
 // End-to-end test: cron schedule created over REST -> real Scheduler with fake

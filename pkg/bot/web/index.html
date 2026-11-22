@@ -73,6 +73,7 @@
   .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .bubble { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; white-space: pre-wrap; word-break: break-word; }
   .msg.human .bubble { background: #1a2740; border-color: #27406b; }
+  .msg.target-run .bubble { box-shadow: 0 0 0 2px var(--accent); transition: box-shadow .3s ease; }
   .bubble pre { background: #0b0d11; border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow-x: auto; white-space: pre; margin: 8px 0; }
   .bubble code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
   .tools { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
@@ -224,11 +225,25 @@
     }
   }
 
-  async function openSession(id, resume) {
+  function showSessionChrome(visible) {
+    document.querySelector("footer").style.display = visible ? "" : "none";
+    $("model").style.display = visible ? "" : "none";
+    $("cancelBtn").style.display = visible ? "" : "none";
+  }
+
+  function showEmptySessionView() {
+    state.currentSch = null;
+    showSessionChrome(true);
+    $("title").textContent = "—";
+    $("log").innerHTML = `<div class="empty"><h2>DeepAI Bot</h2><p>选择或新建一个会话开始。</p></div>`;
+    $("input").disabled = true;
+    setRunning(false);
+  }
+
+  async function openSession(id, resume, targetRunId) {
     if (state.sideTab !== "sessions") setSideTab("sessions");
     state.currentSch = null;
-    document.querySelector("footer").style.display = "";
-    $("model").style.display = ""; $("cancelBtn").style.display = "";
+    showSessionChrome(true);
     if (state.current && state.current !== id) call({ op: "unsubscribe", session_id: state.current }).catch(() => {});
     state.current = id; drawSessions();
     const { session, messages } = await call({ op: "get_session", session_id: id });
@@ -237,27 +252,43 @@
     if (session.model) $("model").value = session.model;
     $("log").innerHTML = "";
     state.turnEl = null; state.toolEls.clear();
-    drawTranscript(messages);
+    drawTranscript(messages, targetRunId);
     setRunning(session.status === "running");
     // Replay the running turn's events (if any) from the buffer, then go live.
     const since = session.status === "running" ? 0 : session.last_seq;
     state.lastSeq.set(id, since);
     await call({ op: "subscribe", session_id: id, since });
     for (const q of session.pending || []) showQuestion(q);
-    $("input").disabled = false; $("input").focus();
+    $("input").disabled = false;
+    if (!targetRunId) $("input").focus();
   }
 
-  function drawTranscript(messages) {
+  function drawTranscript(messages, targetRunId) {
     let aiEl = null;
+    let targetEl = null;
     for (const m of messages || []) {
-      if (m.role === "human") { addMsg("human", "你").bubble.innerHTML = render(m.content); aiEl = null; }
-      else if (m.role === "ai") {
+      if (m.role === "human") {
+        const isSched = m.metadata && m.metadata.source === "schedule";
+        const msg = addMsg("human", isSched ? "⏰ 定时触发" : "你");
+        msg.bubble.innerHTML = render(m.content);
+        if (m.metadata && m.metadata.run_id) {
+          msg.root.dataset.runId = m.metadata.run_id;
+          if (targetRunId && m.metadata.run_id === targetRunId) targetEl = msg.root;
+        }
+        aiEl = null;
+      } else if (m.role === "ai") {
         if (!aiEl) aiEl = addMsg("ai", "DeepAI");
         if (m.content) { const b = document.createElement("div"); b.className = "bubble"; b.innerHTML = render(m.content); aiEl.root.appendChild(b); }
         for (const tc of m.tool_calls || []) aiEl.tools.appendChild(toolEl(tc.name, "completed", "", JSON.stringify(tc.arguments || {})));
       }
     }
-    scroll();
+    if (targetEl) {
+      targetEl.classList.add("target-run");
+      targetEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      setTimeout(() => targetEl.classList.remove("target-run"), 2500);
+    } else {
+      scroll();
+    }
   }
   function addMsg(role, who) {
     const root = document.createElement("div"); root.className = "msg " + role;
@@ -477,14 +508,20 @@
 
   async function openSchedule(id) {
     if (state.sideTab !== "schedules") setSideTab("schedules");
+    let s, runs;
+    try {
+      const [sRes, rRes] = await Promise.all([
+        call({ op: "get_schedule", schedule_id: id }),
+        call({ op: "list_runs", schedule_id: id, params: { limit: 30 } }),
+      ]);
+      s = sRes.schedule; runs = rRes.runs;
+    } catch (e) {
+      note("加载任务失败：" + (e.message || e), "err");
+      return;
+    }
     state.currentSch = id;
     drawSchedules();
-    document.querySelector("footer").style.display = "none";
-    $("model").style.display = "none"; $("cancelBtn").style.display = "none";
-    const [{ schedule: s }, { runs }] = await Promise.all([
-      call({ op: "get_schedule", schedule_id: id }),
-      call({ op: "list_runs", schedule_id: id, params: { limit: 30 } }),
-    ]);
+    showSessionChrome(false);
     state.schedules.set(id, s);
     $("title").textContent = "⏰ " + s.name;
     const log = $("log"); log.innerHTML = "";
@@ -524,8 +561,8 @@
           (r.error ? `<div class="sch-meta err">${esc(r.error)}</div>` : "");
         const row = document.createElement("div"); row.className = "sch-row";
         if (r.session_id) {
-          row.append(mkBtn("查看会话", "", (ev) => { ev.stopPropagation(); openSession(r.session_id); }));
-          item.onclick = () => openSession(r.session_id);
+          row.append(mkBtn("查看会话", "", (ev) => { ev.stopPropagation(); openSession(r.session_id, false, r.id); }));
+          item.onclick = () => openSession(r.session_id, false, r.id);
         }
         if (r.status === "running" || r.status === "waiting_input" || r.status === "pending") {
           row.append(mkBtn("中止", "danger", async (ev) => {
@@ -598,7 +635,11 @@
     return b;
   }
 
-  $("tabSessions").onclick = () => { setSideTab("sessions"); if (state.current) openSession(state.current); };
+  $("tabSessions").onclick = () => {
+    setSideTab("sessions");
+    if (state.current) openSession(state.current);
+    else showEmptySessionView();
+  };
   $("tabSchedules").onclick = () => { setSideTab("schedules"); refreshSchedules(); };
   $("newSchBtn").onclick = showNewScheduleForm;
   $("sendBtn").onclick = send;

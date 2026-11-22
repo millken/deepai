@@ -64,16 +64,14 @@ func ParseCron(expr string) (*CronSpec, error) {
 	if len(fields) != 5 {
 		return nil, NewError(CodeInvalidCron, "cron expression must have 5 fields (minute hour day month weekday), got %d; seconds/year fields are not supported", len(fields))
 	}
-	for _, f := range fields {
-		if strings.ContainsAny(f, "?#W") || strings.Contains(strings.ToUpper(f), "W") && !isNamedToken(f) {
-			if strings.ContainsAny(f, "?#") {
-				return nil, NewError(CodeInvalidCron, "cron token %q uses unsupported syntax (?, W, # are not supported)", f)
-			}
+	for i, f := range fields {
+		if strings.ContainsAny(f, "?#") {
+			return nil, NewError(CodeInvalidCron, "cron token %q uses unsupported syntax (?, W, # are not supported)", f)
 		}
-	}
-	// Explicit check for W in DOM field (e.g. 15W).
-	if strings.ContainsAny(strings.ToUpper(fields[2]), "W") {
-		return nil, NewError(CodeInvalidCron, "cron day-of-month %q uses unsupported 'W' modifier", fields[2])
+		// Reject 'W' modifier in any field except the legitimate weekday name "WED" in DOW.
+		if strings.ContainsAny(strings.ToUpper(f), "W") && !(i == 4 && isWeekdayOnlyW(f)) {
+			return nil, NewError(CodeInvalidCron, "cron token %q uses unsupported syntax (?, W, # are not supported)", f)
+		}
 	}
 
 	minBits, err := parseCronField(fields[0], 0, 59, nil)
@@ -110,9 +108,10 @@ func ParseCron(expr string) (*CronSpec, error) {
 	}, nil
 }
 
-func isNamedToken(f string) bool {
-	u := strings.ToUpper(f)
-	return strings.Contains(u, "WED")
+// isWeekdayOnlyW reports whether every 'W' in a DOW field belongs to "WED".
+func isWeekdayOnlyW(f string) bool {
+	cleaned := strings.ReplaceAll(strings.ToUpper(f), "WED", "")
+	return !strings.ContainsRune(cleaned, 'W')
 }
 
 func parseDOMField(field string) (uint64, bool, error) {
@@ -268,11 +267,25 @@ func (c *CronSpec) Next(after time.Time, loc *time.Location) (time.Time, bool) {
 		loc = time.UTC
 	}
 	// Candidate wall-clock starts at the next whole minute after `after`.
-	base := after.In(loc).Truncate(time.Minute).Add(time.Minute)
+	// If that 1-minute UTC step crosses a DST spring-forward gap (e.g. 01:59
+	// EST -> 03:00 EDT), wall-clock minutes inside the skipped gap (02:00..02:59)
+	// would never be visited if we started at `base`'s wall clock. Start from
+	// `after`'s wall clock + 1 minute in wall-clock arithmetic so any match
+	// inside the gap is still resolved to the first minute after the transition.
+	afterLocal := after.In(loc)
+	base := afterLocal.Truncate(time.Minute).Add(time.Minute)
 	limit := base.AddDate(5, 0, 0)
 
-	year, month, day := base.Year(), base.Month(), base.Day()
-	hour, min := base.Hour(), base.Minute()
+	year, month, day := afterLocal.Year(), afterLocal.Month(), afterLocal.Day()
+	hour, min := afterLocal.Hour(), afterLocal.Minute()+1
+	if min >= 60 {
+		min = 0
+		hour++
+		if hour >= 24 {
+			hour = 0
+			day++
+		}
+	}
 
 	// Track the last instant we tried in a gap/overlap so we never loop.
 	for year <= limit.Year() {

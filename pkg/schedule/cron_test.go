@@ -109,6 +109,20 @@ func TestCronParseAndNext(t *testing.T) {
 			want:  "2026-03-08T03:00:00-04:00",
 		},
 		{
+			name:  "DST spring forward gap from last minute before jump (01:59:00 EST -> 03:00 EDT)",
+			expr:  "30 2 * * *",
+			loc:   ny,
+			after: time.Date(2026, 3, 8, 1, 59, 0, 0, ny),
+			want:  "2026-03-08T03:00:00-04:00",
+		},
+		{
+			name:  "DST spring forward gap from 01:59:30 EST -> 03:00 EDT",
+			expr:  "30 2 * * *",
+			loc:   ny,
+			after: time.Date(2026, 3, 8, 1, 59, 30, 0, ny),
+			want:  "2026-03-08T03:00:00-04:00",
+		},
+		{
 			name:  "DST fall back overlap (America/New_York 2026-11-01 01:30 fires once on first occurrence EDT)",
 			expr:  "30 1 * * *",
 			loc:   ny,
@@ -178,6 +192,18 @@ func TestCronRejectsUnsupportedAndMinInterval(t *testing.T) {
 		if _, err := ParseCron(expr); ErrorCode(err) != CodeInvalidCron {
 			t.Errorf("ParseCron(%q) err = %v, want CodeInvalidCron", expr, err)
 		}
+	}
+
+	// Verify W in non-DOM fields (e.g. hour/dow) gives the same unsupported syntax error.
+	for _, expr := range []string{"0 9W * * *", "0 9 * * 1W"} {
+		_, err := ParseCron(expr)
+		if ErrorCode(err) != CodeInvalidCron || !strings.Contains(err.Error(), "unsupported syntax") {
+			t.Errorf("ParseCron(%q) err = %v, want unsupported syntax error", expr, err)
+		}
+	}
+	// WED in DOW remains valid.
+	if _, err := ParseCron("0 9 * * WED"); err != nil {
+		t.Fatalf("WED in DOW should be valid: %v", err)
 	}
 
 	// Impossible date (Feb 31) rejected on Normalize.
