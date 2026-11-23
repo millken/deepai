@@ -1364,6 +1364,12 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 			}
 
 			if err := ctx.Err(); err != nil {
+				// Same pairing invariant as the fatal branch above: the serial
+				// loop never executed toolCalls[idx+1:], so synthesize a failed
+				// placeholder for each one — runMessages is persisted even on
+				// error, and a tool_use without its tool_result poisons every
+				// later request of the session (issue #50).
+				batch.appendSynthesizedFailures(toolCalls[idx+1:])
 				batch.flushPendingHints()
 				err = normalizeRunError(ctx, err, a.requestTimeout)
 				emit(AgentEvent{Type: AgentEventError, Err: err.Error(), Error: newAgentError(err)})

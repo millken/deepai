@@ -41,16 +41,20 @@ type Config struct {
 // Proxy is a transparent reverse proxy for OpenAI/Anthropic APIs
 // that logs all requests and responses as event streams.
 type Proxy struct {
-	cfg          Config
-	httpServer   *http.Server
-	logger       *slog.Logger
-	store        EventStore
-	storeMu      sync.RWMutex
-	httpClient   *http.Client
-	logCh        chan []LogEvent
-	logDone      chan struct{}
+	cfg        Config
+	httpServer *http.Server
+	logger     *slog.Logger
+	store      EventStore
+	storeMu    sync.RWMutex
+	httpClient *http.Client
+	logCh      chan []LogEvent
+	logDone    chan struct{}
+	// logMu makes emitEvents' check-then-send atomic against Shutdown's
+	// close(logCh): closing while a request that passed the shuttingDown
+	// check is still sending panics with "send on closed channel".
+	logMu        sync.RWMutex
+	shuttingDown bool // guarded by logMu
 	shutdownOnce sync.Once
-	shuttingDown atomic.Bool
 }
 
 var requestSeq uint64
@@ -157,7 +161,9 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	}
 	var shutdownErr error
 	p.shutdownOnce.Do(func() {
-		p.shuttingDown.Store(true)
+		p.logMu.Lock()
+		p.shuttingDown = true
+		p.logMu.Unlock()
 		if _, ok := ctx.Deadline(); !ok {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, p.cfg.ShutdownTimeout)
@@ -166,7 +172,9 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 		if p.httpServer != nil {
 			shutdownErr = p.httpServer.Shutdown(ctx)
 		}
+		p.logMu.Lock()
 		close(p.logCh)
+		p.logMu.Unlock()
 		<-p.logDone
 	})
 	return shutdownErr
@@ -231,9 +239,13 @@ func (p *Proxy) withRecover(next http.Handler) http.Handler {
 
 // emitEvents sends a batch of log events to the background writer channel.
 // Non-blocking: if the channel is full or the proxy is shutting down,
-// the batch is dropped and a warning is logged.
+// the batch is dropped and a warning is logged. The check and the send
+// share Shutdown's write lock so the two can never interleave with
+// close(logCh).
 func (p *Proxy) emitEvents(events []LogEvent) {
-	if p.shuttingDown.Load() || len(events) == 0 {
+	p.logMu.RLock()
+	defer p.logMu.RUnlock()
+	if p.shuttingDown || len(events) == 0 {
 		return
 	}
 	select {

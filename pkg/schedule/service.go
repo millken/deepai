@@ -300,8 +300,8 @@ func (s *Service) Get(ctx context.Context, id string) (Schedule, error) {
 	return s.Decorate(v), nil
 }
 
-// Update applies a partial patch and recomputes next_run_at when the rule or
-// timezone changed.
+// Update applies a partial patch and recomputes next_run_at when the rule,
+// timezone or end_at changed.
 func (s *Service) Update(ctx context.Context, id string, p Patch) (Schedule, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,7 +312,7 @@ func (s *Service) Update(ctx context.Context, id string, p Patch) (Schedule, err
 	if v.State == StateDeleted || v.State == StateCompleted {
 		return Schedule{}, NewError(CodeInvalidState, "schedule %s is %s", id, v.State)
 	}
-	ruleChanged := p.Trigger != nil || p.Timezone != nil
+	ruleChanged := p.Trigger != nil || p.Timezone != nil || p.EndAt != nil || p.ClearEndAt
 	if p.Name != nil {
 		name := strings.TrimSpace(*p.Name)
 		if name == "" || len([]rune(name)) > 80 {
