@@ -51,7 +51,6 @@ func TestSerialBatch_CtxCancelSynthesizesRemainingResults(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run err = %v, want context.Canceled", err)
 	}
-	_ = cancelCtx
 
 	got := map[string]bool{}
 	for _, m := range res.Messages {

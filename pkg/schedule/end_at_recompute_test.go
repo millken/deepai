@@ -60,5 +60,4 @@ func TestUpdate_EndAtRecomputesNextRunAt(t *testing.T) {
 	if sch.NextRunAt == nil || !sch.NextRunAt.Equal(testNow.Add(time.Hour)) {
 		t.Fatalf("NextRunAt = %v with EndAt %v, want %v", sch.NextRunAt, later, testNow.Add(time.Hour))
 	}
-	_ = clock
 }
