@@ -19,6 +19,7 @@ import (
 // one way (Service → bot-wide bus) and executions flow the other way
 // (Service → Dispatcher → Manager.Send on an ordinary session turn).
 func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
+	m.SetSchedules(svc)
 	obs := &scheduleObserver{m: m, svc: svc, last: map[string]schedule.RunStatus{}, meta: map[string]scheduleMeta{}}
 	// Warm the metadata cache with existing schedules so a soft-delete
 	// immediately after restart still has name/notify for cancelled run_end hooks.
@@ -290,8 +291,16 @@ func NewScheduleDispatcher(m *Manager, svc *schedule.Service) *ScheduleDispatche
 // the Manager owns the pausable turnClock, so the Dispatcher no longer runs
 // a competing timer (design §7.2).
 func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, run schedule.Run) (string, string, error) {
+	botID := effectiveBotID(sch.BotID)
+	profile, err := d.m.GetBot(ctx, botID)
+	if err != nil || !profile.Enabled {
+		return "", "", schedule.ErrBotDisabled
+	}
 	sessionID, err := d.resolveSession(sch, run)
 	if err != nil {
+		if errors.Is(err, ErrBotDisabled) {
+			return "", "", schedule.ErrBotDisabled
+		}
 		return "", "", err
 	}
 	timeout := runTimeout(sch.Options.Timeout)
@@ -299,30 +308,37 @@ func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, ru
 	content := scheduledMessage(sch, run)
 	req := SendRequest{Content: content, Model: sch.Options.Model}
 	opts := SendOptions{
-		ScheduleID:   sch.ID,
-		RunID:        run.ID,
-		Timeout:      timeout,
-		MaxToolCalls: sch.Options.MaxToolCalls,
-		Hooks:        hooks,
+		ScheduleID:    sch.ID,
+		RunID:         run.ID,
+		Timeout:       timeout,
+		MaxToolCalls:  sch.Options.MaxToolCalls,
+		ToolAllowlist: sch.Options.ToolAllowlist,
+		Hooks:         hooks,
 		Metadata: map[string]string{
 			"schedule_id": sch.ID,
 			"run_id":      run.ID,
 			"source":      "schedule",
 		},
 	}
-	turn, err := d.m.SendWithOptions(sessionID, req, opts)
+	turn, err := d.m.SendForBot(botID, sessionID, req, opts)
 	if err != nil {
 		// A dedicated session may have been deleted by the user; recreate it
 		// lazily (docs/BOT_SCHEDULER_DESIGN.md §6).
 		if errors.Is(err, ErrNotFound) && sch.Options.SessionMode != schedule.SessionOrigin {
 			sessionID, err = d.createSession(sch)
 			if err != nil {
+				if errors.Is(err, ErrBotDisabled) {
+					return "", "", schedule.ErrBotDisabled
+				}
 				return "", "", err
 			}
 			hooks.setSessionID(sessionID)
-			turn, err = d.m.SendWithOptions(sessionID, req, opts)
+			turn, err = d.m.SendForBot(botID, sessionID, req, opts)
 		}
 		if err != nil {
+			if errors.Is(err, ErrBotDisabled) {
+				return "", "", schedule.ErrBotDisabled
+			}
 			if errors.Is(err, ErrBusy) || errors.Is(err, ErrClosed) {
 				return "", "", schedule.ErrBusy
 			}
@@ -456,7 +472,7 @@ func (d *ScheduleDispatcher) resolveSession(sch schedule.Schedule, run schedule.
 }
 
 func (d *ScheduleDispatcher) createSession(sch schedule.Schedule) (string, error) {
-	info, err := d.m.CreateSession(CreateSessionRequest{Title: "⏰ " + sch.Name})
+	info, err := d.m.CreateSessionForBot(effectiveBotID(sch.BotID), CreateSessionRequest{Title: "⏰ " + sch.Name})
 	if err != nil {
 		return "", fmt.Errorf("create schedule session: %w", err)
 	}

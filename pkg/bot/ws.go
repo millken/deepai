@@ -25,6 +25,8 @@ const wsMaxFrame = 4 << 20
 type WSRequest struct {
 	ID         string `json:"id,omitempty"`
 	Op         string `json:"op"`
+	BotID      string `json:"bot_id,omitempty"`
+	Force      bool   `json:"force,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 	Since      *int64 `json:"since,omitempty"`
 	Content    string `json:"content,omitempty"`
@@ -34,8 +36,8 @@ type WSRequest struct {
 	Answer     string `json:"answer,omitempty"`
 	Limit      int    `json:"limit,omitempty"`
 
-	// Schedule ops (docs/BOT_SCHEDULER_DESIGN.md §9.3). Params mirrors the
-	// REST body; ScheduleID/RunID keep ids out of the correlation ID field.
+	// Schedule & Bot ops. Params mirrors the REST body; ScheduleID/RunID keep
+	// ids out of the correlation ID field.
 	ScheduleID string         `json:"schedule_id,omitempty"`
 	RunID      string         `json:"run_id,omitempty"`
 	Params     map[string]any `json:"params,omitempty"`
@@ -155,25 +157,54 @@ func (c *wsConn) reply(ctx context.Context, req WSRequest, data any, err error) 
 
 func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 	m := c.s.m
+	botID := effectiveBotID(req.BotID)
 	switch req.Op {
 	case "ping":
 		c.reply(ctx, req, "pong", nil)
 	case "info":
 		c.reply(ctx, req, m.Info(), nil)
+	case "list_bots":
+		list, err := m.ListBots(ctx)
+		c.reply(ctx, req, map[string]any{"bots": list}, err)
+	case "get_bot":
+		b, err := m.GetBot(ctx, req.BotID)
+		c.reply(ctx, req, b, err)
+	case "create_bot":
+		var in CreateBotRequest
+		if raw, err := json.Marshal(req.Params); err != nil || json.Unmarshal(raw, &in) != nil {
+			c.reply(ctx, req, nil, fmt.Errorf("%w: invalid bot params", ErrInvalidBot))
+			return
+		}
+		if in.ID == "" && req.BotID != "" {
+			in.ID = req.BotID
+		}
+		b, err := m.CreateBot(ctx, in)
+		c.reply(ctx, req, b, err)
+	case "update_bot":
+		var in UpdateBotRequest
+		if raw, err := json.Marshal(req.Params); err != nil || json.Unmarshal(raw, &in) != nil {
+			c.reply(ctx, req, nil, fmt.Errorf("%w: invalid bot params", ErrInvalidBot))
+			return
+		}
+		b, err := m.UpdateBot(ctx, req.BotID, in)
+		c.reply(ctx, req, b, err)
+	case "delete_bot":
+		force := req.Force || paramBool(req.Params, "force")
+		c.reply(ctx, req, nil, m.DeleteBot(ctx, req.BotID, force))
 	case "list_sessions":
-		list, err := m.ListSessions(req.Limit)
+		list, err := m.ListSessionsForBot(botID, req.Limit)
 		c.reply(ctx, req, map[string]any{"sessions": list}, err)
 	case "create_session":
-		info, err := m.CreateSession(CreateSessionRequest{Title: req.Title, Model: req.Model})
+		info, err := m.CreateSessionForBot(botID, CreateSessionRequest{Title: req.Title, Model: req.Model})
 		c.reply(ctx, req, info, err)
 	case "get_session":
-		info, msgs, err := m.GetSession(req.SessionID)
+		info, msgs, err := m.GetSessionForBot(botID, req.SessionID)
 		c.reply(ctx, req, map[string]any{"session": info, "messages": msgs}, err)
 	case "rename_session":
-		info, err := m.RenameSession(req.SessionID, req.Title)
+		info, err := m.RenameSessionForBot(botID, req.SessionID, req.Title)
 		c.reply(ctx, req, info, err)
 	case "delete_session":
-		c.reply(ctx, req, nil, m.DeleteSession(req.SessionID))
+		c.reply(ctx, req, nil, m.DeleteSessionForBot(botID, req.SessionID))
 	case "subscribe":
 		c.reply(ctx, req, nil, c.subscribe(ctx, req))
 	case "unsubscribe":
@@ -185,16 +216,16 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 		c.mu.Unlock()
 		c.reply(ctx, req, nil, nil)
 	case "send":
-		turn, err := m.Send(req.SessionID, SendRequest{Content: req.Content, Model: req.Model})
+		turn, err := m.SendForBot(botID, req.SessionID, SendRequest{Content: req.Content, Model: req.Model}, SendOptions{})
 		var data any
 		if turn != nil {
 			data = map[string]string{"session_id": req.SessionID, "turn_id": turn.ID}
 		}
 		c.reply(ctx, req, data, err)
 	case "cancel":
-		c.reply(ctx, req, nil, m.Cancel(req.SessionID))
+		c.reply(ctx, req, nil, m.CancelForBot(botID, req.SessionID))
 	case "answer":
-		c.reply(ctx, req, nil, m.Answer(req.SessionID, req.QuestionID, req.Answer))
+		c.reply(ctx, req, nil, m.AnswerForBot(botID, req.SessionID, req.QuestionID, req.Answer))
 	default:
 		if data, handled, err := c.s.handleScheduleWS(ctx, req); handled {
 			c.reply(ctx, req, data, err)
@@ -220,7 +251,7 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 		sub, backlog, gap = c.s.m.SubscribeAll(since)
 	} else {
 		var err error
-		sub, backlog, gap, err = c.s.m.Subscribe(key, since)
+		sub, backlog, gap, err = c.s.m.SubscribeForBot(effectiveBotID(req.BotID), key, since)
 		if err != nil {
 			return err
 		}
@@ -233,10 +264,32 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 	c.mu.Unlock()
 
 	sessionID := key
+	filterBot := ""
 	if sessionID == "*" {
 		sessionID = ""
+		filterBot = req.BotID
 	}
-	push := func(e Event) { c.send(ctx, WSMessage{Kind: "event", Sub: key, Event: &e}) }
+	matchesFilter := func(e Event) bool {
+		if filterBot == "" {
+			return true
+		}
+		if e.Bot != nil {
+			return e.Bot.ID == filterBot
+		}
+		if e.Session != nil {
+			return effectiveBotID(e.Session.BotID) == filterBot
+		}
+		if e.Schedule != nil {
+			return effectiveBotID(e.Schedule.BotID) == filterBot
+		}
+		return true
+	}
+	push := func(e Event) {
+		if !matchesFilter(e) {
+			return
+		}
+		c.send(ctx, WSMessage{Kind: "event", Sub: key, Event: &e})
+	}
 	go func() {
 		if gap {
 			push(Event{Type: EventGap, SessionID: sessionID})

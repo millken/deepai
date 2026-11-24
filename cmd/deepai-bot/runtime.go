@@ -288,7 +288,7 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 	var schedSvc *schedule.Service
 	var schedStore schedule.Store
 	if !opts.DisableSchedule {
-		schedSvc, schedStore, schedCfg, err = newScheduleService(registry, cfg, db)
+		schedSvc, schedStore, schedCfg, err = newScheduleService(registry, cfg, db, workDir)
 		if err != nil {
 			return nil, err
 		}

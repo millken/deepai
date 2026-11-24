@@ -24,6 +24,9 @@
   aside { width: 272px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
   .brand { padding: 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
   .brand b { font-size: 15px; letter-spacing: .3px; }
+  .bot-bar { padding: 8px 10px; display: flex; gap: 6px; align-items: center; border-bottom: 1px solid var(--border); }
+  .bot-bar select { flex: 1; min-width: 0; padding: 5px 8px; font-size: 13px; }
+  .bot-bar button { padding: 5px 9px; font-size: 12px; flex-shrink: 0; }
   .conn { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
   .dot.ok { background: var(--ok); } .dot.bad { background: var(--err); } .dot.run { background: var(--warn); animation: pulse 1s infinite; }
@@ -94,15 +97,27 @@
   .empty { margin: auto; text-align: center; color: var(--muted); }
   .empty h2 { color: var(--text); font-weight: 600; }
 
-  #auth { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; }
+  #auth, #botModal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 20; }
   #auth .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px; width: 420px; display: flex; flex-direction: column; gap: 12px; }
   #auth code { color: var(--accent); }
+  #botModal .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px; width: 680px; max-width: 94vw; max-height: 88vh; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+  .bot-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+  .bot-item { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .bot-item .meta { min-width: 0; flex: 1; }
+  .bot-item .meta b { font-size: 13px; }
+  .bot-item .meta .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bot-item .acts { display: flex; gap: 6px; flex-shrink: 0; }
+  .bot-item .acts button { padding: 3px 8px; font-size: 12px; }
   @media (max-width: 720px) { aside { display: none; } }
 </style>
 </head>
 <body>
 <aside>
   <div class="brand"><b>DeepAI Bot</b><span class="conn"><span id="connDot" class="dot"></span><span id="connText">offline</span></span></div>
+  <div class="bot-bar">
+    <select id="botSelect" title="切换 Bot"></select>
+    <button id="manageBotsBtn" title="管理 Bot">管理</button>
+  </div>
   <div class="side-tabs">
     <button class="side-tab active" id="tabSessions">会话</button>
     <button class="side-tab" id="tabSchedules" style="display:none">任务<span id="pendingBadge" class="badge warn" style="display:none">0</span></button>
@@ -134,12 +149,30 @@
   <input id="tokenInput" type="password" placeholder="token">
   <button class="primary" id="tokenBtn">连接</button>
 </div></div>
+<div id="botModal"><div class="card">
+  <div class="sch-head"><b>Bot 管理</b><button id="botModalClose">关闭</button></div>
+  <div id="botList" class="bot-list"></div>
+  <hr style="border:none;border-top:1px solid var(--border);margin:2px 0">
+  <div class="sch-head"><b id="botFormTitle">新建 Bot</b><button id="botNewModeBtn" style="display:none;padding:3px 8px;font-size:12px">切换为新建</button></div>
+  <div class="form-grid">
+    <label class="form-field">ID（小写字母/数字/-/_）<input id="bId" placeholder="例如：code-reviewer"></label>
+    <label class="form-field">名称<input id="bName" placeholder="例如：Code Reviewer"></label>
+    <label class="form-field">标题/描述<input id="bTitle" placeholder="可选简短定位"></label>
+    <label class="form-field">默认模型<select id="bModel"></select></label>
+    <label class="form-field full">工具白名单（逗号分隔，留空表示全部工具；支持 mcp__server__*）<input id="bTools" placeholder="例如：read_file, grep_search, mcp__github__*"></label>
+    <label class="form-field full">系统指令 (instructions)<textarea id="bInstr" rows="4" placeholder="定义该 Bot 的角色、职责和输出规范"></textarea></label>
+    <label class="form-field" id="bEnabledWrap" style="display:none;flex-direction:row;align-items:center;gap:6px"><input id="bEnabled" type="checkbox" checked> 启用该 Bot</label>
+  </div>
+  <div id="botFormErr" class="note err" style="text-align:left"></div>
+  <div class="sch-row"><button class="primary" id="botSaveBtn">保存</button></div>
+</div></div>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const state = {
     ws: null, reqId: 0, pending: new Map(), retry: 0,
+    bots: new Map(), currentBot: localStorage.getItem("deepai-bot-current") || "default", editingBot: null,
     sessions: new Map(), current: null, lastSeq: new Map(),
     running: false, turnEl: null, turnText: null, toolEls: new Map(), info: null,
     sideTab: "sessions", schedulesEnabled: false, schedules: new Map(), currentSch: null,
@@ -166,6 +199,7 @@
       try {
         state.info = await call({ op: "info" });
         fillModels();
+        await refreshBots();
         await call({ op: "subscribe", session_id: "*" });
         await refreshSessions();
         await refreshSchedules();
@@ -204,14 +238,75 @@
   }
   function fillModels() {
     const sel = $("model"); sel.innerHTML = "";
+    const bSel = $("bModel"); bSel.innerHTML = "";
+    const defOpt = document.createElement("option"); defOpt.value = ""; defOpt.textContent = "（跟随全局默认）";
+    bSel.appendChild(defOpt);
     for (const m of state.info.models || []) {
       const o = document.createElement("option"); o.value = m.name; o.textContent = m.name; sel.appendChild(o);
+      const o2 = document.createElement("option"); o2.value = m.name; o2.textContent = m.name; bSel.appendChild(o2);
+    }
+  }
+  function currentBotObj() { return state.bots.get(state.currentBot) || { id: state.currentBot, name: "DeepAI", enabled: true }; }
+  function botDisplayName() { return currentBotObj().name || state.currentBot || "DeepAI"; }
+
+  async function refreshBots() {
+    try {
+      const { bots } = await call({ op: "list_bots" });
+      state.bots = new Map((bots || []).map((b) => [b.id, b]));
+    } catch (e) {
+      const fallback = (state.info && state.info.bots) || [{ id: "default", name: "DeepAI", enabled: true }];
+      state.bots = new Map(fallback.map((b) => [b.id, b]));
+    }
+    if (!state.bots.has(state.currentBot)) {
+      state.currentBot = (state.info && state.info.default_bot_id) || "default";
+      localStorage.setItem("deepai-bot-current", state.currentBot);
+    }
+    drawBotSelect();
+    applyBotDefaults();
+    if ($("botModal").style.display === "flex") drawBotModalList();
+  }
+  function drawBotSelect() {
+    const sel = $("botSelect"); sel.innerHTML = "";
+    for (const b of state.bots.values()) {
+      const o = document.createElement("option");
+      o.value = b.id;
+      o.textContent = (b.name || b.id) + (b.enabled === false ? "（已停用）" : "");
+      sel.appendChild(o);
+    }
+    sel.value = state.currentBot;
+  }
+  function applyBotDefaults() {
+    const b = currentBotObj();
+    if (!state.current && b.default_model) {
+      const has = [...$("model").options].some((o) => o.value === b.default_model);
+      if (has) $("model").value = b.default_model;
+    }
+    const disabled = b.enabled === false;
+    $("newBtn").disabled = disabled;
+    $("newSchBtn").disabled = disabled;
+  }
+  async function switchBot(id) {
+    if (!id || id === state.currentBot) return;
+    if (state.current) call({ op: "unsubscribe", session_id: state.current }).catch(() => {});
+    state.currentBot = id;
+    localStorage.setItem("deepai-bot-current", id);
+    state.current = null;
+    state.currentSch = null;
+    applyBotDefaults();
+    await refreshSessions();
+    await refreshSchedules();
+    if (state.sideTab === "schedules") {
+      showSessionChrome(false);
+      $("title").textContent = "定时任务";
+      $("log").innerHTML = `<div class="empty"><h2>${esc(botDisplayName())} · 定时任务</h2><p>选择一个任务查看详情，或点击左下角新建。</p></div>`;
+    } else {
+      showEmptySessionView();
     }
   }
 
   async function refreshSessions() {
-    const { sessions } = await call({ op: "list_sessions", limit: 100 });
-    state.sessions = new Map(sessions.map((s) => [s.id, s]));
+    const { sessions } = await call({ op: "list_sessions", bot_id: state.currentBot, limit: 100 });
+    state.sessions = new Map((sessions || []).map((s) => [s.id, s]));
     drawSessions();
   }
   function drawSessions() {
@@ -235,7 +330,9 @@
     state.currentSch = null;
     showSessionChrome(true);
     $("title").textContent = "—";
-    $("log").innerHTML = `<div class="empty"><h2>DeepAI Bot</h2><p>选择或新建一个会话开始。</p></div>`;
+    const b = currentBotObj();
+    const sub = b.enabled === false ? "该 Bot 已停用，可查看历史会话或在“管理”中重新启用。" : (b.title || "选择或新建一个会话开始。");
+    $("log").innerHTML = `<div class="empty"><h2>${esc(botDisplayName())}</h2><p>${esc(sub)}</p></div>`;
     $("input").disabled = true;
     setRunning(false);
   }
@@ -246,7 +343,7 @@
     showSessionChrome(true);
     if (state.current && state.current !== id) call({ op: "unsubscribe", session_id: state.current }).catch(() => {});
     state.current = id; drawSessions();
-    const { session, messages } = await call({ op: "get_session", session_id: id });
+    const { session, messages } = await call({ op: "get_session", bot_id: state.currentBot, session_id: id });
     state.sessions.set(id, session);
     $("title").textContent = session.title || session.id;
     if (session.model) $("model").value = session.model;
@@ -257,10 +354,10 @@
     // Replay the running turn's events (if any) from the buffer, then go live.
     const since = session.status === "running" ? 0 : session.last_seq;
     state.lastSeq.set(id, since);
-    await call({ op: "subscribe", session_id: id, since });
+    await call({ op: "subscribe", bot_id: state.currentBot, session_id: id, since });
     for (const q of session.pending || []) showQuestion(q);
-    $("input").disabled = false;
-    if (!targetRunId) $("input").focus();
+    $("input").disabled = currentBotObj().enabled === false;
+    if (!targetRunId && !$("input").disabled) $("input").focus();
   }
 
   function drawTranscript(messages, targetRunId) {
@@ -277,7 +374,7 @@
         }
         aiEl = null;
       } else if (m.role === "ai") {
-        if (!aiEl) aiEl = addMsg("ai", "DeepAI");
+        if (!aiEl) aiEl = addMsg("ai", esc(botDisplayName()));
         if (m.content) { const b = document.createElement("div"); b.className = "bubble"; b.innerHTML = render(m.content); aiEl.root.appendChild(b); }
         for (const tc of m.tool_calls || []) aiEl.tools.appendChild(toolEl(tc.name, "completed", "", JSON.stringify(tc.arguments || {})));
       }
@@ -314,13 +411,26 @@
   function note(text, cls) { const n = document.createElement("div"); n.className = "note " + (cls || ""); n.textContent = text; $("log").appendChild(n); scroll(); }
 
   function ensureTurn() {
-    if (!state.turnEl) { state.turnEl = addMsg("ai", "DeepAI"); state.turnText = null; }
+    if (!state.turnEl) { state.turnEl = addMsg("ai", esc(botDisplayName())); state.turnText = null; }
     return state.turnEl;
   }
   // The "*" feed only drives the sidebar; its seq counter is separate from
   // every session's, so it must never touch a session's resume cursor.
   function onLifecycle(e) {
     if (!e || e.type === "heartbeat") return;
+    if (e.type === "bot_created" || e.type === "bot_updated" || e.type === "bot_deleted") {
+      const deletedActive = e.type === "bot_deleted" && e.bot && e.bot.id === state.currentBot;
+      refreshBots().then(() => {
+        if (deletedActive) {
+          state.current = null;
+          state.currentSch = null;
+          refreshSessions().catch(() => {});
+          refreshSchedules().catch(() => {});
+          showEmptySessionView();
+        }
+      }).catch(() => {});
+      return;
+    }
     if (e.type && e.type.startsWith("schedule_")) {
       refreshSchedules().then(() => {
         if (state.sideTab === "schedules" && state.currentSch) openSchedule(state.currentSch).catch(() => {});
@@ -385,8 +495,8 @@
     if (document.querySelector(`[data-q="${q.id}"]`)) return;
     const box = document.createElement("div"); box.className = "msg";
     const card = document.createElement("div"); card.className = "question"; card.dataset.q = q.id;
-    card.innerHTML = `<div><b>DeepAI 想确认：</b>${render(q.text)}</div>`;
-    const answer = (a) => call({ op: "answer", session_id: state.current, question_id: q.id, answer: a }).catch((e) => note(e.message, "err"));
+    card.innerHTML = `<div><b>${esc(botDisplayName())} 想确认：</b>${render(q.text)}</div>`;
+    const answer = (a) => call({ op: "answer", bot_id: state.currentBot, session_id: state.current, question_id: q.id, answer: a }).catch((e) => note(e.message, "err"));
     if (q.options && q.options.length) {
       const opts = document.createElement("div"); opts.className = "opts";
       for (const o of q.options) { const b = document.createElement("button"); b.textContent = o; b.onclick = () => answer(o); opts.appendChild(b); }
@@ -413,7 +523,7 @@
     const empty = $("log").querySelector(".empty"); if (empty) empty.remove();
     addMsg("human", "你").bubble.innerHTML = render(text); scroll();
     state.optimistic = true; setRunning(true);
-    try { await call({ op: "send", session_id: state.current, content: text, model: $("model").value }); }
+    try { await call({ op: "send", bot_id: state.currentBot, session_id: state.current, content: text, model: $("model").value }); }
     catch (e) { state.optimistic = false; note("发送失败：" + e.message, "err"); setRunning(false); }
   }
   function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(220, t.scrollHeight) + "px"; }
@@ -442,7 +552,7 @@
 
   async function refreshSchedules() {
     try {
-      const res = await call({ op: "list_schedules", params: { limit: 100 } });
+      const res = await call({ op: "list_schedules", bot_id: state.currentBot, params: { limit: 100 } });
       state.schedulesEnabled = true;
       $("tabSchedules").style.display = "";
       state.schedules = new Map((res.schedules || []).map((s) => [s.id, s]));
@@ -618,7 +728,7 @@
     };
     $("fCreateBtn").onclick = async () => {
       try {
-        const res = await call({ op: "create_schedule", params: {
+        const res = await call({ op: "create_schedule", bot_id: state.currentBot, params: {
           name: $("fName").value.trim(), prompt: $("fPrompt").value.trim(),
           trigger: buildTrigger(), timezone: $("fTZ").value.trim(),
         }});
@@ -628,6 +738,93 @@
     };
   }
 
+  function openBotModal() {
+    setBotForm(null);
+    drawBotModalList();
+    $("botModal").style.display = "flex";
+  }
+  function closeBotModal() { $("botModal").style.display = "none"; }
+  function setBotForm(bot) {
+    state.editingBot = bot ? bot.id : null;
+    $("botFormErr").textContent = "";
+    $("botFormTitle").textContent = bot ? `编辑 Bot：${bot.id}` : "新建 Bot";
+    $("botNewModeBtn").style.display = bot ? "" : "none";
+    $("bId").value = bot ? bot.id : "";
+    $("bId").disabled = !!bot;
+    $("bName").value = bot ? (bot.name || "") : "";
+    $("bTitle").value = bot ? (bot.title || "") : "";
+    $("bModel").value = bot ? (bot.default_model || "") : "";
+    $("bTools").value = bot && Array.isArray(bot.tool_allowlist) ? bot.tool_allowlist.join(", ") : "";
+    $("bInstr").value = bot ? (bot.instructions || "") : "";
+    const isDefault = bot && bot.id === "default";
+    $("bEnabledWrap").style.display = bot && !isDefault ? "flex" : "none";
+    $("bEnabled").checked = bot ? bot.enabled !== false : true;
+  }
+  function drawBotModalList() {
+    const box = $("botList"); box.innerHTML = "";
+    for (const b of state.bots.values()) {
+      const row = document.createElement("div"); row.className = "bot-item";
+      const meta = document.createElement("div"); meta.className = "meta";
+      const st = b.enabled === false ? `<span class="badge warn">停用</span>` : `<span class="badge ok">启用</span>`;
+      const tools = Array.isArray(b.tool_allowlist) && b.tool_allowlist.length ? ` · tools: ${b.tool_allowlist.join(", ")}` : "";
+      meta.innerHTML = `<div class="sch-head"><b>${esc(b.name || b.id)} <code>(${esc(b.id)})</code></b>${st}</div>` +
+        `<div class="sub">${esc(b.title || (b.instructions || "").slice(0, 80) || "无描述")}${esc(tools)}</div>`;
+      const acts = document.createElement("div"); acts.className = "acts";
+      acts.append(mkBtn("切换", "", async () => { await switchBot(b.id); closeBotModal(); }));
+      acts.append(mkBtn("编辑", "", () => setBotForm(b)));
+      if (b.id !== "default") {
+        acts.append(mkBtn("删除", "danger", async () => {
+          $("botFormErr").textContent = "";
+          try {
+            await call({ op: "delete_bot", bot_id: b.id, force: false });
+          } catch (e) {
+            if (e && e.code === "bot_has_sessions") {
+              if (!confirm(`Bot "${b.id}" 仍有关联会话或定时任务。是否强制删除并级联清理其历史会话、记忆与定时任务？`)) return;
+              try { await call({ op: "delete_bot", bot_id: b.id, force: true }); }
+              catch (e2) { $("botFormErr").textContent = e2.message || String(e2); return; }
+            } else {
+              $("botFormErr").textContent = e.message || String(e);
+              return;
+            }
+          }
+          if (state.editingBot === b.id) setBotForm(null);
+          await refreshBots();
+          if (state.currentBot === b.id) await switchBot("default");
+        }));
+      }
+      row.append(meta, acts);
+      box.appendChild(row);
+    }
+  }
+  async function saveBotForm() {
+    $("botFormErr").textContent = "";
+    const toolsRaw = $("bTools").value.trim();
+    const tools = toolsRaw ? toolsRaw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const payload = {
+      name: $("bName").value.trim(),
+      title: $("bTitle").value.trim(),
+      default_model: $("bModel").value,
+      tool_allowlist: tools,
+      instructions: $("bInstr").value,
+    };
+    try {
+      if (state.editingBot) {
+        if (state.editingBot !== "default") payload.enabled = $("bEnabled").checked;
+        await call({ op: "update_bot", bot_id: state.editingBot, params: payload });
+        await refreshBots();
+        setBotForm(state.bots.get(state.editingBot) || null);
+      } else {
+        payload.id = $("bId").value.trim();
+        const created = await call({ op: "create_bot", params: payload });
+        await refreshBots();
+        setBotForm(null);
+        if (created && created.id) await switchBot(created.id);
+      }
+    } catch (e) {
+      $("botFormErr").textContent = e.message || String(e);
+    }
+  }
+
   function mkBtn(text, cls, fn) {
     const b = document.createElement("button"); b.textContent = text;
     if (cls) b.className = cls;
@@ -635,6 +832,12 @@
     return b;
   }
 
+  $("botSelect").onchange = () => switchBot($("botSelect").value);
+  $("manageBotsBtn").onclick = openBotModal;
+  $("botModalClose").onclick = closeBotModal;
+  $("botNewModeBtn").onclick = () => setBotForm(null);
+  $("botSaveBtn").onclick = saveBotForm;
+  $("botModal").onclick = (ev) => { if (ev.target === $("botModal")) closeBotModal(); };
   $("tabSessions").onclick = () => {
     setSideTab("sessions");
     if (state.current) openSession(state.current);
@@ -645,9 +848,9 @@
   $("sendBtn").onclick = send;
   $("input").addEventListener("input", () => { autosize(); $("sendBtn").disabled = state.running || !state.current; });
   $("input").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); send(); } });
-  $("cancelBtn").onclick = () => call({ op: "cancel", session_id: state.current }).catch((e) => note(e.message, "err"));
+  $("cancelBtn").onclick = () => call({ op: "cancel", bot_id: state.currentBot, session_id: state.current }).catch((e) => note(e.message, "err"));
   $("newBtn").onclick = async () => {
-    try { const s = await call({ op: "create_session", model: $("model").value }); state.sessions.set(s.id, s); await openSession(s.id); }
+    try { const s = await call({ op: "create_session", bot_id: state.currentBot, model: $("model").value }); state.sessions.set(s.id, s); await openSession(s.id); }
     catch (e) { note("创建失败：" + e.message, "err"); }
   };
   $("tokenBtn").onclick = () => { localStorage.setItem("deepai-bot-token", $("tokenInput").value.trim()); $("auth").style.display = "none"; connect(); };

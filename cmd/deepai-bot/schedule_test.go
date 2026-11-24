@@ -48,7 +48,7 @@ func TestScheduleConfigDefaultsAndOverrides(t *testing.T) {
 
 func TestNewScheduleServiceRegistersTool(t *testing.T) {
 	reg := tools.NewRegistry()
-	svc, store, cfg, err := newScheduleService(reg, commands.Config{}, nil)
+	svc, store, cfg, err := newScheduleService(reg, commands.Config{}, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestNewScheduleServiceRegistersTool(t *testing.T) {
 	disabledReg := tools.NewRegistry()
 	svc2, store2, _, err := newScheduleService(disabledReg, commands.Config{
 		Schedule: commands.ScheduleYAML{Enabled: &off},
-	}, nil)
+	}, nil, "")
 	if err != nil || svc2 != nil || store2 != nil || disabledReg.Get("schedule") != nil {
 		t.Fatalf("disabled = %v, %v, %v, %v", svc2, store2, err, disabledReg.Get("schedule"))
 	}
@@ -82,7 +82,7 @@ func TestNewScheduleServiceSQLiteStore(t *testing.T) {
 	}
 	defer db.Close()
 	reg := tools.NewRegistry()
-	svc, store, _, err := newScheduleService(reg, commands.Config{}, db)
+	svc, store, _, err := newScheduleService(reg, commands.Config{}, db, "/proj/a")
 	if err != nil {
 		t.Fatal(err)
 	}
