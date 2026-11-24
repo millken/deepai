@@ -371,15 +371,16 @@ func TestDispatchPRReview_OversizedIncrementalFallsBack(t *testing.T) {
 	}
 }
 
-// Round-2 latency pin: a re-review's budget is scoped to the delta — 3×delta
-// files + 2×previous issues, floor 10 — and must NOT inherit the full-review
-// floor of 40 (the 871s deadline collision).
+// Round-2 latency pin: a re-review's budget is scoped to the delta — 2×delta
+// files + 1×previous issues, floor 8, ceiling 16 — and must NOT inherit the
+// full-review floor.
 func TestReviewBudget_IncrementalScopesToDelta(t *testing.T) {
 	dir, base, _ := gitTestRepo(t)
 	os.WriteFile(dir+"/c.txt", []byte("c\n"), 0o644)
 	os.WriteFile(dir+"/d.txt", []byte("d\n"), 0o644)
+	os.WriteFile(dir+"/e.txt", []byte("e\n"), 0o644)
 	gitStep(t, dir, "add", "-A")
-	gitStep(t, dir, "commit", "-q", "-m", "widen delta") // delta: b,c,d = 3 files
+	gitStep(t, dir, "commit", "-q", "-m", "widen delta") // delta: b,c,d,e = 4 files
 
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	gh := &fakeGH{diff: "FULL", files: nil}
@@ -388,11 +389,11 @@ func TestReviewBudget_IncrementalScopesToDelta(t *testing.T) {
 	st, _ := newPRState(dir, 60, "", "x", "main", "", "b")
 	st.Round = 2
 	st.LastReviewHead = base
-	prev := &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{}, {}}}
+	prev := &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{}, {}, {}}}
 
 	r.dispatchPRReview(context.Background(), st, gh, prev)
-	if got := fake.args["max_tool_calls"]; got != 13 { // 3×3 + 2×2
-		t.Fatalf("max_tool_calls = %v, want 13 (3×delta-files + 2×prev-issues)", got)
+	if got := fake.args["max_tool_calls"]; got != 11 { // 2×4 + 3
+		t.Fatalf("max_tool_calls = %v, want 11 (2×delta-files + prev-issues)", got)
 	}
 }
 
@@ -407,8 +408,8 @@ func TestReviewBudget_IncrementalFloor(t *testing.T) {
 	st.LastReviewHead = base
 
 	r.dispatchPRReview(context.Background(), st, gh, nil)
-	if got := fake.args["max_tool_calls"]; got != 10 {
-		t.Fatalf("max_tool_calls = %v, want floor 10 for a 1-file delta", got)
+	if got := fake.args["max_tool_calls"]; got != 8 {
+		t.Fatalf("max_tool_calls = %v, want floor 8 for a 1-file delta", got)
 	}
 }
 

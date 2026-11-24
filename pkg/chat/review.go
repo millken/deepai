@@ -403,12 +403,16 @@ const DefaultReviewTimeout = 10 * time.Minute
 // unparseable". Accepted: that path needs two failures at once, against a
 // wall-clock expiry that loses the review every single time it happens.
 // DefaultReviewMaxToolCalls is the fallback for the reviewer's tool-call cap
-// when review_max_tool_calls is unset. 40, not 20: the first live PR-loop run
-// (PR #3 round 1) wrapped up at exactly 20 mid-investigation on a diff rung
-// (a) admits — the wrap-up verdict was still valid but one issue's mechanism
-// description came out half-verified, which is exactly the accuracy loss the
-// cap must not cause on reviewable diffs.
-const DefaultReviewMaxToolCalls = 40
+// when review_max_tool_calls is unset. 20 (down from 40): with changed files
+// bundled as context_files and targeted pre-checks injected into the prompt,
+// most reviews settle in 3–8 tool calls; a tighter cap prevents reasoning
+// models from spending 10+ minutes browsing unrelated callers.
+const DefaultReviewMaxToolCalls = 20
+
+// defaultReviewReasoningEffort is sent to gate-dispatched reviewers when
+// review_reasoning_effort is unset. "medium" avoids runaway thinking minutes
+// per lookup turn while preserving bug-finding accuracy.
+const defaultReviewReasoningEffort = "medium"
 
 // reviewDiffByteCap is degradation rung (c) of design §六-3: a diff bigger
 // than this is not reviewed at all — the user is told, loudly, instead of
@@ -662,24 +666,15 @@ func (r *ChatRepl) reviewMaxToolCallsOrDefault() int {
 }
 
 // scaleReviewToolBudget sizes the reviewer's tool-call cap against the scope:
-// max(configured-or-default, 3×changed files) — Round 1 on PR #3 spent 12 of
-// 20 calls merely reading 14 files ONCE, and the half-verified issue text it
-// produced is the accuracy loss this formula prevents. 3× covers one read
-// plus grep follow-ups plus a re-check per file; a configured higher floor
-// always wins for small scopes.
-//
-// The scale term is CLAMPED at twice the floor (round-3 review): cap
-// exhaustion degrades into a tool-less wrap-up verdict, while the wall clock
-// discards the review entirely — so the budget must stay small enough that
-// the cap binds before the deadline. An unbounded 3×files (900 on a
-// 300-file PR) inverts that: the reviewer plans a 900-call investigation,
-// hits the 10-minute DefaultReviewTimeout, and every /pr resume repeats the
-// same total loss. Twice the floor is the largest headroom the default clock
-// plausibly covers; operators needing more raise the config itself.
+// max(configured-or-default, 2×changed files), clamped at 2×floor. With
+// context_files pre-bundled, the reviewer rarely needs more than 1–2 follow-up
+// lookups per file; keeping the ceiling tight prevents 10-minute wall-clock
+// collisions on large PRs. Operators needing deeper sweeps raise
+// review_max_tool_calls explicitly.
 func (r *ChatRepl) scaleReviewToolBudget(changedFiles int) int {
 	floor := r.reviewMaxToolCallsOrDefault()
 	budget := floor
-	if n := 3 * changedFiles; n > budget {
+	if n := 2 * changedFiles; n > budget {
 		budget = n
 	}
 	if ceiling := 2 * floor; budget > ceiling {
@@ -740,23 +735,22 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
-	// Budget: a re-review is scoped to the delta — 3×delta files plus 2×
-	// previous issues to verify, floored at 10. The floor deliberately does
-	// NOT inherit the full-review default of 40: round-2's live run showed a
-	// 5-file delta handed 40 calls, which at reviewer latency turns a
-	// ~4-minute pass into a deadline collision (871s, timeout wrap-up). An
-	// EXPLICIT review_max_tool_calls still wins over both — the operator
-	// raised that knob precisely to fund this kind of whole-tree
-	// verification. A first review keeps the scope-scaled formula.
+	// Budget: a re-review is scoped to the delta — 2×delta files plus 1×
+	// previous issues to verify, floored at 8 and capped at 16 (unless
+	// review_max_tool_calls overrides). Tighter bounds keep incremental passes
+	// under 2–3 minutes.
 	if in.incremental {
-		n := 3 * len(in.scope)
+		n := 2 * len(in.scope)
 		if in.prev != nil {
-			n += 2 * len(in.prev.Issues)
+			n += len(in.prev.Issues)
 		}
-		if floor := 10; n < floor {
+		if floor := 8; n < floor {
 			n = floor
 		}
-		if configured := r.cfg.ReviewMaxToolCalls; configured > n {
+		if ceiling := 16; n > ceiling {
+			n = ceiling
+		}
+		if configured := r.cfg.ReviewMaxToolCalls; configured > 0 && configured > n {
 			n = configured
 		}
 		in.maxToolCalls = n
@@ -765,10 +759,16 @@ func (r *ChatRepl) runReview(parentCtx context.Context, in reviewPromptInput, co
 	}
 	in.timeout = timeout
 
+	effort := strings.TrimSpace(r.cfg.ReviewReasoningEffort)
+	if effort == "" {
+		effort = defaultReviewReasoningEffort
+	}
+
 	args := map[string]any{
-		"description": "Adversarial correctness review",
-		"agent_type":  string(agent.AgentTypeCorrectnessReviewer),
-		"prompt":      buildReviewPrompt(in),
+		"description":      "Adversarial correctness review",
+		"agent_type":       string(agent.AgentTypeCorrectnessReviewer),
+		"prompt":           buildReviewPrompt(in),
+		"reasoning_effort": effort,
 		// The reviewer's profile is uncapped; the GATE caps it, because only
 		// the gate races a wall clock. Exhausting this cap forces a tool-less
 		// wrap-up that still has to satisfy the output schema, so a reviewer
@@ -896,6 +896,10 @@ type reviewPromptInput struct {
 	// local review. Shown so a defect someone already named is in front of
 	// the reviewer before a pass can close the loop.
 	externalComments []prComment
+	// preflight holds deterministic build/vet/test results run by the host
+	// before invoking the LLM reviewer, so the reviewer does not waste tool
+	// calls or minutes re-running compilation and test suites.
+	preflight string
 }
 
 // buildReviewPrompt assembles the reviewer's seed message. Deliberately
@@ -912,15 +916,12 @@ func buildReviewPrompt(in reviewPromptInput) string {
 				"The same defects may have been reported before — re-report a previously reported issue ONLY if you can still construct its failure scenario against the current code. "+
 				"A clean verdict here closes the PR's review loop, so spend the budget to actually verify, not to browse.\n\n", in.prNumber, in.prRound)
 		}
-		// Round 3+ is the convergence phase (docs/review.md §3): two fix
-		// rounds have already answered the earlier findings, and every new
-		// medium/low raised now only buys another fix round — the loop can
-		// never close that way. A finding demoted to the summary sentence is
-		// still a finding: the text below pins it to verdict "fail", and
-		// isPRPassVerdict (pr_loop.go) accepts only an explicit pass —
-		// together they keep the parked shape from closing the loop on it.
-		if in.prRound >= 3 {
-			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — a genuinely new minor finding goes into the summary sentence, not the issue list. A finding parked in the summary is still a finding: it does not widen the loop, but the verdict must stay \"fail\" until every reported finding is fixed — an empty issue list never passes on its own.\n\n")
+		// Round 2+ is the convergence phase: round 1 already did the broad
+		// pass; every later round verifies fixes and checks only critical/high
+		// regressions so the loop converges in 2–3 rounds instead of dragging
+		// on for an hour over minor nits.
+		if in.prRound >= 2 {
+			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — do NOT block approval on new minor/low findings (if you mention a minor note in the summary while all blocking issues are resolved, still output verdict \"pass\").\n\n")
 		}
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")
@@ -931,16 +932,15 @@ func buildReviewPrompt(in reviewPromptInput) string {
 		b.WriteString("## Original task (verbatim user request)\n\n")
 		b.WriteString(in.initialRequest)
 	}
-	// Full PR reviews only. The heading is the switch rule 3b keys on:
-	// a claim-shaped gap (the body says a path is covered, the diff never
-	// touches it) is in scope. Incremental re-reviews stay inside the delta
-	// and must not grow this section, or a late round reopens the whole tree.
+	// Full PR reviews only. Keep the scope anchored to the diff: only verify
+	// a claim gap when the PR description explicitly asserts a concrete file
+	// or behavior that is conspicuously absent from the diff — never sweep
+	// unrelated modules.
 	if in.prNumber > 0 && !in.incremental {
 		b.WriteString("\n\n## PR claim\n\n")
 		b.WriteString("The original task above is what this pull request claims to do. " +
-			"Where that claim says an entry, path, or case is covered and the diff does not touch the code that implements it, " +
-			"that gap is in scope: search the tree for that sibling and report it with a concrete failure scenario. " +
-			"A pre-existing problem the claim does not name stays out of scope.\n")
+			"Only if the claim explicitly names an entry or case that the diff omitted, check that specific target (1–2 targeted lookups max) and report a concrete failure scenario. " +
+			"Do NOT explore unrelated siblings or pre-existing code outside the diff.\n")
 	}
 	if len(in.scope) > 0 {
 		b.WriteString("\n\n## Files changed\n\n")
@@ -953,6 +953,11 @@ func buildReviewPrompt(in reviewPromptInput) string {
 	b.WriteString("\n```\n")
 	if !in.bundled {
 		b.WriteString("\n(Full file contents are NOT attached — read what you need with read_file, preferring line ranges around the hunks above.)\n")
+	}
+	if in.preflight != "" {
+		b.WriteString("\n## Host pre-flight checks (already executed — do NOT re-run these commands)\n\n")
+		b.WriteString(in.preflight)
+		b.WriteString("\n")
 	}
 	if block := reviewCommentsBlock(in.externalComments); block != "" {
 		b.WriteString(block)
@@ -976,9 +981,9 @@ func buildReviewPrompt(in reviewPromptInput) string {
 		if in.timeout > 0 {
 			fmt.Fprintf(&b, "- %s of wall clock for the whole review. Running out kills the review and your findings are lost, so emit your verdict while you still have room.\n", in.timeout)
 		}
-		b.WriteString("- Reason from the diff first; spend tool calls only on questions the diff alone cannot settle.\n")
+		b.WriteString("- Reason from the diff and attached files first; spend tool calls only on questions they cannot settle.\n")
 		if in.prNumber > 0 && !in.incremental {
-			b.WriteString("- The PR claim is one of those questions: look up an entry the claim names when the diff does not touch its code.\n")
+			b.WriteString("- If host pre-flight checks already ran, trust them and do not re-run go vet/test unless testing a specific new reproduction.\n")
 		}
 	}
 	return b.String()

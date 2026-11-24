@@ -247,8 +247,8 @@ func TestRunPRLoop_ResumeIgnoresStaleVerdict(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
 	r := newPRLoopRepl(t, fake, gh)
-	// Round 4 (post-CI-fix review), but the logged verdict is round 1.
-	st := newTrackedPR(t, r, 43, 4, prStatusReviewing)
+	// Round 3 (post-CI-fix review), but the logged verdict is round 1.
+	st := newTrackedPR(t, r, 43, 3, prStatusReviewing)
 	prev := &agent.ReviewResult{Verdict: "fail", Summary: "ancient"}
 	if err := st.appendVerdict(r.cfg.WorkDir, 1, prev); err != nil {
 		t.Fatalf("appendVerdict: %v", err)

@@ -63,8 +63,9 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				"prompt":         map[string]any{"type": "string", "description": "Detailed instructions for the subagent"},
 				"subagent_type":  map[string]any{"type": "string", "description": "Deprecated: use agent_type instead"},
 				"agent_type":     map[string]any{"type": "string", "description": "Agent type (e.g. coder, bash, security-reviewer). Takes precedence over subagent_type."},
-				"model":          map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
-				"skill":          map[string]any{"type": "string", "description": "Optional skill to run inside this subagent. Use the exact name the skill tool told you to use."},
+				"model":            map[string]any{"type": "string", "description": "Model alias for this subagent (e.g. 'fast', 'smart'). Optional; defaults to the agent type config or the main model."},
+				"reasoning_effort": map[string]any{"type": "string", "description": "Optional reasoning effort override for this subagent (low, medium, high, disabled)."},
+				"skill":            map[string]any{"type": "string", "description": "Optional skill to run inside this subagent. Use the exact name the skill tool told you to use."},
 				"max_tool_calls": map[string]any{"type": "integer", "description": "Optional cap on the number of tool calls this subagent may execute (0 = no cap). On exhaustion the subagent wraps up with a final answer instead of failing."},
 				"max_turns":      map[string]any{"type": "integer", "description": "Deprecated alias for max_tool_calls"},
 				"token_budget":   map[string]any{"type": "integer", "description": "Optional max total tokens for this subagent; 0 = unlimited"},
@@ -94,6 +95,7 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 				maxToolCalls = intFromArg(raw)
 			}
 			model, _ := call.Arguments["model"].(string)
+			reasoningEffort, _ := call.Arguments["reasoning_effort"].(string)
 			tokenBudget := intFromArg(call.Arguments["token_budget"])
 
 			// Parent-budget passthrough (plan §M2.2 carry-forward): a parent
@@ -159,12 +161,13 @@ func TaskTool(pool taskPool, agents []AgentOption) models.Tool {
 			}
 
 			task, err := pool.StartTask(ctx, strings.TrimSpace(description), strings.TrimSpace(prompt), subagent.SubagentConfig{
-				AgentType:    agentType,
-				MaxToolCalls: maxToolCalls,
-				Model:        strings.TrimSpace(model),
-				TokenBudget:  tokenBudget,
-				ContextFiles: contextFiles,
-				Skill:        skillName,
+				AgentType:       agentType,
+				MaxToolCalls:    maxToolCalls,
+				Model:           strings.TrimSpace(model),
+				ReasoningEffort: strings.TrimSpace(reasoningEffort),
+				TokenBudget:     tokenBudget,
+				ContextFiles:    contextFiles,
+				Skill:           skillName,
 			})
 			if err != nil {
 				return models.ToolResult{

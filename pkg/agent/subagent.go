@@ -26,6 +26,7 @@ type SubagentExecutor struct {
 	contextWindow   int
 	maxTokens       *int
 	temperature     *float64
+	reasoningEffort string
 	workDir         string
 	pluginAgentDirs []string
 	// skills is the skill registry used for role-carried Skills preload
@@ -83,6 +84,15 @@ func (e *SubagentExecutor) WithMaxTokens(n *int) *SubagentExecutor {
 func (e *SubagentExecutor) WithTemperature(t *float64) *SubagentExecutor {
 	if e != nil {
 		e.temperature = t
+	}
+	return e
+}
+
+// WithReasoningEffort sets the default reasoning effort for subagents when
+// neither the task nor the model definition overrides it.
+func (e *SubagentExecutor) WithReasoningEffort(effort string) *SubagentExecutor {
+	if e != nil {
+		e.reasoningEffort = strings.TrimSpace(effort)
 	}
 	return e
 }
@@ -332,15 +342,21 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	// retry loop below — the same anti-multiplication rule M2-3 applied to
 	// TokenBudget).
 
+	subReasoningEffort := e.reasoningEffort
+	if eff := strings.TrimSpace(task.Config.ReasoningEffort); eff != "" {
+		subReasoningEffort = eff
+	}
+
 	buildAgentConfig := func(tokenBudget, toolCallBudget int) AgentConfig {
 		return AgentConfig{
-			LLMProvider:  provider,
-			Tools:        registry,
-			MaxToolCalls: toolCallBudget,
-			Model:        modelName,
-			MaxTokens:    e.maxTokens,
-			Temperature:  subTemperature,
-			Sandbox:      e.sandbox,
+			LLMProvider:     provider,
+			Tools:           registry,
+			MaxToolCalls:    toolCallBudget,
+			Model:           modelName,
+			MaxTokens:       e.maxTokens,
+			Temperature:     subTemperature,
+			ReasoningEffort: subReasoningEffort,
+			Sandbox:         e.sandbox,
 			// runCtx (built by Pool.runTask) carries a deadline only when a
 			// task- or pool-level timeout is configured; with none, this value
 			// only feeds TimeoutError.Duration reporting.

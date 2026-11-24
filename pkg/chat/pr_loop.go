@@ -15,11 +15,12 @@ import (
 	"github.com/millken/deepai/pkg/tools/builtin"
 )
 
-// maxPRReviewRounds bounds the PR loop's review→fix cycle. Same reason as
-// maxReviewRounds: an unbounded loop burns tokens on a reviewer the
-// implementer demonstrably cannot satisfy — at the cap the findings go to the
-// human instead.
-const maxPRReviewRounds = 5
+// maxPRReviewRounds bounds the PR loop's review→fix cycle. 3 (down from 5):
+// round 1 does the full pass, round 2 verifies fixes in convergence mode, and
+// round 3 is the final verification safety net. Beyond 3 rounds, remaining
+// findings are handed to the human instead of burning an hour on diminishing
+// returns. Configurable via pr_review_rounds.
+const maxPRReviewRounds = 3
 
 const (
 	prCIDefaultPoll = 20 * time.Second
@@ -100,6 +101,8 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 			}
 			r.ui.Info(fmt.Sprintf("  pr: #%d review round %d/%d", st.Number, st.Round, maxRounds))
 			var verdict *agent.ReviewResult
+			var ext []prComment
+			var extLoaded bool
 			if alreadyPosted {
 				alreadyPosted = false
 				verdict = prev
@@ -131,13 +134,27 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 				}
 			} else {
 				var ok bool
-				verdict, ok = r.dispatchPRReview(parentCtx, st, gh, prev)
+				verdict, ext, ok = r.dispatchPRReviewWithComments(parentCtx, st, gh, prev)
+				extLoaded = true
 				if !ok {
 					r.ui.Info("  pr: review could not run — nothing posted, no round consumed; /pr resumes the loop")
 					return
 				}
-				if isPRPassVerdict(verdict) {
-					r.ui.Info(fmt.Sprintf("  pr: #%d review passed — waiting for CI", st.Number))
+				if r.isPRPassVerdict(verdict) {
+					// If non-blocking (below min_severity, e.g. low-only) issues
+					// exist, post them as advisory notes without blocking merge.
+					if len(verdict.Issues) > 0 {
+						r.ui.Info(fmt.Sprintf("  pr: #%d review passed (%d non-blocking advisory note(s) below %s) — waiting for CI",
+							st.Number, len(verdict.Issues), r.prMinBlockingSeverity()))
+						_ = gh.PostComment(parentCtx, st.Repo, st.Number, reviewerCommentBody(st.Round, &agent.ReviewResult{
+							Agent:   verdict.Agent,
+							Verdict: "pass (advisory notes only)",
+							Summary: verdict.Summary,
+							Issues:  verdict.Issues,
+						}))
+					} else {
+						r.ui.Info(fmt.Sprintf("  pr: #%d review passed — waiting for CI", st.Number))
+					}
 					prev = nil
 					st.setStatus(r.cfg.WorkDir, prStatusAwaitingCI)
 					continue
@@ -155,7 +172,9 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					r.ui.Info(fmt.Sprintf("  pr: could not persist the posted-round marker (%v)", err))
 				}
 			}
-			ext := pendingExternalComments(parentCtx, st, gh)
+			if !extLoaded {
+				ext = pendingExternalComments(parentCtx, st, gh)
+			}
 			turnErr := r.runMissionTurn(parentCtx, prFixMessage(st.Round, maxRounds, verdict)+externalCommentsBlock(ext))
 			if turnErr != nil {
 				r.ui.Info("  pr: fix turn interrupted or failed — no round consumed; /pr resumes the loop")
@@ -266,14 +285,31 @@ func prIncrementalDiff(workDir, base string) (diff string, files []string, ok bo
 	return string(out), files, true
 }
 
-// dispatchPRReview runs one correctness review against the PR's change. A
-// FIRST review reads the full PR diff; a re-review reads only the commits
-// since the last reviewed head (round-1's live audit: a full re-read of an
-// unchanged 2000-line diff spends the budget re-deriving findings the
-// previous round already made). ok=false is the same fail-soft contract as
-// the local gate: interrupted, timed out, unparseable, or an oversized diff
-// — no round is consumed and the head anchor does not move.
+// dispatchPRReview runs one correctness review against the PR's change.
+// Wrapper around dispatchPRReviewWithComments preserved for tests and callers
+// that do not need the fetched external comments back.
 func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh prGH, prev *agent.ReviewResult) (*agent.ReviewResult, bool) {
+	v, _, ok := r.dispatchPRReviewWithComments(parentCtx, st, gh, prev)
+	return v, ok
+}
+
+// dispatchPRReviewWithComments runs one correctness review against the PR's
+// change and returns the pending external comments fetched for the round so
+// the caller can reuse them in the fix turn without a second gh.ListComments
+// network round-trip.
+//
+// Performance optimizations over the initial single-agent remote-diff design:
+//   - Round 2+ reads only the local incremental diff since LastReviewHead.
+//   - Round 1 prefers local `git diff merge-base..HEAD` when the PR's base
+//     branch is present locally (avoiding slow gh pr diff / files network calls),
+//     falling back to gh.Diff when local refs don't match.
+//   - Changed files under the 256KiB cap are pre-bundled via context_files so
+//     the reviewer reasons on Turn 1 instead of spending 15+ read_file turns.
+//   - Host pre-flight runs targeted `go vet` + `go test -short` once up front
+//     and embeds the result in the prompt so the reviewer skips duplicate runs.
+//   - Large full-PR diffs (>= 10 files or >= 48KB across multiple modules) fan
+//     out across parallel module shards and merge their verdicts.
+func (r *ChatRepl) dispatchPRReviewWithComments(parentCtx context.Context, st *prState, gh prGH, prev *agent.ReviewResult) (*agent.ReviewResult, []prComment, bool) {
 	var diff string
 	var scope []string
 	incremental := false
@@ -293,45 +329,87 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 		}
 	}
 	if !incremental {
-		var err error
-		diff, err = gh.Diff(parentCtx, st.Repo, st.Number)
-		if err != nil {
-			r.ui.Info(fmt.Sprintf("  pr: gh pr diff failed (%v)", err))
-			return nil, false
+		// Prefer local git diff against the PR's base branch when the worktree
+		// has that branch checked out (only when using the real ghPRClient;
+		// test fakes supply scripted diffs via gh.Diff).
+		usedLocal := false
+		if _, isRealGH := r.prGHOrDefault().(ghPRClient); isRealGH && st.Base != "" {
+			if localDiff, localFiles, ok := prLocalDiff(r.cfg.WorkDir, st.Base); ok {
+				diff, scope, usedLocal = localDiff, localFiles, true
+			}
+		}
+		if !usedLocal {
+			var err error
+			diff, err = gh.Diff(parentCtx, st.Repo, st.Number)
+			if err != nil {
+				r.ui.Info(fmt.Sprintf("  pr: gh pr diff failed (%v)", err))
+				return nil, nil, false
+			}
+			files, err := gh.ChangedFiles(parentCtx, st.Repo, st.Number)
+			if err != nil {
+				files = nil // the diff itself already names every file; not fatal
+			}
+			scope = files
 		}
 		if len(diff) > reviewDiffByteCap {
 			r.ui.Info(fmt.Sprintf("  pr: diff exceeds %dKB — NOT reviewed; split the PR", reviewDiffByteCap>>10))
-			return nil, false
+			return nil, nil, false
 		}
-		files, err := gh.ChangedFiles(parentCtx, st.Repo, st.Number)
-		if err != nil {
-			files = nil // the diff itself already names every file; not fatal
-		}
-		if !equalStrings(st.Scope, files) {
-			st.Scope = files
+		if !equalStrings(st.Scope, scope) {
+			st.Scope = scope
 			st.save(r.cfg.WorkDir)
 		}
-		scope = files
 	}
-	// No context bundle in PR mode: the worktree IS the PR branch (the fix
-	// turn just pushed it), so read_file sees exactly what the diff shows —
-	// which is also what makes incremental review safe: the reviewer verifies
-	// previous findings against the checked-out tree, not against the delta.
-	// Outside comments are read here, before the verdict, and the watermark
-	// stays put: a fail still hands the same comments to the fix turn.
+
+	// Pre-bundle changed files under the context cap (same degradation rung
+	// (b) as local dispatchReview) so the reviewer has surrounding code on
+	// turn 1 instead of spending dozens of sequential read_file round-trips.
+	relScope := relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope))
+	ctxFiles := readableFiles(absPaths(r.cfg.WorkDir, scope))
+	if contextBundleBytes(ctxFiles) > reviewContextBundleCap {
+		ctxFiles = nil
+	}
+
+	// Run host pre-flight checks once when using the real toolchain (skipped
+	// in unit tests with fake task tools or non-Go repos).
+	preflight := ""
+	if _, isRealGH := r.prGHOrDefault().(ghPRClient); isRealGH {
+		preflight = runPRPreflight(parentCtx, r.cfg.WorkDir, relScope)
+	}
+
+	// Outside comments are fetched ONCE here and returned to the caller so a
+	// failing verdict does not incur a duplicate gh.ListComments call before
+	// the fix turn.
 	comments := pendingExternalComments(parentCtx, st, gh)
-	verdict, outcome := r.runReview(parentCtx, reviewPromptInput{
+	promptIn := reviewPromptInput{
 		initialRequest:   st.Brief,
 		diff:             diff,
-		scope:            relToWorkDir(r.cfg.WorkDir, absPaths(r.cfg.WorkDir, scope)),
-		bundled:          false,
+		scope:            relScope,
+		bundled:          len(ctxFiles) > 0,
 		prev:             prev,
 		prNumber:         st.Number,
 		prRound:          st.Round,
 		incremental:      incremental,
 		sinceSHA:         st.LastReviewHead,
 		externalComments: comments,
-	}, nil, takeWorktreeSnapshot(r.cfg.WorkDir))
+		preflight:        preflight,
+	}
+
+	preSnap := takeWorktreeSnapshot(r.cfg.WorkDir)
+	var verdict *agent.ReviewResult
+	var outcome reviewOutcome
+
+	// Fan out large full-PR diffs across parallel module reviewers.
+	sharded := false
+	if !incremental && (len(relScope) >= prShardFileThreshold || len(diff) >= prShardByteThreshold) {
+		if shards := splitUnifiedDiffByModule(diff, prMaxShards); len(shards) > 1 {
+			verdict, outcome = r.runShardedPRReview(parentCtx, promptIn, shards, preSnap)
+			sharded = true
+		}
+	}
+	if !sharded {
+		verdict, outcome = r.runReview(parentCtx, promptIn, ctxFiles, preSnap)
+	}
 	ok := outcome == reviewOK
 	if ok {
 		if head, err := runGit(r.cfg.WorkDir, "rev-parse", "HEAD"); err == nil {
@@ -341,7 +419,7 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 			}
 		}
 	}
-	return verdict, ok
+	return verdict, comments, ok
 }
 
 func shortSHA(sha string) string {

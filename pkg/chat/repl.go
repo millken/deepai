@@ -127,6 +127,10 @@ type ReplConfig struct {
 	// unresolvable alias would otherwise fail every review the gate ever
 	// runs — and on the design side, stop the mission.
 	ReviewModel string
+	// ReviewReasoningEffort optionally overrides reasoning_effort for gate-
+	// dispatched reviewers ("low", "medium", "high", "disabled"). Empty
+	// defaults to "medium".
+	ReviewReasoningEffort string
 
 	// PRReviewAuto auto-attaches the PR review loop when a turn's bash output
 	// shows a freshly created PR (detectPRCreate). Default true; a mission in
@@ -136,8 +140,13 @@ type ReplConfig struct {
 	// awaiting_merge for an explicit merge command. Default false (the
 	// confirmed decision: 全绿后等指令).
 	PRAutoMerge bool
-	// PRReviewRounds bounds the PR loop's review→fix rounds; 0 = default 5.
+	// PRReviewRounds bounds the PR loop's review→fix rounds; 0 = default 3.
 	PRReviewRounds int
+	// PRReviewMinSeverity sets the minimum severity that blocks a PR review
+	// ("critical", "high", "medium", "low"). Empty defaults to "medium":
+	// low-only findings are posted as advisory comments without spending
+	// another fix+re-review cycle.
+	PRReviewMinSeverity string
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// full mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1). Default off, for
