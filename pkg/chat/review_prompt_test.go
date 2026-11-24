@@ -140,11 +140,11 @@ func TestBuildReviewPrompt_PRMode(t *testing.T) {
 	if strings.HasPrefix(p, "Adversarially review the code changes below.\n") {
 		t.Fatalf("PR mode must replace the local-mode header:\n%.120s", p)
 	}
-	if !strings.Contains(p, "## PR claim") || !strings.Contains(p, "search the tree for that sibling") {
-		t.Fatalf("a full PR review must open the claim-gap exception:\n%s", p)
+	if !strings.Contains(p, "## PR claim") || !strings.Contains(p, "1–2 targeted lookups max") {
+		t.Fatalf("a full PR review must carry the bounded PR-claim check:\n%s", p)
 	}
-	if !strings.Contains(p, "The PR claim is one of those questions") {
-		t.Fatalf("the budget closer must not tell a full PR review to ignore the claim:\n%s", p)
+	if !strings.Contains(p, "If host pre-flight checks already ran") {
+		t.Fatalf("the budget closer must guide full PR reviews on pre-flight checks:\n%s", p)
 	}
 
 	local := buildReviewPrompt(reviewPromptInput{initialRequest: "r", diff: "d"})
@@ -170,13 +170,13 @@ func TestScaleReviewToolBudget(t *testing.T) {
 	cases := []struct {
 		configured, files, want int
 	}{
-		{0, 14, 42},    // 3×14 beats the default — PR #3's exact scope
-		{0, 10, 40},    // default floor wins on small scopes
-		{0, 0, 40},     // degenerate scope keeps the floor
-		{60, 30, 90},   // scale beats a higher configured floor
+		{0, 14, 28},    // 2×14 beats the 20 default
+		{0, 10, 20},    // default floor wins on small scopes
+		{0, 0, 20},     // degenerate scope keeps the floor
+		{60, 40, 80},   // scale beats a higher configured floor
 		{60, 10, 60},   // configured floor wins over scale
-		{0, 100, 80},   // clamp: 3×100 capped at 2× the floor
-		{0, 300, 80},   // clamp: the 300-file PR scenario (round-3 review)
+		{0, 100, 40},   // clamp: 2×100 capped at 2× the floor (40)
+		{0, 300, 40},   // clamp: large PR capped at 2× the floor
 		{60, 300, 120}, // clamp follows a raised floor, not the default
 	}
 	for _, c := range cases {
@@ -190,8 +190,8 @@ func TestScaleReviewToolBudget(t *testing.T) {
 }
 
 // The dispatch must carry the SCALED value, not the constant — a 14-file
-// scope reaches the subagent as 42 while the single-file gate tests still see
-// the 40 floor.
+// scope reaches the subagent as 28 while the single-file gate tests still see
+// the 20 floor.
 func TestReviewGateDispatchesScaledBudget(t *testing.T) {
 	fake := &fakeTaskTool{content: passVerdictJSON()}
 	r, _ := newReviewRepl(t, t.TempDir(), fake)
@@ -201,40 +201,39 @@ func TestReviewGateDispatchesScaledBudget(t *testing.T) {
 	if got := r.reviewGate(context.Background(), "req", worktreeSnapshot{}, 0).next; got != "" {
 		t.Fatalf("want pass, got %q", got)
 	}
-	if got := fake.args["max_tool_calls"]; got != 42 {
-		t.Fatalf("max_tool_calls = %v, want 42 (3×14 files)", got)
+	if got := fake.args["max_tool_calls"]; got != 28 {
+		t.Fatalf("max_tool_calls = %v, want 28 (2×14 files)", got)
 	}
 }
 
-// Round 3+ is the PR loop's convergence phase (docs/review.md §3): two fix
-// rounds have already answered the earlier findings, and every NEW medium/low
-// raised now only buys another fix round — the loop can never close that way.
-func TestBuildReviewPrompt_PRRound3IsConvergence(t *testing.T) {
+// Round 2+ is the PR loop's convergence phase: round 1 already did the broad
+// pass; later rounds verify fixes and raise new issues only if critical/high.
+func TestBuildReviewPrompt_PRRound2IsConvergence(t *testing.T) {
 	late := buildReviewPrompt(reviewPromptInput{
 		initialRequest: "req", diff: "d",
-		prNumber: 7, prRound: 3,
+		prNumber: 7, prRound: 2,
 	})
 	for _, want := range []string{
 		"Convergence round",
 		"only if it is critical or high",
-		"an empty issue list never passes",
+		"do NOT block approval on new minor/low findings",
 	} {
 		if !strings.Contains(late, want) {
-			t.Errorf("round-3+ prompt missing %q:\n%s", want, late)
+			t.Errorf("round-2+ prompt missing %q:\n%s", want, late)
 		}
 	}
 
-	early := buildReviewPrompt(reviewPromptInput{
+	first := buildReviewPrompt(reviewPromptInput{
 		initialRequest: "req", diff: "d",
-		prNumber: 7, prRound: 2,
+		prNumber: 7, prRound: 1,
 	})
-	if strings.Contains(early, "Convergence round") {
-		t.Fatalf("rounds 1-2 keep the ordinary charter — findings are not yet throttled:\n%s", early)
+	if strings.Contains(first, "Convergence round") {
+		t.Fatalf("round 1 keeps the ordinary charter — findings are not yet throttled:\n%s", first)
 	}
 
 	inc := buildReviewPrompt(reviewPromptInput{
 		initialRequest: "req", diff: "d",
-		prNumber: 7, prRound: 4, incremental: true, sinceSHA: "abc123",
+		prNumber: 7, prRound: 3, incremental: true, sinceSHA: "abc123",
 	})
 	if !strings.Contains(inc, "Convergence round") {
 		t.Fatalf("an incremental late round must carry the convergence discipline too:\n%s", inc)

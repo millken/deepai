@@ -107,7 +107,7 @@ func TestPRLoop_FailFixPass(t *testing.T) {
 
 	// The fix turn flips the reviewer's next verdict to pass.
 	r.missionTurn = func(ctx context.Context, input string) *turnError {
-		if strings.Contains(input, "[pr-review round 1/5]") {
+		if strings.Contains(input, fmt.Sprintf("[pr-review round 1/%d]", maxPRReviewRounds)) {
 			fake.content = passVerdictJSON()
 		}
 		return nil
@@ -180,16 +180,16 @@ func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
 		"summary":"one medium issue remains","issues":[]}`}
 	gh := &fakeGH{diff: "+line", checksScript: []fakeChecks{{done: true, ok: true}}}
 	r := newPRLoopRepl(t, fake, gh)
-	st := newTrackedPR(t, r, 42, 3, prStatusReviewing)
+	st := newTrackedPR(t, r, 42, 2, prStatusReviewing)
 
 	// The fix turn lands the real fix; the next round passes. fake.args keeps
-	// only the LAST dispatch's arguments, so the round-3 prompt is captured
+	// only the LAST dispatch's arguments, so the round-2 prompt is captured
 	// here — missionTurn runs between the two reviews.
-	var round3Prompt, round3FixInput string
+	var round2Prompt, round2FixInput string
 	r.missionTurn = func(ctx context.Context, input string) *turnError {
-		if round3Prompt == "" {
-			round3Prompt = fmt.Sprint(fake.args["prompt"])
-			round3FixInput = input
+		if round2Prompt == "" {
+			round2Prompt = fmt.Sprint(fake.args["prompt"])
+			round2FixInput = input
 		}
 		fake.content = passVerdictJSON()
 		return nil
@@ -203,11 +203,11 @@ func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
 	if fake.calls != 2 {
 		t.Fatalf("review dispatched %d times, want 2 (fail-with-empty-issues, then pass)", fake.calls)
 	}
-	if !strings.Contains(round3Prompt, "PR #42, review round 3") || !strings.Contains(round3Prompt, "Convergence round") {
-		t.Fatalf("round-3 review must carry the convergence prompt:\n%s", round3Prompt)
+	if !strings.Contains(round2Prompt, "PR #42, review round 2") || !strings.Contains(round2Prompt, "Convergence round") {
+		t.Fatalf("round-2 review must carry the convergence prompt:\n%s", round2Prompt)
 	}
-	if !strings.Contains(round3FixInput, "one medium issue remains") {
-		t.Fatalf("the fix turn must carry the parked summary finding, not an empty list:\n%s", round3FixInput)
+	if !strings.Contains(round2FixInput, "one medium issue remains") {
+		t.Fatalf("the fix turn must carry the parked summary finding, not an empty list:\n%s", round2FixInput)
 	}
 }
 

@@ -45,7 +45,8 @@ type SubagentConfig struct {
 	Timeout      time.Duration
 	SystemPrompt string
 	Tools        []string
-	Model        string
+	Model           string
+	ReasoningEffort string
 	// TokenBudget is an optional per-task total-token cap passed through to
 	// the subagent's AgentConfig.MaxTokensBudget. 0 = unlimited.
 	TokenBudget int

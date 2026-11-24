@@ -108,9 +108,7 @@ type Config struct {
 	// (matching RequestTimeout's unit). 0 or absent = defaultReviewTimeout.
 	ReviewTimeoutMinutes int `yaml:"review_timeout,omitempty"`
 	// ReviewMaxToolCalls caps each review subagent's tool calls. 0 or absent
-	// = DefaultReviewMaxToolCalls (40) in pkg/chat. Raised from 20 after the
-	// first live PR-loop run wrapped up mid-investigation on a reviewable
-	// diff (PR #3 round 1).
+	// = DefaultReviewMaxToolCalls (20) in pkg/chat.
 	ReviewMaxToolCalls int `yaml:"review_max_tool_calls,omitempty"`
 	// ReviewModel names the model every gate-dispatched reviewer runs on —
 	// a models[] alias, not a provider model name. Empty (the default) runs
@@ -122,6 +120,11 @@ type Config struct {
 	// the registry does not know is dropped with a warning at startup
 	// rather than failing every review (pkg/chat's validateReviewModel).
 	ReviewModel string `yaml:"review_model,omitempty"`
+	// ReviewReasoningEffort optionally overrides reasoning_effort for gate-
+	// dispatched reviewers ("low", "medium", "high", "disabled"). Empty
+	// defaults to "medium" so reasoning models don't spend minutes overthinking
+	// simple tool lookups during PR reviews.
+	ReviewReasoningEffort string `yaml:"review_reasoning_effort,omitempty"`
 
 	// PRReviewAutoDisabled turns off the PR review pipeline's auto-attach:
 	// when a turn's bash output shows a freshly created PR, the REPL enters
@@ -134,8 +137,14 @@ type Config struct {
 	// Default off — the confirmed decision for this pipeline.
 	PRAutoMerge bool `yaml:"pr_auto_merge,omitempty"`
 	// PRReviewRounds bounds the PR loop's review→fix rounds. 0 or absent =
-	// 5. Always read through ChatRepl.prMaxRounds, never directly.
+	// 3. Always read through ChatRepl.prMaxRounds, never directly.
 	PRReviewRounds int `yaml:"pr_review_rounds,omitempty"`
+	// PRReviewMinSeverity sets the minimum issue severity that blocks a PR
+	// review from passing and triggers an automatic fix turn. Valid values:
+	// "critical", "high", "medium" (default), "low". Issues below this
+	// threshold are still posted as advisory notes on the PR without spending
+	// another fix+re-review cycle.
+	PRReviewMinSeverity string `yaml:"pr_review_min_severity,omitempty"`
 
 	// MissionOnPlan upgrades an ordinary turn that entered plan mode into a
 	// long-task mission (docs/LONG_TASK_LOOP_DESIGN.md §5.1): design →
