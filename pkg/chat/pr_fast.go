@@ -100,9 +100,9 @@ func (r *ChatRepl) isPRPassVerdict(v *agent.ReviewResult) bool {
 }
 
 // prLocalWorktreeAligned reports whether the worktree is safe to use as a
-// stand-in for the remote PR tip: HEAD is on expectedBranch, and when
-// origin/<branch> exists it must equal HEAD (so we never review unpushed or
-// stale commits while claiming to review the PR).
+// stand-in for the remote PR tip: HEAD is on expectedBranch and equals
+// origin/<branch> (so we never review unpushed, unpushed-local-only, or stale
+// commits while claiming to review the PR).
 func prLocalWorktreeAligned(workDir, expectedBranch string) bool {
 	branch := strings.TrimSpace(expectedBranch)
 	if workDir == "" || branch == "" {
@@ -114,10 +114,10 @@ func prLocalWorktreeAligned(workDir, expectedBranch string) bool {
 	}
 	remoteRef := "origin/" + branch
 	if _, err := runGit(workDir, "rev-parse", "--verify", "--quiet", remoteRef); err != nil {
-		// No remote-tracking tip yet (fresh local branch) — branch name match is
-		// the best local signal; callers still fall back to gh.Diff when the
-		// base ref is missing.
-		return true
+		// Without a local remote-tracking ref we cannot confirm HEAD matches
+		// the remote PR tip (e.g. unpushed commits or non-origin remote);
+		// fall back to gh.Diff rather than risking diff drift.
+		return false
 	}
 	head, err1 := runGit(workDir, "rev-parse", "HEAD")
 	remote, err2 := runGit(workDir, "rev-parse", remoteRef)
@@ -456,18 +456,21 @@ func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewProm
 		}
 	}
 
+	schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
 	results := make([]models.ToolResult, len(shards))
 	errs := make([]error, len(shards))
+	parseErrs := make([]error, len(shards))
+	verdicts := make([]*agent.ReviewResult, len(shards))
 	pending := make([]int, len(shards))
 	for i := range shards {
 		pending[i] = i
 	}
 
-	var turnErr *turnError
-	// One transient retry, matching runReview: deadline hits stay terminal,
-	// everything else gets a single second chance per failing shard.
+	// One transient retry, matching runReview: deadline hits and worktree
+	// tampering stay terminal and abort retries immediately; other transient or
+	// parse failures get a single second chance per failing shard.
 	for attempt := 0; attempt < 2 && len(pending) > 0; attempt++ {
-		batch := pending
+		batch := append([]int(nil), pending...)
 		pending = pending[:0]
 		te := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -489,48 +492,56 @@ func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewProm
 			wg.Wait()
 			return nil
 		})
+		r.ui.FlushSubagentBlock()
+
+		// Reviewer-write defense runs after every attempt before any retry or trust decision.
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
+			r.ui.Info(fmt.Sprintf(
+				"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
+				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
+			return nil, reviewFailedTerminal
+		}
 		if te != nil && te.cancelled {
-			turnErr = te
+			r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
+			return nil, reviewInterrupted
+		}
+
+		// If any shard hit its deadline (terminal), abort retries immediately so
+		// we don't burn another full timeout retrying sibling shards.
+		hasDeadline := false
+		for _, idx := range batch {
+			if errs[idx] != nil && isReviewDeadline(errs[idx]) {
+				hasDeadline = true
+				break
+			}
+		}
+		if hasDeadline {
 			break
 		}
+
 		for _, idx := range batch {
+			parseErrs[idx] = nil
+			verdicts[idx] = nil
 			if errs[idx] != nil {
-				if isReviewDeadline(errs[idx]) {
-					continue // handled below as terminal; do not retry
-				}
 				if attempt == 0 {
 					r.ui.Info(fmt.Sprintf("  review: shard %s failed (%v) — retrying once", shards[idx].name, errs[idx]))
 					pending = append(pending, idx)
 				}
 				continue
 			}
-			// Parse errors also get one retry (content may be truncated mid-stream).
-			schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
-			if _, err := agent.ParseOutput[agent.ReviewResult](schema, results[idx].Content); err != nil {
-				errs[idx] = err
+			v, err := agent.ParseOutput[agent.ReviewResult](schema, results[idx].Content)
+			if err != nil {
+				parseErrs[idx] = err
 				if attempt == 0 {
 					r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — retrying once", shards[idx].name, err))
 					pending = append(pending, idx)
 				}
+				continue
 			}
+			verdicts[idx] = v
 		}
 	}
-	r.ui.FlushSubagentBlock()
 
-	// Reviewer-write defense across all shards at once.
-	if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
-		r.ui.Info(fmt.Sprintf(
-			"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
-			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, reviewFailedTerminal
-	}
-	if turnErr != nil && turnErr.cancelled {
-		r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
-		return nil, reviewInterrupted
-	}
-
-	schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
-	verdicts := make([]*agent.ReviewResult, 0, len(shards))
 	for i := range shards {
 		if errs[i] != nil {
 			if isReviewDeadline(errs[i]) {
@@ -540,12 +551,10 @@ func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewProm
 			r.ui.Info(fmt.Sprintf("  review: shard %s failed (%v) — changes are unreviewed", shards[i].name, errs[i]))
 			return nil, reviewFailedTransient
 		}
-		v, err := agent.ParseOutput[agent.ReviewResult](schema, results[i].Content)
-		if err != nil {
-			r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — changes are unreviewed", shards[i].name, err))
+		if parseErrs[i] != nil {
+			r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — changes are unreviewed", shards[i].name, parseErrs[i]))
 			return nil, reviewFailedTransient
 		}
-		verdicts = append(verdicts, v)
 	}
 	return mergeShardVerdicts(verdicts), reviewOK
 }

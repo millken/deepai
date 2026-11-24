@@ -2,10 +2,12 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -73,8 +75,8 @@ func TestPRLocalWorktreeAligned(t *testing.T) {
 	gitStep(t, dir, "add", "-A")
 	gitStep(t, dir, "commit", "-q", "-m", "x")
 
-	if !prLocalWorktreeAligned(dir, "feat/align") {
-		t.Fatal("current branch with no remote-tracking tip should align by name")
+	if prLocalWorktreeAligned(dir, "feat/align") {
+		t.Fatal("missing origin/feat/align tracking ref must NOT align (fall back to gh.Diff)")
 	}
 	if prLocalWorktreeAligned(dir, "main") {
 		t.Fatal("wrong expected branch must not align")
@@ -298,6 +300,83 @@ func TestDispatchPRReview_ShardsLargeDiffInParallel(t *testing.T) {
 	}
 	if got := calls.Load(); got != 3 {
 		t.Fatalf("parallel shard dispatches = %d, want 3", got)
+	}
+}
+
+func TestRunShardedPRReview_RetriesOnlyFailingShards(t *testing.T) {
+	dir := t.TempDir()
+	shards := []prDiffShard{
+		{name: "pkg/alpha", files: []string{"pkg/alpha/a.go"}, diff: "+a"},
+		{name: "pkg/beta", files: []string{"pkg/beta/b.go"}, diff: "+b"},
+		{name: "pkg/gamma", files: []string{"pkg/gamma/c.go"}, diff: "+c"},
+	}
+
+	var mu sync.Mutex
+	attempts := map[string]int{}
+	fake := &parallelCountingTaskTool{
+		handler: func(call models.ToolCall) (models.ToolResult, error) {
+			desc, _ := call.Arguments["description"].(string)
+			mu.Lock()
+			attempts[desc]++
+			n := attempts[desc]
+			mu.Unlock()
+			switch {
+			case strings.Contains(desc, "pkg/beta") && n == 1:
+				return models.ToolResult{}, errors.New("temporary network reset")
+			case strings.Contains(desc, "pkg/gamma") && n == 1:
+				return models.ToolResult{CallID: call.ID, ToolName: "task", Status: models.CallStatusCompleted, Content: "not valid json"}, nil
+			default:
+				return models.ToolResult{CallID: call.ID, ToolName: "task", Status: models.CallStatusCompleted, Content: passVerdictJSON()}, nil
+			}
+		},
+	}
+	r := newReviewReplWithHandler(t, dir, fake)
+	base := reviewPromptInput{prNumber: 90, prRound: 1, scope: []string{"pkg/alpha/a.go", "pkg/beta/b.go", "pkg/gamma/c.go"}, diff: "+all"}
+
+	verdict, outcome := r.runShardedPRReview(context.Background(), base, shards, worktreeSnapshot{})
+	if outcome != reviewOK || verdict == nil || verdict.Verdict != "pass" {
+		t.Fatalf("expected retry recovery to pass, got outcome=%v verdict=%+v", outcome, verdict)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := attempts["Adversarial correctness review (pkg/alpha)"]; got != 1 {
+		t.Errorf("healthy shard pkg/alpha ran %d times, want 1", got)
+	}
+	if got := attempts["Adversarial correctness review (pkg/beta)"]; got != 2 {
+		t.Errorf("transient-error shard pkg/beta ran %d times, want 2", got)
+	}
+	if got := attempts["Adversarial correctness review (pkg/gamma)"]; got != 2 {
+		t.Errorf("parse-error shard pkg/gamma ran %d times, want 2", got)
+	}
+}
+
+func TestRunShardedPRReview_DeadlineAbortsSiblingRetries(t *testing.T) {
+	dir := t.TempDir()
+	shards := []prDiffShard{
+		{name: "pkg/alpha", files: []string{"pkg/alpha/a.go"}, diff: "+a"},
+		{name: "pkg/beta", files: []string{"pkg/beta/b.go"}, diff: "+b"},
+	}
+
+	var calls atomic.Int32
+	fake := &parallelCountingTaskTool{
+		handler: func(call models.ToolCall) (models.ToolResult, error) {
+			calls.Add(1)
+			desc, _ := call.Arguments["description"].(string)
+			if strings.Contains(desc, "pkg/alpha") {
+				return models.ToolResult{}, context.DeadlineExceeded
+			}
+			return models.ToolResult{}, errors.New("transient error")
+		},
+	}
+	r := newReviewReplWithHandler(t, dir, fake)
+	base := reviewPromptInput{prNumber: 91, prRound: 1, scope: []string{"pkg/alpha/a.go", "pkg/beta/b.go"}, diff: "+all"}
+
+	_, outcome := r.runShardedPRReview(context.Background(), base, shards, worktreeSnapshot{})
+	if outcome != reviewFailedTerminal {
+		t.Fatalf("outcome = %v, want reviewFailedTerminal", outcome)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("total shard calls = %d, want 2 (terminal deadline must abort retry of sibling shard)", got)
 	}
 }
 

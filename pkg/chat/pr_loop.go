@@ -296,8 +296,8 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 // Performance optimizations over the initial single-agent remote-diff design:
 //   - Round 2+ reads only the local incremental diff since LastReviewHead.
 //   - Round 1 prefers local `git diff merge-base..HEAD` when the worktree is
-//     on the PR branch and (when present) HEAD matches origin/<branch>,
-//     falling back to gh.Diff when local refs don't match the remote tip.
+//     on the PR branch and HEAD matches origin/<branch>, falling back to
+//     gh.Diff when local refs are missing or drift from the remote tip.
 //   - Changed files under the 256KiB cap are pre-bundled via context_files so
 //     the reviewer reasons on Turn 1 instead of spending 15+ read_file turns.
 //   - Host pre-flight runs targeted `go vet` + `go test -short` once up front
