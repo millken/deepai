@@ -25,7 +25,7 @@ func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
 	// immediately after restart still has name/notify for cancelled run_end hooks.
 	if list, err := svc.List(context.Background(), "", 0); err == nil {
 		for _, sch := range list {
-			obs.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+			obs.meta[sch.ID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: sch.Name, notify: sch.Options.Notify}
 		}
 	}
 	svc.SetObserver(obs)
@@ -93,17 +93,19 @@ type scheduleObserver struct {
 }
 
 type scheduleMeta struct {
+	botID  string
 	name   string
 	notify string
 }
 
 func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.ChangeKind) {
+	botID := effectiveBotID(sch.BotID)
 	if kind != schedule.ChangeDeleted && sch.ID != "" {
 		o.mu.Lock()
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+		o.meta[sch.ID] = scheduleMeta{botID: botID, name: sch.Name, notify: sch.Options.Notify}
 		o.mu.Unlock()
 	}
 	typ := EventScheduleUpdated
@@ -113,7 +115,7 @@ func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.
 	case schedule.ChangeDeleted:
 		typ = EventScheduleDeleted
 	}
-	o.m.global.publish(Event{Type: typ, Schedule: &sch, Time: time.Now().UTC()})
+	o.m.global.publish(Event{BotID: botID, Type: typ, Schedule: &sch, Time: time.Now().UTC()})
 
 	if kind == schedule.ChangeCreated && sch.State == schedule.StatePendingApproval &&
 		o.m.opts.Hook != nil && sch.Options.Notify != schedule.NotifyNever {
@@ -139,6 +141,7 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 	} else {
 		o.last[run.ID] = run.Status
 	}
+	botID := o.meta[run.ScheduleID].botID
 	o.mu.Unlock()
 	typ := EventScheduleRunUpdated
 	switch {
@@ -149,7 +152,7 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 		// intermediate update (design §9.1).
 		typ = EventScheduleRunStarted
 	}
-	o.m.global.publish(Event{Type: typ, Run: &run, Time: time.Now().UTC()})
+	o.m.global.publish(Event{BotID: effectiveBotID(botID), Type: typ, Run: &run, Time: time.Now().UTC()})
 
 	if run.Status.Terminal() && o.m.opts.Hook != nil && o.svc != nil {
 		// Dispatch asynchronously: RunChanged is called while Service.mu is
@@ -293,7 +296,10 @@ func NewScheduleDispatcher(m *Manager, svc *schedule.Service) *ScheduleDispatche
 func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, run schedule.Run) (string, string, error) {
 	botID := effectiveBotID(sch.BotID)
 	profile, err := d.m.GetBot(ctx, botID)
-	if err != nil || !profile.Enabled {
+	if err != nil {
+		return "", "", fmt.Errorf("schedule bot %q: %w", botID, err)
+	}
+	if !profile.Enabled {
 		return "", "", schedule.ErrBotDisabled
 	}
 	sessionID, err := d.resolveSession(sch, run)

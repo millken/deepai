@@ -140,6 +140,9 @@ func MatchAllowlist(name string, allowlist []string) bool {
 		}
 		if strings.HasSuffix(pat, "*") {
 			prefix := strings.TrimSuffix(pat, "*")
+			if prefix == "" {
+				continue // bare "*" is disallowed; omit allowlist for unrestricted access
+			}
 			if strings.HasPrefix(name, prefix) {
 				return true
 			}
@@ -190,10 +193,12 @@ func (r *Registry) ValidateAllowlist(allowlist []string) []string {
 		matched := false
 		if strings.HasSuffix(pat, "*") {
 			prefix := strings.TrimSuffix(pat, "*")
-			for name := range r.tools {
-				if strings.HasPrefix(name, prefix) {
-					matched = true
-					break
+			if prefix != "" {
+				for name := range r.tools {
+					if strings.HasPrefix(name, prefix) {
+						matched = true
+						break
+					}
 				}
 			}
 		} else {

@@ -270,8 +270,11 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 		filterBot = req.BotID
 	}
 	matchesFilter := func(e Event) bool {
-		if filterBot == "" {
+		if filterBot == "" || e.Type == EventHeartbeat || e.Type == EventGap {
 			return true
+		}
+		if e.BotID != "" {
+			return e.BotID == filterBot
 		}
 		if e.Bot != nil {
 			return e.Bot.ID == filterBot
@@ -282,7 +285,7 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 		if e.Schedule != nil {
 			return effectiveBotID(e.Schedule.BotID) == filterBot
 		}
-		return true
+		return false
 	}
 	push := func(e Event) {
 		if !matchesFilter(e) {

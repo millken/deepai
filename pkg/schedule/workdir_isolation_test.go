@@ -116,12 +116,30 @@ func TestMultiWorkDirLeasesAndScheduleIsolation(t *testing.T) {
 		t.Fatalf("svcB.List = %+v, err=%v", listB, err)
 	}
 
-	// CountByBot & DeleteByBot work cleanly across schedules and runs.
+	// CountByBot & DeleteByBot work cleanly across schedules and runs,
+	// and DeleteByBot only bumps schedule_metas for affected work_dirs.
+	metaVer := func(wd string) int64 {
+		var v int64
+		if err := db.QueryRowContext(ctx, `SELECT version FROM schedule_metas WHERE work_dir = ?`, wd).Scan(&v); err != nil {
+			t.Fatalf("query schedule_metas(%s): %v", wd, err)
+		}
+		return v
+	}
+	verABefore := metaVer("/repo/a")
+	verBBefore := metaVer("/repo/b")
 	if n, err := svcA.CountByBot(ctx, "reviewer"); err != nil || n != 1 {
 		t.Fatalf("CountByBot(reviewer) = %d, %v; want 1", n, err)
 	}
 	if err := svcA.DeleteByBot(ctx, "reviewer"); err != nil {
 		t.Fatal(err)
+	}
+	verAAfter := metaVer("/repo/a")
+	verBAfter := metaVer("/repo/b")
+	if verAAfter <= verABefore {
+		t.Fatalf("expected /repo/a meta version bump: before=%d after=%d", verABefore, verAAfter)
+	}
+	if verBAfter != verBBefore {
+		t.Fatalf("unrelated /repo/b meta version bumped: before=%d after=%d", verBBefore, verBAfter)
 	}
 	if n, err := svcA.CountByBot(ctx, "reviewer"); err != nil || n != 0 {
 		t.Fatalf("CountByBot(reviewer) after delete = %d, %v; want 0", n, err)
@@ -161,8 +179,8 @@ func TestLegacyMigrationBackfillsWorkDirFromSessions(t *testing.T) {
 		t.Fatalf("Migrate legacy db: %v", err)
 	}
 
-	// sch_old_b should have been backfilled to /repo/b from sessions.cwd;
-	// sch_old_orphan falls back to /repo/a.
+	// sch_old_b is backfilled to /repo/b from sessions.cwd;
+	// sch_old_orphan has no session so it stays work_dir='' (not claimed by /repo/a).
 	storeB := NewSQLiteStoreForDir(db, "/repo/b")
 	gotB, err := storeB.GetSchedule(ctx, "sch_old_b")
 	if err != nil {
@@ -171,12 +189,15 @@ func TestLegacyMigrationBackfillsWorkDirFromSessions(t *testing.T) {
 	if gotB.BotID != DefaultBotID || gotB.WorkDir != "/repo/b" {
 		t.Fatalf("gotB = %+v, want bot_id=default work_dir=/repo/b", gotB)
 	}
-	gotA, err := storeA.GetSchedule(ctx, "sch_old_orphan")
-	if err != nil {
-		t.Fatalf("expected sch_old_orphan in /repo/a: %v", err)
+	if _, err := storeA.GetSchedule(ctx, "sch_old_orphan"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("storeA should not claim sessionless legacy schedule: err=%v", err)
 	}
-	if gotA.BotID != DefaultBotID || gotA.WorkDir != "/repo/a" {
-		t.Fatalf("gotA = %+v, want bot_id=default work_dir=/repo/a", gotA)
+	var orphanDir string
+	if err := db.QueryRowContext(ctx, `SELECT work_dir FROM schedules WHERE id = 'sch_old_orphan'`).Scan(&orphanDir); err != nil {
+		t.Fatal(err)
+	}
+	if orphanDir != "" {
+		t.Fatalf("sch_old_orphan work_dir = %q, want empty string", orphanDir)
 	}
 }
 

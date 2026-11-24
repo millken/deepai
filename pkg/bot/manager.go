@@ -276,7 +276,7 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 		return BotProfile{}, err
 	}
 	cp := created.Clone()
-	m.global.publish(Event{Type: EventBotCreated, Bot: &cp})
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotCreated, Bot: &cp})
 	return created, nil
 }
 
@@ -316,7 +316,7 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 		return BotProfile{}, err
 	}
 	cp := updated.Clone()
-	m.global.publish(Event{Type: EventBotUpdated, Bot: &cp})
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
 	return updated, nil
 }
 
@@ -431,16 +431,16 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 		if conv != nil {
 			_ = conv.Close()
 		}
-		s.bus.publish(Event{SessionID: s.id, Type: EventSessionDeleted})
+		s.bus.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionDeleted})
 		s.bus.close()
 	}
 
-	if sched != nil && schedCount > 0 {
+	if sched != nil {
 		if err := sched.DeleteByBot(ctx, id); err != nil {
 			return err
 		}
 	}
-	if force && hasBotStore {
+	if hasBotStore {
 		if err := bs.DeleteBotCascade(id); err != nil {
 			return err
 		}
@@ -451,7 +451,7 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 	}
 
 	cp := cur.Clone()
-	m.global.publish(Event{Type: EventBotDeleted, Bot: &cp})
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotDeleted, Bot: &cp})
 	return nil
 }
 
@@ -521,7 +521,7 @@ func (m *Manager) CreateSessionForBot(botID string, req CreateSessionRequest) (S
 	m.mu.Unlock()
 
 	info := s.info()
-	m.global.publish(Event{SessionID: s.id, Type: EventSessionCreated, Session: &info})
+	m.global.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionCreated, Session: &info})
 	return info, nil
 }
 
@@ -636,9 +636,10 @@ func (m *Manager) DeleteSessionForBot(botID, id string) error {
 	if conv != nil {
 		_ = conv.Close()
 	}
-	s.bus.publish(Event{SessionID: id, Type: EventSessionDeleted})
+	delEvt := Event{BotID: effectiveBotID(s.botID), SessionID: id, Type: EventSessionDeleted}
+	s.bus.publish(delEvt)
 	s.bus.close()
-	m.global.publish(Event{SessionID: id, Type: EventSessionDeleted})
+	m.global.publish(delEvt)
 	return nil
 }
 
@@ -977,7 +978,8 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	defer t.cancel()
 
 	started := time.Now().UTC()
-	startEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnStart, Text: history[len(history)-1].Content}
+	botID := effectiveBotID(s.botID)
+	startEvt := Event{BotID: botID, SessionID: s.id, TurnID: t.id, Type: EventTurnStart, Text: history[len(history)-1].Content}
 	s.bus.publish(startEvt)
 	m.global.publish(startEvt)
 
@@ -987,6 +989,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	// below, so nothing a Runtime emits late (e.g. from an abandoned run)
 	// can appear after this turn's turn_end.
 	emit := func(evt Event) {
+		evt.BotID = botID
 		evt.SessionID = s.id
 		evt.TurnID = t.id
 		s.mu.Lock()
@@ -1065,7 +1068,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 
 	// turn_end goes out while s.turn is still t: a Send racing Done() must
 	// not get its turn_start onto either bus ahead of this turn's end.
-	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
+	endEvt := Event{BotID: botID, SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
 	s.mu.Lock()
 	s.bus.publish(endEvt)
 	m.global.publish(endEvt)

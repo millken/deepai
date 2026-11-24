@@ -45,8 +45,11 @@ func TestRegistrySubsetAndValidateAllowlist(t *testing.T) {
 	if missing := reg.ValidateAllowlist([]string{"read_file", "mcp__github__*"}); len(missing) != 0 {
 		t.Fatalf("expected no missing patterns, got %v", missing)
 	}
-	missing := reg.ValidateAllowlist([]string{"read_file", "no_such_tool", "mcp__jira__*"})
-	if len(missing) != 2 || missing[0] != "no_such_tool" || missing[1] != "mcp__jira__*" {
-		t.Fatalf("missing = %v, want [no_such_tool mcp__jira__*]", missing)
+	missing := reg.ValidateAllowlist([]string{"read_file", "no_such_tool", "mcp__jira__*", "*"})
+	if len(missing) != 3 || missing[0] != "no_such_tool" || missing[1] != "mcp__jira__*" || missing[2] != "*" {
+		t.Fatalf("missing = %v, want [no_such_tool mcp__jira__* *]", missing)
+	}
+	if MatchAllowlist("read_file", []string{"*"}) {
+		t.Fatal("bare * must not match tools")
 	}
 }

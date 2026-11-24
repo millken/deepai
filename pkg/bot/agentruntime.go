@@ -165,13 +165,13 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	disableEnterPlan := false
 	if len(in.BotToolAllowlist) > 0 {
 		toolsReg = toolsReg.Subset(in.BotToolAllowlist)
-		if !toolAllowlistIncludes(in.BotToolAllowlist, "enter_plan_mode") {
+		if !tools.MatchAllowlist("enter_plan_mode", in.BotToolAllowlist) {
 			disableEnterPlan = true
 		}
 	}
 	if len(in.ToolAllowlist) > 0 {
 		toolsReg = toolsReg.Subset(in.ToolAllowlist)
-		if !toolAllowlistIncludes(in.ToolAllowlist, "enter_plan_mode") {
+		if !tools.MatchAllowlist("enter_plan_mode", in.ToolAllowlist) {
 			disableEnterPlan = true
 		}
 	}
@@ -352,20 +352,4 @@ func translateAgentEvent(ctx context.Context, evt agent.AgentEvent) (Event, bool
 		return Event{Type: EventError, Error: e}, true
 	}
 	return Event{}, false
-}
-
-func toolAllowlistIncludes(allowlist []string, name string) bool {
-	for _, raw := range allowlist {
-		p := strings.TrimSpace(raw)
-		if p == "" {
-			continue
-		}
-		if p == name {
-			return true
-		}
-		if strings.HasSuffix(p, "*") && strings.HasPrefix(name, strings.TrimSuffix(p, "*")) {
-			return true
-		}
-	}
-	return false
 }

@@ -390,7 +390,6 @@ func TestScheduleP2EndToEndCronAndWebhook(t *testing.T) {
 	var sawAsk, sawEnd bool
 	waitDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(waitDeadline) {
-		hookDisp.WaitIdle(50 * time.Millisecond)
 		mu.Lock()
 		sawAsk, sawEnd = false, false
 		for _, ev := range received {

@@ -643,3 +643,132 @@ func TestAgentRuntimeTurnInjectionAndToolIntersection(t *testing.T) {
 		t.Fatalf("tools sent to LLM = %v, want intersection %v", gotTools, wantTools)
 	}
 }
+
+func TestMultiBotWSGlobalFilterExcludesOtherBotTurns(t *testing.T) {
+	ts, m, _, _ := newMultiBotServer(t)
+
+	if _, err := m.CreateBot(context.Background(), CreateBotRequest{ID: "reviewer", Name: "Reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	defSess, err := m.CreateSessionForBot(DefaultBotID, CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revSess, err := m.CreateSessionForBot("reviewer", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/ws?token=secret"
+	conn, err := websocket.Dial(wsURL, "", ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Subscribe "*" filtered strictly to bot_id="reviewer".
+	if err := websocket.JSON.Send(conn, WSRequest{ID: "1", Op: "subscribe", SessionID: "*", BotID: "reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	var rep WSMessage
+	for {
+		if err := websocket.JSON.Receive(conn, &rep); err != nil {
+			t.Fatal(err)
+		}
+		if rep.Kind == "reply" && rep.ID == "1" {
+			if !rep.OK {
+				t.Fatalf("subscribe failed: %+v", rep.Error)
+			}
+			break
+		}
+	}
+
+	// Run a turn on default bot (must NOT leak to reviewer's "*" feed),
+	// followed by a turn on reviewer (MUST appear).
+	tDef, err := m.SendForBot(DefaultBotID, defSess.ID, SendRequest{Content: "default msg"}, SendOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTurn(t, tDef)
+
+	tRev, err := m.SendForBot("reviewer", revSess.ID, SendRequest{Content: "reviewer msg"}, SendOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTurn(t, tRev)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var seenRevStart, seenRevEnd bool
+	for !(seenRevStart && seenRevEnd) {
+		var msg WSMessage
+		if err := websocket.JSON.Receive(conn, &msg); err != nil {
+			t.Fatalf("waiting for reviewer events: %v", err)
+		}
+		if msg.Kind != "event" || msg.Event == nil || msg.Event.Type == EventHeartbeat {
+			continue
+		}
+		e := msg.Event
+		if e.SessionID == defSess.ID || (e.BotID != "" && e.BotID != "reviewer") {
+			t.Fatalf("cross-bot event leaked into reviewer-filtered * stream: %+v", e)
+		}
+		if e.SessionID == revSess.ID && e.Type == EventTurnStart {
+			seenRevStart = true
+		}
+		if e.SessionID == revSess.ID && e.Type == EventTurnEnd {
+			seenRevEnd = true
+		}
+	}
+}
+
+func TestMultiBotDeletePurgesSoftDeletedSchedules(t *testing.T) {
+	ts, m, _, svc := newMultiBotServer(t)
+	ctx := context.Background()
+
+	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "ephemeral", Name: "Ephemeral"}); err != nil {
+		t.Fatal(err)
+	}
+	sch, err := svc.Create(ctx, schedule.CreateInput{
+		BotID:   "ephemeral",
+		Name:    "temp-task",
+		Prompt:  "ping",
+		Trigger: schedule.Trigger{Type: schedule.TriggerInterval, Every: "1h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Soft-delete the schedule so active CountByBot is 0, leaving a soft-deleted row.
+	if _, err := svc.Delete(ctx, sch.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-forced DELETE /v1/bots/ephemeral succeeds and must hard-purge the soft-deleted schedule.
+	resp := doReq(t, http.MethodDelete, ts.URL+"/v1/bots/ephemeral", "secret", nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE ephemeral status = %d, want 204", resp.StatusCode)
+	}
+	if list, err := svc.ListForBot(ctx, "ephemeral", "all", 50); err != nil || len(list) != 0 {
+		t.Fatalf("soft-deleted schedule leaked after DeleteBot: %+v, err=%v", list, err)
+	}
+}
+
+func TestScheduleDispatcherUnknownBotDoesNotMarkBotDisabled(t *testing.T) {
+	m, _, _ := newTestManager(t)
+	svc, disp := newScheduleTestService(t, m)
+
+	_, _, err := disp.Fire(context.Background(), schedule.Schedule{
+		ID:    "sch_orphan",
+		BotID: "ghost",
+		Name:  "ghost task",
+	}, schedule.Run{ID: "run_orphan", ScheduleID: "sch_orphan"})
+	_ = svc
+	if err == nil {
+		t.Fatal("expected error for unknown bot, got nil")
+	}
+	if errors.Is(err, schedule.ErrBotDisabled) {
+		t.Fatalf("unknown bot must not be mapped to schedule.ErrBotDisabled: %v", err)
+	}
+	if !errors.Is(err, ErrUnknownBot) {
+		t.Fatalf("err = %v, want wrapped ErrUnknownBot", err)
+	}
+}

@@ -146,25 +146,21 @@ func (s *SQLiteStore) ensureColumn(ctx context.Context, table, col, def string) 
 }
 
 // backfillLegacyWorkDir assigns pre-v2 schedules (work_dir = '') to their
-// session's cwd when a sessions table exists, falling back to this store's
-// workDir for sessionless legacy tasks.
+// session's cwd when a sessions table exists and has a non-empty cwd.
+// Sessionless legacy schedules are left with work_dir = '' rather than being
+// blindly claimed by whichever repo calls Migrate first.
 func (s *SQLiteStore) backfillLegacyWorkDir(ctx context.Context) error {
 	var hasSessions int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'`).Scan(&hasSessions)
-	if hasSessions > 0 {
-		if _, err := s.db.ExecContext(ctx, `
-			UPDATE schedules
-			SET work_dir = COALESCE(
-				(SELECT cwd FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != ''),
-				?
-			)
-			WHERE work_dir = ''`, s.workDir); err != nil {
-			return fmt.Errorf("backfill schedule work_dir from sessions: %w", err)
-		}
+	if hasSessions == 0 {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE schedules SET work_dir = ? WHERE work_dir = ''`, s.workDir); err != nil {
-		return fmt.Errorf("backfill schedule work_dir: %w", err)
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE schedules
+		SET work_dir = (SELECT cwd FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')
+		WHERE work_dir = ''
+		  AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')`); err != nil {
+		return fmt.Errorf("backfill schedule work_dir from sessions: %w", err)
 	}
 	return nil
 }
@@ -510,14 +506,38 @@ func (s *SQLiteStore) DeleteByBot(ctx context.Context, botID string) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT work_dir FROM schedules WHERE bot_id = ?`, target)
+	if err != nil {
+		return err
+	}
+	var dirs []string
+	for rows.Next() {
+		var wd string
+		if err := rows.Scan(&wd); err != nil {
+			rows.Close()
+			return err
+		}
+		dirs = append(dirs, wd)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedules WHERE bot_id = ?)`, target); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM schedules WHERE bot_id = ?`, target); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE schedule_metas SET version = version + 1`); err != nil {
-		return err
+	for _, wd := range dirs {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schedule_metas (work_dir, version) VALUES (?, 1)
+			ON CONFLICT(work_dir) DO UPDATE SET version = version + 1`, wd); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

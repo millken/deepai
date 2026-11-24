@@ -63,6 +63,7 @@ const (
 // miss nothing that is still in the replay buffer.
 type Event struct {
 	Seq       int64     `json:"seq"`
+	BotID     string    `json:"bot_id,omitempty"`
 	SessionID string    `json:"session_id"`
 	TurnID    string    `json:"turn_id,omitempty"`
 	Type      EventType `json:"type"`
