@@ -498,6 +498,8 @@ func normalizeScopeFiles(workDir string, in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, raw := range in {
 		p := strings.TrimSpace(raw)
+		p = strings.Trim(p, "`'\"")
+		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}

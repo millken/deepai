@@ -417,6 +417,11 @@ type ChatRepl struct {
 	// phase which files the implementation actually needed (§5.4.3).
 	missionScopeViolations []string
 
+	// missionLastReviewSnap records the worktree snapshot from the previous
+	// implementation review round so fix re-reviews can focus on the delta
+	// files touched since that review rather than re-feeding the entire phase.
+	missionLastReviewSnap worktreeSnapshot
+
 	// missionTurn overrides how a mission turn is executed. Tests only —
 	// nil in every real ChatRepl, and the production path (runMissionTurn)
 	// then runs an ordinary runTurn. Mirrors the orphanWait /

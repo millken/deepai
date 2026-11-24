@@ -95,6 +95,7 @@ func (r *ChatRepl) clearMissionTurnMode() {
 	r.deferPlanApproval = false
 	r.missionPendingInput = ""
 	r.missionEscalationNote = ""
+	r.missionLastReviewSnap = worktreeSnapshot{}
 	r.ui.SetStatus(r.currentModel, r.planMode)
 }
 

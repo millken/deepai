@@ -253,13 +253,15 @@ type prDiffShard struct {
 // pkg/schedule, pkg/bot, cmd/deepai-bot) so large PRs can be reviewed
 // concurrently across independent subagents.
 func splitUnifiedDiffByModule(diff string, maxShards int) []prDiffShard {
+	return splitUnifiedDiffByModuleInWorkDir("", diff, maxShards)
+}
+
+// splitUnifiedDiffByModuleInWorkDir is like splitUnifiedDiffByModule but also
+// strips workDir from absolute paths produced by `git diff --no-index` on
+// untracked files so new multi-module packages shard by their real repo paths.
+func splitUnifiedDiffByModuleInWorkDir(workDir, diff string, maxShards int) []prDiffShard {
 	if maxShards <= 1 {
 		return nil
-	}
-	type fileChunk struct {
-		path  string
-		group string
-		text  string
 	}
 	// Split on "\ndiff --git " boundaries while preserving leading header.
 	var rawChunks []string
@@ -286,16 +288,27 @@ func splitUnifiedDiffByModule(diff string, maxShards int) []prDiffShard {
 	groups := map[string]*prDiffShard{}
 	var order []string
 	for _, chunk := range rawChunks {
-		path := parseDiffChunkPath(chunk)
-		grp := moduleGroupKey(path)
+		p := parseDiffChunkPath(chunk)
+		if workDir != "" && p != "" {
+			if rel, ok := workdirRel(workDir, p); ok {
+				p = rel
+			} else if !strings.HasPrefix(p, "/") {
+				// git diff --no-index drops the leading "/" after "b/", turning
+				// "/abs/workdir/pkg/a.go" into "b/abs/workdir/pkg/a.go".
+				if rel, ok := workdirRel(workDir, "/"+p); ok {
+					p = rel
+				}
+			}
+		}
+		grp := moduleGroupKey(p)
 		sh, ok := groups[grp]
 		if !ok {
 			sh = &prDiffShard{name: grp}
 			groups[grp] = sh
 			order = append(order, grp)
 		}
-		if path != "" {
-			sh.files = append(sh.files, path)
+		if p != "" {
+			sh.files = append(sh.files, p)
 		}
 		sh.diff += chunk
 	}
@@ -405,8 +418,13 @@ func mergeShardVerdicts(results []*agent.ReviewResult) *agent.ReviewResult {
 // Ctrl+C signal handling stay single-threaded on the REPL goroutine while all
 // shard LLM subagents run concurrently in the tool registry / subagent pool.
 func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewPromptInput, shards []prDiffShard, preReview worktreeSnapshot) (*agent.ReviewResult, reviewOutcome) {
-	r.ui.Info(fmt.Sprintf("  pr: #%d large diff (%d files, %dKB) — running %d parallel module reviewers",
-		base.prNumber, len(base.scope), len(base.diff)>>10, len(shards)))
+	if base.prNumber > 0 {
+		r.ui.Info(fmt.Sprintf("  pr: #%d large diff (%d files, %dKB) — running %d parallel module reviewers",
+			base.prNumber, len(base.scope), len(base.diff)>>10, len(shards)))
+	} else {
+		r.ui.Info(fmt.Sprintf("  mission: large diff (%d files, %dKB) — running %d parallel module reviewers",
+			len(base.scope), len(base.diff)>>10, len(shards)))
+	}
 
 	timeout := r.cfg.ReviewTimeout
 	if timeout <= 0 {

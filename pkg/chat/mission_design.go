@@ -3,6 +3,8 @@ package chat
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -222,7 +224,7 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 			return false
 		}
 
-		scope, pass, gateReason := designOutcome(r.cfg.WorkDir, verdict)
+		scope, pass, gateReason := designOutcomeWithSeverity(r.cfg.WorkDir, verdict, r.prMinBlockingSeverity())
 		m.appendReview(missionReviewRecord{
 			Phase: "design", Round: round, Verdict: verdictWord(pass), Summary: verdict.Summary,
 			Detail: map[string]any{"issues": verdict.Issues, "scope_files": scope,
@@ -230,6 +232,10 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 		})
 
 		if pass {
+			if len(verdict.Issues) > 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design review reported %d non-blocking note(s) below %s — accepting plan",
+					len(verdict.Issues), r.prMinBlockingSeverity()))
+			}
 			c := &Charter{ScopeFiles: scope, Acceptance: verdict.Acceptance}
 			if err := m.lockCharter(c); err != nil {
 				r.ui.Info(fmt.Sprintf("  mission: could not lock the charter (%v) — NOT implementing", err))
@@ -371,32 +377,59 @@ func (r *ChatRepl) presentDesignIssues(header string, v *agent.DesignReviewResul
 // scope path spelled outside the worktree. reason is empty for an ordinary
 // failing verdict, whose issues speak for themselves.
 func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string, pass bool, reason string) {
+	return designOutcomeWithSeverity(workDir, v, "medium")
+}
+
+// designOutcomeWithSeverity applies the code test for a passing design with a
+// minimum blocking severity threshold. Severity gating wins over the model's
+// verdict label:
+//   - Any issue at or above minSeverity (default "medium") blocks, even when
+//     the model says "pass".
+//   - A non-pass verdict with zero issues NEVER passes (strict schema guard).
+//   - A verdict whose issues are ALL strictly below minSeverity (e.g. low-only)
+//     passes when the reviewer also supplied a lockable charter (valid
+//     acceptance criteria + scope_files).
+func designOutcomeWithSeverity(workDir string, v *agent.DesignReviewResult, minSeverity string) (scope []string, pass bool, reason string) {
 	if v == nil {
 		return nil, false, "the design review returned no verdict"
 	}
-	// An EXPLICIT pass is required — the same tightening isMissionPassVerdict
-	// applies, and for the same reason: "no issues" is a shape a Strict
-	// schema lets a failing reviewer emit, and here it would lock a charter
-	// from a plan the reviewer rejected. The design text allows the empty-
-	// issues fallback (isDesignPass, §5.2); both reviewer prompts promise
-	// the literal word, and the cost of demanding it is one more revision
-	// round, while the cost of the fallback is an implementation phase
-	// spent on a plan that failed review.
-	if !strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
-		return nil, false, ""
+	explicitPass := strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
+	if len(v.Issues) == 0 {
+		if !explicitPass {
+			return nil, false, ""
+		}
+	} else {
+		if !explicitPass && !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") {
+			return nil, false, ""
+		}
+		minRank := prSeverityRank(minSeverity)
+		for _, is := range v.Issues {
+			if prSeverityRank(is.Severity) >= minRank {
+				return nil, false, ""
+			}
+		}
 	}
 	if len(v.Acceptance) == 0 {
+		if !explicitPass {
+			return nil, false, ""
+		}
 		return nil, false, "the review passed the plan but returned no acceptance criteria, so there is nothing for the charter to hold the implementation to. State the acceptance criteria in the plan as complete Given/When/Then sentences, each with one observable outcome."
 	}
 	for _, a := range v.Acceptance {
 		// A criterion this short cannot state an observable outcome; it is
 		// the shape a hedged pass takes ("works", "ok").
 		if len(strings.TrimSpace(a)) < 12 {
+			if !explicitPass {
+				return nil, false, ""
+			}
 			return nil, false, fmt.Sprintf("the review passed the plan, but acceptance criterion %q is too short to state an observable outcome, so the charter cannot be locked from it. Write every criterion as a full Given/When/Then sentence naming the thing an observer would see.", strings.TrimSpace(a))
 		}
 	}
 	scope = normalizeScopeFiles(workDir, v.ScopeFiles)
 	if len(scope) == 0 {
+		if !explicitPass {
+			return nil, false, ""
+		}
 		return nil, false, fmt.Sprintf("the review passed the plan, but none of the in-scope paths it returned (%s) resolve to a file inside this working directory, so the charter would lock an empty scope. Name in-scope files in the plan as repo-relative paths (pkg/chat/mission.go), not absolute paths and not paths outside the repository.",
 			strings.Join(v.ScopeFiles, ", "))
 	}
@@ -406,6 +439,18 @@ func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string,
 // ---------------------------------------------------------------------------
 // Design review dispatch
 // ---------------------------------------------------------------------------
+
+const (
+	// designReReviewMaxToolCalls caps design re-reviews (round >= 2) when the
+	// user has not explicitly configured review_max_tool_calls: the reviewer is
+	// verifying revisions to a plan it already checked, not exploring from zero.
+	designReReviewMaxToolCalls = 12
+	// designContextMaxFiles and designContextBundleCap bound how many existing
+	// repo files cited in the plan are pre-bundled via context_files so the
+	// design reviewer skips sequential read_file round trips.
+	designContextMaxFiles  = 8
+	designContextBundleCap = 128 << 10
+)
 
 // designReviewInput is the reviewer's seed material. Everything here is
 // either the user's own words, the plan document, or the review machinery's
@@ -423,6 +468,8 @@ type designReviewInput struct {
 	// be built, not just restate itself.
 	escalation   string
 	planPath     string
+	round        int
+	bundledFiles []string
 	maxToolCalls int
 	timeout      time.Duration
 }
@@ -442,24 +489,36 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 	if timeout <= 0 {
 		timeout = DefaultReviewTimeout
 	}
+	maxToolCalls := r.reviewMaxToolCallsOrDefault()
+	if prev != nil && r.cfg.ReviewMaxToolCalls <= 0 && maxToolCalls > designReReviewMaxToolCalls {
+		maxToolCalls = designReReviewMaxToolCalls
+	}
+	effort := strings.TrimSpace(r.cfg.ReviewReasoningEffort)
+	if effort == "" {
+		effort = defaultReviewReasoningEffort
+	}
+	ctxFiles := extractPlanContextFiles(r.cfg.WorkDir, plan, designContextMaxFiles, designContextBundleCap)
 	in := designReviewInput{
 		brief:        m.brief,
 		plan:         plan,
 		prev:         prev,
 		escalation:   r.missionEscalationNote,
 		planPath:     m.designPath(),
-		maxToolCalls: r.reviewMaxToolCallsOrDefault(),
+		round:        round,
+		bundledFiles: relToWorkDir(r.cfg.WorkDir, ctxFiles),
+		maxToolCalls: maxToolCalls,
 		timeout:      timeout,
 	}
 	args := map[string]any{
-		"description": "Adversarial design review",
-		"agent_type":  string(agent.AgentTypeDesignReviewer),
-		"prompt":      buildDesignReviewPrompt(in),
+		"description":      "Adversarial design review",
+		"agent_type":       string(agent.AgentTypeDesignReviewer),
+		"prompt":           buildDesignReviewPrompt(in),
+		"reasoning_effort": effort,
 		// The gate caps the reviewer, not the profile — the same split the
 		// correctness gate uses, and the same configured value: one config
 		// key drives every gate-dispatched reviewer (round-2 review caught this
 		// desync — mission reviewers silently ignored review_max_tool_calls).
-		"max_tool_calls": r.reviewMaxToolCallsOrDefault(),
+		"max_tool_calls": maxToolCalls,
 	}
 	if r.cfg.ReviewTokenBudget > 0 {
 		args["token_budget"] = r.cfg.ReviewTokenBudget
@@ -470,6 +529,13 @@ func (r *ChatRepl) dispatchDesignReview(parentCtx context.Context, m *mission, p
 	// would be — a plan has no compiler to disagree with either of them.
 	if model := strings.TrimSpace(r.cfg.ReviewModel); model != "" {
 		args["model"] = model
+	}
+	if len(ctxFiles) > 0 {
+		files := make([]any, len(ctxFiles))
+		for i, f := range ctxFiles {
+			files[i] = f
+		}
+		args["context_files"] = files
 	}
 
 	// A design reviewer has no bash and only read-only tools, so this
@@ -535,6 +601,9 @@ const designPlanPromptCap = 64 << 10
 func buildDesignReviewPrompt(in designReviewInput) string {
 	var b strings.Builder
 	b.WriteString("Adversarially review the implementation plan below against the brief it is supposed to answer.\n\n")
+	if in.round >= 2 && in.prev != nil {
+		b.WriteString("Convergence round: your job now is to close the design phase, not to widen it. Verify whether each previously reported issue is addressed in the plan above, and stop there. Raise a NEW issue only if it is critical or high (a flaw that would make the implementation unbuildable or break the brief) — do NOT block approval on minor/low polish or stylistic suggestions (mention them in summary and still output verdict \"pass\" with scope_files and acceptance populated).\n\n")
+	}
 	b.WriteString("## Original brief (verbatim user request — the fixed anchor)\n\n")
 	b.WriteString(strings.TrimSpace(in.brief))
 	b.WriteString("\n\n## Plan under review (" + in.planPath + ")\n\n")
@@ -547,6 +616,12 @@ func buildDesignReviewPrompt(in designReviewInput) string {
 		b.WriteString(plan)
 		b.WriteString("\n")
 	}
+	if len(in.bundledFiles) > 0 {
+		b.WriteString("\n## Pre-attached referenced files (already in your context — do not re-read unless checking outside them)\n\n")
+		for _, f := range in.bundledFiles {
+			b.WriteString("- " + f + "\n")
+		}
+	}
 	if in.escalation != "" {
 		b.WriteString("\n## Why this plan is being re-designed\n\n")
 		b.WriteString(in.escalation)
@@ -557,13 +632,14 @@ func buildDesignReviewPrompt(in designReviewInput) string {
 		writeIssueList(&b, in.prev.Issues)
 		b.WriteString("\nThe author has since either fixed each of these or argued it is not a real problem. " +
 			"Decide independently whether each still holds against the plan above — report it again ONLY if you can " +
-			"still construct the failure scenario. Then look for problems the rewrite itself introduced.\n")
+			"still construct the failure scenario. Then look for critical or high problems the rewrite itself introduced.\n")
 	}
 	b.WriteString("\n## What a pass commits to\n\n")
 	b.WriteString("On pass, your scope_files and acceptance BECOME the mission's locked charter: the implementer may " +
 		"edit only those files (plus *_test.go companions of them), and the code reviewer judges the change against " +
 		"those criteria. scope_files must be repo-relative paths — include files the plan will CREATE, and the " +
-		"*_test.go files the implementation needs. A pass with either list empty is counted as a FAIL by the gate.\n")
+		"*_test.go files the implementation needs. A pass with either list empty is counted as a FAIL by the gate. " +
+		"Do NOT fail the plan solely over minor/low observations — note them in summary and still output verdict \"pass\" with scope_files and acceptance populated.\n")
 	if in.maxToolCalls > 0 || in.timeout > 0 {
 		b.WriteString("\n## Your budget\n\n")
 		if in.maxToolCalls > 0 {
@@ -572,7 +648,74 @@ func buildDesignReviewPrompt(in designReviewInput) string {
 		if in.timeout > 0 {
 			fmt.Fprintf(&b, "- %s of wall clock for the whole review. Running out kills the review and your findings are lost.\n", in.timeout)
 		}
-		b.WriteString("- Reason from the plan first; spend tool calls only to check that identifiers and paths it names really exist.\n")
+		b.WriteString("- Reason from the plan and pre-attached files first; spend tool calls only to check identifiers and paths not already attached.\n")
 	}
 	return b.String()
+}
+
+// extractPlanContextFiles scans a design plan for repo-relative file paths
+// that already exist as regular files under workDir and returns up to
+// maxFiles paths whose combined size fits within maxBytes. Pre-attaching
+// existing referenced files via context_files saves the design reviewer
+// several sequential read_file tool calls on round 1.
+func extractPlanContextFiles(workDir, plan string, maxFiles int, maxBytes int64) []string {
+	if workDir == "" || plan == "" || maxFiles <= 0 || maxBytes <= 0 {
+		return nil
+	}
+	fields := strings.FieldsFunc(plan, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', '`', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'', ',', ';':
+			return true
+		}
+		return false
+	})
+	seen := make(map[string]struct{}, maxFiles)
+	var out []string
+	var total int64
+	for _, raw := range fields {
+		tok := strings.Trim(raw, ".*:")
+		if tok == "" || strings.Contains(tok, "://") || strings.Contains(tok, "*") || strings.Contains(tok, "..") {
+			continue
+		}
+		// Strip trailing :line / :line-line / #Lline suffixes.
+		if idx := strings.IndexByte(tok, '#'); idx > 0 {
+			tok = tok[:idx]
+		}
+		if idx := strings.IndexByte(tok, ':'); idx > 0 {
+			tok = tok[:idx]
+		}
+		tok = strings.TrimPrefix(tok, "./")
+		if tok == "" || strings.HasPrefix(tok, "/") || !strings.Contains(tok, "/") {
+			continue
+		}
+		if strings.HasPrefix(tok, ".deepai/") {
+			continue
+		}
+		full := filepath.Join(workDir, filepath.FromSlash(tok))
+		rel, ok := relUnderRoot(filepath.Clean(workDir), filepath.Clean(full))
+		if !ok {
+			continue
+		}
+		relSlash := filepath.ToSlash(rel)
+		if strings.HasPrefix(relSlash, ".deepai/") {
+			continue
+		}
+		if _, dup := seen[relSlash]; dup {
+			continue
+		}
+		info, err := os.Stat(full)
+		if err != nil || info.IsDir() || !info.Mode().IsRegular() {
+			continue
+		}
+		if info.Size() == 0 || total+info.Size() > maxBytes {
+			continue
+		}
+		seen[relSlash] = struct{}{}
+		out = append(out, full)
+		total += info.Size()
+		if len(out) >= maxFiles {
+			break
+		}
+	}
+	return out
 }

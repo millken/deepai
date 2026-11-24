@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/millken/deepai/pkg/agent"
@@ -53,6 +54,7 @@ func (r *ChatRepl) runImplementPhase(parentCtx context.Context) bool {
 		// fallback path those records ARE the review scope (R27/R30).
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
+		r.missionLastReviewSnap = worktreeSnapshot{}
 		m.saveBaseline(takeWorktreeSnapshot(r.cfg.WorkDir))
 	}
 
@@ -199,6 +201,7 @@ func (r *ChatRepl) escalateToDesign(signal string) {
 	r.carry.SetMissionCharter("")
 	r.carry.ClearEditedFiles()
 	r.reviewPrev = nil
+	r.missionLastReviewSnap = worktreeSnapshot{}
 
 	m.state.Phase = missionPhaseDesign
 	m.state.EscalatedDesignRound = 0
@@ -344,7 +347,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		return gateResult{next: missionIdleMessage(m.state.IdleRound, maxIdleRounds)}
 	}
 
-	verdict, outcome := r.dispatchReview(parentCtx, m.brief, reviewScope, after, before, r.reviewPrev)
+	verdict, outcome := r.dispatchMissionReview(parentCtx, m.brief, reviewScope, after, before, r.reviewPrev, round)
 	if outcome != reviewOK {
 		// Implementation-side fail-soft: the edits exist and stopping cannot
 		// un-write them, and nothing here may ever report them as reviewed.
@@ -354,6 +357,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		// terminal class (deadline, oversized diff, tampering) hands over
 		// exactly as it did before these states existed.
 		r.reviewPrev = nil
+		r.missionLastReviewSnap = worktreeSnapshot{}
 		switch outcome {
 		case reviewFailedTransient:
 			return gateResult{reviewFailed: true}
@@ -361,13 +365,29 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 			return gateResult{reviewInterrupted: outcome == reviewInterrupted}
 		}
 	}
+	minSeverity := r.prMinBlockingSeverity()
+	minRank := prSeverityRank(minSeverity)
+	passed := isMissionPassVerdictWithSeverity(verdict, minSeverity)
+	if !passed && strings.EqualFold(strings.TrimSpace(verdict.Verdict), "pass") {
+		// Model claimed "pass" while listing blocking-severity issues —
+		// relabel so reviews.jsonl and fix rounds stay consistent.
+		fixed := *verdict
+		fixed.Verdict = "fail"
+		verdict = &fixed
+	}
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})
 
-	if isMissionPassVerdict(verdict) {
+	if passed {
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
-		r.ui.Info("  mission: implementation review pass — " + verdictSummary(verdict))
+		r.missionLastReviewSnap = worktreeSnapshot{}
+		if len(verdict.Issues) > 0 {
+			r.ui.Info(fmt.Sprintf("  mission: implementation review pass (ignoring %d non-blocking note(s) below %s) — %s",
+				len(verdict.Issues), minSeverity, verdictSummary(verdict)))
+		} else {
+			r.ui.Info("  mission: implementation review pass — " + verdictSummary(verdict))
+		}
 		return gateResult{passed: true}
 	}
 
@@ -379,8 +399,9 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 
 	// S1: the reviewer itself says the plan is at fault. Acted on
 	// immediately — spending fix rounds on code that faithfully implements
-	// a wrong plan is exactly the failure this signal exists for.
-	if hasDesignFault(verdict) {
+	// a wrong plan is exactly the failure this signal exists for. Only
+	// blocking-severity issues (>= minRank) may discard a locked charter.
+	if hasDesignFaultWithMinRank(verdict, minRank) {
 		r.reviewPrev = verdict
 		if esc, ok := r.tryEscalate(escalateFaultLayer); ok {
 			return esc
@@ -394,33 +415,228 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 			"  mission: the review blames the PLAN and no escalation is left (%d/%d used) — human judgment needed. Issues:",
 			m.state.Escalation, maxDesignEscalations), verdict)
 		r.reviewPrev = nil
+		r.missionLastReviewSnap = worktreeSnapshot{}
 		return gateResult{}
 	}
 
 	if round >= maxReviewRounds {
 		// S2: about to hand the mission to a human, and the same file has
-		// failed twice running. One re-design first — a false positive
-		// costs one design phase, while never firing costs the escalation
-		// path its only code-side trigger.
-		if sharesFailingFile(prev, verdict) {
+		// failed twice running on blocking issues. One re-design first — a
+		// false positive costs one design phase, while never firing costs the
+		// escalation path its only code-side trigger.
+		if sharesFailingFileInWorkDir(r.cfg.WorkDir, prev, verdict, minRank) {
 			r.reviewPrev = verdict
 			if esc, ok := r.tryEscalate(escalateRepeatFile); ok {
 				return esc
 			}
 		}
 		r.reviewPrev = nil
+		r.missionLastReviewSnap = worktreeSnapshot{}
 		r.presentIssues(fmt.Sprintf(
 			"  mission: implementation STILL FAILING after %d fix rounds — human judgment needed. Unresolved issues:", maxReviewRounds), verdict)
 		return gateResult{}
 	}
 
 	r.reviewPrev = verdict
+	r.missionLastReviewSnap = after
 	m.state.ImplementRound = round + 1
 	if err := m.save(); err != nil {
 		r.ui.Info(fmt.Sprintf("  mission: could not persist state (%v)", err))
 	}
 	r.ui.Info(fmt.Sprintf("  mission: %d issue(s) — fix round %d/%d", len(verdict.Issues), round+1, maxReviewRounds))
 	return gateResult{next: synthesizeFixMessage(round+1, verdict)}
+}
+
+// dispatchMissionReview dispatches the implementation reviewer for one mission
+// gate round, layering three fast-path optimizations on top of the standard
+// review pipeline:
+//   - Round 2+ incremental delta: scopes the diff & bundled files to the files
+//     touched since the prior review round (plus previously flagged files) so
+//     fix re-reviews run in 1–3 minutes instead of re-reading the entire phase.
+//   - Host pre-flight checks: runs targeted `go vet` + `go test -short` once
+//     up front on round 1 and embeds the result so the reviewer skips duplicate
+//     test runs.
+//   - Parallel module sharding: fans out large multi-module round-1 diffs across
+//     concurrent module reviewers and merges their verdicts.
+func (r *ChatRepl) dispatchMissionReview(parentCtx context.Context, initialRequest string, reviewScope []string, snap, base worktreeSnapshot, prev *agent.ReviewResult, round int) (*agent.ReviewResult, reviewOutcome) {
+	activeScope := reviewScope
+	diffBase := base
+	incremental := false
+	var diff string
+	var oversized bool
+
+	if round >= 1 && prev != nil && snap.root != "" && r.missionLastReviewSnap.root == snap.root {
+		deltaScope := missionIncrementalScope(r.cfg.WorkDir, reviewScope, snap, r.missionLastReviewSnap, prev)
+		headMoved := snap.head != "" && r.missionLastReviewSnap.head != "" && snap.head != r.missionLastReviewSnap.head
+		if len(deltaScope) > 0 && (len(deltaScope) < len(reviewScope) || headMoved) {
+			candBase := base
+			if headMoved {
+				candBase = r.missionLastReviewSnap
+			}
+			candDiff, candOversized := buildReviewDiff(r.cfg.WorkDir, snap, candBase, deltaScope)
+			if !candOversized && strings.TrimSpace(candDiff) != "" {
+				activeScope = deltaScope
+				diffBase = candBase
+				diff = candDiff
+				incremental = true
+				r.ui.Info(fmt.Sprintf("  mission: re-review round %d reads %d delta file(s) (of %d in scope)",
+					round+1, len(deltaScope), len(reviewScope)))
+			}
+		}
+	}
+
+	if !incremental {
+		diff, oversized = buildReviewDiff(r.cfg.WorkDir, snap, diffBase, activeScope)
+		if oversized {
+			r.ui.Info(fmt.Sprintf("  review: change set exceeds %dKB of diff — NOT reviewed; consider reviewing in smaller batches", reviewDiffByteCap>>10))
+			return nil, reviewFailedTerminal
+		}
+	}
+
+	contextFiles := readableFiles(activeScope)
+	if contextBundleBytes(contextFiles) > reviewContextBundleCap {
+		contextFiles = nil
+	}
+
+	var charter *Charter
+	var lockedPlan string
+	if r.mission != nil && r.mission.state.Phase == missionPhaseImplement {
+		charter = r.mission.charter
+		lockedPlan = r.mission.lockedPlan()
+	}
+
+	relScope := relToWorkDir(r.cfg.WorkDir, activeScope)
+	preflight := ""
+	if !incremental && snap.root != "" {
+		preflight = runPRPreflight(parentCtx, r.cfg.WorkDir, relScope)
+	}
+
+	promptIn := reviewPromptInput{
+		initialRequest: initialRequest,
+		diff:           diff,
+		scope:          relScope,
+		bundled:        contextFiles != nil,
+		prev:           prev,
+		charter:        charter,
+		lockedPlan:     lockedPlan,
+		missionRound:   round + 1,
+		incremental:    incremental,
+		preflight:      preflight,
+	}
+
+	if !incremental && (len(diff) >= prShardByteThreshold || len(relScope) >= prShardFileThreshold) {
+		if shards := splitUnifiedDiffByModuleInWorkDir(r.cfg.WorkDir, diff, prMaxShards); len(shards) >= 2 {
+			return r.runShardedPRReview(parentCtx, promptIn, shards, snap)
+		}
+	}
+	return r.runReview(parentCtx, promptIn, contextFiles, snap)
+}
+
+// normalizeIssueFilePath canonicalizes a reviewer-emitted issue File path into
+// the repo-relative slash form used by reviewScope and charter comparisons.
+// It strips markdown backticks/quotes, optional :line / #Lline anchors, converts
+// in-tree absolute paths via workdirRel, and cleans ./ prefixes so incremental
+// re-reviews and S2 repeat-file matching do not miss differently spelled paths.
+func normalizeIssueFilePath(workDir, raw string) string {
+	p := strings.TrimSpace(raw)
+	p = strings.Trim(p, "`'\"")
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(p, '#'); idx > 0 {
+		p = p[:idx]
+	}
+	// Strip trailing :line / :line-line / :line:col anchors while leaving
+	// Windows drive letters (C:\...) intact.
+	if idx := strings.LastIndexByte(p, ':'); idx > 1 {
+		if isLineAnchor(p[idx+1:]) {
+			p = p[:idx]
+		}
+	}
+	p = filepath.FromSlash(p)
+	if filepath.IsAbs(p) && workDir != "" {
+		if rel, ok := workdirRel(workDir, p); ok {
+			p = rel
+		}
+	}
+	p = filepath.ToSlash(filepath.Clean(p))
+	p = strings.TrimPrefix(p, "./")
+	if p == "" || p == "." {
+		return ""
+	}
+	return p
+}
+
+func isLineAnchor(s string) bool {
+	if s == "" {
+		return false
+	}
+	hasDigit := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '-' || c == ':':
+		default:
+			return false
+		}
+	}
+	return hasDigit
+}
+
+// missionIncrementalScope selects the subset of reviewScope relevant to a
+// mission fix re-review: files modified since lastSnap plus any in-scope file
+// named in prev.Issues (so rebuttals on unedited files remain verifiable).
+func missionIncrementalScope(workDir string, reviewScope []string, snap, lastSnap worktreeSnapshot, prev *agent.ReviewResult) []string {
+	inScopeAbs := make(map[string]struct{}, len(reviewScope))
+	inScopeRel := make(map[string]string, len(reviewScope))
+	inScopeByBase := make(map[string][]string, len(reviewScope))
+	for _, abs := range reviewScope {
+		inScopeAbs[abs] = struct{}{}
+		if rel, ok := workdirRel(workDir, abs); ok {
+			inScopeRel[rel] = abs
+			base := path.Base(rel)
+			inScopeByBase[base] = append(inScopeByBase[base], abs)
+		}
+	}
+	picked := make(map[string]struct{})
+	for _, abs := range snap.changesSince(lastSnap) {
+		if _, ok := inScopeAbs[abs]; ok {
+			picked[abs] = struct{}{}
+		}
+	}
+	if prev != nil {
+		for _, is := range prev.Issues {
+			f := normalizeIssueFilePath(workDir, is.File)
+			if f == "" {
+				continue
+			}
+			if abs, ok := inScopeRel[f]; ok {
+				picked[abs] = struct{}{}
+				continue
+			}
+			// If the reviewer emitted only a bare filename (e.g. "a.go") without
+			// its directory prefix, keep matching in-scope files in the delta so
+			// the previous finding remains verifiable.
+			if !strings.Contains(f, "/") {
+				for _, abs := range inScopeByBase[f] {
+					picked[abs] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(picked) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(picked))
+	for _, abs := range reviewScope {
+		if _, ok := picked[abs]; ok {
+			out = append(out, abs)
+		}
+	}
+	return out
 }
 
 // tryEscalate reports an escalation only while the mission has one left
@@ -440,20 +656,51 @@ func (r *ChatRepl) tryEscalate(signal string) (gateResult, bool) {
 // decides whether a mission is recorded as reviewed and DONE, and a
 // reviewer that failed a change but returned an empty issues array — a
 // Strict schema makes that shape perfectly valid — would have the loop
-// report an unfixed change as passed. An explicit verdict is the one thing
-// both reviewer prompts actually promise ("output verdict \"pass\"").
+// report an unfixed change as passed.
+//
+// When the reviewer DID list structured issues and EVERY issue falls strictly
+// below minSeverity (default "medium", i.e. low-only nits), the gate treats
+// them as advisory notes rather than spending another fix + re-review round.
 func isMissionPassVerdict(v *agent.ReviewResult) bool {
-	return v != nil && strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
+	return isMissionPassVerdictWithSeverity(v, "medium")
 }
 
-// hasDesignFault is S1: any issue the reviewer marked as a fault in the
-// plan. Case-insensitive because the field is free text filled by a model.
+func isMissionPassVerdictWithSeverity(v *agent.ReviewResult, minSeverity string) bool {
+	if v == nil {
+		return false
+	}
+	explicitPass := strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
+	if len(v.Issues) == 0 {
+		// Fail/unknown with zero structured issues is NEVER a pass (Strict schema guard).
+		return explicitPass
+	}
+	if !explicitPass && !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") {
+		return false
+	}
+	// Severity gating wins over the verdict string: "pass" + blocking issue
+	// still fails, while low-only issues below minSeverity pass as advisory.
+	minRank := prSeverityRank(minSeverity)
+	for _, is := range v.Issues {
+		if prSeverityRank(is.Severity) >= minRank {
+			return false
+		}
+	}
+	return true
+}
+
+// hasDesignFault is S1: any blocking-severity issue the reviewer marked as a
+// fault in the plan. Case-insensitive because the field is free text filled
+// by a model.
 func hasDesignFault(v *agent.ReviewResult) bool {
+	return hasDesignFaultWithMinRank(v, prSeverityRank("medium"))
+}
+
+func hasDesignFaultWithMinRank(v *agent.ReviewResult, minRank int) bool {
 	if v == nil {
 		return false
 	}
 	for _, is := range v.Issues {
-		if strings.EqualFold(strings.TrimSpace(is.FaultLayer), "design") {
+		if strings.EqualFold(strings.TrimSpace(is.FaultLayer), "design") && prSeverityRank(is.Severity) >= minRank {
 			return true
 		}
 	}
@@ -461,23 +708,58 @@ func hasDesignFault(v *agent.ReviewResult) bool {
 }
 
 // sharesFailingFile is S2: two consecutive failing verdicts naming at least
-// one file in common. Empty File fields never match — an issue with no
-// location cannot establish that the SAME thing failed twice.
+// one file in common with blocking-severity issues. Empty File fields never
+// match — an issue with no location cannot establish that the SAME thing
+// failed twice.
 func sharesFailingFile(prev, cur *agent.ReviewResult) bool {
+	return sharesFailingFileInWorkDir("", prev, cur, prSeverityRank("medium"))
+}
+
+func sharesFailingFileWithMinRank(prev, cur *agent.ReviewResult, minRank int) bool {
+	return sharesFailingFileInWorkDir("", prev, cur, minRank)
+}
+
+func sharesFailingFileInWorkDir(workDir string, prev, cur *agent.ReviewResult, minRank int) bool {
 	if prev == nil || cur == nil {
 		return false
 	}
-	seen := make(map[string]struct{}, len(prev.Issues))
+	seenExact := make(map[string]struct{}, len(prev.Issues))
+	seenBases := make(map[string]struct{}, len(prev.Issues))
+	seenBare := make(map[string]struct{})
 	for _, is := range prev.Issues {
-		if f := strings.TrimSpace(is.File); f != "" {
-			seen[f] = struct{}{}
+		if prSeverityRank(is.Severity) < minRank {
+			continue
+		}
+		f := normalizeIssueFilePath(workDir, is.File)
+		if f == "" {
+			continue
+		}
+		seenExact[f] = struct{}{}
+		seenBases[path.Base(f)] = struct{}{}
+		if !strings.Contains(f, "/") {
+			seenBare[f] = struct{}{}
 		}
 	}
 	for _, is := range cur.Issues {
-		if f := strings.TrimSpace(is.File); f != "" {
-			if _, ok := seen[f]; ok {
+		if prSeverityRank(is.Severity) < minRank {
+			continue
+		}
+		f := normalizeIssueFilePath(workDir, is.File)
+		if f == "" {
+			continue
+		}
+		if _, ok := seenExact[f]; ok {
+			return true
+		}
+		// Match bare filename ("a.go") against a full repo path ("pkg/chat/a.go"),
+		// while keeping two distinct directory paths ("pkg/foo/a.go" vs "pkg/bar/a.go")
+		// separate.
+		if !strings.Contains(f, "/") {
+			if _, ok := seenBases[f]; ok {
 				return true
 			}
+		} else if _, ok := seenBare[path.Base(f)]; ok {
+			return true
 		}
 	}
 	return false
@@ -493,10 +775,13 @@ func sharesFailingFile(prev, cur *agent.ReviewResult) bool {
 // mission's own state.json to a reviewer wastes the 20 tool calls the gate
 // gives it on content no human would review either.
 func isScopeExempt(rel string) bool {
+	base := path.Base(rel)
 	switch {
 	case strings.HasPrefix(rel, ".deepai/"):
 		return true // the mission's own bookkeeping, plans, sessions
-	case rel == "go.sum" || rel == "go.work.sum":
+	case base == "go.sum" || base == "go.work.sum":
+		return true
+	case base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "npm-shrinkwrap.json":
 		return true
 	case strings.HasSuffix(rel, ".lock"):
 		return true
