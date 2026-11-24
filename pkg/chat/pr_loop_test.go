@@ -169,12 +169,8 @@ func TestPRLoop_RoundCapAborts(t *testing.T) {
 	}
 }
 
-// The convergence prompt (round 3+) tells the reviewer to park genuinely-new
-// minor findings in the summary sentence, NOT the issue list — so a compliant
-// failing reviewer legitimately emits {"verdict":"fail","issues":[]}. That
-// verdict must spend another fix round, not close the loop: isPassVerdict
-// would treat the empty list as a pass and hand the PR to CI and auto-merge
-// with a confirmed-unfixed finding.
+// A fail with an empty issues list (parked summary, or a malformed empty
+// payload) must spend another fix round — never close the loop on that shape.
 func TestPRLoop_FailWithEmptyIssuesSpendsFixRound(t *testing.T) {
 	fake := &fakeTaskTool{content: `{"agent":"correctness-reviewer","verdict":"fail",
 		"summary":"one medium issue remains","issues":[]}`}

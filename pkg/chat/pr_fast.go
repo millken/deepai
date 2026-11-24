@@ -57,21 +57,27 @@ func (r *ChatRepl) prMinBlockingSeverity() string {
 	}
 }
 
-// prHasBlockingIssues reports whether v contains at least one issue meeting
-// the configured minimum blocking severity. When verdict is "fail" with an
-// empty issues slice (e.g. a convergence verdict with a finding parked in
-// summary), it is treated as blocking only if the verdict explicitly failed
-// with no issues at all (legacy safety net for parked summary findings).
+// prHasBlockingIssues reports whether v should keep the PR review loop open.
+//
+// Rules (order matters):
+//  1. Any issue at or above PRReviewMinSeverity (default "medium") blocks,
+//     even when the model labels the verdict "pass" — convergence prompts
+//     sometimes emit pass while still listing real findings.
+//  2. A non-pass verdict with an empty issues slice always blocks (parked
+//     summary finding, or a malformed empty fail that must not silently close
+//     the loop).
+//  3. Issues strictly below the threshold (e.g. low-only under default medium)
+//     do not block; the loop posts them as advisory notes instead.
 func (r *ChatRepl) prHasBlockingIssues(v *agent.ReviewResult) bool {
-	if v == nil || strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
+	if v == nil {
 		return false
 	}
 	if len(v.Issues) == 0 {
-		// Fail with zero structured issues: treat as non-blocking ONLY if
-		// minSeverity is critical/high? Keep existing safety: a fail with
-		// empty issues carries a parked summary finding, so honor it unless
-		// summary is empty.
-		return strings.TrimSpace(v.Summary) != ""
+		if strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
+			return false
+		}
+		// fail/unknown + empty issues: always block (parked summary OR empty payload).
+		return true
 	}
 	minRank := prSeverityRank(r.prMinBlockingSeverity())
 	for _, is := range v.Issues {
@@ -83,18 +89,42 @@ func (r *ChatRepl) prHasBlockingIssues(v *agent.ReviewResult) bool {
 }
 
 // isPRPassVerdict reports whether a PR review verdict closes the review loop.
-// It passes when the reviewer explicitly says "pass", OR when every reported
-// issue falls strictly below PRReviewMinSeverity (default "medium": low-only
-// nits are posted as advisory notes on the PR instead of spending another
-// 10–15 minute fix+push+re-review cycle).
+// Severity gating always wins over the model's verdict string: "pass" with
+// blocking-severity issues still fails, and "fail" with only below-threshold
+// nits (default: low) still passes as advisory.
 func (r *ChatRepl) isPRPassVerdict(v *agent.ReviewResult) bool {
 	if v == nil {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
-		return true
-	}
 	return !r.prHasBlockingIssues(v)
+}
+
+// prLocalWorktreeAligned reports whether the worktree is safe to use as a
+// stand-in for the remote PR tip: HEAD is on expectedBranch and equals
+// origin/<branch> (so we never review unpushed, unpushed-local-only, or stale
+// commits while claiming to review the PR).
+func prLocalWorktreeAligned(workDir, expectedBranch string) bool {
+	branch := strings.TrimSpace(expectedBranch)
+	if workDir == "" || branch == "" {
+		return false
+	}
+	cur, err := runGit(workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || strings.TrimSpace(string(cur)) != branch {
+		return false
+	}
+	remoteRef := "origin/" + branch
+	if _, err := runGit(workDir, "rev-parse", "--verify", "--quiet", remoteRef); err != nil {
+		// Without a local remote-tracking ref we cannot confirm HEAD matches
+		// the remote PR tip (e.g. unpushed commits or non-origin remote);
+		// fall back to gh.Diff rather than risking diff drift.
+		return false
+	}
+	head, err1 := runGit(workDir, "rev-parse", "HEAD")
+	remote, err2 := runGit(workDir, "rev-parse", remoteRef)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return strings.TrimSpace(string(head)) == strings.TrimSpace(string(remote))
 }
 
 // prLocalDiff computes the PR diff from the local git repo against the PR's
@@ -426,44 +456,92 @@ func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewProm
 		}
 	}
 
+	schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
 	results := make([]models.ToolResult, len(shards))
 	errs := make([]error, len(shards))
-	turnErr := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		var uiMu sync.Mutex
-		ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
-			uiMu.Lock()
-			r.ui.RenderSubagentEvent(evt)
-			uiMu.Unlock()
+	parseErrs := make([]error, len(shards))
+	verdicts := make([]*agent.ReviewResult, len(shards))
+	pending := make([]int, len(shards))
+	for i := range shards {
+		pending[i] = i
+	}
+
+	// One transient retry, matching runReview: deadline hits and worktree
+	// tampering stay terminal and abort retries immediately; other transient or
+	// parse failures get a single second chance per failing shard.
+	for attempt := 0; attempt < 2 && len(pending) > 0; attempt++ {
+		batch := append([]int(nil), pending...)
+		pending = pending[:0]
+		te := r.runTurnWithSignal(parentCtx, func(ctx context.Context) error {
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			var uiMu sync.Mutex
+			ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {
+				uiMu.Lock()
+				r.ui.RenderSubagentEvent(evt)
+				uiMu.Unlock()
+			})
+			var wg sync.WaitGroup
+			for _, idx := range batch {
+				wg.Add(1)
+				go func(i int, c models.ToolCall) {
+					defer wg.Done()
+					results[i], errs[i] = r.cfg.ToolRegistry.Execute(ctx, c)
+				}(idx, calls[idx])
+			}
+			wg.Wait()
+			return nil
 		})
-		var wg sync.WaitGroup
-		for i, call := range calls {
-			wg.Add(1)
-			go func(idx int, c models.ToolCall) {
-				defer wg.Done()
-				results[idx], errs[idx] = r.cfg.ToolRegistry.Execute(ctx, c)
-			}(i, call)
+		r.ui.FlushSubagentBlock()
+
+		// Reviewer-write defense runs after every attempt before any retry or trust decision.
+		if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
+			r.ui.Info(fmt.Sprintf(
+				"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
+				strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
+			return nil, reviewFailedTerminal
 		}
-		wg.Wait()
-		return nil
-	})
-	r.ui.FlushSubagentBlock()
+		if te != nil && te.cancelled {
+			r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
+			return nil, reviewInterrupted
+		}
 
-	// Reviewer-write defense across all shards at once.
-	if tampered := takeWorktreeSnapshot(r.cfg.WorkDir).changesSince(preReview); len(tampered) > 0 {
-		r.ui.Info(fmt.Sprintf(
-			"  review: reviewer modified the working tree (%s) — verdict DISCARDED, changes are unreviewed; inspect these files",
-			strings.Join(relToWorkDir(r.cfg.WorkDir, tampered), ", ")))
-		return nil, reviewFailedTerminal
-	}
-	if turnErr != nil && turnErr.cancelled {
-		r.ui.Info("  review: skipped (interrupted) — changes are unreviewed")
-		return nil, reviewInterrupted
+		// If any shard hit its deadline (terminal), abort retries immediately so
+		// we don't burn another full timeout retrying sibling shards.
+		hasDeadline := false
+		for _, idx := range batch {
+			if errs[idx] != nil && isReviewDeadline(errs[idx]) {
+				hasDeadline = true
+				break
+			}
+		}
+		if hasDeadline {
+			break
+		}
+
+		for _, idx := range batch {
+			parseErrs[idx] = nil
+			verdicts[idx] = nil
+			if errs[idx] != nil {
+				if attempt == 0 {
+					r.ui.Info(fmt.Sprintf("  review: shard %s failed (%v) — retrying once", shards[idx].name, errs[idx]))
+					pending = append(pending, idx)
+				}
+				continue
+			}
+			v, err := agent.ParseOutput[agent.ReviewResult](schema, results[idx].Content)
+			if err != nil {
+				parseErrs[idx] = err
+				if attempt == 0 {
+					r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — retrying once", shards[idx].name, err))
+					pending = append(pending, idx)
+				}
+				continue
+			}
+			verdicts[idx] = v
+		}
 	}
 
-	schema := agent.GetAgentTypeConfig(agent.AgentTypeCorrectnessReviewer).OutputSchema
-	verdicts := make([]*agent.ReviewResult, 0, len(shards))
 	for i := range shards {
 		if errs[i] != nil {
 			if isReviewDeadline(errs[i]) {
@@ -473,12 +551,10 @@ func (r *ChatRepl) runShardedPRReview(parentCtx context.Context, base reviewProm
 			r.ui.Info(fmt.Sprintf("  review: shard %s failed (%v) — changes are unreviewed", shards[i].name, errs[i]))
 			return nil, reviewFailedTransient
 		}
-		v, err := agent.ParseOutput[agent.ReviewResult](schema, results[i].Content)
-		if err != nil {
-			r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — changes are unreviewed", shards[i].name, err))
+		if parseErrs[i] != nil {
+			r.ui.Info(fmt.Sprintf("  review: shard %s verdict unparseable (%v) — changes are unreviewed", shards[i].name, parseErrs[i]))
 			return nil, reviewFailedTransient
 		}
-		verdicts = append(verdicts, v)
 	}
 	return mergeShardVerdicts(verdicts), reviewOK
 }
