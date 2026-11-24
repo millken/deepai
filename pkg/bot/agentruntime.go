@@ -14,6 +14,7 @@ import (
 	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/subagent"
@@ -116,17 +117,34 @@ func (r *AgentRuntime) NewConversation(sessionID string) (Conversation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sandbox init: %w", err)
 	}
-	return &agentConversation{r: r, sb: sb, carry: agent.NewSessionCarry()}, nil
+	return &agentConversation{
+		r:            r,
+		sb:           sb,
+		presentFiles: tools.NewPresentFileRegistry(),
+		carry:        agent.NewSessionCarry(),
+	}, nil
 }
 
 // agentConversation carries per-session agent state across turns, like the
 // REPL does for its one session.
 type agentConversation struct {
-	r  *AgentRuntime
-	sb *sandbox.Sandbox
+	r            *AgentRuntime
+	sb           *sandbox.Sandbox
+	presentFiles *tools.PresentFileRegistry
 
 	mu    sync.Mutex
 	carry *agent.SessionCarry
+}
+
+func (c *agentConversation) SandboxDir() string {
+	if c.sb == nil {
+		return ""
+	}
+	return c.sb.GetDir()
+}
+
+func (c *agentConversation) PresentFiles() *tools.PresentFileRegistry {
+	return c.presentFiles
 }
 
 func (c *agentConversation) Close() error { return c.sb.Close() }
@@ -163,16 +181,23 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 
 	toolsReg := cfg.Tools
 	disableEnterPlan := false
+	presentFiles := c.presentFiles
 	if len(in.BotToolAllowlist) > 0 {
 		toolsReg = toolsReg.Subset(in.BotToolAllowlist)
 		if !tools.MatchAllowlist("enter_plan_mode", in.BotToolAllowlist) {
 			disableEnterPlan = true
+		}
+		if !tools.MatchAllowlist("present_file", in.BotToolAllowlist) {
+			presentFiles = nil
 		}
 	}
 	if len(in.ToolAllowlist) > 0 {
 		toolsReg = toolsReg.Subset(in.ToolAllowlist)
 		if !tools.MatchAllowlist("enter_plan_mode", in.ToolAllowlist) {
 			disableEnterPlan = true
+		}
+		if !tools.MatchAllowlist("present_file", in.ToolAllowlist) {
+			presentFiles = nil
 		}
 	}
 
@@ -184,6 +209,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	a := agent.New(agent.AgentConfig{
 		LLMProvider:        provider,
 		Tools:              toolsReg,
+		PresentFiles:       presentFiles,
 		Sandbox:            c.sb,
 		Model:              modelName,
 		ContextWindow:      contextWindow,
@@ -227,6 +253,9 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		for evt := range a.Events() {
 			if out, ok := translateAgentEvent(ctx, evt); ok {
 				gate.send(out)
+			}
+			if art, ok := presentedArtifactEvent(evt, c.presentFiles); ok {
+				gate.send(art)
 			}
 		}
 	}()
@@ -355,4 +384,37 @@ func translateAgentEvent(ctx context.Context, evt agent.AgentEvent) (Event, bool
 		return Event{Type: EventError, Error: e}, true
 	}
 	return Event{}, false
+}
+
+func presentedArtifactEvent(evt agent.AgentEvent, reg *tools.PresentFileRegistry) (Event, bool) {
+	if evt.Type != agent.AgentEventToolCallEnd || evt.ToolEvent == nil || reg == nil {
+		return Event{}, false
+	}
+	te := evt.ToolEvent
+	if te.Name != "present_file" || te.Result == nil || te.Result.Status != models.CallStatusCompleted {
+		return Event{}, false
+	}
+	id, _ := te.Result.Data["id"].(string)
+	if id == "" {
+		return Event{}, false
+	}
+	pf, ok := reg.Get(id)
+	if !ok {
+		return Event{}, false
+	}
+	var size int64
+	if st, err := os.Stat(pf.Path); err == nil {
+		size = st.Size()
+	}
+	art := &Artifact{
+		ID:           pf.ID,
+		Name:         filepath.Base(pf.Path),
+		Path:         pf.Path,
+		DownloadPath: "artifacts/" + pf.ID,
+		Description:  pf.Description,
+		MimeType:     pf.MimeType,
+		Size:         size,
+		CreatedAt:    pf.CreatedAt,
+	}
+	return Event{Type: EventArtifact, Artifact: art}, true
 }

@@ -47,6 +47,9 @@ type Options struct {
 	// scopes the Manager to them: sessions from other directories are
 	// neither listed nor opened (ErrNotFound). Empty disables scoping.
 	WorkDir string
+	// UploadBaseDir is the fallback root directory for per-session uploaded
+	// attachments when Conversation does not implement SandboxConversation.
+	UploadBaseDir string
 	// ReplayEvents bounds each session's replay buffer (default
 	// DefaultReplayEvents).
 	ReplayEvents int
@@ -91,17 +94,21 @@ type session struct {
 	id    string
 	botID string
 
-	mu        sync.Mutex
-	title     string
-	model     string
-	createdAt time.Time
-	updatedAt time.Time
-	messages  []models.Message
-	conv      Conversation
-	turn      *activeTurn
-	queue     []QueuedMessage
-	lastUsed  time.Time
-	bus       *bus
+	mu             sync.Mutex
+	title          string
+	model          string
+	createdAt      time.Time
+	updatedAt      time.Time
+	messages       []models.Message
+	conv           Conversation
+	turn           *activeTurn
+	queue          []QueuedMessage
+	attachments    map[string]Attachment
+	artifacts      map[string]Artifact
+	uploadBytes    int64
+	ownedUploadDir string
+	lastUsed       time.Time
+	bus            *bus
 }
 
 type activeTurn struct {
@@ -508,9 +515,14 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 		s.mu.Lock()
 		conv := s.conv
 		s.conv = nil
+		ownedDir := s.ownedUploadDir
+		s.ownedUploadDir = ""
 		s.mu.Unlock()
 		if conv != nil {
 			_ = conv.Close()
+		}
+		if ownedDir != "" {
+			_ = os.RemoveAll(ownedDir)
 		}
 		s.bus.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionDeleted})
 		s.bus.close()
@@ -719,6 +731,8 @@ func (m *Manager) DeleteSessionForBot(botID, id string) error {
 	}
 	conv := s.conv
 	s.conv = nil
+	ownedDir := s.ownedUploadDir
+	s.ownedUploadDir = ""
 	s.mu.Unlock()
 
 	if err := m.opts.Store.Delete(id); err != nil {
@@ -730,6 +744,9 @@ func (m *Manager) DeleteSessionForBot(botID, id string) error {
 	m.mu.Unlock()
 	if conv != nil {
 		_ = conv.Close()
+	}
+	if ownedDir != "" {
+		_ = os.RemoveAll(ownedDir)
 	}
 	delEvt := Event{BotID: effectiveBotID(s.botID), SessionID: id, Type: EventSessionDeleted}
 	s.bus.publish(delEvt)
@@ -811,7 +828,7 @@ type preparedTurn struct {
 
 // prepareTurnLocked initializes a new activeTurn on an idle session. Caller
 // must hold s.mu and have already incremented m.turns and m.botTurns[botID].
-func (m *Manager) prepareTurnLocked(s *session, profile BotProfile, content, model string, opts SendOptions) (preparedTurn, error) {
+func (m *Manager) prepareTurnLocked(s *session, profile BotProfile, content, model string, images []models.MessageImage, extraMeta map[string]string, opts SendOptions) (preparedTurn, error) {
 	if s.conv == nil {
 		conv, err := m.opts.Runtime.NewConversation(s.id)
 		if err != nil {
@@ -855,12 +872,23 @@ func (m *Manager) prepareTurnLocked(s *session, profile BotProfile, content, mod
 	ctx = tools.WithTurnID(ctx, t.id)
 	s.turn = t
 	s.lastUsed = time.Now().UTC()
+	var mergedMeta map[string]string
+	if len(opts.Metadata) > 0 || len(extraMeta) > 0 {
+		mergedMeta = make(map[string]string, len(opts.Metadata)+len(extraMeta))
+		for k, v := range extraMeta {
+			mergedMeta[k] = v
+		}
+		for k, v := range opts.Metadata {
+			mergedMeta[k] = v
+		}
+	}
 	userMsg := models.Message{
 		ID:        s.id + "_" + randomHex(6),
 		SessionID: s.id,
 		Role:      models.RoleHuman,
 		Content:   content,
-		Metadata:  opts.Metadata,
+		Images:    images,
+		Metadata:  mergedMeta,
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := m.opts.Store.AppendMessage(s.id, userMsg); err != nil {
@@ -1031,6 +1059,8 @@ func (m *Manager) Close(ctx context.Context) error {
 		s.mu.Lock()
 		conv := s.conv
 		s.conv = nil
+		ownedDir := s.ownedUploadDir
+		s.ownedUploadDir = ""
 		if len(s.queue) > 0 {
 			s.queue = nil
 			s.bus.publish(Event{
@@ -1043,6 +1073,9 @@ func (m *Manager) Close(ctx context.Context) error {
 		s.mu.Unlock()
 		if conv != nil {
 			_ = conv.Close()
+		}
+		if ownedDir != "" {
+			_ = os.RemoveAll(ownedDir)
 		}
 		s.bus.close()
 	}
@@ -1073,6 +1106,12 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.turn == t {
+			if evt.Type == EventArtifact && evt.Artifact != nil && evt.Artifact.ID != "" {
+				if s.artifacts == nil {
+					s.artifacts = map[string]Artifact{}
+				}
+				s.artifacts[evt.Artifact.ID] = *evt.Artifact
+			}
 			s.bus.publish(evt)
 		}
 	}
@@ -1402,9 +1441,14 @@ func (m *Manager) evictIdle(before time.Time) {
 		s.mu.Lock()
 		conv := s.conv
 		s.conv = nil
+		ownedDir := s.ownedUploadDir
+		s.ownedUploadDir = ""
 		s.mu.Unlock()
 		if conv != nil {
 			_ = conv.Close()
+		}
+		if ownedDir != "" {
+			_ = os.RemoveAll(ownedDir)
 		}
 		s.bus.close()
 		m.log.Debug("bot: unloaded idle session", "session", s.id)
@@ -1435,6 +1479,13 @@ func (s *session) info() SessionInfo {
 	if len(s.queue) > 0 {
 		info.Queue = make([]QueuedMessage, len(s.queue))
 		copy(info.Queue, s.queue)
+	}
+	if len(s.artifacts) > 0 {
+		arts := make([]Artifact, 0, len(s.artifacts))
+		for _, a := range s.artifacts {
+			arts = append(arts, a)
+		}
+		info.Artifacts = arts
 	}
 	return info
 }

@@ -31,6 +31,14 @@ type Conversation interface {
 	Close() error
 }
 
+// SandboxConversation is optionally implemented by Conversation (such as
+// AgentRuntime's agentConversation) to expose the session sandbox directory
+// and its PresentFileRegistry for attachments and artifact downloads.
+type SandboxConversation interface {
+	SandboxDir() string
+	PresentFiles() *tools.PresentFileRegistry
+}
+
 // TurnInput is one turn's request.
 type TurnInput struct {
 	SessionID string

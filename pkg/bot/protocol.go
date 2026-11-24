@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/millken/deepai/pkg/agent"
+	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/subagent"
 )
@@ -57,6 +58,9 @@ const (
 	EventSteerQueued   EventType = "steer_queued"
 	EventSteerApplied  EventType = "steer_applied"
 
+	// Artifact events (docs/BOT_NEXT_DESIGN.md §3.2).
+	EventArtifact EventType = "artifact"
+
 	// EventGap (seq 0) tells a client that events it asked for were evicted
 	// from the replay buffer or that it fell behind: reload the session
 	// transcript, then resubscribe from the session's last_seq.
@@ -90,8 +94,33 @@ type Event struct {
 	Run       *schedule.Run        `json:"run,omitempty"`
 	Bot       *BotProfile          `json:"bot,omitempty"`
 	QueueItem *QueuedMessage       `json:"queue_item,omitempty"`
+	Artifact  *Artifact            `json:"artifact,omitempty"`
 	SteerID   string               `json:"steer_id,omitempty"`
 	Reason    string               `json:"reason,omitempty"`
+}
+
+// Attachment describes a file uploaded to a session sandbox via
+// POST /v1/sessions/{id}/attachments (docs/BOT_NEXT_DESIGN.md §3.1).
+type Attachment struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	MimeType    string `json:"mime_type"`
+	Size        int64  `json:"size"`
+	Kind        string `json:"kind"` // "image" | "file"
+	SandboxPath string `json:"sandbox_path"`
+}
+
+// Artifact describes a generated file explicitly registered via present_file
+// and authorized for download via GET /v1/sessions/{id}/files/...
+type Artifact struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Path         string    `json:"-"` // absolute host path (internal only; never serialized)
+	DownloadPath string    `json:"download_path"`
+	Description  string    `json:"description,omitempty"`
+	MimeType     string    `json:"mime_type"`
+	Size         int64     `json:"size,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Question is an ask_clarification call waiting for a client to answer it.
@@ -159,6 +188,8 @@ type SessionInfo struct {
 	Pending []Question `json:"pending,omitempty"`
 	// Queue lists follow-up messages waiting to run after the current turn.
 	Queue []QueuedMessage `json:"queue,omitempty"`
+	// Artifacts lists files explicitly presented during this session.
+	Artifacts []Artifact `json:"artifacts,omitempty"`
 }
 
 // SendRequest is the body of POST /v1/sessions/{id}/messages and of the
@@ -172,6 +203,10 @@ type SendRequest struct {
 	// "" / "reject" (default: 409 busy), "queue" (FIFO follow-up queue),
 	// or "steer" (inject into the running turn at the next ReAct boundary).
 	Mode string `json:"mode,omitempty"`
+	// AttachmentIDs references files uploaded via POST .../attachments.
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	// Images carries optional inline base64 images (optimized server-side).
+	Images []models.MessageImage `json:"images,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /v1/sessions.
