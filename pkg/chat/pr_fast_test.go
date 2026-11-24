@@ -14,6 +14,90 @@ import (
 	"github.com/millken/deepai/pkg/tools"
 )
 
+func TestPRLoop_PassWithBlockingIssuesStillFails(t *testing.T) {
+	// Model says "pass" while listing a high finding — severity gating must win.
+	passWithHigh := `{"agent":"correctness-reviewer","verdict":"pass","summary":"mostly fine",
+		"issues":[{"severity":"high","file":"a.go","line":10,"message":"race","scenario":"concurrent"}]}`
+	fake := &fakeTaskTool{content: passWithHigh}
+	gh := &fakeGH{diff: "+line", files: []string{"a.go"}, checksScript: []fakeChecks{{done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 80, 1, prStatusReviewing)
+
+	fixTurns := 0
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		fixTurns++
+		fake.content = passVerdictJSON()
+		return nil
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	if fixTurns != 1 {
+		t.Fatalf("fix turns = %d, want 1 (pass+high must block)", fixTurns)
+	}
+	if st.Status != prStatusAwaitingMerge {
+		t.Fatalf("status = %s, want awaiting_merge after the fix round", st.Status)
+	}
+	if len(gh.commentsPosted) < 1 || !strings.Contains(gh.commentsPosted[0], "fail") {
+		t.Fatalf("public comment must be relabeled fail, got %+v", gh.commentsPosted)
+	}
+}
+
+func TestPRLoop_FailEmptyPayloadDoesNotPass(t *testing.T) {
+	emptyFail := `{"agent":"correctness-reviewer","verdict":"fail","summary":"","issues":[]}`
+	fake := &fakeTaskTool{content: emptyFail}
+	gh := &fakeGH{diff: "+line", files: []string{"a.go"}, checksScript: []fakeChecks{{done: true, ok: true}}}
+	r := newPRLoopRepl(t, fake, gh)
+	st := newTrackedPR(t, r, 81, 1, prStatusReviewing)
+
+	fixTurns := 0
+	r.missionTurn = func(ctx context.Context, input string) *turnError {
+		fixTurns++
+		fake.content = passVerdictJSON()
+		return nil
+	}
+
+	r.runPRLoop(context.Background(), st)
+
+	if fixTurns != 1 || st.Status != prStatusAwaitingMerge {
+		t.Fatalf("empty fail payload must spend a fix round: fixTurns=%d status=%s", fixTurns, st.Status)
+	}
+}
+
+func TestPRLocalWorktreeAligned(t *testing.T) {
+	dir, _, _ := gitTestRepo(t)
+	gitStep(t, dir, "checkout", "-q", "-b", "feat/align")
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "x")
+
+	if !prLocalWorktreeAligned(dir, "feat/align") {
+		t.Fatal("current branch with no remote-tracking tip should align by name")
+	}
+	if prLocalWorktreeAligned(dir, "main") {
+		t.Fatal("wrong expected branch must not align")
+	}
+	if prLocalWorktreeAligned(dir, "") {
+		t.Fatal("empty branch must not align")
+	}
+
+	// Simulate a pushed tip that drifts from local HEAD.
+	gitStep(t, dir, "update-ref", "refs/remotes/origin/feat/align", "HEAD")
+	if !prLocalWorktreeAligned(dir, "feat/align") {
+		t.Fatal("HEAD == origin/feat/align must align")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "y.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitStep(t, dir, "add", "-A")
+	gitStep(t, dir, "commit", "-q", "-m", "ahead")
+	if prLocalWorktreeAligned(dir, "feat/align") {
+		t.Fatal("local ahead of origin/feat/align must NOT align")
+	}
+}
+
 func TestPRLoop_LowOnlyFindingsPassAsAdvisory(t *testing.T) {
 	lowOnly := `{"agent":"correctness-reviewer","verdict":"fail","summary":"minor nit only",
 		"issues":[{"severity":"low","file":"a.go","line":10,"message":"minor naming","scenario":"cosmetic"}]}`

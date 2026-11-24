@@ -49,18 +49,6 @@ func (r *ChatRepl) prMaxRounds() int {
 	return maxPRReviewRounds
 }
 
-// isPRPassVerdict is deliberately STRICTER than isPassVerdict, which also
-// treats "no issues" as a pass. The round-3+ convergence prompt
-// (buildReviewPrompt) tells the reviewer to park genuinely-new minor findings
-// in the summary sentence OUTSIDE the issue list, so an empty issues array is
-// a shape a COMPLIANT failing reviewer now produces on purpose. This check
-// decides the loop's terminal pass — CI wait, then auto-merge — so a fail with
-// an empty issue list must spend another fix round: exactly the hole
-// isMissionPassVerdict closes on the mission path.
-func isPRPassVerdict(v *agent.ReviewResult) bool {
-	return v != nil && strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
-}
-
 func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 	gh := r.prGHOrDefault()
 	maxRounds := r.prMaxRounds()
@@ -158,6 +146,13 @@ func (r *ChatRepl) runPRLoop(parentCtx context.Context, st *prState) {
 					prev = nil
 					st.setStatus(r.cfg.WorkDir, prStatusAwaitingCI)
 					continue
+				}
+				// Model claimed "pass" while listing blocking-severity issues —
+				// correct the public label so the timeline matches the loop.
+				if strings.EqualFold(strings.TrimSpace(verdict.Verdict), "pass") {
+					fixed := *verdict
+					fixed.Verdict = "fail"
+					verdict = &fixed
 				}
 				prev = verdict
 				if err := st.appendVerdict(r.cfg.WorkDir, st.Round, verdict); err != nil {
@@ -300,9 +295,9 @@ func (r *ChatRepl) dispatchPRReview(parentCtx context.Context, st *prState, gh p
 //
 // Performance optimizations over the initial single-agent remote-diff design:
 //   - Round 2+ reads only the local incremental diff since LastReviewHead.
-//   - Round 1 prefers local `git diff merge-base..HEAD` when the PR's base
-//     branch is present locally (avoiding slow gh pr diff / files network calls),
-//     falling back to gh.Diff when local refs don't match.
+//   - Round 1 prefers local `git diff merge-base..HEAD` when the worktree is
+//     on the PR branch and (when present) HEAD matches origin/<branch>,
+//     falling back to gh.Diff when local refs don't match the remote tip.
 //   - Changed files under the 256KiB cap are pre-bundled via context_files so
 //     the reviewer reasons on Turn 1 instead of spending 15+ read_file turns.
 //   - Host pre-flight runs targeted `go vet` + `go test -short` once up front
@@ -333,7 +328,7 @@ func (r *ChatRepl) dispatchPRReviewWithComments(parentCtx context.Context, st *p
 		// has that branch checked out (only when using the real ghPRClient;
 		// test fakes supply scripted diffs via gh.Diff).
 		usedLocal := false
-		if _, isRealGH := r.prGHOrDefault().(ghPRClient); isRealGH && st.Base != "" {
+		if _, isRealGH := r.prGHOrDefault().(ghPRClient); isRealGH && st.Base != "" && prLocalWorktreeAligned(r.cfg.WorkDir, st.Branch) {
 			if localDiff, localFiles, ok := prLocalDiff(r.cfg.WorkDir, st.Base); ok {
 				diff, scope, usedLocal = localDiff, localFiles, true
 			}
@@ -552,11 +547,9 @@ func prFixMessage(round, maxRounds int, v *agent.ReviewResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "[pr-review round %d/%d] An independent review of the pull request found the following issues. For each one: either fix it, or state explicitly why it is not a real problem. Commit the fixes and push them to the PR branch.\n", round, maxRounds)
 	writeIssueList(&b, v.Issues)
-	// The round-3+ convergence prompt parks a genuinely-new minor finding in
-	// the summary sentence OUTSIDE the issue list, and isPRPassVerdict keeps
-	// that verdict failing — so the round this message spends must carry the
-	// parked finding too, or the fixer gets an empty, unactionable prompt and
-	// the loop can only spin to the cap.
+	// A fail with an empty issues list (parked summary finding, or a
+	// malformed empty payload) still spends a fix round via isPRPassVerdict —
+	// surface the summary so the fixer has something actionable.
 	if len(v.Issues) == 0 {
 		fmt.Fprintf(&b, "\n1. [summary] %s\n", verdictSummary(v))
 	}
