@@ -202,6 +202,7 @@ type Agent struct {
 
 	// User interaction
 	userInteraction tools.UserInteraction
+	steer           SteerSource
 
 	// Plan mode: restrict agent to read-only tools until user approves
 	planMode  atomic.Bool
@@ -316,6 +317,7 @@ func New(cfg AgentConfig) *Agent {
 		memoryExtractor:     cfg.MemoryExtractor,
 		memoryUserID:        cfg.MemoryUserID,
 		userInteraction:     cfg.UserInteraction,
+		steer:               cfg.Steer,
 		workDir:             cfg.WorkDir,
 		offloadDir:          offloadDir,
 		offloadBytes:        cfg.OffloadBytes,
@@ -732,6 +734,9 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 				woundDownReason = WoundDownReasonDeadline
 				wrapUpBudget = reserve
 				wrapUpCumulativeDeadline = time.Now().Add(reserve)
+				if n, ok := a.steer.(SteerWrapUpNotifier); ok {
+					n.MarkWrapUp()
+				}
 				a.logger.Warn("wall clock deadline approaching, forcing final answer without tools",
 					"reserve", reserve, "remaining", time.Until(deadline), "turn", turn)
 			}
@@ -743,8 +748,41 @@ func (a *Agent) Run(ctx context.Context, sessionID string, messages []models.Mes
 		if a.maxToolCalls > 0 && toolCallsExecuted >= a.maxToolCalls && !wrapUp {
 			wrapUp = true
 			woundDownReason = WoundDownReasonToolBudget
+			if n, ok := a.steer.(SteerWrapUpNotifier); ok {
+				n.MarkWrapUp()
+			}
 			a.logger.Warn("tool call budget exhausted, forcing final answer without tools",
 				"max_tool_calls", a.maxToolCalls, "executed", toolCallsExecuted, "turn", turn)
+		}
+
+		// Mid-turn user steering (BOT_NEXT_DESIGN §2.3): consume pending steer
+		// messages after the previous turn's tool calls finish and before the
+		// next LLM request is built. Skipped during wrapUp so unconsumed steer
+		// messages remain in SteerSource for the caller to queue cleanly.
+		if turn > 0 && !wrapUp && a.steer != nil {
+			for _, st := range a.steer.DrainSteer() {
+				if strings.TrimSpace(st.Content) == "" && len(st.Images) == 0 {
+					continue
+				}
+				msgID := st.ID
+				if msgID == "" {
+					msgID = newAgentRequestID()
+				}
+				runMessages = append(runMessages, models.Message{
+					ID:        msgID,
+					SessionID: sessionID,
+					Role:      models.RoleHuman,
+					Content:   st.Content,
+					Images:    st.Images,
+					Metadata:  map[string]string{"source": "steer"},
+					CreatedAt: time.Now().UTC(),
+				})
+				emit(AgentEvent{
+					Type:      AgentEventSteerApplied,
+					MessageID: msgID,
+					Text:      st.Content,
+				})
+			}
 		}
 
 		// Token budget check

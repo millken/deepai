@@ -49,6 +49,14 @@ const (
 	EventBotUpdated EventType = "bot_updated"
 	EventBotDeleted EventType = "bot_deleted"
 
+	// Follow-up queue & mid-turn steer events (docs/BOT_NEXT_DESIGN.md §2).
+	EventQueueEnqueued EventType = "queue_enqueued"
+	EventQueueDequeued EventType = "queue_dequeued"
+	EventQueueRemoved  EventType = "queue_removed"
+	EventQueueCleared  EventType = "queue_cleared"
+	EventSteerQueued   EventType = "steer_queued"
+	EventSteerApplied  EventType = "steer_applied"
+
 	// EventGap (seq 0) tells a client that events it asked for were evicted
 	// from the replay buffer or that it fell behind: reload the session
 	// transcript, then resubscribe from the session's last_seq.
@@ -78,9 +86,12 @@ type Event struct {
 	Error    *agent.AgentError    `json:"error,omitempty"`
 	Turn     *TurnSummary         `json:"turn,omitempty"`
 	Session  *SessionInfo         `json:"session,omitempty"`
-	Schedule *schedule.Schedule   `json:"schedule,omitempty"`
-	Run      *schedule.Run        `json:"run,omitempty"`
-	Bot      *BotProfile          `json:"bot,omitempty"`
+	Schedule  *schedule.Schedule   `json:"schedule,omitempty"`
+	Run       *schedule.Run        `json:"run,omitempty"`
+	Bot       *BotProfile          `json:"bot,omitempty"`
+	QueueItem *QueuedMessage       `json:"queue_item,omitempty"`
+	SteerID   string               `json:"steer_id,omitempty"`
+	Reason    string               `json:"reason,omitempty"`
 }
 
 // Question is an ask_clarification call waiting for a client to answer it.
@@ -146,6 +157,8 @@ type SessionInfo struct {
 	UpdatedAt time.Time     `json:"updated_at"`
 	// Pending lists questions the running turn is blocked on.
 	Pending []Question `json:"pending,omitempty"`
+	// Queue lists follow-up messages waiting to run after the current turn.
+	Queue []QueuedMessage `json:"queue,omitempty"`
 }
 
 // SendRequest is the body of POST /v1/sessions/{id}/messages and of the
@@ -155,6 +168,10 @@ type SendRequest struct {
 	// Model overrides the session's model alias for this turn and becomes
 	// the session's model from then on.
 	Model string `json:"model,omitempty"`
+	// Mode controls behavior when a turn is already running:
+	// "" / "reject" (default: 409 busy), "queue" (FIFO follow-up queue),
+	// or "steer" (inject into the running turn at the next ReAct boundary).
+	Mode string `json:"mode,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /v1/sessions.

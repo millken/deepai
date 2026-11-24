@@ -31,6 +31,8 @@ type WSRequest struct {
 	Since      *int64 `json:"since,omitempty"`
 	Content    string `json:"content,omitempty"`
 	Model      string `json:"model,omitempty"`
+	Mode       string `json:"mode,omitempty"`
+	QueueID    string `json:"queue_id,omitempty"`
 	Title      string `json:"title,omitempty"`
 	QuestionID string `json:"question_id,omitempty"`
 	Answer     string `json:"answer,omitempty"`
@@ -216,12 +218,19 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 		c.mu.Unlock()
 		c.reply(ctx, req, nil, nil)
 	case "send":
-		turn, err := m.SendForBot(botID, req.SessionID, SendRequest{Content: req.Content, Model: req.Model}, SendOptions{})
-		var data any
-		if turn != nil {
-			data = map[string]string{"session_id": req.SessionID, "turn_id": turn.ID}
+		res, err := m.SubmitForBot(botID, req.SessionID, SendRequest{Content: req.Content, Model: req.Model, Mode: req.Mode}, SendOptions{})
+		c.reply(ctx, req, res, err)
+	case "list_queue":
+		items, err := m.ListQueueForBot(botID, req.SessionID)
+		c.reply(ctx, req, map[string]any{"queue": items}, err)
+	case "remove_queue_item":
+		qid := req.QueueID
+		if qid == "" {
+			qid = paramString(req.Params, "queue_id")
 		}
-		c.reply(ctx, req, data, err)
+		c.reply(ctx, req, nil, m.RemoveQueuedMessageForBot(botID, req.SessionID, qid))
+	case "clear_queue":
+		c.reply(ctx, req, nil, m.ClearQueueForBot(botID, req.SessionID))
 	case "cancel":
 		c.reply(ctx, req, nil, m.CancelForBot(botID, req.SessionID))
 	case "answer":

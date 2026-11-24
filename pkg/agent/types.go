@@ -126,6 +126,11 @@ type AgentConfig struct {
 	// User interaction (e.g. ask_clarification tool)
 	UserInteraction tools.UserInteraction // nil = non-interactive, tools proceed without user input
 
+	// Steer optionally supplies mid-turn user steering messages consumed at
+	// safe ReAct loop boundaries (after tool calls complete, before the next
+	// LLM request). nil = disabled (zero overhead).
+	Steer SteerSource
+
 	// Plan mode: restrict agent to read-only tools until user approves the plan
 	PlanMode bool
 	WorkDir  string // working directory for writing plan files
@@ -294,6 +299,9 @@ const (
 	// heartbeats. Consumers that ignore it lose nothing but the ability to
 	// say "still thinking" instead of showing a frozen last-tool line.
 	AgentEventProgress AgentEventType = "progress"
+	// AgentEventSteerApplied is emitted when a mid-turn steering message from
+	// AgentConfig.Steer is appended to the conversation at a ReAct boundary.
+	AgentEventSteerApplied AgentEventType = "steer_applied"
 )
 
 type ToolCallEvent struct {
