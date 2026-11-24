@@ -886,10 +886,14 @@ type reviewPromptInput struct {
 	// cycle. prNumber > 0 is the mode switch; prRound is 1-based.
 	prNumber int
 	prRound  int
-	// incremental marks a PR re-review reading only the commits since
-	// sinceSHA — the human second-reviewer's approach: verify the previous
-	// findings against the delta, check the delta itself, do not re-read
-	// the whole PR. Only meaningful when prNumber > 0.
+	// missionRound is the 1-based implementation review round inside a /mission
+	// (0 for ordinary /review or post-edit gate). Rounds >= 2 enter convergence
+	// mode so fix rounds close the loop instead of widening scope on minor nits.
+	missionRound int
+	// incremental marks a re-review reading only the delta since the prior
+	// review (PR commits since sinceSHA, or mission fix-round delta files) —
+	// the human second-reviewer's approach: verify previous findings against
+	// the delta and check the delta itself without re-reading untouched files.
 	incremental bool
 	sinceSHA    string
 	// externalComments are PR comments this loop did not post. Empty on a
@@ -923,6 +927,13 @@ func buildReviewPrompt(in reviewPromptInput) string {
 		if in.prRound >= 2 {
 			b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — do NOT block approval on new minor/low findings (if you mention a minor note in the summary while all blocking issues are resolved, still output verdict \"pass\").\n\n")
 		}
+	} else if in.missionRound >= 2 {
+		if in.incremental {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: mission implementation re-review round %d. The diff below is scoped ONLY to the files touched in the fix round and previously flagged files. Verify whether each previously reported issue is actually fixed, and check the fix diff itself for regressions. Stay inside this delta — do NOT re-read untouched files from earlier rounds.\n\n", in.missionRound)
+		} else {
+			fmt.Fprintf(&b, "Adversarially review the code changes below: mission implementation re-review round %d.\n\n", in.missionRound)
+		}
+		b.WriteString("Convergence round: your job now is to close the loop, not to widen it. Verify whether each previously reported issue is actually fixed, and stop there. Raise a NEW issue only if it is critical or high — do NOT block approval on new minor/low findings (if you mention a minor note in the summary while all blocking issues are resolved, still output verdict \"pass\").\n\n")
 	} else {
 		b.WriteString("Adversarially review the code changes below.\n\n")
 	}
@@ -982,7 +993,7 @@ func buildReviewPrompt(in reviewPromptInput) string {
 			fmt.Fprintf(&b, "- %s of wall clock for the whole review. Running out kills the review and your findings are lost, so emit your verdict while you still have room.\n", in.timeout)
 		}
 		b.WriteString("- Reason from the diff and attached files first; spend tool calls only on questions they cannot settle.\n")
-		if in.prNumber > 0 && !in.incremental {
+		if (in.prNumber > 0 && !in.incremental) || in.preflight != "" {
 			b.WriteString("- If host pre-flight checks already ran, trust them and do not re-run go vet/test unless testing a specific new reproduction.\n")
 		}
 	}
