@@ -63,7 +63,7 @@
 | `pkg/schedule` | 数据模型、触发规则（含 cron 解析）、SQLite 存储与迁移、`Service`（增删改查 + 校验）、`Scheduler`（调度循环）、`Dispatcher` 接口 | 只依赖标准库和 `database/sql`，**不依赖** `pkg/bot` / `pkg/agent` |
 | `pkg/schedule/tool.go` | `schedule` 工具（`models.Tool`），只调用 `Service` | `pkg/models`、`pkg/tools`（取会话 ID、`AskQuestion`） |
 | `pkg/bot` | `scheduleDispatcher`（实现 `Dispatcher`）、REST/WS 路由、事件类型、控制台面板 | `pkg/schedule` 的接口与类型 |
-| `pkg/commands/bot.go` | 打开存储、构造 `Service`/`Scheduler`、注册工具、接线 | 两者 |
+| `cmd/deepai-bot/{schedule,runtime,serve}.go` | 打开 `bot.db`、构造 `Service`/`Scheduler`、注册工具、接线 `pkg/hook` 与优雅启停 | 两者 |
 
 ```go
 // pkg/schedule
@@ -208,6 +208,7 @@ CREATE TABLE schedules (
   state TEXT NOT NULL,
   created_by_json TEXT NOT NULL,
   next_run_at INTEGER,                 -- unix ms, NULL = 当前不会触发
+  last_run_json TEXT,                  -- 最近一次 RunSummary 快照
   run_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -231,6 +232,7 @@ CREATE TABLE schedule_runs (
   auto_answers INTEGER NOT NULL DEFAULT 0,
   cancel_requested_at INTEGER,
   output TEXT, error TEXT, error_code TEXT, usage_json TEXT,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
   UNIQUE(schedule_id, slot),
   UNIQUE(schedule_id, request_id)
 );
@@ -655,6 +657,17 @@ schedule:
 | `pkg/hook` 接入 `deepai-bot`：`schedule_run_end`（按 `notify` 三策略过滤）、`schedule_ask`、`schedule_approval` 与可选 `schedule_id/run_id` 字段，同时接通交互 turn 的 `turn_end`/`ask` | `pkg/hook/hook.go`、`pkg/bot/{manager,schedule,schedule_questions}.go`、`cmd/deepai-bot/{runtime,serve}.go` |
 | Web 控制台「任务」页签（待批准置顶与红点、批准/拒绝、新建任务 + 规则预览、Run 历史、中止运行、点击跳转会话） | `pkg/bot/web/index.html` |
 | 端到端测试（假时钟 + Cron + `Scheduler` + `Manager` + REST + 自动回答 + 真实 `hook.Dispatcher` Webhook 回调） | `pkg/bot/schedule_hook_test.go` |
+
+### 12.4 已知架构演进与 P3 详细设计索引
+
+P1 + P2 均已在 `main` 上落地并稳定运行。在对接多 Bot 与多项目进程时，识别出以下演进项并已纳入后续设计定稿：
+
+1. **多 Workdir 与多 Bot 调度隔离**（见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §5.4）：当前 `schedule_lease` / `schedule_meta` 为全库单行（`id = 1`），且 `schedules` 无 `bot_id`/`work_dir` 列。多项目共用 `~/.deepai/bot/bot.db` 时，需将 `schedules` 扩展 `(bot_id, work_dir)` 并将租约与版本号改为按 `work_dir` 分桶，避免 Repo A 的进程抢占 Repo B 的定时任务。
+2. **P3 自动化引擎升级**（见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §2 & §4）：
+   - **单任务工具白名单**（复用 `tools.Registry.Subset`）；
+   - **运行中 Steer（插话纠偏）**（复用统一 `SteerSource` 机制，见 `BOT_NEXT_DESIGN.md` §2.3）；
+   - **Inbound Webhook 触发器**（HMAC 验签 + 模板渲染 + `delivery_id` 幂等）；
+   - **任务链（A → B）与按结果条件通知（`notify_if`）**。
 
 ## 13. 关键取舍
 

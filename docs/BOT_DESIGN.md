@@ -78,9 +78,11 @@
 | `subagent` | `subagent`（`task_started/running/completed/failed/cancelled`） | 子代理进度 |
 | `progress` | — | 模型在思考，尚无可渲染输出（保活） |
 | `compact` | `compact` | 上下文压缩统计 |
-| `question` / `question_answered` | `question` | ask_clarification |
+| `question` / `question_answered` | `question`（自动回答带 `auto: true`） | ask_clarification |
 | `error` | `error` | 非致命错误（取消引起的错误不重复上报） |
-| `turn_end` | `turn`（status: `completed/cancelled/timed_out/failed`、最终输出、usage、工具调用数）、`usage` | 一定会到达，且是该 turn 的最后一个事件 |
+| `turn_end` | `turn`（status: `completed/cancelled/timed_out/failed`、`cancel_source`、最终输出、usage、工具调用数）、`usage` | 一定会到达，且是该 turn 的最后一个事件 |
+| `schedule_created` / `schedule_updated` / `schedule_deleted` | `schedule` | 全局总线（定时任务生命周期，见 `BOT_SCHEDULER_DESIGN.md`） |
+| `schedule_run_started` / `schedule_run_updated` / `schedule_run_finished` | `run` | 全局总线（定时任务运行状态） |
 | `gap` | — | seq=0，合成事件：请求的事件已被逐出回放缓冲或客户端落后被断开 → 重新拉 transcript 后从 `last_seq` 订阅 |
 | `heartbeat` | — | seq=0，NDJSON/WS 保活（SSE 用注释行） |
 
@@ -97,7 +99,7 @@
 
 只要回放不能精确接上客户端的游标就报 `gap`：`since` 之后的事件已被逐出，或 `since` 超过了当前总线（会话被空闲回收后重新加载、或 bot 重启过）。会话从存储重新加载时，seq 从当前时间（微秒）起编号，保证旧游标一定落在新区间之前而被识别出来；因此 seq 只保证单调递增，不保证连续，客户端应把它当作不透明的游标。`since=0` 表示「从当前总线的第一条事件开始」。
 
-turn 的结束状态：`cancelled` 是客户端调用 cancel 或 bot 关闭；`timed_out` 是触到截止时间（`--turn-timeout`，或 agent 自身的 `request_timeout`）；其余错误为 `failed`。取消后若工具不响应 ctx，bot 最多等 10s 便放弃该次运行并结束 turn，之后那次运行再产生的任何事件都会被丢弃，不会出现在 `turn_end` 之后。
+turn 的结束状态：`cancelled` 是客户端调用 cancel、bot 关闭或调度器取消（`TurnSummary.cancel_source` 区分 `client` / `shutdown` / `scheduler`）；`timed_out` 是触到截止时间（`--turn-timeout` 或定时任务 `timeout`，均使用可暂停的 `turnClock`，等待 `ask_clarification` 期间暂停计时；或 agent 自身的 `request_timeout`）；其余错误为 `failed`。取消后若工具不响应 ctx，bot 最多等 10s 便放弃该次运行并结束 turn，之后那次运行再产生的任何事件都会被丢弃，不会出现在 `turn_end` 之后。
 
 ---
 
@@ -238,18 +240,29 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat`；多 `bot_id` 见 BOT_MULTI_DESIGN |
 | 内嵌单文件控制台 | 开箱可用，也是协议的活文档；正式 GUI/App 可独立开发 |
 
+### 7.1 已识别的运行时优化项
+
+1. **Prompt 前缀缓存保护（高优）**：当前 `AgentRuntime` 通过 `SystemPromptSuffix` 将动态时间（`当前时间：YYYY-MM-DD HH:MM`）拼进 `a.systemPrompt`，导致每分钟都破坏 LLM 提供商的自动前缀缓存；而 `pkg/agent`（M4-2）已将易变内容统一移至尾部 `turnInjection`。后续应把 `SystemPromptSuffix` 迁入 `turnInjection` 附加段，保持 `systemPrompt` 跨轮字节稳定（详见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §1.2）。
+2. **多 Workdir 共用 `bot.db` 时的调度隔离（高优）**：当前 `schedule_lease` 为全局单行，同一机器启动多个不同 `--workdir` 的 `deepai-bot` 时会导致租约互抢与跨目录触发，需随多 Bot 设计一并改为按 `work_dir` 分桶（详见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §5.4）。
+
 ---
 
-## 8. 后续路线
+## 8. 演进路线与设计文档索引
 
-0. **多 Bot 人格（同进程）**：在单一 `deepai-bot` 内注册多个 Bot（名称、指令、默认模型、隔离记忆），会话归属 `bot_id`；详见 [`docs/BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
-1. **消息队列 / 插话**：运行中发送的消息排队，或作为"steer"注入下一步。
-2. **IM 渠道适配器**（Telegram / Slack / 飞书 / 企业微信）：作为 `Manager` 的另一个客户端，映射 "聊天线程 ↔ 会话"、"按钮 ↔ question 选项"。
-3. **定时任务 / Webhook 触发**：cron 或 GitHub 事件创建 turn，结果推送到渠道。定时任务设计见 [BOT_SCHEDULER_DESIGN.md](BOT_SCHEDULER_DESIGN.md)。
-4. **多工作目录 / 多项目**：会话级 workdir，需要按会话构建工具注册表。
-5. **多用户与细粒度权限**：多 token、只读 token、按会话授权；审计日志。
-6. **附件**：图片/文件上传（`models.MessageImage` 已支持），对应 `@path` 引用。
-7. **Plan / Mission 模式**：把 REPL 的 `/plan`、mission loop 暴露为 API。
-8. **Hooks**：复用 `pkg/hook` 的通知/控制源，turn 结束推送通知。
-9. **OpenAI 兼容端点**（`/v1/chat/completions`）：让现成的 Chat UI 直接接入。
-10. **指标**：Prometheus `/metrics`（运行中 turn、token 用量、工具耗时）。
+### 8.1 已落地
+
+- **核心常驻服务（PR #40）**：本文件 §1–§7（REST / SSE / NDJSON / WebSocket、事件总线与断线续传、`ask_clarification`、独立 `bot.db` 与 `cwd` 隔离、会话锁、守护进程、内置 Web 控制台）。
+- **定时任务 P1 + P2（PR #43 / PR #49）**：`once` / `interval` / 自写 5 字段 `cron`、`misfire=run_once` 补跑、可暂停 `turnClock`、`waiting_input` 与 `answer_timeout(assume/fail)`、`messages.metadata` 持久化、Web 控制台「任务」页签；详见 [`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)。
+- **Outbound Hooks（PR #49）**：`pkg/hook` 已接入 `deepai-bot`，支持 `turn_end` / `ask` / `schedule_run_end` / `schedule_ask` / `schedule_approval` 出站通知。
+
+### 8.2 后续演进（设计已定稿）
+
+| 阶段 | 能力 | 详细设计文档 |
+|------|------|--------------|
+| **Phase A（优先）** | **多 Bot 人格 + 多 Workdir 调度隔离 + 工具白名单**：同进程 N 个 Bot、`TurnInput` 注入 `BotProfile`（替代 `RuntimeFactory`）、`schedule_lease` 按 `work_dir` 分桶、级联清理与 Web Bot 切换器 | [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) |
+| **Phase B** | **消息排队（Follow-up Queue）与运行中插话（Mid-turn Steer）**：消除长 turn 期间的 `409 busy`，支持队列编辑与 ReAct 循环内无缝纠偏（同时覆盖 Scheduler P3 steer） | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §2 |
+| **Phase C** | **多模态附件与产出物工作流**：图片/文件上传至会话沙箱、`models.MessageImage` 接入、bot 产出物安全预览与下载 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §3 |
+| **Phase D** | **自动化引擎升级（Scheduler P3）**：Inbound Webhook 触发器（HMAC + 模板 + 幂等）、任务链（A → B + `{{prev.output}}`）、条件通知 `notify_if`、单任务工具白名单 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §4 |
+| **Phase E** | **IM 渠道适配器网关**：`pkg/bot/channel` 统一抽象，首批支持 Telegram（Long Polling）与飞书（WebSocket 长连接），零公网域名自部署 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §5 |
+| **Phase F** | **生产治理与生态接入**：多 Token / 作用域权限（RBAC）、OpenAI `/v1/chat/completions` 兼容端点、Prometheus `/metrics` 与审计日志 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §6 |
+| **远期备选** | 会话级多工作目录、REPL `/plan` 与 `/mission` API 化 | 视实际需求立项 |
