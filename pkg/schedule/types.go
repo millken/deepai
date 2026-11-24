@@ -116,9 +116,35 @@ const (
 	CancelShutdown  CancelReason = "shutdown"
 )
 
+// DefaultBotID is the system default bot identity when a schedule does not
+// name an explicit bot.
+const DefaultBotID = "default"
+
+type botIDContextKey struct{}
+
+// WithBotID attaches the current bot's ID to ctx so the schedule tool can
+// inherit the owning bot automatically.
+func WithBotID(ctx context.Context, botID string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, botIDContextKey{}, botID)
+}
+
+// BotIDFromContext returns the bot ID injected via WithBotID, or "".
+func BotIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(botIDContextKey{}).(string)
+	return id
+}
+
 // Schedule is a task definition. Times are UTC on the wire.
 type Schedule struct {
 	ID        string    `json:"id"`
+	BotID     string    `json:"bot_id,omitempty"`
+	WorkDir   string    `json:"work_dir,omitempty"`
 	Name      string    `json:"name"`
 	Prompt    string    `json:"prompt"`
 	Trigger   Trigger   `json:"trigger"`
@@ -145,6 +171,7 @@ type Schedule struct {
 func (s Schedule) Clone() Schedule {
 	out := s
 	out.NextRuns = append([]time.Time(nil), s.NextRuns...)
+	out.Options.ToolAllowlist = append([]string(nil), s.Options.ToolAllowlist...)
 	if s.NextRunAt != nil {
 		t := *s.NextRunAt
 		out.NextRunAt = &t
@@ -184,6 +211,7 @@ type Options struct {
 	MaxRuns         int        `json:"max_runs,omitempty"`
 	MaxToolCalls    int        `json:"max_tool_calls,omitempty"`
 	AutoAnswers     int        `json:"max_auto_answers,omitempty"`
+	ToolAllowlist   []string   `json:"tool_allowlist,omitempty"`
 }
 
 // CreatedBy records who asked for the task.
@@ -253,6 +281,10 @@ type Dispatcher interface {
 
 // ErrBusy is the non-blocking "try again later" signal from a Dispatcher.
 var ErrBusy = errors.New("schedule: target session is busy")
+
+// ErrBotDisabled is returned by a Dispatcher when the schedule's owning bot
+// has enabled=false; the Scheduler marks the Run skipped(bot_disabled).
+var ErrBotDisabled = errors.New("schedule: owning bot is disabled")
 
 // Observer receives every Schedule/Run change; bot uses it to publish the
 // global schedule_* event stream.
@@ -344,6 +376,7 @@ func HTTPStatus(err error) int {
 // Config is the `schedule:` section of ~/.deepai/config.yaml.
 type Config struct {
 	Enabled               bool
+	WorkDir               string
 	Timezone              string
 	Confirm               string // "ask" | "auto"
 	ConfirmTimeout        time.Duration

@@ -89,7 +89,12 @@ type AgentConfig struct {
 	Model           string
 	ReasoningEffort string
 	SystemPrompt    string
-	Temperature     *float64
+	// TurnInjectionExtra optionally returns per-Run volatile text (e.g.
+	// current wall-clock time/timezone for deepai-bot) that rides the trailing
+	// turn injection instead of SystemPrompt, keeping the system prompt
+	// byte-stable across turns for automatic provider prefix caching.
+	TurnInjectionExtra func() string
+	Temperature        *float64
 	MaxTokens       *int
 	Sandbox         *sandbox.Sandbox
 	// RequestTimeout bounds the *entire* Run (all turns + tool calls).

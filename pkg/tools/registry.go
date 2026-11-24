@@ -125,6 +125,87 @@ func (r *Registry) Clone() *Registry {
 	return &Registry{tools: cloned}
 }
 
+// MatchAllowlist reports whether tool name matches at least one entry in
+// allowlist. Entries may be exact tool names or a single trailing "*" prefix
+// (e.g. "mcp__github__*").
+func MatchAllowlist(name string, allowlist []string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, raw := range allowlist {
+		pat := strings.TrimSpace(raw)
+		if pat == "" {
+			continue
+		}
+		if strings.HasSuffix(pat, "*") {
+			prefix := strings.TrimSuffix(pat, "*")
+			if strings.HasPrefix(name, prefix) {
+				return true
+			}
+			continue
+		}
+		if name == pat {
+			return true
+		}
+	}
+	return false
+}
+
+// Subset returns a new Registry containing only tools matching allowlist
+// (exact name or single trailing "*" prefix). An empty allowlist returns r
+// unchanged (no restriction).
+func (r *Registry) Subset(allowlist []string) *Registry {
+	if r == nil {
+		return NewRegistry()
+	}
+	if len(allowlist) == 0 {
+		return r
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	filtered := make(map[string]models.Tool)
+	for name, tool := range r.tools {
+		if MatchAllowlist(name, allowlist) {
+			filtered[name] = tool
+		}
+	}
+	return &Registry{tools: filtered}
+}
+
+// ValidateAllowlist returns any patterns in allowlist that match zero
+// registered tools in r.
+func (r *Registry) ValidateAllowlist(allowlist []string) []string {
+	if len(allowlist) == 0 {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var missing []string
+	for _, raw := range allowlist {
+		pat := strings.TrimSpace(raw)
+		if pat == "" {
+			continue
+		}
+		matched := false
+		if strings.HasSuffix(pat, "*") {
+			prefix := strings.TrimSuffix(pat, "*")
+			for name := range r.tools {
+				if strings.HasPrefix(name, prefix) {
+					matched = true
+					break
+				}
+			}
+		} else {
+			_, matched = r.tools[pat]
+		}
+		if !matched {
+			missing = append(missing, pat)
+		}
+	}
+	return missing
+}
+
 func (r *Registry) Register(tool models.Tool) error {
 	if err := tool.Validate(); err != nil {
 		return err

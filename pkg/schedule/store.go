@@ -19,6 +19,8 @@ var (
 
 // ScheduleFilter selects schedules for ListSchedules.
 type ScheduleFilter struct {
+	BotID          string
+	WorkDir        string
 	State          State
 	IncludeDeleted bool
 	Limit          int
@@ -57,6 +59,13 @@ type Store interface {
 	// PruneRuns removes terminal Runs beyond the newest `keep` per schedule.
 	// Active/pending Runs are never removed.
 	PruneRuns(ctx context.Context, scheduleID string, keep int) error
+
+	// CountByBot counts non-deleted schedules belonging to botID (across all
+	// workdirs in this store) so DELETE /v1/bots/{id} can guard against orphans.
+	CountByBot(ctx context.Context, botID string) (int, error)
+	// DeleteByBot hard-deletes all schedules and schedule_runs owned by botID
+	// (used by DELETE /v1/bots/{id}?force=1).
+	DeleteByBot(ctx context.Context, botID string) error
 
 	Close() error
 }
@@ -127,12 +136,25 @@ func (s *MemoryStore) GetSchedule(_ context.Context, id string) (Schedule, error
 	return v.Clone(), nil
 }
 
+func effectiveBotID(id string) string {
+	if id == "" {
+		return DefaultBotID
+	}
+	return id
+}
+
 func (s *MemoryStore) ListSchedules(_ context.Context, f ScheduleFilter) ([]Schedule, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Schedule, 0, len(s.schedules))
 	for _, v := range s.schedules {
 		if !f.IncludeDeleted && v.State == StateDeleted {
+			continue
+		}
+		if f.BotID != "" && effectiveBotID(v.BotID) != f.BotID {
+			continue
+		}
+		if f.WorkDir != "" && v.WorkDir != f.WorkDir {
 			continue
 		}
 		if f.State != "" && v.State != f.State {
@@ -142,6 +164,40 @@ func (s *MemoryStore) ListSchedules(_ context.Context, f ScheduleFilter) ([]Sche
 	}
 	sortSchedules(out)
 	return limitSchedules(out, f.Limit), nil
+}
+
+func (s *MemoryStore) CountByBot(_ context.Context, botID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, v := range s.schedules {
+		if v.State != StateDeleted && effectiveBotID(v.BotID) == effectiveBotID(botID) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *MemoryStore) DeleteByBot(_ context.Context, botID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := effectiveBotID(botID)
+	removed := map[string]struct{}{}
+	for id, v := range s.schedules {
+		if effectiveBotID(v.BotID) == target {
+			removed[id] = struct{}{}
+			delete(s.schedules, id)
+		}
+	}
+	for id, r := range s.runs {
+		if _, ok := removed[r.ScheduleID]; ok {
+			delete(s.runs, id)
+		}
+	}
+	if len(removed) > 0 {
+		s.version++
+	}
+	return nil
 }
 
 func (s *MemoryStore) InsertRun(_ context.Context, r Run) error {

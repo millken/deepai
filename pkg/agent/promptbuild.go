@@ -329,6 +329,13 @@ func (a *Agent) buildTurnInjection(ctx context.Context, sessionID string, runMes
 	var b strings.Builder
 	fmt.Fprintf(&b, dateNoteFormat, time.Now().Format("2006-01-02"))
 
+	if a.turnInjectionExtra != nil {
+		if extra := strings.TrimSpace(a.turnInjectionExtra()); extra != "" {
+			b.WriteString("\n\n")
+			b.WriteString(extra)
+		}
+	}
+
 	if note := formatTodoNote(hasTodoTool(a.tools), a.todos); note != "" {
 		b.WriteString("\n\n")
 		b.WriteString(note)

@@ -107,6 +107,9 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		if err != nil {
 			return nil, err
 		}
+		if botID := BotIDFromContext(ctx); botID != "" {
+			in.BotID = botID
+		}
 		if parentScheduleID != "" {
 			if !cfg.AllowNested {
 				return nil, NewError(CodeNotAllowedInScheduled, "creating schedules from inside a scheduled run is disabled")
@@ -138,7 +141,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "list":
-		list, err := svc.List(ctx, strArg(args, "state"), intArg(args, "limit"))
+		list, err := svc.ListForBot(ctx, BotIDFromContext(ctx), strArg(args, "state"), intArg(args, "limit"))
 		if err != nil {
 			return nil, err
 		}
@@ -368,6 +371,7 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 		return CreateInput{}, err
 	}
 	return CreateInput{
+		BotID:    strArg(args, "bot_id"),
 		Name:     strArg(args, "name"),
 		Prompt:   strArg(args, "prompt"),
 		Trigger:  tr,
@@ -386,9 +390,34 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 			MaxRuns:         intArg(args, "max_runs"),
 			MaxToolCalls:    intArg(args, "max_tool_calls"),
 			AutoAnswers:     intArg(args, "max_auto_answers"),
+			ToolAllowlist:   strSliceArg(args["tool_allowlist"]),
 		},
 		CreatedBy: CreatedBy{Kind: "model", SessionID: sessionID, TurnID: turnID},
 	}, nil
+}
+
+func strSliceArg(v any) []string {
+	switch list := v.(type) {
+	case []string:
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // patchFromArgs builds a Patch from tool/REST/WS arguments. origTZ is the
