@@ -232,8 +232,8 @@ func (r *ChatRepl) runDesignPhase(parentCtx context.Context) bool {
 		})
 
 		if pass {
-			if !strings.EqualFold(strings.TrimSpace(verdict.Verdict), "pass") && len(verdict.Issues) > 0 {
-				r.ui.Info(fmt.Sprintf("  mission: design review reported %d low-severity note(s) below blocking threshold (%s) — accepting plan",
+			if len(verdict.Issues) > 0 {
+				r.ui.Info(fmt.Sprintf("  mission: design review reported %d non-blocking note(s) below %s — accepting plan",
 					len(verdict.Issues), r.prMinBlockingSeverity()))
 			}
 			c := &Charter{ScopeFiles: scope, Acceptance: verdict.Acceptance}

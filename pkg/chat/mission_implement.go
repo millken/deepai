@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/millken/deepai/pkg/agent"
@@ -382,7 +383,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		r.reviewPrev = nil
 		r.missionLastReviewSnap = worktreeSnapshot{}
 		if len(verdict.Issues) > 0 {
-			r.ui.Info(fmt.Sprintf("  mission: implementation review pass (ignoring %d low-severity note(s) below %s) — %s",
+			r.ui.Info(fmt.Sprintf("  mission: implementation review pass (ignoring %d non-blocking note(s) below %s) — %s",
 				len(verdict.Issues), minSeverity, verdictSummary(verdict)))
 		} else {
 			r.ui.Info("  mission: implementation review pass — " + verdictSummary(verdict))
@@ -423,7 +424,7 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 		// failed twice running on blocking issues. One re-design first — a
 		// false positive costs one design phase, while never firing costs the
 		// escalation path its only code-side trigger.
-		if sharesFailingFileWithMinRank(prev, verdict, minRank) {
+		if sharesFailingFileInWorkDir(r.cfg.WorkDir, prev, verdict, minRank) {
 			r.reviewPrev = verdict
 			if esc, ok := r.tryEscalate(escalateRepeatFile); ok {
 				return esc
@@ -531,16 +532,73 @@ func (r *ChatRepl) dispatchMissionReview(parentCtx context.Context, initialReque
 	return r.runReview(parentCtx, promptIn, contextFiles, snap)
 }
 
+// normalizeIssueFilePath canonicalizes a reviewer-emitted issue File path into
+// the repo-relative slash form used by reviewScope and charter comparisons.
+// It strips markdown backticks/quotes, optional :line / #Lline anchors, converts
+// in-tree absolute paths via workdirRel, and cleans ./ prefixes so incremental
+// re-reviews and S2 repeat-file matching do not miss differently spelled paths.
+func normalizeIssueFilePath(workDir, raw string) string {
+	p := strings.TrimSpace(raw)
+	p = strings.Trim(p, "`'\"")
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(p, '#'); idx > 0 {
+		p = p[:idx]
+	}
+	// Strip trailing :line / :line-line / :line:col anchors while leaving
+	// Windows drive letters (C:\...) intact.
+	if idx := strings.LastIndexByte(p, ':'); idx > 1 {
+		if isLineAnchor(p[idx+1:]) {
+			p = p[:idx]
+		}
+	}
+	p = filepath.FromSlash(p)
+	if filepath.IsAbs(p) && workDir != "" {
+		if rel, ok := workdirRel(workDir, p); ok {
+			p = rel
+		}
+	}
+	p = filepath.ToSlash(filepath.Clean(p))
+	p = strings.TrimPrefix(p, "./")
+	if p == "" || p == "." {
+		return ""
+	}
+	return p
+}
+
+func isLineAnchor(s string) bool {
+	if s == "" {
+		return false
+	}
+	hasDigit := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '-' || c == ':':
+		default:
+			return false
+		}
+	}
+	return hasDigit
+}
+
 // missionIncrementalScope selects the subset of reviewScope relevant to a
 // mission fix re-review: files modified since lastSnap plus any in-scope file
 // named in prev.Issues (so rebuttals on unedited files remain verifiable).
 func missionIncrementalScope(workDir string, reviewScope []string, snap, lastSnap worktreeSnapshot, prev *agent.ReviewResult) []string {
 	inScopeAbs := make(map[string]struct{}, len(reviewScope))
 	inScopeRel := make(map[string]string, len(reviewScope))
+	inScopeByBase := make(map[string][]string, len(reviewScope))
 	for _, abs := range reviewScope {
 		inScopeAbs[abs] = struct{}{}
 		if rel, ok := workdirRel(workDir, abs); ok {
 			inScopeRel[rel] = abs
+			base := path.Base(rel)
+			inScopeByBase[base] = append(inScopeByBase[base], abs)
 		}
 	}
 	picked := make(map[string]struct{})
@@ -551,9 +609,21 @@ func missionIncrementalScope(workDir string, reviewScope []string, snap, lastSna
 	}
 	if prev != nil {
 		for _, is := range prev.Issues {
-			f := strings.TrimPrefix(strings.TrimSpace(is.File), "./")
+			f := normalizeIssueFilePath(workDir, is.File)
+			if f == "" {
+				continue
+			}
 			if abs, ok := inScopeRel[f]; ok {
 				picked[abs] = struct{}{}
+				continue
+			}
+			// If the reviewer emitted only a bare filename (e.g. "a.go") without
+			// its directory prefix, keep matching in-scope files in the delta so
+			// the previous finding remains verifiable.
+			if !strings.Contains(f, "/") {
+				for _, abs := range inScopeByBase[f] {
+					picked[abs] = struct{}{}
+				}
 			}
 		}
 	}
@@ -642,30 +712,54 @@ func hasDesignFaultWithMinRank(v *agent.ReviewResult, minRank int) bool {
 // match — an issue with no location cannot establish that the SAME thing
 // failed twice.
 func sharesFailingFile(prev, cur *agent.ReviewResult) bool {
-	return sharesFailingFileWithMinRank(prev, cur, prSeverityRank("medium"))
+	return sharesFailingFileInWorkDir("", prev, cur, prSeverityRank("medium"))
 }
 
 func sharesFailingFileWithMinRank(prev, cur *agent.ReviewResult, minRank int) bool {
+	return sharesFailingFileInWorkDir("", prev, cur, minRank)
+}
+
+func sharesFailingFileInWorkDir(workDir string, prev, cur *agent.ReviewResult, minRank int) bool {
 	if prev == nil || cur == nil {
 		return false
 	}
-	seen := make(map[string]struct{}, len(prev.Issues))
+	seenExact := make(map[string]struct{}, len(prev.Issues))
+	seenBases := make(map[string]struct{}, len(prev.Issues))
+	seenBare := make(map[string]struct{})
 	for _, is := range prev.Issues {
 		if prSeverityRank(is.Severity) < minRank {
 			continue
 		}
-		if f := strings.TrimSpace(is.File); f != "" {
-			seen[f] = struct{}{}
+		f := normalizeIssueFilePath(workDir, is.File)
+		if f == "" {
+			continue
+		}
+		seenExact[f] = struct{}{}
+		seenBases[path.Base(f)] = struct{}{}
+		if !strings.Contains(f, "/") {
+			seenBare[f] = struct{}{}
 		}
 	}
 	for _, is := range cur.Issues {
 		if prSeverityRank(is.Severity) < minRank {
 			continue
 		}
-		if f := strings.TrimSpace(is.File); f != "" {
-			if _, ok := seen[f]; ok {
+		f := normalizeIssueFilePath(workDir, is.File)
+		if f == "" {
+			continue
+		}
+		if _, ok := seenExact[f]; ok {
+			return true
+		}
+		// Match bare filename ("a.go") against a full repo path ("pkg/chat/a.go"),
+		// while keeping two distinct directory paths ("pkg/foo/a.go" vs "pkg/bar/a.go")
+		// separate.
+		if !strings.Contains(f, "/") {
+			if _, ok := seenBases[f]; ok {
 				return true
 			}
+		} else if _, ok := seenBare[path.Base(f)]; ok {
+			return true
 		}
 	}
 	return false

@@ -212,8 +212,8 @@ func TestMissionGate_LowOnlyIssuesPassWithoutExtraFixRound(t *testing.T) {
 	if !got.passed {
 		t.Fatalf("low-only verdict should pass under default medium threshold: %+v", got)
 	}
-	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "ignoring 1 low-severity note(s)") {
-		t.Errorf("expected advisory low-severity log, got: %v", ui.infoMsgs)
+	if !strings.Contains(strings.Join(ui.infoMsgs, "\n"), "ignoring 1 non-blocking note(s)") {
+		t.Errorf("expected advisory non-blocking log, got: %v", ui.infoMsgs)
 	}
 }
 
@@ -363,6 +363,76 @@ func TestIsScopeExempt_GeneratedLockfiles(t *testing.T) {
 	for _, rel := range notExempt {
 		if isScopeExempt(rel) {
 			t.Errorf("isScopeExempt(%q) = true, want false", rel)
+		}
+	}
+}
+
+func TestNormalizeIssueFilePath_IncrementalScopeAndS2Alignment(t *testing.T) {
+	dir := t.TempDir()
+	absA := filepath.Join(dir, "pkg", "chat", "a.go")
+	absB := filepath.Join(dir, "pkg", "chat", "b.go")
+	absC := filepath.Join(dir, "pkg", "other", "c.go")
+	writeNestedFileOrFatal(t, absA, "package chat\n")
+	writeNestedFileOrFatal(t, absB, "package chat\n")
+	writeNestedFileOrFatal(t, absC, "package other\n")
+
+	// Direct normalization cases.
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"`pkg/chat/a.go`", "pkg/chat/a.go"},
+		{"\"./pkg/chat/a.go\"", "pkg/chat/a.go"},
+		{"pkg/chat/a.go:42", "pkg/chat/a.go"},
+		{"pkg/chat/a.go:42-50", "pkg/chat/a.go"},
+		{"pkg/chat/a.go#L42", "pkg/chat/a.go"},
+		{absA, "pkg/chat/a.go"},
+		{"`" + absA + ":15`", "pkg/chat/a.go"},
+		{"   ", ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeIssueFilePath(dir, tc.raw); got != tc.want {
+			t.Errorf("normalizeIssueFilePath(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	// Incremental scope retains prev.Issues files across backticked, absolute,
+	// line-anchored, and bare-filename spellings even when untouched in fix round.
+	reviewScope := []string{absA, absB, absC}
+	emptySnap := worktreeSnapshot{root: dir}
+	prev := &agent.ReviewResult{
+		Verdict: "fail",
+		Issues: []agent.Issue{
+			{Severity: "high", File: "`" + absA + ":12`", Message: "bug a"},
+			{Severity: "medium", File: "b.go", Message: "bug b (bare name)"},
+		},
+	}
+	delta := missionIncrementalScope(dir, reviewScope, emptySnap, emptySnap, prev)
+	if len(delta) != 2 || delta[0] != absA || delta[1] != absB {
+		t.Fatalf("missionIncrementalScope = %v, want [%s %s]", delta, absA, absB)
+	}
+
+	// S2 matches differently spelled paths for the same file, and keeps distinct
+	// directories with identical basenames separate.
+	minRank := prSeverityRank("medium")
+	s2MatchCases := []struct {
+		name string
+		f1   string
+		f2   string
+		want bool
+	}{
+		{"backtick vs plain", "`pkg/chat/a.go`", "pkg/chat/a.go", true},
+		{"abs vs rel", absA, "./pkg/chat/a.go:99", true},
+		{"bare vs full repo path", "a.go", "pkg/chat/a.go", true},
+		{"full repo path vs bare", "pkg/chat/a.go", "`a.go`", true},
+		{"different dirs same basename", "pkg/foo/a.go", "pkg/bar/a.go", false},
+		{"completely different files", "pkg/chat/a.go", "pkg/chat/b.go", false},
+	}
+	for _, tc := range s2MatchCases {
+		p := &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{Severity: "high", File: tc.f1, Message: "m1"}}}
+		c := &agent.ReviewResult{Verdict: "fail", Issues: []agent.Issue{{Severity: "high", File: tc.f2, Message: "m2"}}}
+		if got := sharesFailingFileInWorkDir(dir, p, c, minRank); got != tc.want {
+			t.Errorf("S2 %s (%q vs %q): got %v, want %v", tc.name, tc.f1, tc.f2, got, tc.want)
 		}
 	}
 }
