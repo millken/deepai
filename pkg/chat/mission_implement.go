@@ -364,16 +364,24 @@ func (r *ChatRepl) missionReviewGate(parentCtx context.Context, round int) gateR
 			return gateResult{reviewInterrupted: outcome == reviewInterrupted}
 		}
 	}
+	minSeverity := r.prMinBlockingSeverity()
+	minRank := prSeverityRank(minSeverity)
+	passed := isMissionPassVerdictWithSeverity(verdict, minSeverity)
+	if !passed && strings.EqualFold(strings.TrimSpace(verdict.Verdict), "pass") {
+		// Model claimed "pass" while listing blocking-severity issues —
+		// relabel so reviews.jsonl and fix rounds stay consistent.
+		fixed := *verdict
+		fixed.Verdict = "fail"
+		verdict = &fixed
+	}
 	m.appendReview(missionReviewRecord{Phase: "implement", Round: round + 1,
 		Verdict: verdict.Verdict, Summary: verdict.Summary, Detail: map[string]any{"issues": verdict.Issues}})
 
-	minSeverity := r.prMinBlockingSeverity()
-	minRank := prSeverityRank(minSeverity)
-	if isMissionPassVerdictWithSeverity(verdict, minSeverity) {
+	if passed {
 		r.carry.ClearEditedFiles()
 		r.reviewPrev = nil
 		r.missionLastReviewSnap = worktreeSnapshot{}
-		if !strings.EqualFold(strings.TrimSpace(verdict.Verdict), "pass") && len(verdict.Issues) > 0 {
+		if len(verdict.Issues) > 0 {
 			r.ui.Info(fmt.Sprintf("  mission: implementation review pass (ignoring %d low-severity note(s) below %s) — %s",
 				len(verdict.Issues), minSeverity, verdictSummary(verdict)))
 		} else {
@@ -591,13 +599,16 @@ func isMissionPassVerdictWithSeverity(v *agent.ReviewResult, minSeverity string)
 	if v == nil {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(v.Verdict), "pass") {
-		return true
+	explicitPass := strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
+	if len(v.Issues) == 0 {
+		// Fail/unknown with zero structured issues is NEVER a pass (Strict schema guard).
+		return explicitPass
 	}
-	// Fail with zero structured issues is NEVER a pass (Strict schema guard).
-	if !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") || len(v.Issues) == 0 {
+	if !explicitPass && !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") {
 		return false
 	}
+	// Severity gating wins over the verdict string: "pass" + blocking issue
+	// still fails, while low-only issues below minSeverity pass as advisory.
 	minRank := prSeverityRank(minSeverity)
 	for _, is := range v.Issues {
 		if prSeverityRank(is.Severity) >= minRank {

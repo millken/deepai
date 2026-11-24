@@ -172,6 +172,33 @@ func TestDesignOutcome_LowOnlyFailWithValidCharterPasses(t *testing.T) {
 	if _, pass, _ := designOutcomeWithSeverity(dir, lowOnly, "low"); pass {
 		t.Fatal("low issue must block when minSeverity is low")
 	}
+
+	// Severity gating wins over verdict label: "pass" + high issue must block.
+	passWithHigh := &agent.DesignReviewResult{
+		Verdict: "pass",
+		Summary: "looks mostly ok",
+		Issues: []agent.Issue{
+			{Severity: "high", File: "plan", Message: "missing error path"},
+		},
+		ScopeFiles: []string{"pkg/chat/mission.go"},
+		Acceptance: []string{"Given a mission, when design passes, then charter locks cleanly"},
+	}
+	if _, pass, reason := designOutcomeWithSeverity(dir, passWithHigh, "medium"); pass || reason != "" {
+		t.Fatalf("pass verdict with high issue must fail without gateReason: pass=%v reason=%q", pass, reason)
+	}
+}
+
+func TestMissionGate_PassWithBlockingIssueStillFails(t *testing.T) {
+	passWithHigh := `{"agent":"correctness-reviewer","verdict":"pass","summary":"mostly fine",
+		"issues":[{"severity":"high","file":"a.go","line":1,"message":"data race","scenario":"concurrent writes"}]}`
+	fake := &fakeTaskTool{content: passWithHigh}
+	r, _, _ := newImplementRepl(t, fake, []string{"a.go"})
+	writeFileOrFatal(t, filepath.Join(r.cfg.WorkDir, "a.go"), "package x\n")
+
+	got := r.missionReviewGate(context.Background(), 0)
+	if got.passed || got.next == "" {
+		t.Fatalf("pass verdict with high issue must fail and enter fix round: %+v", got)
+	}
 }
 
 func TestMissionGate_LowOnlyIssuesPassWithoutExtraFixRound(t *testing.T) {

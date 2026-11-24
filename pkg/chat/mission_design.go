@@ -381,21 +381,25 @@ func designOutcome(workDir string, v *agent.DesignReviewResult) (scope []string,
 }
 
 // designOutcomeWithSeverity applies the code test for a passing design with a
-// minimum blocking severity threshold. Explicit "pass" verdicts require valid
-// acceptance criteria and in-scope paths (returning a gateReason if malformed).
-// A "fail" verdict with zero issues NEVER passes (strict schema safety), while
-// a "fail" verdict whose issues are ALL strictly below minSeverity (e.g.
-// low-only polish notes) passes when the reviewer also supplied a lockable
-// charter (valid acceptance criteria + scope_files).
+// minimum blocking severity threshold. Severity gating wins over the model's
+// verdict label:
+//   - Any issue at or above minSeverity (default "medium") blocks, even when
+//     the model says "pass".
+//   - A non-pass verdict with zero issues NEVER passes (strict schema guard).
+//   - A verdict whose issues are ALL strictly below minSeverity (e.g. low-only)
+//     passes when the reviewer also supplied a lockable charter (valid
+//     acceptance criteria + scope_files).
 func designOutcomeWithSeverity(workDir string, v *agent.DesignReviewResult, minSeverity string) (scope []string, pass bool, reason string) {
 	if v == nil {
 		return nil, false, "the design review returned no verdict"
 	}
 	explicitPass := strings.EqualFold(strings.TrimSpace(v.Verdict), "pass")
-	if !explicitPass {
-		// Fail with zero structured issues is never a pass — empty-issues is a
-		// valid Strict-schema shape for a reviewer that failed the plan.
-		if !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") || len(v.Issues) == 0 {
+	if len(v.Issues) == 0 {
+		if !explicitPass {
+			return nil, false, ""
+		}
+	} else {
+		if !explicitPass && !strings.EqualFold(strings.TrimSpace(v.Verdict), "fail") {
 			return nil, false, ""
 		}
 		minRank := prSeverityRank(minSeverity)
