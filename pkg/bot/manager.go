@@ -312,6 +312,7 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	if err != nil {
 		return BotProfile{}, err
 	}
+	wasEnabled := cur.Enabled
 	if req.Name != nil {
 		cur.Name = strings.TrimSpace(*req.Name)
 	}
@@ -343,7 +344,31 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	}
 	cp := updated.Clone()
 	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
+	if !wasEnabled && updated.Enabled {
+		m.wakeQueuedForBot(updated.ID)
+	}
 	return updated, nil
+}
+
+// wakeQueuedForBot resumes queued follow-up turns on idle sessions when a
+// disabled bot transitions back to enabled.
+func (m *Manager) wakeQueuedForBot(botID string) {
+	botID = effectiveBotID(botID)
+	var idle []*session
+	m.mu.Lock()
+	for _, s := range m.sessions {
+		if effectiveBotID(s.botID) == botID {
+			s.mu.Lock()
+			if s.turn == nil && len(s.queue) > 0 {
+				idle = append(idle, s)
+			}
+			s.mu.Unlock()
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range idle {
+		m.startNextQueued(s)
+	}
 }
 
 func (m *Manager) validateBotConfig(b BotProfile, isCreate bool) error {
@@ -1142,7 +1167,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 				Reason:    "cancelled",
 			})
 		}
-	case TurnCompleted:
+	case TurnCompleted, TurnFailed, TurnTimedOut:
 		if len(unconsumedSteers) > 0 {
 			promoted := make([]QueuedMessage, 0, len(unconsumedSteers))
 			now := time.Now().UTC()

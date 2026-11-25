@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -703,5 +704,138 @@ func TestAgentRuntimeEndToEndSteer(t *testing.T) {
 	}
 	if !sawApplied {
 		t.Fatalf("missing EventSteerApplied in session stream: %v", eventTypes(evts))
+	}
+}
+
+func TestUnconsumedSteerPromotedOnTurnFailedAndTimedOut(t *testing.T) {
+	t.Run("turn failed preserves unconsumed steer in queue", func(t *testing.T) {
+		rt := newGatedRuntime("gate_fail")
+		m, _ := NewManager(Options{Runtime: rt, Store: NewMemoryStore(), IdleTimeout: -1})
+		defer m.Close(context.Background())
+
+		sess, _ := m.CreateSession(CreateSessionRequest{})
+		turn, _ := m.Send(sess.ID, SendRequest{Content: "will fail"})
+		<-rt.started
+
+		res, err := m.Submit(sess.ID, SendRequest{Content: "do not lose me", Mode: SendModeSteer})
+		if err != nil || !res.Steered {
+			t.Fatalf("Submit steer = (%+v, %v)", res, err)
+		}
+		close(rt.release)
+		sum := waitTurn(t, turn)
+		if sum.Status != TurnFailed {
+			t.Fatalf("status = %s, want failed", sum.Status)
+		}
+		q, err := m.ListQueue(sess.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(q) != 1 || q[0].Content != "do not lose me" {
+			t.Fatalf("queue after TurnFailed = %+v, want [do not lose me]", q)
+		}
+	})
+
+	t.Run("turn timed out preserves unconsumed steer in queue", func(t *testing.T) {
+		rt := newGatedRuntime("gate")
+		m, _ := NewManager(Options{Runtime: rt, Store: NewMemoryStore(), IdleTimeout: -1, TurnTimeout: 80 * time.Millisecond})
+		defer m.Close(context.Background())
+
+		sess, _ := m.CreateSession(CreateSessionRequest{})
+		turn, _ := m.Send(sess.ID, SendRequest{Content: "slow"})
+		<-rt.started
+
+		res, err := m.Submit(sess.ID, SendRequest{Content: "keep after timeout", Mode: SendModeSteer})
+		if err != nil || !res.Steered {
+			t.Fatalf("Submit steer = (%+v, %v)", res, err)
+		}
+		sum := waitTurn(t, turn)
+		if sum.Status != TurnTimedOut {
+			t.Fatalf("status = %s, want timed_out", sum.Status)
+		}
+		q, err := m.ListQueue(sess.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(q) != 1 || q[0].Content != "keep after timeout" {
+			t.Fatalf("queue after TurnTimedOut = %+v, want [keep after timeout]", q)
+		}
+	})
+}
+
+func TestSteerBufferCappedAtMaxSessionQueueDepth(t *testing.T) {
+	rt := newGatedRuntime("gate")
+	m, _ := NewManager(Options{Runtime: rt, Store: NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(context.Background())
+
+	sess, _ := m.CreateSession(CreateSessionRequest{})
+	turn, _ := m.Send(sess.ID, SendRequest{Content: "first"})
+	<-rt.started
+
+	for i := 0; i < MaxSessionQueueDepth; i++ {
+		res, err := m.Submit(sess.ID, SendRequest{Content: fmt.Sprintf("steer %d", i), Mode: SendModeSteer})
+		if err != nil || !res.Steered {
+			t.Fatalf("steer %d = (%+v, %v)", i, res, err)
+		}
+	}
+	if _, err := m.Submit(sess.ID, SendRequest{Content: "overflow", Mode: SendModeSteer}); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("17th steer err = %v, want ErrQueueFull", err)
+	}
+	close(rt.release)
+	waitTurn(t, turn)
+}
+
+func TestReEnablingBotWakesQueuedFollowUp(t *testing.T) {
+	rt := newGatedRuntime("gate")
+	m, _ := NewManager(Options{Runtime: rt, Store: NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(context.Background())
+
+	if _, err := m.CreateBot(context.Background(), CreateBotRequest{ID: "worker", Name: "Worker"}); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := m.CreateSessionForBot("worker", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, _, _, err := m.SubscribeForBot("worker", sess.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	turn, err := m.SendForBot("worker", sess.ID, SendRequest{Content: "turn1"}, SendOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-rt.started
+
+	if _, err := m.SubmitForBot("worker", sess.ID, SendRequest{Content: "turn2", Mode: SendModeQueue}, SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Disable bot while turn1 is running so startNextQueued pauses turn2.
+	disabled := false
+	if _, err := m.UpdateBot(context.Background(), "worker", UpdateBotRequest{Enabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	close(rt.release)
+	waitTurn(t, turn)
+
+	// Confirm EventError(bot_disabled) was emitted and turn2 is still queued.
+	evts := collectUntil(t, sub, EventError)
+	if evts[len(evts)-1].Error == nil || evts[len(evts)-1].Error.Code != "bot_disabled" {
+		t.Fatalf("expected bot_disabled error event, got %+v", evts[len(evts)-1])
+	}
+
+	// Re-enabling the bot must automatically wake the queued follow-up turn.
+	enabled := true
+	if _, err := m.UpdateBot(context.Background(), "worker", UpdateBotRequest{Enabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-rt.started:
+		if got != "turn2" {
+			t.Fatalf("woken turn = %q, want turn2", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("queued turn did not wake after bot re-enabled")
 	}
 }

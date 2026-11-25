@@ -72,17 +72,28 @@ type steerBuffer struct {
 
 func newSteerBuffer() *steerBuffer { return &steerBuffer{} }
 
+type steerPushStatus int
+
+const (
+	steerAccepted steerPushStatus = iota
+	steerFallbackQueue
+	steerFull
+)
+
 // Push attempts to queue a steer message for the running turn. It returns
-// false when the turn has entered wrap-up or already finished, signalling the
-// caller to fall back to the session's follow-up queue.
-func (b *steerBuffer) Push(m agent.SteerMessage) bool {
+// steerFallbackQueue when the turn has entered wrap-up or already finished,
+// and steerFull when pending steer messages already reached MaxSessionQueueDepth.
+func (b *steerBuffer) Push(m agent.SteerMessage) steerPushStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.wrapUp || b.closed {
-		return false
+		return steerFallbackQueue
+	}
+	if len(b.msgs) >= MaxSessionQueueDepth {
+		return steerFull
 	}
 	b.msgs = append(b.msgs, m)
-	return true
+	return steerAccepted
 }
 
 // DrainSteer implements agent.SteerSource.
@@ -172,12 +183,18 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 		m.mu.Unlock()
 		return nil, ErrClosed
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.turns.Add(1)
+	m.botTurns[botID]++
 	m.mu.Unlock()
 
 	started := false
 	defer func() {
 		if !started {
+			m.decBotTurn(botID)
 			m.turns.Done()
 		}
 	}()
@@ -191,24 +208,30 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 
 		case SendModeSteer:
 			steerID := "st_" + randomHex(6)
-			if s.turn.steer != nil && s.turn.steer.Push(agent.SteerMessage{ID: steerID, Content: content}) {
-				turnID := s.turn.id
-				s.lastUsed = time.Now().UTC()
-				s.bus.publish(Event{
-					BotID:     botID,
-					SessionID: id,
-					TurnID:    turnID,
-					Type:      EventSteerQueued,
-					SteerID:   steerID,
-					Text:      content,
-				})
-				s.mu.Unlock()
-				return &SendResult{
-					SessionID: id,
-					TurnID:    turnID,
-					Steered:   true,
-					SteerID:   steerID,
-				}, nil
+			if s.turn.steer != nil {
+				switch s.turn.steer.Push(agent.SteerMessage{ID: steerID, Content: content}) {
+				case steerAccepted:
+					turnID := s.turn.id
+					s.lastUsed = time.Now().UTC()
+					s.bus.publish(Event{
+						BotID:     botID,
+						SessionID: id,
+						TurnID:    turnID,
+						Type:      EventSteerQueued,
+						SteerID:   steerID,
+						Text:      content,
+					})
+					s.mu.Unlock()
+					return &SendResult{
+						SessionID: id,
+						TurnID:    turnID,
+						Steered:   true,
+						SteerID:   steerID,
+					}, nil
+				case steerFull:
+					s.mu.Unlock()
+					return nil, ErrQueueFull
+				}
 			}
 			// Turn is in wrapUp (or finishing): fall back to follow-up queue.
 			if len(s.queue) >= MaxSessionQueueDepth {
@@ -371,24 +394,47 @@ func (m *Manager) ClearQueueForBot(botID, id string) error {
 // Called from runTurn before its deferred m.turns.Done() so Manager.Close waits
 // cleanly for chained queued turns.
 func (m *Manager) startNextQueued(s *session) {
+	botID := effectiveBotID(s.botID)
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return
+	}
 	m.turns.Add(1)
+	m.botTurns[botID]++
 	m.mu.Unlock()
 
 	started := false
 	defer func() {
 		if !started {
+			m.decBotTurn(botID)
 			m.turns.Done()
 		}
 	}()
 
-	botID := effectiveBotID(s.botID)
 	profile, err := m.bots.GetBot(context.Background(), botID)
 	if err != nil || !profile.Enabled {
+		if err == nil {
+			s.mu.Lock()
+			hasQ := len(s.queue) > 0
+			if hasQ {
+				s.bus.publish(Event{
+					BotID:     botID,
+					SessionID: s.id,
+					Type:      EventError,
+					Error: &agent.AgentError{
+						Code:      "bot_disabled",
+						Message:   fmt.Sprintf("queued follow-up paused: bot %s is disabled", botID),
+						Retryable: true,
+					},
+				})
+			}
+			s.mu.Unlock()
+		}
 		return
 	}
 
@@ -403,6 +449,16 @@ func (m *Manager) startNextQueued(s *session) {
 	if err != nil {
 		// Re-queue at front so user input isn't silently dropped on transient lock/conv error.
 		s.queue = append([]QueuedMessage{item}, s.queue...)
+		s.bus.publish(Event{
+			BotID:     botID,
+			SessionID: s.id,
+			Type:      EventError,
+			Error: &agent.AgentError{
+				Code:      "queue_launch_failed",
+				Message:   err.Error(),
+				Retryable: true,
+			},
+		})
 		s.mu.Unlock()
 		m.log.Warn("bot: start queued turn failed", "session", s.id, "queue_id", item.ID, "err", err)
 		return
