@@ -383,3 +383,40 @@ func TestChainRejectsCrossBotUpstreamFromBotContext(t *testing.T) {
 		t.Fatalf("cross-bot chain err = %v, want CodeNotFound", err)
 	}
 }
+
+func TestWebhookTemplateAmplificationStopsAtLimit(t *testing.T) {
+	ctx := context.Background()
+	svc, err := NewService(NewMemoryStore(), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 600 repetitions of {{.Payload}} (~7.2 KiB, under 8 KiB prompt cap) with a 900 KiB body.
+	ampPrompt := strings.Repeat("{{.Payload}}", 600)
+	sch, err := svc.Create(ctx, CreateInput{
+		Name:    "wh-amp",
+		Prompt:  ampPrompt,
+		Trigger: Trigger{Type: TriggerWebhook, SignatureScheme: WebhookSigBearer, SignatureHeader: "Authorization"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugeBody := []byte(`{"body":"` + strings.Repeat("X", 900<<10) + `"}`)
+	start := time.Now()
+	res, err := svc.TriggerWebhook(ctx, sch.ID, WebhookRequest{
+		Headers: http.Header{"Authorization": {"Bearer " + sch.WebhookSecret}},
+		Body:    hugeBody,
+	})
+	elapsed := time.Since(start)
+	if err != nil || res.Run == nil {
+		t.Fatalf("TriggerWebhook = (%+v, %v)", res, err)
+	}
+	if len(res.Run.PromptOverride) > 2*MaxWebhookPayloadBytes {
+		t.Fatalf("PromptOverride len = %d, exceeds 2*MaxWebhookPayloadBytes", len(res.Run.PromptOverride))
+	}
+	if !strings.Contains(res.Run.PromptOverride, "...[truncated]") {
+		t.Fatalf("expected truncated marker in PromptOverride")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("template amplification took %v, want < 1s (must stop writing at limit)", elapsed)
+	}
+}

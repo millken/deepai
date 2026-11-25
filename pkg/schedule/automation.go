@@ -406,6 +406,73 @@ func validateWebhookPrompt(promptTmpl string) error {
 	return nil
 }
 
+var errTemplateWriteLimit = errors.New("webhook template output limit reached")
+
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	rem := l.limit - l.buf.Len()
+	if rem <= 0 {
+		return 0, errTemplateWriteLimit
+	}
+	if len(p) > rem {
+		l.buf.Write(p[:rem])
+		return rem, errTemplateWriteLimit
+	}
+	return l.buf.Write(p)
+}
+
+func capTemplateValue(v any, budget *int) any {
+	if *budget <= 0 {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		if len(x) > *budget {
+			out := truncateBytes(x, *budget)
+			*budget = 0
+			return out
+		}
+		*budget -= len(x)
+		return x
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			if *budget <= 0 {
+				break
+			}
+			*budget -= len(k) + 2
+			out[k] = capTemplateValue(val, budget)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, min(len(x), 64))
+		for _, item := range x {
+			if *budget <= 0 {
+				break
+			}
+			*budget -= 2
+			out = append(out, capTemplateValue(item, budget))
+		}
+		return out
+	default:
+		*budget -= 16
+		return v
+	}
+}
+
+func capTemplatePayload(payload map[string]any, maxBytes int) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	budget := maxBytes
+	capped, _ := capTemplateValue(payload, &budget).(map[string]any)
+	return capped
+}
+
 func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, rawBody []byte, payload map[string]any) string {
 	safeHeaders := map[string]string{}
 	sigCanon := http.CanonicalHeaderKey(tr.SignatureHeader)
@@ -433,26 +500,27 @@ func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, raw
 	}{
 		Event:       eventName,
 		Headers:     safeHeaders,
-		Payload:     payload,
+		Payload:     capTemplatePayload(payload, MaxWebhookPayloadBytes),
 		PayloadJSON: payloadStr,
 	}
 
+	const truncSuffix = "...[truncated]"
 	rendered := promptTmpl
 	if strings.Contains(promptTmpl, "{{") {
 		tmpl, err := template.New("webhook").Funcs(template.FuncMap{}).Option("missingkey=zero").Parse(promptTmpl)
 		if err == nil {
-			var buf bytes.Buffer
-			if err := tmpl.Execute(&buf, data); err == nil {
-				rendered = buf.String()
+			lw := &limitedBuffer{limit: MaxWebhookPayloadBytes - len(truncSuffix)}
+			err := tmpl.Execute(lw, data)
+			if err == nil {
+				rendered = lw.buf.String()
+			} else if errors.Is(err, errTemplateWriteLimit) {
+				rendered = strings.TrimSpace(lw.buf.String()) + truncSuffix
 			}
 		}
 	}
-	// Bound the rendered template output as well as the fenced payload so
-	// {{.Payload}} / {{.Headers}} on large bodies cannot bypass MaxWebhookPayloadBytes.
 	rendered = strings.TrimSpace(rendered)
 	if len(rendered) > MaxWebhookPayloadBytes {
-		const suffix = "...[truncated]"
-		rendered = truncateBytes(rendered, MaxWebhookPayloadBytes-len(suffix)) + suffix
+		rendered = truncateBytes(rendered, MaxWebhookPayloadBytes-len(truncSuffix)) + truncSuffix
 	}
 	// Always wrap untrusted external payload in an explicit data fence.
 	var fence bytes.Buffer
