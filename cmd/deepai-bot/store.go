@@ -220,7 +220,7 @@ func marshalAllowlist(list []string) string {
 // ─────────────────────────── bot.Store / bot.BotStore ───────────────────────────
 
 func (s *botSessionStore) CreateForBot(botID string, opts models.CreateOpts) (*models.Session, error) {
-	sess, err := s.SQLiteSessionStore.Create(opts)
+	sess, err := s.Create(opts)
 	if err != nil {
 		return nil, err
 	}

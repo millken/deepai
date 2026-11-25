@@ -28,6 +28,7 @@ type telegramChannelConfig struct {
 	BotTokenEnv        string   `yaml:"bot_token_env"`
 	BotName            string   `yaml:"bot_name"`
 	DefaultBotID       string   `yaml:"default_bot_id"`
+	AllowedBots        []string `yaml:"allowed_bots"`
 	AllowUsers         []string `yaml:"allow_users"`
 	AllowChats         []string `yaml:"allow_chats"`
 	StreamEditInterval string   `yaml:"stream_edit_interval"`
@@ -37,7 +38,9 @@ type feishuChannelConfig struct {
 	Enabled            bool     `yaml:"enabled"`
 	AppIDEnv           string   `yaml:"app_id_env"`
 	AppSecretEnv       string   `yaml:"app_secret_env"`
+	BotOpenID          string   `yaml:"bot_open_id"`
 	DefaultBotID       string   `yaml:"default_bot_id"`
+	AllowedBots        []string `yaml:"allowed_bots"`
 	AllowUsers         []string `yaml:"allow_users"`
 	AllowChats         []string `yaml:"allow_chats"`
 	StreamEditInterval string   `yaml:"stream_edit_interval"`
@@ -102,6 +105,7 @@ func startChannelGateway(ctx context.Context, mgr *bot.Manager, sched *schedule.
 				BotName: tg.BotName,
 			}), channel.AccessPolicy{
 				DefaultBotID:       tg.DefaultBotID,
+				AllowedBots:        tg.AllowedBots,
 				AllowUsers:         tg.AllowUsers,
 				AllowChats:         tg.AllowChats,
 				StreamEditInterval: interval,
@@ -128,8 +132,10 @@ func startChannelGateway(ctx context.Context, mgr *bot.Manager, sched *schedule.
 			gw.Register(channel.NewFeishuAdapter(channel.FeishuConfig{
 				AppID:     appID,
 				AppSecret: appSecret,
+				BotOpenID: fs.BotOpenID,
 			}), channel.AccessPolicy{
 				DefaultBotID:       fs.DefaultBotID,
+				AllowedBots:        fs.AllowedBots,
 				AllowUsers:         fs.AllowUsers,
 				AllowChats:         fs.AllowChats,
 				StreamEditInterval: interval,

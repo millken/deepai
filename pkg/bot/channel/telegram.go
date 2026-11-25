@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -69,6 +70,7 @@ func (t *TelegramAdapter) Start(ctx context.Context, onInbound func(InboundMessa
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			slog.Warn("channel: telegram getUpdates failed", "err", err)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -184,25 +186,48 @@ func (t *TelegramAdapter) toInbound(ctx context.Context, u tgUpdate) (InboundMes
 		text = strings.TrimSpace(m.Caption)
 	}
 	isGroup := m.Chat.Type != "private"
-	mentioned := !isGroup || strings.HasPrefix(text, "/")
-	if isGroup && t.botName != "" && strings.Contains(strings.ToLower(text), "@"+t.botName) {
-		mentioned = true
+	mentioned := !isGroup
+	if isGroup {
+		lower := strings.ToLower(text)
+		if t.botName != "" && strings.Contains(lower, "@"+t.botName) {
+			mentioned = true
+		} else if fields := strings.Fields(text); len(fields) > 0 && strings.HasPrefix(fields[0], "/") {
+			cmdTok := strings.ToLower(fields[0])
+			if at := strings.Index(cmdTok, "@"); at > 0 {
+				targetBot := cmdTok[at+1:]
+				if t.botName != "" && targetBot == t.botName && isKnownSlashCommand(cmdTok[:at]) {
+					mentioned = true
+				}
+			} else if isKnownSlashCommand(cmdTok) {
+				mentioned = true
+			}
+		}
 	}
 
+	// Defer file downloads until Gateway has checked AccessPolicy and group mention.
 	var atts []InboundAttachment
 	if m.Document != nil && m.Document.FileID != "" {
-		if data, err := t.downloadFile(ctx, m.Document.FileID); err == nil {
-			name := m.Document.FileName
-			if name == "" {
-				name = "document"
-			}
-			atts = append(atts, InboundAttachment{Name: name, MimeType: m.Document.MimeType, Data: data})
+		fileID := m.Document.FileID
+		name := m.Document.FileName
+		if name == "" {
+			name = "document"
 		}
+		atts = append(atts, InboundAttachment{
+			Name:     name,
+			MimeType: m.Document.MimeType,
+			Download: func(dlCtx context.Context) ([]byte, error) {
+				return t.downloadFile(dlCtx, fileID)
+			},
+		})
 	} else if len(m.Photo) > 0 {
-		best := m.Photo[len(m.Photo)-1]
-		if data, err := t.downloadFile(ctx, best.FileID); err == nil {
-			atts = append(atts, InboundAttachment{Name: "photo.jpg", MimeType: "image/jpeg", Data: data})
-		}
+		fileID := m.Photo[len(m.Photo)-1].FileID
+		atts = append(atts, InboundAttachment{
+			Name:     "photo.jpg",
+			MimeType: "image/jpeg",
+			Download: func(dlCtx context.Context) ([]byte, error) {
+				return t.downloadFile(dlCtx, fileID)
+			},
+		})
 	}
 
 	return InboundMessage{
@@ -274,10 +299,12 @@ func (t *TelegramAdapter) SendQuestion(ctx context.Context, dst Destination, q b
 	}
 	if len(q.Options) > 0 {
 		var rows [][]map[string]string
-		for _, opt := range q.Options {
+		for idx, opt := range q.Options {
 			cb := "ans:" + q.ID + ":" + opt
 			if len(cb) > 64 {
-				cb = cb[:64]
+				// Use option index to stay within Telegram's 64-byte callback_data
+				// limit without truncating multi-byte UTF-8 option text.
+				cb = fmt.Sprintf("ans:%s:#%d", q.ID, idx)
 			}
 			rows = append(rows, []map[string]string{{"text": opt, "callback_data": cb}})
 		}
@@ -370,4 +397,12 @@ func threadStr(id int64) string {
 		return ""
 	}
 	return strconv.FormatInt(id, 10)
+}
+
+func isKnownSlashCommand(cmd string) bool {
+	switch cmd {
+	case "/new", "/cancel", "/steer", "/bot", "/model", "/status", "/approve":
+		return true
+	}
+	return false
 }

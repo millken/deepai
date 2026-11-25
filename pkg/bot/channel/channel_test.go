@@ -23,7 +23,6 @@ import (
 type fakeChannelRuntime struct {
 	mu      sync.Mutex
 	blockCh chan struct{}
-	mode    string
 }
 
 func (f *fakeChannelRuntime) Info() bot.Info {
@@ -363,5 +362,278 @@ func TestFeishuAdapterParseAndOutbound(t *testing.T) {
 	defer mu.Unlock()
 	if len(gotMsgTypes) != 2 || gotMsgTypes[0] != "text" || gotMsgTypes[1] != "interactive" {
 		t.Fatalf("feishu msg_types = %v, want [text interactive]", gotMsgTypes)
+	}
+}
+
+type chunkingRuntime struct {
+	fakeChannelRuntime
+}
+
+func (r *chunkingRuntime) NewConversation(string) (bot.Conversation, error) {
+	return &chunkingConv{}, nil
+}
+
+type chunkingConv struct{}
+
+func (c *chunkingConv) Close() error { return nil }
+func (c *chunkingConv) RunTurn(_ context.Context, in bot.TurnInput) (*bot.TurnOutput, error) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		seg := strings.Repeat(string(rune('A'+i)), 10)
+		sb.WriteString(seg)
+		in.Emit(bot.Event{Type: bot.EventTextDelta, Text: seg})
+		time.Sleep(15 * time.Millisecond)
+	}
+	full := sb.String()
+	msgs := append(append([]models.Message(nil), in.Messages...), models.Message{
+		ID: in.SessionID + "_ai_" + in.TurnID, SessionID: in.SessionID, Role: models.RoleAI, Content: full,
+	})
+	return &bot.TurnOutput{Messages: msgs, FinalOutput: full, LLMTurns: 1}, nil
+}
+
+func TestGatewayLongChunkedStreamNoDuplicates(t *testing.T) {
+	m, _ := bot.NewManager(bot.Options{Runtime: &chunkingRuntime{}, Store: bot.NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(context.Background())
+
+	gw := NewGateway(GatewayOptions{Manager: m})
+	ad := &mockAdapter{name: "telegram"}
+	gw.Register(ad, AccessPolicy{
+		AllowUsers:         []string{"u1"},
+		StreamEditInterval: 10 * time.Millisecond,
+		MaxMessageRunes:    20,
+	})
+
+	gw.HandleInbound(context.Background(), InboundMessage{Channel: "telegram", UserID: "u1", ChatID: "c1", Text: "long"})
+	gw.Wait()
+
+	ad.mu.Lock()
+	defer ad.mu.Unlock()
+	if len(ad.sent) != 5 {
+		t.Fatalf("100-rune reply with MaxMessageRunes=20 sent %d messages, want 5: %v", len(ad.sent), ad.sent)
+	}
+}
+
+func TestGatewaySteerOnIdleModelValidationAndAllowChatsRestriction(t *testing.T) {
+	ctx := context.Background()
+	rt := &fakeChannelRuntime{}
+	m, _ := bot.NewManager(bot.Options{Runtime: rt, Store: bot.NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(ctx)
+	_, _ = m.CreateBot(ctx, bot.CreateBotRequest{ID: "secret", Name: "Secret"})
+
+	svc, _ := schedule.NewService(schedule.NewMemoryStore(), schedule.DefaultConfig())
+	bot.AttachSchedule(m, svc)
+	secSch, _ := svc.Create(ctx, schedule.CreateInput{
+		BotID:   "secret",
+		Name:    "sec-job",
+		Prompt:  "p",
+		Trigger: schedule.Trigger{Type: schedule.TriggerInterval, Every: "1h"},
+		State:   schedule.StatePendingApproval,
+	})
+
+	gw := NewGateway(GatewayOptions{Manager: m, Schedules: svc})
+	ad := &mockAdapter{name: "telegram"}
+	gw.Register(ad, AccessPolicy{
+		DefaultBotID:       "default",
+		AllowUsers:         []string{"admin_u"},
+		AllowChats:         []string{"grp_public"},
+		StreamEditInterval: 10 * time.Millisecond,
+	})
+
+	// 61-M1: /steer on idle session must attach forwarder and deliver reply.
+	gw.HandleInbound(ctx, InboundMessage{Channel: "telegram", UserID: "admin_u", ChatID: "dm_1", Text: "/steer hello idle"})
+	ad.waitForSent(t, "echo:default:hello idle")
+	gw.Wait()
+
+	// 61-M7: /model with unknown alias is rejected.
+	gw.HandleInbound(ctx, InboundMessage{Channel: "telegram", UserID: "admin_u", ChatID: "dm_1", Text: "/model nonexistent"})
+	ad.waitForSent(t, "未知模型")
+
+	// 61-M2: group member admitted only via AllowChats cannot switch to secret bot or approve secret schedule.
+	gw.HandleInbound(ctx, InboundMessage{Channel: "telegram", UserID: "random_member", ChatID: "grp_public", IsGroup: true, Mentioned: true, Text: "/bot secret"})
+	ad.waitForSent(t, "不允许使用该 Bot")
+	gw.HandleInbound(ctx, InboundMessage{Channel: "telegram", UserID: "random_member", ChatID: "grp_public", IsGroup: true, Mentioned: true, Text: "/approve " + secSch.ID})
+	ad.waitForSent(t, "无权批准")
+	gotSch, _ := svc.Get(ctx, secSch.ID)
+	if gotSch.State != schedule.StatePendingApproval {
+		t.Fatalf("group member approved secret schedule: state=%s", gotSch.State)
+	}
+}
+
+func TestTelegramLazyDownloadGroupMentionAndCallbackIndex(t *testing.T) {
+	var mu sync.Mutex
+	var getFileCalls int
+	var sentQuestionPayload map[string]any
+
+	mockTG := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getFile"):
+			mu.Lock()
+			getFileCalls++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"file_path": "docs/a.txt"}})
+		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
+			_ = json.NewDecoder(r.Body).Decode(&sentQuestionPayload)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"message_id": 11}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+		}
+	}))
+	defer mockTG.Close()
+
+	tg := NewTelegramAdapter(TelegramConfig{Token: "tok", BotName: "my_bot", APIBaseURL: mockTG.URL})
+	m, _ := bot.NewManager(bot.Options{Runtime: &fakeChannelRuntime{}, Store: bot.NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(context.Background())
+
+	gw := NewGateway(GatewayOptions{Manager: m})
+	gw.Register(tg, AccessPolicy{AllowUsers: []string{"allowed_u"}})
+
+	// 61-M6: unauthorized user sending a document must NOT trigger getFile.
+	inMsg, ok := tg.toInbound(context.Background(), tgUpdate{
+		UpdateID: 1,
+		Message: &tgMessage{
+			MessageID: 1,
+			From:      &tgUser{ID: 9999},
+			Chat:      tgChat{ID: 9999, Type: "private"},
+			Document:  &tgDocument{FileID: "evil_file", FileName: "big.bin"},
+		},
+	})
+	if !ok {
+		t.Fatal("toInbound returned false")
+	}
+	gw.HandleInbound(context.Background(), inMsg)
+	mu.Lock()
+	calls := getFileCalls
+	mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("getFile called %d times for unauthorized user, want 0", calls)
+	}
+
+	// 61-M3: group command for another bot is NOT mentioned; /status and @my_bot ARE mentioned.
+	otherCmd, _ := tg.toInbound(context.Background(), tgUpdate{
+		Message: &tgMessage{Chat: tgChat{ID: -100, Type: "group"}, Text: "/help@other_bot"},
+	})
+	if otherCmd.Mentioned {
+		t.Fatalf("/help@other_bot should not be Mentioned")
+	}
+	otherSlash, _ := tg.toInbound(context.Background(), tgUpdate{
+		Message: &tgMessage{Chat: tgChat{ID: -100, Type: "group"}, Text: "/unknown_cmd"},
+	})
+	if otherSlash.Mentioned {
+		t.Fatalf("/unknown_cmd in group should not be Mentioned")
+	}
+	ownMention, _ := tg.toInbound(context.Background(), tgUpdate{
+		Message: &tgMessage{Chat: tgChat{ID: -100, Type: "group"}, Text: "hi @my_bot"},
+	})
+	if !ownMention.Mentioned {
+		t.Fatalf("@my_bot in group should be Mentioned")
+	}
+
+	// 61-L1: long CJK option encodes index in callback_data without byte truncation.
+	longOpt := strings.Repeat("非常长的中文选项说明", 5)
+	if _, err := tg.SendQuestion(context.Background(), Destination{ChatID: "42"}, bot.Question{
+		ID: "q_123456", Text: "选哪个？", Options: []string{longOpt},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rm := sentQuestionPayload["reply_markup"].(map[string]any)
+	rows := rm["inline_keyboard"].([]any)
+	btn := rows[0].([]any)[0].(map[string]any)
+	if cb := btn["callback_data"].(string); cb != "ans:q_123456:#0" {
+		t.Fatalf("callback_data = %q, want ans:q_123456:#0", cb)
+	}
+}
+
+func TestFeishuCardActionTriggerPutEditAndInboundImage(t *testing.T) {
+	var mu sync.Mutex
+	var editMethod string
+	var resourceCalls int
+
+	mockFS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/tenant_access_token/internal"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "tenant_access_token": "t-123", "expire": 7200})
+		case strings.Contains(r.URL.Path, "/resources/"):
+			mu.Lock()
+			resourceCalls++
+			mu.Unlock()
+			_, _ = w.Write([]byte("fake-image-bytes"))
+		case strings.Contains(r.URL.Path, "/im/v1/messages/om_edit"):
+			mu.Lock()
+			editMethod = r.Method
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer mockFS.Close()
+
+	// 61-H5: official card.action.trigger uses event.operator.open_id & event.context.open_chat_id.
+	cardEvt := []byte(`{
+		"header": {"event_type": "card.action.trigger"},
+		"event": {
+			"operator": {"open_id": "ou_clicker"},
+			"context": {"open_chat_id": "oc_chat99", "open_message_id": "om_card1"},
+			"action": {"value": {"callback_data": "ans:q1:yes"}}
+		}
+	}`)
+	inCard, ok := ParseFeishuEvent(cardEvt)
+	if !ok || inCard.UserID != "ou_clicker" || inCard.ChatID != "oc_chat99" || inCard.CallbackData != "ans:q1:yes" {
+		t.Fatalf("card.action.trigger parsed = (%+v, %v)", inCard, ok)
+	}
+
+	fs := NewFeishuAdapter(FeishuConfig{AppID: "cli_1", AppSecret: "sec_1", BotOpenID: "ou_mybot", APIBaseURL: mockFS.URL})
+
+	// 61-H6: EditText uses PUT (not PATCH) and respects feishuMaxMessageEdits cap.
+	if err := fs.EditText(context.Background(), Destination{ChatID: "oc_chat99"}, "om_edit", "v1"); err != nil {
+		t.Fatalf("EditText: %v", err)
+	}
+	mu.Lock()
+	gotMethod := editMethod
+	mu.Unlock()
+	if gotMethod != http.MethodPut {
+		t.Fatalf("EditText HTTP method = %q, want PUT", gotMethod)
+	}
+
+	// 61-M3: group mention checks BotOpenID when configured.
+	grpOtherMention := []byte(`{
+		"header": {"event_type": "im.message.receive_v1"},
+		"event": {
+			"sender": {"sender_id": {"open_id": "ou_u1"}},
+			"message": {
+				"message_id": "om_2", "chat_id": "oc_grp", "chat_type": "group", "message_type": "text",
+				"content": "{\"text\":\"@_user_1 hi\"}",
+				"mentions": [{"key": "@_user_1", "id": {"open_id": "ou_someone_else"}}]
+			}
+		}
+	}`)
+	if msg, ok := fs.parseEvent(grpOtherMention); !ok || msg.Mentioned {
+		t.Fatalf("group mention of another user should not set Mentioned: (%+v, %v)", msg, ok)
+	}
+
+	// 61-M8: inbound image message parses with lazy Download (not called until invoked).
+	imgEvt := []byte(`{
+		"header": {"event_type": "im.message.receive_v1"},
+		"event": {
+			"sender": {"sender_id": {"open_id": "ou_u1"}},
+			"message": {
+				"message_id": "om_img1", "chat_id": "oc_dm", "chat_type": "p2p", "message_type": "image",
+				"content": "{\"image_key\":\"img_v2_abc\"}"
+			}
+		}
+	}`)
+	imgMsg, ok := fs.parseEvent(imgEvt)
+	if !ok || len(imgMsg.Attachments) != 1 || imgMsg.Attachments[0].Download == nil {
+		t.Fatalf("image event parsed = (%+v, %v)", imgMsg, ok)
+	}
+	mu.Lock()
+	before := resourceCalls
+	mu.Unlock()
+	if before != 0 {
+		t.Fatalf("resource downloaded eagerly before auth")
+	}
+	data, err := imgMsg.Attachments[0].Download(context.Background())
+	if err != nil || string(data) != "fake-image-bytes" {
+		t.Fatalf("lazy download = (%q, %v)", string(data), err)
 	}
 }

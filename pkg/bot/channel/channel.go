@@ -29,11 +29,14 @@ type Destination struct {
 	ReplyToID string
 }
 
-// InboundAttachment carries a downloaded file or image sent by an IM user.
+// InboundAttachment carries a file or image sent by an IM user.
+// Adapters should prefer setting Download over eagerly fetching Data so
+// Gateway only downloads bytes after AccessPolicy and mention checks pass.
 type InboundAttachment struct {
 	Name     string
 	MimeType string
 	Data     []byte
+	Download func(ctx context.Context) ([]byte, error)
 }
 
 // InboundMessage is the normalized message delivered from any IM Adapter to Gateway.
@@ -63,6 +66,7 @@ type Adapter interface {
 // AccessPolicy enforces default-deny allowlisting per channel (§5.4).
 type AccessPolicy struct {
 	DefaultBotID       string
+	AllowedBots        []string // optional explicit set of bots usable via /bot and /approve
 	AllowUsers         []string
 	AllowChats         []string
 	StreamEditInterval time.Duration
@@ -84,6 +88,43 @@ func (p AccessPolicy) Allowed(userID, chatID string) bool {
 		return true
 	}
 	return false
+}
+
+// IsAllowedUser reports whether userID is explicitly listed in AllowUsers.
+func (p AccessPolicy) IsAllowedUser(userID string) bool {
+	userID = strings.TrimSpace(userID)
+	return userID != "" && slices.Contains(p.AllowUsers, userID)
+}
+
+// AllowsBot reports whether userID may select or operate on botID.
+// When AllowedBots is configured, only bots in that set are allowed.
+// When a caller is admitted only via AllowChats (not in AllowUsers), they are
+// restricted to DefaultBotID so group members cannot escalate to other bots.
+func (p AccessPolicy) AllowsBot(userID, botID string) bool {
+	botID = strings.TrimSpace(botID)
+	if botID == "" {
+		botID = bot.DefaultBotID
+	}
+	if len(p.AllowedBots) > 0 {
+		return slices.Contains(p.AllowedBots, botID)
+	}
+	if !p.IsAllowedUser(userID) {
+		return botID == p.defaultBot()
+	}
+	return true
+}
+
+// CanApprove reports whether userID may approve a schedule belonging to botID.
+// Group members admitted solely via AllowChats cannot approve schedules when
+// AllowUsers is configured, and approvals are always constrained to AllowedBots.
+func (p AccessPolicy) CanApprove(userID, botID string) bool {
+	if !p.AllowsBot(userID, botID) {
+		return false
+	}
+	if len(p.AllowUsers) > 0 && !p.IsAllowedUser(userID) {
+		return false
+	}
+	return true
 }
 
 func (p AccessPolicy) editInterval() time.Duration {

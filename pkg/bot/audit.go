@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const defaultAuditMaxBytes int64 = 10 << 20 // 10 MiB before simple .1 rotation
+const (
+	defaultAuditMaxBytes int64 = 10 << 20 // 10 MiB before simple .1 rotation
+	defaultNoisyAuditCap       = 60       // max unauthenticated failure records per minute per action
+)
 
 // AuditEntry is one line in ~/.deepai/bot/audit.jsonl (docs/BOT_NEXT_DESIGN.md §6.3).
 type AuditEntry struct {
@@ -23,11 +26,13 @@ type AuditEntry struct {
 }
 
 // AuditLogger appends structured JSONL security & governance events with
-// size-based rotation. Safe for concurrent use; nil receiver is a no-op.
+// size-based rotation and rate limiting for noisy unauthenticated failures.
+// Safe for concurrent use; nil receiver is a no-op.
 type AuditLogger struct {
 	mu       sync.Mutex
 	path     string
 	maxBytes int64
+	noisy    map[string][]time.Time
 }
 
 // NewAuditLogger configures a JSONL audit log at path. maxBytes <= 0 defaults
@@ -39,7 +44,17 @@ func NewAuditLogger(path string, maxBytes int64) (*AuditLogger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	return &AuditLogger{path: path, maxBytes: maxBytes}, nil
+	return &AuditLogger{path: path, maxBytes: maxBytes, noisy: map[string][]time.Time{}}, nil
+}
+
+func noisyAuditKey(e AuditEntry) string {
+	if e.Action == "auth_failed" {
+		return "auth_failed"
+	}
+	if e.Action == "webhook_triggered" && e.Outcome == "error" {
+		return "webhook_error"
+	}
+	return ""
 }
 
 // Record appends one AuditEntry as a single JSON line.
@@ -50,14 +65,34 @@ func (a *AuditLogger) Record(e AuditEntry) {
 	if e.Time.IsZero() {
 		e.Time = time.Now().UTC()
 	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if key := noisyAuditKey(e); key != "" {
+		if a.noisy == nil {
+			a.noisy = map[string][]time.Time{}
+		}
+		cutoff := e.Time.Add(-time.Minute)
+		hits := a.noisy[key]
+		kept := hits[:0]
+		for _, ts := range hits {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		if len(kept) >= defaultNoisyAuditCap {
+			a.noisy[key] = kept
+			return
+		}
+		a.noisy[key] = append(kept, e.Time)
+	}
+
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return
 	}
 	raw = append(raw, '\n')
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if st, err := os.Stat(a.path); err == nil && st.Size()+int64(len(raw)) > a.maxBytes {
 		_ = os.Rename(a.path, a.path+".1")
 	}

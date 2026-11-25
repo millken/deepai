@@ -72,6 +72,9 @@ type Server struct {
 
 	oaiMu       sync.Mutex
 	oaiSessions map[string]string
+
+	touchMu   sync.Mutex
+	lastTouch map[string]time.Time
 }
 
 // NewServer builds the handler. Routes are documented in docs/BOT_DESIGN.md.
@@ -91,6 +94,10 @@ func NewServer(opts ServerOptions) *Server {
 		opts: opts, m: opts.Manager, schedules: opts.Schedules,
 		tokens: opts.Tokens, audit: opts.Audit, metrics: met,
 		log: log, mux: http.NewServeMux(),
+		lastTouch: map[string]time.Time{},
+	}
+	if opts.Manager != nil && opts.Audit != nil {
+		opts.Manager.SetAudit(opts.Audit)
 	}
 
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +253,9 @@ func (s *Server) auth(h http.HandlerFunc) http.Handler {
 						if rec.RevokedAt == nil && (rec.ExpiresAt == nil || rec.ExpiresAt.After(now)) {
 							p = Principal{ID: rec.ID, Name: rec.Name, Role: rec.Role, BotIDs: rec.BotIDs}
 							matched = true
-							_ = s.tokens.TouchToken(r.Context(), rec.ID, now)
+							if s.shouldTouchToken(rec.ID, now) {
+								_ = s.tokens.TouchToken(r.Context(), rec.ID, now)
+							}
 						}
 					}
 				}
@@ -292,6 +301,19 @@ func (s *Server) auth(h http.HandlerFunc) http.Handler {
 
 		h(w, r.WithContext(withPrincipal(r.Context(), p)))
 	})
+}
+
+func (s *Server) shouldTouchToken(id string, now time.Time) bool {
+	s.touchMu.Lock()
+	defer s.touchMu.Unlock()
+	if s.lastTouch == nil {
+		s.lastTouch = map[string]time.Time{}
+	}
+	if prev, ok := s.lastTouch[id]; ok && now.Sub(prev) < time.Minute {
+		return false
+	}
+	s.lastTouch[id] = now
+	return true
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -391,6 +413,16 @@ func (s *Server) handleListBots(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() && len(p.BotIDs) > 0 {
+		filtered := make([]BotSummary, 0, len(list))
+		for _, b := range list {
+			if p.AllowsBot(b.ID) {
+				filtered = append(filtered, b)
+			}
+		}
+		list = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"bots": list})
 }
 
@@ -428,6 +460,8 @@ func (s *Server) handleUpdateBot(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	p := principalFromContext(r.Context())
+	s.audit.Record(AuditEntry{Action: "bot_updated", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
 	writeJSON(w, http.StatusOK, b)
 }
 
@@ -679,13 +713,62 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	s.streamSubscription(w, r, sub, backlog, gap)
 }
 
+func eventBotID(e Event) string {
+	if e.BotID != "" {
+		return effectiveBotID(e.BotID)
+	}
+	if e.Bot != nil && e.Bot.ID != "" {
+		return effectiveBotID(e.Bot.ID)
+	}
+	if e.Session != nil && e.Session.BotID != "" {
+		return effectiveBotID(e.Session.BotID)
+	}
+	if e.Schedule != nil && e.Schedule.BotID != "" {
+		return effectiveBotID(e.Schedule.BotID)
+	}
+	return ""
+}
+
+func eventAllowedForPrincipal(p Principal, e Event) bool {
+	if e.Type == EventHeartbeat || e.Type == EventGap {
+		return true
+	}
+	if p.IsAdmin() || len(p.BotIDs) == 0 {
+		return true
+	}
+	bid := eventBotID(e)
+	if bid == "" {
+		return false
+	}
+	return p.AllowsBot(bid)
+}
+
 func (s *Server) handleGlobalEvents(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	filterBot := strings.TrimSpace(r.URL.Query().Get("bot_id"))
+	if filterBot != "" && !p.AllowsBot(filterBot) {
+		writeError(w, http.StatusForbidden, "forbidden", "token is not authorized for bot "+filterBot)
+		return
+	}
 	sub, backlog, gap := s.m.SubscribeAll(sinceParam(r))
 	defer sub.Close()
-	s.streamSubscription(w, r, sub, backlog, gap)
+	allow := func(e Event) bool {
+		if !eventAllowedForPrincipal(p, e) {
+			return false
+		}
+		if filterBot == "" || e.Type == EventHeartbeat || e.Type == EventGap {
+			return true
+		}
+		return eventBotID(e) == effectiveBotID(filterBot)
+	}
+	s.streamSubscriptionFiltered(w, r, sub, backlog, gap, allow)
 }
 
 func (s *Server) streamSubscription(w http.ResponseWriter, r *http.Request, sub *Subscription, backlog []Event, gap bool) {
+	s.streamSubscriptionFiltered(w, r, sub, backlog, gap, nil)
+}
+
+func (s *Server) streamSubscriptionFiltered(w http.ResponseWriter, r *http.Request, sub *Subscription, backlog []Event, gap bool, allow func(Event) bool) {
 	mode := streamMode(r)
 	if mode == "" {
 		mode = "sse"
@@ -695,10 +778,17 @@ func (s *Server) streamSubscription(w http.ResponseWriter, r *http.Request, sub 
 		sw.write(Event{Type: EventGap})
 	}
 	for _, e := range backlog {
-		sw.write(e)
+		if allow == nil || allow(e) {
+			sw.write(e)
+		}
 	}
 	sw.flush()
-	s.pump(r.Context(), sw, sub, func(Event) (bool, bool) { return true, false })
+	s.pump(r.Context(), sw, sub, func(e Event) (bool, bool) {
+		if allow != nil && !allow(e) {
+			return false, false
+		}
+		return true, false
+	})
 }
 
 // pump forwards sub to sw until ctx ends, filter reports last, or the

@@ -89,6 +89,7 @@ type Manager struct {
 	closed       bool
 	stopJan      chan struct{}
 	metrics      *Metrics
+	audit        *AuditLogger
 }
 
 type session struct {
@@ -187,6 +188,20 @@ func NewManager(opts Options) (*Manager, error) {
 // DeleteBot can inspect, cancel and cascade-delete bot-owned schedules.
 // Metrics returns the Manager's Prometheus metrics collector.
 func (m *Manager) Metrics() *Metrics { return m.metrics }
+
+// SetAudit attaches an optional AuditLogger so schedule run completions and
+// other manager-level lifecycle actions record audit entries.
+func (m *Manager) SetAudit(a *AuditLogger) {
+	m.mu.Lock()
+	m.audit = a
+	m.mu.Unlock()
+}
+
+func (m *Manager) auditLogger() *AuditLogger {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.audit
+}
 
 func (m *Manager) SetSchedules(svc *schedule.Service) {
 	m.mu.Lock()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -160,10 +161,20 @@ func (g *Gateway) HandleInbound(ctx context.Context, msg InboundMessage) {
 		}
 	}
 
-	// 4. Upload any inbound attachments via M3 pipeline.
+	// 4. Lazy-download (after auth/mention) and upload any inbound attachments via M3 pipeline.
 	var attIDs []string
 	for _, att := range msg.Attachments {
-		uploaded, err := g.m.UploadAttachmentForBot(binding.BotID, binding.SessionID, att.Name, bytes.NewReader(att.Data))
+		data := att.Data
+		if len(data) == 0 && att.Download != nil {
+			var dlErr error
+			data, dlErr = att.Download(ctx)
+			if dlErr != nil {
+				g.log.Warn("channel: download inbound attachment failed", "channel", msg.Channel, "name", att.Name, "err", dlErr)
+				_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("附件 %s 下载失败：%v", att.Name, dlErr))
+				return
+			}
+		}
+		uploaded, err := g.m.UploadAttachmentForBot(binding.BotID, binding.SessionID, att.Name, bytes.NewReader(data))
 		if err != nil {
 			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("附件 %s 上传失败：%v", att.Name, err))
 			return
@@ -191,16 +202,29 @@ func (g *Gateway) HandleInbound(ctx context.Context, msg InboundMessage) {
 		return
 	}
 	if res.Queued {
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已加入队列（第 %d 位），发送 /steer <内容> 可立即插话，/cancel 可中止。", res.Position))
+		// If the running turn originated from Web/Scheduler (no IM forwarder
+		// attached yet), attach one so this queued follow-up reply is delivered.
+		if subErr == nil && sub != nil && !g.hasActiveStream(binding.SessionID) {
+			g.startStreamForwarder(ctx, ra, dst, binding, sub)
+			return
+		}
 		if sub != nil {
 			sub.Close()
 		}
-		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已加入队列（第 %d 位），发送 /steer <内容> 可立即插话，/cancel 可中止。", res.Position))
 		return
 	}
 	if subErr != nil || sub == nil {
 		return
 	}
 	g.startStreamForwarder(ctx, ra, dst, binding, sub)
+}
+
+func (g *Gateway) hasActiveStream(sessionID string) bool {
+	g.mu.Lock()
+	_, ok := g.streams[sessionID]
+	g.mu.Unlock()
+	return ok
 }
 
 func (g *Gateway) handleQuestionCallback(ctx context.Context, ra registeredAdapter, dst Destination, msg InboundMessage) {
@@ -214,6 +238,20 @@ func (g *Gateway) handleQuestionCallback(ctx context.Context, ra registeredAdapt
 	if err != nil || !ok {
 		_, _ = ra.adapter.SendText(ctx, dst, "当前没有活跃会话。")
 		return
+	}
+	// Resolve index-encoded callback payloads ("ans:<qid>:#<idx>") used when
+	// Telegram's 64-byte callback_data limit prevents embedding full option text.
+	if strings.HasPrefix(answer, "#") {
+		if idx, err := strconv.Atoi(strings.TrimPrefix(answer, "#")); err == nil && idx >= 0 {
+			if info, _, err := g.m.GetSessionForBot(binding.BotID, binding.SessionID); err == nil {
+				for _, pq := range info.Pending {
+					if pq.ID == qID && idx < len(pq.Options) {
+						answer = pq.Options[idx]
+						break
+					}
+				}
+			}
+		}
 	}
 	if err := g.m.AnswerForBot(binding.BotID, binding.SessionID, qID, answer); err != nil {
 		_, _ = ra.adapter.SendText(ctx, dst, "提交回答失败："+err.Error())
@@ -277,20 +315,42 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 			_, _ = ra.adapter.SendText(ctx, dst, "会话初始化失败："+err.Error())
 			return true
 		}
+		sub, _, _, subErr := g.m.SubscribeForBot(cur.BotID, cur.SessionID, -1)
 		res, err := g.m.SubmitForBot(cur.BotID, cur.SessionID, bot.SendRequest{
 			Content: arg,
+			Model:   cur.Model,
 			Mode:    bot.SendModeSteer,
 		}, bot.SendOptions{})
 		if err != nil {
+			if sub != nil {
+				sub.Close()
+			}
 			_, _ = ra.adapter.SendText(ctx, dst, "插话失败："+err.Error())
 			return true
 		}
 		if res.Steered {
 			_, _ = ra.adapter.SendText(ctx, dst, "↪ 已提交插话，将在当前步骤完成后生效。")
+			if subErr == nil && sub != nil && !g.hasActiveStream(cur.SessionID) {
+				g.startStreamForwarder(ctx, ra, dst, cur, sub)
+				return true
+			}
+			if sub != nil {
+				sub.Close()
+			}
 		} else if res.Queued {
 			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前回合正在收尾，已转入队列（第 %d 位）。", res.Position))
+			if subErr == nil && sub != nil && !g.hasActiveStream(cur.SessionID) {
+				g.startStreamForwarder(ctx, ra, dst, cur, sub)
+				return true
+			}
+			if sub != nil {
+				sub.Close()
+			}
 		} else {
 			_, _ = ra.adapter.SendText(ctx, dst, "已直接开始新回合。")
+			if subErr == nil && sub != nil {
+				g.startStreamForwarder(ctx, ra, dst, cur, sub)
+			}
 		}
 		return true
 
@@ -303,11 +363,23 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 			bots, _ := g.m.ListBots(ctx)
 			var names []string
 			for _, b := range bots {
-				if b.Enabled {
+				if b.Enabled && ra.policy.AllowsBot(msg.UserID, b.ID) {
 					names = append(names, b.ID)
 				}
 			}
 			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前 Bot：%s\n可用 Bot：%s\n用法：/bot <id>", curBot, strings.Join(names, ", ")))
+			return true
+		}
+		if !ra.policy.AllowsBot(msg.UserID, arg) {
+			g.audit.Record(bot.AuditEntry{
+				Action:  "channel_rejected",
+				Actor:   msg.Channel + ":" + msg.UserID,
+				BotID:   arg,
+				Target:  msg.ChatID,
+				Outcome: "denied",
+				Detail:  "bot not allowed by channel policy",
+			})
+			_, _ = ra.adapter.SendText(ctx, dst, "切换失败：当前频道策略不允许使用该 Bot。")
 			return true
 		}
 		b, err := g.m.GetBot(ctx, arg)
@@ -335,6 +407,10 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 		}
 		if arg == "" {
 			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前模型：%s\n用法：/model <alias>", cur.Model))
+			return true
+		}
+		if !g.hasModel(arg) {
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("切换失败：未知模型 %q（可用：%s）。", arg, strings.Join(g.modelNames(), ", ")))
 			return true
 		}
 		cur.Model = arg
@@ -366,11 +442,35 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 			_, _ = ra.adapter.SendText(ctx, dst, "用法：/approve <schedule_id>")
 			return true
 		}
+		targetSch, err := g.schedules.Get(ctx, arg)
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "批准失败："+err.Error())
+			return true
+		}
+		if !ra.policy.CanApprove(msg.UserID, targetSch.BotID) {
+			g.audit.Record(bot.AuditEntry{
+				Action:  "channel_rejected",
+				Actor:   msg.Channel + ":" + msg.UserID,
+				BotID:   targetSch.BotID,
+				Target:  targetSch.ID,
+				Outcome: "denied",
+				Detail:  "approve not allowed by channel policy",
+			})
+			_, _ = ra.adapter.SendText(ctx, dst, "批准失败：无权批准该 Bot 的定时任务。")
+			return true
+		}
 		sch, err := g.schedules.Approve(ctx, arg)
 		if err != nil {
 			_, _ = ra.adapter.SendText(ctx, dst, "批准失败："+err.Error())
 			return true
 		}
+		g.audit.Record(bot.AuditEntry{
+			Action:  "schedule_approved",
+			Actor:   msg.Channel + ":" + msg.UserID,
+			BotID:   sch.BotID,
+			Target:  sch.ID,
+			Outcome: "ok",
+		})
 		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已批准任务「%s」(%s)。", sch.Name, sch.ID))
 		return true
 	}
@@ -401,6 +501,29 @@ func (g *Gateway) ensureBinding(ctx context.Context, policy AccessPolicy, ch, ch
 	return b, nil
 }
 
+func (g *Gateway) hasModel(alias string) bool {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return false
+	}
+	info := g.m.Info()
+	for _, m := range info.Models {
+		if m.Name == alias {
+			return true
+		}
+	}
+	return info.DefaultModel != "" && info.DefaultModel == alias
+}
+
+func (g *Gateway) modelNames() []string {
+	info := g.m.Info()
+	names := make([]string, 0, len(info.Models))
+	for _, m := range info.Models {
+		names = append(names, m.Name)
+	}
+	return names
+}
+
 // startStreamForwarder streams a session's events to the IM adapter with
 // throttled message editing, tool status indicators, question cards, and
 // artifact attachments until the session goes idle (including any auto-dequeued
@@ -418,7 +541,12 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		defer sub.Close()
+		curSub := sub
+		defer func() {
+			if curSub != nil {
+				curSub.Close()
+			}
+		}()
 		defer func() {
 			g.mu.Lock()
 			delete(g.streams, b.SessionID)
@@ -432,8 +560,9 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 
 		var textBuf strings.Builder
 		var activeTool string
-		var msgID string
-		var lastSent string
+		var chunkMsgIDs []string
+		var chunkTexts []string
+		var lastSeq int64
 		dirty := false
 
 		flush := func(final bool) {
@@ -445,39 +574,96 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 				body += "🔧 运行 " + activeTool + "..."
 			}
 			body = strings.TrimSpace(body)
-			if body == "" || body == lastSent {
+			if body == "" {
 				dirty = false
 				return
 			}
 			chunks := splitRunes(body, maxRunes)
-			if len(chunks) == 1 {
-				if msgID == "" {
-					if id, err := ra.adapter.SendText(ctx, dst, chunks[0]); err == nil {
-						msgID = id
-						lastSent = chunks[0]
+			for i, ch := range chunks {
+				if i < len(chunkMsgIDs) {
+					if chunkTexts[i] == ch {
+						continue
+					}
+					if err := ra.adapter.EditText(ctx, dst, chunkMsgIDs[i], ch); err != nil {
+						g.log.Warn("channel: EditText failed", "channel", ra.adapter.Name(), "chat", dst.ChatID, "msg_id", chunkMsgIDs[i], "final", final, "err", err)
+						if final {
+							if id, sendErr := ra.adapter.SendText(ctx, dst, ch); sendErr != nil {
+								g.log.Warn("channel: fallback SendText failed", "channel", ra.adapter.Name(), "chat", dst.ChatID, "err", sendErr)
+							} else {
+								chunkMsgIDs[i] = id
+								chunkTexts[i] = ch
+							}
+						}
+					} else {
+						chunkTexts[i] = ch
 					}
 				} else {
-					if err := ra.adapter.EditText(ctx, dst, msgID, chunks[0]); err == nil {
-						lastSent = chunks[0]
+					id, err := ra.adapter.SendText(ctx, dst, ch)
+					if err != nil {
+						g.log.Warn("channel: SendText failed", "channel", ra.adapter.Name(), "chat", dst.ChatID, "err", err)
+						break
 					}
+					chunkMsgIDs = append(chunkMsgIDs, id)
+					chunkTexts = append(chunkTexts, ch)
 				}
-			} else {
-				// First chunk updates existing message; overflow chunks sent as new messages.
-				if msgID == "" {
-					if id, err := ra.adapter.SendText(ctx, dst, chunks[0]); err == nil {
-						msgID = id
-					}
-				} else {
-					_ = ra.adapter.EditText(ctx, dst, msgID, chunks[0])
-				}
-				for _, ch := range chunks[1:] {
-					if id, err := ra.adapter.SendText(ctx, dst, ch); err == nil {
-						msgID = id
-					}
-				}
-				lastSent = body
 			}
 			dirty = false
+		}
+
+		handleEvent := func(e bot.Event) (done bool) {
+			if e.Seq > lastSeq {
+				lastSeq = e.Seq
+			}
+			switch e.Type {
+			case bot.EventTextDelta:
+				textBuf.WriteString(e.Text)
+				dirty = true
+			case bot.EventToolCallStart:
+				if e.Tool != nil {
+					activeTool = e.Tool.Name
+					dirty = true
+				}
+			case bot.EventToolCallEnd:
+				activeTool = ""
+				dirty = true
+			case bot.EventQuestion:
+				if e.Question != nil {
+					flush(false)
+					if _, err := ra.adapter.SendQuestion(ctx, dst, *e.Question); err != nil {
+						g.log.Warn("channel: SendQuestion failed", "channel", ra.adapter.Name(), "chat", dst.ChatID, "question", e.Question.ID, "err", err)
+					}
+				}
+			case bot.EventArtifact:
+				if e.Artifact != nil && e.Artifact.DownloadPath != "" {
+					if rf, err := g.m.ResolveSessionFileForBot(b.BotID, b.SessionID, e.Artifact.DownloadPath); err != nil {
+						g.log.Warn("channel: resolve artifact failed", "session", b.SessionID, "path", e.Artifact.DownloadPath, "err", err)
+					} else if err := ra.adapter.SendAttachment(ctx, dst, rf.AbsPath, e.Artifact.Description); err != nil {
+						g.log.Warn("channel: SendAttachment failed", "channel", ra.adapter.Name(), "chat", dst.ChatID, "file", rf.Name, "err", err)
+					}
+				}
+			case bot.EventTurnEnd:
+				activeTool = ""
+				if e.Turn != nil && textBuf.Len() == 0 && e.Turn.FinalOutput != "" {
+					textBuf.WriteString(e.Turn.FinalOutput)
+				}
+				if e.Turn != nil && (e.Turn.Status == bot.TurnFailed || e.Turn.Status == bot.TurnTimedOut) && textBuf.Len() == 0 {
+					textBuf.WriteString("执行失败：" + e.Turn.Error)
+				}
+				flush(true)
+				// Exit only when the session is idle, has no queued items, AND
+				// has published no newer events beyond lastSeq (which can happen
+				// if a queued follow-up turn ran during flush's network round-trip).
+				info, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID)
+				if err != nil || (info.Status == bot.SessionIdle && len(info.Queue) == 0 && info.LastSeq <= lastSeq) {
+					return true
+				}
+				// Reset chunk buffer for next queued turn.
+				textBuf.Reset()
+				chunkMsgIDs = nil
+				chunkTexts = nil
+				dirty = false
+			}
+			return false
 		}
 
 		for {
@@ -488,53 +674,29 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 				if dirty {
 					flush(false)
 				}
-			case e, ok := <-sub.C:
+			case e, ok := <-curSub.C:
 				if !ok {
+					if curSub.Lagged() {
+						flush(false)
+						nextSub, backlog, _, err := g.m.SubscribeForBot(b.BotID, b.SessionID, lastSeq)
+						if err != nil {
+							g.log.Warn("channel: resubscribe after lag failed", "session", b.SessionID, "err", err)
+							flush(true)
+							return
+						}
+						curSub = nextSub
+						for _, be := range backlog {
+							if handleEvent(be) {
+								return
+							}
+						}
+						continue
+					}
 					flush(true)
 					return
 				}
-				switch e.Type {
-				case bot.EventTextDelta:
-					textBuf.WriteString(e.Text)
-					dirty = true
-				case bot.EventToolCallStart:
-					if e.Tool != nil {
-						activeTool = e.Tool.Name
-						dirty = true
-					}
-				case bot.EventToolCallEnd:
-					activeTool = ""
-					dirty = true
-				case bot.EventQuestion:
-					if e.Question != nil {
-						flush(false)
-						_, _ = ra.adapter.SendQuestion(ctx, dst, *e.Question)
-					}
-				case bot.EventArtifact:
-					if e.Artifact != nil && e.Artifact.DownloadPath != "" {
-						if rf, err := g.m.ResolveSessionFileForBot(b.BotID, b.SessionID, e.Artifact.DownloadPath); err == nil {
-							_ = ra.adapter.SendAttachment(ctx, dst, rf.AbsPath, e.Artifact.Description)
-						}
-					}
-				case bot.EventTurnEnd:
-					activeTool = ""
-					if e.Turn != nil && textBuf.Len() == 0 && e.Turn.FinalOutput != "" {
-						textBuf.WriteString(e.Turn.FinalOutput)
-					}
-					if e.Turn != nil && (e.Turn.Status == bot.TurnFailed || e.Turn.Status == bot.TurnTimedOut) && textBuf.Len() == 0 {
-						textBuf.WriteString("执行失败：" + e.Turn.Error)
-					}
-					flush(true)
-					// Check if follow-up queue has more turns coming; if idle, exit cleanly.
-					info, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID)
-					if err != nil || (info.Status == bot.SessionIdle && len(info.Queue) == 0) {
-						return
-					}
-					// Reset buffer for next queued turn.
-					textBuf.Reset()
-					msgID = ""
-					lastSent = ""
-					dirty = false
+				if handleEvent(e) {
+					return
 				}
 			}
 		}

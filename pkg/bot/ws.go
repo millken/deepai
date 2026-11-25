@@ -208,6 +208,9 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 			in.ID = req.BotID
 		}
 		b, err := m.CreateBot(ctx, in)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_created", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
+		}
 		c.reply(ctx, req, b, err)
 	case "update_bot":
 		var in UpdateBotRequest
@@ -216,10 +219,17 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 			return
 		}
 		b, err := m.UpdateBot(ctx, req.BotID, in)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_updated", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
+		}
 		c.reply(ctx, req, b, err)
 	case "delete_bot":
 		force := req.Force || paramBool(req.Params, "force")
-		c.reply(ctx, req, nil, m.DeleteBot(ctx, req.BotID, force))
+		err := m.DeleteBot(ctx, req.BotID, force)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_deleted", Actor: p.Name, Role: string(p.Role), BotID: req.BotID, Target: req.BotID, Outcome: "ok"})
+		}
+		c.reply(ctx, req, nil, err)
 	case "list_sessions":
 		list, err := m.ListSessionsForBot(botID, req.Limit)
 		c.reply(ctx, req, map[string]any{"sessions": list}, err)
@@ -278,6 +288,7 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 }
 
 func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
+	p := principalFromContext(ctx)
 	since := int64(-1)
 	if req.Since != nil {
 		since = *req.Since
@@ -290,10 +301,17 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 	)
 	if key == "*" || key == "" {
 		key = "*"
+		if req.BotID != "" && !p.AllowsBot(req.BotID) {
+			return fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, req.BotID)
+		}
 		sub, backlog, gap = c.s.m.SubscribeAll(since)
 	} else {
+		targetBot := effectiveBotID(req.BotID)
+		if !p.AllowsBot(targetBot) {
+			return fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, targetBot)
+		}
 		var err error
-		sub, backlog, gap, err = c.s.m.SubscribeForBot(effectiveBotID(req.BotID), key, since)
+		sub, backlog, gap, err = c.s.m.SubscribeForBot(targetBot, key, since)
 		if err != nil {
 			return err
 		}
@@ -312,22 +330,13 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 		filterBot = req.BotID
 	}
 	matchesFilter := func(e Event) bool {
+		if !eventAllowedForPrincipal(p, e) {
+			return false
+		}
 		if filterBot == "" || e.Type == EventHeartbeat || e.Type == EventGap {
 			return true
 		}
-		if e.BotID != "" {
-			return e.BotID == filterBot
-		}
-		if e.Bot != nil {
-			return e.Bot.ID == filterBot
-		}
-		if e.Session != nil {
-			return effectiveBotID(e.Session.BotID) == filterBot
-		}
-		if e.Schedule != nil {
-			return effectiveBotID(e.Schedule.BotID) == filterBot
-		}
-		return false
+		return eventBotID(e) == effectiveBotID(filterBot)
 	}
 	push := func(e Event) {
 		if !matchesFilter(e) {

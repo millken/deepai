@@ -13,7 +13,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/millken/deepai/pkg/schedule"
+	"golang.org/x/net/websocket"
 	_ "modernc.org/sqlite"
 )
 
@@ -253,5 +256,243 @@ func TestOpenAICompatAndPrometheusMetrics(t *testing.T) {
 	}
 	if !strings.Contains(metStr, `deepai_bot_tokens_total{bot_id="reviewer"`) {
 		t.Fatalf("metrics missing tokens_total:\n%s", metStr)
+	}
+}
+
+func TestScopedTokenEnforcesBotScopeOnSchedulesRunsChainAndStreams(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tokStore, err := NewSQLiteTokenStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := NewManager(Options{Runtime: &recordingRuntime{}, Store: NewMemoryStore(), IdleTimeout: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(ctx)
+
+	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "reviewer", Name: "Reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "secret", Name: "Secret"}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := schedule.NewService(schedule.NewMemoryStore(), schedule.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp := AttachSchedule(m, svc)
+	defer disp.Wait(ctx)
+
+	srv := NewServer(ServerOptions{
+		Manager:   m,
+		Schedules: svc,
+		Token:     "master-secret",
+		Tokens:    tokStore,
+		Audit:     auditLog,
+	})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Create secret bot's schedule + run and reviewer bot's pending schedule.
+	secretSch, err := svc.Create(ctx, schedule.CreateInput{
+		BotID:   "secret",
+		Name:    "secret-job",
+		Prompt:  "confidential",
+		Trigger: schedule.Trigger{Type: schedule.TriggerInterval, Every: "1h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretRun, err := svc.RunNow(ctx, secretSch.ID, "sec-r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp.Wait(ctx)
+
+	revSch, err := svc.Create(ctx, schedule.CreateInput{
+		BotID:   "reviewer",
+		Name:    "rev-job",
+		Prompt:  "review",
+		Trigger: schedule.Trigger{Type: schedule.TriggerInterval, Every: "1h"},
+		State:   schedule.StatePendingApproval,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Issue a user token scoped strictly to "reviewer".
+	revTok, err := tokStore.CreateToken(ctx, CreateTokenRequest{
+		Name:   "rev-only",
+		Role:   RoleUser,
+		BotIDs: []string{"reviewer"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 61-H1: flat /v1/schedules & /v1/runs must enforce bot_ids!
+	rCreateSec := doReq(t, http.MethodPost, ts.URL+"/v1/schedules", revTok.Token, map[string]any{
+		"bot_id": "secret", "name": "hack", "prompt": "p",
+		"trigger": map[string]any{"type": "interval", "every": "1h"},
+	})
+	rCreateSec.Body.Close()
+	if rCreateSec.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /v1/schedules for secret bot = %d, want 403", rCreateSec.StatusCode)
+	}
+
+	// 60-M2 + 61-H1: chaining reviewer schedule after secret schedule must be 403!
+	rChain := doReq(t, http.MethodPost, ts.URL+"/v1/bots/reviewer/schedules", revTok.Token, map[string]any{
+		"name": "steal-chain", "prompt": "leak {{prev.output}}",
+		"trigger": map[string]any{"type": "chain", "after_schedule_id": secretSch.ID},
+	})
+	rChain.Body.Close()
+	if rChain.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST chain after secret schedule = %d, want 403", rChain.StatusCode)
+	}
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/schedules/" + secretSch.ID},
+		{http.MethodPatch, "/v1/schedules/" + secretSch.ID},
+		{http.MethodPost, "/v1/schedules/" + secretSch.ID + "/run"},
+		{http.MethodPost, "/v1/schedules/" + secretSch.ID + "/pause"},
+		{http.MethodDelete, "/v1/schedules/" + secretSch.ID},
+		{http.MethodGet, "/v1/schedules/" + secretSch.ID + "/runs"},
+		{http.MethodGet, "/v1/runs/" + secretRun.ID},
+		{http.MethodPost, "/v1/runs/" + secretRun.ID + "/cancel"},
+	} {
+		resp := doReq(t, tc.method, ts.URL+tc.path, revTok.Token, map[string]any{"prompt": "pwned"})
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("scoped token %s %s = %d, want 403", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+
+	// GET /v1/schedules must only list reviewer schedules, never secretSch.
+	rList := doReq(t, http.MethodGet, ts.URL+"/v1/schedules", revTok.Token, nil)
+	var listRes struct {
+		Schedules []schedule.Schedule `json:"schedules"`
+	}
+	_ = json.NewDecoder(rList.Body).Decode(&listRes)
+	rList.Body.Close()
+	if len(listRes.Schedules) != 1 || listRes.Schedules[0].ID != revSch.ID {
+		t.Fatalf("GET /v1/schedules leaked unauthorized schedules: %+v", listRes.Schedules)
+	}
+
+	// Approving reviewer's own schedule succeeds and writes schedule_approved audit.
+	rApp := doReq(t, http.MethodPost, ts.URL+"/v1/schedules/"+revSch.ID+"/approve", revTok.Token, nil)
+	rApp.Body.Close()
+	if rApp.StatusCode != http.StatusOK {
+		t.Fatalf("approve own schedule = %d, want 200", rApp.StatusCode)
+	}
+
+	// 61-H2: GET /v1/events?bot_id=secret -> 403; WS subscribe to secret session -> forbidden; WS subscribe "*" leaks nothing from secret.
+	rEvSec := doReq(t, http.MethodGet, ts.URL+"/v1/events?bot_id=secret", revTok.Token, nil)
+	rEvSec.Body.Close()
+	if rEvSec.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET /v1/events?bot_id=secret = %d, want 403", rEvSec.StatusCode)
+	}
+
+	secSess, err := m.CreateSessionForBot("secret", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revSess, err := m.CreateSessionForBot("reviewer", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/ws?token=" + revTok.Token
+	conn, err := websocket.Dial(wsURL, "", ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Subscribe to secret session must be rejected.
+	if err := websocket.JSON.Send(conn, WSRequest{ID: "sub-sec", Op: "subscribe", BotID: "secret", SessionID: secSess.ID}); err != nil {
+		t.Fatal(err)
+	}
+	var rep WSMessage
+	if err := websocket.JSON.Receive(conn, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK || rep.Error == nil || rep.Error.Code != "forbidden" {
+		t.Fatalf("WS subscribe to secret session = %+v, want forbidden", rep)
+	}
+
+	// Subscribe "*" without bot_id must filter out secret bot turns while delivering reviewer bot turns.
+	zero := int64(0)
+	if err := websocket.JSON.Send(conn, WSRequest{ID: "sub-all", Op: "subscribe", SessionID: "*", Since: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var m2 WSMessage
+		if err := websocket.JSON.Receive(conn, &m2); err != nil {
+			t.Fatal(err)
+		}
+		if m2.Kind == "reply" && m2.ID == "sub-all" {
+			if !m2.OK {
+				t.Fatalf("subscribe *: %+v", m2.Error)
+			}
+			break
+		}
+		if m2.Kind == "event" && m2.Event != nil && m2.Event.BotID == "secret" {
+			t.Fatalf("secret event leaked in * backlog: %+v", m2.Event)
+		}
+	}
+
+	tSec, _ := m.SendForBot("secret", secSess.ID, SendRequest{Content: "TOP SECRET"}, SendOptions{})
+	waitTurn(t, tSec)
+	tRev, _ := m.SendForBot("reviewer", revSess.ID, SendRequest{Content: "REVIEW OK"}, SendOptions{})
+	waitTurn(t, tRev)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var msg WSMessage
+		if err := websocket.JSON.Receive(conn, &msg); err != nil {
+			t.Fatalf("waiting for reviewer turn_end: %v", err)
+		}
+		if msg.Kind != "event" || msg.Event == nil {
+			continue
+		}
+		if msg.Event.BotID == "secret" || msg.Event.SessionID == secSess.ID || strings.Contains(msg.Event.Text, "TOP SECRET") {
+			t.Fatalf("secret bot event leaked to reviewer-scoped WS *: %+v", msg.Event)
+		}
+		if msg.Event.SessionID == revSess.ID && msg.Event.Type == EventTurnEnd {
+			break
+		}
+	}
+
+	// 61-M4: verify bot_updated, schedule_approved, schedule_run_end in audit.jsonl + auth_failed rate cap.
+	rPatch := doReq(t, http.MethodPatch, ts.URL+"/v1/bots/reviewer", "master-secret", map[string]any{"title": "Code Reviewer"})
+	rPatch.Body.Close()
+	for i := 0; i < 80; i++ {
+		auditLog.Record(AuditEntry{Action: "auth_failed", Target: "/v1/info", Outcome: "denied"})
+	}
+	rawAudit, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditText := string(rawAudit)
+	for _, act := range []string{"bot_updated", "schedule_approved", "schedule_run_end"} {
+		if !strings.Contains(auditText, `"action":"`+act+`"`) {
+			t.Errorf("audit.jsonl missing %q:\n%s", act, auditText)
+		}
+	}
+	if n := strings.Count(auditText, `"action":"auth_failed"`); n > defaultNoisyAuditCap {
+		t.Errorf("auth_failed audit count = %d, want <= %d", n, defaultNoisyAuditCap)
 	}
 }

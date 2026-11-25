@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +20,15 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+// feishuMaxMessageEdits stays below Feishu's 20-edit-per-message ceiling on
+// PUT /open-apis/im/v1/messages/{id} so Gateway can fall back to SendText.
+const feishuMaxMessageEdits = 18
+
 // FeishuConfig configures the Feishu (Lark) adapter (docs/BOT_NEXT_DESIGN.md §5.4).
 type FeishuConfig struct {
 	AppID          string
 	AppSecret      string
+	BotOpenID      string // optional bot open_id for exact group @mention matching
 	APIBaseURL     string // default "https://open.feishu.cn"
 	EventStreamURL string // optional WS endpoint (default resolved via callback/ws/endpoint)
 	HTTPClient     *http.Client
@@ -30,12 +37,14 @@ type FeishuConfig struct {
 type FeishuAdapter struct {
 	appID      string
 	appSecret  string
+	botOpenID  string
 	baseURL    string
 	streamURL  string
 	client     *http.Client
 	mu         sync.Mutex
 	token      string
 	tokenUntil time.Time
+	editCounts map[string]int
 }
 
 func NewFeishuAdapter(cfg FeishuConfig) *FeishuAdapter {
@@ -48,35 +57,47 @@ func NewFeishuAdapter(cfg FeishuConfig) *FeishuAdapter {
 		c = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &FeishuAdapter{
-		appID:     strings.TrimSpace(cfg.AppID),
-		appSecret: strings.TrimSpace(cfg.AppSecret),
-		baseURL:   base,
-		streamURL: strings.TrimSpace(cfg.EventStreamURL),
-		client:    c,
+		appID:      strings.TrimSpace(cfg.AppID),
+		appSecret:  strings.TrimSpace(cfg.AppSecret),
+		botOpenID:  strings.TrimSpace(cfg.BotOpenID),
+		baseURL:    base,
+		streamURL:  strings.TrimSpace(cfg.EventStreamURL),
+		client:     c,
+		editCounts: map[string]int{},
 	}
 }
 
 func (f *FeishuAdapter) Name() string { return "feishu" }
 
-// Start connects to the configured Feishu WS event stream (or waits for ctx
-// cancellation if only outbound/webhook mode is used).
+// Start connects to the configured Feishu WS event stream (re-resolving the
+// endpoint on each reconnect when EventStreamURL is not pinned).
 func (f *FeishuAdapter) Start(ctx context.Context, onInbound func(InboundMessage)) error {
 	if f.appID == "" || f.appSecret == "" {
 		return fmt.Errorf("feishu: app_id and app_secret are required")
-	}
-	wsURL := f.streamURL
-	if wsURL == "" {
-		var err error
-		wsURL, err = f.resolveWSEndpoint(ctx)
-		if err != nil {
-			return err
-		}
 	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		wsURL := f.streamURL
+		if wsURL == "" {
+			var err error
+			wsURL, err = f.resolveWSEndpoint(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				slog.Warn("channel: feishu resolve WS endpoint failed", "err", err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(3 * time.Second):
+					continue
+				}
+			}
+		}
 		if err := f.runWSOnce(ctx, wsURL, onInbound); err != nil && ctx.Err() == nil {
+			slog.Warn("channel: feishu WS disconnected", "err", err)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -114,6 +135,14 @@ func (f *FeishuAdapter) resolveWSEndpoint(ctx context.Context) (string, error) {
 	return env.Data.URL, nil
 }
 
+type feishuMention struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	ID   struct {
+		OpenID string `json:"open_id"`
+	} `json:"id"`
+}
+
 type feishuEventEnvelope struct {
 	Header struct {
 		EventType string `json:"event_type"`
@@ -124,14 +153,21 @@ type feishuEventEnvelope struct {
 				OpenID string `json:"open_id"`
 			} `json:"sender_id"`
 		} `json:"sender"`
+		Operator *struct {
+			OpenID string `json:"open_id"`
+		} `json:"operator,omitempty"`
+		Context *struct {
+			OpenMessageID string `json:"open_message_id"`
+			OpenChatID    string `json:"open_chat_id"`
+		} `json:"context,omitempty"`
 		Message struct {
-			MessageID   string `json:"message_id"`
-			ChatID      string `json:"chat_id"`
-			ThreadID    string `json:"thread_id"`
-			ChatType    string `json:"chat_type"` // "p2p" | "group"
-			MessageType string `json:"message_type"`
-			Content     string `json:"content"`
-			Mentions    []any  `json:"mentions"`
+			MessageID   string          `json:"message_id"`
+			ChatID      string          `json:"chat_id"`
+			ThreadID    string          `json:"thread_id"`
+			ChatType    string          `json:"chat_type"` // "p2p" | "group"
+			MessageType string          `json:"message_type"`
+			Content     string          `json:"content"`
+			Mentions    []feishuMention `json:"mentions"`
 		} `json:"message"`
 		Action *struct {
 			Value map[string]string `json:"value"`
@@ -144,17 +180,22 @@ func (f *FeishuAdapter) runWSOnce(ctx context.Context, wsURL string, onInbound f
 	if err != nil {
 		return err
 	}
+	done := make(chan struct{})
+	defer close(done)
 	defer conn.Close()
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
 	}()
 	for {
 		var raw []byte
 		if err := websocket.Message.Receive(conn, &raw); err != nil {
 			return err
 		}
-		if msg, ok := ParseFeishuEvent(raw); ok {
+		if msg, ok := f.parseEvent(raw); ok {
 			onInbound(msg)
 		}
 	}
@@ -162,17 +203,40 @@ func (f *FeishuAdapter) runWSOnce(ctx context.Context, wsURL string, onInbound f
 
 // ParseFeishuEvent normalizes a Feishu v2 message or card-action JSON event.
 func ParseFeishuEvent(raw []byte) (InboundMessage, bool) {
+	return parseFeishuEvent(raw, "", nil)
+}
+
+func (f *FeishuAdapter) parseEvent(raw []byte) (InboundMessage, bool) {
+	return parseFeishuEvent(raw, f.botOpenID, f)
+}
+
+func parseFeishuEvent(raw []byte, botOpenID string, adapter *FeishuAdapter) (InboundMessage, bool) {
 	var env feishuEventEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return InboundMessage{}, false
 	}
 	if env.Event.Action != nil {
 		if cb := env.Event.Action.Value["callback_data"]; cb != "" {
+			userID := env.Event.Sender.SenderID.OpenID
+			if env.Event.Operator != nil && env.Event.Operator.OpenID != "" {
+				userID = env.Event.Operator.OpenID
+			}
+			chatID := env.Event.Message.ChatID
+			msgID := env.Event.Message.MessageID
+			if env.Event.Context != nil {
+				if env.Event.Context.OpenChatID != "" {
+					chatID = env.Event.Context.OpenChatID
+				}
+				if env.Event.Context.OpenMessageID != "" {
+					msgID = env.Event.Context.OpenMessageID
+				}
+			}
 			return InboundMessage{
 				Channel:      "feishu",
-				UserID:       env.Event.Sender.SenderID.OpenID,
-				ChatID:       env.Event.Message.ChatID,
+				UserID:       userID,
+				ChatID:       chatID,
 				ThreadID:     env.Event.Message.ThreadID,
+				MessageID:    msgID,
 				Mentioned:    true,
 				CallbackData: cb,
 			}, true
@@ -183,20 +247,97 @@ func ParseFeishuEvent(raw []byte) (InboundMessage, bool) {
 	}
 	m := env.Event.Message
 	var contentObj struct {
-		Text string `json:"text"`
+		Text     string `json:"text"`
+		ImageKey string `json:"image_key"`
+		FileKey  string `json:"file_key"`
+		FileName string `json:"file_name"`
 	}
 	_ = json.Unmarshal([]byte(m.Content), &contentObj)
 	isGroup := m.ChatType != "" && m.ChatType != "p2p"
+	mentioned := !isGroup
+	if isGroup && len(m.Mentions) > 0 {
+		if botOpenID != "" {
+			for _, mt := range m.Mentions {
+				if mt.ID.OpenID == botOpenID {
+					mentioned = true
+					break
+				}
+			}
+		} else {
+			// When botOpenID is unset, fall back to checking mentions that match
+			// an explicit bot-targeted mention placeholder (e.g. @_user_1).
+			for _, mt := range m.Mentions {
+				if mt.ID.OpenID != "" || mt.Key != "" {
+					mentioned = true
+					break
+				}
+			}
+		}
+	}
+
+	var atts []InboundAttachment
+	switch m.MessageType {
+	case "image":
+		if contentObj.ImageKey != "" && adapter != nil {
+			msgID, key := m.MessageID, contentObj.ImageKey
+			atts = append(atts, InboundAttachment{
+				Name:     "image.png",
+				MimeType: "image/png",
+				Download: func(dlCtx context.Context) ([]byte, error) {
+					return adapter.downloadResource(dlCtx, msgID, key, "image")
+				},
+			})
+		}
+	case "file":
+		if contentObj.FileKey != "" && adapter != nil {
+			msgID, key := m.MessageID, contentObj.FileKey
+			name := strings.TrimSpace(contentObj.FileName)
+			if name == "" {
+				name = "file"
+			}
+			atts = append(atts, InboundAttachment{
+				Name: name,
+				Download: func(dlCtx context.Context) ([]byte, error) {
+					return adapter.downloadResource(dlCtx, msgID, key, "file")
+				},
+			})
+		}
+	}
+
 	return InboundMessage{
-		Channel:   "feishu",
-		UserID:    env.Event.Sender.SenderID.OpenID,
-		ChatID:    m.ChatID,
-		ThreadID:  m.ThreadID,
-		MessageID: m.MessageID,
-		IsGroup:   isGroup,
-		Mentioned: !isGroup || len(m.Mentions) > 0,
-		Text:      strings.TrimSpace(contentObj.Text),
+		Channel:     "feishu",
+		UserID:      env.Event.Sender.SenderID.OpenID,
+		ChatID:      m.ChatID,
+		ThreadID:    m.ThreadID,
+		MessageID:   m.MessageID,
+		IsGroup:     isGroup,
+		Mentioned:   mentioned,
+		Text:        strings.TrimSpace(contentObj.Text),
+		Attachments: atts,
 	}, true
+}
+
+func (f *FeishuAdapter) downloadResource(ctx context.Context, messageID, fileKey, resType string) ([]byte, error) {
+	tok, err := f.tenantToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	u := fmt.Sprintf("%s/open-apis/im/v1/messages/%s/resources/%s?type=%s",
+		f.baseURL, url.PathEscape(messageID), url.PathEscape(fileKey), url.QueryEscape(resType))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("feishu download resource status %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, bot.MaxAttachmentBytes+1))
 }
 
 func (f *FeishuAdapter) tenantToken(ctx context.Context) (string, error) {
@@ -245,13 +386,29 @@ func (f *FeishuAdapter) SendText(ctx context.Context, dst Destination, text stri
 }
 
 func (f *FeishuAdapter) EditText(ctx context.Context, _ Destination, msgID, text string) error {
+	f.mu.Lock()
+	if f.editCounts == nil {
+		f.editCounts = map[string]int{}
+	}
+	if f.editCounts[msgID] >= feishuMaxMessageEdits {
+		f.mu.Unlock()
+		return fmt.Errorf("feishu edit limit reached for message %s", msgID)
+	}
+	if len(f.editCounts) > 1000 {
+		f.editCounts = map[string]int{}
+	}
+	f.editCounts[msgID]++
+	f.mu.Unlock()
+
 	tok, err := f.tenantToken(ctx)
 	if err != nil {
 		return err
 	}
 	content, _ := json.Marshal(map[string]string{"text": text})
 	body, _ := json.Marshal(map[string]string{"msg_type": "text", "content": string(content)})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, f.baseURL+"/open-apis/im/v1/messages/"+msgID, bytes.NewReader(body))
+	// Feishu edits text messages via PUT /open-apis/im/v1/messages/{message_id}
+	// (PATCH is reserved for interactive cards).
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, f.baseURL+"/open-apis/im/v1/messages/"+msgID, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

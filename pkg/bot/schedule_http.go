@@ -91,6 +91,60 @@ func paramBool(m map[string]any, key string) bool {
 	return false
 }
 
+// ─────────────────────────── RBAC Helpers ───────────────────────────
+
+func (s *Server) authorizeSchedule(ctx context.Context, id string) (schedule.Schedule, error) {
+	sch, err := s.schedules.Get(ctx, id)
+	if err != nil {
+		return schedule.Schedule{}, err
+	}
+	p := principalFromContext(ctx)
+	if !p.AllowsBot(sch.BotID) {
+		return schedule.Schedule{}, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, effectiveBotID(sch.BotID))
+	}
+	return sch, nil
+}
+
+func (s *Server) authorizeRun(ctx context.Context, runID string) (schedule.Run, error) {
+	run, err := s.schedules.GetRun(ctx, runID)
+	if err != nil {
+		return schedule.Run{}, err
+	}
+	p := principalFromContext(ctx)
+	if p.IsAdmin() || len(p.BotIDs) == 0 {
+		return run, nil
+	}
+	sch, err := s.schedules.Get(ctx, run.ScheduleID)
+	if err != nil {
+		return schedule.Run{}, fmt.Errorf("%w: token not authorized for run %s", ErrForbidden, runID)
+	}
+	if !p.AllowsBot(sch.BotID) {
+		return schedule.Run{}, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, effectiveBotID(sch.BotID))
+	}
+	return run, nil
+}
+
+func (s *Server) authorizeChainTrigger(ctx context.Context, tr schedule.Trigger) error {
+	if tr.Type != schedule.TriggerChain || strings.TrimSpace(tr.AfterScheduleID) == "" {
+		return nil
+	}
+	_, err := s.authorizeSchedule(ctx, strings.TrimSpace(tr.AfterScheduleID))
+	return err
+}
+
+func filterSchedulesForPrincipal(p Principal, list []schedule.Schedule) []schedule.Schedule {
+	if p.IsAdmin() || len(p.BotIDs) == 0 {
+		return list
+	}
+	out := make([]schedule.Schedule, 0, len(list))
+	for _, sch := range list {
+		if p.AllowsBot(sch.BotID) {
+			out = append(out, sch)
+		}
+	}
+	return out
+}
+
 // ─────────────────────────── REST ───────────────────────────
 
 func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
@@ -98,11 +152,16 @@ func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	p := principalFromContext(r.Context())
 	botID := strings.TrimSpace(r.PathValue("bot_id"))
 	if botID == "" {
 		botID = strings.TrimSpace(r.URL.Query().Get("bot_id"))
 	}
 	if botID != "" {
+		if !p.AllowsBot(botID) {
+			s.writeErr(w, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, botID))
+			return
+		}
 		if _, err := s.m.GetBot(r.Context(), botID); err != nil {
 			s.writeErr(w, err)
 			return
@@ -114,6 +173,7 @@ func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	list = filterSchedulesForPrincipal(p, list)
 	writeJSON(w, http.StatusOK, s.scheduleResult(map[string]any{"schedules": list}))
 }
 
@@ -135,6 +195,15 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		in.BotID = pathBot
 	}
 	in.BotID = effectiveBotID(in.BotID)
+	p := principalFromContext(r.Context())
+	if !p.AllowsBot(in.BotID) {
+		s.writeErr(w, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, in.BotID))
+		return
+	}
+	if err := s.authorizeChainTrigger(r.Context(), in.Trigger); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	profile, err := s.m.GetBot(r.Context(), in.BotID)
 	if err != nil {
 		s.writeErr(w, err)
@@ -168,7 +237,7 @@ func (s *Server) handleGetSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	sch, err := svc.Get(r.Context(), id)
+	sch, err := s.authorizeSchedule(r.Context(), id)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -182,18 +251,25 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	cur, err := s.authorizeSchedule(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	body, ok := scheduleBody(w, r, false)
 	if !ok {
 		return
 	}
-	origTZ := ""
-	if cur, err := svc.Get(r.Context(), r.PathValue("id")); err == nil {
-		origTZ = cur.Timezone
-	}
-	patch, err := schedule.PatchFromMap(body, svc.Config(), origTZ)
+	patch, err := schedule.PatchFromMap(body, svc.Config(), cur.Timezone)
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	if patch.Trigger != nil {
+		if err := s.authorizeChainTrigger(r.Context(), *patch.Trigger); err != nil {
+			s.writeErr(w, err)
+			return
+		}
 	}
 	if patch.ToolAllowlist != nil {
 		if err := s.validateScheduleTools(*patch.ToolAllowlist); err != nil {
@@ -212,6 +288,10 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 	svc, ok := s.scheduleOr404(w)
 	if !ok {
+		return
+	}
+	if _, err := s.authorizeSchedule(r.Context(), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
 		return
 	}
 	cancel := false
@@ -244,6 +324,10 @@ func (s *Server) writeScheduleTransition(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	id := r.PathValue("id")
+	if _, err := s.authorizeSchedule(r.Context(), id); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	var (
 		sch schedule.Schedule
 		err error
@@ -260,12 +344,27 @@ func (s *Server) writeScheduleTransition(w http.ResponseWriter, r *http.Request,
 		s.writeErr(w, err)
 		return
 	}
+	if kind == "approve" {
+		p := principalFromContext(r.Context())
+		s.audit.Record(AuditEntry{
+			Action:  "schedule_approved",
+			Actor:   p.Name,
+			Role:    string(p.Role),
+			BotID:   effectiveBotID(sch.BotID),
+			Target:  sch.ID,
+			Outcome: "ok",
+		})
+	}
 	writeJSON(w, http.StatusOK, s.scheduleResult(map[string]any{"schedule": sch}))
 }
 
 func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 	svc, ok := s.scheduleOr404(w)
 	if !ok {
+		return
+	}
+	if _, err := s.authorizeSchedule(r.Context(), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
 		return
 	}
 	body, ok := scheduleBody(w, r, true)
@@ -285,6 +384,10 @@ func (s *Server) handleSkipSchedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, err := s.authorizeSchedule(r.Context(), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	run, err := svc.Skip(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeErr(w, err)
@@ -298,6 +401,10 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, err := s.authorizeSchedule(r.Context(), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	runs, err := svc.Runs(r.Context(), r.PathValue("id"), limit)
 	if err != nil {
@@ -308,11 +415,10 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
-	svc, ok := s.scheduleOr404(w)
-	if !ok {
+	if _, ok := s.scheduleOr404(w); !ok {
 		return
 	}
-	run, err := svc.GetRun(r.Context(), r.PathValue("id"))
+	run, err := s.authorizeRun(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -323,6 +429,10 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	svc, ok := s.scheduleOr404(w)
 	if !ok {
+		return
+	}
+	if _, err := s.authorizeRun(r.Context(), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
 		return
 	}
 	run, err := svc.CancelRun(r.Context(), r.PathValue("id"))
@@ -446,16 +556,23 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 	if runID == "" {
 		runID = paramString(params, "run_id")
 	}
+	p := principalFromContext(ctx)
 	switch req.Op {
 	case "list_schedules":
 		botID := req.BotID
 		if botID == "" {
 			botID = paramString(params, "bot_id")
 		}
+		if botID != "" && !p.AllowsBot(botID) {
+			return nil, true, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, botID)
+		}
 		list, err := svc.ListForBot(ctx, botID, paramString(params, "state"), paramInt(params, "limit", req.Limit))
+		if err == nil {
+			list = filterSchedulesForPrincipal(p, list)
+		}
 		return s.scheduleResult(map[string]any{"schedules": list}), true, err
 	case "get_schedule":
-		sch, err := svc.Get(ctx, id)
+		sch, err := s.authorizeSchedule(ctx, id)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "create_schedule":
 		in, err := schedule.CreateInputFromMap(params, svc.Config(), paramString(params, "session_id"), "")
@@ -466,6 +583,12 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 			in.BotID = req.BotID
 		}
 		in.BotID = effectiveBotID(in.BotID)
+		if !p.AllowsBot(in.BotID) {
+			return nil, true, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, in.BotID)
+		}
+		if err := s.authorizeChainTrigger(ctx, in.Trigger); err != nil {
+			return nil, true, err
+		}
 		profile, err := s.m.GetBot(ctx, in.BotID)
 		if err != nil {
 			return nil, true, err
@@ -484,13 +607,18 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		sch, err := svc.Create(ctx, in)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "update_schedule":
-		origTZ := ""
-		if cur, err := svc.Get(ctx, id); err == nil {
-			origTZ = cur.Timezone
-		}
-		patch, err := schedule.PatchFromMap(params, svc.Config(), origTZ)
+		cur, err := s.authorizeSchedule(ctx, id)
 		if err != nil {
 			return nil, true, err
+		}
+		patch, err := schedule.PatchFromMap(params, svc.Config(), cur.Timezone)
+		if err != nil {
+			return nil, true, err
+		}
+		if patch.Trigger != nil {
+			if err := s.authorizeChainTrigger(ctx, *patch.Trigger); err != nil {
+				return nil, true, err
+			}
 		}
 		if patch.ToolAllowlist != nil {
 			if err := s.validateScheduleTools(*patch.ToolAllowlist); err != nil {
@@ -500,30 +628,64 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		sch, err := svc.Update(ctx, id, patch)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "delete_schedule", "cancel_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		_, err := svc.Delete(ctx, id, paramBool(params, "cancel"))
 		return s.scheduleResult(nil), true, err
 	case "pause_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		sch, err := svc.Pause(ctx, id)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "resume_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		sch, err := svc.Resume(ctx, id)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "approve_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		sch, err := svc.Approve(ctx, id)
+		if err == nil {
+			s.audit.Record(AuditEntry{
+				Action:  "schedule_approved",
+				Actor:   p.Name,
+				Role:    string(p.Role),
+				BotID:   effectiveBotID(sch.BotID),
+				Target:  sch.ID,
+				Outcome: "ok",
+			})
+		}
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "run_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		run, err := svc.RunNow(ctx, id, paramString(params, "request_id"))
 		return s.scheduleResult(map[string]any{"run": run}), true, err
 	case "skip_schedule":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		run, err := svc.Skip(ctx, id)
 		return s.scheduleResult(map[string]any{"run": run}), true, err
 	case "list_runs":
+		if _, err := s.authorizeSchedule(ctx, id); err != nil {
+			return nil, true, err
+		}
 		runs, err := svc.Runs(ctx, id, paramInt(params, "limit", req.Limit))
 		return s.scheduleResult(map[string]any{"runs": runs}), true, err
 	case "get_run":
-		run, err := svc.GetRun(ctx, runID)
+		run, err := s.authorizeRun(ctx, runID)
 		return s.scheduleResult(map[string]any{"run": run}), true, err
 	case "cancel_run":
+		if _, err := s.authorizeRun(ctx, runID); err != nil {
+			return nil, true, err
+		}
 		run, err := svc.CancelRun(ctx, runID)
 		return s.scheduleResult(map[string]any{"run": run}), true, err
 	case "validate_trigger":
