@@ -47,6 +47,9 @@ type Patch struct {
 	MaxRuns        *int
 	MaxToolCalls   *int
 	MaxAutoAnswers *int
+	NotifyIf       *NotifyIf
+	ClearNotifyIf  bool
+	ToolAllowlist  *[]string
 }
 
 // Validation is returned by /v1/schedule/validate and by the tool's
@@ -93,6 +96,10 @@ type Service struct {
 	// the previous lease holder may still be executing them (run ID → the
 	// time after which they must be reconciled). Guarded by mu.
 	deferred map[string]time.Time
+
+	// webhookHits tracks per-schedule inbound webhook timestamps over the
+	// trailing 1 minute for RateLimitPerMin enforcement. Guarded by mu.
+	webhookHits map[string][]time.Time
 }
 
 // ServiceOption configures optional collaborators.
@@ -210,8 +217,13 @@ func (s *Service) kickLocked() {
 	}
 }
 
-// Decorate fills the computed fields a client expects on every response.
+// Decorate fills the computed fields a client expects on every response and
+// strips persisted webhook secrets so they are never exposed after Create.
 func (s *Service) Decorate(v Schedule) Schedule {
+	if v.Trigger.Secret != "" || v.Trigger.SecretRef != "" {
+		v.Trigger.HasSecret = true
+	}
+	v.Trigger.Secret = ""
 	v.Summary = v.Trigger.Summary(v.Timezone)
 	v.NextRuns = v.Trigger.NextRuns(s.now(), 3, v.Timezone)
 	return v
@@ -244,6 +256,19 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Schedule, error) 
 	tr := in.Trigger
 	if err := tr.Normalize(tz, now, s.cfg.MinInterval, false); err != nil {
 		return Schedule{}, err
+	}
+	if err := s.validateChainLocked(ctx, "", tr); err != nil {
+		return Schedule{}, err
+	}
+	var generatedSecret string
+	if tr.Type == TriggerWebhook {
+		if tr.SecretRef == "" {
+			generatedSecret = newID("whsec_") + newID("")
+			tr.Secret = generatedSecret
+		} else {
+			tr.Secret = ""
+		}
+		tr.HasSecret = true
 	}
 	opts, err := s.normalizeOptions(in.Options, now)
 	if err != nil {
@@ -278,7 +303,9 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Schedule, error) 
 	}
 	s.changed(v, ChangeCreated)
 	s.kickLocked()
-	return s.Decorate(v), nil
+	out := s.Decorate(v)
+	out.WebhookSecret = generatedSecret
+	return out, nil
 }
 
 // List returns schedules in this service's workdir, newest-created first.
@@ -395,6 +422,21 @@ func (s *Service) Update(ctx context.Context, id string, p Patch) (Schedule, err
 		tr := *p.Trigger
 		if err := tr.Normalize(v.Timezone, s.now(), s.cfg.MinInterval, false); err != nil {
 			return Schedule{}, err
+		}
+		if err := s.validateChainLocked(ctx, id, tr); err != nil {
+			return Schedule{}, err
+		}
+		if tr.Type == TriggerWebhook {
+			if tr.SecretRef == "" {
+				if v.Trigger.Secret != "" {
+					tr.Secret = v.Trigger.Secret
+				} else {
+					tr.Secret = newID("whsec_") + newID("")
+				}
+			} else {
+				tr.Secret = ""
+			}
+			tr.HasSecret = true
 		}
 		v.Trigger = tr
 	}
@@ -1211,6 +1253,11 @@ func (s *Service) normalizeOptions(o Options, now time.Time) (Options, error) {
 	if o.EndAt != nil && !o.EndAt.After(now) {
 		return o, NewError(CodeTimeInPast, "end_at must be in the future")
 	}
+	ni, err := normalizeNotifyIf(o.NotifyIf)
+	if err != nil {
+		return o, err
+	}
+	o.NotifyIf = ni
 	return o, nil
 }
 
@@ -1236,6 +1283,12 @@ func applyPatch(o *Options, p Patch) {
 	if p.Notify != nil {
 		o.Notify = *p.Notify
 	}
+	if p.ClearNotifyIf {
+		o.NotifyIf = nil
+	} else if p.NotifyIf != nil {
+		cp := *p.NotifyIf
+		o.NotifyIf = &cp
+	}
 	if p.EndAt != nil {
 		t := *p.EndAt
 		o.EndAt = &t
@@ -1257,6 +1310,9 @@ func applyPatch(o *Options, p Patch) {
 	}
 	if p.MaxAutoAnswers != nil {
 		o.AutoAnswers = *p.MaxAutoAnswers
+	}
+	if p.ToolAllowlist != nil {
+		o.ToolAllowlist = append([]string(nil), (*p.ToolAllowlist)...)
 	}
 }
 
@@ -1456,6 +1512,7 @@ func (s *Service) finishEffectsLocked(ctx context.Context, r Run) {
 	if err := s.store.PruneRuns(ctx, v.ID, s.cfg.RunHistory); err != nil {
 		s.log.Warn("schedule: prune run history", "schedule", v.ID, "err", err)
 	}
+	s.triggerDownstreamChainsLocked(ctx, r)
 }
 
 func (s *Service) requireMutable(ctx context.Context, id string) (Schedule, error) {
@@ -1498,6 +1555,10 @@ func (s *Service) updateScheduleLocked(ctx context.Context, v Schedule, kind Cha
 func (s *Service) changed(v Schedule, kind ChangeKind) {
 	if s.observer != nil {
 		payload := v
+		if payload.Trigger.Secret != "" || payload.Trigger.SecretRef != "" {
+			payload.Trigger.HasSecret = true
+		}
+		payload.Trigger.Secret = ""
 		if kind == ChangeDeleted {
 			payload = Schedule{ID: v.ID, BotID: v.BotID, State: StateDeleted}
 		}

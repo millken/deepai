@@ -19,7 +19,25 @@ type Trigger struct {
 	Every   string `json:"every,omitempty"`    // interval: period
 	StartAt string `json:"start_at,omitempty"` // interval: first slot
 	Expr    string `json:"expr,omitempty"`     // cron: 5-field expression or macro
+
+	// Webhook trigger fields (docs/BOT_NEXT_DESIGN.md §4.2).
+	SecretRef       string            `json:"secret_ref,omitempty"`
+	Secret          string            `json:"secret,omitempty"` // persisted auto-generated secret; masked by Decorate/API
+	HasSecret       bool              `json:"has_secret,omitempty"`
+	SignatureHeader string            `json:"signature_header,omitempty"`
+	SignatureScheme string            `json:"signature_scheme,omitempty"`
+	DedupHeader     string            `json:"dedup_header,omitempty"`
+	EventFilter     map[string]string `json:"event_filter,omitempty"`
+	RateLimitPerMin int               `json:"rate_limit_per_min,omitempty"`
+
+	// Chain trigger fields (docs/BOT_NEXT_DESIGN.md §4.3).
+	AfterScheduleID string `json:"after_schedule_id,omitempty"`
+	OnStatus        string `json:"on_status,omitempty"` // completed (default) | failed | any
 }
+
+// IsEventDriven reports whether the trigger is fired by external events or
+// upstream runs rather than a wall-clock slot.
+func (t Trigger) IsEventDriven() bool { return t.Type == TriggerWebhook || t.Type == TriggerChain }
 
 // IsPeriodic reports whether the trigger fires more than once.
 func (t Trigger) IsPeriodic() bool { return t.Type == TriggerInterval || t.Type == TriggerCron }
@@ -111,8 +129,74 @@ func (t *Trigger) Normalize(tz string, now time.Time, minInterval time.Duration,
 		t.Type = TriggerCron
 		t.Expr = spec.expr
 		t.At, t.In, t.Every, t.StartAt = "", "", "", ""
+	case TriggerWebhook:
+		t.Type = TriggerWebhook
+		t.At, t.In, t.Every, t.StartAt, t.Expr = "", "", "", "", ""
+		t.AfterScheduleID, t.OnStatus = "", ""
+		t.SecretRef = strings.TrimSpace(t.SecretRef)
+		if t.SecretRef != "" && !strings.HasPrefix(t.SecretRef, "env:") {
+			return NewError(CodeInvalidTrigger, "webhook.secret_ref must be empty (auto-generate) or use 'env:<VAR>'")
+		}
+		if t.SecretRef != "" && strings.TrimSpace(strings.TrimPrefix(t.SecretRef, "env:")) == "" {
+			return NewError(CodeInvalidTrigger, "webhook.secret_ref env var name is empty")
+		}
+		scheme := strings.ToLower(strings.TrimSpace(t.SignatureScheme))
+		if scheme == "" {
+			scheme = WebhookSigGitHubSHA256
+		}
+		switch scheme {
+		case WebhookSigGitHubSHA256, WebhookSigHMACSHA256, WebhookSigBearer:
+			t.SignatureScheme = scheme
+		default:
+			return NewError(CodeInvalidTrigger, "webhook.signature_scheme %q invalid (want github_sha256, hmac_sha256, or bearer)", t.SignatureScheme)
+		}
+		t.SignatureHeader = strings.TrimSpace(t.SignatureHeader)
+		if t.SignatureHeader == "" {
+			switch scheme {
+			case WebhookSigGitHubSHA256:
+				t.SignatureHeader = "X-Hub-Signature-256"
+			case WebhookSigHMACSHA256:
+				t.SignatureHeader = "X-Signature-256"
+			case WebhookSigBearer:
+				t.SignatureHeader = "Authorization"
+			}
+		}
+		t.DedupHeader = strings.TrimSpace(t.DedupHeader)
+		if t.DedupHeader == "" && scheme == WebhookSigGitHubSHA256 {
+			t.DedupHeader = "X-GitHub-Delivery"
+		}
+		if t.RateLimitPerMin <= 0 {
+			t.RateLimitPerMin = 5
+		}
+		if t.RateLimitPerMin > 60 {
+			return NewError(CodeInvalidTrigger, "webhook.rate_limit_per_min %d exceeds maximum 60", t.RateLimitPerMin)
+		}
+		for k := range t.EventFilter {
+			if !strings.HasPrefix(k, "header.") && !strings.HasPrefix(k, "payload.") {
+				return NewError(CodeInvalidTrigger, "webhook.event_filter key %q must start with 'header.' or 'payload.'", k)
+			}
+		}
+	case TriggerChain:
+		t.Type = TriggerChain
+		t.At, t.In, t.Every, t.StartAt, t.Expr = "", "", "", "", ""
+		t.SecretRef, t.Secret, t.SignatureHeader, t.SignatureScheme, t.DedupHeader = "", "", "", "", ""
+		t.EventFilter, t.RateLimitPerMin = nil, 0
+		t.AfterScheduleID = strings.TrimSpace(t.AfterScheduleID)
+		if t.AfterScheduleID == "" {
+			return NewError(CodeInvalidTrigger, "chain requires after_schedule_id")
+		}
+		on := strings.ToLower(strings.TrimSpace(t.OnStatus))
+		if on == "" {
+			on = ChainOnCompleted
+		}
+		switch on {
+		case ChainOnCompleted, ChainOnFailed, ChainOnAny:
+			t.OnStatus = on
+		default:
+			return NewError(CodeInvalidTrigger, "chain.on_status %q invalid (want completed, failed, or any)", t.OnStatus)
+		}
 	default:
-		return NewError(CodeInvalidTrigger, "unknown trigger type %q (want once, interval or cron)", t.Type)
+		return NewError(CodeInvalidTrigger, "unknown trigger type %q (want once, interval, cron, webhook, or chain)", t.Type)
 	}
 	return nil
 }
@@ -212,6 +296,10 @@ func (t Trigger) Summary(tz string) string {
 			return spec.HumanSummary(tz)
 		}
 		return fmt.Sprintf("cron %s（%s）", t.Expr, tz)
+	case TriggerWebhook:
+		return fmt.Sprintf("Webhook 触发（%s，限流 %d/min）", t.SignatureScheme, t.RateLimitPerMin)
+	case TriggerChain:
+		return fmt.Sprintf("任务链：在 %s %s 后触发", t.AfterScheduleID, t.OnStatus)
 	}
 	return "未知触发规则"
 }

@@ -129,6 +129,10 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("GET /v1/runs/{id}", s.auth(s.handleGetRun))
 	s.mux.Handle("POST /v1/runs/{id}/cancel", s.auth(s.handleCancelRun))
 	s.mux.Handle("POST /v1/schedule/validate", s.auth(s.handleValidateSchedule))
+	// Inbound webhook trigger endpoint: authenticated solely by the schedule's
+	// own webhook signature/secret (never the bot's main bearer token, per
+	// docs/BOT_NEXT_DESIGN.md §4.2).
+	s.mux.HandleFunc("POST /v1/hooks/{schedule_id}", s.handleWebhookHook)
 
 	if !opts.DisableWebUI {
 		sub, _ := fs.Sub(webFS, "web")

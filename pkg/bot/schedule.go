@@ -25,7 +25,7 @@ func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
 	// immediately after restart still has name/notify for cancelled run_end hooks.
 	if list, err := svc.List(context.Background(), "", 0); err == nil {
 		for _, sch := range list {
-			obs.meta[sch.ID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: sch.Name, notify: sch.Options.Notify}
+			obs.meta[sch.ID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: sch.Name, notify: sch.Options.Notify, notifyIf: cloneNotifyIf(sch.Options.NotifyIf)}
 		}
 	}
 	svc.SetObserver(obs)
@@ -93,9 +93,18 @@ type scheduleObserver struct {
 }
 
 type scheduleMeta struct {
-	botID  string
-	name   string
-	notify string
+	botID    string
+	name     string
+	notify   string
+	notifyIf *schedule.NotifyIf
+}
+
+func cloneNotifyIf(in *schedule.NotifyIf) *schedule.NotifyIf {
+	if in == nil {
+		return nil
+	}
+	cp := *in
+	return &cp
 }
 
 func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.ChangeKind) {
@@ -106,7 +115,7 @@ func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[sch.ID] = scheduleMeta{botID: botID, name: sch.Name, notify: sch.Options.Notify}
+		o.meta[sch.ID] = scheduleMeta{botID: botID, name: sch.Name, notify: sch.Options.Notify, notifyIf: cloneNotifyIf(sch.Options.NotifyIf)}
 		o.mu.Unlock()
 	} else if botID == "" && sch.ID != "" {
 		o.mu.Lock()
@@ -169,15 +178,16 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 
 func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
 	var name, notify string
+	var notifyIf *schedule.NotifyIf
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if sch, err := o.svc.Get(ctx, run.ScheduleID); err == nil {
-		name, notify = sch.Name, sch.Options.Notify
+		name, notify, notifyIf = sch.Name, sch.Options.Notify, cloneNotifyIf(sch.Options.NotifyIf)
 		o.mu.Lock()
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[run.ScheduleID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: name, notify: notify}
+		o.meta[run.ScheduleID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: name, notify: notify, notifyIf: notifyIf}
 		o.mu.Unlock()
 	} else {
 		// Fall back to cached metadata: Delete soft-deletes the schedule before
@@ -189,9 +199,9 @@ func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
 			o.m.log.Warn("bot: lookup schedule for run_end notification failed", "schedule", run.ScheduleID, "run", run.ID, "err", err)
 			return
 		}
-		name, notify = cached.name, cached.notify
+		name, notify, notifyIf = cached.name, cached.notify, cached.notifyIf
 	}
-	if !shouldNotifyRunEnd(notify, run.Status) {
+	if !schedule.ShouldNotify(notify, notifyIf, run.Status, run.Output) {
 		return
 	}
 	msg := formatScheduleRunMessage(name, run)
@@ -497,9 +507,27 @@ func scheduledMessage(sch schedule.Schedule, run schedule.Run) string {
 		loc = time.UTC
 	}
 	local := run.ScheduledFor.In(loc).Format("2006-01-02 15:04")
-	header := fmt.Sprintf("[定时任务] %s · 第 %d 次 · 计划时间 %s (%s)",
-		sch.Name, run.Seq, local, sch.Timezone)
-	return header + "\n\n" + strings.TrimSpace(sch.Prompt)
+	prefix := "[定时任务]"
+	switch run.Trigger {
+	case schedule.FireWebhook:
+		prefix = "[Webhook 触发]"
+	case schedule.FireChain:
+		prefix = "[任务链触发]"
+	}
+	header := fmt.Sprintf("%s %s · 第 %d 次 · 触发时间 %s (%s)",
+		prefix, sch.Name, run.Seq, local, sch.Timezone)
+	body := strings.TrimSpace(sch.Prompt)
+	if strings.TrimSpace(run.PromptOverride) != "" {
+		body = strings.TrimSpace(run.PromptOverride)
+	}
+	if sch.Options.NotifyIf != nil && sch.Options.NotifyIf.Mode == schedule.NotifyIfMarker {
+		marker := strings.TrimSpace(sch.Options.NotifyIf.Pattern)
+		if marker == "" {
+			marker = schedule.DefaultNotifyMarker
+		}
+		body += fmt.Sprintf("\n\n（通知约定：若本次检查无异常、无需打扰用户，请直接以 %s 开头回复。）", marker)
+	}
+	return header + "\n\n" + body
 }
 
 // outcomeFromSummary maps a turn_end status onto a Run terminal state.
