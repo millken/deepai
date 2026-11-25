@@ -41,6 +41,7 @@ type QueuedMessage struct {
 	Content   string                `json:"content"`
 	Model     string                `json:"model,omitempty"`
 	Images    []models.MessageImage `json:"images,omitempty"`
+	Metadata  map[string]string     `json:"metadata,omitempty"`
 	CreatedAt time.Time             `json:"created_at"`
 }
 
@@ -166,7 +167,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
 	}
 	content := strings.TrimSpace(req.Content)
-	if content == "" {
+	if content == "" && len(req.AttachmentIDs) == 0 && len(req.Images) == 0 {
 		return nil, ErrEmptyMessage
 	}
 	model := strings.TrimSpace(req.Model)
@@ -200,6 +201,11 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 	}()
 
 	s.mu.Lock()
+	resolvedContent, resolvedImages, attMeta, err := resolveAttachmentsLocked(s, content, req.AttachmentIDs, req.Images)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	if s.turn != nil {
 		switch mode {
 		case SendModeReject:
@@ -209,7 +215,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 		case SendModeSteer:
 			steerID := "st_" + randomHex(6)
 			if s.turn.steer != nil {
-				switch s.turn.steer.Push(agent.SteerMessage{ID: steerID, Content: content}) {
+				switch s.turn.steer.Push(agent.SteerMessage{ID: steerID, Content: resolvedContent, Images: resolvedImages}) {
 				case steerAccepted:
 					turnID := s.turn.id
 					s.lastUsed = time.Now().UTC()
@@ -219,7 +225,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 						TurnID:    turnID,
 						Type:      EventSteerQueued,
 						SteerID:   steerID,
-						Text:      content,
+						Text:      resolvedContent,
 					})
 					s.mu.Unlock()
 					return &SendResult{
@@ -240,8 +246,10 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 			}
 			item := QueuedMessage{
 				ID:        "q_" + randomHex(6),
-				Content:   content,
+				Content:   resolvedContent,
 				Model:     model,
+				Images:    resolvedImages,
+				Metadata:  attMeta,
 				CreatedAt: time.Now().UTC(),
 			}
 			s.queue = append(s.queue, item)
@@ -253,7 +261,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 				SessionID: id,
 				Type:      EventQueueEnqueued,
 				QueueItem: &cp,
-				Text:      content,
+				Text:      resolvedContent,
 			})
 			s.mu.Unlock()
 			return &SendResult{
@@ -271,8 +279,10 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 			}
 			item := QueuedMessage{
 				ID:        "q_" + randomHex(6),
-				Content:   content,
+				Content:   resolvedContent,
 				Model:     model,
+				Images:    resolvedImages,
+				Metadata:  attMeta,
 				CreatedAt: time.Now().UTC(),
 			}
 			s.queue = append(s.queue, item)
@@ -284,7 +294,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 				SessionID: id,
 				Type:      EventQueueEnqueued,
 				QueueItem: &cp,
-				Text:      content,
+				Text:      resolvedContent,
 			})
 			s.mu.Unlock()
 			return &SendResult{
@@ -296,7 +306,7 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 		}
 	}
 
-	launch, err := m.prepareTurnLocked(s, profile, content, model, opts)
+	launch, err := m.prepareTurnLocked(s, profile, resolvedContent, model, resolvedImages, attMeta, opts)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -304,7 +314,11 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 	s.mu.Unlock()
 
 	if launch.needTitle {
-		m.autoTitle(s, content)
+		titleSrc := content
+		if titleSrc == "" {
+			titleSrc = resolvedContent
+		}
+		m.autoTitle(s, titleSrc)
 	}
 	started = true
 	go m.runTurn(launch.ctx, s, launch.turn, launch.conv, launch.model, launch.history)
@@ -445,7 +459,7 @@ func (m *Manager) startNextQueued(s *session) {
 	}
 	item := s.queue[0]
 	s.queue = s.queue[1:]
-	launch, err := m.prepareTurnLocked(s, profile, item.Content, item.Model, SendOptions{})
+	launch, err := m.prepareTurnLocked(s, profile, item.Content, item.Model, item.Images, item.Metadata, SendOptions{})
 	if err != nil {
 		// Re-queue at front so user input isn't silently dropped on transient lock/conv error.
 		s.queue = append([]QueuedMessage{item}, s.queue...)

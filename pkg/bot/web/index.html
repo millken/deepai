@@ -102,6 +102,14 @@
   .composer { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
   .composer textarea { flex: 1; resize: none; min-height: 44px; max-height: 220px; padding: 11px 12px; }
   button.steer { border-color: var(--warn); color: var(--warn); }
+  .attach-bar { max-width: 860px; margin: 0 auto 8px; display: none; flex-wrap: wrap; gap: 6px; }
+  .attach-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px; font-size: 12px; }
+  .attach-chip button { padding: 0 4px; font-size: 11px; border: none; background: transparent; color: var(--muted); }
+  .attach-chip button:hover { color: var(--err); }
+  main.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
+  .artifact-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .artifact-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .artifact-card img { max-width: 100%; max-height: 360px; border-radius: 6px; border: 1px solid var(--border); align-self: flex-start; }
   .empty { margin: auto; text-align: center; color: var(--muted); }
   .empty h2 { color: var(--text); font-weight: 600; }
 
@@ -149,7 +157,10 @@
       <div class="queue-head"><span id="queueTitle">待发队列</span><button id="clearQueueBtn" class="danger">清空</button></div>
       <div id="queueItems" class="queue-items"></div>
     </div>
+    <div id="attachBar" class="attach-bar"></div>
     <div class="composer">
+      <input id="fileInput" type="file" multiple style="display:none">
+      <button id="attachBtn" title="上传图片或文件（也支持拖拽/粘贴截图）" disabled>📎</button>
       <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
       <button class="steer" id="steerBtn" style="display:none" title="立即插入当前运行中的回合（下一轮工具边界生效）">插话</button>
       <button class="primary" id="sendBtn" disabled>发送</button>
@@ -186,7 +197,7 @@
   const state = {
     ws: null, reqId: 0, pending: new Map(), retry: 0,
     bots: new Map(), currentBot: localStorage.getItem("deepai-bot-current") || "default", editingBot: null,
-    sessions: new Map(), current: null, lastSeq: new Map(), queue: [],
+    sessions: new Map(), current: null, lastSeq: new Map(), queue: [], attachments: [],
     running: false, turnEl: null, turnText: null, toolEls: new Map(), info: null,
     sideTab: "sessions", schedulesEnabled: false, schedules: new Map(), currentSch: null,
   };
@@ -342,7 +353,9 @@
   function showEmptySessionView() {
     state.currentSch = null;
     state.queue = [];
+    state.attachments = [];
     drawQueue();
+    drawAttachments();
     showSessionChrome(true);
     $("title").textContent = "—";
     const b = currentBotObj();
@@ -365,8 +378,11 @@
     $("log").innerHTML = "";
     state.turnEl = null; state.toolEls.clear();
     state.queue = Array.isArray(session.queue) ? session.queue.slice() : [];
+    state.attachments = [];
     drawQueue();
+    drawAttachments();
     drawTranscript(messages, targetRunId);
+    for (const a of session.artifacts || []) showArtifact(a);
     setRunning(session.status === "running");
     // Replay the running turn's events (if any) from the buffer, then go live.
     const since = session.status === "running" ? 0 : session.last_seq;
@@ -516,6 +532,9 @@
         addMsg("human", "↪ 插话（已生效）").bubble.innerHTML = render(e.text || "");
         state.turnEl = null; state.turnText = null; scroll();
         break;
+      case "artifact":
+        if (e.artifact) showArtifact(e.artifact);
+        break;
       case "question": showQuestion(e.question); break;
       case "question_answered": document.querySelectorAll(`[data-q="${e.question.id}"]`).forEach((el) => { el.innerHTML = `<b>${e.question.auto ? "已自动回答" : "已回答"}：</b>${esc(e.question.answer)}`; }); break;
       case "error": note("错误：" + ((e.error && e.error.message) || ""), "err"); break;
@@ -548,6 +567,77 @@
     free.append(inp, ok); card.appendChild(free);
     box.appendChild(card); $("log").appendChild(box); scroll();
   }
+  function sessionFileURL(downloadPath) {
+    const base = state.currentBot && state.currentBot !== "default"
+      ? `/v1/bots/${encodeURIComponent(state.currentBot)}/sessions/${encodeURIComponent(state.current)}`
+      : `/v1/sessions/${encodeURIComponent(state.current)}`;
+    return `${base}/files/${downloadPath}`;
+  }
+  async function fetchAuthedBlob(url) {
+    const res = await fetch(url, { headers: token() ? { Authorization: "Bearer " + token() } : {} });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.blob();
+  }
+  function showArtifact(art) {
+    if (!art || !art.download_path || document.querySelector(`[data-art="${art.id}"]`)) return;
+    const box = document.createElement("div"); box.className = "msg";
+    const card = document.createElement("div"); card.className = "artifact-card"; card.dataset.art = art.id;
+    const sizeKB = art.size ? `${(art.size / 1024).toFixed(1)} KB` : "";
+    const head = document.createElement("div"); head.className = "artifact-head";
+    head.innerHTML = `<div><b>📄 ${esc(art.name || art.id)}</b> <span class="badge">${esc(art.mime_type || "file")}${sizeKB ? " · " + sizeKB : ""}</span></div>`;
+    const dlBtn = mkBtn("下载", "", async () => {
+      try {
+        const blob = await fetchAuthedBlob(sessionFileURL(art.download_path) + "?download=1");
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = u; a.download = art.name || art.id; a.click();
+        setTimeout(() => URL.revokeObjectURL(u), 5000);
+      } catch (e) { note("下载失败：" + (e.message || e), "err"); }
+    });
+    head.appendChild(dlBtn);
+    card.appendChild(head);
+    if (art.description) {
+      const desc = document.createElement("div"); desc.className = "sch-meta"; desc.textContent = art.description;
+      card.appendChild(desc);
+    }
+    if (/^image\/(png|jpeg|webp|gif)$/i.test(art.mime_type || "")) {
+      const img = document.createElement("img"); img.alt = art.name || "preview";
+      fetchAuthedBlob(sessionFileURL(art.download_path)).then((b) => { img.src = URL.createObjectURL(b); scroll(); }).catch(() => {});
+      card.appendChild(img);
+    }
+    box.appendChild(card); $("log").appendChild(box); scroll();
+  }
+  function drawAttachments() {
+    const bar = $("attachBar");
+    if (!state.attachments.length || !state.current) { bar.style.display = "none"; bar.innerHTML = ""; return; }
+    bar.style.display = "flex"; bar.innerHTML = "";
+    for (const att of state.attachments) {
+      const chip = document.createElement("span"); chip.className = "attach-chip";
+      chip.innerHTML = `<span>${att.kind === "image" ? "🖼️" : "📎"} ${esc(att.name)}</span>`;
+      const rm = mkBtn("×", "", () => { state.attachments = state.attachments.filter((x) => x.id !== att.id); drawAttachments(); });
+      chip.appendChild(rm);
+      bar.appendChild(chip);
+    }
+  }
+  async function uploadFiles(files) {
+    if (!state.current || currentBotObj().enabled === false || !files || !files.length) return;
+    const base = state.currentBot && state.currentBot !== "default"
+      ? `/v1/bots/${encodeURIComponent(state.currentBot)}/sessions/${encodeURIComponent(state.current)}`
+      : `/v1/sessions/${encodeURIComponent(state.current)}`;
+    for (const f of files) {
+      const fd = new FormData(); fd.append("file", f, f.name || "upload");
+      try {
+        const res = await fetch(`${base}/attachments`, {
+          method: "POST",
+          headers: token() ? { Authorization: "Bearer " + token() } : {},
+          body: fd,
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error((body && body.error && body.error.message) || `HTTP ${res.status}`);
+        state.attachments.push(body);
+        drawAttachments();
+      } catch (e) { note(`上传 ${f.name || "文件"} 失败：` + (e.message || e), "err"); }
+    }
+  }
   function drawQueue() {
     const bar = $("queueBar"), box = $("queueItems");
     if (!state.queue.length || !state.current) { bar.style.display = "none"; box.innerHTML = ""; return; }
@@ -566,25 +656,32 @@
     state.running = r;
     const disabled = !state.current || currentBotObj().enabled === false;
     $("cancelBtn").disabled = !r;
+    $("attachBtn").disabled = disabled;
     $("sendBtn").disabled = disabled;
     $("sendBtn").textContent = r ? "排队" : "发送";
     $("steerBtn").style.display = r ? "" : "none";
     $("steerBtn").disabled = disabled || !r;
-    $("input").placeholder = r ? "运行中：Enter 加入队列，或点击「插话」中途纠偏" : "输入消息，Enter 发送，Shift+Enter 换行";
+    $("input").placeholder = r ? "运行中：Enter 加入队列，或点击「插话」中途纠偏" : "输入消息，Enter 发送，Shift+Enter 换行（可拖拽或粘贴图片）";
   }
 
   async function send(explicitMode) {
     const text = $("input").value.trim();
-    if (!text || !state.current || currentBotObj().enabled === false) return;
+    const attIds = state.attachments.map((a) => a.id);
+    if ((!text && !attIds.length) || !state.current || currentBotObj().enabled === false) return;
     const mode = explicitMode || (state.running ? "queue" : "reject");
+    const attNames = state.attachments.map((a) => a.name);
     $("input").value = ""; autosize();
+    state.attachments = []; drawAttachments();
     if (mode === "reject") {
       const empty = $("log").querySelector(".empty"); if (empty) empty.remove();
-      addMsg("human", "你").bubble.innerHTML = render(text); scroll();
+      const preview = text + (attNames.length ? (text ? "\n" : "") + attNames.map((n) => `📎 ${n}`).join(" ") : "");
+      addMsg("human", "你").bubble.innerHTML = render(preview); scroll();
       state.optimistic = true; setRunning(true);
     }
     try {
-      const res = await call({ op: "send", bot_id: state.currentBot, session_id: state.current, content: text, model: $("model").value, mode });
+      const req = { op: "send", bot_id: state.currentBot, session_id: state.current, content: text, model: $("model").value, mode };
+      if (attIds.length) req.attachment_ids = attIds;
+      const res = await call(req);
       if (res && res.fallback === "queue") note("当前回合正在收尾，插话已自动转入待发队列");
     } catch (e) {
       if (mode === "reject") { state.optimistic = false; setRunning(false); }
@@ -912,6 +1009,24 @@
   $("newSchBtn").onclick = showNewScheduleForm;
   $("sendBtn").onclick = () => send();
   $("steerBtn").onclick = () => send("steer");
+  $("attachBtn").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = () => { uploadFiles($("fileInput").files); $("fileInput").value = ""; };
+  $("input").addEventListener("paste", (ev) => {
+    const items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    const imgs = [];
+    for (const it of items) { if (it.kind === "file") { const f = it.getAsFile(); if (f) imgs.push(f); } }
+    if (imgs.length) { ev.preventDefault(); uploadFiles(imgs); }
+  });
+  const mainEl = document.querySelector("main");
+  mainEl.addEventListener("dragover", (ev) => { if (state.current) { ev.preventDefault(); mainEl.classList.add("drag-over"); } });
+  mainEl.addEventListener("dragleave", () => mainEl.classList.remove("drag-over"));
+  mainEl.addEventListener("drop", (ev) => {
+    mainEl.classList.remove("drag-over");
+    if (!state.current || !ev.dataTransfer || !ev.dataTransfer.files.length) return;
+    ev.preventDefault();
+    uploadFiles(ev.dataTransfer.files);
+  });
   $("clearQueueBtn").onclick = () => call({ op: "clear_queue", bot_id: state.currentBot, session_id: state.current }).catch((e) => note(e.message, "err"));
   $("input").addEventListener("input", () => { autosize(); $("sendBtn").disabled = !state.current || currentBotObj().enabled === false; });
   $("input").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); send(); } });

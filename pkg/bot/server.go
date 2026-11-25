@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -84,6 +85,8 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("PATCH /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleRenameSession))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleDeleteSession))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/messages", s.auth(s.handleSend))
+	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/attachments", s.auth(s.handleUploadAttachment))
+	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}/files/{path...}", s.auth(s.handleDownloadFile))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}/queue", s.auth(s.handleListQueue))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}/queue/{queue_id}", s.auth(s.handleRemoveQueueItem))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}/queue", s.auth(s.handleClearQueue))
@@ -100,6 +103,8 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("PATCH /v1/sessions/{id}", s.auth(s.handleRenameSession))
 	s.mux.Handle("DELETE /v1/sessions/{id}", s.auth(s.handleDeleteSession))
 	s.mux.Handle("POST /v1/sessions/{id}/messages", s.auth(s.handleSend))
+	s.mux.Handle("POST /v1/sessions/{id}/attachments", s.auth(s.handleUploadAttachment))
+	s.mux.Handle("GET /v1/sessions/{id}/files/{path...}", s.auth(s.handleDownloadFile))
 	s.mux.Handle("GET /v1/sessions/{id}/queue", s.auth(s.handleListQueue))
 	s.mux.Handle("DELETE /v1/sessions/{id}/queue/{queue_id}", s.auth(s.handleRemoveQueueItem))
 	s.mux.Handle("DELETE /v1/sessions/{id}/queue", s.auth(s.handleClearQueue))
@@ -405,6 +410,71 @@ func (s *Server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleUploadAttachment(w http.ResponseWriter, r *http.Request) {
+	botID := botIDFromRequest(r)
+	id := r.PathValue("id")
+	// Cap total multipart body slightly above MaxAttachmentBytes so oversized
+	// files fail fast without buffering arbitrary payloads in memory.
+	r.Body = http.MaxBytesReader(w, r.Body, MaxAttachmentBytes+(1<<20))
+	if err := r.ParseMultipartForm(MaxAttachmentBytes); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.writeErr(w, ErrAttachmentTooLarge)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart upload: "+err.Error())
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "missing multipart field 'file'")
+		return
+	}
+	defer f.Close()
+
+	att, err := s.m.UploadAttachmentForBot(botID, id, hdr.Filename, f)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, att)
+}
+
+func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
+	rf, err := s.m.ResolveSessionFileForBot(botIDFromRequest(r), r.PathValue("id"), r.PathValue("path"))
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	f, err := os.Open(rf.AbsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.writeErr(w, ErrAttachmentNotFound)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		s.writeErr(w, ErrAttachmentNotFound)
+		return
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	if rf.MimeType != "" {
+		w.Header().Set("Content-Type", rf.MimeType)
+	}
+	if rf.ForceDownload || r.URL.Query().Get("download") == "1" {
+		w.Header().Set("Content-Disposition", `attachment; filename="`+rf.Name+`"`)
+	}
+	http.ServeContent(w, r, rf.Name, st.ModTime(), f)
+}
+
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	if err := s.m.CancelForBot(botIDFromRequest(r), r.PathValue("id")); err != nil {
 		s.writeErr(w, err)
@@ -637,6 +707,16 @@ func errorStatus(err error) (int, string) {
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrInvalidMode):
 		return http.StatusBadRequest, "bad_request"
+	case errors.Is(err, ErrAttachmentTooLarge):
+		return http.StatusRequestEntityTooLarge, "attachment_too_large"
+	case errors.Is(err, ErrUploadQuotaExceeded):
+		return http.StatusRequestEntityTooLarge, "upload_quota_exceeded"
+	case errors.Is(err, ErrAttachmentNotFound):
+		return http.StatusNotFound, "attachment_not_found"
+	case errors.Is(err, ErrInvalidAttachment):
+		return http.StatusBadRequest, "invalid_attachment"
+	case errors.Is(err, ErrForbiddenPath):
+		return http.StatusForbidden, "forbidden_path"
 	case errors.As(err, &locked):
 		return http.StatusConflict, "session_locked"
 	case errors.Is(err, ErrNotRunning):

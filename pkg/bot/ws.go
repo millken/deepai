@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/millken/deepai/pkg/models"
 	"golang.org/x/net/websocket"
 )
 
@@ -29,10 +30,12 @@ type WSRequest struct {
 	Force      bool   `json:"force,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 	Since      *int64 `json:"since,omitempty"`
-	Content    string `json:"content,omitempty"`
-	Model      string `json:"model,omitempty"`
-	Mode       string `json:"mode,omitempty"`
-	QueueID    string `json:"queue_id,omitempty"`
+	Content       string                `json:"content,omitempty"`
+	Model         string                `json:"model,omitempty"`
+	Mode          string                `json:"mode,omitempty"`
+	AttachmentIDs []string              `json:"attachment_ids,omitempty"`
+	Images        []models.MessageImage `json:"images,omitempty"`
+	QueueID       string                `json:"queue_id,omitempty"`
 	Title      string `json:"title,omitempty"`
 	QuestionID string `json:"question_id,omitempty"`
 	Answer     string `json:"answer,omitempty"`
@@ -218,7 +221,13 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 		c.mu.Unlock()
 		c.reply(ctx, req, nil, nil)
 	case "send":
-		res, err := m.SubmitForBot(botID, req.SessionID, SendRequest{Content: req.Content, Model: req.Model, Mode: req.Mode}, SendOptions{})
+		res, err := m.SubmitForBot(botID, req.SessionID, SendRequest{
+			Content:       req.Content,
+			Model:         req.Model,
+			Mode:          req.Mode,
+			AttachmentIDs: req.AttachmentIDs,
+			Images:        req.Images,
+		}, SendOptions{})
 		c.reply(ctx, req, res, err)
 	case "list_queue":
 		items, err := m.ListQueueForBot(botID, req.SessionID)
