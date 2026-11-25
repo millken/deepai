@@ -182,7 +182,7 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 	case "ping":
 		c.reply(ctx, req, "pong", nil)
 	case "info":
-		c.reply(ctx, req, m.Info(), nil)
+		c.reply(ctx, req, c.s.infoForPrincipal(p), nil)
 	case "list_bots":
 		list, err := m.ListBots(ctx)
 		if err == nil && !p.IsAdmin() && len(p.BotIDs) > 0 {

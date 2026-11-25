@@ -285,7 +285,7 @@ func TestScopedTokenEnforcesBotScopeOnSchedulesRunsChainAndStreams(t *testing.T)
 	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "reviewer", Name: "Reviewer"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "secret", Name: "Secret"}); err != nil {
+	if _, err := m.CreateBot(ctx, CreateBotRequest{ID: "secret", Name: "Secret", Instructions: "TOP_SECRET_PROMPT"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -341,6 +341,14 @@ func TestScopedTokenEnforcesBotScopeOnSchedulesRunsChainAndStreams(t *testing.T)
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// 61-M9: GET /v1/info and WS info must filter bots to authorized bot_ids only.
+	rInfo := doReq(t, http.MethodGet, ts.URL+"/v1/info", revTok.Token, nil)
+	infoBody, _ := io.ReadAll(rInfo.Body)
+	rInfo.Body.Close()
+	if rInfo.StatusCode != http.StatusOK || strings.Contains(string(infoBody), "TOP_SECRET_PROMPT") || strings.Contains(string(infoBody), `"id":"secret"`) {
+		t.Fatalf("GET /v1/info leaked unauthorized bot profile: %s", string(infoBody))
 	}
 
 	// 61-H1: flat /v1/schedules & /v1/runs must enforce bot_ids!
@@ -420,6 +428,19 @@ func TestScopedTokenEnforcesBotScopeOnSchedulesRunsChainAndStreams(t *testing.T)
 		t.Fatal(err)
 	}
 	defer conn.Close()
+
+	// WS info must also omit unauthorized bots.
+	if err := websocket.JSON.Send(conn, WSRequest{ID: "info-1", Op: "info"}); err != nil {
+		t.Fatal(err)
+	}
+	var infoRep WSMessage
+	if err := websocket.JSON.Receive(conn, &infoRep); err != nil {
+		t.Fatal(err)
+	}
+	rawInfoRep, _ := json.Marshal(infoRep)
+	if !infoRep.OK || strings.Contains(string(rawInfoRep), "TOP_SECRET_PROMPT") || strings.Contains(string(rawInfoRep), `"id":"secret"`) {
+		t.Fatalf("WS info leaked unauthorized bot profile: %s", string(rawInfoRep))
+	}
 
 	// Subscribe to secret session must be rejected.
 	if err := websocket.JSON.Send(conn, WSRequest{ID: "sub-sec", Op: "subscribe", BotID: "secret", SessionID: secSess.ID}); err != nil {

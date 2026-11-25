@@ -399,8 +399,25 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) infoForPrincipal(p Principal) Info {
+	info := s.m.Info()
+	if !p.IsAdmin() && len(p.BotIDs) > 0 {
+		filtered := make([]BotProfile, 0, len(info.Bots))
+		for _, b := range info.Bots {
+			if p.AllowsBot(b.ID) {
+				filtered = append(filtered, b)
+			}
+		}
+		info.Bots = filtered
+		if !p.AllowsBot(info.DefaultBotID) && len(filtered) > 0 {
+			info.DefaultBotID = filtered[0].ID
+		}
+	}
+	return info
+}
+
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.m.Info())
+	writeJSON(w, http.StatusOK, s.infoForPrincipal(principalFromContext(r.Context())))
 }
 
 func botIDFromRequest(r *http.Request) string {

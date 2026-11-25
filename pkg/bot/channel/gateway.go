@@ -566,19 +566,30 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 		dirty := false
 
 		flush := func(final bool) {
-			body := textBuf.String()
-			if !final && activeTool != "" {
-				if body != "" {
-					body += "\n\n"
-				}
-				body += "🔧 运行 " + activeTool + "..."
+			rawText := strings.TrimSpace(textBuf.String())
+			var chunks []string
+			if rawText != "" {
+				chunks = splitRunes(rawText, maxRunes)
 			}
-			body = strings.TrimSpace(body)
-			if body == "" {
+			// Keep the transient tool indicator inside the existing last chunk
+			// (or chunk 0 when no text arrived yet) so it never spawns an extra
+			// overflow message that becomes orphaned once the tool finishes.
+			if !final && activeTool != "" {
+				indicator := "🔧 运行 " + activeTool + "..."
+				if len(chunks) == 0 {
+					chunks = []string{indicator}
+				} else {
+					last := chunks[len(chunks)-1]
+					cand := last + "\n\n" + indicator
+					if maxRunes <= 0 || len([]rune(cand)) <= maxRunes {
+						chunks[len(chunks)-1] = cand
+					}
+				}
+			}
+			if len(chunks) == 0 {
 				dirty = false
 				return
 			}
-			chunks := splitRunes(body, maxRunes)
 			for i, ch := range chunks {
 				if i < len(chunkMsgIDs) {
 					if chunkTexts[i] == ch {
@@ -650,11 +661,12 @@ func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter
 					textBuf.WriteString("执行失败：" + e.Turn.Error)
 				}
 				flush(true)
-				// Exit only when the session is idle, has no queued items, AND
-				// has published no newer events beyond lastSeq (which can happen
-				// if a queued follow-up turn ran during flush's network round-trip).
+				// Exit when the session is idle with no newer events beyond lastSeq
+				// and either the queue is empty OR the turn did not complete (failed,
+				// timed_out, cancelled — those preserve the queue without auto-dequeuing).
 				info, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID)
-				if err != nil || (info.Status == bot.SessionIdle && len(info.Queue) == 0 && info.LastSeq <= lastSeq) {
+				nonCompleted := e.Turn != nil && e.Turn.Status != bot.TurnCompleted
+				if err != nil || (info.Status == bot.SessionIdle && info.LastSeq <= lastSeq && (len(info.Queue) == 0 || nonCompleted)) {
 					return true
 				}
 				// Reset chunk buffer for next queued turn.

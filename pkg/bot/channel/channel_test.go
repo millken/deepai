@@ -636,4 +636,97 @@ func TestFeishuCardActionTriggerPutEditAndInboundImage(t *testing.T) {
 	if err != nil || string(data) != "fake-image-bytes" {
 		t.Fatalf("lazy download = (%q, %v)", string(data), err)
 	}
+
+	// 61-L5: without BotOpenID, group mentions must NOT blindly trigger.
+	if msg, ok := ParseFeishuEvent(grpOtherMention); !ok || msg.Mentioned {
+		t.Fatalf("ParseFeishuEvent without BotOpenID should not set Mentioned on group mention: (%+v, %v)", msg, ok)
+	}
+}
+
+func TestTelegramRedactsTokenInTransportErrors(t *testing.T) {
+	// Closed server guarantees a transport-level *url.Error carrying the URL.
+	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close()
+
+	const secretTok = "123456:SUPER_SECRET_TG_TOKEN"
+	tg := NewTelegramAdapter(TelegramConfig{Token: secretTok, APIBaseURL: closedURL})
+
+	if _, err := tg.SendText(context.Background(), Destination{ChatID: "1"}, "hi"); err == nil {
+		t.Fatal("expected transport error")
+	} else if strings.Contains(err.Error(), secretTok) {
+		t.Fatalf("SendText error leaked telegram token: %v", err)
+	}
+	if _, err := tg.getUpdates(context.Background(), 0, 1); err == nil {
+		t.Fatal("expected transport error")
+	} else if strings.Contains(err.Error(), secretTok) {
+		t.Fatalf("getUpdates error leaked telegram token: %v", err)
+	}
+}
+
+type toolEdgeRuntime struct {
+	fakeChannelRuntime
+}
+
+func (r *toolEdgeRuntime) NewConversation(string) (bot.Conversation, error) {
+	return &toolEdgeConv{}, nil
+}
+
+type toolEdgeConv struct{}
+
+func (c *toolEdgeConv) Close() error { return nil }
+func (c *toolEdgeConv) RunTurn(_ context.Context, in bot.TurnInput) (*bot.TurnOutput, error) {
+	last := in.Messages[len(in.Messages)-1].Content
+	if last == "fail_me" {
+		time.Sleep(40 * time.Millisecond)
+		return &bot.TurnOutput{Messages: in.Messages}, context.DeadlineExceeded
+	}
+	text := strings.Repeat("Z", 18) // 18 runes with maxRunes=20
+	in.Emit(bot.Event{Type: bot.EventTextDelta, Text: text})
+	in.Emit(bot.Event{Type: bot.EventToolCallStart, Tool: &agent.ToolCallEvent{Name: "bash"}})
+	time.Sleep(35 * time.Millisecond)
+	in.Emit(bot.Event{Type: bot.EventToolCallEnd, Tool: &agent.ToolCallEvent{Name: "bash"}})
+	msgs := append(append([]models.Message(nil), in.Messages...), models.Message{
+		ID: in.SessionID + "_ai_" + in.TurnID, SessionID: in.SessionID, Role: models.RoleAI, Content: text,
+	})
+	return &bot.TurnOutput{Messages: msgs, FinalOutput: text, LLMTurns: 1}, nil
+}
+
+func TestGatewayToolIndicatorNoOrphanChunkAndFailedQueueExit(t *testing.T) {
+	m, _ := bot.NewManager(bot.Options{Runtime: &toolEdgeRuntime{}, Store: bot.NewMemoryStore(), IdleTimeout: -1})
+	defer m.Close(context.Background())
+
+	gw := NewGateway(GatewayOptions{Manager: m})
+	ad := &mockAdapter{name: "telegram"}
+	gw.Register(ad, AccessPolicy{
+		AllowUsers:         []string{"u1"},
+		StreamEditInterval: 10 * time.Millisecond,
+		MaxMessageRunes:    20,
+	})
+
+	// 61-L6: 18-rune reply + active tool indicator must not create a 2nd orphan message.
+	gw.HandleInbound(context.Background(), InboundMessage{Channel: "telegram", UserID: "u1", ChatID: "c1", Text: "run tool"})
+	gw.Wait()
+	ad.mu.Lock()
+	sentCount := len(ad.sent)
+	ad.mu.Unlock()
+	if sentCount != 1 {
+		t.Fatalf("expected 1 message (no orphan tool chunk), got %d: %v", sentCount, ad.sent)
+	}
+
+	// 61-L7: failed/timed-out turn with preserved queue must let stream forwarder exit cleanly.
+	gw.HandleInbound(context.Background(), InboundMessage{Channel: "telegram", UserID: "u1", ChatID: "c2", Text: "fail_me"})
+	time.Sleep(10 * time.Millisecond)
+	gw.HandleInbound(context.Background(), InboundMessage{Channel: "telegram", UserID: "u1", ChatID: "c2", Text: "queued behind failure"})
+
+	done := make(chan struct{})
+	go func() {
+		gw.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream forwarder leaked after failed turn with preserved queue")
+	}
 }

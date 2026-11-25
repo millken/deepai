@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,6 +55,19 @@ func (t *TelegramAdapter) Name() string { return "telegram" }
 
 func (t *TelegramAdapter) apiURL(method string) string {
 	return fmt.Sprintf("%s/bot%s/%s", t.baseURL, t.token, method)
+}
+
+// redactErr strips the Telegram bot token from transport errors (such as
+// *url.Error carrying the full request URL) before returning or logging.
+func (t *TelegramAdapter) redactErr(err error) error {
+	if err == nil || t.token == "" {
+		return err
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, t.token) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(msg, t.token, "[REDACTED]"))
 }
 
 func (t *TelegramAdapter) Start(ctx context.Context, onInbound func(InboundMessage)) error {
@@ -137,11 +151,11 @@ func (t *TelegramAdapter) getUpdates(ctx context.Context, offset int64, timeoutS
 	url := fmt.Sprintf("%s?timeout=%d&offset=%d", t.apiURL("getUpdates"), timeoutSec, offset)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, t.redactErr(err)
 	}
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, t.redactErr(err)
 	}
 	defer resp.Body.Close()
 	var env struct {
@@ -256,11 +270,11 @@ func (t *TelegramAdapter) downloadFile(ctx context.Context, fileID string) ([]by
 	url := fmt.Sprintf("%s/file/bot%s/%s", t.baseURL, t.token, strings.TrimPrefix(res.FilePath, "/"))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, t.redactErr(err)
 	}
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, t.redactErr(err)
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(io.LimitReader(resp.Body, bot.MaxAttachmentBytes+1))
@@ -346,12 +360,12 @@ func (t *TelegramAdapter) SendAttachment(ctx context.Context, dst Destination, f
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.apiURL("sendDocument"), &body)
 	if err != nil {
-		return err
+		return t.redactErr(err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return err
+		return t.redactErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -367,12 +381,12 @@ func (t *TelegramAdapter) postJSON(ctx context.Context, method string, payload a
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.apiURL(method), bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return t.redactErr(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return err
+		return t.redactErr(err)
 	}
 	defer resp.Body.Close()
 	var env struct {

@@ -75,6 +75,17 @@ func (f *FeishuAdapter) Start(ctx context.Context, onInbound func(InboundMessage
 	if f.appID == "" || f.appSecret == "" {
 		return fmt.Errorf("feishu: app_id and app_secret are required")
 	}
+	// Best-effort lookup of our own bot open_id when not configured explicitly,
+	// so group @mention matching only triggers when this bot itself is mentioned.
+	if f.getBotOpenID() == "" {
+		if oid, err := f.resolveBotOpenID(ctx); err == nil && oid != "" {
+			f.mu.Lock()
+			f.botOpenID = oid
+			f.mu.Unlock()
+		} else if err != nil && ctx.Err() == nil {
+			slog.Warn("channel: feishu resolve bot_open_id failed (group @mentions require bot_open_id)", "err", err)
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -206,8 +217,45 @@ func ParseFeishuEvent(raw []byte) (InboundMessage, bool) {
 	return parseFeishuEvent(raw, "", nil)
 }
 
+func (f *FeishuAdapter) getBotOpenID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.botOpenID
+}
+
+func (f *FeishuAdapter) resolveBotOpenID(ctx context.Context) (string, error) {
+	tok, err := f.tenantToken(ctx)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/open-apis/bot/v3/info", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var res struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Bot  struct {
+			OpenID string `json:"open_id"`
+		} `json:"bot"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+	if res.Code != 0 {
+		return "", fmt.Errorf("feishu bot info (%d): %s", res.Code, res.Msg)
+	}
+	return strings.TrimSpace(res.Bot.OpenID), nil
+}
+
 func (f *FeishuAdapter) parseEvent(raw []byte) (InboundMessage, bool) {
-	return parseFeishuEvent(raw, f.botOpenID, f)
+	return parseFeishuEvent(raw, f.getBotOpenID(), f)
 }
 
 func parseFeishuEvent(raw []byte, botOpenID string, adapter *FeishuAdapter) (InboundMessage, bool) {
@@ -255,22 +303,11 @@ func parseFeishuEvent(raw []byte, botOpenID string, adapter *FeishuAdapter) (Inb
 	_ = json.Unmarshal([]byte(m.Content), &contentObj)
 	isGroup := m.ChatType != "" && m.ChatType != "p2p"
 	mentioned := !isGroup
-	if isGroup && len(m.Mentions) > 0 {
-		if botOpenID != "" {
-			for _, mt := range m.Mentions {
-				if mt.ID.OpenID == botOpenID {
-					mentioned = true
-					break
-				}
-			}
-		} else {
-			// When botOpenID is unset, fall back to checking mentions that match
-			// an explicit bot-targeted mention placeholder (e.g. @_user_1).
-			for _, mt := range m.Mentions {
-				if mt.ID.OpenID != "" || mt.Key != "" {
-					mentioned = true
-					break
-				}
+	if isGroup && botOpenID != "" && len(m.Mentions) > 0 {
+		for _, mt := range m.Mentions {
+			if mt.ID.OpenID == botOpenID {
+				mentioned = true
+				break
 			}
 		}
 	}
