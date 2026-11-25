@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -46,6 +47,13 @@ type ServerOptions struct {
 	// call the API cross-origin, e.g. a separately hosted web client. "*"
 	// allows any origin. The bot's own web console is always same-origin.
 	AllowedOrigins []string
+	// Tokens optionally enables multi-token RBAC (admin/user/readonly) on top
+	// of the master Token (docs/BOT_NEXT_DESIGN.md §6.1).
+	Tokens TokenStore
+	// Audit optionally writes structured security/governance JSONL records.
+	Audit *AuditLogger
+	// Metrics optionally overrides Manager.Metrics() for GET /metrics.
+	Metrics *Metrics
 	// DisableWebUI stops serving the embedded console at /.
 	DisableWebUI bool
 	Logger       *slog.Logger
@@ -56,8 +64,14 @@ type Server struct {
 	opts      ServerOptions
 	m         *Manager
 	schedules *schedule.Service
+	tokens    TokenStore
+	audit     *AuditLogger
+	metrics   *Metrics
 	log       *slog.Logger
 	mux       *http.ServeMux
+
+	oaiMu       sync.Mutex
+	oaiSessions map[string]string
 }
 
 // NewServer builds the handler. Routes are documented in docs/BOT_DESIGN.md.
@@ -66,7 +80,18 @@ func NewServer(opts ServerOptions) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{opts: opts, m: opts.Manager, schedules: opts.Schedules, log: log, mux: http.NewServeMux()}
+	met := opts.Metrics
+	if met == nil && opts.Manager != nil {
+		met = opts.Manager.Metrics()
+	}
+	if met == nil {
+		met = NewMetrics()
+	}
+	s := &Server{
+		opts: opts, m: opts.Manager, schedules: opts.Schedules,
+		tokens: opts.Tokens, audit: opts.Audit, metrics: met,
+		log: log, mux: http.NewServeMux(),
+	}
 
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -134,6 +159,16 @@ func NewServer(opts ServerOptions) *Server {
 	// docs/BOT_NEXT_DESIGN.md §4.2).
 	s.mux.HandleFunc("POST /v1/hooks/{schedule_id}", s.handleWebhookHook)
 
+	// OpenAI-compatible API (docs/BOT_NEXT_DESIGN.md §6.2).
+	s.mux.Handle("GET /v1/models", s.auth(s.handleOpenAIModels))
+	s.mux.Handle("POST /v1/chat/completions", s.auth(s.handleOpenAIChatCompletions))
+
+	// Scoped token management & Prometheus metrics (admin-only, §6.1 & §6.3).
+	s.mux.Handle("GET /v1/tokens", s.auth(s.handleListTokens))
+	s.mux.Handle("POST /v1/tokens", s.auth(s.handleCreateToken))
+	s.mux.Handle("DELETE /v1/tokens/{id}", s.auth(s.handleRevokeToken))
+	s.mux.Handle("GET /metrics", s.auth(s.handleMetrics))
+
 	if !opts.DisableWebUI {
 		sub, _ := fs.Sub(webFS, "web")
 		s.mux.Handle("GET /", http.FileServer(http.FS(sub)))
@@ -154,7 +189,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", origin)
 		h.Set("Vary", "Origin")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-DeepAI-Session")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -197,18 +232,149 @@ func (s *Server) originAllowed(origin, host string) bool {
 
 func (s *Server) auth(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := Principal{ID: "master", Name: "master", Role: RoleAdmin}
 		if s.opts.Token != "" {
 			got := r.URL.Query().Get("token")
 			if v, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
 				got = strings.TrimSpace(v)
 			}
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.opts.Token)) != 1 {
-				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid token")
+				matched := false
+				if s.tokens != nil && got != "" {
+					if rec, err := s.tokens.LookupToken(r.Context(), HashToken(got)); err == nil {
+						now := time.Now().UTC()
+						if rec.RevokedAt == nil && (rec.ExpiresAt == nil || rec.ExpiresAt.After(now)) {
+							p = Principal{ID: rec.ID, Name: rec.Name, Role: rec.Role, BotIDs: rec.BotIDs}
+							matched = true
+							_ = s.tokens.TouchToken(r.Context(), rec.ID, now)
+						}
+					}
+				}
+				if !matched {
+					s.audit.Record(AuditEntry{
+						Action:  "auth_failed",
+						Target:  r.Method + " " + r.URL.Path,
+						Outcome: "denied",
+						Detail:  r.RemoteAddr,
+					})
+					writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid token")
+					return
+				}
+			}
+		}
+
+		// Baseline HTTP RBAC enforcement (docs/BOT_NEXT_DESIGN.md §6.1).
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.URL.Path != "/v1/schedule/validate" {
+			if !p.CanWrite() {
+				writeError(w, http.StatusForbidden, "forbidden", "readonly token cannot mutate resources")
 				return
 			}
 		}
-		h(w, r)
+		if pathBot := strings.TrimSpace(r.PathValue("bot_id")); pathBot != "" {
+			if !p.AllowsBot(pathBot) {
+				writeError(w, http.StatusForbidden, "forbidden", "token is not authorized for bot "+pathBot)
+				return
+			}
+		} else if strings.HasPrefix(r.URL.Path, "/v1/sessions") {
+			if !p.AllowsBot(DefaultBotID) {
+				writeError(w, http.StatusForbidden, "forbidden", "token is not authorized for default bot")
+				return
+			}
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/bots") && r.Method != http.MethodGet {
+			if r.URL.Path == "/v1/bots" || !strings.Contains(strings.TrimPrefix(r.URL.Path, "/v1/bots/"), "/") {
+				if !p.IsAdmin() {
+					writeError(w, http.StatusForbidden, "forbidden", "admin role required to modify bots")
+					return
+				}
+			}
+		}
+
+		h(w, r.WithContext(withPrincipal(r.Context(), p)))
 	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !principalFromContext(r.Context()).IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required for /metrics")
+		return
+	}
+	s.metrics.WritePrometheus(w, s.m)
+}
+
+func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	if !principalFromContext(r.Context()).IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if s.tokens == nil {
+		writeError(w, http.StatusNotFound, "not_found", "scoped tokens are not enabled")
+		return
+	}
+	list, err := s.tokens.ListTokens(r.Context())
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if list == nil {
+		list = []TokenRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": list})
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if s.tokens == nil {
+		writeError(w, http.StatusNotFound, "not_found", "scoped tokens are not enabled")
+		return
+	}
+	var req CreateTokenRequest
+	if !readJSON(w, r, &req, false) {
+		return
+	}
+	rec, err := s.tokens.CreateToken(r.Context(), req)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.audit.Record(AuditEntry{
+		Action:  "token_created",
+		Actor:   p.Name,
+		Role:    string(p.Role),
+		Target:  rec.ID,
+		Outcome: "ok",
+		Detail:  string(rec.Role),
+	})
+	writeJSON(w, http.StatusCreated, rec)
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+		return
+	}
+	if s.tokens == nil {
+		writeError(w, http.StatusNotFound, "not_found", "scoped tokens are not enabled")
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.tokens.RevokeToken(r.Context(), id); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.audit.Record(AuditEntry{
+		Action:  "token_revoked",
+		Actor:   p.Name,
+		Role:    string(p.Role),
+		Target:  id,
+		Outcome: "ok",
+	})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -238,6 +404,8 @@ func (s *Server) handleCreateBot(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	p := principalFromContext(r.Context())
+	s.audit.Record(AuditEntry{Action: "bot_created", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
 	writeJSON(w, http.StatusCreated, b)
 }
 
@@ -269,6 +437,8 @@ func (s *Server) handleDeleteBot(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	p := principalFromContext(r.Context())
+	s.audit.Record(AuditEntry{Action: "bot_deleted", Actor: p.Name, Role: string(p.Role), BotID: r.PathValue("bot_id"), Target: r.PathValue("bot_id"), Outcome: "ok"})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -721,6 +891,12 @@ func errorStatus(err error) (int, string) {
 		return http.StatusBadRequest, "invalid_attachment"
 	case errors.Is(err, ErrForbiddenPath):
 		return http.StatusForbidden, "forbidden_path"
+	case errors.Is(err, ErrForbidden):
+		return http.StatusForbidden, "forbidden"
+	case errors.Is(err, ErrTokenNotFound):
+		return http.StatusNotFound, "not_found"
+	case errors.Is(err, ErrInvalidToken):
+		return http.StatusBadRequest, "bad_request"
 	case errors.As(err, &locked):
 		return http.StatusConflict, "session_locked"
 	case errors.Is(err, ErrNotRunning):

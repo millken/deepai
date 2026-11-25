@@ -88,6 +88,7 @@ type Manager struct {
 	botTurns     map[string]int
 	closed       bool
 	stopJan      chan struct{}
+	metrics      *Metrics
 }
 
 type session struct {
@@ -174,6 +175,7 @@ func NewManager(opts Options) (*Manager, error) {
 		deletingBots: map[string]struct{}{},
 		botTurns:     map[string]int{},
 		stopJan:      make(chan struct{}),
+		metrics:      NewMetrics(),
 	}
 	if opts.IdleTimeout > 0 {
 		go m.janitor()
@@ -183,6 +185,9 @@ func NewManager(opts Options) (*Manager, error) {
 
 // SetSchedules attaches the optional schedule.Service so ListBots and
 // DeleteBot can inspect, cancel and cascade-delete bot-owned schedules.
+// Metrics returns the Manager's Prometheus metrics collector.
+func (m *Manager) Metrics() *Metrics { return m.metrics }
+
 func (m *Manager) SetSchedules(svc *schedule.Service) {
 	m.mu.Lock()
 	m.schedules = svc
@@ -1106,6 +1111,9 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.turn == t {
+			if evt.Type == EventToolCallEnd && evt.Tool != nil {
+				m.metrics.ObserveToolCall(botID, evt.Tool.Name, string(evt.Tool.Status))
+			}
 			if evt.Type == EventArtifact && evt.Artifact != nil && evt.Artifact.ID != "" {
 				if s.artifacts == nil {
 					s.artifacts = map[string]Artifact{}
@@ -1183,6 +1191,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	stopRefresh()
 	summary.EndedAt = time.Now().UTC()
 	t.summary = summary
+	m.metrics.ObserveTurnEnd(botID, summary)
 
 	var unconsumedSteers []agent.SteerMessage
 	if t.steer != nil {

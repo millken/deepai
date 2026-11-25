@@ -167,6 +167,33 @@ func runServe(ctx context.Context, f serveFlags) error {
 		}
 	}
 
+	var tokStore bot.TokenStore
+	if rt.DBConn != nil {
+		if ts, err := bot.NewSQLiteTokenStore(rt.DBConn); err == nil {
+			tokStore = ts
+		} else {
+			slog.Warn("init scoped token store failed", "err", err)
+		}
+	} else {
+		tokStore = bot.NewMemoryTokenStore()
+	}
+
+	var auditLog *bot.AuditLogger
+	if !f.ephemeral {
+		if al, err := bot.NewAuditLogger(filepath.Join(botHome(), "audit.jsonl"), 0); err == nil {
+			auditLog = al
+		} else {
+			slog.Warn("init audit logger failed", "err", err)
+		}
+	}
+
+	gwCtx, cancelGW := context.WithCancel(rtCtx)
+	defer cancelGW()
+	gw, err := startChannelGateway(gwCtx, mgr, rt.Schedule, rt.DBConn, auditLog)
+	if err != nil {
+		slog.Warn("start channel gateway failed", "err", err)
+	}
+
 	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
 	defer cancelHandlers()
 	srv := &http.Server{
@@ -174,6 +201,8 @@ func runServe(ctx context.Context, f serveFlags) error {
 			Manager:        mgr,
 			Schedules:      rt.Schedule,
 			Token:          token,
+			Tokens:         tokStore,
+			Audit:          auditLog,
 			AllowedOrigins: f.corsOrigins,
 			DisableWebUI:   f.noWeb,
 		}),
@@ -216,8 +245,12 @@ func runServe(ctx context.Context, f serveFlags) error {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	// Stop accepting new fires before cancelling turns, then let the
+	// Stop accepting new fires & IM messages before cancelling turns, then let
 	// turn_end callbacks write their final Run states before db.Close.
+	cancelGW()
+	if gw != nil {
+		gw.Wait()
+	}
 	if sched != nil {
 		sctx, stopSched := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := sched.Stop(sctx); err != nil {

@@ -395,9 +395,26 @@ func (s *Server) handleWebhookHook(w http.ResponseWriter, r *http.Request) {
 		Body:    body,
 	})
 	if err != nil {
+		s.audit.Record(AuditEntry{
+			Action:  "webhook_triggered",
+			Target:  r.PathValue("schedule_id"),
+			Outcome: "error",
+			Detail:  err.Error(),
+		})
 		s.writeErr(w, err)
 		return
 	}
+	outcome := "triggered"
+	if res.Ignored {
+		outcome = "ignored"
+	} else if res.Deduplicated {
+		outcome = "deduplicated"
+	}
+	s.audit.Record(AuditEntry{
+		Action:  "webhook_triggered",
+		Target:  r.PathValue("schedule_id"),
+		Outcome: outcome,
+	})
 	if res.Ignored {
 		writeJSON(w, http.StatusOK, res)
 		return

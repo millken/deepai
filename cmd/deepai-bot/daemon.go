@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/millken/deepai/pkg/bot"
 	"github.com/spf13/cobra"
 )
 
@@ -191,7 +193,7 @@ func newTokenCmd() *cobra.Command {
 	var rotate bool
 	cmd := &cobra.Command{
 		Use:   "token",
-		Short: "Print (or --rotate) the API token stored in ~/.deepai/bot/token",
+		Short: "Print (or --rotate) the master API token, or manage scoped tokens (create/list/revoke)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t, err := loadOrCreateToken(rotate)
 			if err != nil {
@@ -204,7 +206,96 @@ func newTokenCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&rotate, "rotate", false, "Generate a new token")
+	cmd.Flags().BoolVar(&rotate, "rotate", false, "Generate a new master token")
+
+	var (
+		tokName string
+		tokRole string
+		tokBots []string
+		tokTTL  string
+	)
+	createCmd := &cobra.Command{
+		Use:   "create",
+		Short: "Issue a scoped API token (admin | user | readonly)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openBotTokenStore()
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			rec, err := store.CreateToken(cmd.Context(), bot.CreateTokenRequest{
+				Name:   tokName,
+				Role:   bot.TokenRole(tokRole),
+				BotIDs: tokBots,
+				TTL:    tokTTL,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("id:    %s\nname:  %s\nrole:  %s\nbots:  %s\ntoken: %s\n",
+				rec.ID, rec.Name, rec.Role, strings.Join(rec.BotIDs, ","), rec.Token)
+			fmt.Fprintln(os.Stderr, "(save this token now; it will not be shown again)")
+			return nil
+		},
+	}
+	createCmd.Flags().StringVar(&tokName, "name", "", "Human-readable token name (required)")
+	createCmd.Flags().StringVar(&tokRole, "role", "user", "Token role: admin | user | readonly")
+	createCmd.Flags().StringSliceVar(&tokBots, "bots", nil, "Restrict token to specific bot IDs (empty = all)")
+	createCmd.Flags().StringVar(&tokTTL, "ttl", "", "Optional expiration duration (e.g. 720h)")
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List issued scoped tokens",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openBotTokenStore()
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			list, err := store.ListTokens(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if len(list) == 0 {
+				fmt.Println("no scoped tokens issued")
+				return nil
+			}
+			for _, rec := range list {
+				status := "active"
+				if rec.RevokedAt != nil {
+					status = "revoked"
+				} else if rec.ExpiresAt != nil && time.Now().After(*rec.ExpiresAt) {
+					status = "expired"
+				}
+				bots := "*"
+				if len(rec.BotIDs) > 0 {
+					bots = strings.Join(rec.BotIDs, ",")
+				}
+				fmt.Printf("%s\t%s\t%s\tbots=%s\t%s\n", rec.ID, rec.Name, rec.Role, bots, status)
+			}
+			return nil
+		},
+	}
+
+	revokeCmd := &cobra.Command{
+		Use:   "revoke <token_id>",
+		Short: "Revoke an issued scoped token",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, cleanup, err := openBotTokenStore()
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			if err := store.RevokeToken(cmd.Context(), args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("revoked %s\n", args[0])
+			return nil
+		},
+	}
+
+	cmd.AddCommand(createCmd, listCmd, revokeCmd)
 	return cmd
 }
 

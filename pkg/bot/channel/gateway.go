@@ -1,0 +1,559 @@
+package channel
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/millken/deepai/pkg/bot"
+	"github.com/millken/deepai/pkg/schedule"
+)
+
+// GatewayOptions configures the IM Channel Gateway.
+type GatewayOptions struct {
+	Manager   *bot.Manager
+	Schedules *schedule.Service
+	Bindings  BindingStore
+	Audit     *bot.AuditLogger
+	Logger    *slog.Logger
+}
+
+type registeredAdapter struct {
+	adapter Adapter
+	policy  AccessPolicy
+}
+
+// Gateway bridges registered IM Adapters onto a single bot.Manager.
+type Gateway struct {
+	m         *bot.Manager
+	schedules *schedule.Service
+	bindings  BindingStore
+	audit     *bot.AuditLogger
+	log       *slog.Logger
+
+	mu       sync.Mutex
+	adapters map[string]registeredAdapter
+	streams  map[string]struct{} // active sessionID -> streaming goroutine exists
+	wg       sync.WaitGroup
+}
+
+func NewGateway(opts GatewayOptions) *Gateway {
+	bindings := opts.Bindings
+	if bindings == nil {
+		bindings = NewMemoryBindingStore()
+	}
+	log := opts.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Gateway{
+		m:         opts.Manager,
+		schedules: opts.Schedules,
+		bindings:  bindings,
+		audit:     opts.Audit,
+		log:       log,
+		adapters:  map[string]registeredAdapter{},
+		streams:   map[string]struct{}{},
+	}
+}
+
+// Register attaches an IM Adapter with its AccessPolicy.
+func (g *Gateway) Register(a Adapter, policy AccessPolicy) {
+	if a == nil {
+		return
+	}
+	g.mu.Lock()
+	g.adapters[a.Name()] = registeredAdapter{adapter: a, policy: policy}
+	g.mu.Unlock()
+}
+
+// Start launches all registered adapters in background goroutines until ctx is
+// cancelled. Call Wait() on shutdown to drain active message handlers.
+func (g *Gateway) Start(ctx context.Context) error {
+	g.mu.Lock()
+	list := make([]registeredAdapter, 0, len(g.adapters))
+	for _, ra := range g.adapters {
+		list = append(list, ra)
+	}
+	g.mu.Unlock()
+
+	for _, ra := range list {
+		ra := ra
+		if len(ra.policy.AllowUsers) == 0 && len(ra.policy.AllowChats) == 0 {
+			g.log.Warn("channel: allowlist is empty; all inbound messages will be rejected", "channel", ra.adapter.Name())
+		}
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			if err := ra.adapter.Start(ctx, func(msg InboundMessage) {
+				g.HandleInbound(ctx, msg)
+			}); err != nil && ctx.Err() == nil {
+				g.log.Error("channel: adapter stopped with error", "channel", ra.adapter.Name(), "err", err)
+			}
+		}()
+	}
+	return nil
+}
+
+// Wait blocks until all adapter and streaming goroutines exit.
+func (g *Gateway) Wait() { g.wg.Wait() }
+
+// HandleInbound processes one normalized IM message (exported so tests and
+// webhook-based adapters can inject messages directly).
+func (g *Gateway) HandleInbound(ctx context.Context, msg InboundMessage) {
+	g.mu.Lock()
+	ra, ok := g.adapters[msg.Channel]
+	g.mu.Unlock()
+	if !ok {
+		return
+	}
+	if !ra.policy.Allowed(msg.UserID, msg.ChatID) {
+		g.log.Warn("channel: rejected unauthorized message",
+			"channel", msg.Channel, "user_id", msg.UserID, "chat_id", msg.ChatID)
+		g.audit.Record(bot.AuditEntry{
+			Action:  "channel_rejected",
+			Actor:   msg.Channel + ":" + msg.UserID,
+			Target:  msg.ChatID,
+			Outcome: "denied",
+			Detail:  "not in allowlist",
+		})
+		return
+	}
+	// Group chats only respond when explicitly mentioned or on button callbacks.
+	if msg.IsGroup && !msg.Mentioned && msg.CallbackData == "" {
+		return
+	}
+
+	dst := Destination{ChatID: msg.ChatID, ThreadID: msg.ThreadID, ReplyToID: msg.MessageID}
+	text := strings.TrimSpace(msg.Text)
+
+	// 1. Handle inline button callback for ask_clarification ("ans:<qid>:<answer>").
+	if strings.HasPrefix(msg.CallbackData, "ans:") {
+		g.handleQuestionCallback(ctx, ra, dst, msg)
+		return
+	}
+
+	// 2. Built-in slash commands (docs/BOT_NEXT_DESIGN.md §5.3).
+	if strings.HasPrefix(text, "/") {
+		if g.handleSlashCommand(ctx, ra, dst, msg, text) {
+			return
+		}
+	}
+
+	// 3. Resolve or create bound (bot_id, session_id).
+	binding, err := g.ensureBinding(ctx, ra.policy, msg.Channel, msg.ChatID, msg.ThreadID)
+	if err != nil {
+		_, _ = ra.adapter.SendText(ctx, dst, "会话初始化失败："+err.Error())
+		return
+	}
+
+	// If session currently has a pending question and user sent plain text, treat as answer.
+	if info, _, err := g.m.GetSessionForBot(binding.BotID, binding.SessionID); err == nil && len(info.Pending) > 0 && text != "" && len(msg.Attachments) == 0 {
+		q := info.Pending[0]
+		if err := g.m.AnswerForBot(binding.BotID, binding.SessionID, q.ID, text); err == nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "已提交回答："+text)
+			return
+		}
+	}
+
+	// 4. Upload any inbound attachments via M3 pipeline.
+	var attIDs []string
+	for _, att := range msg.Attachments {
+		uploaded, err := g.m.UploadAttachmentForBot(binding.BotID, binding.SessionID, att.Name, bytes.NewReader(att.Data))
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("附件 %s 上传失败：%v", att.Name, err))
+			return
+		}
+		attIDs = append(attIDs, uploaded.ID)
+	}
+	if text == "" && len(attIDs) == 0 {
+		return
+	}
+
+	// Subscribe BEFORE SubmitForBot so we never miss early deltas on fast turns.
+	sub, _, _, subErr := g.m.SubscribeForBot(binding.BotID, binding.SessionID, -1)
+
+	res, err := g.m.SubmitForBot(binding.BotID, binding.SessionID, bot.SendRequest{
+		Content:       text,
+		Model:         binding.Model,
+		Mode:          bot.SendModeQueue,
+		AttachmentIDs: attIDs,
+	}, bot.SendOptions{})
+	if err != nil {
+		if sub != nil {
+			sub.Close()
+		}
+		_, _ = ra.adapter.SendText(ctx, dst, "发送失败："+err.Error())
+		return
+	}
+	if res.Queued {
+		if sub != nil {
+			sub.Close()
+		}
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已加入队列（第 %d 位），发送 /steer <内容> 可立即插话，/cancel 可中止。", res.Position))
+		return
+	}
+	if subErr != nil || sub == nil {
+		return
+	}
+	g.startStreamForwarder(ctx, ra, dst, binding, sub)
+}
+
+func (g *Gateway) handleQuestionCallback(ctx context.Context, ra registeredAdapter, dst Destination, msg InboundMessage) {
+	rest := strings.TrimPrefix(msg.CallbackData, "ans:")
+	sep := strings.Index(rest, ":")
+	if sep <= 0 {
+		return
+	}
+	qID, answer := rest[:sep], rest[sep+1:]
+	binding, ok, err := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID)
+	if err != nil || !ok {
+		_, _ = ra.adapter.SendText(ctx, dst, "当前没有活跃会话。")
+		return
+	}
+	if err := g.m.AnswerForBot(binding.BotID, binding.SessionID, qID, answer); err != nil {
+		_, _ = ra.adapter.SendText(ctx, dst, "提交回答失败："+err.Error())
+		return
+	}
+	_, _ = ra.adapter.SendText(ctx, dst, "已选择："+answer)
+}
+
+func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, dst Destination, msg InboundMessage, text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	// Strip optional @botname suffix from Telegram commands (e.g. "/new@my_bot").
+	cmd := strings.ToLower(fields[0])
+	if at := strings.Index(cmd, "@"); at > 0 {
+		cmd = cmd[:at]
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+
+	switch cmd {
+	case "/new":
+		botID := ra.policy.defaultBot()
+		model := ""
+		if cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID); ok && cur.BotID != "" {
+			botID = cur.BotID
+			model = cur.Model
+		}
+		info, err := g.m.CreateSessionForBot(botID, bot.CreateSessionRequest{Model: model})
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "新建会话失败："+err.Error())
+			return true
+		}
+		_ = g.bindings.PutBinding(ctx, Binding{
+			Channel: msg.Channel, ChatID: msg.ChatID, ThreadID: msg.ThreadID,
+			BotID: botID, SessionID: info.ID, Model: model,
+		})
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已开启新会话（bot=%s，session=%s）。", botID, info.ID))
+		return true
+
+	case "/cancel":
+		cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID)
+		if !ok {
+			_, _ = ra.adapter.SendText(ctx, dst, "当前没有活跃会话。")
+			return true
+		}
+		if err := g.m.CancelForBot(cur.BotID, cur.SessionID); err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "中止失败："+err.Error())
+			return true
+		}
+		_, _ = ra.adapter.SendText(ctx, dst, "已发送中止信号。")
+		return true
+
+	case "/steer":
+		if arg == "" {
+			_, _ = ra.adapter.SendText(ctx, dst, "用法：/steer <插话内容>")
+			return true
+		}
+		cur, err := g.ensureBinding(ctx, ra.policy, msg.Channel, msg.ChatID, msg.ThreadID)
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "会话初始化失败："+err.Error())
+			return true
+		}
+		res, err := g.m.SubmitForBot(cur.BotID, cur.SessionID, bot.SendRequest{
+			Content: arg,
+			Mode:    bot.SendModeSteer,
+		}, bot.SendOptions{})
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "插话失败："+err.Error())
+			return true
+		}
+		if res.Steered {
+			_, _ = ra.adapter.SendText(ctx, dst, "↪ 已提交插话，将在当前步骤完成后生效。")
+		} else if res.Queued {
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前回合正在收尾，已转入队列（第 %d 位）。", res.Position))
+		} else {
+			_, _ = ra.adapter.SendText(ctx, dst, "已直接开始新回合。")
+		}
+		return true
+
+	case "/bot":
+		if arg == "" {
+			curBot := ra.policy.defaultBot()
+			if cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID); ok && cur.BotID != "" {
+				curBot = cur.BotID
+			}
+			bots, _ := g.m.ListBots(ctx)
+			var names []string
+			for _, b := range bots {
+				if b.Enabled {
+					names = append(names, b.ID)
+				}
+			}
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前 Bot：%s\n可用 Bot：%s\n用法：/bot <id>", curBot, strings.Join(names, ", ")))
+			return true
+		}
+		b, err := g.m.GetBot(ctx, arg)
+		if err != nil || !b.Enabled {
+			_, _ = ra.adapter.SendText(ctx, dst, "切换失败：Bot 不存在或已停用。")
+			return true
+		}
+		info, err := g.m.CreateSessionForBot(b.ID, bot.CreateSessionRequest{})
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "切换失败："+err.Error())
+			return true
+		}
+		_ = g.bindings.PutBinding(ctx, Binding{
+			Channel: msg.Channel, ChatID: msg.ChatID, ThreadID: msg.ThreadID,
+			BotID: b.ID, SessionID: info.ID,
+		})
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已切换至 Bot「%s」(%s)，并开启新会话。", b.Name, b.ID))
+		return true
+
+	case "/model":
+		cur, err := g.ensureBinding(ctx, ra.policy, msg.Channel, msg.ChatID, msg.ThreadID)
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "会话初始化失败："+err.Error())
+			return true
+		}
+		if arg == "" {
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前模型：%s\n用法：/model <alias>", cur.Model))
+			return true
+		}
+		cur.Model = arg
+		_ = g.bindings.PutBinding(ctx, cur)
+		_, _ = ra.adapter.SendText(ctx, dst, "已切换模型为："+arg)
+		return true
+
+	case "/status":
+		cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID)
+		if !ok {
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("当前无活跃会话（默认 Bot：%s）。", ra.policy.defaultBot()))
+			return true
+		}
+		info, _, err := g.m.GetSessionForBot(cur.BotID, cur.SessionID)
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "会话已失效，发送消息将自动创建新会话。")
+			return true
+		}
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot: %s\nSession: %s\n状态: %s · 排队: %d · 消息数: %d",
+			cur.BotID, info.ID, info.Status, len(info.Queue), info.MsgCount))
+		return true
+
+	case "/approve":
+		if g.schedules == nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "定时任务功能未启用。")
+			return true
+		}
+		if arg == "" {
+			_, _ = ra.adapter.SendText(ctx, dst, "用法：/approve <schedule_id>")
+			return true
+		}
+		sch, err := g.schedules.Approve(ctx, arg)
+		if err != nil {
+			_, _ = ra.adapter.SendText(ctx, dst, "批准失败："+err.Error())
+			return true
+		}
+		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已批准任务「%s」(%s)。", sch.Name, sch.ID))
+		return true
+	}
+	return false
+}
+
+func (g *Gateway) ensureBinding(ctx context.Context, policy AccessPolicy, ch, chatID, threadID string) (Binding, error) {
+	if b, ok, err := g.bindings.GetBinding(ctx, ch, chatID, threadID); err == nil && ok {
+		if _, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID); err == nil {
+			return b, nil
+		}
+	}
+	botID := policy.defaultBot()
+	info, err := g.m.CreateSessionForBot(botID, bot.CreateSessionRequest{
+		Title: fmt.Sprintf("%s:%s", ch, chatID),
+	})
+	if err != nil {
+		return Binding{}, err
+	}
+	b := Binding{
+		Channel:   ch,
+		ChatID:    chatID,
+		ThreadID:  threadID,
+		BotID:     botID,
+		SessionID: info.ID,
+	}
+	_ = g.bindings.PutBinding(ctx, b)
+	return b, nil
+}
+
+// startStreamForwarder streams a session's events to the IM adapter with
+// throttled message editing, tool status indicators, question cards, and
+// artifact attachments until the session goes idle (including any auto-dequeued
+// follow-up turns).
+func (g *Gateway) startStreamForwarder(ctx context.Context, ra registeredAdapter, dst Destination, b Binding, sub *bot.Subscription) {
+	g.mu.Lock()
+	if _, active := g.streams[b.SessionID]; active {
+		g.mu.Unlock()
+		sub.Close()
+		return
+	}
+	g.streams[b.SessionID] = struct{}{}
+	g.mu.Unlock()
+
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		defer sub.Close()
+		defer func() {
+			g.mu.Lock()
+			delete(g.streams, b.SessionID)
+			g.mu.Unlock()
+		}()
+
+		interval := ra.policy.editInterval()
+		maxRunes := ra.policy.maxRunes()
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
+
+		var textBuf strings.Builder
+		var activeTool string
+		var msgID string
+		var lastSent string
+		dirty := false
+
+		flush := func(final bool) {
+			body := textBuf.String()
+			if !final && activeTool != "" {
+				if body != "" {
+					body += "\n\n"
+				}
+				body += "🔧 运行 " + activeTool + "..."
+			}
+			body = strings.TrimSpace(body)
+			if body == "" || body == lastSent {
+				dirty = false
+				return
+			}
+			chunks := splitRunes(body, maxRunes)
+			if len(chunks) == 1 {
+				if msgID == "" {
+					if id, err := ra.adapter.SendText(ctx, dst, chunks[0]); err == nil {
+						msgID = id
+						lastSent = chunks[0]
+					}
+				} else {
+					if err := ra.adapter.EditText(ctx, dst, msgID, chunks[0]); err == nil {
+						lastSent = chunks[0]
+					}
+				}
+			} else {
+				// First chunk updates existing message; overflow chunks sent as new messages.
+				if msgID == "" {
+					if id, err := ra.adapter.SendText(ctx, dst, chunks[0]); err == nil {
+						msgID = id
+					}
+				} else {
+					_ = ra.adapter.EditText(ctx, dst, msgID, chunks[0])
+				}
+				for _, ch := range chunks[1:] {
+					if id, err := ra.adapter.SendText(ctx, dst, ch); err == nil {
+						msgID = id
+					}
+				}
+				lastSent = body
+			}
+			dirty = false
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if dirty {
+					flush(false)
+				}
+			case e, ok := <-sub.C:
+				if !ok {
+					flush(true)
+					return
+				}
+				switch e.Type {
+				case bot.EventTextDelta:
+					textBuf.WriteString(e.Text)
+					dirty = true
+				case bot.EventToolCallStart:
+					if e.Tool != nil {
+						activeTool = e.Tool.Name
+						dirty = true
+					}
+				case bot.EventToolCallEnd:
+					activeTool = ""
+					dirty = true
+				case bot.EventQuestion:
+					if e.Question != nil {
+						flush(false)
+						_, _ = ra.adapter.SendQuestion(ctx, dst, *e.Question)
+					}
+				case bot.EventArtifact:
+					if e.Artifact != nil && e.Artifact.DownloadPath != "" {
+						if rf, err := g.m.ResolveSessionFileForBot(b.BotID, b.SessionID, e.Artifact.DownloadPath); err == nil {
+							_ = ra.adapter.SendAttachment(ctx, dst, rf.AbsPath, e.Artifact.Description)
+						}
+					}
+				case bot.EventTurnEnd:
+					activeTool = ""
+					if e.Turn != nil && textBuf.Len() == 0 && e.Turn.FinalOutput != "" {
+						textBuf.WriteString(e.Turn.FinalOutput)
+					}
+					if e.Turn != nil && (e.Turn.Status == bot.TurnFailed || e.Turn.Status == bot.TurnTimedOut) && textBuf.Len() == 0 {
+						textBuf.WriteString("执行失败：" + e.Turn.Error)
+					}
+					flush(true)
+					// Check if follow-up queue has more turns coming; if idle, exit cleanly.
+					info, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID)
+					if err != nil || (info.Status == bot.SessionIdle && len(info.Queue) == 0) {
+						return
+					}
+					// Reset buffer for next queued turn.
+					textBuf.Reset()
+					msgID = ""
+					lastSent = ""
+					dirty = false
+				}
+			}
+		}
+	}()
+}
+
+func splitRunes(s string, max int) []string {
+	if max <= 0 {
+		return []string{s}
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return []string{s}
+	}
+	var out []string
+	for len(r) > 0 {
+		n := min(max, len(r))
+		out = append(out, string(r[:n]))
+		r = r[n:]
+	}
+	return out
+}

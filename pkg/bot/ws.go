@@ -162,7 +162,22 @@ func (c *wsConn) reply(ctx context.Context, req WSRequest, data any, err error) 
 
 func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 	m := c.s.m
+	p := principalFromContext(ctx)
 	botID := effectiveBotID(req.BotID)
+
+	if isWSAdminOp(req.Op) && !p.IsAdmin() {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: admin role required", ErrForbidden))
+		return
+	}
+	if !isWSReadOp(req.Op) && !p.CanWrite() {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: readonly token cannot perform %s", ErrForbidden, req.Op))
+		return
+	}
+	if isWSBotScopedOp(req.Op) && !p.AllowsBot(botID) {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, botID))
+		return
+	}
+
 	switch req.Op {
 	case "ping":
 		c.reply(ctx, req, "pong", nil)
@@ -170,6 +185,15 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 		c.reply(ctx, req, m.Info(), nil)
 	case "list_bots":
 		list, err := m.ListBots(ctx)
+		if err == nil && !p.IsAdmin() && len(p.BotIDs) > 0 {
+			filtered := make([]BotSummary, 0, len(list))
+			for _, b := range list {
+				if p.AllowsBot(b.ID) {
+					filtered = append(filtered, b)
+				}
+			}
+			list = filtered
+		}
 		c.reply(ctx, req, map[string]any{"bots": list}, err)
 	case "get_bot":
 		b, err := m.GetBot(ctx, req.BotID)
@@ -335,4 +359,32 @@ func (c *wsConn) closeSubs() {
 		sub.Close()
 		delete(c.subs, k)
 	}
+}
+
+func isWSAdminOp(op string) bool {
+	switch op {
+	case "create_bot", "update_bot", "delete_bot":
+		return true
+	}
+	return false
+}
+
+func isWSReadOp(op string) bool {
+	switch op {
+	case "ping", "info", "list_bots", "get_bot", "list_sessions", "get_session",
+		"list_queue", "subscribe", "unsubscribe", "list_schedules", "get_schedule",
+		"list_runs", "get_run", "validate_trigger":
+		return true
+	}
+	return false
+}
+
+func isWSBotScopedOp(op string) bool {
+	switch op {
+	case "get_bot", "list_sessions", "create_session", "get_session", "rename_session",
+		"delete_session", "send", "cancel", "answer", "list_queue", "remove_queue_item",
+		"clear_queue", "create_schedule":
+		return true
+	}
+	return false
 }
