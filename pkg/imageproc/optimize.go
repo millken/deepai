@@ -64,6 +64,14 @@ type Result struct {
 	Bytes    int // size of decoded base64 data (for UI display)
 }
 
+const (
+	// MaxDecodeDimension caps either edge before allocating pixel buffers.
+	MaxDecodeDimension = 16384
+	// MaxDecodePixels caps total decoded pixels (~40M pixels) before full
+	// decode to defeat decompression bombs (e.g. forged 10000x10000 PNG IHDR).
+	MaxDecodePixels = 40_000_000
+)
+
 // Optimize reads raw image bytes, decodes, optionally resizes, and re-encodes
 // to minimize size. It returns the optimized result.
 //
@@ -76,6 +84,17 @@ func Optimize(raw []byte, opts Options) (Result, error) {
 	}
 	if opts.JPEGQuality <= 0 || opts.JPEGQuality > 100 {
 		opts.JPEGQuality = 82
+	}
+
+	cfg, err := decodeConfig(raw)
+	if err != nil {
+		return Result{}, fmt.Errorf("decode image header: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return Result{}, fmt.Errorf("invalid image dimensions %dx%d", cfg.Width, cfg.Height)
+	}
+	if cfg.Width > MaxDecodeDimension || cfg.Height > MaxDecodeDimension || int64(cfg.Width)*int64(cfg.Height) > MaxDecodePixels {
+		return Result{}, fmt.Errorf("image dimensions %dx%d exceed decode limit (%dpx max edge, %d max pixels)", cfg.Width, cfg.Height, MaxDecodeDimension, MaxDecodePixels)
 	}
 
 	img, format, err := decode(raw)
@@ -121,6 +140,24 @@ func Optimize(raw []byte, opts Options) (Result, error) {
 		Height:   rh,
 		Bytes:    buf.Len(),
 	}, nil
+}
+
+// decodeConfig reads only the image header to inspect dimensions before full decode.
+func decodeConfig(raw []byte) (image.Config, error) {
+	contentType := sniffFormat(raw)
+	switch contentType {
+	case "image/png":
+		return png.DecodeConfig(bytes.NewReader(raw))
+	case "image/jpeg":
+		return jpeg.DecodeConfig(bytes.NewReader(raw))
+	case "image/gif":
+		return gif.DecodeConfig(bytes.NewReader(raw))
+	case "image/webp":
+		return webp.DecodeConfig(bytes.NewReader(raw))
+	default:
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+		return cfg, err
+	}
 }
 
 // decode dispatches to the correct decoder based on format magic bytes.

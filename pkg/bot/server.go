@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -448,6 +449,21 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
+	f, err := os.Open(rf.AbsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.writeErr(w, ErrAttachmentNotFound)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		s.writeErr(w, ErrAttachmentNotFound)
+		return
+	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, no-store")
 	if rf.MimeType != "" {
@@ -456,7 +472,7 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	if rf.ForceDownload || r.URL.Query().Get("download") == "1" {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+rf.Name+`"`)
 	}
-	http.ServeFile(w, r, rf.AbsPath)
+	http.ServeContent(w, r, rf.Name, st.ModTime(), f)
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {

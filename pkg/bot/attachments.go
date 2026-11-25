@@ -385,12 +385,14 @@ func sanitizeAttachmentName(raw string) string {
 	if out == "" || out == "." || out == ".." {
 		return "file"
 	}
-	if len(out) > 80 {
+	runes := []rune(out)
+	if len(runes) > 80 {
 		ext := filepath.Ext(out)
-		if len(ext) > 12 {
-			ext = ""
+		extRunes := []rune(ext)
+		if len(extRunes) > 12 {
+			extRunes = nil
 		}
-		out = out[:80-len(ext)] + ext
+		out = string(runes[:80-len(extRunes)]) + string(extRunes)
 	}
 	return out
 }

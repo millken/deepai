@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
@@ -427,5 +428,73 @@ func TestAgentRuntimePresentFileArtifactEndToEnd(t *testing.T) {
 	rEvil.Body.Close()
 	if rEvil.StatusCode != http.StatusForbidden {
 		t.Fatalf("escaping artifact symlink status = %d, want 403", rEvil.StatusCode)
+	}
+}
+
+func TestAttachmentIndexHTMLDownloadReturns200(t *testing.T) {
+	m, err := NewManager(Options{Runtime: &fakeRuntime{}, Store: NewMemoryStore(), IdleTimeout: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+
+	srv := NewServer(ServerOptions{Manager: m, Token: "secret"})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	sess, err := m.CreateSession(CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Upload an index.html file directly into the session's sandbox.
+	att, err := m.UploadAttachmentForBot(DefaultBotID, sess.ID, "index.html", strings.NewReader("<h1>Hello</h1>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Also write a bare index.html in uploads/ so URL literally ends with /index.html.
+	sLoaded, _ := m.load(sess.ID)
+	sLoaded.mu.Lock()
+	sbDir := sLoaded.sandboxDirLocked()
+	sLoaded.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(sbDir, "uploads", "index.html"), []byte("<h1>Index</h1>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = att
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/sessions/"+sess.ID+"/files/uploads/index.html", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET .../uploads/index.html status = %d (Location=%q), want 200", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if string(body) != "<h1>Index</h1>" {
+		t.Fatalf("body = %q, want <h1>Index</h1>", string(body))
+	}
+	if !strings.Contains(resp.Header.Get("Content-Disposition"), "attachment") {
+		t.Fatalf("expected Content-Disposition attachment, got %q", resp.Header.Get("Content-Disposition"))
+	}
+}
+
+func TestSanitizeAttachmentNamePreservesValidUTF8(t *testing.T) {
+	longCJK := strings.Repeat("中文报告", 30) + ".pdf"
+	got := sanitizeAttachmentName(longCJK)
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeAttachmentName produced invalid UTF-8: %x", got)
+	}
+	if !strings.HasSuffix(got, ".pdf") {
+		t.Fatalf("expected .pdf suffix, got %q", got)
+	}
+	if len([]rune(got)) > 80 {
+		t.Fatalf("rune length = %d, want <= 80", len([]rune(got)))
 	}
 }

@@ -2,10 +2,13 @@ package imageproc
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"strings"
 	"testing"
 )
 
@@ -188,5 +191,38 @@ func TestEstimateTilesToTokens(t *testing.T) {
 	// 5 tiles high: 85*5 + 85 = 510
 	if got := EstimateTilesToTokens(5, "high"); got != 510 {
 		t.Errorf("5 tile tokens = %d, want 510", got)
+	}
+}
+
+func makeForgedPNGHeader(w, h uint32) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
+	// IHDR chunk (13 bytes)
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], w)
+	binary.BigEndian.PutUint32(ihdr[4:8], h)
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 6 // RGBA
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ihdr)))
+	buf.Write(lenBuf[:])
+	buf.WriteString("IHDR")
+	buf.Write(ihdr)
+	crc := crc32.ChecksumIEEE(append([]byte("IHDR"), ihdr...))
+	binary.BigEndian.PutUint32(lenBuf[:], crc)
+	buf.Write(lenBuf[:])
+	// IEND chunk
+	buf.Write([]byte{0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82})
+	return buf.Bytes()
+}
+
+func TestOptimizeRejectsDecompressionBomb(t *testing.T) {
+	bomb := makeForgedPNGHeader(10000, 10000)
+	_, err := Optimize(bomb, DefaultOptions)
+	if err == nil {
+		t.Fatal("expected decompression bomb error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceed decode limit") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
