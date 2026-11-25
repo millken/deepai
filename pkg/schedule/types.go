@@ -17,11 +17,13 @@ import (
 	"time"
 )
 
-// Trigger types. cron is deliberately rejected in P1 (see Trigger.Normalize).
+// Trigger types (docs/BOT_SCHEDULER_DESIGN.md §3.3 & BOT_NEXT_DESIGN.md §4).
 const (
 	TriggerOnce     = "once"
 	TriggerInterval = "interval"
 	TriggerCron     = "cron"
+	TriggerWebhook  = "webhook"
+	TriggerChain    = "chain"
 )
 
 // State is a Schedule's lifecycle state.
@@ -72,6 +74,8 @@ const (
 	FireMisfire RunTrigger = "misfire"
 	FireManual  RunTrigger = "manual"
 	FireSkip    RunTrigger = "skip"
+	FireWebhook RunTrigger = "webhook"
+	FireChain   RunTrigger = "chain"
 )
 
 // Option enums.
@@ -90,6 +94,25 @@ const (
 	NotifyAlways    = "always"
 	NotifyOnFailure = "on_failure"
 	NotifyNever     = "never"
+
+	// NotifyIf modes (docs/BOT_NEXT_DESIGN.md §4.4).
+	NotifyIfAll         = "all"
+	NotifyIfContains    = "contains"
+	NotifyIfNotContains = "not_contains"
+	NotifyIfRegex       = "regex"
+	NotifyIfMarker      = "marker"
+	DefaultNotifyMarker = "[NO_NOTIFY]"
+
+	// Chain trigger on_status policies (docs/BOT_NEXT_DESIGN.md §4.3).
+	ChainOnCompleted = "completed"
+	ChainOnFailed    = "failed"
+	ChainOnAny       = "any"
+	MaxChainDepth    = 5
+
+	// Webhook signature schemes (docs/BOT_NEXT_DESIGN.md §4.2).
+	WebhookSigGitHubSHA256 = "github_sha256"
+	WebhookSigHMACSHA256   = "hmac_sha256"
+	WebhookSigBearer       = "bearer"
 
 	// What to do when nobody answers an ask_clarification question within
 	// answer_timeout (design §7.1).
@@ -164,6 +187,9 @@ type Schedule struct {
 	// Computed views, never persisted.
 	Summary  string      `json:"summary,omitempty"`
 	NextRuns []time.Time `json:"next_runs,omitempty"`
+	// WebhookSecret is populated ONLY once in the Create response when the
+	// service auto-generates a webhook secret (never returned by Get/List).
+	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
 // Clone copies a Schedule, including its pointer fields, so callers can
@@ -172,6 +198,16 @@ func (s Schedule) Clone() Schedule {
 	out := s
 	out.NextRuns = append([]time.Time(nil), s.NextRuns...)
 	out.Options.ToolAllowlist = append([]string(nil), s.Options.ToolAllowlist...)
+	if s.Options.NotifyIf != nil {
+		ni := *s.Options.NotifyIf
+		out.Options.NotifyIf = &ni
+	}
+	if len(s.Trigger.EventFilter) > 0 {
+		out.Trigger.EventFilter = make(map[string]string, len(s.Trigger.EventFilter))
+		for k, v := range s.Trigger.EventFilter {
+			out.Trigger.EventFilter[k] = v
+		}
+	}
 	if s.NextRunAt != nil {
 		t := *s.NextRunAt
 		out.NextRunAt = &t
@@ -194,6 +230,13 @@ type RunSummary struct {
 	EndedAt *time.Time `json:"ended_at,omitempty"`
 }
 
+// NotifyIf filters outbound notifications based on a completed Run's output
+// (docs/BOT_NEXT_DESIGN.md §4.4).
+type NotifyIf struct {
+	Mode    string `json:"mode,omitempty"`    // all | contains | not_contains | regex | marker
+	Pattern string `json:"pattern,omitempty"` // substring, regex, or marker prefix (default "[NO_NOTIFY]")
+}
+
 // Options are the per-task settings. Durations are duration strings such as
 // "30m" so they survive JSON/YAML round trips unchanged; Service.ParseOptions
 // validates and resolves them to Defaults.
@@ -205,6 +248,7 @@ type Options struct {
 	Misfire         string     `json:"misfire,omitempty"`
 	MisfireGrace    string     `json:"misfire_grace,omitempty"`
 	Notify          string     `json:"notify,omitempty"`
+	NotifyIf        *NotifyIf  `json:"notify_if,omitempty"`
 	AnswerTimeout   string     `json:"answer_timeout,omitempty"`
 	OnAnswerTimeout string     `json:"on_answer_timeout,omitempty"`
 	EndAt           *time.Time `json:"end_at,omitempty"`
@@ -246,6 +290,11 @@ type Run struct {
 	ErrorCode         string         `json:"error_code,omitempty"`
 	ToolCalls         int            `json:"tool_calls,omitempty"`
 	Usage             map[string]any `json:"usage,omitempty"`
+	// PromptOverride holds the rendered prompt for webhook/chain runs (takes
+	// precedence over Schedule.Prompt when dispatching).
+	PromptOverride string `json:"prompt_override,omitempty"`
+	// ChainDepth tracks cascade depth for task chains (capped at MaxChainDepth).
+	ChainDepth int `json:"chain_depth,omitempty"`
 }
 
 // Clone copies a Run including pointer fields.
@@ -325,6 +374,8 @@ const (
 	CodeRunInProgress         Code = "run_in_progress"
 	CodeInvalidState          Code = "invalid_state"
 	CodeConflict              Code = "conflict"
+	CodeCycleDetected         Code = "cycle_detected"
+	CodeUnauthorized          Code = "unauthorized"
 	CodeInternal              Code = "internal"
 )
 
@@ -366,6 +417,8 @@ func HTTPStatus(err error) int {
 		return http.StatusConflict
 	case CodeLimitExceeded:
 		return http.StatusTooManyRequests
+	case CodeUnauthorized:
+		return http.StatusUnauthorized
 	case CodeInternal:
 		return http.StatusInternalServerError
 	default:

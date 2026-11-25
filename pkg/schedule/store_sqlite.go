@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS schedule_runs (
   error_code TEXT,
   usage_json TEXT,
   tool_calls INTEGER NOT NULL DEFAULT 0,
+  prompt_override TEXT,
+  chain_depth INTEGER NOT NULL DEFAULT 0,
   UNIQUE(schedule_id, slot),
   UNIQUE(schedule_id, request_id)
 );
@@ -103,6 +105,12 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "schedules", "work_dir", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "schedule_runs", "prompt_override", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "schedule_runs", "chain_depth", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_schedules_workdir_bot_next ON schedules(work_dir, bot_id, state, next_run_at)`); err != nil {
@@ -373,14 +381,15 @@ func (s *SQLiteStore) InsertRun(ctx context.Context, r Run) error {
 		INSERT INTO schedule_runs
 		  (id, schedule_id, seq, trigger, slot, scheduled_for, request_id, coalesced,
 		   queued_reason, queue_deadline, started_at, ended_at, session_id, turn_id,
-		   status, auto_answers, cancel_requested_at, output, error, error_code, usage_json, tool_calls)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		   status, auto_answers, cancel_requested_at, output, error, error_code, usage_json, tool_calls,
+		   prompt_override, chain_depth)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.ScheduleID, r.Seq, string(r.Trigger), msPtr(r.Slot), ms(r.ScheduledFor),
 		nullableString(r.RequestID), r.Coalesced, nullableString(r.QueuedReason),
 		msPtr(r.QueueDeadline), msPtr(r.StartedAt), msPtr(r.EndedAt), nullableString(r.SessionID),
 		nullableString(r.TurnID), string(r.Status), r.AutoAnswers, msPtr(r.CancelRequestedAt),
 		nullableString(r.Output), nullableString(r.Error), nullableString(r.ErrorCode),
-		nullableJSON(r.Usage), r.ToolCalls)
+		nullableJSON(r.Usage), r.ToolCalls, nullableString(r.PromptOverride), r.ChainDepth)
 	if err != nil {
 		return conflictErr(err, "run "+r.ID)
 	}
@@ -392,13 +401,13 @@ func (s *SQLiteStore) UpdateRun(ctx context.Context, r Run) error {
 		UPDATE schedule_runs SET schedule_id=?, seq=?, trigger=?, slot=?, scheduled_for=?,
 		  request_id=?, coalesced=?, queued_reason=?, queue_deadline=?, started_at=?, ended_at=?,
 		  session_id=?, turn_id=?, status=?, auto_answers=?, cancel_requested_at=?, output=?,
-		  error=?, error_code=?, usage_json=?, tool_calls=? WHERE id=?`,
+		  error=?, error_code=?, usage_json=?, tool_calls=?, prompt_override=?, chain_depth=? WHERE id=?`,
 		r.ScheduleID, r.Seq, string(r.Trigger), msPtr(r.Slot), ms(r.ScheduledFor),
 		nullableString(r.RequestID), r.Coalesced, nullableString(r.QueuedReason),
 		msPtr(r.QueueDeadline), msPtr(r.StartedAt), msPtr(r.EndedAt), nullableString(r.SessionID),
 		nullableString(r.TurnID), string(r.Status), r.AutoAnswers, msPtr(r.CancelRequestedAt),
 		nullableString(r.Output), nullableString(r.Error), nullableString(r.ErrorCode),
-		nullableJSON(r.Usage), r.ToolCalls, r.ID)
+		nullableJSON(r.Usage), r.ToolCalls, nullableString(r.PromptOverride), r.ChainDepth, r.ID)
 	if err != nil {
 		return err
 	}
@@ -420,21 +429,23 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (Run, error) {
 
 const runColumns = `id, schedule_id, seq, trigger, slot, scheduled_for, request_id, coalesced,
   queued_reason, queue_deadline, started_at, ended_at, session_id, turn_id, status,
-  auto_answers, cancel_requested_at, output, error, error_code, usage_json, tool_calls`
+  auto_answers, cancel_requested_at, output, error, error_code, usage_json, tool_calls,
+  prompt_override, chain_depth`
 
 const runColumnsQualified = `r.id, r.schedule_id, r.seq, r.trigger, r.slot, r.scheduled_for, r.request_id, r.coalesced,
   r.queued_reason, r.queue_deadline, r.started_at, r.ended_at, r.session_id, r.turn_id, r.status,
-  r.auto_answers, r.cancel_requested_at, r.output, r.error, r.error_code, r.usage_json, r.tool_calls`
+  r.auto_answers, r.cancel_requested_at, r.output, r.error, r.error_code, r.usage_json, r.tool_calls,
+  r.prompt_override, r.chain_depth`
 
 func scanRun(row rowScanner) (Run, error) {
 	var r Run
-	var requestID, queuedReason, sessionID, turnID, output, errText, errCode, usageJSON sql.NullString
+	var requestID, queuedReason, sessionID, turnID, output, errText, errCode, usageJSON, promptOverride sql.NullString
 	var slot, queueDeadline, startedAt, endedAt, cancelAt sql.NullInt64
 	var scheduledFor int64
 	if err := row.Scan(&r.ID, &r.ScheduleID, &r.Seq, &r.Trigger, &slot, &scheduledFor,
 		&requestID, &r.Coalesced, &queuedReason, &queueDeadline, &startedAt, &endedAt,
 		&sessionID, &turnID, &r.Status, &r.AutoAnswers, &cancelAt, &output, &errText,
-		&errCode, &usageJSON, &r.ToolCalls); err != nil {
+		&errCode, &usageJSON, &r.ToolCalls, &promptOverride, &r.ChainDepth); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Run{}, fmt.Errorf("%w: run", ErrNotFound)
 		}
@@ -445,7 +456,7 @@ func scanRun(row rowScanner) (Run, error) {
 	r.CancelRequestedAt = ptrTime(cancelAt)
 	r.ScheduledFor = mustTime(scheduledFor)
 	r.RequestID, r.QueuedReason, r.SessionID, r.TurnID = requestID.String, queuedReason.String, sessionID.String, turnID.String
-	r.Output, r.Error, r.ErrorCode = output.String, errText.String, errCode.String
+	r.Output, r.Error, r.ErrorCode, r.PromptOverride = output.String, errText.String, errCode.String, promptOverride.String
 	if usageJSON.Valid && usageJSON.String != "" {
 		_ = json.Unmarshal([]byte(usageJSON.String), &r.Usage)
 	}

@@ -397,6 +397,10 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 	if err != nil {
 		return CreateInput{}, err
 	}
+	notifyIf, err := notifyIfArg(args["notify_if"])
+	if err != nil {
+		return CreateInput{}, err
+	}
 	return CreateInput{
 		BotID:    strArg(args, "bot_id"),
 		Name:     strArg(args, "name"),
@@ -411,6 +415,7 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 			Misfire:         strArg(args, "misfire"),
 			MisfireGrace:    strArg(args, "misfire_grace"),
 			Notify:          strArg(args, "notify"),
+			NotifyIf:        notifyIf,
 			AnswerTimeout:   strArg(args, "answer_timeout"),
 			OnAnswerTimeout: strArg(args, "on_answer_timeout"),
 			EndAt:           endAt,
@@ -421,6 +426,25 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 		},
 		CreatedBy: CreatedBy{Kind: "model", SessionID: sessionID, TurnID: turnID},
 	}, nil
+}
+
+func notifyIfArg(v any) (*NotifyIf, error) {
+	if v == nil {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, NewError(CodeBadRequest, "notify_if must be an object")
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return nil, NewError(CodeBadRequest, "notify_if: %v", err)
+	}
+	var ni NotifyIf
+	if err := json.Unmarshal(raw, &ni); err != nil {
+		return nil, NewError(CodeBadRequest, "notify_if: %v", err)
+	}
+	return &ni, nil
 }
 
 func strSliceArg(v any) []string {
@@ -510,6 +534,21 @@ func patchFromArgs(args map[string]any, cfg Config, origTZ string) (Patch, *Trig
 	if v, ok := args["max_auto_answers"]; ok {
 		n := intArg(map[string]any{"v": v}, "v")
 		p.MaxAutoAnswers = &n
+	}
+	if v, ok := args["notify_if"]; ok {
+		if v == nil {
+			p.ClearNotifyIf = true
+		} else {
+			ni, err := notifyIfArg(v)
+			if err != nil {
+				return p, p.Trigger, p.Timezone, err
+			}
+			p.NotifyIf = ni
+		}
+	}
+	if v, ok := args["tool_allowlist"]; ok {
+		list := strSliceArg(v)
+		p.ToolAllowlist = &list
 	}
 	return p, p.Trigger, p.Timezone, nil
 }

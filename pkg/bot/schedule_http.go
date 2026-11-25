@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -148,6 +150,10 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := s.validateScheduleTools(in.Options.ToolAllowlist); err != nil {
+		s.writeErr(w, err)
+		return
+	}
 	sch, err := svc.Create(r.Context(), in)
 	if err != nil {
 		s.writeErr(w, err)
@@ -188,6 +194,12 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	if patch.ToolAllowlist != nil {
+		if err := s.validateScheduleTools(*patch.ToolAllowlist); err != nil {
+			s.writeErr(w, err)
+			return
+		}
 	}
 	sch, err := svc.Update(r.Context(), r.PathValue("id"), patch)
 	if err != nil {
@@ -346,6 +358,53 @@ func (s *Server) handleValidateSchedule(w http.ResponseWriter, r *http.Request) 
 	}))
 }
 
+const maxWebhookBodyBytes = 1 << 20
+
+func (s *Server) validateScheduleTools(allowlist []string) error {
+	if len(allowlist) == 0 {
+		return nil
+	}
+	if tv, ok := s.m.opts.Runtime.(ToolValidator); ok {
+		if missing := tv.ValidateToolAllowlist(allowlist); len(missing) > 0 {
+			return fmt.Errorf("%w: %s", ErrUnknownTool, strings.Join(missing, ", "))
+		}
+	}
+	return nil
+}
+
+// handleWebhookHook receives external webhook deliveries on
+// POST /v1/hooks/{schedule_id} using per-schedule signature verification
+// instead of the bot's main bearer token (docs/BOT_NEXT_DESIGN.md §4.2).
+func (s *Server) handleWebhookHook(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.scheduleOr404(w)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "webhook payload exceeds 1 MiB limit")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", "read webhook body: "+err.Error())
+		return
+	}
+	res, err := svc.TriggerWebhook(r.Context(), r.PathValue("schedule_id"), schedule.WebhookRequest{
+		Headers: r.Header,
+		Body:    body,
+	})
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if res.Ignored {
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, res)
+}
+
 // ─────────────────────────── WebSocket ───────────────────────────
 
 // handleScheduleWS mirrors the REST ops. The bool reports whether the op was
@@ -402,6 +461,9 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 				return nil, true, err
 			}
 		}
+		if err := s.validateScheduleTools(in.Options.ToolAllowlist); err != nil {
+			return nil, true, err
+		}
 		sch, err := svc.Create(ctx, in)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
 	case "update_schedule":
@@ -412,6 +474,11 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		patch, err := schedule.PatchFromMap(params, svc.Config(), origTZ)
 		if err != nil {
 			return nil, true, err
+		}
+		if patch.ToolAllowlist != nil {
+			if err := s.validateScheduleTools(*patch.ToolAllowlist); err != nil {
+				return nil, true, err
+			}
 		}
 		sch, err := svc.Update(ctx, id, patch)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err
