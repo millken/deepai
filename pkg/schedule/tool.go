@@ -101,11 +101,26 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		result["note"] = "任务已保存，将由另一个 deepai-bot 实例执行"
 	}
 
+	callerBot := strings.TrimSpace(BotIDFromContext(ctx))
+	requireBotScope := func(id string) (Schedule, error) {
+		sch, err := svc.Get(ctx, id)
+		if err != nil {
+			return Schedule{}, err
+		}
+		if callerBot != "" && effectiveBotID(sch.BotID) != effectiveBotID(callerBot) {
+			return Schedule{}, NewError(CodeNotFound, "schedule %s not found", id)
+		}
+		return sch, nil
+	}
+
 	switch action {
 	case "create":
 		in, err := createInputFromArgs(args, cfg, sessionID, turnID)
 		if err != nil {
 			return nil, err
+		}
+		if botID := BotIDFromContext(ctx); botID != "" {
+			in.BotID = botID
 		}
 		if parentScheduleID != "" {
 			if !cfg.AllowNested {
@@ -138,7 +153,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "list":
-		list, err := svc.List(ctx, strArg(args, "state"), intArg(args, "limit"))
+		list, err := svc.ListForBot(ctx, BotIDFromContext(ctx), strArg(args, "state"), intArg(args, "limit"))
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +161,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "get":
-		sch, err := svc.Get(ctx, strArg(args, "id"))
+		sch, err := requireBotScope(strArg(args, "id"))
 		if err != nil {
 			return nil, err
 		}
@@ -158,7 +173,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		// base is fetched BEFORE the patch: its Timezone feeds patchFromArgs'
 		// naive end_at interpretation (round-3 L1) and its Trigger/Name/Prompt
 		// feed the confirmation preview below.
-		base, err := svc.Get(ctx, id)
+		base, err := requireBotScope(id)
 		if err != nil {
 			return nil, err
 		}
@@ -207,6 +222,9 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 
 	case "pause", "resume":
 		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
 		var (
 			sch Schedule
 			err error
@@ -223,7 +241,11 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "delete":
-		sch, err := svc.Delete(ctx, strArg(args, "id"), boolArg(args, "cancel"))
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
+		sch, err := svc.Delete(ctx, id, boolArg(args, "cancel"))
 		if err != nil {
 			return nil, err
 		}
@@ -231,11 +253,15 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "run_now":
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
 		reqID := strArg(args, "request_id")
 		if reqID == "" && turnID != "" {
 			reqID = "turn_" + turnID
 		}
-		run, err := svc.RunNow(ctx, strArg(args, "id"), reqID)
+		run, err := svc.RunNow(ctx, id, reqID)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +269,11 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "runs":
-		runs, err := svc.Runs(ctx, strArg(args, "id"), intArg(args, "limit"))
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
+		runs, err := svc.Runs(ctx, id, intArg(args, "limit"))
 		if err != nil {
 			return nil, err
 		}
@@ -368,6 +398,7 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 		return CreateInput{}, err
 	}
 	return CreateInput{
+		BotID:    strArg(args, "bot_id"),
 		Name:     strArg(args, "name"),
 		Prompt:   strArg(args, "prompt"),
 		Trigger:  tr,
@@ -386,9 +417,34 @@ func createInputFromArgs(args map[string]any, cfg Config, sessionID, turnID stri
 			MaxRuns:         intArg(args, "max_runs"),
 			MaxToolCalls:    intArg(args, "max_tool_calls"),
 			AutoAnswers:     intArg(args, "max_auto_answers"),
+			ToolAllowlist:   strSliceArg(args["tool_allowlist"]),
 		},
 		CreatedBy: CreatedBy{Kind: "model", SessionID: sessionID, TurnID: turnID},
 	}, nil
+}
+
+func strSliceArg(v any) []string {
+	switch list := v.(type) {
+	case []string:
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // patchFromArgs builds a Patch from tool/REST/WS arguments. origTZ is the

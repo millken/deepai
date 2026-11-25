@@ -12,6 +12,7 @@ import (
 // CreateInput is the validated input for Service.Create. Both the REST API
 // and the schedule tool build one of these.
 type CreateInput struct {
+	BotID     string
 	Name      string
 	Prompt    string
 	Trigger   Trigger
@@ -259,8 +260,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Schedule, error) 
 	if createdBy.Kind == "" {
 		createdBy.Kind = "user"
 	}
+	botID := strings.TrimSpace(in.BotID)
+	if botID == "" {
+		botID = DefaultBotID
+	}
 	v := Schedule{
-		ID: newID("sch_"), Name: name, Prompt: prompt, Trigger: tr, Timezone: tz,
+		ID: newID("sch_"), BotID: botID, WorkDir: s.cfg.WorkDir,
+		Name: name, Prompt: prompt, Trigger: tr, Timezone: tz,
 		Options: opts, State: state, CreatedBy: createdBy,
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -275,9 +281,19 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Schedule, error) 
 	return s.Decorate(v), nil
 }
 
-// List returns schedules, newest-created first.
+// List returns schedules in this service's workdir, newest-created first.
 func (s *Service) List(ctx context.Context, state string, limit int) ([]Schedule, error) {
-	list, err := s.store.ListSchedules(ctx, ScheduleFilter{State: State(state), Limit: limit})
+	return s.ListForBot(ctx, "", state, limit)
+}
+
+// ListForBot returns schedules optionally filtered by botID (empty = all bots).
+func (s *Service) ListForBot(ctx context.Context, botID, state string, limit int) ([]Schedule, error) {
+	list, err := s.store.ListSchedules(ctx, ScheduleFilter{
+		BotID:   strings.TrimSpace(botID),
+		WorkDir: s.cfg.WorkDir,
+		State:   State(state),
+		Limit:   limit,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +302,48 @@ func (s *Service) List(ctx context.Context, state string, limit int) ([]Schedule
 		out = append(out, s.Decorate(v))
 	}
 	return out, nil
+}
+
+// CountByBot counts non-deleted schedules owned by botID across all workdirs.
+func (s *Service) CountByBot(ctx context.Context, botID string) (int, error) {
+	return s.store.CountByBot(ctx, botID)
+}
+
+// CancelActiveByBot cancels any active runs belonging to botID in this workdir.
+func (s *Service) CancelActiveByBot(ctx context.Context, botID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, err := s.store.ListSchedules(ctx, ScheduleFilter{
+		BotID:          strings.TrimSpace(botID),
+		WorkDir:        s.cfg.WorkDir,
+		IncludeDeleted: true,
+	})
+	if err != nil {
+		return err
+	}
+	for _, v := range list {
+		for _, r := range s.activeRunsLocked(ctx, v.ID) {
+			now := s.now()
+			r.CancelRequestedAt = &now
+			if s.dispatcher != nil {
+				_ = s.dispatcher.Cancel(r, CancelClient)
+			}
+			_ = s.updateRunLocked(ctx, r)
+		}
+	}
+	return nil
+}
+
+// DeleteByBot hard-deletes all schedules and runs owned by botID (used by
+// DELETE /v1/bots/{id}?force=1).
+func (s *Service) DeleteByBot(ctx context.Context, botID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.store.DeleteByBot(ctx, botID); err != nil {
+		return err
+	}
+	s.kickLocked()
+	return nil
 }
 
 // Get returns one task.
@@ -1348,6 +1406,9 @@ func (s *Service) tryStartLocked(ctx context.Context, r Run, v Schedule) {
 		case errors.Is(err, ErrBusy):
 			r.Status, r.StartedAt = RunPending, nil
 			r.QueuedReason, r.QueueDeadline = "session_busy", origDeadline
+		case errors.Is(err, ErrBotDisabled):
+			r.Status, r.StartedAt, r.EndedAt = RunSkipped, nil, &now
+			r.QueuedReason, r.QueueDeadline, r.ErrorCode = "bot_disabled", nil, "bot_disabled"
 		default:
 			r.Status, r.EndedAt = RunFailed, &now
 			r.Error, r.ErrorCode = err.Error(), "dispatch_failed"
@@ -1438,7 +1499,7 @@ func (s *Service) changed(v Schedule, kind ChangeKind) {
 	if s.observer != nil {
 		payload := v
 		if kind == ChangeDeleted {
-			payload = Schedule{ID: v.ID, State: StateDeleted}
+			payload = Schedule{ID: v.ID, BotID: v.BotID, State: StateDeleted}
 		}
 		s.observer.ScheduleChanged(payload, kind)
 	}

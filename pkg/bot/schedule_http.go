@@ -96,8 +96,18 @@ func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	botID := strings.TrimSpace(r.PathValue("bot_id"))
+	if botID == "" {
+		botID = strings.TrimSpace(r.URL.Query().Get("bot_id"))
+	}
+	if botID != "" {
+		if _, err := s.m.GetBot(r.Context(), botID); err != nil {
+			s.writeErr(w, err)
+			return
+		}
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	list, err := svc.List(r.Context(), r.URL.Query().Get("state"), limit)
+	list, err := svc.ListForBot(r.Context(), botID, r.URL.Query().Get("state"), limit)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -118,6 +128,25 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeErr(w, err)
 		return
+	}
+	if pathBot := strings.TrimSpace(r.PathValue("bot_id")); pathBot != "" {
+		in.BotID = pathBot
+	}
+	in.BotID = effectiveBotID(in.BotID)
+	profile, err := s.m.GetBot(r.Context(), in.BotID)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if !profile.Enabled || s.m.IsBotDeleting(in.BotID) {
+		s.writeErr(w, fmt.Errorf("%w: %s", ErrBotDisabled, in.BotID))
+		return
+	}
+	if in.CreatedBy.SessionID != "" {
+		if _, _, err := s.m.GetSessionForBot(in.BotID, in.CreatedBy.SessionID); err != nil {
+			s.writeErr(w, err)
+			return
+		}
 	}
 	sch, err := svc.Create(r.Context(), in)
 	if err != nil {
@@ -343,7 +372,11 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 	}
 	switch req.Op {
 	case "list_schedules":
-		list, err := svc.List(ctx, paramString(params, "state"), paramInt(params, "limit", req.Limit))
+		botID := req.BotID
+		if botID == "" {
+			botID = paramString(params, "bot_id")
+		}
+		list, err := svc.ListForBot(ctx, botID, paramString(params, "state"), paramInt(params, "limit", req.Limit))
 		return s.scheduleResult(map[string]any{"schedules": list}), true, err
 	case "get_schedule":
 		sch, err := svc.Get(ctx, id)
@@ -352,6 +385,22 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		in, err := schedule.CreateInputFromMap(params, svc.Config(), paramString(params, "session_id"), "")
 		if err != nil {
 			return nil, true, err
+		}
+		if req.BotID != "" {
+			in.BotID = req.BotID
+		}
+		in.BotID = effectiveBotID(in.BotID)
+		profile, err := s.m.GetBot(ctx, in.BotID)
+		if err != nil {
+			return nil, true, err
+		}
+		if !profile.Enabled || s.m.IsBotDeleting(in.BotID) {
+			return nil, true, fmt.Errorf("%w: %s", ErrBotDisabled, in.BotID)
+		}
+		if in.CreatedBy.SessionID != "" {
+			if _, _, err := s.m.GetSessionForBot(in.BotID, in.CreatedBy.SessionID); err != nil {
+				return nil, true, err
+			}
 		}
 		sch, err := svc.Create(ctx, in)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err

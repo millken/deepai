@@ -44,6 +44,11 @@ const (
 	EventScheduleRunUpdated  EventType = "schedule_run_updated"
 	EventScheduleRunFinished EventType = "schedule_run_finished"
 
+	// Global bot_* events (docs/BOT_MULTI_DESIGN.md §5.4).
+	EventBotCreated EventType = "bot_created"
+	EventBotUpdated EventType = "bot_updated"
+	EventBotDeleted EventType = "bot_deleted"
+
 	// EventGap (seq 0) tells a client that events it asked for were evicted
 	// from the replay buffer or that it fell behind: reload the session
 	// transcript, then resubscribe from the session's last_seq.
@@ -58,6 +63,7 @@ const (
 // miss nothing that is still in the replay buffer.
 type Event struct {
 	Seq       int64     `json:"seq"`
+	BotID     string    `json:"bot_id,omitempty"`
 	SessionID string    `json:"session_id"`
 	TurnID    string    `json:"turn_id,omitempty"`
 	Type      EventType `json:"type"`
@@ -74,6 +80,7 @@ type Event struct {
 	Session  *SessionInfo         `json:"session,omitempty"`
 	Schedule *schedule.Schedule   `json:"schedule,omitempty"`
 	Run      *schedule.Run        `json:"run,omitempty"`
+	Bot      *BotProfile          `json:"bot,omitempty"`
 }
 
 // Question is an ask_clarification call waiting for a client to answer it.
@@ -128,6 +135,7 @@ const (
 // SessionInfo is the listing/detail view of a session.
 type SessionInfo struct {
 	ID        string        `json:"id"`
+	BotID     string        `json:"bot_id,omitempty"`
 	Title     string        `json:"title,omitempty"`
 	Model     string        `json:"model,omitempty"`
 	Status    SessionStatus `json:"status"`
@@ -170,10 +178,12 @@ type ModelInfo struct {
 
 // Info is the body of GET /v1/info.
 type Info struct {
-	Name         string      `json:"name"`
-	Version      string      `json:"version,omitempty"`
-	WorkDir      string      `json:"work_dir,omitempty"`
-	DefaultModel string      `json:"default_model,omitempty"`
-	Models       []ModelInfo `json:"models,omitempty"`
-	StartedAt    time.Time   `json:"started_at"`
+	Name         string       `json:"name"`
+	Version      string       `json:"version,omitempty"`
+	WorkDir      string       `json:"work_dir,omitempty"`
+	DefaultModel string       `json:"default_model,omitempty"`
+	DefaultBotID string       `json:"default_bot_id,omitempty"`
+	Models       []ModelInfo  `json:"models,omitempty"`
+	Bots         []BotProfile `json:"bots,omitempty"`
+	StartedAt    time.Time    `json:"started_at"`
 }

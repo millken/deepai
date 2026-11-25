@@ -47,17 +47,18 @@ func scheduleConfig(cfg commands.Config) schedule.Config {
 	return out
 }
 
-// newScheduleService builds the Service on bot.db (or in memory under
-// --ephemeral) and registers the single `schedule` tool. A disabled config
-// returns (nil, nil, cfg, nil): no tool, no tables, no scheduler.
-func newScheduleService(registry *tools.Registry, cfg commands.Config, db *sql.DB) (*schedule.Service, schedule.Store, schedule.Config, error) {
+// newScheduleService builds the Service on bot.db (scoped to workDir so
+// multiple repos sharing ~/.deepai/bot/bot.db keep independent leases and
+// tasks) or in memory under --ephemeral, and registers the `schedule` tool.
+func newScheduleService(registry *tools.Registry, cfg commands.Config, db *sql.DB, workDir string) (*schedule.Service, schedule.Store, schedule.Config, error) {
 	c := scheduleConfig(cfg)
+	c.WorkDir = workDir
 	if !c.Enabled {
 		return nil, nil, c, nil
 	}
 	var store schedule.Store
 	if db != nil {
-		store = schedule.NewSQLiteStore(db)
+		store = schedule.NewSQLiteStoreForDir(db, workDir)
 	} else {
 		store = schedule.NewMemoryStore()
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/memory"
 	"github.com/millken/deepai/pkg/sandbox"
+	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -105,6 +106,11 @@ func (r *AgentRuntime) DefaultModel() string { return r.cfg.Models.DefaultName()
 
 func (r *AgentRuntime) HasModel(alias string) bool { return r.cfg.Models.Has(alias) }
 
+// ValidateToolAllowlist checks allowlist patterns against the runtime's tools.
+func (r *AgentRuntime) ValidateToolAllowlist(allowlist []string) []string {
+	return r.cfg.Tools.ValidateAllowlist(allowlist)
+}
+
 func (r *AgentRuntime) NewConversation(sessionID string) (Conversation, error) {
 	sb, err := sandbox.NewSession(r.cfg.SandboxBaseDir, sandbox.Config{})
 	if err != nil {
@@ -155,37 +161,59 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		maxToolCalls = in.MaxToolCalls
 	}
 
+	toolsReg := cfg.Tools
+	disableEnterPlan := false
+	if len(in.BotToolAllowlist) > 0 {
+		toolsReg = toolsReg.Subset(in.BotToolAllowlist)
+		if !tools.MatchAllowlist("enter_plan_mode", in.BotToolAllowlist) {
+			disableEnterPlan = true
+		}
+	}
+	if len(in.ToolAllowlist) > 0 {
+		toolsReg = toolsReg.Subset(in.ToolAllowlist)
+		if !tools.MatchAllowlist("enter_plan_mode", in.ToolAllowlist) {
+			disableEnterPlan = true
+		}
+	}
+
+	memUserID := cfg.MemoryUserID
+	if uid := strings.TrimSpace(in.MemoryUserID); uid != "" {
+		memUserID = uid
+	}
+
 	a := agent.New(agent.AgentConfig{
-		LLMProvider:     provider,
-		Tools:           cfg.Tools,
-		Sandbox:         c.sb,
-		Model:           modelName,
-		ContextWindow:   contextWindow,
-		ReasoningEffort: effort,
-		MaxToolCalls:    maxToolCalls,
-		MaxTokens:       cfg.MaxTokens,
-		Temperature:     temperature,
-		RequestTimeout:  cfg.RequestTimeout,
-		UserInteraction: in.Interaction,
-		WorkDir:         cfg.WorkDir,
-		MemoryService:   cfg.MemoryService,
-		MemoryExtractor: cfg.MemoryExtractor,
-		MemoryUserID:    cfg.MemoryUserID,
-		ImageDetail:     "low",
-		AgentCatalog:    cfg.AgentCatalog,
-		Session:         carry,
-		KeepFullTurns:   cfg.KeepFullTurns,
-		OffloadBytes:    cfg.ToolOffloadBytes,
-		Summarizer:      c.summarizer(in.Model),
+		LLMProvider:        provider,
+		Tools:              toolsReg,
+		Sandbox:            c.sb,
+		Model:              modelName,
+		ContextWindow:      contextWindow,
+		ReasoningEffort:    effort,
+		TurnInjectionExtra: cfg.SystemPromptSuffix,
+		DisableEnterPlan:   disableEnterPlan,
+		MaxToolCalls:       maxToolCalls,
+		MaxTokens:          cfg.MaxTokens,
+		Temperature:        temperature,
+		RequestTimeout:     cfg.RequestTimeout,
+		UserInteraction:    in.Interaction,
+		WorkDir:            cfg.WorkDir,
+		MemoryService:      cfg.MemoryService,
+		MemoryExtractor:    cfg.MemoryExtractor,
+		MemoryUserID:       memUserID,
+		ImageDetail:        "low",
+		AgentCatalog:       cfg.AgentCatalog,
+		Session:            carry,
+		KeepFullTurns:      cfg.KeepFullTurns,
+		OffloadBytes:       cfg.ToolOffloadBytes,
+		Summarizer:         c.summarizer(in.Model),
 	})
 	if cfg.SystemPrompt != "" {
 		a.AppendSystemPrompt(cfg.SystemPrompt)
 	}
-	if cfg.SystemPromptSuffix != nil {
-		if suffix := cfg.SystemPromptSuffix(); suffix != "" {
-			a.AppendSystemPrompt(suffix)
-		}
+	if extra := strings.TrimSpace(in.SystemPromptExtra); extra != "" {
+		a.AppendSystemPrompt("## Bot Instructions\n\n" + extra)
 	}
+
+	ctx = schedule.WithBotID(ctx, effectiveBotID(in.BotID))
 
 	gate := &emitGate{emit: in.Emit}
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {

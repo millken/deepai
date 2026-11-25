@@ -71,6 +71,26 @@ func NewServer(opts ServerOptions) *Server {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	s.mux.Handle("GET /v1/info", s.auth(s.handleInfo))
+
+	// Bot management + bot-scoped session/schedule routes (docs/BOT_MULTI_DESIGN.md §5).
+	s.mux.Handle("GET /v1/bots", s.auth(s.handleListBots))
+	s.mux.Handle("POST /v1/bots", s.auth(s.handleCreateBot))
+	s.mux.Handle("GET /v1/bots/{bot_id}", s.auth(s.handleGetBot))
+	s.mux.Handle("PATCH /v1/bots/{bot_id}", s.auth(s.handleUpdateBot))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}", s.auth(s.handleDeleteBot))
+	s.mux.Handle("GET /v1/bots/{bot_id}/sessions", s.auth(s.handleListSessions))
+	s.mux.Handle("POST /v1/bots/{bot_id}/sessions", s.auth(s.handleCreateSession))
+	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleGetSession))
+	s.mux.Handle("PATCH /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleRenameSession))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleDeleteSession))
+	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/messages", s.auth(s.handleSend))
+	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/cancel", s.auth(s.handleCancel))
+	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/answer", s.auth(s.handleAnswer))
+	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}/events", s.auth(s.handleSessionEvents))
+	s.mux.Handle("GET /v1/bots/{bot_id}/schedules", s.auth(s.handleListSchedules))
+	s.mux.Handle("POST /v1/bots/{bot_id}/schedules", s.auth(s.handleCreateSchedule))
+
+	// Flat aliases bound to default bot + current workdir.
 	s.mux.Handle("GET /v1/sessions", s.auth(s.handleListSessions))
 	s.mux.Handle("POST /v1/sessions", s.auth(s.handleCreateSession))
 	s.mux.Handle("GET /v1/sessions/{id}", s.auth(s.handleGetSession))
@@ -180,9 +200,66 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.m.Info())
 }
 
+func botIDFromRequest(r *http.Request) string {
+	return effectiveBotID(r.PathValue("bot_id"))
+}
+
+func (s *Server) handleListBots(w http.ResponseWriter, r *http.Request) {
+	list, err := s.m.ListBots(r.Context())
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bots": list})
+}
+
+func (s *Server) handleCreateBot(w http.ResponseWriter, r *http.Request) {
+	var req CreateBotRequest
+	if !readJSON(w, r, &req, false) {
+		return
+	}
+	b, err := s.m.CreateBot(r.Context(), req)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, b)
+}
+
+func (s *Server) handleGetBot(w http.ResponseWriter, r *http.Request) {
+	b, err := s.m.GetBot(r.Context(), r.PathValue("bot_id"))
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+func (s *Server) handleUpdateBot(w http.ResponseWriter, r *http.Request) {
+	var req UpdateBotRequest
+	if !readJSON(w, r, &req, false) {
+		return
+	}
+	b, err := s.m.UpdateBot(r.Context(), r.PathValue("bot_id"), req)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+func (s *Server) handleDeleteBot(w http.ResponseWriter, r *http.Request) {
+	force := r.URL.Query().Get("force") == "1" || strings.EqualFold(r.URL.Query().Get("force"), "true")
+	if err := s.m.DeleteBot(r.Context(), r.PathValue("bot_id"), force); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	list, err := s.m.ListSessions(limit)
+	list, err := s.m.ListSessionsForBot(botIDFromRequest(r), limit)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -195,7 +272,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req, true) {
 		return
 	}
-	info, err := s.m.CreateSession(req)
+	info, err := s.m.CreateSessionForBot(botIDFromRequest(r), req)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -204,7 +281,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
-	info, msgs, err := s.m.GetSession(r.PathValue("id"))
+	info, msgs, err := s.m.GetSessionForBot(botIDFromRequest(r), r.PathValue("id"))
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -219,7 +296,7 @@ func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req, false) {
 		return
 	}
-	info, err := s.m.RenameSession(r.PathValue("id"), req.Title)
+	info, err := s.m.RenameSessionForBot(botIDFromRequest(r), r.PathValue("id"), req.Title)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -228,7 +305,7 @@ func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
-	if err := s.m.DeleteSession(r.PathValue("id")); err != nil {
+	if err := s.m.DeleteSessionForBot(botIDFromRequest(r), r.PathValue("id")); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -248,6 +325,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 // mid-stream does not cancel it (use /cancel), and can pick the events back
 // up from /events?since=<last seq>.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+	botID := botIDFromRequest(r)
 	id := r.PathValue("id")
 	var req SendRequest
 	if !readJSON(w, r, &req, false) {
@@ -258,14 +336,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var sub *Subscription
 	if mode != "" {
 		var err error
-		sub, _, _, err = s.m.Subscribe(id, -1)
+		sub, _, _, err = s.m.SubscribeForBot(botID, id, -1)
 		if err != nil {
 			s.writeErr(w, err)
 			return
 		}
 		defer sub.Close()
 	}
-	turn, err := s.m.Send(id, req)
+	turn, err := s.m.SendForBot(botID, id, req, SendOptions{})
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -292,7 +370,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	if err := s.m.Cancel(r.PathValue("id")); err != nil {
+	if err := s.m.CancelForBot(botIDFromRequest(r), r.PathValue("id")); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -304,7 +382,7 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req, false) {
 		return
 	}
-	if err := s.m.Answer(r.PathValue("id"), req.QuestionID, req.Answer); err != nil {
+	if err := s.m.AnswerForBot(botIDFromRequest(r), r.PathValue("id"), req.QuestionID, req.Answer); err != nil {
 		s.writeErr(w, err)
 		return
 	}
@@ -312,7 +390,7 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
-	sub, backlog, gap, err := s.m.Subscribe(r.PathValue("id"), sinceParam(r))
+	sub, backlog, gap, err := s.m.SubscribeForBot(botIDFromRequest(r), r.PathValue("id"), sinceParam(r))
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -501,6 +579,20 @@ func errorStatus(err error) (int, string) {
 		return schedule.HTTPStatus(err), string(schedule.ErrorCode(err))
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound, "not_found"
+	case errors.Is(err, ErrUnknownBot):
+		return http.StatusNotFound, "unknown_bot"
+	case errors.Is(err, ErrBotDisabled):
+		return http.StatusForbidden, "bot_disabled"
+	case errors.Is(err, ErrBotHasSessions):
+		return http.StatusConflict, "bot_has_sessions"
+	case errors.Is(err, ErrBotDeleteForbidden):
+		return http.StatusMethodNotAllowed, "method_not_allowed"
+	case errors.Is(err, ErrBotExists):
+		return http.StatusConflict, "bot_exists"
+	case errors.Is(err, ErrInvalidBot):
+		return http.StatusBadRequest, "bad_request"
+	case errors.Is(err, ErrUnknownTool):
+		return http.StatusBadRequest, "unknown_tool"
 	case errors.Is(err, ErrBusy):
 		return http.StatusConflict, "busy"
 	case errors.As(err, &locked):

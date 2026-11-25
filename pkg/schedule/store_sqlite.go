@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -13,16 +14,29 @@ import (
 // SQLiteStore keeps schedules/runs in deepai-bot's own bot.db. The package
 // only uses database/sql; the driver is opened by the command that wires the
 // bot together (cmd/deepai-bot), so the CLI never touches these tables.
+//
+// When workDir is non-empty (NewSQLiteStoreForDir), every schedule query,
+// run lookup, lease and meta version is isolated to that work_dir bucket so
+// multiple deepai-bot processes serving different repositories over the same
+// ~/.deepai/bot/bot.db never steal each other's leases or fire across repos.
 type SQLiteStore struct {
-	db *sql.DB
+	db      *sql.DB
+	workDir string
 }
 
-// NewSQLiteStore wraps an already-open bot.db connection.
+// NewSQLiteStore wraps an already-open bot.db connection without work_dir scoping.
 func NewSQLiteStore(db *sql.DB) *SQLiteStore { return &SQLiteStore{db: db} }
+
+// NewSQLiteStoreForDir wraps bot.db scoped to a specific workDir bucket.
+func NewSQLiteStoreForDir(db *sql.DB, workDir string) *SQLiteStore {
+	return &SQLiteStore{db: db, workDir: strings.TrimSpace(workDir)}
+}
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL DEFAULT 'default',
+  work_dir TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,
   prompt TEXT NOT NULL,
   trigger_json TEXT NOT NULL,
@@ -69,22 +83,104 @@ CREATE TABLE IF NOT EXISTS schedule_runs (
 CREATE INDEX IF NOT EXISTS schedule_runs_by_schedule ON schedule_runs(schedule_id, seq DESC);
 CREATE INDEX IF NOT EXISTS schedule_runs_active ON schedule_runs(status);
 
-CREATE TABLE IF NOT EXISTS schedule_lease (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS schedule_leases (
+  work_dir TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS schedule_meta (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  version INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS schedule_metas (
+  work_dir TEXT PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO schedule_meta (id, version) VALUES (1, 0);
 `
 
-// Migrate creates the schedule tables and bumps the schema version.
+// Migrate creates or upgrades the schedule tables idempotently.
 func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("migrate schedule schema: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "schedules", "bot_id", "TEXT NOT NULL DEFAULT 'default'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "schedules", "work_dir", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_schedules_workdir_bot_next ON schedules(work_dir, bot_id, state, next_run_at)`); err != nil {
+		return fmt.Errorf("create schedule workdir index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schedule_metas (work_dir, version) VALUES (?, 0)`, s.workDir); err != nil {
+		return fmt.Errorf("init schedule meta: %w", err)
+	}
+	if s.workDir != "" {
+		if err := s.backfillLegacyWorkDir(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ensureColumn(ctx context.Context, table, col, def string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, def)); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("add %s.%s: %w", table, col, err)
+	}
+	return nil
+}
+
+// backfillLegacyWorkDir assigns pre-v2 schedules (work_dir = '') to their
+// session's cwd when a sessions table exists and has a non-empty cwd.
+// Sessionless legacy schedules are left with work_dir = '' rather than being
+// blindly claimed by whichever repo calls Migrate first, and are logged as a
+// warning so operators can explicitly claim or clean them up.
+func (s *SQLiteStore) backfillLegacyWorkDir(ctx context.Context) error {
+	var hasSessions int
+	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'`).Scan(&hasSessions)
+	if hasSessions > 0 {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE schedules
+			SET work_dir = (SELECT cwd FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')
+			WHERE work_dir = ''
+			  AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')`); err != nil {
+			return fmt.Errorf("backfill schedule work_dir from sessions: %w", err)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state FROM schedules WHERE work_dir = '' AND state != ?`, string(StateDeleted))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var orphans []string
+	for rows.Next() {
+		var id, name, state string
+		if err := rows.Scan(&id, &name, &state); err == nil {
+			orphans = append(orphans, fmt.Sprintf("%s(%s,%s)", id, name, state))
+		}
+	}
+	if len(orphans) > 0 {
+		slog.Warn("schedule: legacy schedules without session cwd left unowned (work_dir=''); run UPDATE schedules SET work_dir='<repo>' WHERE id='...' to claim or mark deleted",
+			"count", len(orphans), "schedules", strings.Join(orphans, ", "))
 	}
 	return nil
 }
@@ -92,7 +188,9 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 func (s *SQLiteStore) Close() error { return nil } // the connection belongs to the caller
 
 func (s *SQLiteStore) bump(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE schedule_meta SET version = version + 1 WHERE id = 1`)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO schedule_metas (work_dir, version) VALUES (?, 1)
+		ON CONFLICT(work_dir) DO UPDATE SET version = version + 1`, s.workDir)
 	return err
 }
 
@@ -135,12 +233,17 @@ func jsonString(v any) string {
 }
 
 func (s *SQLiteStore) InsertSchedule(ctx context.Context, v Schedule) error {
+	botID := effectiveBotID(v.BotID)
+	workDir := v.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO schedules
-		  (id, name, prompt, trigger_json, timezone, options_json, session_id, state,
+		  (id, bot_id, work_dir, name, prompt, trigger_json, timezone, options_json, session_id, state,
 		   created_by_json, next_run_at, last_run_json, run_count, created_at, updated_at, deleted_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		v.ID, v.Name, v.Prompt, jsonString(v.Trigger), v.Timezone, jsonString(v.Options),
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		v.ID, botID, workDir, v.Name, v.Prompt, jsonString(v.Trigger), v.Timezone, jsonString(v.Options),
 		nullableString(v.SessionID), string(v.State), jsonString(v.CreatedBy), msPtr(v.NextRunAt),
 		nullableJSON(v.LastRun), v.RunCount, ms(v.CreatedAt), ms(v.UpdatedAt), msPtr(v.DeletedAt))
 	if err != nil {
@@ -150,13 +253,25 @@ func (s *SQLiteStore) InsertSchedule(ctx context.Context, v Schedule) error {
 }
 
 func (s *SQLiteStore) UpdateSchedule(ctx context.Context, v Schedule) error {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE schedules SET name=?, prompt=?, trigger_json=?, timezone=?, options_json=?,
+	botID := effectiveBotID(v.BotID)
+	workDir := v.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
+	query := `
+		UPDATE schedules SET bot_id=?, work_dir=?, name=?, prompt=?, trigger_json=?, timezone=?, options_json=?,
 		  session_id=?, state=?, created_by_json=?, next_run_at=?, last_run_json=?,
-		  run_count=?, created_at=?, updated_at=?, deleted_at=? WHERE id=?`,
-		v.Name, v.Prompt, jsonString(v.Trigger), v.Timezone, jsonString(v.Options),
+		  run_count=?, created_at=?, updated_at=?, deleted_at=? WHERE id=?`
+	args := []any{
+		botID, workDir, v.Name, v.Prompt, jsonString(v.Trigger), v.Timezone, jsonString(v.Options),
 		nullableString(v.SessionID), string(v.State), jsonString(v.CreatedBy), msPtr(v.NextRunAt),
-		nullableJSON(v.LastRun), v.RunCount, ms(v.CreatedAt), ms(v.UpdatedAt), msPtr(v.DeletedAt), v.ID)
+		nullableJSON(v.LastRun), v.RunCount, ms(v.CreatedAt), ms(v.UpdatedAt), msPtr(v.DeletedAt), v.ID,
+	}
+	if s.workDir != "" {
+		query += ` AND work_dir=?`
+		args = append(args, s.workDir)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -167,10 +282,13 @@ func (s *SQLiteStore) UpdateSchedule(ctx context.Context, v Schedule) error {
 }
 
 func (s *SQLiteStore) GetSchedule(ctx context.Context, id string) (Schedule, error) {
+	if s.workDir != "" {
+		return scanSchedule(s.db.QueryRowContext(ctx, `SELECT `+scheduleColumns+` FROM schedules WHERE id = ? AND work_dir = ?`, id, s.workDir))
+	}
 	return scanSchedule(s.db.QueryRowContext(ctx, `SELECT `+scheduleColumns+` FROM schedules WHERE id = ?`, id))
 }
 
-const scheduleColumns = `id, name, prompt, trigger_json, timezone, options_json, session_id, state,
+const scheduleColumns = `id, bot_id, work_dir, name, prompt, trigger_json, timezone, options_json, session_id, state,
   created_by_json, next_run_at, last_run_json, run_count, created_at, updated_at, deleted_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
@@ -181,13 +299,16 @@ func scanSchedule(row rowScanner) (Schedule, error) {
 	var sessionID, lastRunJSON sql.NullString
 	var nextRunAt, deletedAt sql.NullInt64
 	var createdAt, updatedAt int64
-	if err := row.Scan(&v.ID, &v.Name, &v.Prompt, &triggerJSON, &v.Timezone, &optionsJSON,
+	if err := row.Scan(&v.ID, &v.BotID, &v.WorkDir, &v.Name, &v.Prompt, &triggerJSON, &v.Timezone, &optionsJSON,
 		&sessionID, &v.State, &createdByJSON, &nextRunAt, &lastRunJSON,
 		&v.RunCount, &createdAt, &updatedAt, &deletedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Schedule{}, fmt.Errorf("%w: schedule", ErrNotFound)
 		}
 		return Schedule{}, err
+	}
+	if v.BotID == "" {
+		v.BotID = DefaultBotID
 	}
 	_ = json.Unmarshal([]byte(triggerJSON), &v.Trigger)
 	_ = json.Unmarshal([]byte(optionsJSON), &v.Options)
@@ -206,6 +327,18 @@ func scanSchedule(row rowScanner) (Schedule, error) {
 func (s *SQLiteStore) ListSchedules(ctx context.Context, f ScheduleFilter) ([]Schedule, error) {
 	query := `SELECT ` + scheduleColumns + ` FROM schedules WHERE 1=1`
 	var args []any
+	workDir := f.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
+	if workDir != "" {
+		query += ` AND work_dir = ?`
+		args = append(args, workDir)
+	}
+	if f.BotID != "" {
+		query += ` AND bot_id = ?`
+		args = append(args, f.BotID)
+	}
 	if !f.IncludeDeleted {
 		query += ` AND state != ?`
 		args = append(args, string(StateDeleted))
@@ -276,12 +409,22 @@ func (s *SQLiteStore) UpdateRun(ctx context.Context, r Run) error {
 }
 
 func (s *SQLiteStore) GetRun(ctx context.Context, id string) (Run, error) {
+	if s.workDir != "" {
+		return scanRun(s.db.QueryRowContext(ctx, `
+			SELECT `+runColumnsQualified+`
+			FROM schedule_runs r JOIN schedules sc ON sc.id = r.schedule_id
+			WHERE r.id = ? AND sc.work_dir = ?`, id, s.workDir))
+	}
 	return scanRun(s.db.QueryRowContext(ctx, `SELECT `+runColumns+` FROM schedule_runs WHERE id = ?`, id))
 }
 
 const runColumns = `id, schedule_id, seq, trigger, slot, scheduled_for, request_id, coalesced,
   queued_reason, queue_deadline, started_at, ended_at, session_id, turn_id, status,
   auto_answers, cancel_requested_at, output, error, error_code, usage_json, tool_calls`
+
+const runColumnsQualified = `r.id, r.schedule_id, r.seq, r.trigger, r.slot, r.scheduled_for, r.request_id, r.coalesced,
+  r.queued_reason, r.queue_deadline, r.started_at, r.ended_at, r.session_id, r.turn_id, r.status,
+  r.auto_answers, r.cancel_requested_at, r.output, r.error, r.error_code, r.usage_json, r.tool_calls`
 
 func scanRun(row rowScanner) (Run, error) {
 	var r Run
@@ -310,37 +453,43 @@ func scanRun(row rowScanner) (Run, error) {
 }
 
 func (s *SQLiteStore) FindRun(ctx context.Context, f RunFilter) ([]Run, error) {
-	query := `SELECT ` + runColumns + ` FROM schedule_runs WHERE 1=1`
+	query := `SELECT ` + runColumnsQualified + ` FROM schedule_runs r`
 	var args []any
+	if s.workDir != "" {
+		query += ` JOIN schedules sc ON sc.id = r.schedule_id WHERE sc.work_dir = ?`
+		args = append(args, s.workDir)
+	} else {
+		query += ` WHERE 1=1`
+	}
 	if f.ScheduleID != "" {
-		query += ` AND schedule_id = ?`
+		query += ` AND r.schedule_id = ?`
 		args = append(args, f.ScheduleID)
 	}
 	if f.RequestID != "" {
-		query += ` AND request_id = ?`
+		query += ` AND r.request_id = ?`
 		args = append(args, f.RequestID)
 	}
 	if f.Slot != nil {
-		query += ` AND slot = ?`
+		query += ` AND r.slot = ?`
 		args = append(args, ms(*f.Slot))
 	}
 	if f.Since != nil {
-		query += ` AND scheduled_for >= ?`
+		query += ` AND r.scheduled_for >= ?`
 		args = append(args, ms(*f.Since))
 	}
 	if len(f.Statuses) > 0 {
-		query += ` AND status IN (` + strings.Repeat(",?", len(f.Statuses))[1:] + `)`
+		query += ` AND r.status IN (` + strings.Repeat(",?", len(f.Statuses))[1:] + `)`
 		for _, st := range f.Statuses {
 			args = append(args, string(st))
 		}
 	}
 	if f.CancelRequested {
-		query += ` AND cancel_requested_at IS NOT NULL`
+		query += ` AND r.cancel_requested_at IS NOT NULL`
 	}
 	if f.Order == "scheduled_for_asc" {
-		query += ` ORDER BY scheduled_for ASC, seq ASC`
+		query += ` ORDER BY r.scheduled_for ASC, r.seq ASC`
 	} else {
-		query += ` ORDER BY seq DESC`
+		query += ` ORDER BY r.seq DESC`
 	}
 	if f.Limit > 0 {
 		query += ` LIMIT ?`
@@ -362,6 +511,57 @@ func (s *SQLiteStore) FindRun(ctx context.Context, f RunFilter) ([]Run, error) {
 	return out, rows.Err()
 }
 
+func (s *SQLiteStore) CountByBot(ctx context.Context, botID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedules WHERE bot_id = ? AND state != ?`,
+		effectiveBotID(botID), string(StateDeleted)).Scan(&n)
+	return n, err
+}
+
+func (s *SQLiteStore) DeleteByBot(ctx context.Context, botID string) error {
+	target := effectiveBotID(botID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT work_dir FROM schedules WHERE bot_id = ?`, target)
+	if err != nil {
+		return err
+	}
+	var dirs []string
+	for rows.Next() {
+		var wd string
+		if err := rows.Scan(&wd); err != nil {
+			rows.Close()
+			return err
+		}
+		dirs = append(dirs, wd)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedules WHERE bot_id = ?)`, target); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM schedules WHERE bot_id = ?`, target); err != nil {
+		return err
+	}
+	for _, wd := range dirs {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO schedule_metas (work_dir, version) VALUES (?, 1)
+			ON CONFLICT(work_dir) DO UPDATE SET version = version + 1`, wd); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // PruneRuns keeps at most `keep` terminal runs per schedule. The OFFSET form
 // deletes everything after the newest `keep`, ordered by seq.
 func (s *SQLiteStore) PruneRuns(ctx context.Context, scheduleID string, keep int) error {
@@ -380,13 +580,14 @@ func (s *SQLiteStore) PruneRuns(ctx context.Context, scheduleID string, keep int
 	return s.bump(ctx)
 }
 
-// AcquireLease atomically takes (or steals an expired) single-writer lease.
+// AcquireLease atomically takes (or steals an expired) single-writer lease for
+// this store's work_dir bucket.
 func (s *SQLiteStore) AcquireLease(ctx context.Context, owner string, now, expiresAt time.Time) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO schedule_lease (id, owner, expires_at) VALUES (1, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
-		WHERE schedule_lease.owner = excluded.owner OR schedule_lease.expires_at <= ?`,
-		owner, ms(expiresAt), ms(now))
+		INSERT INTO schedule_leases (work_dir, owner, expires_at) VALUES (?, ?, ?)
+		ON CONFLICT(work_dir) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+		WHERE schedule_leases.owner = excluded.owner OR schedule_leases.expires_at <= ?`,
+		s.workDir, owner, ms(expiresAt), ms(now))
 	if err != nil {
 		return false, err
 	}
@@ -395,7 +596,7 @@ func (s *SQLiteStore) AcquireLease(ctx context.Context, owner string, now, expir
 }
 
 func (s *SQLiteStore) RenewLease(ctx context.Context, owner string, expiresAt time.Time) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE schedule_lease SET expires_at = ? WHERE id = 1 AND owner = ?`, ms(expiresAt), owner)
+	res, err := s.db.ExecContext(ctx, `UPDATE schedule_leases SET expires_at = ? WHERE work_dir = ? AND owner = ?`, ms(expiresAt), s.workDir, owner)
 	if err != nil {
 		return false, err
 	}
@@ -404,7 +605,7 @@ func (s *SQLiteStore) RenewLease(ctx context.Context, owner string, expiresAt ti
 }
 
 func (s *SQLiteStore) ReleaseLease(ctx context.Context, owner string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_lease WHERE id = 1 AND owner = ?`, owner)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_leases WHERE work_dir = ? AND owner = ?`, s.workDir, owner)
 	return err
 }
 

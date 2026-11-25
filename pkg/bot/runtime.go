@@ -46,6 +46,14 @@ type TurnInput struct {
 	// MaxToolCalls overrides the runtime-wide limit for this turn only.
 	// 0 means "use the bot configuration" (design §3.1 max_tool_calls).
 	MaxToolCalls int
+
+	// Multi-bot per-turn overrides (docs/BOT_MULTI_DESIGN.md §6.3). Empty
+	// values preserve single-bot default behavior.
+	BotID             string
+	SystemPromptExtra string
+	MemoryUserID      string
+	BotToolAllowlist  []string
+	ToolAllowlist     []string
 }
 
 // TurnOutput is what a finished (or interrupted) turn produced.

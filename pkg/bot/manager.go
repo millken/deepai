@@ -14,6 +14,7 @@ import (
 
 	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
+	"github.com/millken/deepai/pkg/schedule"
 	"github.com/millken/deepai/pkg/tools"
 )
 
@@ -38,6 +39,9 @@ const lockRefreshInterval = 20 * time.Second
 type Options struct {
 	Runtime Runtime
 	Store   Store
+	// Bots persists multi-bot personas (optional; defaults to Store when it
+	// implements BotRegistry, else an in-memory registry with "default").
+	Bots BotRegistry
 	// WorkDir is recorded on created sessions (the store's cwd column) and
 	// scopes the Manager to them: sessions from other directories are
 	// neither listed nor opened (ErrNotFound). Empty disables scoping.
@@ -60,6 +64,8 @@ type Options struct {
 // transport is a thin adapter over its methods.
 type Manager struct {
 	opts      Options
+	bots      BotRegistry
+	schedules *schedule.Service
 	log       *slog.Logger
 	owner     models.LockOwner
 	startedAt time.Time
@@ -69,15 +75,20 @@ type Manager struct {
 	turns     sync.WaitGroup
 	global    *bus
 
-	mu       sync.Mutex
-	sessions map[string]*session
-	seqFloor map[string]int64 // last seq of sessions unloaded by the janitor
-	closed   bool
-	stopJan  chan struct{}
+	botMu sync.Mutex // serializes CreateBot / UpdateBot / DeleteBot
+
+	mu           sync.Mutex
+	sessions     map[string]*session
+	seqFloor     map[string]int64 // last seq of sessions unloaded by the janitor
+	deletingBots map[string]struct{}
+	botTurns     map[string]int
+	closed       bool
+	stopJan      chan struct{}
 }
 
 type session struct {
-	id string
+	id    string
+	botID string
 
 	mu        sync.Mutex
 	title     string
@@ -92,14 +103,16 @@ type session struct {
 }
 
 type activeTurn struct {
-	id           string
-	cancel       context.CancelFunc
-	clock        *turnClock
-	hooks        turnHooks
-	maxToolCalls int
-	done         chan struct{}
-	summary      *TurnSummary
-	questions    map[string]*pendingQuestion
+	id            string
+	cancel        context.CancelFunc
+	clock         *turnClock
+	hooks         turnHooks
+	maxToolCalls  int
+	botProfile    BotProfile
+	toolAllowlist []string
+	done          chan struct{}
+	summary       *TurnSummary
+	questions     map[string]*pendingQuestion
 }
 
 type pendingQuestion struct {
@@ -115,6 +128,17 @@ func NewManager(opts Options) (*Manager, error) {
 	if opts.Store == nil {
 		opts.Store = NewMemoryStore()
 	}
+	bots := opts.Bots
+	if bots == nil {
+		if br, ok := opts.Store.(BotRegistry); ok {
+			bots = br
+		} else {
+			bots = NewMemoryStore()
+		}
+	}
+	if err := bots.EnsureDefault(context.Background()); err != nil {
+		return nil, fmt.Errorf("bot: ensure default bot: %w", err)
+	}
 	if opts.IdleTimeout == 0 {
 		opts.IdleTimeout = 30 * time.Minute
 	}
@@ -126,6 +150,7 @@ func NewManager(opts Options) (*Manager, error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	m := &Manager{
 		opts:      opts,
+		bots:      bots,
 		log:       log,
 		owner:     models.LockOwner{PID: os.Getpid(), Host: host},
 		startedAt: time.Now().UTC(),
@@ -133,15 +158,44 @@ func NewManager(opts Options) (*Manager, error) {
 		// The cause propagates to every turn's context, so turn_end can
 		// report cancel_source=shutdown (design §3.2).
 		cancelAll: func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
-		global:    newBus(opts.ReplayEvents),
-		sessions:  map[string]*session{},
-		seqFloor:  map[string]int64{},
-		stopJan:   make(chan struct{}),
+		global:       newBus(opts.ReplayEvents),
+		sessions:     map[string]*session{},
+		seqFloor:     map[string]int64{},
+		deletingBots: map[string]struct{}{},
+		botTurns:     map[string]int{},
+		stopJan:      make(chan struct{}),
 	}
 	if opts.IdleTimeout > 0 {
 		go m.janitor()
 	}
 	return m, nil
+}
+
+// SetSchedules attaches the optional schedule.Service so ListBots and
+// DeleteBot can inspect, cancel and cascade-delete bot-owned schedules.
+func (m *Manager) SetSchedules(svc *schedule.Service) {
+	m.mu.Lock()
+	m.schedules = svc
+	m.mu.Unlock()
+}
+
+// IsBotDeleting reports whether DeleteBot is currently draining botID.
+func (m *Manager) IsBotDeleting(id string) bool {
+	id = effectiveBotID(id)
+	m.mu.Lock()
+	_, ok := m.deletingBots[id]
+	m.mu.Unlock()
+	return ok
+}
+
+func (m *Manager) decBotTurn(botID string) {
+	m.mu.Lock()
+	if n := m.botTurns[botID]; n <= 1 {
+		delete(m.botTurns, botID)
+	} else {
+		m.botTurns[botID] = n - 1
+	}
+	m.mu.Unlock()
 }
 
 // Info describes the bot.
@@ -153,15 +207,329 @@ func (m *Manager) Info() Info {
 	if info.WorkDir == "" {
 		info.WorkDir = m.opts.WorkDir
 	}
+	info.DefaultBotID = DefaultBotID
+	if bots, err := m.bots.ListBots(context.Background()); err == nil {
+		info.Bots = bots
+	}
 	info.StartedAt = m.startedAt
 	return info
 }
 
-// CreateSession creates and loads a new session.
+// ─────────────────────────── Bot CRUD ───────────────────────────
+
+// ListBots lists all registered bots with per-workdir live counts.
+func (m *Manager) ListBots(ctx context.Context) ([]BotSummary, error) {
+	profiles, err := m.bots.ListBots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	activeByBot := map[string]int{}
+	m.mu.Lock()
+	for _, s := range m.sessions {
+		s.mu.Lock()
+		running := s.turn != nil
+		s.mu.Unlock()
+		if running {
+			activeByBot[effectiveBotID(s.botID)]++
+		}
+	}
+	sched := m.schedules
+	m.mu.Unlock()
+
+	bs, hasBotStore := m.opts.Store.(BotStore)
+	out := make([]BotSummary, 0, len(profiles))
+	for _, b := range profiles {
+		sum := BotSummary{BotProfile: b, ActiveTurns: activeByBot[b.ID]}
+		if hasBotStore {
+			if list, err := bs.ListRecentForBot(b.ID, m.opts.WorkDir, 0); err == nil {
+				sum.SessionCount = len(list)
+			}
+		} else if b.ID == DefaultBotID {
+			if list, err := m.opts.Store.ListRecentInDir(m.opts.WorkDir, 0); err == nil {
+				sum.SessionCount = len(list)
+			}
+		}
+		if sched != nil {
+			if list, err := sched.ListForBot(ctx, b.ID, "", 0); err == nil {
+				sum.ScheduleCount = len(list)
+			}
+		}
+		out = append(out, sum)
+	}
+	return out, nil
+}
+
+// GetBot returns one BotProfile by ID.
+func (m *Manager) GetBot(ctx context.Context, id string) (BotProfile, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = DefaultBotID
+	}
+	return m.bots.GetBot(ctx, id)
+}
+
+// CreateBot validates and registers a new bot persona.
+func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfile, error) {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	now := time.Now().UTC()
+	b := BotProfile{
+		ID:            strings.TrimSpace(req.ID),
+		Name:          strings.TrimSpace(req.Name),
+		Title:         strings.TrimSpace(req.Title),
+		Description:   strings.TrimSpace(req.Description),
+		Instructions:  req.Instructions,
+		DefaultModel:  strings.TrimSpace(req.DefaultModel),
+		ToolAllowlist: normalizeToolAllowlist(req.ToolAllowlist),
+		Enabled:       enabled,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := m.validateBotConfig(b, true); err != nil {
+		return BotProfile{}, err
+	}
+	created, err := m.bots.CreateBot(ctx, b)
+	if err != nil {
+		return BotProfile{}, err
+	}
+	cp := created.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotCreated, Bot: &cp})
+	return created, nil
+}
+
+// UpdateBot patches mutable fields of an existing bot persona.
+func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest) (BotProfile, error) {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
+	cur, err := m.bots.GetBot(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return BotProfile{}, err
+	}
+	if req.Name != nil {
+		cur.Name = strings.TrimSpace(*req.Name)
+	}
+	if req.Title != nil {
+		cur.Title = strings.TrimSpace(*req.Title)
+	}
+	if req.Description != nil {
+		cur.Description = strings.TrimSpace(*req.Description)
+	}
+	if req.Instructions != nil {
+		cur.Instructions = *req.Instructions
+	}
+	if req.DefaultModel != nil {
+		cur.DefaultModel = strings.TrimSpace(*req.DefaultModel)
+	}
+	if req.ToolAllowlist != nil {
+		cur.ToolAllowlist = normalizeToolAllowlist(*req.ToolAllowlist)
+	}
+	if req.Enabled != nil {
+		cur.Enabled = *req.Enabled
+	}
+	cur.UpdatedAt = time.Now().UTC()
+	if err := m.validateBotConfig(cur, false); err != nil {
+		return BotProfile{}, err
+	}
+	updated, err := m.bots.UpdateBot(ctx, cur)
+	if err != nil {
+		return BotProfile{}, err
+	}
+	cp := updated.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
+	return updated, nil
+}
+
+func (m *Manager) validateBotConfig(b BotProfile, isCreate bool) error {
+	if err := validateBotProfile(b, isCreate); err != nil {
+		return err
+	}
+	if b.DefaultModel != "" && !m.opts.Runtime.HasModel(b.DefaultModel) {
+		return fmt.Errorf("%w: %s", ErrUnknownModel, b.DefaultModel)
+	}
+	if len(b.ToolAllowlist) > 0 {
+		if tv, ok := m.opts.Runtime.(ToolValidator); ok {
+			if missing := tv.ValidateToolAllowlist(b.ToolAllowlist); len(missing) > 0 {
+				return fmt.Errorf("%w: %s", ErrUnknownTool, strings.Join(missing, ", "))
+			}
+		}
+	}
+	return nil
+}
+
+// DeleteBot removes a bot persona. Without force, refuses if any sessions,
+// schedules or active turns exist; with force, cancels local active turns,
+// verifies no external process holds a session lock, and cascades deletion
+// across schedules, sessions, messages and memory (docs/BOT_MULTI_DESIGN.md §5.2).
+func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
+	id = strings.TrimSpace(id)
+	if id == DefaultBotID {
+		return ErrBotDeleteForbidden
+	}
+	cur, err := m.bots.GetBot(ctx, id)
+	if err != nil {
+		return err
+	}
+	bs, hasBotStore := m.opts.Store.(BotStore)
+	if hasBotStore {
+		locked, err := bs.HasExternalBotLock(id, m.owner)
+		if err != nil {
+			return err
+		}
+		if locked {
+			return &models.ErrSessionLocked{SessionID: id}
+		}
+	}
+
+	// Mark the bot as deleting before draining so concurrent SendForBot,
+	// CreateSessionForBot, and schedule Fire calls are rejected during the
+	// cancel/wait window.
+	m.mu.Lock()
+	m.deletingBots[id] = struct{}{}
+	sched := m.schedules
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.deletingBots, id)
+		m.mu.Unlock()
+	}()
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelWait()
+	cancelledSchedules := false
+
+	for {
+		var activeTurns []*activeTurn
+		m.mu.Lock()
+		for _, s := range m.sessions {
+			if effectiveBotID(s.botID) == id {
+				s.mu.Lock()
+				if s.turn != nil {
+					activeTurns = append(activeTurns, s.turn)
+				}
+				s.mu.Unlock()
+			}
+		}
+		inFlight := m.botTurns[id]
+		m.mu.Unlock()
+
+		if len(activeTurns) == 0 && inFlight == 0 {
+			break
+		}
+		if !force {
+			return ErrBusy
+		}
+		if sched != nil && !cancelledSchedules {
+			_ = sched.CancelActiveByBot(ctx, id)
+			cancelledSchedules = true
+		}
+		for _, t := range activeTurns {
+			t.clock.CancelWithSource(cancelSourceClient)
+		}
+		if len(activeTurns) > 0 {
+			for _, t := range activeTurns {
+				select {
+				case <-t.done:
+				case <-waitCtx.Done():
+					return ErrBusy
+				}
+			}
+		} else {
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-waitCtx.Done():
+				return ErrBusy
+			}
+		}
+	}
+
+	var sessCount, schedCount int
+	if hasBotStore {
+		sessCount, err = bs.CountBotSessions(id)
+		if err != nil {
+			return err
+		}
+	}
+	if sched != nil {
+		schedCount, err = sched.CountByBot(ctx, id)
+		if err != nil {
+			return err
+		}
+	}
+	if !force && (sessCount > 0 || schedCount > 0) {
+		return &BotHasSessionsError{Sessions: sessCount, Schedules: schedCount}
+	}
+
+	// Re-scan and unload all in-memory sessions belonging to this bot and release sandboxes.
+	var loaded []*session
+	m.mu.Lock()
+	for sid, s := range m.sessions {
+		if effectiveBotID(s.botID) == id {
+			loaded = append(loaded, s)
+			delete(m.sessions, sid)
+			delete(m.seqFloor, sid)
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range loaded {
+		s.mu.Lock()
+		conv := s.conv
+		s.conv = nil
+		s.mu.Unlock()
+		if conv != nil {
+			_ = conv.Close()
+		}
+		s.bus.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionDeleted})
+		s.bus.close()
+	}
+
+	if sched != nil {
+		if err := sched.DeleteByBot(ctx, id); err != nil {
+			return err
+		}
+	}
+	if hasBotStore {
+		if err := bs.DeleteBotCascade(id); err != nil {
+			return err
+		}
+	} else {
+		if err := m.bots.DeleteBot(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	cp := cur.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotDeleted, Bot: &cp})
+	return nil
+}
+
+// CreateSession creates and loads a new session for the default bot.
 func (m *Manager) CreateSession(req CreateSessionRequest) (SessionInfo, error) {
+	return m.CreateSessionForBot(DefaultBotID, req)
+}
+
+// CreateSessionForBot creates and loads a new session owned by botID.
+func (m *Manager) CreateSessionForBot(botID string, req CreateSessionRequest) (SessionInfo, error) {
+	botID = effectiveBotID(botID)
+	profile, err := m.bots.GetBot(context.Background(), botID)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if !profile.Enabled {
+		return SessionInfo{}, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = m.opts.Runtime.DefaultModel()
+		if profile.DefaultModel != "" && m.opts.Runtime.HasModel(profile.DefaultModel) {
+			model = profile.DefaultModel
+		} else {
+			model = m.opts.Runtime.DefaultModel()
+		}
 	} else if !m.opts.Runtime.HasModel(model) {
 		return SessionInfo{}, fmt.Errorf("%w: %s", ErrUnknownModel, model)
 	}
@@ -170,20 +538,34 @@ func (m *Manager) CreateSession(req CreateSessionRequest) (SessionInfo, error) {
 		m.mu.Unlock()
 		return SessionInfo{}, ErrClosed
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return SessionInfo{}, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.mu.Unlock()
 
-	rec, err := m.opts.Store.Create(models.CreateOpts{
+	createOpts := models.CreateOpts{
 		Title:  strings.TrimSpace(req.Title),
 		Model:  model,
 		CWD:    m.opts.WorkDir,
 		Source: SessionSource,
-	})
+	}
+	var rec *models.Session
+	if bs, ok := m.opts.Store.(BotStore); ok {
+		rec, err = bs.CreateForBot(botID, createOpts)
+	} else {
+		if botID != DefaultBotID {
+			return SessionInfo{}, fmt.Errorf("%w: store does not support multi-bot", ErrUnknownBot)
+		}
+		rec, err = m.opts.Store.Create(createOpts)
+	}
 	if err != nil {
 		return SessionInfo{}, fmt.Errorf("create session: %w", err)
 	}
 	now := time.Now().UTC()
 	s := &session{
 		id:        rec.ID,
+		botID:     botID,
 		title:     rec.Title,
 		model:     model,
 		createdAt: orNow(rec.CreatedAt, now),
@@ -192,21 +574,47 @@ func (m *Manager) CreateSession(req CreateSessionRequest) (SessionInfo, error) {
 		bus:       newBus(m.opts.ReplayEvents),
 	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = m.opts.Store.Delete(s.id)
+		return SessionInfo{}, ErrClosed
+	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		_ = m.opts.Store.Delete(s.id)
+		return SessionInfo{}, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.sessions[s.id] = s
 	m.mu.Unlock()
 
 	info := s.info()
-	m.global.publish(Event{SessionID: s.id, Type: EventSessionCreated, Session: &info})
+	m.global.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionCreated, Session: &info})
 	return info, nil
 }
 
-// ListSessions merges the store's recent sessions with the live state of
-// loaded ones.
+// ListSessions lists recent sessions for the default bot in this workdir.
 func (m *Manager) ListSessions(limit int) ([]SessionInfo, error) {
+	return m.ListSessionsForBot(DefaultBotID, limit)
+}
+
+// ListSessionsForBot merges the store's recent sessions for botID with live state.
+func (m *Manager) ListSessionsForBot(botID string, limit int) ([]SessionInfo, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(context.Background(), botID); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 50
 	}
-	metas, err := m.opts.Store.ListRecentInDir(m.opts.WorkDir, limit)
+	var (
+		metas []models.SessionMeta
+		err   error
+	)
+	if bs, ok := m.opts.Store.(BotStore); ok {
+		metas, err = bs.ListRecentForBot(botID, m.opts.WorkDir, limit)
+	} else {
+		metas, err = m.opts.Store.ListRecentInDir(m.opts.WorkDir, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -220,17 +628,21 @@ func (m *Manager) ListSessions(limit int) ([]SessionInfo, error) {
 			continue
 		}
 		out = append(out, SessionInfo{
-			ID: meta.ID, Title: meta.Title, Status: SessionIdle, MsgCount: meta.MsgCount,
+			ID: meta.ID, BotID: botID, Title: meta.Title, Status: SessionIdle, MsgCount: meta.MsgCount,
 			CreatedAt: meta.CreatedAt, UpdatedAt: meta.UpdatedAt,
 		})
 	}
 	return out, nil
 }
 
-// GetSession returns a session's state and transcript, loading it from the
-// store if needed.
+// GetSession returns a default-bot session's state and transcript.
 func (m *Manager) GetSession(id string) (SessionInfo, []models.Message, error) {
-	s, err := m.load(id)
+	return m.GetSessionForBot(DefaultBotID, id)
+}
+
+// GetSessionForBot returns a bot-scoped session's state and transcript.
+func (m *Manager) GetSessionForBot(botID, id string) (SessionInfo, []models.Message, error) {
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return SessionInfo{}, nil, err
 	}
@@ -240,9 +652,14 @@ func (m *Manager) GetSession(id string) (SessionInfo, []models.Message, error) {
 	return s.info(), msgs, nil
 }
 
-// RenameSession sets a session's title.
+// RenameSession sets a default-bot session's title.
 func (m *Manager) RenameSession(id, title string) (SessionInfo, error) {
-	s, err := m.load(id)
+	return m.RenameSessionForBot(DefaultBotID, id, title)
+}
+
+// RenameSessionForBot sets a bot-scoped session's title.
+func (m *Manager) RenameSessionForBot(botID, id, title string) (SessionInfo, error) {
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return SessionInfo{}, err
 	}
@@ -256,9 +673,14 @@ func (m *Manager) RenameSession(id, title string) (SessionInfo, error) {
 	return s.info(), nil
 }
 
-// DeleteSession removes an idle session from the store.
+// DeleteSession removes an idle default-bot session from the store.
 func (m *Manager) DeleteSession(id string) error {
-	s, err := m.load(id)
+	return m.DeleteSessionForBot(DefaultBotID, id)
+}
+
+// DeleteSessionForBot removes an idle bot-scoped session from the store.
+func (m *Manager) DeleteSessionForBot(botID, id string) error {
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return err
 	}
@@ -281,9 +703,10 @@ func (m *Manager) DeleteSession(id string) error {
 	if conv != nil {
 		_ = conv.Close()
 	}
-	s.bus.publish(Event{SessionID: id, Type: EventSessionDeleted})
+	delEvt := Event{BotID: effectiveBotID(s.botID), SessionID: id, Type: EventSessionDeleted}
+	s.bus.publish(delEvt)
 	s.bus.close()
-	m.global.publish(Event{SessionID: id, Type: EventSessionDeleted})
+	m.global.publish(delEvt)
 	return nil
 }
 
@@ -319,19 +742,36 @@ type SendOptions struct {
 	Timeout time.Duration
 	// MaxToolCalls overrides the bot-wide limit for this turn only.
 	MaxToolCalls int
+	// ToolAllowlist optionally narrows the tool registry for this turn (e.g.
+	// per-schedule tool_allowlist, intersected with the bot's own allowlist).
+	ToolAllowlist []string
 	// Hooks observes questions; scheduled turns use it for waiting_input /
 	// answer_timeout. It is deliberately unexported: transports must not set it.
 	Hooks turnHooks
 }
 
-// Send starts a turn and returns without waiting for it. Follow it with the
-// returned handle or a subscription.
+// Send starts a turn on a default-bot session and returns without waiting for it.
 func (m *Manager) Send(id string, req SendRequest) (*Turn, error) {
-	return m.SendWithOptions(id, req, SendOptions{})
+	return m.SendForBot(DefaultBotID, id, req, SendOptions{})
 }
 
-// SendWithOptions starts a turn with internal metadata (scheduled runs).
+// SendWithOptions starts a turn on a default-bot session with internal metadata.
 func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) (*Turn, error) {
+	return m.SendForBot(DefaultBotID, id, req, opts)
+}
+
+// SendForBot starts a turn on a bot-scoped session, loading the bot's latest
+// BotProfile on every turn so PATCH edits take effect immediately without cache
+// invalidation (docs/BOT_MULTI_DESIGN.md §2).
+func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions) (*Turn, error) {
+	botID = effectiveBotID(botID)
+	profile, err := m.bots.GetBot(context.Background(), botID)
+	if err != nil {
+		return nil, err
+	}
+	if !profile.Enabled {
+		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	content := strings.TrimSpace(req.Content)
 	if content == "" {
 		return nil, ErrEmptyMessage
@@ -340,7 +780,7 @@ func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) 
 	if model != "" && !m.opts.Runtime.HasModel(model) {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownModel, model)
 	}
-	s, err := m.load(id)
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -350,12 +790,18 @@ func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) 
 		m.mu.Unlock()
 		return nil, ErrClosed
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.turns.Add(1)
+	m.botTurns[botID]++
 	m.mu.Unlock()
 
 	started := false
 	defer func() {
 		if !started {
+			m.decBotTurn(botID)
 			m.turns.Done()
 		}
 	}()
@@ -377,7 +823,11 @@ func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) 
 		s.model = model
 	}
 	if s.model == "" {
-		s.model = m.opts.Runtime.DefaultModel()
+		if profile.DefaultModel != "" && m.opts.Runtime.HasModel(profile.DefaultModel) {
+			s.model = profile.DefaultModel
+		} else {
+			s.model = m.opts.Runtime.DefaultModel()
+		}
 	}
 	if locker, ok := m.opts.Store.(Locker); ok {
 		if err := locker.AcquireSessionLock(id, m.owner, false); err != nil {
@@ -391,13 +841,15 @@ func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) 
 	}
 	ctx, clock := newTurnClock(m.baseCtx, budget)
 	t := &activeTurn{
-		id:           "turn_" + randomHex(6),
-		cancel:       clock.cancelPlain,
-		clock:        clock,
-		hooks:        opts.Hooks,
-		maxToolCalls: opts.MaxToolCalls,
-		done:         make(chan struct{}),
-		questions:    map[string]*pendingQuestion{},
+		id:            "turn_" + randomHex(6),
+		cancel:        clock.cancelPlain,
+		clock:         clock,
+		hooks:         opts.Hooks,
+		maxToolCalls:  opts.MaxToolCalls,
+		botProfile:    profile.Clone(),
+		toolAllowlist: append([]string(nil), opts.ToolAllowlist...),
+		done:          make(chan struct{}),
+		questions:     map[string]*pendingQuestion{},
 	}
 	ctx = tools.WithScheduleRun(ctx, opts.ScheduleID, opts.RunID)
 	ctx = tools.WithTurnID(ctx, t.id)
@@ -438,17 +890,31 @@ func (m *Manager) Closing() bool {
 	return m.closed
 }
 
-// Cancel interrupts the session's running turn. The turn still ends with a
-// turn_end event (status "cancelled") once the agent has unwound and its
-// partial progress is persisted.
+// Cancel interrupts a default-bot session's running turn.
 func (m *Manager) Cancel(id string) error {
-	return m.cancelWithSource(id, cancelSourceClient)
+	return m.CancelForBot(DefaultBotID, id)
+}
+
+// CancelForBot interrupts a bot-scoped session's running turn.
+func (m *Manager) CancelForBot(botID, id string) error {
+	s, err := m.loadForBot(botID, id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	t := s.turn
+	s.mu.Unlock()
+	if t == nil {
+		return ErrNotRunning
+	}
+	t.clock.CancelWithSource(cancelSourceClient)
+	return nil
 }
 
 // cancelWithSource lets the schedule Dispatcher attribute a cancellation to
-// the scheduler (answer_timeout / overlap=replace) instead of a client.
+// the scheduler (answer_timeout / overlap=replace) regardless of owning bot.
 func (m *Manager) cancelWithSource(id string, src cancelSource) error {
-	s, err := m.load(id)
+	s, err := m.loadAny(id)
 	if err != nil {
 		return err
 	}
@@ -462,21 +928,31 @@ func (m *Manager) cancelWithSource(id string, src cancelSource) error {
 	return nil
 }
 
-// Answer resolves a pending ask_clarification question.
+// Answer resolves a pending ask_clarification question on a default-bot session.
 func (m *Manager) Answer(id, questionID, answer string) error {
-	return m.answer(id, questionID, answer, false)
+	return m.AnswerForBot(DefaultBotID, id, questionID, answer)
 }
 
-// answerAuto resolves a question on behalf of the bot (unattended runs).
-func (m *Manager) answerAuto(id, questionID, answer string) error {
-	return m.answer(id, questionID, answer, true)
-}
-
-func (m *Manager) answer(id, questionID, answer string, auto bool) error {
-	s, err := m.load(id)
+// AnswerForBot resolves a pending ask_clarification question on a bot-scoped session.
+func (m *Manager) AnswerForBot(botID, id, questionID, answer string) error {
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return err
 	}
+	return m.answerSession(s, questionID, answer, false)
+}
+
+// answerAuto resolves a question on behalf of the bot (unattended runs, any bot).
+func (m *Manager) answerAuto(id, questionID, answer string) error {
+	s, err := m.loadAny(id)
+	if err != nil {
+		return err
+	}
+	return m.answerSession(s, questionID, answer, true)
+}
+
+func (m *Manager) answerSession(s *session, questionID, answer string, auto bool) error {
+	id := s.id
 	s.mu.Lock()
 	t := s.turn
 	var pq *pendingQuestion
@@ -500,10 +976,14 @@ func (m *Manager) answer(id, questionID, answer string, auto bool) error {
 	return nil
 }
 
-// Subscribe follows one session's events. since is the last Seq the client
-// has seen (0 for everything buffered, -1 for live only).
+// Subscribe follows one default-bot session's events.
 func (m *Manager) Subscribe(id string, since int64) (*Subscription, []Event, bool, error) {
-	s, err := m.load(id)
+	return m.SubscribeForBot(DefaultBotID, id, since)
+}
+
+// SubscribeForBot follows one bot-scoped session's events.
+func (m *Manager) SubscribeForBot(botID, id string, since int64) (*Subscription, []Event, bool, error) {
+	s, err := m.loadForBot(botID, id)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -567,11 +1047,13 @@ func (m *Manager) Close(ctx context.Context) error {
 }
 
 func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv Conversation, model string, history []models.Message) {
+	defer m.decBotTurn(effectiveBotID(s.botID))
 	defer m.turns.Done()
 	defer t.cancel()
 
 	started := time.Now().UTC()
-	startEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnStart, Text: history[len(history)-1].Content}
+	botID := effectiveBotID(s.botID)
+	startEvt := Event{BotID: botID, SessionID: s.id, TurnID: t.id, Type: EventTurnStart, Text: history[len(history)-1].Content}
 	s.bus.publish(startEvt)
 	m.global.publish(startEvt)
 
@@ -581,6 +1063,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	// below, so nothing a Runtime emits late (e.g. from an abandoned run)
 	// can appear after this turn's turn_end.
 	emit := func(evt Event) {
+		evt.BotID = botID
 		evt.SessionID = s.id
 		evt.TurnID = t.id
 		s.mu.Lock()
@@ -590,13 +1073,18 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		}
 	}
 	out, runErr := conv.RunTurn(ctx, TurnInput{
-		SessionID:    s.id,
-		TurnID:       t.id,
-		Model:        model,
-		Messages:     history,
-		Emit:         emit,
-		Interaction:  &turnInteraction{m: m, s: s, t: t},
-		MaxToolCalls: t.maxToolCalls,
+		SessionID:         s.id,
+		TurnID:            t.id,
+		Model:             model,
+		Messages:          history,
+		Emit:              emit,
+		Interaction:       &turnInteraction{m: m, s: s, t: t},
+		MaxToolCalls:      t.maxToolCalls,
+		BotID:             effectiveBotID(t.botProfile.ID),
+		SystemPromptExtra: t.botProfile.Instructions,
+		MemoryUserID:      "bot:" + effectiveBotID(t.botProfile.ID),
+		BotToolAllowlist:  t.botProfile.ToolAllowlist,
+		ToolAllowlist:     t.toolAllowlist,
 	})
 	if t.hooks != nil {
 		t.hooks.TurnEnded()
@@ -654,7 +1142,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 
 	// turn_end goes out while s.turn is still t: a Send racing Done() must
 	// not get its turn_start onto either bus ahead of this turn's end.
-	endEvt := Event{SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
+	endEvt := Event{BotID: botID, SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
 	s.mu.Lock()
 	s.bus.publish(endEvt)
 	m.global.publish(endEvt)
@@ -726,10 +1214,28 @@ func (m *Manager) autoTitle(s *session, content string) {
 	s.mu.Unlock()
 }
 
-// load returns the in-memory session, loading it from the store on first
-// use. Store I/O runs under m.mu so two requests cannot load one session
-// twice; loads are rare (once per session per process lifetime).
+// load loads a default-bot session (kept as a convenience alias for tests).
 func (m *Manager) load(id string) (*session, error) {
+	return m.loadForBot(DefaultBotID, id)
+}
+
+// loadForBot loads session id and enforces that it belongs to botID and this
+// process's WorkDir (returning ErrNotFound on mismatch).
+func (m *Manager) loadForBot(botID, id string) (*session, error) {
+	botID = effectiveBotID(botID)
+	s, err := m.loadAny(id)
+	if err != nil {
+		return nil, err
+	}
+	if effectiveBotID(s.botID) != botID {
+		return nil, ErrNotFound
+	}
+	return s, nil
+}
+
+// loadAny returns the in-memory session (regardless of botID, still enforcing
+// WorkDir isolation), loading it from the store on first use.
+func (m *Manager) loadAny(id string) (*session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -738,7 +1244,20 @@ func (m *Manager) load(id string) (*session, error) {
 	if s := m.sessions[id]; s != nil {
 		return s, nil
 	}
-	if m.opts.WorkDir != "" {
+	ownerBot := DefaultBotID
+	if bs, ok := m.opts.Store.(BotStore); ok {
+		gotBot, gotCWD, err := bs.SessionOwner(id)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if m.opts.WorkDir != "" && gotCWD != m.opts.WorkDir {
+			return nil, ErrNotFound
+		}
+		ownerBot = effectiveBotID(gotBot)
+	} else if m.opts.WorkDir != "" {
 		ok, err := m.opts.Store.InDir(id, m.opts.WorkDir)
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
@@ -773,6 +1292,7 @@ func (m *Manager) load(id string) (*session, error) {
 	now := time.Now().UTC()
 	s := &session{
 		id:        id,
+		botID:     ownerBot,
 		title:     rec.Title,
 		model:     model,
 		createdAt: orNow(rec.CreatedAt, now),
@@ -847,6 +1367,7 @@ func (s *session) info() SessionInfo {
 	defer s.mu.Unlock()
 	info := SessionInfo{
 		ID:        s.id,
+		BotID:     effectiveBotID(s.botID),
 		Title:     s.title,
 		Model:     s.model,
 		Status:    SessionIdle,

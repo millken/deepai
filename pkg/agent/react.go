@@ -64,9 +64,10 @@ type Agent struct {
 	logger          *slog.Logger
 	agentType       AgentType
 	model           string
-	reasoningEffort string
-	systemPrompt    string
-	temperature     *float64
+	reasoningEffort    string
+	systemPrompt       string
+	turnInjectionExtra func() string
+	temperature        *float64
 	maxTokens       *int
 	maxToolCalls    int
 	maxTokensBudget int
@@ -296,6 +297,7 @@ func New(cfg AgentConfig) *Agent {
 		model:               resolveModel(cfg.Model),
 		reasoningEffort:     strings.TrimSpace(cfg.ReasoningEffort),
 		systemPrompt:        strings.TrimSpace(cfg.SystemPrompt),
+		turnInjectionExtra:  cfg.TurnInjectionExtra,
 		temperature:         cfg.Temperature,
 		maxTokens:           cfg.MaxTokens,
 		maxToolCalls:        maxToolCalls,

@@ -19,12 +19,13 @@ import (
 // one way (Service → bot-wide bus) and executions flow the other way
 // (Service → Dispatcher → Manager.Send on an ordinary session turn).
 func AttachSchedule(m *Manager, svc *schedule.Service) *ScheduleDispatcher {
+	m.SetSchedules(svc)
 	obs := &scheduleObserver{m: m, svc: svc, last: map[string]schedule.RunStatus{}, meta: map[string]scheduleMeta{}}
 	// Warm the metadata cache with existing schedules so a soft-delete
 	// immediately after restart still has name/notify for cancelled run_end hooks.
 	if list, err := svc.List(context.Background(), "", 0); err == nil {
 		for _, sch := range list {
-			obs.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+			obs.meta[sch.ID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: sch.Name, notify: sch.Options.Notify}
 		}
 	}
 	svc.SetObserver(obs)
@@ -92,19 +93,27 @@ type scheduleObserver struct {
 }
 
 type scheduleMeta struct {
+	botID  string
 	name   string
 	notify string
 }
 
 func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.ChangeKind) {
+	botID := sch.BotID
 	if kind != schedule.ChangeDeleted && sch.ID != "" {
+		botID = effectiveBotID(botID)
 		o.mu.Lock()
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[sch.ID] = scheduleMeta{name: sch.Name, notify: sch.Options.Notify}
+		o.meta[sch.ID] = scheduleMeta{botID: botID, name: sch.Name, notify: sch.Options.Notify}
+		o.mu.Unlock()
+	} else if botID == "" && sch.ID != "" {
+		o.mu.Lock()
+		botID = o.meta[sch.ID].botID
 		o.mu.Unlock()
 	}
+	botID = effectiveBotID(botID)
 	typ := EventScheduleUpdated
 	switch kind {
 	case schedule.ChangeCreated:
@@ -112,7 +121,7 @@ func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.
 	case schedule.ChangeDeleted:
 		typ = EventScheduleDeleted
 	}
-	o.m.global.publish(Event{Type: typ, Schedule: &sch, Time: time.Now().UTC()})
+	o.m.global.publish(Event{BotID: botID, Type: typ, Schedule: &sch, Time: time.Now().UTC()})
 
 	if kind == schedule.ChangeCreated && sch.State == schedule.StatePendingApproval &&
 		o.m.opts.Hook != nil && sch.Options.Notify != schedule.NotifyNever {
@@ -138,6 +147,7 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 	} else {
 		o.last[run.ID] = run.Status
 	}
+	botID := o.meta[run.ScheduleID].botID
 	o.mu.Unlock()
 	typ := EventScheduleRunUpdated
 	switch {
@@ -148,7 +158,7 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 		// intermediate update (design §9.1).
 		typ = EventScheduleRunStarted
 	}
-	o.m.global.publish(Event{Type: typ, Run: &run, Time: time.Now().UTC()})
+	o.m.global.publish(Event{BotID: effectiveBotID(botID), Type: typ, Run: &run, Time: time.Now().UTC()})
 
 	if run.Status.Terminal() && o.m.opts.Hook != nil && o.svc != nil {
 		// Dispatch asynchronously: RunChanged is called while Service.mu is
@@ -167,7 +177,7 @@ func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[run.ScheduleID] = scheduleMeta{name: name, notify: notify}
+		o.meta[run.ScheduleID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: name, notify: notify}
 		o.mu.Unlock()
 	} else {
 		// Fall back to cached metadata: Delete soft-deletes the schedule before
@@ -290,8 +300,19 @@ func NewScheduleDispatcher(m *Manager, svc *schedule.Service) *ScheduleDispatche
 // the Manager owns the pausable turnClock, so the Dispatcher no longer runs
 // a competing timer (design §7.2).
 func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, run schedule.Run) (string, string, error) {
+	botID := effectiveBotID(sch.BotID)
+	profile, err := d.m.GetBot(ctx, botID)
+	if err != nil {
+		return "", "", fmt.Errorf("schedule bot %q: %w", botID, err)
+	}
+	if !profile.Enabled || d.m.IsBotDeleting(botID) {
+		return "", "", schedule.ErrBotDisabled
+	}
 	sessionID, err := d.resolveSession(sch, run)
 	if err != nil {
+		if errors.Is(err, ErrBotDisabled) {
+			return "", "", schedule.ErrBotDisabled
+		}
 		return "", "", err
 	}
 	timeout := runTimeout(sch.Options.Timeout)
@@ -299,30 +320,37 @@ func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, ru
 	content := scheduledMessage(sch, run)
 	req := SendRequest{Content: content, Model: sch.Options.Model}
 	opts := SendOptions{
-		ScheduleID:   sch.ID,
-		RunID:        run.ID,
-		Timeout:      timeout,
-		MaxToolCalls: sch.Options.MaxToolCalls,
-		Hooks:        hooks,
+		ScheduleID:    sch.ID,
+		RunID:         run.ID,
+		Timeout:       timeout,
+		MaxToolCalls:  sch.Options.MaxToolCalls,
+		ToolAllowlist: sch.Options.ToolAllowlist,
+		Hooks:         hooks,
 		Metadata: map[string]string{
 			"schedule_id": sch.ID,
 			"run_id":      run.ID,
 			"source":      "schedule",
 		},
 	}
-	turn, err := d.m.SendWithOptions(sessionID, req, opts)
+	turn, err := d.m.SendForBot(botID, sessionID, req, opts)
 	if err != nil {
 		// A dedicated session may have been deleted by the user; recreate it
 		// lazily (docs/BOT_SCHEDULER_DESIGN.md §6).
 		if errors.Is(err, ErrNotFound) && sch.Options.SessionMode != schedule.SessionOrigin {
 			sessionID, err = d.createSession(sch)
 			if err != nil {
+				if errors.Is(err, ErrBotDisabled) {
+					return "", "", schedule.ErrBotDisabled
+				}
 				return "", "", err
 			}
 			hooks.setSessionID(sessionID)
-			turn, err = d.m.SendWithOptions(sessionID, req, opts)
+			turn, err = d.m.SendForBot(botID, sessionID, req, opts)
 		}
 		if err != nil {
+			if errors.Is(err, ErrBotDisabled) {
+				return "", "", schedule.ErrBotDisabled
+			}
 			if errors.Is(err, ErrBusy) || errors.Is(err, ErrClosed) {
 				return "", "", schedule.ErrBusy
 			}
@@ -456,7 +484,7 @@ func (d *ScheduleDispatcher) resolveSession(sch schedule.Schedule, run schedule.
 }
 
 func (d *ScheduleDispatcher) createSession(sch schedule.Schedule) (string, error) {
-	info, err := d.m.CreateSession(CreateSessionRequest{Title: "⏰ " + sch.Name})
+	info, err := d.m.CreateSessionForBot(effectiveBotID(sch.BotID), CreateSessionRequest{Title: "⏰ " + sch.Name})
 	if err != nil {
 		return "", fmt.Errorf("create schedule session: %w", err)
 	}
