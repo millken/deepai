@@ -84,6 +84,9 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("PATCH /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleRenameSession))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleDeleteSession))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/messages", s.auth(s.handleSend))
+	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}/queue", s.auth(s.handleListQueue))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}/queue/{queue_id}", s.auth(s.handleRemoveQueueItem))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}/sessions/{id}/queue", s.auth(s.handleClearQueue))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/cancel", s.auth(s.handleCancel))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions/{id}/answer", s.auth(s.handleAnswer))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}/events", s.auth(s.handleSessionEvents))
@@ -97,6 +100,9 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("PATCH /v1/sessions/{id}", s.auth(s.handleRenameSession))
 	s.mux.Handle("DELETE /v1/sessions/{id}", s.auth(s.handleDeleteSession))
 	s.mux.Handle("POST /v1/sessions/{id}/messages", s.auth(s.handleSend))
+	s.mux.Handle("GET /v1/sessions/{id}/queue", s.auth(s.handleListQueue))
+	s.mux.Handle("DELETE /v1/sessions/{id}/queue/{queue_id}", s.auth(s.handleRemoveQueueItem))
+	s.mux.Handle("DELETE /v1/sessions/{id}/queue", s.auth(s.handleClearQueue))
 	s.mux.Handle("POST /v1/sessions/{id}/cancel", s.auth(s.handleCancel))
 	s.mux.Handle("POST /v1/sessions/{id}/answer", s.auth(s.handleAnswer))
 	s.mux.Handle("GET /v1/sessions/{id}/events", s.auth(s.handleSessionEvents))
@@ -343,11 +349,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		defer sub.Close()
 	}
-	turn, err := s.m.SendForBot(botID, id, req, SendOptions{})
+	res, err := s.m.SubmitForBot(botID, id, req, SendOptions{})
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
+	if res.Queued || res.Steered || res.Turn == nil {
+		writeJSON(w, http.StatusAccepted, res)
+		return
+	}
+	turn := res.Turn
 
 	switch {
 	case mode != "":
@@ -367,6 +378,31 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusAccepted, map[string]string{"session_id": id, "turn_id": turn.ID})
 	}
+}
+
+func (s *Server) handleListQueue(w http.ResponseWriter, r *http.Request) {
+	items, err := s.m.ListQueueForBot(botIDFromRequest(r), r.PathValue("id"))
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"queue": items})
+}
+
+func (s *Server) handleRemoveQueueItem(w http.ResponseWriter, r *http.Request) {
+	if err := s.m.RemoveQueuedMessageForBot(botIDFromRequest(r), r.PathValue("id"), r.PathValue("queue_id")); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleClearQueue(w http.ResponseWriter, r *http.Request) {
+	if err := s.m.ClearQueueForBot(botIDFromRequest(r), r.PathValue("id")); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +631,12 @@ func errorStatus(err error) (int, string) {
 		return http.StatusBadRequest, "unknown_tool"
 	case errors.Is(err, ErrBusy):
 		return http.StatusConflict, "busy"
+	case errors.Is(err, ErrQueueFull):
+		return http.StatusConflict, "queue_full"
+	case errors.Is(err, ErrQueueItemNotFound):
+		return http.StatusNotFound, "not_found"
+	case errors.Is(err, ErrInvalidMode):
+		return http.StatusBadRequest, "bad_request"
 	case errors.As(err, &locked):
 		return http.StatusConflict, "session_locked"
 	case errors.Is(err, ErrNotRunning):

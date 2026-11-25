@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/millken/deepai/pkg/agent"
 	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/schedule"
@@ -98,6 +99,7 @@ type session struct {
 	messages  []models.Message
 	conv      Conversation
 	turn      *activeTurn
+	queue     []QueuedMessage
 	lastUsed  time.Time
 	bus       *bus
 }
@@ -110,6 +112,7 @@ type activeTurn struct {
 	maxToolCalls  int
 	botProfile    BotProfile
 	toolAllowlist []string
+	steer         *steerBuffer
 	done          chan struct{}
 	summary       *TurnSummary
 	questions     map[string]*pendingQuestion
@@ -309,6 +312,7 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	if err != nil {
 		return BotProfile{}, err
 	}
+	wasEnabled := cur.Enabled
 	if req.Name != nil {
 		cur.Name = strings.TrimSpace(*req.Name)
 	}
@@ -340,7 +344,31 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	}
 	cp := updated.Clone()
 	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
+	if !wasEnabled && updated.Enabled {
+		m.wakeQueuedForBot(updated.ID)
+	}
 	return updated, nil
+}
+
+// wakeQueuedForBot resumes queued follow-up turns on idle sessions when a
+// disabled bot transitions back to enabled.
+func (m *Manager) wakeQueuedForBot(botID string) {
+	botID = effectiveBotID(botID)
+	var idle []*session
+	m.mu.Lock()
+	for _, s := range m.sessions {
+		if effectiveBotID(s.botID) == botID {
+			s.mu.Lock()
+			if s.turn == nil && len(s.queue) > 0 {
+				idle = append(idle, s)
+			}
+			s.mu.Unlock()
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range idle {
+		m.startNextQueued(s)
+	}
 }
 
 func (m *Manager) validateBotConfig(b BotProfile, isCreate bool) error {
@@ -762,60 +790,32 @@ func (m *Manager) SendWithOptions(id string, req SendRequest, opts SendOptions) 
 
 // SendForBot starts a turn on a bot-scoped session, loading the bot's latest
 // BotProfile on every turn so PATCH edits take effect immediately without cache
-// invalidation (docs/BOT_MULTI_DESIGN.md §2).
+// invalidation (docs/BOT_MULTI_DESIGN.md §2). For queue/steer semantics use
+// SubmitForBot.
 func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions) (*Turn, error) {
-	botID = effectiveBotID(botID)
-	profile, err := m.bots.GetBot(context.Background(), botID)
+	res, err := m.SubmitForBot(botID, id, req, opts)
 	if err != nil {
 		return nil, err
 	}
-	if !profile.Enabled {
-		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
-	}
-	content := strings.TrimSpace(req.Content)
-	if content == "" {
-		return nil, ErrEmptyMessage
-	}
-	model := strings.TrimSpace(req.Model)
-	if model != "" && !m.opts.Runtime.HasModel(model) {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownModel, model)
-	}
-	s, err := m.loadForBot(botID, id)
-	if err != nil {
-		return nil, err
-	}
+	return res.Turn, nil
+}
 
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil, ErrClosed
-	}
-	if _, deleting := m.deletingBots[botID]; deleting {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
-	}
-	m.turns.Add(1)
-	m.botTurns[botID]++
-	m.mu.Unlock()
+type preparedTurn struct {
+	ctx       context.Context
+	turn      *activeTurn
+	conv      Conversation
+	model     string
+	history   []models.Message
+	needTitle bool
+}
 
-	started := false
-	defer func() {
-		if !started {
-			m.decBotTurn(botID)
-			m.turns.Done()
-		}
-	}()
-
-	s.mu.Lock()
-	if s.turn != nil {
-		s.mu.Unlock()
-		return nil, ErrBusy
-	}
+// prepareTurnLocked initializes a new activeTurn on an idle session. Caller
+// must hold s.mu and have already incremented m.turns and m.botTurns[botID].
+func (m *Manager) prepareTurnLocked(s *session, profile BotProfile, content, model string, opts SendOptions) (preparedTurn, error) {
 	if s.conv == nil {
-		conv, err := m.opts.Runtime.NewConversation(id)
+		conv, err := m.opts.Runtime.NewConversation(s.id)
 		if err != nil {
-			s.mu.Unlock()
-			return nil, fmt.Errorf("start conversation: %w", err)
+			return preparedTurn{}, fmt.Errorf("start conversation: %w", err)
 		}
 		s.conv = conv
 	}
@@ -830,9 +830,8 @@ func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions
 		}
 	}
 	if locker, ok := m.opts.Store.(Locker); ok {
-		if err := locker.AcquireSessionLock(id, m.owner, false); err != nil {
-			s.mu.Unlock()
-			return nil, err
+		if err := locker.AcquireSessionLock(s.id, m.owner, false); err != nil {
+			return preparedTurn{}, err
 		}
 	}
 	budget := opts.Timeout
@@ -848,6 +847,7 @@ func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions
 		maxToolCalls:  opts.MaxToolCalls,
 		botProfile:    profile.Clone(),
 		toolAllowlist: append([]string(nil), opts.ToolAllowlist...),
+		steer:         newSteerBuffer(),
 		done:          make(chan struct{}),
 		questions:     map[string]*pendingQuestion{},
 	}
@@ -856,30 +856,25 @@ func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions
 	s.turn = t
 	s.lastUsed = time.Now().UTC()
 	userMsg := models.Message{
-		ID:        id + "_" + randomHex(6),
-		SessionID: id,
+		ID:        s.id + "_" + randomHex(6),
+		SessionID: s.id,
 		Role:      models.RoleHuman,
 		Content:   content,
 		Metadata:  opts.Metadata,
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := m.opts.Store.AppendMessage(id, userMsg); err != nil {
-		m.log.Warn("bot: persist user message", "session", id, "err", err)
+	if err := m.opts.Store.AppendMessage(s.id, userMsg); err != nil {
+		m.log.Warn("bot: persist user message", "session", s.id, "err", err)
 	}
 	s.messages = append(s.messages, userMsg)
-	history := append([]models.Message(nil), s.messages...)
-	turnModel := s.model
-	conv := s.conv
-	needTitle := s.title == ""
-	s.mu.Unlock()
-
-	if needTitle {
-		m.autoTitle(s, content)
-	}
-
-	started = true
-	go m.runTurn(ctx, s, t, conv, turnModel, history)
-	return &Turn{ID: t.id, t: t}, nil
+	return preparedTurn{
+		ctx:       ctx,
+		turn:      t,
+		conv:      s.conv,
+		model:     s.model,
+		history:   append([]models.Message(nil), s.messages...),
+		needTitle: s.title == "",
+	}, nil
 }
 
 // Closing reports whether Close has begun. The schedule Dispatcher uses it
@@ -1036,6 +1031,15 @@ func (m *Manager) Close(ctx context.Context) error {
 		s.mu.Lock()
 		conv := s.conv
 		s.conv = nil
+		if len(s.queue) > 0 {
+			s.queue = nil
+			s.bus.publish(Event{
+				BotID:     effectiveBotID(s.botID),
+				SessionID: s.id,
+				Type:      EventQueueCleared,
+				Reason:    "shutdown",
+			})
+		}
 		s.mu.Unlock()
 		if conv != nil {
 			_ = conv.Close()
@@ -1079,6 +1083,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		Messages:          history,
 		Emit:              emit,
 		Interaction:       &turnInteraction{m: m, s: s, t: t},
+		Steer:             t.steer,
 		MaxToolCalls:      t.maxToolCalls,
 		BotID:             effectiveBotID(t.botProfile.ID),
 		SystemPromptExtra: t.botProfile.Instructions,
@@ -1140,13 +1145,54 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 	summary.EndedAt = time.Now().UTC()
 	t.summary = summary
 
+	var unconsumedSteers []agent.SteerMessage
+	if t.steer != nil {
+		unconsumedSteers = t.steer.CloseAndDrain()
+	}
+
 	// turn_end goes out while s.turn is still t: a Send racing Done() must
 	// not get its turn_start onto either bus ahead of this turn's end.
 	endEvt := Event{BotID: botID, SessionID: s.id, TurnID: t.id, Type: EventTurnEnd, Turn: summary, Usage: summary.Usage}
 	s.mu.Lock()
 	s.bus.publish(endEvt)
 	m.global.publish(endEvt)
+	switch summary.Status {
+	case TurnCancelled:
+		if len(s.queue) > 0 {
+			s.queue = nil
+			s.bus.publish(Event{
+				BotID:     botID,
+				SessionID: s.id,
+				Type:      EventQueueCleared,
+				Reason:    "cancelled",
+			})
+		}
+	case TurnCompleted, TurnFailed, TurnTimedOut:
+		if len(unconsumedSteers) > 0 {
+			promoted := make([]QueuedMessage, 0, len(unconsumedSteers))
+			now := time.Now().UTC()
+			for _, st := range unconsumedSteers {
+				item := QueuedMessage{
+					ID:        "q_" + randomHex(6),
+					Content:   st.Content,
+					Images:    st.Images,
+					CreatedAt: now,
+				}
+				promoted = append(promoted, item)
+				cp := item
+				s.bus.publish(Event{
+					BotID:     botID,
+					SessionID: s.id,
+					Type:      EventQueueEnqueued,
+					QueueItem: &cp,
+					Text:      item.Content,
+				})
+			}
+			s.queue = append(promoted, s.queue...)
+		}
+	}
 	s.turn = nil
+	hasQueued := summary.Status == TurnCompleted && len(s.queue) > 0
 	s.mu.Unlock()
 	close(t.done)
 	if m.opts.Hook != nil && t.hooks == nil {
@@ -1160,6 +1206,9 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		})
 	}
 	afterTurnDone()
+	if hasQueued {
+		m.startNextQueued(s)
+	}
 }
 
 // afterTurnDone is a test hook run once a turn's Done() has fired.
@@ -1340,7 +1389,7 @@ func (m *Manager) evictIdle(before time.Time) {
 	var victims []*session
 	for id, s := range m.sessions {
 		s.mu.Lock()
-		idle := s.turn == nil && s.lastUsed.Before(before) && s.bus.subscriberCount() == 0
+		idle := s.turn == nil && len(s.queue) == 0 && s.lastUsed.Before(before) && s.bus.subscriberCount() == 0
 		s.mu.Unlock()
 		if idle {
 			victims = append(victims, s)
@@ -1382,6 +1431,10 @@ func (s *session) info() SessionInfo {
 		for _, pq := range s.turn.questions {
 			info.Pending = append(info.Pending, pq.q)
 		}
+	}
+	if len(s.queue) > 0 {
+		info.Queue = make([]QueuedMessage, len(s.queue))
+		copy(info.Queue, s.queue)
 	}
 	return info
 }

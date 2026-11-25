@@ -43,6 +43,9 @@ type TurnInput struct {
 	Emit func(Event)
 	// Interaction answers ask_clarification by asking connected clients.
 	Interaction tools.UserInteraction
+	// Steer optionally supplies mid-turn user steering messages consumed at
+	// safe ReAct loop boundaries (docs/BOT_NEXT_DESIGN.md §2.3).
+	Steer agent.SteerSource
 	// MaxToolCalls overrides the runtime-wide limit for this turn only.
 	// 0 means "use the bot configuration" (design §3.1 max_tool_calls).
 	MaxToolCalls int

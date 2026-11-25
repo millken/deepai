@@ -195,6 +195,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		Temperature:        temperature,
 		RequestTimeout:     cfg.RequestTimeout,
 		UserInteraction:    in.Interaction,
+		Steer:              in.Steer,
 		WorkDir:            cfg.WorkDir,
 		MemoryService:      cfg.MemoryService,
 		MemoryExtractor:    cfg.MemoryExtractor,
@@ -337,6 +338,8 @@ func translateAgentEvent(ctx context.Context, evt agent.AgentEvent) (Event, bool
 		return Event{Type: typ, Tool: &te}, true
 	case agent.AgentEventProgress:
 		return Event{Type: EventProgress}, true
+	case agent.AgentEventSteerApplied:
+		return Event{Type: EventSteerApplied, SteerID: evt.MessageID, Text: evt.Text}, true
 	case agent.AgentEventCompact:
 		return Event{Type: EventCompact, Compact: evt.CompactStats}, true
 	case agent.AgentEventError:
