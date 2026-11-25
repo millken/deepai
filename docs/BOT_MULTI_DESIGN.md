@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 - 每个 `deepai-bot` 进程只查询、调度、持有自己 `work_dir` 的 `schedules`、`schedule_leases` 与 `schedule_metas`；
 - 同一 `work_dir` 启动两个 `deepai-bot` 进程时，依然严格遵守「一个 `active`、另一个 `standby` 仅写库并 bump `schedule_metas(work_dir)`」的原语义；
 - 不同 `work_dir` 的两个 `deepai-bot` 进程各自持有自己的 `work_dir` 租约，均为 `active`，彼此完全隔离；
-- 存量升级兼容：迁移时如发现 `schedules.work_dir = ''` 的旧任务，首次启动该目录的进程按 `session_id` 关联 `sessions.cwd` 自动回填 `work_dir`；无会话的孤立旧任务回填为当前进程的 `work_dir` 并打印一条 `INFO` 日志。
+- 存量升级兼容：迁移时如发现 `schedules.work_dir = ''` 的旧任务，按 `session_id` 关联 `sessions.cwd` 自动回填 `work_dir`；无会话的孤立旧任务保持 `work_dir = ''`（避免被首个启动的无关目录误认领）并打印 `WARN` 日志列出未归属任务的 `id / name / state` 与显式认领提示。
 
 ---
 

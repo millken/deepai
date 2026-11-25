@@ -82,6 +82,9 @@ func (s *botSessionStore) ensureSessionBotIDColumn() error {
 		return err
 	}
 	if _, err := s.db.Exec(`ALTER TABLE sessions ADD COLUMN bot_id TEXT NOT NULL DEFAULT 'default'`); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
 		return fmt.Errorf("add sessions.bot_id: %w", err)
 	}
 	return nil

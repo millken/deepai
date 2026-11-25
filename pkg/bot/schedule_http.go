@@ -138,9 +138,15 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	if !profile.Enabled {
+	if !profile.Enabled || s.m.IsBotDeleting(in.BotID) {
 		s.writeErr(w, fmt.Errorf("%w: %s", ErrBotDisabled, in.BotID))
 		return
+	}
+	if in.CreatedBy.SessionID != "" {
+		if _, _, err := s.m.GetSessionForBot(in.BotID, in.CreatedBy.SessionID); err != nil {
+			s.writeErr(w, err)
+			return
+		}
 	}
 	sch, err := svc.Create(r.Context(), in)
 	if err != nil {
@@ -388,8 +394,13 @@ func (s *Server) handleScheduleWS(ctx context.Context, req WSRequest) (any, bool
 		if err != nil {
 			return nil, true, err
 		}
-		if !profile.Enabled {
+		if !profile.Enabled || s.m.IsBotDeleting(in.BotID) {
 			return nil, true, fmt.Errorf("%w: %s", ErrBotDisabled, in.BotID)
+		}
+		if in.CreatedBy.SessionID != "" {
+			if _, _, err := s.m.GetSessionForBot(in.BotID, in.CreatedBy.SessionID); err != nil {
+				return nil, true, err
+			}
 		}
 		sch, err := svc.Create(ctx, in)
 		return s.scheduleResult(map[string]any{"schedule": sch}), true, err

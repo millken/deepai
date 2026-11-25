@@ -323,9 +323,12 @@ func (s *Service) CancelActiveByBot(ctx context.Context, botID string) error {
 	}
 	for _, v := range list {
 		for _, r := range s.activeRunsLocked(ctx, v.ID) {
+			now := s.now()
+			r.CancelRequestedAt = &now
 			if s.dispatcher != nil {
 				_ = s.dispatcher.Cancel(r, CancelClient)
 			}
+			_ = s.updateRunLocked(ctx, r)
 		}
 	}
 	return nil
@@ -1496,7 +1499,7 @@ func (s *Service) changed(v Schedule, kind ChangeKind) {
 	if s.observer != nil {
 		payload := v
 		if kind == ChangeDeleted {
-			payload = Schedule{ID: v.ID, State: StateDeleted}
+			payload = Schedule{ID: v.ID, BotID: v.BotID, State: StateDeleted}
 		}
 		s.observer.ScheduleChanged(payload, kind)
 	}

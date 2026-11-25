@@ -99,15 +99,21 @@ type scheduleMeta struct {
 }
 
 func (o *scheduleObserver) ScheduleChanged(sch schedule.Schedule, kind schedule.ChangeKind) {
-	botID := effectiveBotID(sch.BotID)
+	botID := sch.BotID
 	if kind != schedule.ChangeDeleted && sch.ID != "" {
+		botID = effectiveBotID(botID)
 		o.mu.Lock()
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
 		o.meta[sch.ID] = scheduleMeta{botID: botID, name: sch.Name, notify: sch.Options.Notify}
 		o.mu.Unlock()
+	} else if botID == "" && sch.ID != "" {
+		o.mu.Lock()
+		botID = o.meta[sch.ID].botID
+		o.mu.Unlock()
 	}
+	botID = effectiveBotID(botID)
 	typ := EventScheduleUpdated
 	switch kind {
 	case schedule.ChangeCreated:
@@ -171,7 +177,7 @@ func (o *scheduleObserver) notifyRunEnd(run schedule.Run) {
 		if o.meta == nil {
 			o.meta = map[string]scheduleMeta{}
 		}
-		o.meta[run.ScheduleID] = scheduleMeta{name: name, notify: notify}
+		o.meta[run.ScheduleID] = scheduleMeta{botID: effectiveBotID(sch.BotID), name: name, notify: notify}
 		o.mu.Unlock()
 	} else {
 		// Fall back to cached metadata: Delete soft-deletes the schedule before
@@ -299,7 +305,7 @@ func (d *ScheduleDispatcher) Fire(ctx context.Context, sch schedule.Schedule, ru
 	if err != nil {
 		return "", "", fmt.Errorf("schedule bot %q: %w", botID, err)
 	}
-	if !profile.Enabled {
+	if !profile.Enabled || d.m.IsBotDeleting(botID) {
 		return "", "", schedule.ErrBotDisabled
 	}
 	sessionID, err := d.resolveSession(sch, run)

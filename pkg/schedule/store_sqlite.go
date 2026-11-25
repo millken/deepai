@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -140,6 +141,9 @@ func (s *SQLiteStore) ensureColumn(ctx context.Context, table, col, def string) 
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col, def)); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
 		return fmt.Errorf("add %s.%s: %w", table, col, err)
 	}
 	return nil
@@ -148,19 +152,35 @@ func (s *SQLiteStore) ensureColumn(ctx context.Context, table, col, def string) 
 // backfillLegacyWorkDir assigns pre-v2 schedules (work_dir = '') to their
 // session's cwd when a sessions table exists and has a non-empty cwd.
 // Sessionless legacy schedules are left with work_dir = '' rather than being
-// blindly claimed by whichever repo calls Migrate first.
+// blindly claimed by whichever repo calls Migrate first, and are logged as a
+// warning so operators can explicitly claim or clean them up.
 func (s *SQLiteStore) backfillLegacyWorkDir(ctx context.Context) error {
 	var hasSessions int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'`).Scan(&hasSessions)
-	if hasSessions == 0 {
+	if hasSessions > 0 {
+		if _, err := s.db.ExecContext(ctx, `
+			UPDATE schedules
+			SET work_dir = (SELECT cwd FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')
+			WHERE work_dir = ''
+			  AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')`); err != nil {
+			return fmt.Errorf("backfill schedule work_dir from sessions: %w", err)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, state FROM schedules WHERE work_dir = '' AND state != ?`, string(StateDeleted))
+	if err != nil {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE schedules
-		SET work_dir = (SELECT cwd FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')
-		WHERE work_dir = ''
-		  AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = schedules.session_id AND sessions.cwd != '')`); err != nil {
-		return fmt.Errorf("backfill schedule work_dir from sessions: %w", err)
+	defer rows.Close()
+	var orphans []string
+	for rows.Next() {
+		var id, name, state string
+		if err := rows.Scan(&id, &name, &state); err == nil {
+			orphans = append(orphans, fmt.Sprintf("%s(%s,%s)", id, name, state))
+		}
+	}
+	if len(orphans) > 0 {
+		slog.Warn("schedule: legacy schedules without session cwd left unowned (work_dir=''); run UPDATE schedules SET work_dir='<repo>' WHERE id='...' to claim or mark deleted",
+			"count", len(orphans), "schedules", strings.Join(orphans, ", "))
 	}
 	return nil
 }

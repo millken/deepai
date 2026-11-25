@@ -101,6 +101,18 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		result["note"] = "任务已保存，将由另一个 deepai-bot 实例执行"
 	}
 
+	callerBot := strings.TrimSpace(BotIDFromContext(ctx))
+	requireBotScope := func(id string) (Schedule, error) {
+		sch, err := svc.Get(ctx, id)
+		if err != nil {
+			return Schedule{}, err
+		}
+		if callerBot != "" && effectiveBotID(sch.BotID) != effectiveBotID(callerBot) {
+			return Schedule{}, NewError(CodeNotFound, "schedule %s not found", id)
+		}
+		return sch, nil
+	}
+
 	switch action {
 	case "create":
 		in, err := createInputFromArgs(args, cfg, sessionID, turnID)
@@ -149,7 +161,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "get":
-		sch, err := svc.Get(ctx, strArg(args, "id"))
+		sch, err := requireBotScope(strArg(args, "id"))
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +173,7 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		// base is fetched BEFORE the patch: its Timezone feeds patchFromArgs'
 		// naive end_at interpretation (round-3 L1) and its Trigger/Name/Prompt
 		// feed the confirmation preview below.
-		base, err := svc.Get(ctx, id)
+		base, err := requireBotScope(id)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +222,9 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 
 	case "pause", "resume":
 		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
 		var (
 			sch Schedule
 			err error
@@ -226,7 +241,11 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "delete":
-		sch, err := svc.Delete(ctx, strArg(args, "id"), boolArg(args, "cancel"))
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
+		sch, err := svc.Delete(ctx, id, boolArg(args, "cancel"))
 		if err != nil {
 			return nil, err
 		}
@@ -234,11 +253,15 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "run_now":
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
 		reqID := strArg(args, "request_id")
 		if reqID == "" && turnID != "" {
 			reqID = "turn_" + turnID
 		}
-		run, err := svc.RunNow(ctx, strArg(args, "id"), reqID)
+		run, err := svc.RunNow(ctx, id, reqID)
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +269,11 @@ func runToolAction(ctx context.Context, svc *Service, args map[string]any) (map[
 		return result, nil
 
 	case "runs":
-		runs, err := svc.Runs(ctx, strArg(args, "id"), intArg(args, "limit"))
+		id := strArg(args, "id")
+		if _, err := requireBotScope(id); err != nil {
+			return nil, err
+		}
+		runs, err := svc.Runs(ctx, id, intArg(args, "limit"))
 		if err != nil {
 			return nil, err
 		}

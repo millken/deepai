@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/millken/deepai/pkg/models"
 	_ "modernc.org/sqlite"
 )
 
@@ -239,3 +240,41 @@ func (d *errDispatcher) Fire(context.Context, Schedule, Run) (string, string, er
 func (d *errDispatcher) Cancel(Run, CancelReason) error { return nil }
 
 var _ = errors.Is
+
+func TestScheduleToolEnforcesBotOwnership(t *testing.T) {
+	ctx := context.Background()
+	cfg := DefaultConfig()
+	cfg.Confirm = "auto"
+	svc, err := NewService(NewMemoryStore(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schA, err := svc.Create(ctx, CreateInput{
+		BotID:   "admin_bot",
+		Name:    "secret-job",
+		Prompt:  "original prompt",
+		Trigger: Trigger{Type: TriggerInterval, Every: "1h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := Tool(svc)
+	callerCtx := WithBotID(ctx, "restricted_bot")
+	for _, action := range []string{"get", "update", "pause", "resume", "delete", "run_now", "runs"} {
+		args := map[string]any{"action": action, "id": schA.ID}
+		if action == "update" {
+			args["prompt"] = "hijacked"
+		}
+		res, err := tool.Handler(callerCtx, models.ToolCall{ID: "c1", Name: "schedule", Arguments: args})
+		if err == nil || ErrorCode(err) != CodeNotFound {
+			t.Fatalf("action %s across bots: res=%+v err=%v, want CodeNotFound", action, res, err)
+		}
+	}
+	got, err := svc.Get(ctx, schA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Prompt != "original prompt" || got.State != StateActive {
+		t.Fatalf("admin_bot schedule was mutated across bots: %+v", got)
+	}
+}

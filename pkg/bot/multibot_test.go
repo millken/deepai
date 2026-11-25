@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/millken/deepai/pkg/hook"
 	"github.com/millken/deepai/pkg/llm"
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/schedule"
@@ -770,5 +771,194 @@ func TestScheduleDispatcherUnknownBotDoesNotMarkBotDisabled(t *testing.T) {
 	}
 	if !errors.Is(err, ErrUnknownBot) {
 		t.Fatalf("err = %v, want wrapped ErrUnknownBot", err)
+	}
+}
+
+type noopHookEmitter struct{}
+
+func (noopHookEmitter) Fire(context.Context, hook.Event) {}
+
+type blockingRuntime struct {
+	fakeRuntime
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingRuntime) NewConversation(string) (Conversation, error) {
+	return &blockingConv{b: b}, nil
+}
+
+type blockingConv struct{ b *blockingRuntime }
+
+func (c *blockingConv) Close() error { return nil }
+func (c *blockingConv) RunTurn(ctx context.Context, in TurnInput) (*TurnOutput, error) {
+	select {
+	case <-c.b.started:
+	default:
+		close(c.b.started)
+	}
+	<-ctx.Done()
+	<-c.b.release
+	return nil, ctx.Err()
+}
+
+func TestMultiBotForceDeleteBlocksConcurrentSend(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rt := &blockingRuntime{started: started, release: release}
+	m, err := NewManager(Options{Runtime: rt, Store: NewMemoryStore(), WorkDir: "/repo", IdleTimeout: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+
+	if _, err := m.CreateBot(context.Background(), CreateBotRequest{ID: "ephemeral", Name: "Ephemeral"}); err != nil {
+		t.Fatal(err)
+	}
+	s1, err := m.CreateSessionForBot("ephemeral", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := m.CreateSessionForBot("ephemeral", CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SendForBot("ephemeral", s1.ID, SendRequest{Content: "slow"}, SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	delErr := make(chan error, 1)
+	go func() {
+		delErr <- m.DeleteBot(context.Background(), "ephemeral", true)
+	}()
+
+	// Wait until DeleteBot has marked the bot as deleting.
+	deadline := time.Now().Add(2 * time.Second)
+	for !m.IsBotDeleting("ephemeral") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !m.IsBotDeleting("ephemeral") {
+		t.Fatal("DeleteBot did not mark bot as deleting")
+	}
+
+	// Concurrent SendForBot and CreateSessionForBot during the cancel/wait window must fail.
+	if _, err := m.SendForBot("ephemeral", s2.ID, SendRequest{Content: "sneak"}, SendOptions{}); !errors.Is(err, ErrBotDisabled) {
+		t.Fatalf("SendForBot during DeleteBot = %v, want ErrBotDisabled", err)
+	}
+	if _, err := m.CreateSessionForBot("ephemeral", CreateSessionRequest{}); !errors.Is(err, ErrBotDisabled) {
+		t.Fatalf("CreateSessionForBot during DeleteBot = %v, want ErrBotDisabled", err)
+	}
+
+	close(release)
+	if err := <-delErr; err != nil {
+		t.Fatalf("DeleteBot(force=true): %v", err)
+	}
+	m.mu.Lock()
+	remaining := 0
+	for _, s := range m.sessions {
+		if effectiveBotID(s.botID) == "ephemeral" {
+			remaining++
+		}
+	}
+	m.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("found %d zombie sessions after DeleteBot", remaining)
+	}
+}
+
+func TestScheduleObserverPreservesBotIDAfterNotifyRunEndAndDelete(t *testing.T) {
+	m, err := NewManager(Options{
+		Runtime:     &fakeRuntime{},
+		Store:       NewMemoryStore(),
+		WorkDir:     "/repo",
+		IdleTimeout: -1,
+		Hook:        noopHookEmitter{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close(context.Background())
+
+	if _, err := m.CreateBot(context.Background(), CreateBotRequest{ID: "reviewer", Name: "Reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := schedule.NewService(schedule.NewMemoryStore(), schedule.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp := AttachSchedule(m, svc)
+	defer disp.Wait(context.Background())
+
+	sub, _, _ := m.SubscribeAll(0)
+	defer sub.Close()
+
+	sch, err := svc.Create(context.Background(), schedule.CreateInput{
+		BotID:   "reviewer",
+		Name:    "rev-task",
+		Prompt:  "review",
+		Trigger: schedule.Trigger{Type: schedule.TriggerInterval, Every: "1h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run1, err := svc.RunNow(context.Background(), sch.ID, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp.Wait(context.Background())
+	// Give async notifyRunEnd a brief moment to update o.meta.
+	time.Sleep(50 * time.Millisecond)
+
+	run2, err := svc.RunNow(context.Background(), sch.ID, "r2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disp.Wait(context.Background())
+	if _, err := svc.Delete(context.Background(), sch.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenRun2, seenDeleted bool
+	deadline := time.After(2 * time.Second)
+	for !(seenRun2 && seenDeleted) {
+		select {
+		case e := <-sub.C:
+			if e.Type == EventScheduleRunFinished && e.Run != nil && e.Run.ID == run2.ID {
+				if e.BotID != "reviewer" {
+					t.Fatalf("run2 finished BotID = %q, want reviewer", e.BotID)
+				}
+				seenRun2 = true
+			}
+			if e.Type == EventScheduleDeleted && e.Schedule != nil && e.Schedule.ID == sch.ID {
+				if e.BotID != "reviewer" {
+					t.Fatalf("schedule_deleted BotID = %q, want reviewer", e.BotID)
+				}
+				seenDeleted = true
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for events (run1=%s seenRun2=%v seenDeleted=%v)", run1.ID, seenRun2, seenDeleted)
+		}
+	}
+}
+
+func TestCreateScheduleValidatesSessionBotOwnership(t *testing.T) {
+	ts, m, _, _ := newMultiBotServer(t)
+	if _, err := m.CreateBot(context.Background(), CreateBotRequest{ID: "reviewer", Name: "Reviewer"}); err != nil {
+		t.Fatal(err)
+	}
+	defSess, err := m.CreateSessionForBot(DefaultBotID, CreateSessionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := doReq(t, http.MethodPost, ts.URL+"/v1/bots/reviewer/schedules?session_id="+defSess.ID, "secret", map[string]any{
+		"name":         "cross-bot-origin",
+		"prompt":       "hi",
+		"session_mode": "origin",
+		"trigger":      map[string]any{"type": "interval", "every": "1h"},
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("create schedule with another bot's session_id = %d, want 404", resp.StatusCode)
 	}
 }

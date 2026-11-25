@@ -75,11 +75,15 @@ type Manager struct {
 	turns     sync.WaitGroup
 	global    *bus
 
-	mu       sync.Mutex
-	sessions map[string]*session
-	seqFloor map[string]int64 // last seq of sessions unloaded by the janitor
-	closed   bool
-	stopJan  chan struct{}
+	botMu sync.Mutex // serializes CreateBot / UpdateBot / DeleteBot
+
+	mu           sync.Mutex
+	sessions     map[string]*session
+	seqFloor     map[string]int64 // last seq of sessions unloaded by the janitor
+	deletingBots map[string]struct{}
+	botTurns     map[string]int
+	closed       bool
+	stopJan      chan struct{}
 }
 
 type session struct {
@@ -154,10 +158,12 @@ func NewManager(opts Options) (*Manager, error) {
 		// The cause propagates to every turn's context, so turn_end can
 		// report cancel_source=shutdown (design §3.2).
 		cancelAll: func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
-		global:    newBus(opts.ReplayEvents),
-		sessions:  map[string]*session{},
-		seqFloor:  map[string]int64{},
-		stopJan:   make(chan struct{}),
+		global:       newBus(opts.ReplayEvents),
+		sessions:     map[string]*session{},
+		seqFloor:     map[string]int64{},
+		deletingBots: map[string]struct{}{},
+		botTurns:     map[string]int{},
+		stopJan:      make(chan struct{}),
 	}
 	if opts.IdleTimeout > 0 {
 		go m.janitor()
@@ -173,10 +179,23 @@ func (m *Manager) SetSchedules(svc *schedule.Service) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) scheduleService() *schedule.Service {
+// IsBotDeleting reports whether DeleteBot is currently draining botID.
+func (m *Manager) IsBotDeleting(id string) bool {
+	id = effectiveBotID(id)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.schedules
+	_, ok := m.deletingBots[id]
+	m.mu.Unlock()
+	return ok
+}
+
+func (m *Manager) decBotTurn(botID string) {
+	m.mu.Lock()
+	if n := m.botTurns[botID]; n <= 1 {
+		delete(m.botTurns, botID)
+	} else {
+		m.botTurns[botID] = n - 1
+	}
+	m.mu.Unlock()
 }
 
 // Info describes the bot.
@@ -251,6 +270,8 @@ func (m *Manager) GetBot(ctx context.Context, id string) (BotProfile, error) {
 
 // CreateBot validates and registers a new bot persona.
 func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfile, error) {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -282,6 +303,8 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 
 // UpdateBot patches mutable fields of an existing bot persona.
 func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest) (BotProfile, error) {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
 	cur, err := m.bots.GetBot(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return BotProfile{}, err
@@ -342,6 +365,8 @@ func (m *Manager) validateBotConfig(b BotProfile, isCreate bool) error {
 // verifies no external process holds a session lock, and cascades deletion
 // across schedules, sessions, messages and memory (docs/BOT_MULTI_DESIGN.md §5.2).
 func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
 	id = strings.TrimSpace(id)
 	if id == DefaultBotID {
 		return ErrBotDeleteForbidden
@@ -361,38 +386,62 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 		}
 	}
 
-	// Collect in-memory sessions & active turns for this bot.
-	var activeTurns []*activeTurn
-	var loaded []*session
+	// Mark the bot as deleting before draining so concurrent SendForBot,
+	// CreateSessionForBot, and schedule Fire calls are rejected during the
+	// cancel/wait window.
 	m.mu.Lock()
-	for _, s := range m.sessions {
-		if effectiveBotID(s.botID) == id {
-			loaded = append(loaded, s)
-			s.mu.Lock()
-			if s.turn != nil {
-				activeTurns = append(activeTurns, s.turn)
-			}
-			s.mu.Unlock()
-		}
-	}
+	m.deletingBots[id] = struct{}{}
 	sched := m.schedules
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.deletingBots, id)
+		m.mu.Unlock()
+	}()
 
-	if len(activeTurns) > 0 {
+	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelWait()
+	cancelledSchedules := false
+
+	for {
+		var activeTurns []*activeTurn
+		m.mu.Lock()
+		for _, s := range m.sessions {
+			if effectiveBotID(s.botID) == id {
+				s.mu.Lock()
+				if s.turn != nil {
+					activeTurns = append(activeTurns, s.turn)
+				}
+				s.mu.Unlock()
+			}
+		}
+		inFlight := m.botTurns[id]
+		m.mu.Unlock()
+
+		if len(activeTurns) == 0 && inFlight == 0 {
+			break
+		}
 		if !force {
 			return ErrBusy
 		}
-		if sched != nil {
+		if sched != nil && !cancelledSchedules {
 			_ = sched.CancelActiveByBot(ctx, id)
+			cancelledSchedules = true
 		}
 		for _, t := range activeTurns {
 			t.clock.CancelWithSource(cancelSourceClient)
 		}
-		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		for _, t := range activeTurns {
+		if len(activeTurns) > 0 {
+			for _, t := range activeTurns {
+				select {
+				case <-t.done:
+				case <-waitCtx.Done():
+					return ErrBusy
+				}
+			}
+		} else {
 			select {
-			case <-t.done:
+			case <-time.After(10 * time.Millisecond):
 			case <-waitCtx.Done():
 				return ErrBusy
 			}
@@ -416,11 +465,15 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 		return &BotHasSessionsError{Sessions: sessCount, Schedules: schedCount}
 	}
 
-	// Unload any in-memory sessions belonging to this bot and release sandboxes.
+	// Re-scan and unload all in-memory sessions belonging to this bot and release sandboxes.
+	var loaded []*session
 	m.mu.Lock()
-	for _, s := range loaded {
-		delete(m.sessions, s.id)
-		delete(m.seqFloor, s.id)
+	for sid, s := range m.sessions {
+		if effectiveBotID(s.botID) == id {
+			loaded = append(loaded, s)
+			delete(m.sessions, sid)
+			delete(m.seqFloor, sid)
+		}
 	}
 	m.mu.Unlock()
 	for _, s := range loaded {
@@ -485,6 +538,10 @@ func (m *Manager) CreateSessionForBot(botID string, req CreateSessionRequest) (S
 		m.mu.Unlock()
 		return SessionInfo{}, ErrClosed
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return SessionInfo{}, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.mu.Unlock()
 
 	createOpts := models.CreateOpts{
@@ -517,6 +574,16 @@ func (m *Manager) CreateSessionForBot(botID string, req CreateSessionRequest) (S
 		bus:       newBus(m.opts.ReplayEvents),
 	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = m.opts.Store.Delete(s.id)
+		return SessionInfo{}, ErrClosed
+	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		_ = m.opts.Store.Delete(s.id)
+		return SessionInfo{}, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.sessions[s.id] = s
 	m.mu.Unlock()
 
@@ -723,12 +790,18 @@ func (m *Manager) SendForBot(botID, id string, req SendRequest, opts SendOptions
 		m.mu.Unlock()
 		return nil, ErrClosed
 	}
+	if _, deleting := m.deletingBots[botID]; deleting {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrBotDisabled, botID)
+	}
 	m.turns.Add(1)
+	m.botTurns[botID]++
 	m.mu.Unlock()
 
 	started := false
 	defer func() {
 		if !started {
+			m.decBotTurn(botID)
 			m.turns.Done()
 		}
 	}()
@@ -974,6 +1047,7 @@ func (m *Manager) Close(ctx context.Context) error {
 }
 
 func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv Conversation, model string, history []models.Message) {
+	defer m.decBotTurn(effectiveBotID(s.botID))
 	defer m.turns.Done()
 	defer t.cancel()
 
