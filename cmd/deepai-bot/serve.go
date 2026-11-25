@@ -162,6 +162,9 @@ func runServe(ctx context.Context, f serveFlags) error {
 		}
 		sched = schedule.NewScheduler(rt.Schedule, disp, schedule.SchedulerOptions{Lease: lease})
 		if err := sched.Start(rtCtx); err != nil {
+			mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = mgr.Close(mctx)
+			cancel()
 			_ = ln.Close()
 			return fmt.Errorf("start scheduler: %w", err)
 		}
@@ -214,7 +217,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	if err := writeState(daemonState{PID: os.Getpid(), Addr: addr, StartedAt: time.Now().UTC(), Version: buildVersion(), WorkDir: rt.WorkDir}); err != nil {
 		slog.Warn("write state file", "err", err)
 	}
-	defer removeState(os.Getpid())
+	defer removeState(rt.WorkDir, os.Getpid())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -229,12 +232,14 @@ func runServe(ctx context.Context, f serveFlags) error {
 		fmt.Fprintf(os.Stderr, "\n  deepai-bot is running. Web console: %s\n\n", url)
 	}
 
+	var fatalServeErr error
 	select {
 	case <-ctx.Done():
 		slog.Info("deepai-bot shutting down")
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server stopped", "err", err)
+			fatalServeErr = fmt.Errorf("http server stopped: %w", err)
 		}
 	}
 
@@ -274,7 +279,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	}
 	cancelHandlers()
 	<-shutdownDone
-	return nil
+	return fatalServeErr
 }
 
 // resolveToken picks the API token: --token, $DEEPAI_BOT_TOKEN, or the

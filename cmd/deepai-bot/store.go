@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -220,17 +223,52 @@ func marshalAllowlist(list []string) string {
 // ─────────────────────────── bot.Store / bot.BotStore ───────────────────────────
 
 func (s *botSessionStore) CreateForBot(botID string, opts models.CreateOpts) (*models.Session, error) {
-	sess, err := s.Create(opts)
-	if err != nil {
-		return nil, err
-	}
+	botID = strings.TrimSpace(botID)
 	if botID == "" {
 		botID = bot.DefaultBotID
 	}
-	if _, err := s.db.Exec(`UPDATE sessions SET bot_id = ? WHERE id = ?`, botID, sess.ID); err != nil {
-		return nil, fmt.Errorf("set session bot_id: %w", err)
+	now := time.Now()
+	var randBytes [2]byte
+	_, _ = rand.Read(randBytes[:])
+	id := fmt.Sprintf("%s_%s", now.Format("20060102_150405"), hex.EncodeToString(randBytes[:]))
+	cwd := normalizeSessionCWD(opts.CWD)
+	metadata := make(map[string]string)
+	if opts.Model != "" {
+		metadata["model"] = opts.Model
 	}
-	return sess, nil
+	if cwd != "" {
+		metadata["cwd"] = cwd
+	}
+	metaJSON, _ := json.Marshal(metadata)
+	source := opts.Source
+	if source == "" {
+		source = bot.SessionSource
+	}
+	ts := float64(now.UnixNano()) / 1e9
+	if _, err := s.db.Exec(`
+		INSERT INTO sessions (id, title, model, cwd, source, state, created_at, updated_at, metadata, bot_id)
+		VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+		id, opts.Title, opts.Model, cwd, source, ts, ts, string(metaJSON), botID); err != nil {
+		return nil, fmt.Errorf("create session for bot %s: %w", botID, err)
+	}
+	return &models.Session{
+		ID:        id,
+		Title:     opts.Title,
+		State:     models.SessionStateActive,
+		Metadata:  metadata,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, nil
+}
+
+func normalizeSessionCWD(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(cwd)
 }
 
 func (s *botSessionStore) ListRecentInDir(cwd string, limit int) ([]models.SessionMeta, error) {
@@ -322,8 +360,9 @@ func (s *botSessionStore) HasExternalBotLock(botID string, self models.LockOwner
 }
 
 func (s *botSessionStore) DeleteBotCascade(botID string) error {
-	if botID == "" {
-		botID = bot.DefaultBotID
+	botID = strings.TrimSpace(botID)
+	if botID == "" || botID == bot.DefaultBotID {
+		return bot.ErrBotDeleteForbidden
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -341,6 +380,48 @@ func (s *botSessionStore) DeleteBotCascade(botID string) error {
 	if tableExistsTx(tx, "memory_gate_verdicts") {
 		if _, err := tx.Exec(`DELETE FROM memory_gate_verdicts WHERE scope_key = ? OR scope_key IN (SELECT id FROM sessions WHERE bot_id = ?)`, userKey, botID); err != nil {
 			return fmt.Errorf("delete bot memory verdicts: %w", err)
+		}
+	}
+	if tableExistsTx(tx, "channel_bindings") {
+		if _, err := tx.Exec(`DELETE FROM channel_bindings WHERE bot_id = ? OR session_id IN (SELECT id FROM sessions WHERE bot_id = ?)`, botID, botID); err != nil {
+			return fmt.Errorf("delete bot channel bindings: %w", err)
+		}
+	}
+	if tableExistsTx(tx, "schedules") {
+		if tableExistsTx(tx, "schedule_metas") {
+			rows, err := tx.Query(`SELECT DISTINCT work_dir FROM schedules WHERE bot_id = ?`, botID)
+			if err != nil {
+				return fmt.Errorf("query bot schedule workdirs: %w", err)
+			}
+			var dirs []string
+			for rows.Next() {
+				var wd string
+				if err := rows.Scan(&wd); err != nil {
+					rows.Close()
+					return err
+				}
+				dirs = append(dirs, wd)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			rows.Close()
+			for _, wd := range dirs {
+				if _, err := tx.Exec(`
+					INSERT INTO schedule_metas (work_dir, version) VALUES (?, 1)
+					ON CONFLICT(work_dir) DO UPDATE SET version = version + 1`, wd); err != nil {
+					return fmt.Errorf("bump schedule metas: %w", err)
+				}
+			}
+		}
+		if tableExistsTx(tx, "schedule_runs") {
+			if _, err := tx.Exec(`DELETE FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedules WHERE bot_id = ?)`, botID); err != nil {
+				return fmt.Errorf("delete bot schedule runs: %w", err)
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM schedules WHERE bot_id = ?`, botID); err != nil {
+			return fmt.Errorf("delete bot schedules: %w", err)
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM sessions WHERE bot_id = ?`, botID); err != nil {

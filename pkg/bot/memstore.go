@@ -237,9 +237,12 @@ func (s *MemoryStore) HasExternalBotLock(string, models.LockOwner) (bool, error)
 }
 
 func (s *MemoryStore) DeleteBotCascade(botID string) error {
+	target := effectiveBotID(botID)
+	if target == DefaultBotID {
+		return ErrBotDeleteForbidden
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	target := effectiveBotID(botID)
 	for id := range s.sessions {
 		if effectiveBotID(s.botID[id]) == target {
 			delete(s.sessions, id)

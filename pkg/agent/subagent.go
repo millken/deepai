@@ -168,6 +168,12 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		return subagent.ExecutionResult{}, e.unknownAgentTypeError(agentType, profileProblems)
 	}
 
+	constraints, hasConstraints := tools.SubagentConstraintsFromContext(ctx)
+	baseTools := e.tools
+	if hasConstraints && constraints.Tools != nil {
+		baseTools = constraints.Tools
+	}
+
 	// Determine tools: explicit Tools > AgentType DefaultTools > all
 	var toolSelectors []string
 	if len(task.Config.Tools) > 0 {
@@ -176,7 +182,7 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 		toolSelectors = profileCfg.DefaultTools
 	}
 
-	selectedTools, err := selectSubagentTools(e.tools.List(), toolSelectors)
+	selectedTools, err := selectSubagentTools(baseTools.List(), toolSelectors)
 	if err != nil {
 		return subagent.ExecutionResult{}, err
 	}
@@ -288,27 +294,22 @@ func (e *SubagentExecutor) Execute(ctx context.Context, task *subagent.Task, emi
 	if e.instructions != "" {
 		systemPrompt += "\n\n" + e.instructions
 	}
+	if hasConstraints && constraints.ExtraInstructions != "" {
+		systemPrompt += "\n\n## Bot Instructions\n\n" + constraints.ExtraInstructions
+	}
 
 	// Resolve model alias: task.Config.Model (caller-explicit) > fork
-	// skill's model: > agent type YAML model > registry default. The fork
-	// skill sits between the caller-explicit override and the profile's own
-	// default: it is more specific than "whatever this role normally runs
-	// on" (the skill was picked for THIS task) but must not silently
-	// override an explicit task-tool `model` argument. This resolution MUST
-	// run after the fork-skill block above (which is what determines
-	// forkModelAlias) and before e.registry.ProviderFor below — reordering
-	// choice for this M5-1 change: the model-resolution block (previously
-	// positioned right after the OutputSchema injection) was moved DOWN, to
-	// after system-prompt/fork-skill assembly, rather than moving fork-skill
-	// resolution up before tool selection — model resolution has no
-	// dependency on the selected tool set, so moving it down keeps the
-	// system-prompt-building code contiguous instead.
+	// skill's model: > agent type YAML model > parent turn's constrained
+	// model > registry default.
 	modelAlias := strings.TrimSpace(task.Config.Model)
 	if modelAlias == "" {
 		modelAlias = forkModelAlias
 	}
 	if modelAlias == "" {
 		modelAlias = strings.TrimSpace(profileCfg.Model)
+	}
+	if modelAlias == "" && hasConstraints {
+		modelAlias = strings.TrimSpace(constraints.DefaultModel)
 	}
 	provider, modelName, err := e.registry.ProviderFor(modelAlias)
 	if err != nil {

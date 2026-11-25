@@ -277,8 +277,10 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 		botID := ra.policy.defaultBot()
 		model := ""
 		if cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID); ok && cur.BotID != "" {
-			botID = cur.BotID
-			model = cur.Model
+			if b, err := g.m.GetBot(ctx, cur.BotID); err == nil && b.Enabled && ra.policy.AllowsBot(msg.UserID, b.ID) {
+				botID = b.ID
+				model = cur.Model
+			}
 		}
 		info, err := g.m.CreateSessionForBot(botID, bot.CreateSessionRequest{Model: model})
 		if err != nil {
@@ -479,8 +481,10 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 
 func (g *Gateway) ensureBinding(ctx context.Context, policy AccessPolicy, ch, chatID, threadID string) (Binding, error) {
 	if b, ok, err := g.bindings.GetBinding(ctx, ch, chatID, threadID); err == nil && ok {
-		if _, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID); err == nil {
-			return b, nil
+		if prof, bErr := g.m.GetBot(ctx, b.BotID); bErr == nil && prof.Enabled {
+			if _, _, err := g.m.GetSessionForBot(b.BotID, b.SessionID); err == nil {
+				return b, nil
+			}
 		}
 	}
 	botID := policy.defaultBot()
