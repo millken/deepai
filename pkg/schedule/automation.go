@@ -127,6 +127,23 @@ func ShouldNotify(notify string, notifyIf *NotifyIf, status RunStatus, output st
 // TriggerWebhook authenticates, filters, deduplicates, rate-limits, renders,
 // and dispatches an inbound webhook delivery for scheduleID.
 func (s *Service) TriggerWebhook(ctx context.Context, scheduleID string, req WebhookRequest) (WebhookResult, error) {
+	// Pre-check and verify signature BEFORE acquiring s.mu or inspecting
+	// schedule state, so unauthenticated requests neither contend on the
+	// scheduler mutex nor learn whether a schedule is paused/pending.
+	pre, err := s.store.GetSchedule(ctx, scheduleID)
+	if err != nil {
+		return WebhookResult{}, notFound(err, "schedule "+scheduleID)
+	}
+	if pre.State == StateDeleted {
+		return WebhookResult{}, NewError(CodeNotFound, "schedule %s not found", scheduleID)
+	}
+	if pre.Trigger.Type != TriggerWebhook {
+		return WebhookResult{}, NewError(CodeNotFound, "schedule %s is not a webhook trigger", scheduleID)
+	}
+	if err := verifyWebhookSignature(pre.Trigger, req.Headers, req.Body); err != nil {
+		return WebhookResult{}, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -140,12 +157,14 @@ func (s *Service) TriggerWebhook(ctx context.Context, scheduleID string, req Web
 	if v.Trigger.Type != TriggerWebhook {
 		return WebhookResult{}, NewError(CodeNotFound, "schedule %s is not a webhook trigger", scheduleID)
 	}
+	if v.Trigger.Secret != pre.Trigger.Secret || v.Trigger.SecretRef != pre.Trigger.SecretRef ||
+		v.Trigger.SignatureScheme != pre.Trigger.SignatureScheme || v.Trigger.SignatureHeader != pre.Trigger.SignatureHeader {
+		if err := verifyWebhookSignature(v.Trigger, req.Headers, req.Body); err != nil {
+			return WebhookResult{}, err
+		}
+	}
 	if v.State != StateActive {
 		return WebhookResult{}, NewError(CodeInvalidState, "schedule %s is %s", scheduleID, v.State)
-	}
-
-	if err := verifyWebhookSignature(v.Trigger, req.Headers, req.Body); err != nil {
-		return WebhookResult{}, err
 	}
 
 	var payloadMap map[string]any
@@ -377,6 +396,16 @@ func lookupJSONPath(obj map[string]any, dotPath string) (string, bool) {
 	}
 }
 
+func validateWebhookPrompt(promptTmpl string) error {
+	if !strings.Contains(promptTmpl, "{{") {
+		return nil
+	}
+	if _, err := template.New("webhook").Funcs(template.FuncMap{}).Option("missingkey=zero").Parse(promptTmpl); err != nil {
+		return NewError(CodeBadRequest, "invalid webhook prompt template: %v", err)
+	}
+	return nil
+}
+
 func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, rawBody []byte, payload map[string]any) string {
 	safeHeaders := map[string]string{}
 	sigCanon := http.CanonicalHeaderKey(tr.SignatureHeader)
@@ -386,14 +415,15 @@ func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, raw
 			continue
 		}
 		if len(vals) > 0 {
-			safeHeaders[ck] = vals[0]
+			safeHeaders[ck] = truncateBytes(vals[0], 1024)
 		}
 	}
 	eventName := safeHeaders["X-Github-Event"]
 	if eventName == "" {
 		eventName = safeHeaders["X-Event-Type"]
 	}
-	payloadStr := truncateBytes(string(bytes.TrimSpace(rawBody)), MaxWebhookPayloadBytes)
+	const maxFencePayloadBytes = MaxWebhookPayloadBytes - 256
+	payloadStr := truncateBytes(string(bytes.TrimSpace(rawBody)), maxFencePayloadBytes)
 
 	data := struct {
 		Event       string
@@ -417,6 +447,13 @@ func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, raw
 			}
 		}
 	}
+	// Bound the rendered template output as well as the fenced payload so
+	// {{.Payload}} / {{.Headers}} on large bodies cannot bypass MaxWebhookPayloadBytes.
+	rendered = strings.TrimSpace(rendered)
+	if len(rendered) > MaxWebhookPayloadBytes {
+		const suffix = "...[truncated]"
+		rendered = truncateBytes(rendered, MaxWebhookPayloadBytes-len(suffix)) + suffix
+	}
 	// Always wrap untrusted external payload in an explicit data fence.
 	var fence bytes.Buffer
 	fence.WriteString("\n\n<untrusted_webhook_payload")
@@ -428,7 +465,7 @@ func renderWebhookPrompt(promptTmpl string, tr Trigger, headers http.Header, raw
 	fence.WriteString(">\n")
 	fence.WriteString(payloadStr)
 	fence.WriteString("\n</untrusted_webhook_payload>")
-	return strings.TrimSpace(rendered) + fence.String()
+	return rendered + fence.String()
 }
 
 // ─────────────────────── Task Chaining (A -> B) ───────────────────────
@@ -444,6 +481,11 @@ func (s *Service) validateChainLocked(ctx context.Context, selfID string, tr Tri
 	upstream, err := s.store.GetSchedule(ctx, upstreamID)
 	if err != nil || upstream.State == StateDeleted {
 		return NewError(CodeNotFound, "upstream schedule %s not found", upstreamID)
+	}
+	if callerBot := strings.TrimSpace(BotIDFromContext(ctx)); callerBot != "" {
+		if effectiveBotID(upstream.BotID) != effectiveBotID(callerBot) {
+			return NewError(CodeNotFound, "upstream schedule %s not found", upstreamID)
+		}
 	}
 
 	// Build adjacency map (child -> parent) across non-deleted schedules and

@@ -292,3 +292,94 @@ func TestNotifyIfPolicies(t *testing.T) {
 		t.Fatal("expected error for empty contains pattern")
 	}
 }
+
+func TestWebhookPromptTruncationTemplateValidationAndAuthOrder(t *testing.T) {
+	ctx := context.Background()
+	svc, err := NewService(NewMemoryStore(), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 60-L1: invalid template rejected on Create.
+	if _, err := svc.Create(ctx, CreateInput{
+		Name:    "bad-tmpl",
+		Prompt:  "Review {{.Payload.body",
+		Trigger: Trigger{Type: TriggerWebhook, SignatureScheme: WebhookSigBearer, SignatureHeader: "Authorization"},
+	}); err == nil || ErrorCode(err) != CodeBadRequest {
+		t.Fatalf("Create invalid template err = %v, want CodeBadRequest", err)
+	}
+
+	// 60-L2: bare "*" tool_allowlist rejected in service normalizeOptions.
+	if _, err := svc.Create(ctx, CreateInput{
+		Name:    "bad-allowlist",
+		Prompt:  "hello",
+		Trigger: Trigger{Type: TriggerInterval, Every: "1h"},
+		Options: Options{ToolAllowlist: []string{"*"}},
+	}); err == nil || ErrorCode(err) != CodeBadRequest {
+		t.Fatalf("Create bare wildcard allowlist err = %v, want CodeBadRequest", err)
+	}
+
+	// 60-M1: large 300 KiB payload expanded via {{.Payload.body}} stays strictly bounded.
+	sch, err := svc.Create(ctx, CreateInput{
+		Name:    "wh-cap",
+		Prompt:  "Inspect: {{.Payload.body}}",
+		Trigger: Trigger{Type: TriggerWebhook, SignatureScheme: WebhookSigBearer, SignatureHeader: "Authorization"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugeBody := []byte(`{"body":"` + strings.Repeat("A", 300<<10) + `"}`)
+	res, err := svc.TriggerWebhook(ctx, sch.ID, WebhookRequest{
+		Headers: http.Header{"Authorization": {"Bearer " + sch.WebhookSecret}},
+		Body:    hugeBody,
+	})
+	if err != nil || res.Run == nil {
+		t.Fatalf("TriggerWebhook = (%+v, %v)", res, err)
+	}
+	if len(res.Run.PromptOverride) > 2*MaxWebhookPayloadBytes {
+		t.Fatalf("PromptOverride len = %d, exceeds 2*MaxWebhookPayloadBytes (%d)", len(res.Run.PromptOverride), 2*MaxWebhookPayloadBytes)
+	}
+
+	// 60-L1: invalid template rejected on Update.
+	badPrompt := "Broken {{.Event"
+	if _, err := svc.Update(ctx, sch.ID, Patch{Prompt: &badPrompt}); err == nil || ErrorCode(err) != CodeBadRequest {
+		t.Fatalf("Update invalid template err = %v, want CodeBadRequest", err)
+	}
+
+	// 60-L2: paused webhook must return CodeUnauthorized (not CodeInvalidState) for bad auth.
+	if _, err := svc.Pause(ctx, sch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.TriggerWebhook(ctx, sch.ID, WebhookRequest{
+		Headers: http.Header{"Authorization": {"Bearer wrong"}},
+		Body:    []byte(`{}`),
+	}); err == nil || ErrorCode(err) != CodeUnauthorized {
+		t.Fatalf("unauthenticated paused webhook err = %v, want CodeUnauthorized", err)
+	}
+}
+
+func TestChainRejectsCrossBotUpstreamFromBotContext(t *testing.T) {
+	ctx := context.Background()
+	svc, err := NewService(NewMemoryStore(), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretSch, err := svc.Create(ctx, CreateInput{
+		BotID:   "secret",
+		Name:    "secret-job",
+		Prompt:  "do secret stuff",
+		Trigger: Trigger{Type: TriggerInterval, Every: "1h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revCtx := WithBotID(ctx, "reviewer")
+	if _, err := svc.Create(revCtx, CreateInput{
+		BotID:   "reviewer",
+		Name:    "steal-output",
+		Prompt:  "leak {{prev.output}}",
+		Trigger: Trigger{Type: TriggerChain, AfterScheduleID: secretSch.ID},
+	}); err == nil || ErrorCode(err) != CodeNotFound {
+		t.Fatalf("cross-bot chain err = %v, want CodeNotFound", err)
+	}
+}

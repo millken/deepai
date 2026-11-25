@@ -262,6 +262,9 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Schedule, error) 
 	}
 	var generatedSecret string
 	if tr.Type == TriggerWebhook {
+		if err := validateWebhookPrompt(prompt); err != nil {
+			return Schedule{}, err
+		}
 		if tr.SecretRef == "" {
 			generatedSecret = newID("whsec_") + newID("")
 			tr.Secret = generatedSecret
@@ -439,6 +442,11 @@ func (s *Service) Update(ctx context.Context, id string, p Patch) (Schedule, err
 			tr.HasSecret = true
 		}
 		v.Trigger = tr
+	}
+	if v.Trigger.Type == TriggerWebhook {
+		if err := validateWebhookPrompt(v.Prompt); err != nil {
+			return Schedule{}, err
+		}
 	}
 	applyPatch(&v.Options, p)
 	opts, err := s.normalizeOptions(v.Options, s.now())
@@ -1258,6 +1266,20 @@ func (s *Service) normalizeOptions(o Options, now time.Time) (Options, error) {
 		return o, err
 	}
 	o.NotifyIf = ni
+	if len(o.ToolAllowlist) > 0 {
+		cleaned := make([]string, 0, len(o.ToolAllowlist))
+		for _, item := range o.ToolAllowlist {
+			pat := strings.TrimSpace(item)
+			if pat == "" {
+				continue
+			}
+			if pat == "*" {
+				return o, NewError(CodeBadRequest, "tool_allowlist cannot contain bare wildcard '*'; omit it for unrestricted tools")
+			}
+			cleaned = append(cleaned, pat)
+		}
+		o.ToolAllowlist = cleaned
+	}
 	return o, nil
 }
 
