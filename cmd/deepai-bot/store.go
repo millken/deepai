@@ -105,7 +105,7 @@ func (s *botSessionStore) EnsureDefault(ctx context.Context) error {
 
 func (s *botSessionStore) ListBots(ctx context.Context) ([]bot.BotProfile, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at
+		SELECT id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at, extra_json
 		FROM bots
 		ORDER BY CASE WHEN id = 'default' THEN 0 ELSE 1 END, created_at ASC, id ASC`)
 	if err != nil {
@@ -125,7 +125,7 @@ func (s *botSessionStore) ListBots(ctx context.Context) ([]bot.BotProfile, error
 
 func (s *botSessionStore) GetBot(ctx context.Context, id string) (bot.BotProfile, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at
+		SELECT id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at, extra_json
 		FROM bots WHERE id = ?`, id)
 	b, err := scanBotProfile(row)
 	if err != nil {
@@ -139,15 +139,16 @@ func (s *botSessionStore) GetBot(ctx context.Context, id string) (bot.BotProfile
 
 func (s *botSessionStore) CreateBot(ctx context.Context, b bot.BotProfile) (bot.BotProfile, error) {
 	allowJSON := marshalAllowlist(b.ToolAllowlist)
+	extraJSON := marshalExtensions(b.Extensions)
 	enabled := 0
 	if b.Enabled {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO bots (id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO bots (id, name, title, description, instructions, default_model, tool_allowlist_json, enabled, created_at, updated_at, extra_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.ID, b.Name, b.Title, b.Description, b.Instructions, b.DefaultModel,
-		allowJSON, enabled, b.CreatedAt.UnixMilli(), b.UpdatedAt.UnixMilli())
+		allowJSON, enabled, b.CreatedAt.UnixMilli(), b.UpdatedAt.UnixMilli(), extraJSON)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return bot.BotProfile{}, fmt.Errorf("%w: %s", bot.ErrBotExists, b.ID)
@@ -159,16 +160,17 @@ func (s *botSessionStore) CreateBot(ctx context.Context, b bot.BotProfile) (bot.
 
 func (s *botSessionStore) UpdateBot(ctx context.Context, b bot.BotProfile) (bot.BotProfile, error) {
 	allowJSON := marshalAllowlist(b.ToolAllowlist)
+	extraJSON := marshalExtensions(b.Extensions)
 	enabled := 0
 	if b.Enabled {
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE bots
-		SET name=?, title=?, description=?, instructions=?, default_model=?, tool_allowlist_json=?, enabled=?, updated_at=?
+		SET name=?, title=?, description=?, instructions=?, default_model=?, tool_allowlist_json=?, enabled=?, updated_at=?, extra_json=?
 		WHERE id=?`,
 		b.Name, b.Title, b.Description, b.Instructions, b.DefaultModel,
-		allowJSON, enabled, b.UpdatedAt.UnixMilli(), b.ID)
+		allowJSON, enabled, b.UpdatedAt.UnixMilli(), extraJSON, b.ID)
 	if err != nil {
 		return bot.BotProfile{}, err
 	}
@@ -193,11 +195,11 @@ type botRowScanner interface{ Scan(dest ...any) error }
 
 func scanBotProfile(row botRowScanner) (bot.BotProfile, error) {
 	var b bot.BotProfile
-	var allowJSON string
+	var allowJSON, extraJSON string
 	var enabled int
 	var createdAt, updatedAt int64
 	if err := row.Scan(&b.ID, &b.Name, &b.Title, &b.Description, &b.Instructions,
-		&b.DefaultModel, &allowJSON, &enabled, &createdAt, &updatedAt); err != nil {
+		&b.DefaultModel, &allowJSON, &enabled, &createdAt, &updatedAt, &extraJSON); err != nil {
 		return bot.BotProfile{}, err
 	}
 	b.Enabled = enabled != 0
@@ -206,7 +208,18 @@ func scanBotProfile(row botRowScanner) (bot.BotProfile, error) {
 	if allowJSON != "" && allowJSON != "[]" {
 		_ = json.Unmarshal([]byte(allowJSON), &b.ToolAllowlist)
 	}
+	if extraJSON != "" && extraJSON != "{}" {
+		_ = json.Unmarshal([]byte(extraJSON), &b.Extensions)
+	}
 	return b, nil
+}
+
+func marshalExtensions(ext bot.BotExtensions) string {
+	b, err := json.Marshal(ext)
+	if err != nil || len(b) == 0 {
+		return "{}"
+	}
+	return string(b)
 }
 
 func marshalAllowlist(list []string) string {
@@ -385,6 +398,11 @@ func (s *botSessionStore) DeleteBotCascade(botID string) error {
 	if tableExistsTx(tx, "channel_bindings") {
 		if _, err := tx.Exec(`DELETE FROM channel_bindings WHERE bot_id = ? OR session_id IN (SELECT id FROM sessions WHERE bot_id = ?)`, botID, botID); err != nil {
 			return fmt.Errorf("delete bot channel bindings: %w", err)
+		}
+	}
+	if tableExistsTx(tx, "bot_secrets") {
+		if _, err := tx.Exec(`DELETE FROM bot_secrets WHERE bot_id = ?`, botID); err != nil {
+			return fmt.Errorf("delete bot secrets: %w", err)
 		}
 	}
 	if tableExistsTx(tx, "schedules") {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,12 @@ type Options struct {
 	// Bots persists multi-bot personas (optional; defaults to Store when it
 	// implements BotRegistry, else an in-memory registry with "default").
 	Bots BotRegistry
+	// Secrets persists machine-sealed per-bot credentials for {{secret:NAME}}
+	// placeholders (optional; defaults to an in-memory store).
+	Secrets SecretStore
+	// BotDataDir is the root directory for per-bot state on disk (e.g.
+	// ~/.deepai/bot/bots/<bot_id>/skills/); cleaned up on DeleteBot.
+	BotDataDir string
 	// WorkDir is recorded on created sessions (the store's cwd column) and
 	// scopes the Manager to them: sessions from other directories are
 	// neither listed nor opened (ErrNotFound). Empty disables scoping.
@@ -69,6 +76,7 @@ type Options struct {
 type Manager struct {
 	opts      Options
 	bots      BotRegistry
+	secrets   SecretStore
 	schedules *schedule.Service
 	log       *slog.Logger
 	owner     models.LockOwner
@@ -151,6 +159,10 @@ func NewManager(opts Options) (*Manager, error) {
 	if err := bots.EnsureDefault(context.Background()); err != nil {
 		return nil, fmt.Errorf("bot: ensure default bot: %w", err)
 	}
+	secrets := opts.Secrets
+	if secrets == nil {
+		secrets = NewMemorySecretStore()
+	}
 	if opts.IdleTimeout == 0 {
 		opts.IdleTimeout = 30 * time.Minute
 	}
@@ -163,13 +175,14 @@ func NewManager(opts Options) (*Manager, error) {
 	m := &Manager{
 		opts:      opts,
 		bots:      bots,
+		secrets:   secrets,
 		log:       log,
 		owner:     models.LockOwner{PID: os.Getpid(), Host: host},
 		startedAt: time.Now().UTC(),
 		baseCtx:   ctx,
 		// The cause propagates to every turn's context, so turn_end can
 		// report cancel_source=shutdown (design §3.2).
-		cancelAll: func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
+		cancelAll:    func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
 		global:       newBus(opts.ReplayEvents),
 		sessions:     map[string]*session{},
 		seqFloor:     map[string]int64{},
@@ -178,10 +191,20 @@ func NewManager(opts Options) (*Manager, error) {
 		stopJan:      make(chan struct{}),
 		metrics:      NewMetrics(),
 	}
+	if ar, ok := opts.Runtime.(*AgentRuntime); ok {
+		ar.BindGovernance(m.bots, m.secrets, nil, m.NotifyBotUpdated)
+	}
 	if opts.IdleTimeout > 0 {
 		go m.janitor()
 	}
 	return m, nil
+}
+
+// NotifyBotUpdated broadcasts a bot_updated lifecycle event when an in-turn
+// self-training tool mutates a BotProfile directly via BotRegistry.
+func (m *Manager) NotifyBotUpdated(b BotProfile) {
+	cp := b.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
 }
 
 // SetSchedules attaches the optional schedule.Service so ListBots and
@@ -195,6 +218,9 @@ func (m *Manager) SetAudit(a *AuditLogger) {
 	m.mu.Lock()
 	m.audit = a
 	m.mu.Unlock()
+	if ar, ok := m.opts.Runtime.(*AgentRuntime); ok {
+		ar.BindGovernance(m.bots, m.secrets, a, m.NotifyBotUpdated)
+	}
 }
 
 func (m *Manager) auditLogger() *AuditLogger {
@@ -307,6 +333,10 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 		enabled = *req.Enabled
 	}
 	now := time.Now().UTC()
+	var ext BotExtensions
+	if req.Extensions != nil {
+		ext = normalizeBotExtensions(*req.Extensions)
+	}
 	b := BotProfile{
 		ID:            strings.TrimSpace(req.ID),
 		Name:          strings.TrimSpace(req.Name),
@@ -316,6 +346,7 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 		DefaultModel:  strings.TrimSpace(req.DefaultModel),
 		ToolAllowlist: normalizeToolAllowlist(req.ToolAllowlist),
 		Enabled:       enabled,
+		Extensions:    ext,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -360,6 +391,9 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	}
 	if req.Enabled != nil {
 		cur.Enabled = *req.Enabled
+	}
+	if req.Extensions != nil {
+		cur.Extensions = normalizeBotExtensions(*req.Extensions)
 	}
 	cur.UpdatedAt = time.Now().UTC()
 	if err := m.validateBotConfig(cur, false); err != nil {
@@ -553,6 +587,9 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 			return err
 		}
 	}
+	if m.secrets != nil {
+		_ = m.secrets.DeleteAllSecretsForBot(ctx, id)
+	}
 	if hasBotStore {
 		if err := bs.DeleteBotCascade(id); err != nil {
 			return err
@@ -562,10 +599,43 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 			return err
 		}
 	}
+	if base := strings.TrimSpace(m.opts.BotDataDir); base != "" {
+		_ = os.RemoveAll(filepath.Join(base, id))
+	}
 
 	cp := cur.Clone()
 	m.global.publish(Event{BotID: cp.ID, Type: EventBotDeleted, Bot: &cp})
 	return nil
+}
+
+// Secrets returns the Manager's per-bot SecretStore.
+func (m *Manager) Secrets() SecretStore { return m.secrets }
+
+// SetSecret seals and stores a named credential scoped to botID.
+func (m *Manager) SetSecret(ctx context.Context, botID, name, plaintext string) (SecretMeta, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return SecretMeta{}, err
+	}
+	return m.secrets.SetSecret(ctx, botID, name, plaintext)
+}
+
+// ListSecrets lists credential metadata (never plaintext values) scoped to botID.
+func (m *Manager) ListSecrets(ctx context.Context, botID string) ([]SecretMeta, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return nil, err
+	}
+	return m.secrets.ListSecrets(ctx, botID)
+}
+
+// DeleteSecret removes one named credential scoped to botID.
+func (m *Manager) DeleteSecret(ctx context.Context, botID, name string) error {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return err
+	}
+	return m.secrets.DeleteSecret(ctx, botID, name)
 }
 
 // CreateSession creates and loads a new session for the default bot.
@@ -1152,6 +1222,7 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		MemoryUserID:      "bot:" + effectiveBotID(t.botProfile.ID),
 		BotToolAllowlist:  t.botProfile.ToolAllowlist,
 		ToolAllowlist:     t.toolAllowlist,
+		Extensions:        t.botProfile.Extensions.Clone(),
 	})
 	if t.hooks != nil {
 		t.hooks.TurnEnded()

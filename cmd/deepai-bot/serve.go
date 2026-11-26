@@ -68,7 +68,7 @@ func newRootCmd() *cobra.Command {
 	}
 	registerServeFlags(start, &f)
 
-	root.AddCommand(serve, start, newStopCmd(), newStatusCmd(), newTokenCmd(), &cobra.Command{
+	root.AddCommand(serve, start, newStopCmd(), newStatusCmd(), newTokenCmd(), newSecretCmd(), &cobra.Command{
 		Use:   "version",
 		Short: "Print the build version",
 		Run: func(cmd *cobra.Command, args []string) {
@@ -140,6 +140,8 @@ func runServe(ctx context.Context, f serveFlags) error {
 	mgr, err := bot.NewManager(bot.Options{
 		Runtime:     rt.Runtime,
 		Store:       rt.Store,
+		Secrets:     rt.Secrets,
+		BotDataDir:  rt.BotDataDir,
 		WorkDir:     rt.WorkDir,
 		IdleTimeout: f.idleTimeout,
 		TurnTimeout: f.turnTimeout,
@@ -189,6 +191,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 			slog.Warn("init audit logger failed", "err", err)
 		}
 	}
+	mgr.SetAudit(auditLog)
 
 	gwCtx, cancelGW := context.WithCancel(rtCtx)
 	defer cancelGW()

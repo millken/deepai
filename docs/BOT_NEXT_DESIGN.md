@@ -1,7 +1,7 @@
 # DeepAI Bot 后续能力演进设计（Queue / Steer · Attachments · Automation P3 · IM Channels · Governance）
 
-> 状态：设计定稿（分阶段实施）  
-> 前置文档：[`BOT_DESIGN.md`](BOT_DESIGN.md)（核心服务，已落地）、[`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)（P1+P2，已落地）、[`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)（多 Bot 与多 Workdir 隔离，v2 定稿）
+> 状态：已落地（M1 → M6 全部完成）  
+> 前置文档：[`BOT_DESIGN.md`](BOT_DESIGN.md)（核心服务，已落地）、[`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)（P1+P2，已落地）、[`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)（多 Bot、对话自训练与第三方业务 API 连接器，已落地）
 
 ---
 
@@ -234,7 +234,7 @@ type Adapter interface {
 | **流式节流编辑** | 订阅 `Manager` 会话事件流：累积 `text_delta`，每 `800ms`（可配）调用一次 `EditText` 刷新消息（防触发 IM API 限流）；运行工具时在消息末尾追加状态行（如 `🔧 运行 bash...`）；超出平台单条字数上限（如 TG 4096 字符）时自动分段发新消息 |
 | **提问 ↔ 内联按钮** | 收到 `question` 事件 → 调用 `SendQuestion` 渲染带选项按钮的卡片（Telegram `InlineKeyboard` / 飞书交互卡片）；用户点按钮或直接回复该消息 → 调 `Manager.Answer` 恢复 turn |
 | **并发消息处理** | 运行中收到同一线程的新消息：默认按 `mode: "queue"` 入队并回复「已加入队列（第 N 位），发送 `/steer <内容>` 可立即插话，`/cancel` 可中止」 |
-| **内置斜杠指令** | `/new`（开新会话）、`/cancel`（中止当前 turn）、`/steer <text>`（运行中插话）、`/bot [id]`（切换当前线程绑定的 Bot 人格）、`/model [alias]`（切换模型）、`/status`（查看当前会话与运行中任务）、`/approve <sch_id>`（手机端直接批准待审批定时任务） |
+| **内置斜杠指令** | `/new`（开新会话）、`/cancel`（中止当前 turn）、`/steer <text>`（运行中插话）、`/bot [id]`（切换当前线程绑定的 Bot 人格）、`/model [alias]`（切换模型）、`/status`（查看当前会话与运行中任务）、`/approve <sch_id>`（手机端直接批准待审批定时任务）、`/secret list\|set <NAME> <VALUE>\|delete <NAME>`（仅私聊 `allow_users` 可用，直接密文落库、不进会话历史与上下文） |
 | **双向附件** | 用户在 IM 发图片/文件 → 适配器下载后写入会话沙箱 `uploads/` 并走 §3 附件管线；agent 调 `present_file` → 适配器自动回传文件/图片到对应聊天 |
 
 ### 5.4 安全边界（IM 通道强制默认收紧）
@@ -310,13 +310,21 @@ CREATE TABLE IF NOT EXISTS bot_tokens (
   - `deepai_bot_queue_depth{bot_id}`（Gauge）
   - `deepai_bot_schedule_runs_total{bot_id,trigger,status}`（Counter）
   - `deepai_bot_schedule_lag_seconds`（Histogram，实际启动时刻 − 计划槽位）
-- **结构化审计日志**：写往 `~/.deepai/bot/audit.jsonl`（按大小轮转），记录鉴权失败、Token 签发/吊销、Bot 创建/修改/删除、Webhook 触发、定时任务批准与执行终态、IM 渠道被拒消息。
+- **结构化审计日志**：写往 `~/.deepai/bot/audit.jsonl`（按大小轮转），记录鉴权失败、Token 签发/吊销、Bot 创建/修改/删除、Bot 密钥增删与自训练技能/人格更新、Webhook 触发、定时任务批准与执行终态、IM 渠道被拒消息。
+
+### 6.4 对话式自训练与受控第三方业务 API 连接器（M6）
+
+承接「出生一致、后天对话训练分化」理念，所有自定义 Bot 共享同一套 `ModelRegistry` 与 `AgentRuntime`，通过三层机制在聊天过程中习得专属业务能力并安全对接外部 HTTP API（完整数据结构见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §3.4）：
+
+- **硬件绑定密钥仓（`bot_secrets`）**：通过 `deepai-bot secret`、`PUT /v1/bots/{bot_id}/secrets/{name}` 或 IM 私聊 `/secret set` 将第三方服务凭证用 `pkg/secret.Seal` 加密落盘；模型仅获知 `{{secret:NAME}}` 占位符名。
+- **受控连接器调用（`http_request`）**：无需授予 `bash` 权限即可调用 REST/GraphQL 接口，宿主侧注入 `{{secret:NAME}}` 并对响应体与报错自动执行 `[REDACTED:NAME]` 脱敏，同时强制带凭据请求走 HTTPS、拦截跨域名重定向与内网 SSRF。
+- **自进化工具（`update_bot_persona` + `save_bot_skill`）**：在交互式训练中自动演化 `Instructions` / `APIConnector` / `IsolatedPrompt`，并将复杂接口文档沉淀到 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`（拦截明文密钥、Prompt 注入与 `` !`command` `` 动态执行块，且在定时任务/Webhook 无人值守运行时自动禁用）。
 
 ---
 
-## 7. 分阶段实施路线图（M1 → M5）
+## 7. 分阶段实施路线图（M1 → M6，已落地）
 
-每个 Milestone 均可拆为 1–2 个独立 PR，做到**每合一个 PR 即立即可用、零破坏升级**：
+每个 Milestone 均保持向后兼容与独立测试闭环：
 
 | Milestone | 核心内容 | 涉及包 | 核心验收标准 |
 |---|---|---|---|
@@ -325,3 +333,4 @@ CREATE TABLE IF NOT EXISTS bot_tokens (
 | **M3（多模态与产物）** | 1. 附件上传 `/attachments` + 图片压缩接入 `models.Message.Images`<br>2. 沙箱/授权产出物安全下载 `/files/{path}` + Web 拖放上传与预览卡片 | `pkg/bot`、`pkg/bot/web` | 拖入截图给 bot 分析全链路通畅；路径穿越/符号链接逃逸单测 100% 拦截；删除会话自动清理上传沙箱 |
 | **M4（自动化 P3）** | 1. 单任务 `tool_allowlist`（与 Bot 取交集）<br>2. Inbound Webhook 触发器（HMAC + 模板 + `delivery_id` 去重 + 限流）<br>3. 任务链（A → B + 环检测 + `{{prev.output}}`）与条件通知 `notify_if` | `pkg/schedule`、`pkg/bot`、`pkg/hook` | GitHub Webhook 签名校验 + 重复投递幂等单测通过；A→B 链式触发与环检测通过；`[NO_NOTIFY]` 静默不发通知 |
 | **M5（IM 与治理）** | 1. `pkg/bot/channel` 网关 + Telegram（Long Polling）& 飞书（WS 长连接）适配器<br>2. Scoped Tokens（`bot_tokens`）、`/v1/chat/completions` 兼容层、`/metrics` 与 `audit.jsonl` | `pkg/bot/channel`、`pkg/bot`、`cmd/deepai-bot` | 手机 Telegram/飞书完整对话 + 按钮回答提问 + 审批定时任务；未在白名单的外部用户 100% 拒绝；Open WebUI 直连流式输出正常 |
+| **M6（对话自训练与连接器）** | 1. 按 Bot 隔离的 `SecretStore`（`bot_secrets`）与 `/v1/bots/{bot_id}/secrets` / CLI `secret` / IM `/secret`<br>2. 受控 `http_request` 工具（`APIConnector`、`{{secret:NAME}}` 注入与响应脱敏、SSRF 防护）<br>3. `save_bot_skill` + `update_bot_persona` + `IsolatedPrompt` 与每轮专属技能叠加 | `pkg/skill`、`pkg/bot`、`pkg/bot/channel`、`cmd/deepai-bot` | 空白 Bot 经对话训练习得专属技能并调用第三方 API；回显密钥 100% 脱敏；跨 Bot 技能/密钥零泄漏；定时任务与 `` !` `` 越权自修改 100% 拦截 |

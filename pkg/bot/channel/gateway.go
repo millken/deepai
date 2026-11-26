@@ -475,6 +475,102 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 		})
 		_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已批准任务「%s」(%s)。", sch.Name, sch.ID))
 		return true
+
+	case "/secret":
+		if msg.IsGroup {
+			_, _ = ra.adapter.SendText(ctx, dst, "出于安全原因，仅限私聊管理 Bot 密钥。")
+			return true
+		}
+		if !ra.policy.IsAllowedUser(msg.UserID) {
+			g.audit.Record(bot.AuditEntry{
+				Action:  "channel_rejected",
+				Actor:   msg.Channel + ":" + msg.UserID,
+				Target:  msg.ChatID,
+				Outcome: "denied",
+				Detail:  "secret management requires allow_users membership",
+			})
+			_, _ = ra.adapter.SendText(ctx, dst, "无权管理 Bot 密钥。")
+			return true
+		}
+		curBot := ra.policy.defaultBot()
+		if cur, ok, _ := g.bindings.GetBinding(ctx, msg.Channel, msg.ChatID, msg.ThreadID); ok && cur.BotID != "" {
+			if b, err := g.m.GetBot(ctx, cur.BotID); err == nil && b.Enabled {
+				curBot = b.ID
+			}
+		}
+		if !ra.policy.AllowsBot(msg.UserID, curBot) {
+			_, _ = ra.adapter.SendText(ctx, dst, "当前频道策略不允许操作该 Bot 的密钥。")
+			return true
+		}
+		parts := strings.Fields(arg)
+		subCmd := "list"
+		if len(parts) > 0 {
+			subCmd = strings.ToLower(parts[0])
+		}
+		switch subCmd {
+		case "list":
+			list, err := g.m.ListSecrets(ctx, curBot)
+			if err != nil {
+				_, _ = ra.adapter.SendText(ctx, dst, "查询密钥失败："+err.Error())
+				return true
+			}
+			if len(list) == 0 {
+				_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」尚未配置密钥。\n用法：/secret set <NAME> <VALUE>", curBot))
+				return true
+			}
+			names := make([]string, 0, len(list))
+			for _, m := range list {
+				names = append(names, m.Name)
+			}
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」已配置密钥：%s\n可在 http_request 中使用 {{secret:<NAME>}} 引用。", curBot, strings.Join(names, ", ")))
+			return true
+		case "set":
+			// Split into at most 3 tokens ("set", NAME, VALUE) preserving spaces inside VALUE if any.
+			rest := strings.TrimSpace(strings.TrimPrefix(arg, parts[0]))
+			nameEnd := strings.IndexAny(rest, " \t")
+			if nameEnd <= 0 {
+				_, _ = ra.adapter.SendText(ctx, dst, "用法：/secret set <NAME> <VALUE>")
+				return true
+			}
+			secName := strings.TrimSpace(rest[:nameEnd])
+			secVal := strings.TrimSpace(rest[nameEnd+1:])
+			meta, err := g.m.SetSecret(ctx, curBot, secName, secVal)
+			if err != nil {
+				_, _ = ra.adapter.SendText(ctx, dst, "保存密钥失败："+err.Error())
+				return true
+			}
+			g.audit.Record(bot.AuditEntry{
+				Action:  "secret_set",
+				Actor:   msg.Channel + ":" + msg.UserID,
+				BotID:   meta.BotID,
+				Target:  meta.Name,
+				Outcome: "ok",
+			})
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已为 Bot「%s」加密保存密钥 %s（未写入聊天上下文，可通过 {{secret:%s}} 安全调用）。", meta.BotID, meta.Name, meta.Name))
+			return true
+		case "delete", "del", "rm":
+			if len(parts) < 2 {
+				_, _ = ra.adapter.SendText(ctx, dst, "用法：/secret delete <NAME>")
+				return true
+			}
+			secName := strings.TrimSpace(parts[1])
+			if err := g.m.DeleteSecret(ctx, curBot, secName); err != nil {
+				_, _ = ra.adapter.SendText(ctx, dst, "删除密钥失败："+err.Error())
+				return true
+			}
+			g.audit.Record(bot.AuditEntry{
+				Action:  "secret_deleted",
+				Actor:   msg.Channel + ":" + msg.UserID,
+				BotID:   curBot,
+				Target:  secName,
+				Outcome: "ok",
+			})
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已删除 Bot「%s」的密钥 %s。", curBot, secName))
+			return true
+		default:
+			_, _ = ra.adapter.SendText(ctx, dst, "用法：/secret list | /secret set <NAME> <VALUE> | /secret delete <NAME>")
+			return true
+		}
 	}
 	return false
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/millken/deepai/pkg/models"
 	"github.com/millken/deepai/pkg/sandbox"
 	"github.com/millken/deepai/pkg/schedule"
+	"github.com/millken/deepai/pkg/skill"
 	"github.com/millken/deepai/pkg/subagent"
 	"github.com/millken/deepai/pkg/tools"
 )
@@ -37,13 +38,20 @@ const DefaultMemoryUserID = "bot:default"
 type AgentRuntimeConfig struct {
 	Models *llm.ModelRegistry
 	Tools  *tools.Registry
-	// SystemPrompt is appended to every turn's system prompt (DEEPAI.md
-	// instructions, skill descriptions). SystemPromptSuffix is evaluated per
-	// turn for time-dependent context (the scheduler injects "current time").
+	// SystemPrompt is appended to every non-isolated turn's system prompt when
+	// BaseSkills/GlobalInstructions are not supplied directly.
 	SystemPrompt       string
+	BaseSkills         *skill.Registry
+	GlobalInstructions string
 	SystemPromptSuffix func() string
 	WorkDir            string
 	SandboxBaseDir     string
+	BotDataDir         string
+	Bots               BotRegistry
+	Secrets            SecretStore
+	Audit              *AuditLogger
+	OnBotUpdated       func(BotProfile)
+	AllowLoopbackHTTP  bool
 	ContextWindow      int
 	ReasoningEffort    string
 	Temperature        *float64
@@ -70,17 +78,26 @@ type AgentRuntimeConfig struct {
 
 // AgentRuntime is the Runtime backed by pkg/agent.
 type AgentRuntime struct {
+	mu  sync.RWMutex
 	cfg AgentRuntimeConfig
 	log *slog.Logger
 }
 
-// NewAgentRuntime validates cfg.
+// NewAgentRuntime validates cfg and registers built-in bot tools.
 func NewAgentRuntime(cfg AgentRuntimeConfig) (*AgentRuntime, error) {
 	if cfg.Models == nil {
 		return nil, errors.New("bot: model registry is required")
 	}
 	if cfg.Tools == nil {
 		cfg.Tools = tools.NewRegistry()
+	}
+	for _, bt := range []models.Tool{HTTPRequestTool(), SaveBotSkillTool(), UpdateBotPersonaTool()} {
+		if cfg.Tools.Get(bt.Name) == nil {
+			_ = cfg.Tools.Register(bt)
+		}
+	}
+	if cfg.Tools.Get("skill") == nil {
+		_ = cfg.Tools.Register(skill.SkillToolWithRegistry(skill.NewRegistry()))
 	}
 	if strings.TrimSpace(cfg.MemoryUserID) == "" {
 		cfg.MemoryUserID = DefaultMemoryUserID
@@ -95,25 +112,52 @@ func NewAgentRuntime(cfg AgentRuntimeConfig) (*AgentRuntime, error) {
 	return &AgentRuntime{cfg: cfg, log: log}, nil
 }
 
+// BindGovernance wires Manager-owned stores and callbacks into the runtime so
+// per-turn tools (`http_request`, `save_bot_skill`, `update_bot_persona`) share
+// the Manager's live BotRegistry, SecretStore, AuditLogger, and event bus.
+func (r *AgentRuntime) BindGovernance(bots BotRegistry, secrets SecretStore, audit *AuditLogger, onBotUpdated func(BotProfile)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if bots != nil {
+		r.cfg.Bots = bots
+	}
+	if secrets != nil {
+		r.cfg.Secrets = secrets
+	}
+	if audit != nil {
+		r.cfg.Audit = audit
+	}
+	if onBotUpdated != nil {
+		r.cfg.OnBotUpdated = onBotUpdated
+	}
+}
+
+func (r *AgentRuntime) snapshotConfig() AgentRuntimeConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg
+}
+
 func (r *AgentRuntime) Info() Info {
-	info := Info{Name: "deepai-bot", Version: r.cfg.Version, WorkDir: r.cfg.WorkDir, DefaultModel: r.cfg.Models.DefaultName()}
-	for _, d := range r.cfg.Models.List() {
+	cfg := r.snapshotConfig()
+	info := Info{Name: "deepai-bot", Version: cfg.Version, WorkDir: cfg.WorkDir, DefaultModel: cfg.Models.DefaultName()}
+	for _, d := range cfg.Models.List() {
 		info.Models = append(info.Models, ModelInfo{Name: d.Name, Provider: d.Provider, Model: d.Model})
 	}
 	return info
 }
 
-func (r *AgentRuntime) DefaultModel() string { return r.cfg.Models.DefaultName() }
+func (r *AgentRuntime) DefaultModel() string { return r.snapshotConfig().Models.DefaultName() }
 
-func (r *AgentRuntime) HasModel(alias string) bool { return r.cfg.Models.Has(alias) }
+func (r *AgentRuntime) HasModel(alias string) bool { return r.snapshotConfig().Models.Has(alias) }
 
 // ValidateToolAllowlist checks allowlist patterns against the runtime's tools.
 func (r *AgentRuntime) ValidateToolAllowlist(allowlist []string) []string {
-	return r.cfg.Tools.ValidateAllowlist(allowlist)
+	return r.snapshotConfig().Tools.ValidateAllowlist(allowlist)
 }
 
 func (r *AgentRuntime) NewConversation(sessionID string) (Conversation, error) {
-	sb, err := sandbox.NewSession(r.cfg.SandboxBaseDir, sandbox.Config{})
+	sb, err := sandbox.NewSession(r.snapshotConfig().SandboxBaseDir, sandbox.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox init: %w", err)
 	}
@@ -150,7 +194,8 @@ func (c *agentConversation) PresentFiles() *tools.PresentFileRegistry {
 func (c *agentConversation) Close() error { return c.sb.Close() }
 
 func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOutput, error) {
-	cfg := c.r.cfg
+	cfg := c.r.snapshotConfig()
+	botID := effectiveBotID(in.BotID)
 	provider, modelName, err := cfg.Models.ProviderFor(in.Model)
 	if err != nil {
 		return nil, fmt.Errorf("resolve model %q: %w", in.Model, err)
@@ -179,7 +224,27 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		maxToolCalls = in.MaxToolCalls
 	}
 
-	toolsReg := cfg.Tools
+	var turnSkills *skill.Registry
+	if !in.Extensions.IsolatedPrompt && cfg.BaseSkills != nil {
+		turnSkills = cfg.BaseSkills.Clone()
+	} else {
+		turnSkills = skill.NewRegistry()
+	}
+	if dir := botSkillsDir(cfg.BotDataDir, botID); dir != "" {
+		if st, statErr := os.Stat(dir); statErr == nil && st.IsDir() {
+			_ = turnSkills.LoadFromDir(dir)
+		}
+	}
+
+	toolsReg := cfg.Tools.Clone()
+	toolsReg.Unregister("skill")
+	if turnSkills.Count() > 0 {
+		_ = toolsReg.Register(skill.SkillToolWithRegistry(turnSkills))
+	}
+	if in.Extensions.DisableSelfTrain {
+		toolsReg.Unregister("save_bot_skill")
+		toolsReg.Unregister("update_bot_persona")
+	}
 	disableEnterPlan := false
 	presentFiles := c.presentFiles
 	if len(in.BotToolAllowlist) > 0 {
@@ -233,14 +298,43 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 		OffloadBytes:       cfg.ToolOffloadBytes,
 		Summarizer:         c.summarizer(in.Model),
 	})
-	if cfg.SystemPrompt != "" {
-		a.AppendSystemPrompt(cfg.SystemPrompt)
+	if !in.Extensions.IsolatedPrompt {
+		if cfg.BaseSkills != nil || cfg.GlobalInstructions != "" {
+			if turnSkills.Count() > 0 {
+				a.AppendSystemPrompt(turnSkills.Descriptions())
+			}
+			if inst := strings.TrimSpace(cfg.GlobalInstructions); inst != "" {
+				a.AppendSystemPrompt(inst)
+			}
+		} else {
+			if cfg.SystemPrompt != "" {
+				a.AppendSystemPrompt(cfg.SystemPrompt)
+			}
+			if turnSkills.Count() > 0 {
+				a.AppendSystemPrompt(turnSkills.Descriptions())
+			}
+		}
+	} else if turnSkills.Count() > 0 {
+		a.AppendSystemPrompt(turnSkills.Descriptions())
 	}
 	if extra := strings.TrimSpace(in.SystemPromptExtra); extra != "" {
 		a.AppendSystemPrompt("## Bot Instructions\n\n" + extra)
 	}
+	if caps := botCapabilitiesPrompt(ctx, botID, in.Extensions, cfg.Secrets); caps != "" {
+		a.AppendSystemPrompt(caps)
+	}
 
-	ctx = schedule.WithBotID(ctx, effectiveBotID(in.BotID))
+	ctx = schedule.WithBotID(ctx, botID)
+	ctx = withBotTurnEnv(ctx, botTurnEnv{
+		botID:      botID,
+		extensions: in.Extensions.Clone(),
+		secrets:    cfg.Secrets,
+		bots:       cfg.Bots,
+		botDataDir: cfg.BotDataDir,
+		audit:      cfg.Audit,
+		onBotSaved: cfg.OnBotUpdated,
+		allowLocal: cfg.AllowLoopbackHTTP,
+	})
 	ctx = tools.WithSubagentConstraints(ctx, tools.SubagentConstraints{
 		Tools:             toolsReg,
 		DefaultModel:      in.Model,
@@ -309,7 +403,7 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 }
 
 func (c *agentConversation) summarizer(model string) agent.SessionSummarizer {
-	cfg := c.r.cfg
+	cfg := c.r.snapshotConfig()
 	if cfg.SessionSummaryDisabled || cfg.KeepFullTurns <= 0 {
 		return nil
 	}

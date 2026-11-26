@@ -111,6 +111,9 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("GET /v1/bots/{bot_id}", s.auth(s.handleGetBot))
 	s.mux.Handle("PATCH /v1/bots/{bot_id}", s.auth(s.handleUpdateBot))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}", s.auth(s.handleDeleteBot))
+	s.mux.Handle("GET /v1/bots/{bot_id}/secrets", s.auth(s.handleListBotSecrets))
+	s.mux.Handle("PUT /v1/bots/{bot_id}/secrets/{name}", s.auth(s.handleSetBotSecret))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}/secrets/{name}", s.auth(s.handleDeleteBotSecret))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions", s.auth(s.handleListSessions))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions", s.auth(s.handleCreateSession))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleGetSession))
@@ -197,7 +200,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Set("Access-Control-Allow-Origin", origin)
 		h.Set("Vary", "Origin")
 		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-DeepAI-Session")
-		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -490,6 +493,58 @@ func (s *Server) handleDeleteBot(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalFromContext(r.Context())
 	s.audit.Record(AuditEntry{Action: "bot_deleted", Actor: p.Name, Role: string(p.Role), BotID: r.PathValue("bot_id"), Target: r.PathValue("bot_id"), Outcome: "ok"})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleListBotSecrets(w http.ResponseWriter, r *http.Request) {
+	botID := botIDFromRequest(r)
+	list, err := s.m.ListSecrets(r.Context(), botID)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if list == nil {
+		list = []SecretMeta{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"secrets": list})
+}
+
+func (s *Server) handleSetBotSecret(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required to manage bot secrets")
+		return
+	}
+	var req struct {
+		Value string `json:"value"`
+	}
+	if !readJSON(w, r, &req, false) {
+		return
+	}
+	botID := botIDFromRequest(r)
+	name := r.PathValue("name")
+	meta, err := s.m.SetSecret(r.Context(), botID, name, req.Value)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.audit.Record(AuditEntry{Action: "secret_set", Actor: p.Name, Role: string(p.Role), BotID: meta.BotID, Target: meta.Name, Outcome: "ok"})
+	writeJSON(w, http.StatusOK, meta)
+}
+
+func (s *Server) handleDeleteBotSecret(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required to manage bot secrets")
+		return
+	}
+	botID := botIDFromRequest(r)
+	name := r.PathValue("name")
+	if err := s.m.DeleteSecret(r.Context(), botID, name); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.audit.Record(AuditEntry{Action: "secret_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: name, Outcome: "ok"})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1003,6 +1058,10 @@ func errorStatus(err error) (int, string) {
 	case errors.Is(err, ErrTokenNotFound):
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrInvalidToken):
+		return http.StatusBadRequest, "bad_request"
+	case errors.Is(err, ErrSecretNotFound):
+		return http.StatusNotFound, "secret_not_found"
+	case errors.Is(err, ErrInvalidSecret):
 		return http.StatusBadRequest, "bad_request"
 	case errors.As(err, &locked):
 		return http.StatusConflict, "session_locked"

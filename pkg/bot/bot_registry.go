@@ -2,8 +2,10 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +19,8 @@ const (
 	DefaultBotID = "default"
 	// MaxBotInstructionsBytes caps BotProfile.Instructions at 64 KiB.
 	MaxBotInstructionsBytes = 64 << 10
+	// MaxBotExtensionsBytes caps serialized BotProfile.Extensions (extra_json) at 64 KiB.
+	MaxBotExtensionsBytes = 64 << 10
 )
 
 var (
@@ -29,7 +33,10 @@ var (
 	ErrUnknownTool        = errors.New("unknown tool")
 )
 
-var botIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+var (
+	botIDPattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+	connectorNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
+)
 
 // BotHasSessionsError carries the session/schedule counts preventing a
 // non-forced DELETE /v1/bots/{id}.
@@ -44,24 +51,89 @@ func (e *BotHasSessionsError) Error() string {
 
 func (e *BotHasSessionsError) Unwrap() error { return ErrBotHasSessions }
 
-// BotProfile is one registered persona inside deepai-bot (docs/BOT_MULTI_DESIGN.md §3).
-type BotProfile struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Title         string    `json:"title,omitempty"`
-	Description   string    `json:"description,omitempty"`
-	Instructions  string    `json:"instructions,omitempty"`
-	DefaultModel  string    `json:"default_model,omitempty"`
-	ToolAllowlist []string  `json:"tool_allowlist,omitempty"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+// APIConnector declares one third-party HTTP service endpoint bound to a bot,
+// allowing `http_request` to inherit BaseURL, default headers/query params
+// (including `{{secret:NAME}}` placeholders), and host allowlists.
+type APIConnector struct {
+	Name         string            `json:"name"`
+	BaseURL      string            `json:"base_url"`
+	AllowedHosts []string          `json:"allowed_hosts,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	QueryParams  map[string]string `json:"query_params,omitempty"`
+	TimeoutSec   int               `json:"timeout_sec,omitempty"`
 }
 
-// Clone copies b including its ToolAllowlist slice.
+func (c APIConnector) Clone() APIConnector {
+	out := c
+	if len(c.AllowedHosts) > 0 {
+		out.AllowedHosts = append([]string(nil), c.AllowedHosts...)
+	}
+	if len(c.Headers) > 0 {
+		out.Headers = make(map[string]string, len(c.Headers))
+		for k, v := range c.Headers {
+			out.Headers[k] = v
+		}
+	}
+	if len(c.QueryParams) > 0 {
+		out.QueryParams = make(map[string]string, len(c.QueryParams))
+		for k, v := range c.QueryParams {
+			out.QueryParams[k] = v
+		}
+	}
+	return out
+}
+
+// BotExtensions maps to `bots.extra_json`, storing per-bot training flags and
+// bound third-party service API connectors without altering core table columns.
+type BotExtensions struct {
+	// IsolatedPrompt omits workspace DEEPAI.md and workspace code skills so a
+	// domain-focused custom bot runs with a clean persona and its own skills.
+	IsolatedPrompt bool `json:"isolated_prompt,omitempty"`
+	// DisableSelfTrain freezes the bot's persona and per-bot skills against
+	// conversational mutations via update_bot_persona / save_bot_skill.
+	DisableSelfTrain bool `json:"disable_self_train,omitempty"`
+	// Connectors lists named third-party HTTP API connectors bound to this bot.
+	Connectors []APIConnector `json:"connectors,omitempty"`
+}
+
+func (e BotExtensions) IsZero() bool {
+	return !e.IsolatedPrompt && !e.DisableSelfTrain && len(e.Connectors) == 0
+}
+
+func (e BotExtensions) Clone() BotExtensions {
+	out := BotExtensions{
+		IsolatedPrompt:   e.IsolatedPrompt,
+		DisableSelfTrain: e.DisableSelfTrain,
+	}
+	if len(e.Connectors) > 0 {
+		out.Connectors = make([]APIConnector, len(e.Connectors))
+		for i, c := range e.Connectors {
+			out.Connectors[i] = c.Clone()
+		}
+	}
+	return out
+}
+
+// BotProfile is one registered persona inside deepai-bot (docs/BOT_MULTI_DESIGN.md §3).
+type BotProfile struct {
+	ID            string        `json:"id"`
+	Name          string        `json:"name"`
+	Title         string        `json:"title,omitempty"`
+	Description   string        `json:"description,omitempty"`
+	Instructions  string        `json:"instructions,omitempty"`
+	DefaultModel  string        `json:"default_model,omitempty"`
+	ToolAllowlist []string      `json:"tool_allowlist,omitempty"`
+	Enabled       bool          `json:"enabled"`
+	Extensions    BotExtensions `json:"extensions,omitempty"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
+}
+
+// Clone copies b including its ToolAllowlist and Extensions slices/maps.
 func (b BotProfile) Clone() BotProfile {
 	out := b
 	out.ToolAllowlist = append([]string(nil), b.ToolAllowlist...)
+	out.Extensions = b.Extensions.Clone()
 	return out
 }
 
@@ -75,25 +147,27 @@ type BotSummary struct {
 
 // CreateBotRequest is the body of POST /v1/bots.
 type CreateBotRequest struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Title         string   `json:"title,omitempty"`
-	Description   string   `json:"description,omitempty"`
-	Instructions  string   `json:"instructions,omitempty"`
-	DefaultModel  string   `json:"default_model,omitempty"`
-	ToolAllowlist []string `json:"tool_allowlist,omitempty"`
-	Enabled       *bool    `json:"enabled,omitempty"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Title         string         `json:"title,omitempty"`
+	Description   string         `json:"description,omitempty"`
+	Instructions  string         `json:"instructions,omitempty"`
+	DefaultModel  string         `json:"default_model,omitempty"`
+	ToolAllowlist []string       `json:"tool_allowlist,omitempty"`
+	Enabled       *bool          `json:"enabled,omitempty"`
+	Extensions    *BotExtensions `json:"extensions,omitempty"`
 }
 
 // UpdateBotRequest is the body of PATCH /v1/bots/{bot_id}.
 type UpdateBotRequest struct {
-	Name          *string   `json:"name,omitempty"`
-	Title         *string   `json:"title,omitempty"`
-	Description   *string   `json:"description,omitempty"`
-	Instructions  *string   `json:"instructions,omitempty"`
-	DefaultModel  *string   `json:"default_model,omitempty"`
-	ToolAllowlist *[]string `json:"tool_allowlist,omitempty"`
-	Enabled       *bool     `json:"enabled,omitempty"`
+	Name          *string        `json:"name,omitempty"`
+	Title         *string        `json:"title,omitempty"`
+	Description   *string        `json:"description,omitempty"`
+	Instructions  *string        `json:"instructions,omitempty"`
+	DefaultModel  *string        `json:"default_model,omitempty"`
+	ToolAllowlist *[]string      `json:"tool_allowlist,omitempty"`
+	Enabled       *bool          `json:"enabled,omitempty"`
+	Extensions    *BotExtensions `json:"extensions,omitempty"`
 }
 
 // BotRegistry persists bot personas (bots table in bot.db or MemoryStore).
@@ -155,6 +229,65 @@ func normalizeToolAllowlist(in []string) []string {
 	return out
 }
 
+func normalizeBotExtensions(in BotExtensions) BotExtensions {
+	out := in.Clone()
+	for i := range out.Connectors {
+		c := &out.Connectors[i]
+		c.Name = strings.TrimSpace(c.Name)
+		c.BaseURL = strings.TrimSpace(c.BaseURL)
+		if len(c.AllowedHosts) > 0 {
+			hosts := make([]string, 0, len(c.AllowedHosts))
+			seen := map[string]struct{}{}
+			for _, h := range c.AllowedHosts {
+				h = strings.ToLower(strings.TrimSpace(h))
+				if h == "" {
+					continue
+				}
+				if _, dup := seen[h]; dup {
+					continue
+				}
+				seen[h] = struct{}{}
+				hosts = append(hosts, h)
+			}
+			c.AllowedHosts = hosts
+		}
+	}
+	return out
+}
+
+func validateBotExtensions(ext BotExtensions) error {
+	raw, err := json.Marshal(ext)
+	if err != nil {
+		return fmt.Errorf("%w: invalid extensions JSON: %v", ErrInvalidBot, err)
+	}
+	if len(raw) > MaxBotExtensionsBytes {
+		return fmt.Errorf("%w: extensions must be at most %d bytes", ErrInvalidBot, MaxBotExtensionsBytes)
+	}
+	seen := make(map[string]struct{}, len(ext.Connectors))
+	for _, c := range ext.Connectors {
+		name := strings.TrimSpace(c.Name)
+		if !connectorNamePattern.MatchString(name) {
+			return fmt.Errorf("%w: connector name %q must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$", ErrInvalidBot, c.Name)
+		}
+		key := strings.ToLower(name)
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("%w: duplicate connector %q", ErrInvalidBot, name)
+		}
+		seen[key] = struct{}{}
+		if strings.TrimSpace(c.BaseURL) == "" {
+			return fmt.Errorf("%w: connector %q base_url is required", ErrInvalidBot, name)
+		}
+		u, err := url.Parse(strings.TrimSpace(c.BaseURL))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			return fmt.Errorf("%w: connector %q base_url must be a valid http(s) URL", ErrInvalidBot, name)
+		}
+		if c.TimeoutSec < 0 || c.TimeoutSec > 300 {
+			return fmt.Errorf("%w: connector %q timeout_sec must be between 0 and 300", ErrInvalidBot, name)
+		}
+	}
+	return nil
+}
+
 func validateBotProfile(b BotProfile, isCreate bool) error {
 	if isCreate {
 		if b.ID == DefaultBotID {
@@ -179,6 +312,9 @@ func validateBotProfile(b BotProfile, isCreate bool) error {
 	}
 	if b.ID == DefaultBotID && !b.Enabled {
 		return fmt.Errorf("%w: default bot cannot be disabled", ErrInvalidBot)
+	}
+	if err := validateBotExtensions(b.Extensions); err != nil {
+		return err
 	}
 	return nil
 }
