@@ -241,6 +241,11 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	}
 
 	ctx = schedule.WithBotID(ctx, effectiveBotID(in.BotID))
+	ctx = tools.WithSubagentConstraints(ctx, tools.SubagentConstraints{
+		Tools:             toolsReg,
+		DefaultModel:      in.Model,
+		ExtraInstructions: strings.TrimSpace(in.SystemPromptExtra),
+	})
 
 	gate := &emitGate{emit: in.Emit}
 	ctx = subagent.WithEventSink(ctx, func(evt subagent.TaskEvent) {

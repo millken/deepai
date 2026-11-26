@@ -168,6 +168,18 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 		typ = EventScheduleRunStarted
 	}
 	o.m.global.publish(Event{BotID: effectiveBotID(botID), Type: typ, Run: &run, Time: time.Now().UTC()})
+	if run.Status.Terminal() {
+		o.m.auditLogger().Record(AuditEntry{
+			Action:  "schedule_run_end",
+			BotID:   effectiveBotID(botID),
+			Target:  run.ScheduleID + "/" + run.ID,
+			Outcome: string(run.Status),
+			Detail:  run.ErrorCode,
+		})
+	}
+	if run.Status.Terminal() {
+		o.m.metrics.ObserveScheduleRun(effectiveBotID(botID), string(run.Trigger), string(run.Status))
+	}
 
 	if run.Status.Terminal() && o.m.opts.Hook != nil && o.svc != nil {
 		// Dispatch asynchronously: RunChanged is called while Service.mu is

@@ -162,9 +162,39 @@ func runServe(ctx context.Context, f serveFlags) error {
 		}
 		sched = schedule.NewScheduler(rt.Schedule, disp, schedule.SchedulerOptions{Lease: lease})
 		if err := sched.Start(rtCtx); err != nil {
+			mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = mgr.Close(mctx)
+			cancel()
 			_ = ln.Close()
 			return fmt.Errorf("start scheduler: %w", err)
 		}
+	}
+
+	var tokStore bot.TokenStore
+	if rt.DBConn != nil {
+		if ts, err := bot.NewSQLiteTokenStore(rt.DBConn); err == nil {
+			tokStore = ts
+		} else {
+			slog.Warn("init scoped token store failed", "err", err)
+		}
+	} else {
+		tokStore = bot.NewMemoryTokenStore()
+	}
+
+	var auditLog *bot.AuditLogger
+	if !f.ephemeral {
+		if al, err := bot.NewAuditLogger(filepath.Join(botHome(), "audit.jsonl"), 0); err == nil {
+			auditLog = al
+		} else {
+			slog.Warn("init audit logger failed", "err", err)
+		}
+	}
+
+	gwCtx, cancelGW := context.WithCancel(rtCtx)
+	defer cancelGW()
+	gw, err := startChannelGateway(gwCtx, mgr, rt.Schedule, rt.DBConn, auditLog)
+	if err != nil {
+		slog.Warn("start channel gateway failed", "err", err)
 	}
 
 	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
@@ -174,6 +204,8 @@ func runServe(ctx context.Context, f serveFlags) error {
 			Manager:        mgr,
 			Schedules:      rt.Schedule,
 			Token:          token,
+			Tokens:         tokStore,
+			Audit:          auditLog,
 			AllowedOrigins: f.corsOrigins,
 			DisableWebUI:   f.noWeb,
 		}),
@@ -185,7 +217,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	if err := writeState(daemonState{PID: os.Getpid(), Addr: addr, StartedAt: time.Now().UTC(), Version: buildVersion(), WorkDir: rt.WorkDir}); err != nil {
 		slog.Warn("write state file", "err", err)
 	}
-	defer removeState(os.Getpid())
+	defer removeState(rt.WorkDir, os.Getpid())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -200,12 +232,14 @@ func runServe(ctx context.Context, f serveFlags) error {
 		fmt.Fprintf(os.Stderr, "\n  deepai-bot is running. Web console: %s\n\n", url)
 	}
 
+	var fatalServeErr error
 	select {
 	case <-ctx.Done():
 		slog.Info("deepai-bot shutting down")
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server stopped", "err", err)
+			fatalServeErr = fmt.Errorf("http server stopped: %w", err)
 		}
 	}
 
@@ -216,8 +250,12 @@ func runServe(ctx context.Context, f serveFlags) error {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
-	// Stop accepting new fires before cancelling turns, then let the
+	// Stop accepting new fires & IM messages before cancelling turns, then let
 	// turn_end callbacks write their final Run states before db.Close.
+	cancelGW()
+	if gw != nil {
+		gw.Wait()
+	}
 	if sched != nil {
 		sctx, stopSched := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := sched.Stop(sctx); err != nil {
@@ -241,7 +279,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 	}
 	cancelHandlers()
 	<-shutdownDone
-	return nil
+	return fatalServeErr
 }
 
 // resolveToken picks the API token: --token, $DEEPAI_BOT_TOKEN, or the

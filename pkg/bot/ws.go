@@ -162,14 +162,38 @@ func (c *wsConn) reply(ctx context.Context, req WSRequest, data any, err error) 
 
 func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 	m := c.s.m
+	p := principalFromContext(ctx)
 	botID := effectiveBotID(req.BotID)
+
+	if isWSAdminOp(req.Op) && !p.IsAdmin() {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: admin role required", ErrForbidden))
+		return
+	}
+	if !isWSReadOp(req.Op) && !p.CanWrite() {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: readonly token cannot perform %s", ErrForbidden, req.Op))
+		return
+	}
+	if isWSBotScopedOp(req.Op) && !p.AllowsBot(botID) {
+		c.reply(ctx, req, nil, fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, botID))
+		return
+	}
+
 	switch req.Op {
 	case "ping":
 		c.reply(ctx, req, "pong", nil)
 	case "info":
-		c.reply(ctx, req, m.Info(), nil)
+		c.reply(ctx, req, c.s.infoForPrincipal(p), nil)
 	case "list_bots":
 		list, err := m.ListBots(ctx)
+		if err == nil && !p.IsAdmin() && len(p.BotIDs) > 0 {
+			filtered := make([]BotSummary, 0, len(list))
+			for _, b := range list {
+				if p.AllowsBot(b.ID) {
+					filtered = append(filtered, b)
+				}
+			}
+			list = filtered
+		}
 		c.reply(ctx, req, map[string]any{"bots": list}, err)
 	case "get_bot":
 		b, err := m.GetBot(ctx, req.BotID)
@@ -184,6 +208,9 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 			in.ID = req.BotID
 		}
 		b, err := m.CreateBot(ctx, in)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_created", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
+		}
 		c.reply(ctx, req, b, err)
 	case "update_bot":
 		var in UpdateBotRequest
@@ -192,10 +219,17 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 			return
 		}
 		b, err := m.UpdateBot(ctx, req.BotID, in)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_updated", Actor: p.Name, Role: string(p.Role), BotID: b.ID, Target: b.ID, Outcome: "ok"})
+		}
 		c.reply(ctx, req, b, err)
 	case "delete_bot":
 		force := req.Force || paramBool(req.Params, "force")
-		c.reply(ctx, req, nil, m.DeleteBot(ctx, req.BotID, force))
+		err := m.DeleteBot(ctx, req.BotID, force)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_deleted", Actor: p.Name, Role: string(p.Role), BotID: req.BotID, Target: req.BotID, Outcome: "ok"})
+		}
+		c.reply(ctx, req, nil, err)
 	case "list_sessions":
 		list, err := m.ListSessionsForBot(botID, req.Limit)
 		c.reply(ctx, req, map[string]any{"sessions": list}, err)
@@ -254,6 +288,7 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 }
 
 func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
+	p := principalFromContext(ctx)
 	since := int64(-1)
 	if req.Since != nil {
 		since = *req.Since
@@ -266,10 +301,17 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 	)
 	if key == "*" || key == "" {
 		key = "*"
+		if req.BotID != "" && !p.AllowsBot(req.BotID) {
+			return fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, req.BotID)
+		}
 		sub, backlog, gap = c.s.m.SubscribeAll(since)
 	} else {
+		targetBot := effectiveBotID(req.BotID)
+		if !p.AllowsBot(targetBot) {
+			return fmt.Errorf("%w: token not authorized for bot %s", ErrForbidden, targetBot)
+		}
 		var err error
-		sub, backlog, gap, err = c.s.m.SubscribeForBot(effectiveBotID(req.BotID), key, since)
+		sub, backlog, gap, err = c.s.m.SubscribeForBot(targetBot, key, since)
 		if err != nil {
 			return err
 		}
@@ -288,22 +330,13 @@ func (c *wsConn) subscribe(ctx context.Context, req WSRequest) error {
 		filterBot = req.BotID
 	}
 	matchesFilter := func(e Event) bool {
+		if !eventAllowedForPrincipal(p, e) {
+			return false
+		}
 		if filterBot == "" || e.Type == EventHeartbeat || e.Type == EventGap {
 			return true
 		}
-		if e.BotID != "" {
-			return e.BotID == filterBot
-		}
-		if e.Bot != nil {
-			return e.Bot.ID == filterBot
-		}
-		if e.Session != nil {
-			return effectiveBotID(e.Session.BotID) == filterBot
-		}
-		if e.Schedule != nil {
-			return effectiveBotID(e.Schedule.BotID) == filterBot
-		}
-		return false
+		return eventBotID(e) == effectiveBotID(filterBot)
 	}
 	push := func(e Event) {
 		if !matchesFilter(e) {
@@ -335,4 +368,32 @@ func (c *wsConn) closeSubs() {
 		sub.Close()
 		delete(c.subs, k)
 	}
+}
+
+func isWSAdminOp(op string) bool {
+	switch op {
+	case "create_bot", "update_bot", "delete_bot":
+		return true
+	}
+	return false
+}
+
+func isWSReadOp(op string) bool {
+	switch op {
+	case "ping", "info", "list_bots", "get_bot", "list_sessions", "get_session",
+		"list_queue", "subscribe", "unsubscribe", "list_schedules", "get_schedule",
+		"list_runs", "get_run", "validate_trigger":
+		return true
+	}
+	return false
+}
+
+func isWSBotScopedOp(op string) bool {
+	switch op {
+	case "get_bot", "list_sessions", "create_session", "get_session", "rename_session",
+		"delete_session", "send", "cancel", "answer", "list_queue", "remove_queue_item",
+		"clear_queue", "create_schedule":
+		return true
+	}
+	return false
 }

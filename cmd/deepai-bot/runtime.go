@@ -56,6 +56,8 @@ type botRuntime struct {
 	WorkDir string
 	// DB is the database path, empty when ephemeral.
 	DB string
+	// DBConn is the shared SQLite handle over bot.db (nil when ephemeral).
+	DBConn *sql.DB
 	// Schedule is nil when timed tasks are disabled.
 	Schedule       *schedule.Service
 	ScheduleStore  schedule.Store
@@ -308,7 +310,7 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		return nil, err
 	}
 	return &botRuntime{
-		Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, Close: closeAll,
+		Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, DBConn: db, Close: closeAll,
 		Schedule: schedSvc, ScheduleStore: schedStore, ScheduleConfig: schedCfg,
 		Hook: hookDisp,
 	}, nil

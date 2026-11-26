@@ -9,9 +9,10 @@ import "context"
 // contextKey is shared with registry.go; the constants below are new keys
 // on that same private type.
 const (
-	scheduleIDContextKey contextKey = "tool_schedule_id"
-	runIDContextKey      contextKey = "tool_schedule_run_id"
-	turnIDContextKey     contextKey = "tool_turn_id"
+	scheduleIDContextKey          contextKey = "tool_schedule_id"
+	runIDContextKey               contextKey = "tool_schedule_run_id"
+	turnIDContextKey              contextKey = "tool_turn_id"
+	subagentConstraintsContextKey contextKey = "tool_subagent_constraints"
 )
 
 // WithScheduleRun marks ctx as belonging to a scheduled run. Empty values
@@ -62,4 +63,31 @@ func TurnIDFromContext(ctx context.Context) string {
 func IsScheduledRun(ctx context.Context) bool {
 	id, _ := ScheduleRunFromContext(ctx)
 	return id != ""
+}
+
+// SubagentConstraints carries turn-scoped restrictions (narrowed tool registry,
+// fallback model alias, and bot-level instructions) from a parent turn into
+// spawned subagents so custom BotProfiles cannot bypass ToolAllowlist or drift
+// back to the process-wide default model via the task tool.
+type SubagentConstraints struct {
+	Tools             *Registry
+	DefaultModel      string
+	ExtraInstructions string
+}
+
+// WithSubagentConstraints attaches turn-scoped subagent constraints to ctx.
+func WithSubagentConstraints(ctx context.Context, c SubagentConstraints) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, subagentConstraintsContextKey, c)
+}
+
+// SubagentConstraintsFromContext returns any turn-scoped subagent constraints on ctx.
+func SubagentConstraintsFromContext(ctx context.Context) (SubagentConstraints, bool) {
+	if ctx == nil {
+		return SubagentConstraints{}, false
+	}
+	c, ok := ctx.Value(subagentConstraintsContextKey).(SubagentConstraints)
+	return c, ok
 }
