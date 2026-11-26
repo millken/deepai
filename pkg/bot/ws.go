@@ -238,14 +238,24 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 		secVal := paramString(req.Params, "value")
 		meta, err := m.SetSecret(ctx, botID, secName, secVal)
 		if err == nil {
-			c.s.audit.Record(AuditEntry{Action: "bot_secret_set", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: meta.Name, Outcome: "ok"})
+			c.s.audit.Record(AuditEntry{Action: "secret_set", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: meta.Name, Outcome: "ok"})
 		}
 		c.reply(ctx, req, meta, err)
 	case "delete_secret":
 		secName := paramString(req.Params, "name")
 		err := m.DeleteSecret(ctx, botID, secName)
 		if err == nil {
-			c.s.audit.Record(AuditEntry{Action: "bot_secret_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: secName, Outcome: "ok"})
+			c.s.audit.Record(AuditEntry{Action: "secret_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: secName, Outcome: "ok"})
+		}
+		c.reply(ctx, req, nil, err)
+	case "list_bot_skills":
+		list, err := m.ListBotSkills(ctx, botID)
+		c.reply(ctx, req, map[string]any{"skills": list}, err)
+	case "delete_bot_skill":
+		skillName := paramString(req.Params, "name")
+		err := m.DeleteBotSkill(ctx, botID, skillName)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_skill_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: skillName, Outcome: "ok"})
 		}
 		c.reply(ctx, req, nil, err)
 	case "list_sessions":
@@ -390,7 +400,7 @@ func (c *wsConn) closeSubs() {
 
 func isWSAdminOp(op string) bool {
 	switch op {
-	case "create_bot", "update_bot", "delete_bot", "set_secret", "delete_secret":
+	case "create_bot", "update_bot", "delete_bot", "set_secret", "delete_secret", "delete_bot_skill":
 		return true
 	}
 	return false
@@ -398,7 +408,7 @@ func isWSAdminOp(op string) bool {
 
 func isWSReadOp(op string) bool {
 	switch op {
-	case "ping", "info", "list_bots", "get_bot", "list_secrets", "list_sessions", "get_session",
+	case "ping", "info", "list_bots", "get_bot", "list_secrets", "list_bot_skills", "list_sessions", "get_session",
 		"list_queue", "subscribe", "unsubscribe", "list_schedules", "get_schedule",
 		"list_runs", "get_run", "validate_trigger":
 		return true
@@ -408,7 +418,7 @@ func isWSReadOp(op string) bool {
 
 func isWSBotScopedOp(op string) bool {
 	switch op {
-	case "get_bot", "list_secrets", "set_secret", "delete_secret", "list_sessions", "create_session",
+	case "get_bot", "list_secrets", "set_secret", "delete_secret", "list_bot_skills", "delete_bot_skill", "list_sessions", "create_session",
 		"get_session", "rename_session", "delete_session", "send", "cancel", "answer", "list_queue",
 		"remove_queue_item", "clear_queue", "create_schedule":
 		return true

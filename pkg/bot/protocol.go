@@ -176,6 +176,7 @@ const (
 type SessionInfo struct {
 	ID        string        `json:"id"`
 	BotID     string        `json:"bot_id,omitempty"`
+	BotName   string        `json:"bot_name,omitempty"`
 	Title     string        `json:"title,omitempty"`
 	Model     string        `json:"model,omitempty"`
 	Status    SessionStatus `json:"status"`
@@ -236,6 +237,6 @@ type Info struct {
 	DefaultModel string       `json:"default_model,omitempty"`
 	DefaultBotID string       `json:"default_bot_id,omitempty"`
 	Models       []ModelInfo  `json:"models,omitempty"`
-	Bots         []BotProfile `json:"bots,omitempty"`
+	Bots         []BotSummary `json:"bots,omitempty"`
 	StartedAt    time.Time    `json:"started_at"`
 }

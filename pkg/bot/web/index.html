@@ -181,14 +181,33 @@
   <div class="form-grid">
     <label class="form-field">ID（小写字母/数字/-/_）<input id="bId" placeholder="例如：code-reviewer"></label>
     <label class="form-field">名称<input id="bName" placeholder="例如：Code Reviewer"></label>
-    <label class="form-field">标题/描述<input id="bTitle" placeholder="可选简短定位"></label>
+    <label class="form-field">副标题<input id="bTitle" placeholder="可选简短定位"></label>
     <label class="form-field">默认模型<select id="bModel"></select></label>
-    <label class="form-field full">工具白名单（逗号分隔，留空表示全部工具；支持 mcp__server__*）<input id="bTools" placeholder="例如：read_file, grep_search, mcp__github__*"></label>
+    <label class="form-field full">简介 (description)<input id="bDesc" placeholder="仅 UI 展示，不进入系统提示词"></label>
+    <label class="form-field full">工具白名单（逗号分隔，留空表示全部工具；支持 mcp__server__*）<input id="bTools" placeholder="例如：read_file, grep_search, http_request, mcp__github__*"></label>
     <label class="form-field full">系统指令 (instructions)<textarea id="bInstr" rows="4" placeholder="定义该 Bot 的角色、职责和输出规范"></textarea></label>
+    <label class="form-field" style="flex-direction:row;align-items:center;gap:6px"><input id="bIsolated" type="checkbox"> 纯净人格 (isolated_prompt，隔离仓库 DEEPAI.md 与项目技能)</label>
+    <label class="form-field" style="flex-direction:row;align-items:center;gap:6px"><input id="bNoSelfTrain" type="checkbox"> 禁止对话式自训练 (disable_self_train)</label>
+    <label class="form-field full">第三方 API 连接器 (extensions.connectors JSON 数组，留空表示不配置)<textarea id="bConnectors" rows="3" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px" placeholder='例如：[{"name":"notion","base_url":"https://api.notion.com/v1","headers":{"Authorization":"Bearer {{secret:NOTION_TOKEN}}"}}]'></textarea></label>
     <label class="form-field" id="bEnabledWrap" style="display:none;flex-direction:row;align-items:center;gap:6px"><input id="bEnabled" type="checkbox" checked> 启用该 Bot</label>
   </div>
   <div id="botFormErr" class="note err" style="text-align:left"></div>
   <div class="sch-row"><button class="primary" id="botSaveBtn">保存</button></div>
+  <div id="botEditExtras" style="display:none;flex-direction:column;gap:10px;border-top:1px solid var(--border);padding-top:10px">
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div class="sch-head"><b>加密密钥 (Secrets)</b><span class="note">仅保存密文，界面永不回显明文；可在连接器中以 <code>{{secret:NAME}}</code> 引用</span></div>
+      <div id="botSecretsList" class="bot-list" style="max-height:130px"></div>
+      <div style="display:flex;gap:6px">
+        <input id="bSecName" placeholder="密钥名（如 NOTION_TOKEN）" style="flex:1">
+        <input id="bSecVal" type="password" placeholder="密钥值" style="flex:1">
+        <button id="bSecSaveBtn">写入</button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div class="sch-head"><b>专属技能 (Bot Skills)</b><span class="note">对话自训练沉淀的 <code>SKILL.md</code>，仅当前 Bot 可见</span></div>
+      <div id="botSkillsList" class="bot-list" style="max-height:160px"></div>
+    </div>
+  </div>
 </div></div>
 
 <script>
@@ -915,12 +934,75 @@
     $("bId").disabled = !!bot;
     $("bName").value = bot ? (bot.name || "") : "";
     $("bTitle").value = bot ? (bot.title || "") : "";
+    $("bDesc").value = bot ? (bot.description || "") : "";
     $("bModel").value = bot ? (bot.default_model || "") : "";
     $("bTools").value = bot && Array.isArray(bot.tool_allowlist) ? bot.tool_allowlist.join(", ") : "";
     $("bInstr").value = bot ? (bot.instructions || "") : "";
+    const ext = (bot && bot.extensions) || {};
+    $("bIsolated").checked = !!ext.isolated_prompt;
+    $("bNoSelfTrain").checked = !!ext.disable_self_train;
+    $("bConnectors").value = Array.isArray(ext.connectors) && ext.connectors.length ? JSON.stringify(ext.connectors, null, 2) : "";
     const isDefault = bot && bot.id === "default";
     $("bEnabledWrap").style.display = bot && !isDefault ? "flex" : "none";
     $("bEnabled").checked = bot ? bot.enabled !== false : true;
+    $("botEditExtras").style.display = bot ? "flex" : "none";
+    $("bSecName").value = "";
+    $("bSecVal").value = "";
+    if (bot) { refreshBotExtras(bot.id); }
+  }
+  async function refreshBotExtras(botId) {
+    const secBox = $("botSecretsList");
+    const skBox = $("botSkillsList");
+    secBox.innerHTML = `<div class="note" style="text-align:left">加载中…</div>`;
+    skBox.innerHTML = `<div class="note" style="text-align:left">加载中…</div>`;
+    try {
+      const res = await call({ op: "list_secrets", bot_id: botId });
+      const list = (res && res.secrets) || [];
+      secBox.innerHTML = list.length ? "" : `<div class="note" style="text-align:left">暂无已配置密钥</div>`;
+      for (const sec of list) {
+        const row = document.createElement("div"); row.className = "bot-item";
+        row.innerHTML = `<div class="meta"><code>{{secret:${esc(sec.name)}}}</code> <span class="note">更新于 ${esc((sec.updated_at || "").slice(0, 19).replace("T", " "))}</span></div>`;
+        const acts = document.createElement("div"); acts.className = "acts";
+        acts.append(mkBtn("删除", "danger", async () => {
+          if (!confirm(`删除密钥 "${sec.name}"？`)) return;
+          try { await call({ op: "delete_secret", bot_id: botId, params: { name: sec.name } }); await refreshBotExtras(botId); }
+          catch (e) { $("botFormErr").textContent = e.message || String(e); }
+        }));
+        row.append(acts);
+        secBox.appendChild(row);
+      }
+    } catch (e) { secBox.innerHTML = `<div class="note err" style="text-align:left">${esc(e.message || String(e))}</div>`; }
+    try {
+      const res = await call({ op: "list_bot_skills", bot_id: botId });
+      const list = (res && res.skills) || [];
+      skBox.innerHTML = list.length ? "" : `<div class="note" style="text-align:left">暂无专属技能（可在对话中让 Bot 使用 save_bot_skill 沉淀）</div>`;
+      for (const sk of list) {
+        const row = document.createElement("div"); row.className = "bot-item";
+        const meta = document.createElement("div"); meta.className = "meta";
+        meta.innerHTML = `<details class="tool"><summary><b>${esc(sk.name)}</b> <span class="note">${esc(sk.description || "")} (${sk.size || 0} B)</span></summary><pre>${esc(sk.content || "")}</pre></details>`;
+        const acts = document.createElement("div"); acts.className = "acts";
+        acts.append(mkBtn("删除", "danger", async () => {
+          if (!confirm(`删除专属技能 "${sk.name}"？`)) return;
+          try { await call({ op: "delete_bot_skill", bot_id: botId, params: { name: sk.name } }); await refreshBotExtras(botId); }
+          catch (e) { $("botFormErr").textContent = e.message || String(e); }
+        }));
+        row.append(meta, acts);
+        skBox.appendChild(row);
+      }
+    } catch (e) { skBox.innerHTML = `<div class="note err" style="text-align:left">${esc(e.message || String(e))}</div>`; }
+  }
+  async function saveBotSecret() {
+    if (!state.editingBot) return;
+    $("botFormErr").textContent = "";
+    const name = $("bSecName").value.trim();
+    const val = $("bSecVal").value;
+    if (!name || !val) { $("botFormErr").textContent = "密钥名与密钥值均不能为空"; return; }
+    try {
+      await call({ op: "set_secret", bot_id: state.editingBot, params: { name, value: val } });
+      $("bSecName").value = "";
+      $("bSecVal").value = "";
+      await refreshBotExtras(state.editingBot);
+    } catch (e) { $("botFormErr").textContent = e.message || String(e); }
   }
   function drawBotModalList() {
     const box = $("botList"); box.innerHTML = "";
@@ -962,12 +1044,29 @@
     $("botFormErr").textContent = "";
     const toolsRaw = $("bTools").value.trim();
     const tools = toolsRaw ? toolsRaw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    let connectors = [];
+    const connRaw = $("bConnectors").value.trim();
+    if (connRaw) {
+      try {
+        connectors = JSON.parse(connRaw);
+        if (!Array.isArray(connectors)) throw new Error("connectors 必须是 JSON 数组");
+      } catch (e) {
+        $("botFormErr").textContent = "连接器 JSON 格式错误：" + (e.message || String(e));
+        return;
+      }
+    }
     const payload = {
       name: $("bName").value.trim(),
       title: $("bTitle").value.trim(),
+      description: $("bDesc").value.trim(),
       default_model: $("bModel").value,
       tool_allowlist: tools,
       instructions: $("bInstr").value,
+      extensions: {
+        isolated_prompt: $("bIsolated").checked,
+        disable_self_train: $("bNoSelfTrain").checked,
+        connectors,
+      },
     };
     try {
       if (state.editingBot) {
@@ -999,6 +1098,7 @@
   $("botModalClose").onclick = closeBotModal;
   $("botNewModeBtn").onclick = () => setBotForm(null);
   $("botSaveBtn").onclick = saveBotForm;
+  $("bSecSaveBtn").onclick = saveBotSecret;
   $("botModal").onclick = (ev) => { if (ev.target === $("botModal")) closeBotModal(); };
   $("tabSessions").onclick = () => {
     setSideTab("sessions");

@@ -114,6 +114,8 @@ func NewServer(opts ServerOptions) *Server {
 	s.mux.Handle("GET /v1/bots/{bot_id}/secrets", s.auth(s.handleListBotSecrets))
 	s.mux.Handle("PUT /v1/bots/{bot_id}/secrets/{name}", s.auth(s.handleSetBotSecret))
 	s.mux.Handle("DELETE /v1/bots/{bot_id}/secrets/{name}", s.auth(s.handleDeleteBotSecret))
+	s.mux.Handle("GET /v1/bots/{bot_id}/skills", s.auth(s.handleListBotSkills))
+	s.mux.Handle("DELETE /v1/bots/{bot_id}/skills/{name}", s.auth(s.handleDeleteBotSkill))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions", s.auth(s.handleListSessions))
 	s.mux.Handle("POST /v1/bots/{bot_id}/sessions", s.auth(s.handleCreateSession))
 	s.mux.Handle("GET /v1/bots/{bot_id}/sessions/{id}", s.auth(s.handleGetSession))
@@ -405,7 +407,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) infoForPrincipal(p Principal) Info {
 	info := s.m.Info()
 	if !p.IsAdmin() && len(p.BotIDs) > 0 {
-		filtered := make([]BotProfile, 0, len(info.Bots))
+		filtered := make([]BotSummary, 0, len(info.Bots))
 		for _, b := range info.Bots {
 			if p.AllowsBot(b.ID) {
 				filtered = append(filtered, b)
@@ -545,6 +547,35 @@ func (s *Server) handleDeleteBotSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Record(AuditEntry{Action: "secret_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: name, Outcome: "ok"})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleListBotSkills(w http.ResponseWriter, r *http.Request) {
+	botID := botIDFromRequest(r)
+	list, err := s.m.ListBotSkills(r.Context(), botID)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if list == nil {
+		list = []BotSkillInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"skills": list})
+}
+
+func (s *Server) handleDeleteBotSkill(w http.ResponseWriter, r *http.Request) {
+	p := principalFromContext(r.Context())
+	if !p.IsAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "admin role required to delete bot skills")
+		return
+	}
+	botID := botIDFromRequest(r)
+	name := r.PathValue("name")
+	if err := s.m.DeleteBotSkill(r.Context(), botID, name); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	s.audit.Record(AuditEntry{Action: "bot_skill_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: name, Outcome: "ok"})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1062,6 +1093,10 @@ func errorStatus(err error) (int, string) {
 	case errors.Is(err, ErrSecretNotFound):
 		return http.StatusNotFound, "secret_not_found"
 	case errors.Is(err, ErrInvalidSecret):
+		return http.StatusBadRequest, "bad_request"
+	case errors.Is(err, ErrBotSkillNotFound):
+		return http.StatusNotFound, "skill_not_found"
+	case errors.Is(err, ErrInvalidBotSkill):
 		return http.StatusBadRequest, "bad_request"
 	case errors.As(err, &locked):
 		return http.StatusConflict, "session_locked"
