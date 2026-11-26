@@ -257,9 +257,16 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 	var dbPath string
 	var db *sql.DB
 	if opts.Ephemeral {
+		ephemeralBotsDir, err := os.MkdirTemp("", "deepai-bot-ephemeral-bots-*")
+		if err != nil {
+			return nil, fmt.Errorf("create ephemeral bot data dir: %w", err)
+		}
+		closers = append(closers, func() { _ = os.RemoveAll(ephemeralBotsDir) })
 		memStore := bot.NewMemoryStore()
 		store = memStore
 		secretStore = bot.NewMemorySecretStore()
+		botDataDir = ephemeralBotsDir
+		rtCfg.BotDataDir = botDataDir
 		rtCfg.Bots = memStore
 		rtCfg.Secrets = secretStore
 	} else {

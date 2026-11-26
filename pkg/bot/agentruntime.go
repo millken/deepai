@@ -48,6 +48,7 @@ type AgentRuntimeConfig struct {
 	SandboxBaseDir     string
 	BotDataDir         string
 	Bots               BotRegistry
+	MutateBot          func(ctx context.Context, botID string, mutate func(*BotProfile) ([]string, error)) (BotProfile, error)
 	Secrets            SecretStore
 	Audit              *AuditLogger
 	OnBotUpdated       func(BotProfile)
@@ -115,7 +116,7 @@ func NewAgentRuntime(cfg AgentRuntimeConfig) (*AgentRuntime, error) {
 // BindGovernance wires Manager-owned stores and callbacks into the runtime so
 // per-turn tools (`http_request`, `save_bot_skill`, `update_bot_persona`) share
 // the Manager's live BotRegistry, SecretStore, AuditLogger, and event bus.
-func (r *AgentRuntime) BindGovernance(bots BotRegistry, secrets SecretStore, audit *AuditLogger, onBotUpdated func(BotProfile)) {
+func (r *AgentRuntime) BindGovernance(bots BotRegistry, secrets SecretStore, audit *AuditLogger, onBotUpdated func(BotProfile), mutateBot func(context.Context, string, func(*BotProfile) ([]string, error)) (BotProfile, error)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if bots != nil {
@@ -129,6 +130,9 @@ func (r *AgentRuntime) BindGovernance(bots BotRegistry, secrets SecretStore, aud
 	}
 	if onBotUpdated != nil {
 		r.cfg.OnBotUpdated = onBotUpdated
+	}
+	if mutateBot != nil {
+		r.cfg.MutateBot = mutateBot
 	}
 }
 
@@ -241,7 +245,8 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 	if turnSkills.Count() > 0 {
 		_ = toolsReg.Register(skill.SkillToolWithRegistry(turnSkills))
 	}
-	if in.Extensions.DisableSelfTrain {
+	disableSelfTrain := in.DisableSelfTrain || in.Extensions.DisableSelfTrain
+	if disableSelfTrain {
 		toolsReg.Unregister("save_bot_skill")
 		toolsReg.Unregister("update_bot_persona")
 	}
@@ -326,14 +331,16 @@ func (c *agentConversation) RunTurn(ctx context.Context, in TurnInput) (*TurnOut
 
 	ctx = schedule.WithBotID(ctx, botID)
 	ctx = withBotTurnEnv(ctx, botTurnEnv{
-		botID:      botID,
-		extensions: in.Extensions.Clone(),
-		secrets:    cfg.Secrets,
-		bots:       cfg.Bots,
-		botDataDir: cfg.BotDataDir,
-		audit:      cfg.Audit,
-		onBotSaved: cfg.OnBotUpdated,
-		allowLocal: cfg.AllowLoopbackHTTP,
+		botID:            botID,
+		extensions:       in.Extensions.Clone(),
+		disableSelfTrain: disableSelfTrain,
+		secrets:          cfg.Secrets,
+		bots:             cfg.Bots,
+		mutateBot:        cfg.MutateBot,
+		botDataDir:       cfg.BotDataDir,
+		audit:            cfg.Audit,
+		onBotSaved:       cfg.OnBotUpdated,
+		allowLocal:       cfg.AllowLoopbackHTTP,
 	})
 	ctx = tools.WithSubagentConstraints(ctx, tools.SubagentConstraints{
 		Tools:             toolsReg,

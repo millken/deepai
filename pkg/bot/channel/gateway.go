@@ -193,7 +193,7 @@ func (g *Gateway) HandleInbound(ctx context.Context, msg InboundMessage) {
 		Model:         binding.Model,
 		Mode:          bot.SendModeQueue,
 		AttachmentIDs: attIDs,
-	}, bot.SendOptions{})
+	}, bot.SendOptions{DisableSelfTrain: !ra.policy.CanSelfTrain(msg.UserID, msg.IsGroup)})
 	if err != nil {
 		if sub != nil {
 			sub.Close()
@@ -322,7 +322,7 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 			Content: arg,
 			Model:   cur.Model,
 			Mode:    bot.SendModeSteer,
-		}, bot.SendOptions{})
+		}, bot.SendOptions{DisableSelfTrain: !ra.policy.CanSelfTrain(msg.UserID, msg.IsGroup)})
 		if err != nil {
 			if sub != nil {
 				sub.Close()
@@ -515,21 +515,29 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 				return true
 			}
 			if len(list) == 0 {
-				_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」尚未配置密钥。\n用法：/secret set <NAME> <VALUE>", curBot))
+				_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」尚未配置密钥。\n推荐本地安全录入：deepai-bot secret set --bot %s <NAME>\n或私聊：/secret set <NAME> <VALUE>", curBot, curBot))
 				return true
 			}
 			names := make([]string, 0, len(list))
 			for _, m := range list {
 				names = append(names, m.Name)
 			}
-			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」已配置密钥：%s\n可在 http_request 中使用 {{secret:<NAME>}} 引用。", curBot, strings.Join(names, ", ")))
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("Bot「%s」已配置密钥：%s\n可在命名 connector 的 http_request 中使用 {{secret:<NAME>}} 引用。", curBot, strings.Join(names, ", ")))
 			return true
 		case "set":
+			deleted := false
+			if msg.MessageID != "" {
+				if del, ok := ra.adapter.(MessageDeleter); ok {
+					if err := del.DeleteMessage(ctx, dst, msg.MessageID); err == nil {
+						deleted = true
+					}
+				}
+			}
 			// Split into at most 3 tokens ("set", NAME, VALUE) preserving spaces inside VALUE if any.
 			rest := strings.TrimSpace(strings.TrimPrefix(arg, parts[0]))
 			nameEnd := strings.IndexAny(rest, " \t")
 			if nameEnd <= 0 {
-				_, _ = ra.adapter.SendText(ctx, dst, "用法：/secret set <NAME> <VALUE>")
+				_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("用法：/secret set <NAME> <VALUE>（更推荐使用 CLI：deepai-bot secret set --bot %s <NAME>）", curBot))
 				return true
 			}
 			secName := strings.TrimSpace(rest[:nameEnd])
@@ -546,7 +554,11 @@ func (g *Gateway) handleSlashCommand(ctx context.Context, ra registeredAdapter, 
 				Target:  meta.Name,
 				Outcome: "ok",
 			})
-			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已为 Bot「%s」加密保存密钥 %s（未写入聊天上下文，可通过 {{secret:%s}} 安全调用）。", meta.BotID, meta.Name, meta.Name))
+			historyNote := fmt.Sprintf("请手动删除上方含明文的聊天记录；生产环境推荐使用 CLI：deepai-bot secret set --bot %s %s", meta.BotID, meta.Name)
+			if deleted {
+				historyNote = fmt.Sprintf("已自动请求撤回含明文的命令消息；更高安全要求请优先使用 CLI：deepai-bot secret set --bot %s %s", meta.BotID, meta.Name)
+			}
+			_, _ = ra.adapter.SendText(ctx, dst, fmt.Sprintf("已为 Bot「%s」加密保存密钥 %s（未写入模型上下文，可通过 {{secret:%s}} 安全调用）。\n%s", meta.BotID, meta.Name, meta.Name, historyNote))
 			return true
 		case "delete", "del", "rm":
 			if len(parts) < 2 {

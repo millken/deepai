@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/millken/deepai/pkg/models"
@@ -22,11 +23,55 @@ const maxBotSkillBytes = 64 << 10
 var (
 	botSkillNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
 	skillInjectionREs   = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)ignore\s+(previous|all|above|prior)\s+instructions`),
-		regexp.MustCompile(`(?i)system\s*:\s*you\s+are`),
-		regexp.MustCompile("[\u200B\u200C\u200D\u200E\u200F\u2060\uFEFF\u202A-\u202E\u2066-\u2069]"),
+		regexp.MustCompile(`(?is)\b(ignore|disregard|forget|override|bypass|disable)\b[^\n]{0,60}\b(previous|prior|above|all|earlier|system|developer|safety|security|existing)\s+(instructions?|rules?|prompts?|constraints?|guardrails?|policies|guidelines?)`),
+		regexp.MustCompile(`(?i)<\s*/?\s*(system|developer|assistant|user|tool_call|tool_result|function_calls|untrusted_webhook_payload)\b`),
+		regexp.MustCompile(`(?i)(\[\s*/?\s*INST\s*\]|<<\s*/?\s*SYS\s*>>|<\|im_(start|end)\|>|<\|(system|user|assistant|endoftext)\|>|\bsystem\s*:\s*you\s+are\b)`),
+		regexp.MustCompile(`(?i)\b(you\s+are\s+now\s+in\s+developer\s+mode|do\s+anything\s+now|\bDAN\s+mode\b|jailbreak|unrestricted\s+mode|act\s+without\s+(restrictions|guardrails|limits))\b`),
+		regexp.MustCompile(`(?s)<!--.*?-->`),
+		regexp.MustCompile(`(?i)!\[[^\]]*\]\([^)]*\{\{secret:`),
+		regexp.MustCompile(`(?is)\b(print|echo|reveal|output|expose|leak|exfiltrate|base64|send\s+to)\b[^\n]{0,60}(\{\{secret:|bot_secrets|plaintext\s+secret)`),
 	}
+	fallbackPersonaMu sync.Mutex
 )
+
+func hasHiddenOrControlUnicode(s string) bool {
+	for _, r := range s {
+		switch {
+		case r < 0x20 && r != '\n' && r != '\r' && r != '\t':
+			return true
+		case r >= 0x7F && r <= 0x9F:
+			return true
+		case r >= 0x200B && r <= 0x200F:
+			return true
+		case r >= 0x202A && r <= 0x202E:
+			return true
+		case r >= 0x2060 && r <= 0x206F:
+			return true
+		case r == 0xFEFF:
+			return true
+		case r >= 0xE0000 && r <= 0xE007F: // Unicode tag block (ASCII smuggling)
+			return true
+		}
+	}
+	return false
+}
+
+func validateTrainingTextSafety(texts ...string) error {
+	for _, t := range texts {
+		if hasHiddenOrControlUnicode(t) {
+			return errors.New("content rejected due to hidden control, bidirectional, or unicode tag characters")
+		}
+		for _, re := range skillInjectionREs {
+			if re.MatchString(t) {
+				return errors.New("content rejected due to unsafe prompt-injection, role-boundary spoofing, covert comment, or secret-exfiltration pattern")
+			}
+		}
+		if secret.IsSealed(t) || strings.Contains(t, "enc:v1:") {
+			return errors.New("do not embed sealed ciphertexts; use '{{secret:NAME}}' placeholders")
+		}
+	}
+	return nil
+}
 
 // SaveBotSkillTool lets a bot crystallize domain workflows or third-party API
 // manuals taught during conversation into its own isolated `~/.deepai/bot/bots/<id>/skills/<name>/SKILL.md`.
@@ -62,7 +107,7 @@ func SaveBotSkillTool() models.Tool {
 func UpdateBotPersonaTool() models.Tool {
 	return models.Tool{
 		Name:        "update_bot_persona",
-		Description: "Evolve THIS bot's durable persona rules (instructions) or register/update a third-party APIConnector in its profile when explicitly taught by the user during conversation. Disabled automatically during unattended scheduled runs.",
+		Description: "Evolve THIS bot's durable persona rules (instructions) or register/update a third-party APIConnector in its profile when explicitly taught by the user during conversation. Disabled automatically during unattended scheduled runs and on untrusted channels.",
 		Groups:      []string{"bot", "training"},
 		InputSchema: map[string]any{
 			"type": "object",
@@ -110,34 +155,34 @@ func checkSelfTrainingAllowed(ctx context.Context) (botTurnEnv, error) {
 	if !ok {
 		return botTurnEnv{}, errors.New("bot training context is unavailable outside deepai-bot")
 	}
-	if env.extensions.DisableSelfTrain {
-		return botTurnEnv{}, fmt.Errorf("self-training is disabled on bot %q", effectiveBotID(env.botID))
+	if env.disableSelfTrain || env.extensions.DisableSelfTrain {
+		return botTurnEnv{}, fmt.Errorf("self-training is disabled for this turn or bot %q", effectiveBotID(env.botID))
 	}
 	return env, nil
 }
 
-func rejectPlaintextSecrets(ctx context.Context, env botTurnEnv, texts ...string) error {
+// rejectStoredBotSecrets verifies that none of texts contain sealed ciphertexts
+// or any plaintext value stored for botID in secrets. Fails closed on store errors.
+func rejectStoredBotSecrets(ctx context.Context, secrets SecretStore, botID string, texts ...string) error {
 	for _, t := range texts {
-		for _, re := range skillInjectionREs {
-			if re.MatchString(t) {
-				return errors.New("content rejected due to unsafe prompt-injection or invisible unicode pattern")
-			}
-		}
 		if secret.IsSealed(t) || strings.Contains(t, "enc:v1:") {
 			return errors.New("do not embed sealed ciphertexts; use '{{secret:NAME}}' placeholders")
 		}
 	}
-	if env.secrets == nil {
+	if secrets == nil {
 		return nil
 	}
-	botID := effectiveBotID(env.botID)
-	metas, err := env.secrets.ListSecrets(ctx, botID)
+	botID = effectiveBotID(botID)
+	metas, err := secrets.ListSecrets(ctx, botID)
 	if err != nil {
-		return nil
+		return fmt.Errorf("verify bot secrets before persisting: %w", err)
 	}
 	for _, m := range metas {
-		val, err := env.secrets.GetSecret(ctx, botID, m.Name)
-		if err != nil || len(val) < 4 {
+		val, err := secrets.GetSecret(ctx, botID, m.Name)
+		if err != nil {
+			return fmt.Errorf("verify bot secret %q before persisting: %w", m.Name, err)
+		}
+		if val == "" {
 			continue
 		}
 		for _, t := range texts {
@@ -147,6 +192,13 @@ func rejectPlaintextSecrets(ctx context.Context, env botTurnEnv, texts ...string
 		}
 	}
 	return nil
+}
+
+func rejectPlaintextSecrets(ctx context.Context, env botTurnEnv, texts ...string) error {
+	if err := validateTrainingTextSafety(texts...); err != nil {
+		return err
+	}
+	return rejectStoredBotSecrets(ctx, env.secrets, effectiveBotID(env.botID), texts...)
 }
 
 func handleSaveBotSkillTool(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
@@ -164,7 +216,7 @@ func handleSaveBotSkillTool(ctx context.Context, call models.ToolCall) (models.T
 		return fail(err)
 	}
 	if strings.TrimSpace(env.botDataDir) == "" {
-		return fail(errors.New("per-bot skill persistence is unavailable in ephemeral mode"))
+		return fail(errors.New("bot skill data directory is not configured on this runtime"))
 	}
 
 	name, _ := call.Arguments["name"].(string)
@@ -222,37 +274,14 @@ func handleSaveBotSkillTool(ctx context.Context, call models.ToolCall) (models.T
 	}, nil
 }
 
-func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
-	fail := func(err error) (models.ToolResult, error) {
-		return models.ToolResult{
-			CallID:   call.ID,
-			ToolName: call.Name,
-			Status:   models.CallStatusFailed,
-			Error:    err.Error(),
-		}, err
-	}
-
-	env, err := checkSelfTrainingAllowed(ctx)
-	if err != nil {
-		return fail(err)
-	}
-	if env.bots == nil {
-		return fail(errors.New("bot registry is not configured on this runtime"))
-	}
-
-	botID := effectiveBotID(env.botID)
-	cur, err := env.bots.GetBot(ctx, botID)
-	if err != nil {
-		return fail(err)
-	}
-
+func applyPersonaToolCall(call models.ToolCall, cur *BotProfile) ([]string, error) {
 	changed := false
 	var checkStrings []string
 
 	if rawInst, exists := call.Arguments["instructions"]; exists && rawInst != nil {
 		inst, ok := rawInst.(string)
 		if !ok {
-			return fail(errors.New("instructions must be a string"))
+			return nil, errors.New("instructions must be a string")
 		}
 		cur.Instructions = strings.TrimSpace(inst)
 		checkStrings = append(checkStrings, cur.Instructions)
@@ -274,7 +303,7 @@ func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (mode
 	}
 	if rmConn, ok := call.Arguments["remove_connector"].(string); ok && strings.TrimSpace(rmConn) != "" {
 		rmConn = strings.TrimSpace(rmConn)
-		kept := cur.Extensions.Connectors[:0]
+		kept := make([]APIConnector, 0, len(cur.Extensions.Connectors))
 		for _, c := range cur.Extensions.Connectors {
 			if !strings.EqualFold(c.Name, rmConn) {
 				kept = append(kept, c)
@@ -286,11 +315,11 @@ func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (mode
 	if rawConn, ok := call.Arguments["upsert_connector"].(map[string]any); ok && len(rawConn) > 0 {
 		rawBytes, err := json.Marshal(rawConn)
 		if err != nil {
-			return fail(fmt.Errorf("encode upsert_connector: %w", err))
+			return nil, fmt.Errorf("encode upsert_connector: %w", err)
 		}
 		var conn APIConnector
 		if err := json.Unmarshal(rawBytes, &conn); err != nil {
-			return fail(fmt.Errorf("parse upsert_connector: %w", err))
+			return nil, fmt.Errorf("parse upsert_connector: %w", err)
 		}
 		checkStrings = append(checkStrings, string(rawBytes))
 		replaced := false
@@ -308,24 +337,73 @@ func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (mode
 	}
 
 	if !changed {
-		return fail(errors.New("provide at least one field to update (instructions, append_instruction, isolated_prompt, upsert_connector, or remove_connector)"))
+		return nil, errors.New("provide at least one field to update (instructions, append_instruction, isolated_prompt, upsert_connector, or remove_connector)")
 	}
-	if err := rejectPlaintextSecrets(ctx, env, checkStrings...); err != nil {
-		return fail(err)
+	if err := validateTrainingTextSafety(checkStrings...); err != nil {
+		return nil, err
+	}
+	return checkStrings, nil
+}
+
+func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
+	fail := func(err error) (models.ToolResult, error) {
+		return models.ToolResult{
+			CallID:   call.ID,
+			ToolName: call.Name,
+			Status:   models.CallStatusFailed,
+			Error:    err.Error(),
+		}, err
 	}
 
-	cur.Extensions = normalizeBotExtensions(cur.Extensions)
-	cur.UpdatedAt = time.Now().UTC()
-	if err := validateBotProfile(cur, false); err != nil {
-		return fail(err)
-	}
-	updated, err := env.bots.UpdateBot(ctx, cur)
+	env, err := checkSelfTrainingAllowed(ctx)
 	if err != nil {
 		return fail(err)
 	}
-	if env.onBotSaved != nil {
-		env.onBotSaved(updated.Clone())
+	if env.mutateBot == nil && env.bots == nil {
+		return fail(errors.New("bot registry is not configured on this runtime"))
 	}
+
+	botID := effectiveBotID(env.botID)
+	var updated BotProfile
+	if env.mutateBot != nil {
+		updated, err = env.mutateBot(ctx, botID, func(cur *BotProfile) ([]string, error) {
+			return applyPersonaToolCall(call, cur)
+		})
+		if err != nil {
+			return fail(err)
+		}
+	} else {
+		fallbackPersonaMu.Lock()
+		cur, gErr := env.bots.GetBot(ctx, botID)
+		if gErr != nil {
+			fallbackPersonaMu.Unlock()
+			return fail(gErr)
+		}
+		checkStrings, mErr := applyPersonaToolCall(call, &cur)
+		if mErr != nil {
+			fallbackPersonaMu.Unlock()
+			return fail(mErr)
+		}
+		if sErr := rejectStoredBotSecrets(ctx, env.secrets, botID, checkStrings...); sErr != nil {
+			fallbackPersonaMu.Unlock()
+			return fail(sErr)
+		}
+		cur.Extensions = normalizeBotExtensions(cur.Extensions)
+		cur.UpdatedAt = time.Now().UTC()
+		if vErr := validateBotProfile(cur, false); vErr != nil {
+			fallbackPersonaMu.Unlock()
+			return fail(vErr)
+		}
+		updated, err = env.bots.UpdateBot(ctx, cur)
+		fallbackPersonaMu.Unlock()
+		if err != nil {
+			return fail(err)
+		}
+		if env.onBotSaved != nil {
+			env.onBotSaved(updated.Clone())
+		}
+	}
+
 	env.audit.Record(AuditEntry{
 		Action:  "bot_persona_updated",
 		Actor:   "bot:" + botID,
@@ -338,7 +416,7 @@ func handleUpdateBotPersonaTool(ctx context.Context, call models.ToolCall) (mode
 		CallID:   call.ID,
 		ToolName: call.Name,
 		Status:   models.CallStatusCompleted,
-		Content:  fmt.Sprintf("Updated persona/connectors for bot %q (connectors=%d, isolated_prompt=%v). Takes full effect on the next turn.", botID, len(updated.Extensions.Connectors), updated.Extensions.IsolatedPrompt),
+		Content:  fmt.Sprintf("Updated persona/connectors for bot %q (connectors=%d, isolated_prompt=%v). Connectors are immediately available to http_request; prompt changes apply on the next turn.", botID, len(updated.Extensions.Connectors), updated.Extensions.IsolatedPrompt),
 	}, nil
 }
 

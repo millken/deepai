@@ -35,7 +35,7 @@ deepai-bot secret set <NAME> <VAL> [--bot <id>] # 为指定 Bot 加密保存第�
 | `--max-tool-calls` | 0（不限） | 每轮工具调用上限 |
 | `--turn-timeout` | 0（不限） | 单轮超时；超时的 turn 以 `turn_end` status `timed_out` 结束 |
 | `--idle-timeout` | 30m | 空闲会话卸载（释放沙箱） |
-| `--ephemeral` | off | 会话只存内存，不写 `bot.db`、不用长期记忆 |
+| `--ephemeral` | off | 会话、Bot 配置与专属技能只存内存/进程临时目录（退出自动清理），不写 `bot.db`、不用长期记忆 |
 | `--cors-origin` | — | 允许跨域访问的前端 origin（可重复，`*` 为任意） |
 | `--no-web` | off | 不提供内置 Web 控制台 |
 | `--no-schedule` | off | 关闭定时任务（不注册 `schedule` 工具、不启动调度器，接口返回 404） |
@@ -110,17 +110,17 @@ curl -s -H "$H" -H 'Content-Type: application/json' \
   -d '{"id":"assistant","name":"业务助手","tool_allowlist":["http_request","skill","save_bot_skill","update_bot_persona","schedule","ask_clarification"]}' \
   $B/v1/bots | jq .
 
-# 2. 加密录入第三方 API 密钥（机器指纹 AES-GCM 落库，明文不进上下文；也可在 Telegram/飞书私聊发 /secret set）
+# 2. 推荐通过本机 CLI 加密录入第三方 API 密钥（机器指纹 AES-GCM 落库，明文不进上下文与聊天记录）
 deepai-bot secret set NOTION_TOKEN "ntn_xxx" --bot assistant
 
 # 3. 创建会话后直接在对话中训练它：
-#    Bot 会调用 update_bot_persona（开启 isolated_prompt 并绑定带 {{secret:NOTION_TOKEN}} 的连接器）
-#    与 save_bot_skill（沉淀专属 ~/.deepai/bot/bots/assistant/skills/<name>/SKILL.md），随后通过 http_request 安全调用外部 API
+#    Bot 会调用 update_bot_persona（开启 isolated_prompt 并绑定带 {{secret:NOTION_TOKEN}} 的具名连接器）
+#    与 save_bot_skill（沉淀专属 ~/.deepai/bot/bots/assistant/skills/<name>/SKILL.md），同轮即可通过 http_request 安全调用该连接器
 ```
 
 ## IM 渠道与 OpenAI 兼容接口
 
-- **Telegram / 飞书网关**：在 `~/.deepai/config.yaml` 中配置 `channels.telegram` 或 `channels.feishu`（默认白名单拒绝一切未授权用户，支持 `/new`、`/steer`、`/cancel`、`/bot`、`/model`、`/approve` 与私聊 `/secret`）；详见 [`docs/BOT_NEXT_DESIGN.md`](../../docs/BOT_NEXT_DESIGN.md) §5。
+- **Telegram / 飞书网关**：在 `~/.deepai/config.yaml` 中配置 `channels.telegram` 或 `channels.feishu`（默认白名单拒绝一切未授权用户；默认 `allow_self_train: false` 禁用渠道内自训练，仅显式开启后对私聊 `allow_users` 放开；支持 `/new`、`/steer`、`/cancel`、`/bot`、`/model`、`/approve` 与私聊应急 `/secret`）；详见 [`docs/BOT_NEXT_DESIGN.md`](../../docs/BOT_NEXT_DESIGN.md) §5。
 - **OpenAI 兼容接口**：`POST /v1/chat/completions` 支持 `model: "bot:<bot_id>"` 或 `"bot:<bot_id>/<model_alias>"` 及 `X-DeepAI-Session` 会话复用，可直接接入 Open WebUI、Cherry Studio、Raycast 等客户端。
 
 ## 交给 systemd 管理

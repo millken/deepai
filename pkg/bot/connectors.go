@@ -31,14 +31,16 @@ var secretPlaceholderRE = regexp.MustCompile(`\{\{secret:([A-Za-z_][A-Za-z0-9_]{
 type botTurnEnvKey struct{}
 
 type botTurnEnv struct {
-	botID      string
-	extensions BotExtensions
-	secrets    SecretStore
-	bots       BotRegistry
-	botDataDir string
-	audit      *AuditLogger
-	onBotSaved func(BotProfile)
-	allowLocal bool
+	botID            string
+	extensions       BotExtensions
+	disableSelfTrain bool
+	secrets          SecretStore
+	bots             BotRegistry
+	mutateBot        func(ctx context.Context, botID string, mutate func(*BotProfile) ([]string, error)) (BotProfile, error)
+	botDataDir       string
+	audit            *AuditLogger
+	onBotSaved       func(BotProfile)
+	allowLocal       bool
 }
 
 func withBotTurnEnv(ctx context.Context, env botTurnEnv) context.Context {
@@ -63,7 +65,7 @@ func botTurnEnvFromContext(ctx context.Context) (botTurnEnv, bool) {
 func HTTPRequestTool() models.Tool {
 	return models.Tool{
 		Name:         "http_request",
-		Description:  "Make an HTTP request to a third-party REST or GraphQL API without using bash. Supports named bot connectors and host-injected '{{secret:NAME}}' credential placeholders (in url, headers, query, or body) so plaintext secrets never enter context.",
+		Description:  "Make an HTTP request to a third-party REST or GraphQL API without using bash. Supports named bot connectors and host-injected '{{secret:NAME}}' credential placeholders (only allowed when a named 'connector' is specified so credentials stay bound to its base_url/allowed_hosts).",
 		Groups:       []string{"builtin", "web", "api"},
 		ParallelSafe: true,
 		InputSchema: map[string]any{
@@ -71,7 +73,7 @@ func HTTPRequestTool() models.Tool {
 			"properties": map[string]any{
 				"connector": map[string]any{
 					"type":        "string",
-					"description": "Optional name of a configured APIConnector on this bot (inherits base_url, default headers/query_params, and allowed_hosts).",
+					"description": "Name of a configured APIConnector on this bot (inherits base_url, default headers/query_params, and allowed_hosts; required whenever '{{secret:NAME}}' is referenced).",
 				},
 				"method": map[string]any{
 					"type":        "string",
@@ -84,12 +86,12 @@ func HTTPRequestTool() models.Tool {
 				"headers": map[string]any{
 					"type":                 "object",
 					"additionalProperties": map[string]any{"type": "string"},
-					"description":          "Optional request headers (may reference '{{secret:NAME}}').",
+					"description":          "Optional request headers (may reference '{{secret:NAME}}' when 'connector' is set).",
 				},
 				"query": map[string]any{
 					"type":                 "object",
 					"additionalProperties": map[string]any{"type": "string"},
-					"description":          "Optional URL query parameters (may reference '{{secret:NAME}}').",
+					"description":          "Optional URL query parameters (may reference '{{secret:NAME}}' when 'connector' is set).",
 				},
 				"json_body": map[string]any{
 					"description": "Optional JSON payload (object, array, or primitive). Automatically sets Content-Type: application/json.",
@@ -107,6 +109,41 @@ func HTTPRequestTool() models.Tool {
 		},
 		Handler: handleHTTPRequestTool,
 	}
+}
+
+func valueContainsSecretPlaceholder(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return strings.Contains(x, "{{secret:")
+	case map[string]any:
+		for _, val := range x {
+			if valueContainsSecretPlaceholder(val) {
+				return true
+			}
+		}
+	case map[string]string:
+		for _, val := range x {
+			if strings.Contains(val, "{{secret:") {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if valueContainsSecretPlaceholder(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func resolveTurnConnectors(ctx context.Context, env botTurnEnv, botID string) []APIConnector {
+	if env.bots != nil {
+		if liveBot, err := env.bots.GetBot(ctx, botID); err == nil {
+			return liveBot.Extensions.Connectors
+		}
+	}
+	return env.extensions.Connectors
 }
 
 func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.ToolResult, error) {
@@ -143,9 +180,10 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 
 	var conn *APIConnector
 	if connectorName != "" {
-		for i := range env.extensions.Connectors {
-			if strings.EqualFold(env.extensions.Connectors[i].Name, connectorName) {
-				cp := env.extensions.Connectors[i].Clone()
+		connectors := resolveTurnConnectors(ctx, env, botID)
+		for i := range connectors {
+			if strings.EqualFold(connectors[i].Name, connectorName) {
+				cp := connectors[i].Clone()
 				conn = &cp
 				break
 			}
@@ -153,6 +191,8 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 		if conn == nil {
 			return fail(fmt.Errorf("unknown connector %q on bot %q", connectorName, botID))
 		}
+	} else if valueContainsSecretPlaceholder(call.Arguments) {
+		return fail(errors.New("referencing '{{secret:NAME}}' requires specifying a configured 'connector' so credentials stay restricted to its base_url and allowed_hosts"))
 	}
 
 	// Secret expansion table collected during this call so any echoed secret is
@@ -161,6 +201,9 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	expandSecrets := func(s string) (string, error) {
 		if !strings.Contains(s, "{{secret:") {
 			return s, nil
+		}
+		if conn == nil {
+			return "", errors.New("referencing '{{secret:NAME}}' requires specifying a configured 'connector'")
 		}
 		if env.secrets == nil {
 			return "", errors.New("secret store is not configured on this runtime")
@@ -290,11 +333,15 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 		bodyBytes = []byte(expandedBody)
 	}
 
+	hasSecrets := len(resolvedSecrets) > 0
+	if hasSecrets && (conn == nil || len(allowedHosts) == 0) {
+		return fail(errors.New("refusing to send secret credentials without a named connector host allowlist"))
+	}
 	// Enforce HTTPS whenever secrets are attached unless running in a local test harness.
-	if len(resolvedSecrets) > 0 && targetURL.Scheme != "https" && !env.allowLocal {
+	if hasSecrets && targetURL.Scheme != "https" && !env.allowLocal {
 		return fail(errors.New("refusing to send secret credentials over non-HTTPS URL"))
 	}
-	if err := validateOutboundHost(targetURL.Hostname(), allowedHosts, env.allowLocal); err != nil {
+	if err := validateOutboundHostWithSecrets(targetURL.Hostname(), allowedHosts, hasSecrets, env.allowLocal); err != nil {
 		return fail(errors.New(redact(err.Error())))
 	}
 
@@ -302,7 +349,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	if conn != nil && conn.TimeoutSec > 0 {
 		timeout = time.Duration(conn.TimeoutSec) * time.Second
 	}
-	client := newSafeConnectorHTTPClient(timeout, allowedHosts, len(resolvedSecrets) > 0, env.allowLocal)
+	client := newSafeConnectorHTTPClient(timeout, allowedHosts, hasSecrets, env.allowLocal)
 
 	var bodyReader io.Reader
 	if len(bodyBytes) > 0 {
@@ -433,9 +480,16 @@ func hostMatchesAllowlist(host string, allowed []string) bool {
 }
 
 func validateOutboundHost(hostname string, allowed []string, allowLocal bool) error {
+	return validateOutboundHostWithSecrets(hostname, allowed, false, allowLocal)
+}
+
+func validateOutboundHostWithSecrets(hostname string, allowed []string, hasSecrets, allowLocal bool) error {
 	hostname = strings.TrimSpace(hostname)
 	if hostname == "" {
 		return errors.New("empty target host")
+	}
+	if hasSecrets && len(allowed) == 0 {
+		return errors.New("secret-bearing requests require an explicit connector host allowlist")
 	}
 	if !hostMatchesAllowlist(hostname, allowed) {
 		return fmt.Errorf("host %q is not in connector allowed_hosts", hostname)
@@ -502,7 +556,7 @@ func newSafeConnectorHTTPClient(timeout time.Duration, allowedHosts []string, ha
 			if len(via) > 0 && hasSecrets && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
 				return errors.New("refusing cross-host redirect when secret credentials are attached")
 			}
-			if err := validateOutboundHost(req.URL.Hostname(), allowedHosts, allowLocal); err != nil {
+			if err := validateOutboundHostWithSecrets(req.URL.Hostname(), allowedHosts, hasSecrets, allowLocal); err != nil {
 				return fmt.Errorf("redirect blocked: %w", err)
 			}
 			return nil

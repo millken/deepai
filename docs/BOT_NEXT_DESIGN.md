@@ -241,6 +241,8 @@ type Adapter interface {
 
 IM 机器人背后连接着能执行 `bash` 的 agent，必须实施**严格白名单准入**：
 - `channels.telegram.allow_users` / `allow_chats`（空列表 = **拒绝一切外部消息**并打告警日志，绝不默认向全网开放）；
+- **IM 渠道默认关闭对话自训练**（`allow_self_train: false`）：避免普通聊天成员诱导持久化改写 `instructions` 或 `SKILL.md`；显式设置 `allow_self_train: true` 后也仅对 `allow_users` 的**私聊（DM）**放开，群聊永久禁用；
+- `/secret set` 仅限私聊且会自动尝试调用平台撤回接口清理源消息，生产环境推荐优先使用本机 CLI `deepai-bot secret set` 以免明文残留在第三方 IM 云端聊天记录；
 - 支持为每个渠道或群聊绑定**受限 Bot 人格**（例如群聊绑定只有只读 `tool_allowlist` 的 `assistant` Bot，私聊管理员才绑定全权限 `default` Bot）；
 - `config.yaml` 配置示例：
   ```yaml
@@ -251,6 +253,7 @@ IM 机器人背后连接着能执行 `bash` 的 agent，必须实施**严格白�
       default_bot_id: default
       allow_users: [123456789]
       allow_chats: []
+      allow_self_train: false
       stream_edit_interval: 800ms
     feishu:
       enabled: false
@@ -258,6 +261,7 @@ IM 机器人背后连接着能执行 `bash` 的 agent，必须实施**严格白�
       app_secret_env: FEISHU_APP_SECRET
       default_bot_id: default
       allow_users: ["ou_xxxx"]
+      allow_self_train: false
   ```
 
 ---
@@ -316,9 +320,9 @@ CREATE TABLE IF NOT EXISTS bot_tokens (
 
 承接「出生一致、后天对话训练分化」理念，所有自定义 Bot 共享同一套 `ModelRegistry` 与 `AgentRuntime`，通过三层机制在聊天过程中习得专属业务能力并安全对接外部 HTTP API（完整数据结构见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §3.4）：
 
-- **硬件绑定密钥仓（`bot_secrets`）**：通过 `deepai-bot secret`、`PUT /v1/bots/{bot_id}/secrets/{name}` 或 IM 私聊 `/secret set` 将第三方服务凭证用 `pkg/secret.Seal` 加密落盘；模型仅获知 `{{secret:NAME}}` 占位符名。
-- **受控连接器调用（`http_request`）**：无需授予 `bash` 权限即可调用 REST/GraphQL 接口，宿主侧注入 `{{secret:NAME}}` 并对响应体与报错自动执行 `[REDACTED:NAME]` 脱敏，同时强制带凭据请求走 HTTPS、拦截跨域名重定向与内网 SSRF。
-- **自进化工具（`update_bot_persona` + `save_bot_skill`）**：在交互式训练中自动演化 `Instructions` / `APIConnector` / `IsolatedPrompt`，并将复杂接口文档沉淀到 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`（拦截明文密钥、Prompt 注入与 `` !`command` `` 动态执行块，且在定时任务/Webhook 无人值守运行时自动禁用）。
+- **硬件绑定密钥仓（`bot_secrets`）**：推荐通过 `deepai-bot secret` 或 `PUT /v1/bots/{bot_id}/secrets/{name}`（亦支持应急 IM 私聊 `/secret set` 并自动尝试撤回源消息）将凭证用 `pkg/secret.Seal` 加密落盘；模型仅获知 `{{secret:NAME}}` 占位符名，且 REST `POST/PATCH /v1/bots` 同步拦截明文连接器密钥。
+- **受控连接器调用（`http_request`）**：任何携带 `{{secret:NAME}}` 的请求必须绑定具名 `connector` 与其 `allowed_hosts`（拒绝向任意公网域名展开凭据），宿主侧注入真实值并对响应体与报错自动执行 `[REDACTED:NAME]` 脱敏，强制 HTTPS、拦截跨域名重定向与内网 SSRF，且同轮新增连接器立即可用。
+- **自进化工具（`update_bot_persona` + `save_bot_skill`）**：持锁串行化演化 `Instructions` / `APIConnector` / `IsolatedPrompt` 并沉淀专属 `SKILL.md`（`SecretStore` 校验失败即关闭、拦截短密钥明文/隐写字符/越界模式与 `` !`command` `` 动态执行块；定时任务/Webhook 及未显式开启 `allow_self_train` 的 IM 渠道自动禁用）。
 
 ---
 

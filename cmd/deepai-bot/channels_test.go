@@ -17,6 +17,7 @@ channels:
     default_bot_id: assistant
     allow_users: ["123456789"]
     allow_chats: ["-100999"]
+    allow_self_train: true
     stream_edit_interval: 800ms
   feishu:
     enabled: false
@@ -34,11 +35,11 @@ channels:
 	}
 	tg := cfg.Channels.Telegram
 	if !tg.Enabled || tg.BotTokenEnv != "TELEGRAM_BOT_TOKEN" || tg.DefaultBotID != "assistant" ||
-		!slices.Equal(tg.AllowUsers, []string{"123456789"}) || tg.StreamEditInterval != "800ms" {
+		!slices.Equal(tg.AllowUsers, []string{"123456789"}) || !tg.AllowSelfTrain || tg.StreamEditInterval != "800ms" {
 		t.Fatalf("unexpected telegram config: %+v", tg)
 	}
 	fs := cfg.Channels.Feishu
-	if fs.Enabled || fs.AppIDEnv != "FEISHU_APP_ID" || !slices.Equal(fs.AllowUsers, []string{"ou_xxxx"}) {
+	if fs.Enabled || fs.AppIDEnv != "FEISHU_APP_ID" || fs.AllowSelfTrain || !slices.Equal(fs.AllowUsers, []string{"ou_xxxx"}) {
 		t.Fatalf("unexpected feishu config: %+v", fs)
 	}
 }

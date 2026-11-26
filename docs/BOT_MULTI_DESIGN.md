@@ -147,16 +147,16 @@ type BotExtensions struct {
 
 1. **按 Bot 隔离的硬件绑定密文仓（`pkg/bot/secrets.go`）**：
    - 表结构：`bot_secrets(bot_id, name, ciphertext, created_at, updated_at, PRIMARY KEY(bot_id, name))`，使用 `pkg/secret.Seal`/`Reveal`（`enc:v1:...` AES-GCM 机器指纹派生密钥）落库。
-   - 录入入口：CLI `deepai-bot secret set <NAME> <VALUE> --bot <id>`、REST `PUT /v1/bots/{bot_id}/secrets/{name}`（仅 `admin`）、WS `set_secret`（仅 `admin`）、以及 IM 私聊 `/secret set <NAME> <VALUE>`（仅 `allow_users` 且禁止群聊，明文直接进 `SecretStore`，**永不写入会话消息历史或送入 LLM**）。
-   - 模型可见性：`AgentRuntime.RunTurn` 仅向 System Prompt 追加排好序的占位符清单（如 `{{secret:NOTION_TOKEN}}`），模型永远看不到真实密钥值。
+   - 录入入口：**推荐使用 CLI `deepai-bot secret set <NAME> <VALUE> --bot <id>`**、REST `PUT /v1/bots/{bot_id}/secrets/{name}`（仅 `admin`）或 WS `set_secret`（仅 `admin`）；手机端应急支持 IM 私聊 `/secret set <NAME> <VALUE>`（仅 `allow_users` 且禁止群聊，明文直接进 `SecretStore`、**永不写入会话消息历史或送入 LLM**，并自动尝试撤回平台侧源私聊消息及提示手动删除客户端残留）。
+   - 模型与 REST 配置卫生：`AgentRuntime.RunTurn` 仅向 System Prompt 追加排好序的占位符清单（如 `{{secret:NOTION_TOKEN}}`）；`POST/PATCH /v1/bots` 同样强制校验连接器敏感头/查询参数（如 `Authorization`、`X-API-Key`、`*token*`、`*secret*`）必须引用 `{{secret:NAME}}`，拒绝写入明文凭证或已存密钥原值（防 `GET /v1/bots/{id}` 回显泄露）。
 2. **受控 HTTP 请求工具 `http_request`（`pkg/bot/connectors.go`）**：
-   - 支持指定 `connector` 继承 `base_url`、默认 Header/Query 与 `allowed_hosts`，也可直接请求受控公网 URL。
-   - **宿主侧凭据注入与回显脱敏**：发起请求前由宿主将 URL/Header/Query/Body 中的 `{{secret:NAME}}` 展开为真实值；响应体与网络报错返回给模型前，自动将所有已展开密钥全文替换为 `[REDACTED:NAME]`。
-   - **安全防线**：携带密钥时强制 `https://` 并拒绝跨域名重定向（防凭据随 302 泄露）；继承 `pkg/netutil.EnvProxyFunc` 代理感知并在解析/拨号阶段拦截环回、私网、链路本地与云元数据地址（SSRF 防护）。
+   - 支持指定 `connector` 继承 `base_url`、默认 Header/Query 与 `allowed_hosts`（同一轮 `update_bot_persona` 新增的连接器立即可在同轮 `http_request` 中调用），也可在**不携带任何密钥**的前提下直接请求受控公网 URL。
+   - **宿主侧凭据绑定、注入与回显脱敏**：任何包含 `{{secret:NAME}}` 占位符的请求**必须显式指定已注册的 `connector`**（拒绝向未绑定白名单域名的任意公网地址展开凭据）；发起请求前由宿主展开真实值，响应体与网络报错返回给模型前全文替换为 `[REDACTED:NAME]`。
+   - **安全防线**：携带密钥时强制 `https://`、校验目标在 `connector.allowed_hosts` 内并拒绝跨域名重定向（防凭据随 302 泄露）；继承 `pkg/netutil.EnvProxyFunc` 代理感知并在解析/拨号阶段拦截环回、私网、链路本地与云元数据地址（SSRF 防护）。
 3. **对话式自训练工具（`pkg/bot/training.go`）**：
-   - `update_bot_persona`：在交互对话中更新当前 Bot 的 `instructions`、`isolated_prompt` 或增删改 `APIConnector`。
-   - `save_bot_skill`：将长篇第三方 API 规范或业务 SOP 写成专属 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`，下一轮立即出现在本 Bot 的 `skill` 工具枚举中。
-   - **自训练护栏**：`DisableSelfTrain=true` 时直接从本轮工具集移除上述两个工具；无人值守定时任务/Webhook 运行期间（`tools.IsScheduledRun(ctx)`）硬性拒绝调用；内容若包含该 Bot 已存密钥明文、`enc:v1:` 密文串、Prompt 注入特征或 `` !`command` `` 动态 Shell 块则直接拦截（防止通过自建技能绕过 `bash` 工具白名单）。
+   - `update_bot_persona`：通过 `Manager.MutateBot`（持 `botMu` 与 REST `PATCH` 严格串行化）更新当前 Bot 的 `instructions`、`isolated_prompt` 或增删改 `APIConnector`。
+   - `save_bot_skill`：将长篇第三方 API 规范或业务 SOP 写成专属 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`（`--ephemeral` 模式下使用进程级临时目录并在退出时自动清理），下一轮立即出现在本 Bot 的 `skill` 工具枚举中。
+   - **自训练护栏**：`DisableSelfTrain=true` 或 IM 渠道默认未开启 `allow_self_train: true`（即使开启也仅允许私聊 `allow_users`、群聊永久禁用）时直接从本轮工具集移除上述两个工具；无人值守定时任务/Webhook 运行期间（`tools.IsScheduledRun(ctx)`）硬性拒绝调用；`SecretStore` 查询异常时**失败关闭（fail-closed）**；内容若包含任意长度的已存密钥明文、`enc:v1:` 密文串、控制/零宽/Bidi/Unicode Tag 字符、结构化越界模式或 `` !`command` `` 动态 Shell 块则直接拦截。
 
 ---
 

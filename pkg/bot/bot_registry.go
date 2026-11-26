@@ -277,12 +277,76 @@ func validateBotExtensions(ext BotExtensions) error {
 		if strings.TrimSpace(c.BaseURL) == "" {
 			return fmt.Errorf("%w: connector %q base_url is required", ErrInvalidBot, name)
 		}
+		if secretPlaceholderRE.MatchString(c.BaseURL) {
+			return fmt.Errorf("%w: connector %q base_url must not contain '{{secret:...}}'; put credentials in headers or query_params", ErrInvalidBot, name)
+		}
 		u, err := url.Parse(strings.TrimSpace(c.BaseURL))
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 			return fmt.Errorf("%w: connector %q base_url must be a valid http(s) URL", ErrInvalidBot, name)
 		}
+		if u.User != nil {
+			return fmt.Errorf("%w: connector %q base_url must not embed userinfo credentials; use '{{secret:NAME}}'", ErrInvalidBot, name)
+		}
 		if c.TimeoutSec < 0 || c.TimeoutSec > 300 {
 			return fmt.Errorf("%w: connector %q timeout_sec must be between 0 and 300", ErrInvalidBot, name)
+		}
+		for hk, hv := range c.Headers {
+			if err := validateConnectorParamSecretHygiene(name, "header", hk, hv); err != nil {
+				return err
+			}
+		}
+		for qk, qv := range c.QueryParams {
+			if err := validateConnectorParamSecretHygiene(name, "query_param", qk, qv); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+var (
+	authSchemeOnlyRE       = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,23}$`)
+	knownSecretTokenPrefix = regexp.MustCompile(`(?i)(^|[\s=:,"'])(sk-[A-Za-z0-9_-]{6,}|rk-[A-Za-z0-9_-]{6,}|pk_(live|test)_[A-Za-z0-9]{6,}|gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|glpat-[A-Za-z0-9_-]{6,}|xox[baprs]-[A-Za-z0-9-]{6,}|ntn_[A-Za-z0-9]{6,}|AKIA[0-9A-Z]{12,}|AIza[0-9A-Za-z_-]{16,})`)
+)
+
+func isSensitiveCredentialKey(k string) bool {
+	lower := strings.ToLower(strings.TrimSpace(k))
+	switch lower {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie":
+		return true
+	}
+	for _, sub := range []string{
+		"api-key", "apikey", "api_key",
+		"secret", "token", "password", "passwd",
+		"access-key", "access_key", "private-key", "private_key",
+		"client-secret", "client_secret", "service-key", "service_key", "app_key", "app-key",
+	} {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateConnectorParamSecretHygiene(connName, kind, key, val string) error {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return nil
+	}
+	if strings.Contains(trimmed, "enc:v1:") {
+		return fmt.Errorf("%w: connector %q %s %q must use '{{secret:NAME}}' instead of sealed ciphertext", ErrInvalidBot, connName, kind, key)
+	}
+	hasPlaceholder := secretPlaceholderRE.MatchString(trimmed)
+	rem := strings.TrimSpace(secretPlaceholderRE.ReplaceAllString(trimmed, ""))
+	if knownSecretTokenPrefix.MatchString(rem) {
+		return fmt.Errorf("%w: connector %q %s %q appears to contain a plaintext credential; store it in bot secrets and reference '{{secret:NAME}}'", ErrInvalidBot, connName, kind, key)
+	}
+	if isSensitiveCredentialKey(key) {
+		if !hasPlaceholder {
+			return fmt.Errorf("%w: connector %q sensitive %s %q must reference '{{secret:NAME}}' instead of a plaintext value", ErrInvalidBot, connName, kind, key)
+		}
+		if rem != "" && !authSchemeOnlyRE.MatchString(rem) {
+			return fmt.Errorf("%w: connector %q sensitive %s %q contains literal text alongside '{{secret:NAME}}'; keep only an auth scheme prefix (e.g. 'Bearer {{secret:NAME}}')", ErrInvalidBot, connName, kind, key)
 		}
 	}
 	return nil
