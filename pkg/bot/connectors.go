@@ -198,41 +198,8 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	// Secret expansion table collected during this call so any echoed secret is
 	// scrubbed from responses and error strings before reaching the model.
 	resolvedSecrets := map[string]string{}
-	expandSecrets := func(s string) (string, error) {
-		if !strings.Contains(s, "{{secret:") {
-			return s, nil
-		}
-		if conn == nil {
-			return "", errors.New("referencing '{{secret:NAME}}' requires specifying a configured 'connector'")
-		}
-		if env.secrets == nil {
-			return "", errors.New("secret store is not configured on this runtime")
-		}
-		var firstErr error
-		expanded := secretPlaceholderRE.ReplaceAllStringFunc(s, func(match string) string {
-			if firstErr != nil {
-				return match
-			}
-			sub := secretPlaceholderRE.FindStringSubmatch(match)
-			if len(sub) < 2 {
-				return match
-			}
-			secName := sub[1]
-			if val, cached := resolvedSecrets[secName]; cached {
-				return val
-			}
-			val, err := env.secrets.GetSecret(ctx, botID, secName)
-			if err != nil {
-				firstErr = err
-				return match
-			}
-			resolvedSecrets[secName] = val
-			return val
-		})
-		if firstErr != nil {
-			return "", firstErr
-		}
-		return expanded, nil
+	expand := func(s string) (string, error) {
+		return expandSecrets(ctx, env, conn, nil, s, resolvedSecrets)
 	}
 	redact := func(s string) string {
 		if len(resolvedSecrets) == 0 || s == "" {
@@ -255,7 +222,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	}
 
 	// Build target URL (resolving against connector BaseURL when relative).
-	expandedURL, err := expandSecrets(rawURL)
+	expandedURL, err := expand(rawURL)
 	if err != nil {
 		return fail(err)
 	}
@@ -279,7 +246,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	if len(mergedQuery) > 0 {
 		q := targetURL.Query()
 		for k, rawV := range mergedQuery {
-			ev, err := expandSecrets(rawV)
+			ev, err := expand(rawV)
 			if err != nil {
 				return fail(err)
 			}
@@ -303,7 +270,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 	finalHeaders := http.Header{}
 	finalHeaders.Set("User-Agent", "deepai-bot/1.0")
 	for k, rawV := range mergedHeaders {
-		ev, err := expandSecrets(rawV)
+		ev, err := expand(rawV)
 		if err != nil {
 			return fail(err)
 		}
@@ -317,7 +284,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 		if err != nil {
 			return fail(fmt.Errorf("marshal json_body: %w", err))
 		}
-		expandedBody, err := expandSecrets(string(rawJSON))
+		expandedBody, err := expand(string(rawJSON))
 		if err != nil {
 			return fail(err)
 		}
@@ -326,7 +293,7 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 			finalHeaders.Set("Content-Type", "application/json")
 		}
 	} else if rb, ok := call.Arguments["body"].(string); ok && rb != "" {
-		expandedBody, err := expandSecrets(rb)
+		expandedBody, err := expand(rb)
 		if err != nil {
 			return fail(err)
 		}
@@ -403,6 +370,44 @@ func handleHTTPRequestTool(ctx context.Context, call models.ToolCall) (models.To
 		Status:   models.CallStatusCompleted,
 		Content:  string(encoded),
 	}, nil
+}
+
+func expandSecrets(ctx context.Context, env botTurnEnv, conn *APIConnector, allowedHosts []string, s string, resolvedSecrets map[string]string) (string, error) {
+	if !strings.Contains(s, "{{secret:") {
+		return s, nil
+	}
+	if conn == nil && len(allowedHosts) == 0 {
+		return "", errors.New("referencing '{{secret:NAME}}' requires specifying a configured 'connector'")
+	}
+	if env.secrets == nil {
+		return "", errors.New("secret store is not configured on this runtime")
+	}
+	botID := effectiveBotID(env.botID)
+	var firstErr error
+	expanded := secretPlaceholderRE.ReplaceAllStringFunc(s, func(match string) string {
+		if firstErr != nil {
+			return match
+		}
+		sub := secretPlaceholderRE.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		secName := sub[1]
+		if val, cached := resolvedSecrets[secName]; cached {
+			return val
+		}
+		val, err := env.secrets.GetSecret(ctx, botID, secName)
+		if err != nil {
+			firstErr = err
+			return match
+		}
+		resolvedSecrets[secName] = val
+		return val
+	})
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return expanded, nil
 }
 
 func buildConnectorTargetURL(expandedURL string, conn *APIConnector) (*url.URL, []string, error) {

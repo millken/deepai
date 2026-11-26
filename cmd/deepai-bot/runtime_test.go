@@ -49,6 +49,7 @@ func TestBuildModelRegistryOverride(t *testing.T) {
 func TestNewBotRuntimeEphemeralProvidesTempBotDataDirAndCleansUp(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("OPENAI_API_KEY", "test-key")
 	cfgDir := filepath.Join(home, ".deepai")
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -58,7 +59,7 @@ func TestNewBotRuntimeEphemeralProvidesTempBotDataDirAndCleansUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rt, err := newBotRuntime(runtimeOptions{
+	rt, err := newBotRuntime(context.Background(), botOptions{
 		WorkDir:   t.TempDir(),
 		Ephemeral: true,
 	})
@@ -72,7 +73,7 @@ func TestNewBotRuntimeEphemeralProvidesTempBotDataDirAndCleansUp(t *testing.T) {
 		t.Fatalf("ephemeral BotDataDir %q does not exist: %v", rt.BotDataDir, statErr)
 	}
 	dir := rt.BotDataDir
-	rt.Close(context.Background())
+	rt.Close()
 	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
 		t.Fatalf("ephemeral BotDataDir %q was not cleaned up on Close: %v", dir, statErr)
 	}

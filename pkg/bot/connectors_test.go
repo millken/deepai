@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -214,7 +213,7 @@ func TestHTTPRequestRejectsSecretsWithoutNamedConnector(t *testing.T) {
 				Name:      "http_request",
 				Arguments: tc.args,
 			})
-			if err == nil || res.Status != models.CallStatusFailed || !strings.Contains(err.Error(), "requires a named connector") {
+			if err == nil || res.Status != models.CallStatusFailed || !strings.Contains(err.Error(), "requires specifying a configured 'connector'") {
 				t.Fatalf("expected named-connector enforcement error, got res=%+v err=%v", res, err)
 			}
 		})
@@ -230,7 +229,7 @@ func TestHTTPRequestRejectsSecretsWithoutNamedConnector(t *testing.T) {
 	if _, err := expandSecrets(ctx, botTurnEnv{botID: "finbot", secrets: spy}, nil, nil, "{{secret:FIN_HDR}}", map[string]string{}); err == nil {
 		t.Fatal("expected expandSecrets without connector/allowedHosts to fail")
 	}
-	if err := validateOutboundHostWithSecrets("example.com", nil, true, true); !errors.Is(err, err) || err == nil {
+	if err := validateOutboundHostWithSecrets("example.com", nil, true, true); err == nil {
 		t.Fatal("expected validateOutboundHostWithSecrets with empty allowlist and hasSecrets=true to fail")
 	}
 }
