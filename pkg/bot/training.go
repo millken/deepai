@@ -21,6 +21,9 @@ import (
 const maxBotSkillBytes = 64 << 10
 
 var (
+	ErrBotSkillNotFound = errors.New("bot skill not found")
+	ErrInvalidBotSkill  = errors.New("invalid bot skill name")
+
 	botSkillNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
 	skillInjectionREs   = []*regexp.Regexp{
 		regexp.MustCompile(`(?is)\b(ignore|disregard|forget|override|bypass|disable)\b[^\n]{0,60}\b(previous|prior|above|all|earlier|system|developer|safety|security|existing)\s+(instructions?|rules?|prompts?|constraints?|guardrails?|policies|guidelines?)`),
@@ -456,4 +459,106 @@ func botSkillsDir(botDataDir, botID string) string {
 		return ""
 	}
 	return filepath.Join(base, effectiveBotID(botID), "skills")
+}
+
+// BotSkillInfo describes one bot-exclusive skill stored under
+// ~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md.
+type BotSkillInfo struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Content     string    `json:"content,omitempty"`
+	Size        int64     `json:"size"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func parseBotSkillMarkdown(raw string) (desc, body string) {
+	text := strings.ReplaceAll(raw, "\r\n", "\n")
+	if !strings.HasPrefix(text, "---\n") {
+		return "", strings.TrimSpace(text)
+	}
+	rest := text[4:]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		return "", strings.TrimSpace(text)
+	}
+	fm := rest[:end]
+	body = strings.TrimSpace(rest[end+5:])
+	for _, line := range strings.Split(fm, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(k) == "description" {
+			v = strings.TrimSpace(v)
+			var unq string
+			if err := json.Unmarshal([]byte(v), &unq); err == nil {
+				desc = unq
+			} else {
+				desc = strings.Trim(v, `"'`)
+			}
+		}
+	}
+	return desc, body
+}
+
+func listBotSkillsOnDisk(botDataDir, botID string) ([]BotSkillInfo, error) {
+	dir := botSkillsDir(botDataDir, botID)
+	if dir == "" {
+		return []BotSkillInfo{}, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []BotSkillInfo{}, nil
+		}
+		return nil, fmt.Errorf("read bot skills dir: %w", err)
+	}
+	out := make([]BotSkillInfo, 0, len(entries))
+	for _, ent := range entries {
+		name := ent.Name()
+		if !ent.IsDir() || !botSkillNamePattern.MatchString(name) {
+			continue
+		}
+		skillPath := filepath.Join(dir, name, "SKILL.md")
+		st, err := os.Lstat(skillPath)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		raw, err := os.ReadFile(skillPath)
+		if err != nil {
+			continue
+		}
+		desc, body := parseBotSkillMarkdown(string(raw))
+		out = append(out, BotSkillInfo{
+			Name:        name,
+			Description: desc,
+			Content:     body,
+			Size:        st.Size(),
+			UpdatedAt:   st.ModTime().UTC(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func deleteBotSkillOnDisk(botDataDir, botID, name string) error {
+	name = strings.TrimSpace(name)
+	if !botSkillNamePattern.MatchString(name) {
+		return fmt.Errorf("%w: %q", ErrInvalidBotSkill, name)
+	}
+	dir := botSkillsDir(botDataDir, botID)
+	if dir == "" {
+		return fmt.Errorf("%w: %s", ErrBotSkillNotFound, name)
+	}
+	target := filepath.Join(dir, name)
+	if !isUnderRoot(target, dir) {
+		return fmt.Errorf("%w: %q", ErrInvalidBotSkill, name)
+	}
+	if _, err := os.Lstat(target); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %s", ErrBotSkillNotFound, name)
+		}
+		return err
+	}
+	return os.RemoveAll(target)
 }

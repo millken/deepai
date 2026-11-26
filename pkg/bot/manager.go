@@ -266,7 +266,7 @@ func (m *Manager) Info() Info {
 		info.WorkDir = m.opts.WorkDir
 	}
 	info.DefaultBotID = DefaultBotID
-	if bots, err := m.bots.ListBots(context.Background()); err == nil {
+	if bots, err := m.ListBots(context.Background()); err == nil {
 		info.Bots = bots
 	}
 	info.StartedAt = m.startedAt
@@ -689,6 +689,41 @@ func (m *Manager) DeleteSecret(ctx context.Context, botID, name string) error {
 	return m.secrets.DeleteSecret(ctx, botID, name)
 }
 
+// ListBotSkills lists bot-exclusive skills persisted under BotDataDir/<bot_id>/skills.
+func (m *Manager) ListBotSkills(ctx context.Context, botID string) ([]BotSkillInfo, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return nil, err
+	}
+	return listBotSkillsOnDisk(m.opts.BotDataDir, botID)
+}
+
+// DeleteBotSkill removes one bot-exclusive skill directory for botID.
+func (m *Manager) DeleteBotSkill(ctx context.Context, botID, name string) error {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return err
+	}
+	return deleteBotSkillOnDisk(m.opts.BotDataDir, botID, name)
+}
+
+func (m *Manager) botDisplayName(botID string) string {
+	if b, err := m.bots.GetBot(context.Background(), effectiveBotID(botID)); err == nil && b.Name != "" {
+		return b.Name
+	}
+	return ""
+}
+
+func (m *Manager) sessionInfoWithBotName(s *session, botName string) SessionInfo {
+	info := s.info()
+	if botName != "" {
+		info.BotName = botName
+	} else {
+		info.BotName = m.botDisplayName(s.botID)
+	}
+	return info
+}
+
 // CreateSession creates and loads a new session for the default bot.
 func (m *Manager) CreateSession(req CreateSessionRequest) (SessionInfo, error) {
 	return m.CreateSessionForBot(DefaultBotID, req)
@@ -768,7 +803,7 @@ func (m *Manager) CreateSessionForBot(botID string, req CreateSessionRequest) (S
 	m.sessions[s.id] = s
 	m.mu.Unlock()
 
-	info := s.info()
+	info := m.sessionInfoWithBotName(s, profile.Name)
 	m.global.publish(Event{BotID: effectiveBotID(s.botID), SessionID: s.id, Type: EventSessionCreated, Session: &info})
 	return info, nil
 }
@@ -781,16 +816,14 @@ func (m *Manager) ListSessions(limit int) ([]SessionInfo, error) {
 // ListSessionsForBot merges the store's recent sessions for botID with live state.
 func (m *Manager) ListSessionsForBot(botID string, limit int) ([]SessionInfo, error) {
 	botID = effectiveBotID(botID)
-	if _, err := m.bots.GetBot(context.Background(), botID); err != nil {
+	profile, err := m.bots.GetBot(context.Background(), botID)
+	if err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	var (
-		metas []models.SessionMeta
-		err   error
-	)
+	var metas []models.SessionMeta
 	if bs, ok := m.opts.Store.(BotStore); ok {
 		metas, err = bs.ListRecentForBot(botID, m.opts.WorkDir, limit)
 	} else {
@@ -805,11 +838,11 @@ func (m *Manager) ListSessionsForBot(botID string, limit int) ([]SessionInfo, er
 		s := m.sessions[meta.ID]
 		m.mu.Unlock()
 		if s != nil {
-			out = append(out, s.info())
+			out = append(out, m.sessionInfoWithBotName(s, profile.Name))
 			continue
 		}
 		out = append(out, SessionInfo{
-			ID: meta.ID, BotID: botID, Title: meta.Title, Status: SessionIdle, MsgCount: meta.MsgCount,
+			ID: meta.ID, BotID: botID, BotName: profile.Name, Title: meta.Title, Status: SessionIdle, MsgCount: meta.MsgCount,
 			CreatedAt: meta.CreatedAt, UpdatedAt: meta.UpdatedAt,
 		})
 	}
@@ -830,7 +863,7 @@ func (m *Manager) GetSessionForBot(botID, id string) (SessionInfo, []models.Mess
 	s.mu.Lock()
 	msgs := append(make([]models.Message, 0, len(s.messages)), s.messages...)
 	s.mu.Unlock()
-	return s.info(), msgs, nil
+	return m.sessionInfoWithBotName(s, ""), msgs, nil
 }
 
 // RenameSession sets a default-bot session's title.
@@ -851,7 +884,7 @@ func (m *Manager) RenameSessionForBot(botID, id, title string) (SessionInfo, err
 	s.mu.Lock()
 	s.title = title
 	s.mu.Unlock()
-	return s.info(), nil
+	return m.sessionInfoWithBotName(s, ""), nil
 }
 
 // DeleteSession removes an idle default-bot session from the store.

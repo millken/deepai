@@ -168,6 +168,9 @@ func (o *scheduleObserver) RunChanged(run schedule.Run) {
 		typ = EventScheduleRunStarted
 	}
 	o.m.global.publish(Event{BotID: effectiveBotID(botID), Type: typ, Run: &run, Time: time.Now().UTC()})
+	if typ == EventScheduleRunStarted && run.Trigger == schedule.FireTimer && run.StartedAt != nil && !run.ScheduledFor.IsZero() {
+		o.m.metrics.ObserveScheduleLag(run.StartedAt.Sub(run.ScheduledFor))
+	}
 	if run.Status.Terminal() {
 		o.m.auditLogger().Record(AuditEntry{
 			Action:  "schedule_run_end",

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Metrics tracks Prometheus-compatible counters and gauges for deepai-bot
@@ -19,6 +20,8 @@ type Metrics struct {
 	tokensTotal       map[[3]string]int64   // {bot_id, model, kind}
 	toolCallsTotal    map[[3]string]int64   // {bot_id, tool, status}
 	scheduleRunsTotal map[[3]string]int64   // {bot_id, trigger, status}
+	scheduleLagSum    float64
+	scheduleLagCount  int64
 }
 
 func NewMetrics() *Metrics {
@@ -74,6 +77,22 @@ func (m *Metrics) ObserveScheduleRun(botID, trigger, status string) {
 	}
 	m.mu.Lock()
 	m.scheduleRunsTotal[[3]string{effectiveBotID(botID), trigger, status}]++
+	m.mu.Unlock()
+}
+
+// ObserveScheduleLag records the delay between a timer run's scheduled slot
+// and its actual start time.
+func (m *Metrics) ObserveScheduleLag(lag time.Duration) {
+	if m == nil {
+		return
+	}
+	sec := lag.Seconds()
+	if sec < 0 {
+		sec = 0
+	}
+	m.mu.Lock()
+	m.scheduleLagSum += sec
+	m.scheduleLagCount++
 	m.mu.Unlock()
 }
 
@@ -141,6 +160,11 @@ func (m *Metrics) WritePrometheus(w http.ResponseWriter, mgr *Manager) {
 	for _, k := range sortedKeys3(m.scheduleRunsTotal) {
 		fmt.Fprintf(&b, "deepai_bot_schedule_runs_total{bot_id=%q,trigger=%q,status=%q} %d\n", k[0], k[1], k[2], m.scheduleRunsTotal[k])
 	}
+
+	b.WriteString("# HELP deepai_bot_schedule_lag_seconds Delay between scheduled slot and actual run start.\n")
+	b.WriteString("# TYPE deepai_bot_schedule_lag_seconds summary\n")
+	fmt.Fprintf(&b, "deepai_bot_schedule_lag_seconds_sum %.6f\n", m.scheduleLagSum)
+	fmt.Fprintf(&b, "deepai_bot_schedule_lag_seconds_count %d\n", m.scheduleLagCount)
 	m.mu.Unlock()
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

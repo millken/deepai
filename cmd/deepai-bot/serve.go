@@ -36,6 +36,7 @@ type serveFlags struct {
 	idleTimeout  time.Duration
 	verbose      bool
 	noSchedule   bool
+	metricsAddr  string
 }
 
 func newRootCmd() *cobra.Command {
@@ -93,6 +94,7 @@ func registerServeFlags(cmd *cobra.Command, f *serveFlags) {
 	fl.DurationVar(&f.turnTimeout, "turn-timeout", 0, "Abort a turn after this long (0 = no limit)")
 	fl.DurationVar(&f.idleTimeout, "idle-timeout", 30*time.Minute, "Unload a session after this long without activity")
 	fl.BoolVar(&f.noSchedule, "no-schedule", false, "Disable timed tasks (do not register the schedule tool or start the scheduler)")
+	fl.StringVar(&f.metricsAddr, "metrics-addr", "", "Optional dedicated address for Prometheus /metrics (e.g. 127.0.0.1:9090)")
 	fl.BoolVarP(&f.verbose, "verbose", "v", false, "Debug logging")
 }
 
@@ -225,6 +227,26 @@ func runServe(ctx context.Context, f serveFlags) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
+	var metricsSrv *http.Server
+	if mAddr := strings.TrimSpace(f.metricsAddr); mAddr != "" {
+		mLn, mErr := net.Listen("tcp", mAddr)
+		if mErr != nil {
+			slog.Warn("listen metrics-addr failed", "addr", mAddr, "err", mErr)
+		} else {
+			mMux := http.NewServeMux()
+			mMux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+				mgr.Metrics().WritePrometheus(w, mgr)
+			})
+			metricsSrv = &http.Server{Handler: mMux, ReadHeaderTimeout: 5 * time.Second}
+			slog.Info("deepai-bot metrics listening", "metrics_addr", mLn.Addr().String())
+			go func() {
+				if err := metricsSrv.Serve(mLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					slog.Warn("metrics server stopped", "err", err)
+				}
+			}()
+		}
+	}
+
 	slog.Info("deepai-bot listening", "addr", addr, "workdir", rt.WorkDir, "db", rt.DB,
 		"auth", token != "", "web", !f.noWeb, "schedule", rt.Schedule != nil)
 	if !f.noWeb {
@@ -252,6 +274,9 @@ func runServe(ctx context.Context, f serveFlags) error {
 		sctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(sctx)
+		}
 	}()
 	// Stop accepting new fires & IM messages before cancelling turns, then let
 	// turn_end callbacks write their final Run states before db.Close.

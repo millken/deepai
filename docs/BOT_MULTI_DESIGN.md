@@ -1,7 +1,7 @@
 # DeepAI Bot 多 Bot 管理与多 Workdir 调度隔离设计（v2）
 
 > 状态：已落地（含 M1 多 Bot 隔离与 M6 对话式自训练 + 第三方业务 API 连接器）  
-> 基线：`feat/bot-m5-channels-governance`  
+> 基线：`main`  
 > 相关文档：[`BOT_DESIGN.md`](BOT_DESIGN.md)、[`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)、[`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md)
 
 ---
@@ -254,6 +254,8 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 | `GET` | `/v1/bots/{bot_id}/secrets` | 列出该 Bot 已配置的密钥元数据列表（仅返回 `name`/`created_at`/`updated_at`，永不返回密文或明文） |
 | `PUT` | `/v1/bots/{bot_id}/secrets/{name}` | 创建或更新单个加密密钥 `{"value":"..."}`（仅 `admin` 令牌可调用） |
 | `DELETE` | `/v1/bots/{bot_id}/secrets/{name}` | 删除单个密钥（仅 `admin` 令牌可调用） |
+| `GET` | `/v1/bots/{bot_id}/skills` | 列出该 Bot 已沉淀的专属技能（`name`/`description`/`content`/`size`/`updated_at`） |
+| `DELETE` | `/v1/bots/{bot_id}/skills/{name}` | 删除单个 Bot 专属技能目录（仅 `admin` 令牌可调用） |
 
 ### 5.2 Bot 删除策略（含跨进程安全保护）
 
@@ -285,9 +287,9 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 - 全局事件总线（`subscribe "*"`）新增：
   - `bot_created` / `bot_updated` / `bot_deleted`（载荷 `bot`）；
   - `subscribe` 支持可选过滤：`{"op":"subscribe","session_id":"*","bot_id":"reviewer","since":0}`（空表示全部 bot）。
-- WS 控制帧新增 ops：`list_bots`、`get_bot`、`create_bot`、`update_bot`、`delete_bot`、`list_secrets`、`set_secret`、`delete_secret`；现有 `list_sessions` / `create_session` / `list_schedules` / `create_schedule` 支持可选 `bot_id`（省略 = `"default"`）。
+- WS 控制帧新增 ops：`list_bots`、`get_bot`、`create_bot`、`update_bot`、`delete_bot`、`list_secrets`、`set_secret`、`delete_secret`、`list_bot_skills`、`delete_bot_skill`；现有 `list_sessions` / `create_session` / `list_schedules` / `create_schedule` 支持可选 `bot_id`（省略 = `"default"`）。
 
-错误码新增：`unknown_bot`（404）、`bot_disabled`（403）、`bot_has_sessions`（409）、`unknown_tool`（400）、`secret_not_found`（404）。
+错误码新增：`unknown_bot`（404）、`bot_disabled`（403）、`bot_has_sessions`（409）、`unknown_tool`（400）、`secret_not_found`（404）、`skill_not_found`（404）。
 
 ---
 
@@ -302,29 +304,30 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 func (r *Registry) Subset(allowlist []string) *Registry
 ```
 
-### 6.2 `pkg/bot/bot_registry.go`（新增）
+### 6.2 `pkg/bot/bot_registry.go`
 
 ```go
 type BotProfile struct {
-    ID            string    `json:"id"`
-    Name          string    `json:"name"`
-    Title         string    `json:"title,omitempty"`
-    Description   string    `json:"description,omitempty"`
-    Instructions  string    `json:"instructions,omitempty"`
-    DefaultModel  string    `json:"default_model,omitempty"`
-    ToolAllowlist []string  `json:"tool_allowlist,omitempty"`
-    Enabled       bool      `json:"enabled"`
-    CreatedAt     time.Time `json:"created_at"`
-    UpdatedAt     time.Time `json:"updated_at"`
+    ID            string        `json:"id"`
+    Name          string        `json:"name"`
+    Title         string        `json:"title,omitempty"`
+    Description   string        `json:"description,omitempty"`
+    Instructions  string        `json:"instructions,omitempty"`
+    DefaultModel  string        `json:"default_model,omitempty"`
+    ToolAllowlist []string      `json:"tool_allowlist,omitempty"`
+    Enabled       bool          `json:"enabled"`
+    Extensions    BotExtensions `json:"extensions,omitempty"`
+    CreatedAt     time.Time     `json:"created_at"`
+    UpdatedAt     time.Time     `json:"updated_at"`
 }
 
 type BotRegistry interface {
     EnsureDefault(ctx context.Context) error
-    List(ctx context.Context) ([]BotProfile, error)
-    Get(ctx context.Context, id string) (BotProfile, error)
-    Create(ctx context.Context, b BotProfile) (BotProfile, error)
-    Update(ctx context.Context, b BotProfile) (BotProfile, error)
-    Delete(ctx context.Context, id string) error
+    ListBots(ctx context.Context) ([]BotProfile, error)
+    GetBot(ctx context.Context, id string) (BotProfile, error)
+    CreateBot(ctx context.Context, b BotProfile) (BotProfile, error)
+    UpdateBot(ctx context.Context, b BotProfile) (BotProfile, error)
+    DeleteBot(ctx context.Context, id string) error
 }
 ```
 
@@ -338,9 +341,12 @@ type BotRegistry interface {
 type TurnInput struct {
     // ... 现有字段保持不变 ...
     BotID             string
-    SystemPromptExtra string   // BotProfile.Instructions
-    MemoryUserID      string   // "bot:" + BotID；空则回退 DefaultMemoryUserID
-    ToolAllowlist     []string // 空则全量；非空则 cfg.Tools.Subset(...)
+    SystemPromptExtra string        // BotProfile.Instructions
+    MemoryUserID      string        // "bot:" + BotID；空则回退 DefaultMemoryUserID
+    BotToolAllowlist  []string      // Bot 级白名单
+    ToolAllowlist     []string      // 单任务白名单（与 Bot 级取交集）
+    BotExtensions     BotExtensions // IsolatedPrompt / DisableSelfTrain / Connectors
+    DisableSelfTrain  bool          // 渠道级禁用自训练覆盖
 }
 ```
 
@@ -366,7 +372,8 @@ type TurnInput struct {
 
 ## 7. Web 控制台交互（`pkg/bot/web/index.html`）
 
-- 侧栏顶部增加 **Bot 切换器**（下拉/胶囊列表，显示名称与停用状态灰标）+ 「管理 Bot」弹窗（新建 / 编辑 `instructions`、`default_model`、`tool_allowlist` / 启用停用 / 强制删除二次确认）；
+- 侧栏顶部增加 **Bot 切换器**（下拉列表，显示名称与停用状态标记）+ 「管理 Bot」弹窗（新建 / 编辑 `description`、`instructions`、`default_model`、`tool_allowlist`、`extensions`（`isolated_prompt`、`disable_self_train`、`connectors`） / 启用停用 / 强制删除二次确认）；
+- 编辑已有 Bot 时联动展示 **加密密钥管理（Secrets）**（调用 WS `list_secrets` / `set_secret` / `delete_secret`，永不回显明文）与 **专属技能管理（Bot Skills）**（调用 WS `list_bot_skills` / `delete_bot_skill`，支持展开预览与单个删除）；
 - 切换 Bot 后，左侧「会话」与「任务」页签自动过滤到当前 Bot，新建会话/任务默认归属当前 Bot；
 - 全局事件订阅接收 `bot_created` / `bot_updated` / `bot_deleted` 实时刷新列表。
 
