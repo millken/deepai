@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +45,12 @@ type Options struct {
 	// Bots persists multi-bot personas (optional; defaults to Store when it
 	// implements BotRegistry, else an in-memory registry with "default").
 	Bots BotRegistry
+	// Secrets persists machine-sealed per-bot credentials for {{secret:NAME}}
+	// placeholders (optional; defaults to an in-memory store).
+	Secrets SecretStore
+	// BotDataDir is the root directory for per-bot state on disk (e.g.
+	// ~/.deepai/bot/bots/<bot_id>/skills/); cleaned up on DeleteBot.
+	BotDataDir string
 	// WorkDir is recorded on created sessions (the store's cwd column) and
 	// scopes the Manager to them: sessions from other directories are
 	// neither listed nor opened (ErrNotFound). Empty disables scoping.
@@ -69,6 +77,7 @@ type Options struct {
 type Manager struct {
 	opts      Options
 	bots      BotRegistry
+	secrets   SecretStore
 	schedules *schedule.Service
 	log       *slog.Logger
 	owner     models.LockOwner
@@ -114,17 +123,18 @@ type session struct {
 }
 
 type activeTurn struct {
-	id            string
-	cancel        context.CancelFunc
-	clock         *turnClock
-	hooks         turnHooks
-	maxToolCalls  int
-	botProfile    BotProfile
-	toolAllowlist []string
-	steer         *steerBuffer
-	done          chan struct{}
-	summary       *TurnSummary
-	questions     map[string]*pendingQuestion
+	id               string
+	cancel           context.CancelFunc
+	clock            *turnClock
+	hooks            turnHooks
+	maxToolCalls     int
+	botProfile       BotProfile
+	toolAllowlist    []string
+	disableSelfTrain bool
+	steer            *steerBuffer
+	done             chan struct{}
+	summary          *TurnSummary
+	questions        map[string]*pendingQuestion
 }
 
 type pendingQuestion struct {
@@ -151,6 +161,10 @@ func NewManager(opts Options) (*Manager, error) {
 	if err := bots.EnsureDefault(context.Background()); err != nil {
 		return nil, fmt.Errorf("bot: ensure default bot: %w", err)
 	}
+	secrets := opts.Secrets
+	if secrets == nil {
+		secrets = NewMemorySecretStore()
+	}
 	if opts.IdleTimeout == 0 {
 		opts.IdleTimeout = 30 * time.Minute
 	}
@@ -163,13 +177,14 @@ func NewManager(opts Options) (*Manager, error) {
 	m := &Manager{
 		opts:      opts,
 		bots:      bots,
+		secrets:   secrets,
 		log:       log,
 		owner:     models.LockOwner{PID: os.Getpid(), Host: host},
 		startedAt: time.Now().UTC(),
 		baseCtx:   ctx,
 		// The cause propagates to every turn's context, so turn_end can
 		// report cancel_source=shutdown (design §3.2).
-		cancelAll: func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
+		cancelAll:    func() { cancel(turnStopCause{source: string(cancelSourceShutdown), err: context.Canceled}) },
 		global:       newBus(opts.ReplayEvents),
 		sessions:     map[string]*session{},
 		seqFloor:     map[string]int64{},
@@ -178,10 +193,20 @@ func NewManager(opts Options) (*Manager, error) {
 		stopJan:      make(chan struct{}),
 		metrics:      NewMetrics(),
 	}
+	if ar, ok := opts.Runtime.(*AgentRuntime); ok {
+		ar.BindGovernance(m.bots, m.secrets, nil, m.NotifyBotUpdated, m.MutateBot)
+	}
 	if opts.IdleTimeout > 0 {
 		go m.janitor()
 	}
 	return m, nil
+}
+
+// NotifyBotUpdated broadcasts a bot_updated lifecycle event when an in-turn
+// self-training tool mutates a BotProfile directly via BotRegistry.
+func (m *Manager) NotifyBotUpdated(b BotProfile) {
+	cp := b.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
 }
 
 // SetSchedules attaches the optional schedule.Service so ListBots and
@@ -195,6 +220,9 @@ func (m *Manager) SetAudit(a *AuditLogger) {
 	m.mu.Lock()
 	m.audit = a
 	m.mu.Unlock()
+	if ar, ok := m.opts.Runtime.(*AgentRuntime); ok {
+		ar.BindGovernance(m.bots, m.secrets, a, m.NotifyBotUpdated, m.MutateBot)
+	}
 }
 
 func (m *Manager) auditLogger() *AuditLogger {
@@ -307,6 +335,10 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 		enabled = *req.Enabled
 	}
 	now := time.Now().UTC()
+	var ext BotExtensions
+	if req.Extensions != nil {
+		ext = normalizeBotExtensions(*req.Extensions)
+	}
 	b := BotProfile{
 		ID:            strings.TrimSpace(req.ID),
 		Name:          strings.TrimSpace(req.Name),
@@ -316,10 +348,11 @@ func (m *Manager) CreateBot(ctx context.Context, req CreateBotRequest) (BotProfi
 		DefaultModel:  strings.TrimSpace(req.DefaultModel),
 		ToolAllowlist: normalizeToolAllowlist(req.ToolAllowlist),
 		Enabled:       enabled,
+		Extensions:    ext,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := m.validateBotConfig(b, true); err != nil {
+	if err := m.validateBotConfigWithSecrets(ctx, b, true); err != nil {
 		return BotProfile{}, err
 	}
 	created, err := m.bots.CreateBot(ctx, b)
@@ -361,8 +394,11 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	if req.Enabled != nil {
 		cur.Enabled = *req.Enabled
 	}
+	if req.Extensions != nil {
+		cur.Extensions = normalizeBotExtensions(*req.Extensions)
+	}
 	cur.UpdatedAt = time.Now().UTC()
-	if err := m.validateBotConfig(cur, false); err != nil {
+	if err := m.validateBotConfigWithSecrets(ctx, cur, false); err != nil {
 		return BotProfile{}, err
 	}
 	updated, err := m.bots.UpdateBot(ctx, cur)
@@ -374,6 +410,38 @@ func (m *Manager) UpdateBot(ctx context.Context, id string, req UpdateBotRequest
 	if !wasEnabled && updated.Enabled {
 		m.wakeQueuedForBot(updated.ID)
 	}
+	return updated, nil
+}
+
+// MutateBot applies an atomic read-modify-write mutation to a bot profile under
+// m.botMu so in-turn update_bot_persona calls serialize cleanly with REST/WS
+// UpdateBot and DeleteBot without lost updates.
+func (m *Manager) MutateBot(ctx context.Context, id string, mutate func(*BotProfile) ([]string, error)) (BotProfile, error) {
+	m.botMu.Lock()
+	defer m.botMu.Unlock()
+	id = effectiveBotID(id)
+	if m.IsBotDeleting(id) {
+		return BotProfile{}, fmt.Errorf("%w: %s", ErrBotDisabled, id)
+	}
+	cur, err := m.bots.GetBot(ctx, id)
+	if err != nil {
+		return BotProfile{}, err
+	}
+	extraChecks, err := mutate(&cur)
+	if err != nil {
+		return BotProfile{}, err
+	}
+	cur.Extensions = normalizeBotExtensions(cur.Extensions)
+	cur.UpdatedAt = time.Now().UTC()
+	if err := m.validateBotConfigWithSecrets(ctx, cur, false, extraChecks...); err != nil {
+		return BotProfile{}, err
+	}
+	updated, err := m.bots.UpdateBot(ctx, cur)
+	if err != nil {
+		return BotProfile{}, err
+	}
+	cp := updated.Clone()
+	m.global.publish(Event{BotID: cp.ID, Type: EventBotUpdated, Bot: &cp})
 	return updated, nil
 }
 
@@ -411,6 +479,23 @@ func (m *Manager) validateBotConfig(b BotProfile, isCreate bool) error {
 				return fmt.Errorf("%w: %s", ErrUnknownTool, strings.Join(missing, ", "))
 			}
 		}
+	}
+	return nil
+}
+
+func (m *Manager) validateBotConfigWithSecrets(ctx context.Context, b BotProfile, isCreate bool, extraTexts ...string) error {
+	if err := m.validateBotConfig(b, isCreate); err != nil {
+		return err
+	}
+	extJSON, _ := json.Marshal(b.Extensions)
+	texts := make([]string, 0, 4+len(extraTexts))
+	texts = append(texts, b.Title, b.Description, b.Instructions, string(extJSON))
+	texts = append(texts, extraTexts...)
+	if err := rejectStoredBotSecrets(ctx, m.secrets, b.ID, texts...); err != nil {
+		if strings.Contains(err.Error(), "plaintext value of secret") || strings.Contains(err.Error(), "sealed ciphertexts") {
+			return fmt.Errorf("%w: %v", ErrInvalidBot, err)
+		}
+		return err
 	}
 	return nil
 }
@@ -553,6 +638,9 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 			return err
 		}
 	}
+	if m.secrets != nil {
+		_ = m.secrets.DeleteAllSecretsForBot(ctx, id)
+	}
 	if hasBotStore {
 		if err := bs.DeleteBotCascade(id); err != nil {
 			return err
@@ -562,10 +650,43 @@ func (m *Manager) DeleteBot(ctx context.Context, id string, force bool) error {
 			return err
 		}
 	}
+	if base := strings.TrimSpace(m.opts.BotDataDir); base != "" {
+		_ = os.RemoveAll(filepath.Join(base, id))
+	}
 
 	cp := cur.Clone()
 	m.global.publish(Event{BotID: cp.ID, Type: EventBotDeleted, Bot: &cp})
 	return nil
+}
+
+// Secrets returns the Manager's per-bot SecretStore.
+func (m *Manager) Secrets() SecretStore { return m.secrets }
+
+// SetSecret seals and stores a named credential scoped to botID.
+func (m *Manager) SetSecret(ctx context.Context, botID, name, plaintext string) (SecretMeta, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return SecretMeta{}, err
+	}
+	return m.secrets.SetSecret(ctx, botID, name, plaintext)
+}
+
+// ListSecrets lists credential metadata (never plaintext values) scoped to botID.
+func (m *Manager) ListSecrets(ctx context.Context, botID string) ([]SecretMeta, error) {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return nil, err
+	}
+	return m.secrets.ListSecrets(ctx, botID)
+}
+
+// DeleteSecret removes one named credential scoped to botID.
+func (m *Manager) DeleteSecret(ctx context.Context, botID, name string) error {
+	botID = effectiveBotID(botID)
+	if _, err := m.bots.GetBot(ctx, botID); err != nil {
+		return err
+	}
+	return m.secrets.DeleteSecret(ctx, botID, name)
 }
 
 // CreateSession creates and loads a new session for the default bot.
@@ -810,6 +931,9 @@ type SendOptions struct {
 	// ToolAllowlist optionally narrows the tool registry for this turn (e.g.
 	// per-schedule tool_allowlist, intersected with the bot's own allowlist).
 	ToolAllowlist []string
+	// DisableSelfTrain suppresses save_bot_skill and update_bot_persona for
+	// this turn (used by IM channel adapters unless explicitly opted in).
+	DisableSelfTrain bool
 	// Hooks observes questions; scheduled turns use it for waiting_input /
 	// answer_timeout. It is deliberately unexported: transports must not set it.
 	Hooks turnHooks
@@ -877,16 +1001,17 @@ func (m *Manager) prepareTurnLocked(s *session, profile BotProfile, content, mod
 	}
 	ctx, clock := newTurnClock(m.baseCtx, budget)
 	t := &activeTurn{
-		id:            "turn_" + randomHex(6),
-		cancel:        clock.cancelPlain,
-		clock:         clock,
-		hooks:         opts.Hooks,
-		maxToolCalls:  opts.MaxToolCalls,
-		botProfile:    profile.Clone(),
-		toolAllowlist: append([]string(nil), opts.ToolAllowlist...),
-		steer:         newSteerBuffer(),
-		done:          make(chan struct{}),
-		questions:     map[string]*pendingQuestion{},
+		id:               "turn_" + randomHex(6),
+		cancel:           clock.cancelPlain,
+		clock:            clock,
+		hooks:            opts.Hooks,
+		maxToolCalls:     opts.MaxToolCalls,
+		botProfile:       profile.Clone(),
+		toolAllowlist:    append([]string(nil), opts.ToolAllowlist...),
+		disableSelfTrain: opts.DisableSelfTrain,
+		steer:            newSteerBuffer(),
+		done:             make(chan struct{}),
+		questions:        map[string]*pendingQuestion{},
 	}
 	ctx = tools.WithScheduleRun(ctx, opts.ScheduleID, opts.RunID)
 	ctx = tools.WithTurnID(ctx, t.id)
@@ -1152,6 +1277,8 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 		MemoryUserID:      "bot:" + effectiveBotID(t.botProfile.ID),
 		BotToolAllowlist:  t.botProfile.ToolAllowlist,
 		ToolAllowlist:     t.toolAllowlist,
+		Extensions:        t.botProfile.Extensions.Clone(),
+		DisableSelfTrain:  t.disableSelfTrain,
 	})
 	if t.hooks != nil {
 		t.hooks.TurnEnded()
@@ -1236,10 +1363,11 @@ func (m *Manager) runTurn(ctx context.Context, s *session, t *activeTurn, conv C
 			now := time.Now().UTC()
 			for _, st := range unconsumedSteers {
 				item := QueuedMessage{
-					ID:        "q_" + randomHex(6),
-					Content:   st.Content,
-					Images:    st.Images,
-					CreatedAt: now,
+					ID:               "q_" + randomHex(6),
+					Content:          st.Content,
+					Images:           st.Images,
+					DisableSelfTrain: t.disableSelfTrain,
+					CreatedAt:        now,
 				}
 				promoted = append(promoted, item)
 				cp := item

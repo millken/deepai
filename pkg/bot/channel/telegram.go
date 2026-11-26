@@ -303,6 +303,17 @@ func (t *TelegramAdapter) EditText(ctx context.Context, dst Destination, msgID, 
 	}, nil)
 }
 
+func (t *TelegramAdapter) DeleteMessage(ctx context.Context, dst Destination, msgID string) error {
+	id, err := strconv.ParseInt(msgID, 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid telegram message_id %q", msgID)
+	}
+	return t.postJSON(ctx, "deleteMessage", map[string]any{
+		"chat_id":    dst.ChatID,
+		"message_id": id,
+	}, nil)
+}
+
 func (t *TelegramAdapter) SendQuestion(ctx context.Context, dst Destination, q bot.Question) (string, error) {
 	payload := map[string]any{
 		"chat_id": dst.ChatID,
@@ -415,7 +426,7 @@ func threadStr(id int64) string {
 
 func isKnownSlashCommand(cmd string) bool {
 	switch cmd {
-	case "/new", "/cancel", "/steer", "/bot", "/model", "/status", "/approve":
+	case "/new", "/cancel", "/steer", "/bot", "/model", "/status", "/approve", "/secret":
 		return true
 	}
 	return false

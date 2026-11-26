@@ -65,6 +65,8 @@ type TurnInput struct {
 	MemoryUserID      string
 	BotToolAllowlist  []string
 	ToolAllowlist     []string
+	Extensions        BotExtensions
+	DisableSelfTrain  bool
 }
 
 // TurnOutput is what a finished (or interrupted) turn produced.

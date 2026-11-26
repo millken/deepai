@@ -31,6 +31,7 @@ type telegramChannelConfig struct {
 	AllowedBots        []string `yaml:"allowed_bots"`
 	AllowUsers         []string `yaml:"allow_users"`
 	AllowChats         []string `yaml:"allow_chats"`
+	AllowSelfTrain     bool     `yaml:"allow_self_train"`
 	StreamEditInterval string   `yaml:"stream_edit_interval"`
 }
 
@@ -43,6 +44,7 @@ type feishuChannelConfig struct {
 	AllowedBots        []string `yaml:"allowed_bots"`
 	AllowUsers         []string `yaml:"allow_users"`
 	AllowChats         []string `yaml:"allow_chats"`
+	AllowSelfTrain     bool     `yaml:"allow_self_train"`
 	StreamEditInterval string   `yaml:"stream_edit_interval"`
 }
 
@@ -108,6 +110,7 @@ func startChannelGateway(ctx context.Context, mgr *bot.Manager, sched *schedule.
 				AllowedBots:        tg.AllowedBots,
 				AllowUsers:         tg.AllowUsers,
 				AllowChats:         tg.AllowChats,
+				AllowSelfTrain:     tg.AllowSelfTrain,
 				StreamEditInterval: interval,
 			})
 			registered++
@@ -138,6 +141,7 @@ func startChannelGateway(ctx context.Context, mgr *bot.Manager, sched *schedule.
 				AllowedBots:        fs.AllowedBots,
 				AllowUsers:         fs.AllowUsers,
 				AllowChats:         fs.AllowChats,
+				AllowSelfTrain:     fs.AllowSelfTrain,
 				StreamEditInterval: interval,
 			})
 			registered++

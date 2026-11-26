@@ -63,12 +63,19 @@ type Adapter interface {
 	SendAttachment(ctx context.Context, dst Destination, filePath, caption string) error
 }
 
+// MessageDeleter is optionally implemented by Adapters capable of deleting
+// sensitive inbound command messages (such as `/secret set`) from chat history.
+type MessageDeleter interface {
+	DeleteMessage(ctx context.Context, dst Destination, msgID string) error
+}
+
 // AccessPolicy enforces default-deny allowlisting per channel (§5.4).
 type AccessPolicy struct {
 	DefaultBotID       string
 	AllowedBots        []string // optional explicit set of bots usable via /bot and /approve
 	AllowUsers         []string
 	AllowChats         []string
+	AllowSelfTrain     bool // opt-in: allow DM AllowUsers to invoke save_bot_skill / update_bot_persona
 	StreamEditInterval time.Duration
 	MaxMessageRunes    int
 }
@@ -125,6 +132,17 @@ func (p AccessPolicy) CanApprove(userID, botID string) bool {
 		return false
 	}
 	return true
+}
+
+// CanSelfTrain reports whether an inbound IM message may invoke conversational
+// self-training tools (save_bot_skill / update_bot_persona). Disabled by
+// default on IM channels, never permitted in group chats, and restricted to
+// explicit AllowUsers in private DMs when AllowSelfTrain is enabled.
+func (p AccessPolicy) CanSelfTrain(userID string, isGroup bool) bool {
+	if !p.AllowSelfTrain || isGroup {
+		return false
+	}
+	return p.IsAllowedUser(userID)
 }
 
 func (p AccessPolicy) editInterval() time.Duration {

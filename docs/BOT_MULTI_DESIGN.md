@@ -1,34 +1,37 @@
 # DeepAI Bot 多 Bot 管理与多 Workdir 调度隔离设计（v2）
 
-> 状态：设计定稿（可直接开工）  
-> 基线：`main`（已含 PR #40 核心服务、PR #43 / #49 定时任务 P1+P2 与 `pkg/hook`）  
+> 状态：已落地（含 M1 多 Bot 隔离与 M6 对话式自训练 + 第三方业务 API 连接器）  
+> 基线：`feat/bot-m5-channels-governance`  
 > 相关文档：[`BOT_DESIGN.md`](BOT_DESIGN.md)、[`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)、[`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md)
 
 ---
 
-## 1. 背景与 v2 修订要点
+## 1. 背景与核心设计哲学
 
-当前 `deepai-bot` 已经落地独立 `~/.deepai/bot/bot.db`、`cwd` 会话隔离（`cmd/deepai-bot/store.go` 的 `botSessionStore`）以及完整的定时任务引擎（`pkg/schedule`），但仍是**单人格**：一个进程只有一套全局 system prompt、一个默认模型和一个记忆空间 `bot:default`。
+当前 `deepai-bot` 采用**「出生一致、后天对话训练分化」**（Grok 风格多机器人）架构：
+- **出生一致（共享底层大脑）**：所有 Bot 共享同一个 `llm.ModelRegistry` 与 `bot.AgentRuntime`（同一套大模型池、基础工具集与进程基础设施），不为单个 Bot 重复实例化重量级运行时或单独配置大模型 API。
+- **后天分化（记忆 + 专属技能 + 业务连接器 + 定时任务）**：每个 Bot 从空白状态起步，随着用户在对话中不断教导业务规则、录入第三方服务密钥、沉淀 API 调用手册和安排定时任务，逐步演化出各自独立的长期记忆（`bot:<id>`）、人格指令（`instructions`）、专属技能目录（`~/.deepai/bot/bots/<id>/skills/`）以及受控的第三方 HTTP 连接器（`APIConnector` + `bot_secrets`）。
 
 在深度审视既有代码与 v1 草案后，v2 做了 4 项关键架构收口，消除实现阶段的潜在冲突：
 
 | 维度 | v1 草案 | v2 定稿（对齐现状代码） |
 |------|---------|-------------------------|
-| **Runtime 抽象** | `RuntimeFactory` 替换单一 `Runtime` | **保留单一共享 `AgentRuntime`**，通过 `TurnInput.Bot` 透传每轮 `BotProfile`（`Instructions` / `MemoryUserID` / `ToolAllowlist`），PATCH 后下一 turn 即热生效，无需工厂与缓存失效 |
-| **存储实现** | 另写独立 `BotSessionStore`，不复用 `SQLiteSessionStore` | **增量扩展现有 `cmd/deepai-bot/store.go`**（已组合 `*chat.SQLiteSessionStore` 操作 `bot.db`），通过幂等 migration 建 `bots` 表并为 `sessions` 增列 `bot_id` |
-| **多 Workdir × 调度器冲突（关键修复）** | 仅一句「#41 跟进」 | **显式解决**：`schedules` 增列 `(bot_id, work_dir)`；`schedule_lease` / `schedule_meta` 从全库单行升级为**按 `work_dir` 分桶**，防止同机多项目进程互相抢租约或跨目录误触发 |
-| **工具白名单** | 推迟到 v1.1 | `pkg/tools.Registry` 已有 `Clone()`，补一个 15 行 `Subset(allowlist)` 即可在 v2 直接支持 `tool_allowlist`，并同步复用于 Scheduler P3 单任务白名单 |
+| **Runtime 抽象** | `RuntimeFactory` 替换单一 `Runtime` | **保留单一共享 `AgentRuntime`**，通过 `TurnInput` 透传每轮 `BotProfile`（`Instructions` / `MemoryUserID` / `BotToolAllowlist` / `Extensions`），PATCH 或对话自训练后下一 turn 即热生效，无需工厂与缓存失效 |
+| **存储实现** | 另写独立 `BotSessionStore`，不复用 `SQLiteSessionStore` | **增量扩展现有 `cmd/deepai-bot/store.go`**（已组合 `*chat.SQLiteSessionStore` 操作 `bot.db`），通过幂等 migration 建 `bots`、`bot_secrets` 表并为 `sessions` 增列 `bot_id` |
+| **多 Workdir × 调度器冲突（关键修复）** | 仅一句「#41 跟进」 | **显式解决**：`schedules` 增列 `(bot_id, work_dir)`；`schedule_leases` / `schedule_metas` 升级为**按 `work_dir` 分桶**，防止同机多项目进程互相抢租约或跨目录误触发 |
+| **工具白名单** | 推迟到 v1.1 | `pkg/tools.Registry.Subset(allowlist)` 直接支持精确工具名与单后缀 `*` 通配，并与 Scheduler 单任务 `tool_allowlist` 取交集 |
 
-### 1.1 v2 目标边界
+### 1.1 目标边界
 
 | 维度 | 约定 |
 |------|------|
-| 进程模型 | 一个 `deepai-bot` 进程服务一个 `--workdir`（与 #40 一致） |
+| 进程模型 | 一个 `deepai-bot` 进程服务一个 `--workdir`（多实例状态分别写入 `~/.deepai/bot/instances/<hash>.json`） |
 | Bot 数量 | 进程内 N 个 Bot（CRUD）+ 不可删的系统内置 `default` |
 | 会话归属 | 每条会话必属 `(bot_id, cwd)` |
 | 定时任务归属 | 每个 Schedule 必属 `(bot_id, work_dir)`；每 `work_dir` 独立调度租约 |
-| HTTP API | 主路径 `/v1/bots/{bot_id}/sessions/...` 与 `/v1/bots/{bot_id}/schedules/...`；`default` 保留扁平别名 `/v1/sessions`、`/v1/schedules` |
-| 持久化 | 全机单库 `~/.deepai/bot/bot.db`（`bots` + `sessions` + `messages` + `session_locks` + `memory_*` + `schedules` + `schedule_runs`） |
+| 专属技能与密钥 | 专属技能落盘于 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`；第三方 API 密钥经 `pkg/secret.Seal` 加密存入 `bot.db` 的 `bot_secrets` 表 |
+| HTTP API | 主路径 `/v1/bots/{bot_id}/{sessions,schedules,secrets}/...`；`default` 保留扁平别名 `/v1/sessions`、`/v1/schedules` |
+| 持久化 | 全机单库 `~/.deepai/bot/bot.db`（`bots` + `bot_secrets` + `sessions` + `messages` + `session_locks` + `memories` + `schedules` + `schedule_runs` + `channel_bindings` + `bot_tokens`） |
 | 与 CLI | **物理隔离**：CLI 只读 `deepai.db`，bot 只读 `bot.db`；仅只读共享 `config.yaml` / `.env` / `DEEPAI.md` / 技能 / MCP |
 
 ---
@@ -87,25 +90,28 @@ flowchart TB
 | `description` | string | 可选，≤ 512 字符 | 仅 UI 展示，不进入 prompt |
 | `instructions` | string | 可选，**≤ 64 KiB** | Bot 人格指令（Soul），追加到项目 `DEEPAI.md` 之后 |
 | `default_model` | string | 可选 | 空 = 沿用 `config.yaml` 默认模型；非空时创建/更新均校验 `Runtime.HasModel` |
-| `tool_allowlist` | `[]string` | 可选（空 = 全量） | 允许调用的工具名集合；`ask_clarification` 始终隐式保留或显式声明，见 §3.2 |
+| `tool_allowlist` | `[]string` | 可选（空 = 全量） | 允许调用的工具名集合（子代理 `task` 同步继承收敛后的工具集），见 §3.2 |
 | `enabled` | bool | 默认 `true` | 停用开关，见 §3.3 |
+| `extensions` | `BotExtensions` | 默认 `{}`，序列化 **≤ 64 KiB** | 映射至 `bots.extra_json`：`isolated_prompt`、`disable_self_train`、`connectors`，见 §3.4 |
 | `created_at` / `updated_at` | time | 自动 UTC | |
 
-### 3.1 Prompt 与记忆隔离规则
+### 3.1 Prompt、技能与记忆隔离规则
 
 | 维度 | 规则 |
 |------|------|
-| System Prompt 组装 | `基础 Agent 提示` → `工作目录 DEEPAI.md + 技能目录` → `## Bot Instructions\n<bot.instructions>`（字节稳定） |
-| 长期记忆 Scope | `MemoryUserID = "bot:" + bot.ID`（写入 `bot.db` 的 `memory_*` 表；`default` 即现有的 `bot:default`，零迁移） |
+| System Prompt 组装（默认 `isolated_prompt=false`） | `基础 Agent 提示` → `全局/工作目录技能描述 + Bot 专属技能描述` → `全局/项目 DEEPAI.md` → `## Bot Instructions\n<bot.instructions>` → `## Bot API Capabilities`（字节稳定） |
+| System Prompt 组装（纯净人格 `isolated_prompt=true`） | `基础 Agent 提示` → `仅该 Bot 专属技能描述` → `## Bot Instructions\n<bot.instructions>` → `## Bot API Capabilities`（完全剥离代码仓库 `DEEPAI.md` 与项目技能干扰） |
+| Bot 专属技能目录 | `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`；每轮通过 `BaseSkills.Clone()` 叠加并重建本轮 `skill` 工具 `enum`，零重启热生效且跨 Bot 物理不可见 |
+| 长期记忆 Scope | `MemoryUserID = "bot:" + bot.ID`（写入 `bot.db` 的 `memories` 与 `memory_gate_verdicts` 表；`default` 即现有的 `bot:default`） |
 | 会话记忆 Scope | `SessionScope(session_id)`（写入 `bot.db`） |
-| 沙箱目录 | `~/.deepai/bot/sandbox/session-<id>`（会话维度，无需按 bot 嵌套） |
+| 沙箱目录 | `~/.deepai/bot/sandbox/session-<id>`（会话维度，卸载或删除时自动回收） |
 
 ### 3.2 `tool_allowlist` 语义
 
-- 空切片（`nil` 或 `[]`）：不限制，开放进程注册表中的全部工具（含 MCP 与 `schedule`）。
-- 非空切片：通过 `cfg.Tools.Subset(allowlist)` 构造只读子视图，仅暴露白名单中的工具（既不发给 LLM schema，也在 `Execute` 时硬拒绝未知工具）。
-- **校验策略**：创建/更新 Bot 时，如果 allowlist 里出现当前未注册的工具名，返回 `400 unknown_tool`（或允许通配前缀如 `mcp__github__*`？v2 支持精确名 + 单后缀 `*` 前缀匹配，方便一键授权整个 MCP server，例如 `mcp__figma__*`）。
-- 与 Scheduler P3 单任务白名单叠加时，取**交集**：`effective = intersect(bot.tool_allowlist, schedule.tool_allowlist)`，确保定时任务绝不会突破所属 Bot 的权限边界。
+- 空切片（`nil` 或 `[]`）：不限制，开放进程注册表中的全部工具（含 MCP、`schedule`、`http_request`、`save_bot_skill`、`update_bot_persona`）。
+- 非空切片：通过 `toolsReg.Subset(allowlist)` 构造只读子视图，仅暴露白名单中的工具（例如自定义业务 Bot 可配置 `["http_request", "skill", "save_bot_skill", "update_bot_persona", "schedule"]` 彻底剥离 `bash` 与本地文件改写权限）。
+- **校验策略**：创建/更新 Bot 时，如果 allowlist 里出现当前未注册的工具名，返回 `400 unknown_tool`；支持精确名 + 单后缀 `*` 前缀匹配（如 `mcp__figma__*`）。
+- 与 Scheduler P3 单任务白名单叠加时，取**交集**：`effective = intersect(bot.tool_allowlist, schedule.tool_allowlist)`，且子代理（`task`）同样继承收敛后的工具集与当前 Bot 上下文。
 
 ### 3.3 `enabled = false` 语义
 
@@ -117,6 +123,40 @@ flowchart TB
 | `POST /v1/bots/{id}/schedules` | `403 bot_disabled` |
 | 已有定时任务到期触发（`Scheduler` → `Fire`） | 不建 turn，Run 直接记 `skipped`（`queued_reason = "bot_disabled"`），不打断其它 Bot 调度 |
 | `GET` 会话 / 历史 / Run / `DELETE` | 正常可读可清理 |
+
+### 3.4 `BotExtensions`（`extra_json`）与对话自训练 / 第三方业务 API 接入
+
+为避免污染 `memories`（受单条 500 字符上限与 `pkg/memory/security.go` 密钥拦截规则保护）且无需开放 `bash` 即可安全调用外部 REST/GraphQL 服务，`BotProfile.Extensions`（持久化于 `bots.extra_json`）与 `SecretStore`（持久化于 `bot_secrets`）协同提供三层能力：
+
+```go
+type APIConnector struct {
+    Name         string            `json:"name"`                    // ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$
+    BaseURL      string            `json:"base_url"`                // http(s)://...
+    AllowedHosts []string          `json:"allowed_hosts,omitempty"` // 默认自动包含 BaseURL 域名，支持 *.example.com
+    Headers      map[string]string `json:"headers,omitempty"`       // 支持 {{secret:NAME}} 占位符
+    QueryParams  map[string]string `json:"query_params,omitempty"`  // 支持 {{secret:NAME}} 占位符
+    TimeoutSec   int               `json:"timeout_sec,omitempty"`   // 0..300（默认 30s）
+}
+
+type BotExtensions struct {
+    IsolatedPrompt   bool           `json:"isolated_prompt,omitempty"`
+    DisableSelfTrain bool           `json:"disable_self_train,omitempty"`
+    Connectors       []APIConnector `json:"connectors,omitempty"`
+}
+```
+
+1. **按 Bot 隔离的硬件绑定密文仓（`pkg/bot/secrets.go`）**：
+   - 表结构：`bot_secrets(bot_id, name, ciphertext, created_at, updated_at, PRIMARY KEY(bot_id, name))`，使用 `pkg/secret.Seal`/`Reveal`（`enc:v1:...` AES-GCM 机器指纹派生密钥）落库。
+   - 录入入口：**推荐使用 CLI `deepai-bot secret set <NAME> <VALUE> --bot <id>`**、REST `PUT /v1/bots/{bot_id}/secrets/{name}`（仅 `admin`）或 WS `set_secret`（仅 `admin`）；手机端应急支持 IM 私聊 `/secret set <NAME> <VALUE>`（仅 `allow_users` 且禁止群聊，明文直接进 `SecretStore`、**永不写入会话消息历史或送入 LLM**，并自动尝试撤回平台侧源私聊消息及提示手动删除客户端残留）。
+   - 模型与 REST 配置卫生：`AgentRuntime.RunTurn` 仅向 System Prompt 追加排好序的占位符清单（如 `{{secret:NOTION_TOKEN}}`）；`POST/PATCH /v1/bots` 同样强制校验连接器敏感头/查询参数（如 `Authorization`、`X-API-Key`、`*token*`、`*secret*`）必须引用 `{{secret:NAME}}`，拒绝写入明文凭证或已存密钥原值（防 `GET /v1/bots/{id}` 回显泄露）。
+2. **受控 HTTP 请求工具 `http_request`（`pkg/bot/connectors.go`）**：
+   - 支持指定 `connector` 继承 `base_url`、默认 Header/Query 与 `allowed_hosts`（同一轮 `update_bot_persona` 新增的连接器立即可在同轮 `http_request` 中调用），也可在**不携带任何密钥**的前提下直接请求受控公网 URL。
+   - **宿主侧凭据绑定、注入与回显脱敏**：任何包含 `{{secret:NAME}}` 占位符的请求**必须显式指定已注册的 `connector`**（拒绝向未绑定白名单域名的任意公网地址展开凭据）；发起请求前由宿主展开真实值，响应体与网络报错返回给模型前全文替换为 `[REDACTED:NAME]`。
+   - **安全防线**：携带密钥时强制 `https://`、校验目标在 `connector.allowed_hosts` 内并拒绝跨域名重定向（防凭据随 302 泄露）；继承 `pkg/netutil.EnvProxyFunc` 代理感知并在解析/拨号阶段拦截环回、私网、链路本地与云元数据地址（SSRF 防护）。
+3. **对话式自训练工具（`pkg/bot/training.go`）**：
+   - `update_bot_persona`：通过 `Manager.MutateBot`（持 `botMu` 与 REST `PATCH` 严格串行化）更新当前 Bot 的 `instructions`、`isolated_prompt` 或增删改 `APIConnector`。
+   - `save_bot_skill`：将长篇第三方 API 规范或业务 SOP 写成专属 `~/.deepai/bot/bots/<bot_id>/skills/<name>/SKILL.md`（`--ephemeral` 模式下使用进程级临时目录并在退出时自动清理），下一轮立即出现在本 Bot 的 `skill` 工具枚举中。
+   - **自训练护栏**：`DisableSelfTrain=true` 或 IM 渠道默认未开启 `allow_self_train: true`（即使开启也仅允许私聊 `allow_users`、群聊永久禁用）时直接从本轮工具集移除上述两个工具；无人值守定时任务/Webhook 运行期间（`tools.IsScheduledRun(ctx)`）硬性拒绝调用；`SecretStore` 查询异常时**失败关闭（fail-closed）**；内容若包含任意长度的已存密钥明文、`enc:v1:` 密文串、控制/零宽/Bidi/Unicode Tag 字符、结构化越界模式或 `` !`command` `` 动态 Shell 块则直接拦截。
 
 ---
 
@@ -202,15 +242,18 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 
 鉴权、Origin/Host 校验、JSON Content-Type 约束完全沿用 [`BOT_DESIGN.md`](BOT_DESIGN.md) §4。
 
-### 5.1 Bot 管理 REST
+### 5.1 Bot 管理与密钥 REST
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/v1/bots` | 列出全部 Bot（带统计字段 `session_count`、`active_runs`、`schedule_count`，按当前 `work_dir` 统计） |
-| `POST` | `/v1/bots` | 创建 Bot（`id`, `name`, `title?`, `description?`, `instructions?`, `default_model?`, `tool_allowlist?`, `enabled?`） |
-| `GET` | `/v1/bots/{bot_id}` | 获取单个 Bot 详情 |
-| `PATCH` | `/v1/bots/{bot_id}` | 更新可变字段（不可改 `id`；`default` 允许改 `name`/`instructions`/`default_model`/`tool_allowlist`，禁止设 `enabled=false`） |
+| `GET` | `/v1/bots` | 列出全部 Bot（带统计字段 `session_count`、`active_turns`、`schedule_count`，按当前 `work_dir` 统计） |
+| `POST` | `/v1/bots` | 创建 Bot（`id`, `name`, `title?`, `description?`, `instructions?`, `default_model?`, `tool_allowlist?`, `enabled?`, `extensions?`） |
+| `GET` | `/v1/bots/{bot_id}` | 获取单个 Bot 详情（含 `extensions`） |
+| `PATCH` | `/v1/bots/{bot_id}` | 更新可变字段（不可改 `id`；`default` 允许改 `name`/`instructions`/`default_model`/`tool_allowlist`/`extensions`，禁止设 `enabled=false`） |
 | `DELETE` | `/v1/bots/{bot_id}` | 删除 Bot，见 §5.2 强约束规则 |
+| `GET` | `/v1/bots/{bot_id}/secrets` | 列出该 Bot 已配置的密钥元数据列表（仅返回 `name`/`created_at`/`updated_at`，永不返回密文或明文） |
+| `PUT` | `/v1/bots/{bot_id}/secrets/{name}` | 创建或更新单个加密密钥 `{"value":"..."}`（仅 `admin` 令牌可调用） |
+| `DELETE` | `/v1/bots/{bot_id}/secrets/{name}` | 删除单个密钥（仅 `admin` 令牌可调用） |
 
 ### 5.2 Bot 删除策略（含跨进程安全保护）
 
@@ -218,8 +261,8 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 |------|------------------------|---------------------------------|
 | `id == "default"` | `405 method_not_allowed` | `405 method_not_allowed` |
 | 其它 `deepai-bot` 进程持有该 bot 任一会话的未过期 `session_lock` | `409 session_locked` | `409 session_locked`（不能跨进程强杀他进程中的工具执行） |
-| 本进程存在运行中 turn 或活跃 schedule run | `409 busy` | 先取消本进程该 bot 下所有运行中 turn 与 schedule runs，等待落盘（最多 10s），超时则 `409 busy` |
-| 存在任意会话或定时任务（含跨其它 `cwd` 的历史会话） | `409 bot_has_sessions`（body 附 `{sessions, schedules}` 计数） | 单事务级联删除：该 bot 下全部 `schedule_runs` → `schedules` → `messages` → `sessions` → `SessionScope` 与 `bot:<id>` 记忆 → `bots` 行，并清理本进程已加载的沙箱目录 |
+| 本进程存在运行中 turn 或活跃 schedule run | `409 busy` | 先标记 `deletingBots` 阻断新请求，取消本进程该 bot 下所有运行中 turn 与活跃 schedule runs，等待落盘（最多 10s），超时则 `409 busy` |
+| 存在任意会话或定时任务（含跨其它 `cwd` 的历史会话） | `409 bot_has_sessions`（body 附 `{sessions, schedules}` 计数） | 单事务级联删除：该 bot 下全部 `schedule_runs` → `schedules`（同步递增对应 `schedule_metas` 版本号）→ `channel_bindings` → `bot_secrets` → `messages` → `sessions` → `memories` 与 `memory_gate_verdicts` → `bots` 行，并清理内存会话沙箱与 `~/.deepai/bot/bots/<id>/` 专属技能目录 |
 
 > 最佳实践：日常下线人格优先 `PATCH enabled=false` 保留审计历史；硬删除仅在明确清理时显式使用 `?force=1`。
 
@@ -242,9 +285,9 @@ CREATE TABLE IF NOT EXISTS schedule_metas (
 - 全局事件总线（`subscribe "*"`）新增：
   - `bot_created` / `bot_updated` / `bot_deleted`（载荷 `bot`）；
   - `subscribe` 支持可选过滤：`{"op":"subscribe","session_id":"*","bot_id":"reviewer","since":0}`（空表示全部 bot）。
-- WS 控制帧新增 ops：`list_bots`、`get_bot`、`create_bot`、`update_bot`、`delete_bot`；现有 `list_sessions` / `create_session` / `list_schedules` / `create_schedule` 支持可选 `bot_id`（省略 = `"default"`）。
+- WS 控制帧新增 ops：`list_bots`、`get_bot`、`create_bot`、`update_bot`、`delete_bot`、`list_secrets`、`set_secret`、`delete_secret`；现有 `list_sessions` / `create_session` / `list_schedules` / `create_schedule` 支持可选 `bot_id`（省略 = `"default"`）。
 
-错误码新增：`unknown_bot`（404）、`bot_disabled`（403）、`bot_has_sessions`（409）、`unknown_tool`（400）。
+错误码新增：`unknown_bot`（404）、`bot_disabled`（403）、`bot_has_sessions`（409）、`unknown_tool`（400）、`secret_not_found`（404）。
 
 ---
 
@@ -329,17 +372,20 @@ type TurnInput struct {
 
 ---
 
-## 8. 实施拆分与验收清单
-
-建议拆为 **2 个紧凑可独立评审的 PR**：
+## 8. 实施与验收清单（已完成）
 
 ### PR-A：调度器多 Workdir 隔离 + `tools.Registry.Subset`
-- [ ] `pkg/tools/registry.go`：`Subset(allowlist)`（含单后缀 `*` 前缀匹配）与单测
-- [ ] `pkg/schedule`：`schedules` 增 `(bot_id, work_dir)`、`schedule_leases` / `schedule_metas` 按 `work_dir` 分桶与老库自动回填迁移
-- [ ] 集成测试：同一 SQLite 上两个不同 `work_dir` 的 `Scheduler` 并发启动，各自独立 `active`、互不干扰；同 `work_dir` 双实例仍严格 `active` + `standby`
+- [x] `pkg/tools/registry.go`：`Subset(allowlist)`（含单后缀 `*` 前缀匹配）与单测
+- [x] `pkg/schedule`：`schedules` 增 `(bot_id, work_dir)`、`schedule_leases` / `schedule_metas` 按 `work_dir` 分桶与老库自动回填迁移
+- [x] 集成测试：同一 SQLite 上两个不同 `work_dir` 的 `Scheduler` 并发启动，各自独立 `active`、互不干扰；同 `work_dir` 双实例仍严格 `active` + `standby`
 
 ### PR-B：多 Bot 注册表、API、Manager 集成与 Web UI
-- [ ] `pkg/bot`：`BotRegistry`（SQLite + 内存版）、`TurnInput` 注入 `BotProfile`、`Manager` 校验 `(bot_id, cwd)` 与 `enabled=false`、`DELETE ?force=1` 跨进程锁保护与级联清理（含 schedules 与 memory）
-- [ ] `pkg/bot/server.go` & `ws.go`：`/v1/bots` CRUD、嵌套路径、扁平路径跨 bot 返回 404、`bot_*` 事件与 WS ops
-- [ ] `pkg/bot/web/index.html`：Bot 切换器与管理弹窗
-- [ ] 完整测试覆盖：扁平路径跨 bot 404、`enabled=false` 拒绝新建/发送/跳过调度、PATCH 后下一 turn 热生效、记忆按 `bot:<id>` 隔离、`DELETE` 409 与 `?force=1` 级联清理、`go test -race ./pkg/bot ./pkg/schedule ./cmd/deepai-bot`
+- [x] `pkg/bot`：`BotRegistry`（SQLite + 内存版）、`TurnInput` 注入 `BotProfile`（子代理同步继承 `SubagentConstraints`）、`Manager` 校验 `(bot_id, cwd)` 与 `enabled=false`、`DELETE ?force=1` 跨进程锁保护与级联清理（含 schedules、channel_bindings、secrets 与 memory）
+- [x] `pkg/bot/server.go` & `ws.go`：`/v1/bots` CRUD、嵌套路径、扁平路径跨 bot 返回 404、`bot_*` 事件与 WS ops
+- [x] `pkg/bot/web/index.html`：Bot 切换器与管理弹窗
+- [x] 完整测试覆盖：`go test -race ./pkg/bot/... ./pkg/schedule/... ./cmd/deepai-bot/...`
+
+### PR-C：对话式自训练、专属技能隔离与受控第三方业务 API 连接器
+- [x] `pkg/bot/secrets.go` & `cmd/deepai-bot/secrets_cmd.go`：`bot_secrets` 机器指纹加密存储、`/v1/bots/{bot_id}/secrets` REST/WS 接口、`deepai-bot secret` CLI 与 IM 私聊 `/secret` 脱敏指令
+- [x] `pkg/bot/connectors.go`：`http_request` 工具（连接器继承、`{{secret:NAME}}` 宿主注入、响应/报错自动脱敏、HTTPS/跨域名重定向守卫与 SSRF 防护）
+- [x] `pkg/bot/training.go` & `pkg/bot/agentruntime.go`：`save_bot_skill`（拦截明文密钥、Prompt 注入与 `` !`command` `` 动态命令块）+ `update_bot_persona`（定时任务期间禁止自修改）+ 每轮技能 `Clone()` 叠加与 `IsolatedPrompt` 隔离

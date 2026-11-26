@@ -24,22 +24,22 @@ const wsMaxFrame = 4 << 20
 // answer, plus the schedule_* ops in schedule_http.go. subscribe with
 // session_id "*" follows the bot-wide lifecycle feed.
 type WSRequest struct {
-	ID         string `json:"id,omitempty"`
-	Op         string `json:"op"`
-	BotID      string `json:"bot_id,omitempty"`
-	Force      bool   `json:"force,omitempty"`
-	SessionID  string `json:"session_id,omitempty"`
-	Since      *int64 `json:"since,omitempty"`
+	ID            string                `json:"id,omitempty"`
+	Op            string                `json:"op"`
+	BotID         string                `json:"bot_id,omitempty"`
+	Force         bool                  `json:"force,omitempty"`
+	SessionID     string                `json:"session_id,omitempty"`
+	Since         *int64                `json:"since,omitempty"`
 	Content       string                `json:"content,omitempty"`
 	Model         string                `json:"model,omitempty"`
 	Mode          string                `json:"mode,omitempty"`
 	AttachmentIDs []string              `json:"attachment_ids,omitempty"`
 	Images        []models.MessageImage `json:"images,omitempty"`
 	QueueID       string                `json:"queue_id,omitempty"`
-	Title      string `json:"title,omitempty"`
-	QuestionID string `json:"question_id,omitempty"`
-	Answer     string `json:"answer,omitempty"`
-	Limit      int    `json:"limit,omitempty"`
+	Title         string                `json:"title,omitempty"`
+	QuestionID    string                `json:"question_id,omitempty"`
+	Answer        string                `json:"answer,omitempty"`
+	Limit         int                   `json:"limit,omitempty"`
 
 	// Schedule & Bot ops. Params mirrors the REST body; ScheduleID/RunID keep
 	// ids out of the correlation ID field.
@@ -230,6 +230,24 @@ func (c *wsConn) handle(ctx context.Context, req WSRequest) {
 			c.s.audit.Record(AuditEntry{Action: "bot_deleted", Actor: p.Name, Role: string(p.Role), BotID: req.BotID, Target: req.BotID, Outcome: "ok"})
 		}
 		c.reply(ctx, req, nil, err)
+	case "list_secrets":
+		list, err := m.ListSecrets(ctx, botID)
+		c.reply(ctx, req, map[string]any{"secrets": list}, err)
+	case "set_secret":
+		secName := paramString(req.Params, "name")
+		secVal := paramString(req.Params, "value")
+		meta, err := m.SetSecret(ctx, botID, secName, secVal)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_secret_set", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: meta.Name, Outcome: "ok"})
+		}
+		c.reply(ctx, req, meta, err)
+	case "delete_secret":
+		secName := paramString(req.Params, "name")
+		err := m.DeleteSecret(ctx, botID, secName)
+		if err == nil {
+			c.s.audit.Record(AuditEntry{Action: "bot_secret_deleted", Actor: p.Name, Role: string(p.Role), BotID: botID, Target: secName, Outcome: "ok"})
+		}
+		c.reply(ctx, req, nil, err)
 	case "list_sessions":
 		list, err := m.ListSessionsForBot(botID, req.Limit)
 		c.reply(ctx, req, map[string]any{"sessions": list}, err)
@@ -372,7 +390,7 @@ func (c *wsConn) closeSubs() {
 
 func isWSAdminOp(op string) bool {
 	switch op {
-	case "create_bot", "update_bot", "delete_bot":
+	case "create_bot", "update_bot", "delete_bot", "set_secret", "delete_secret":
 		return true
 	}
 	return false
@@ -380,7 +398,7 @@ func isWSAdminOp(op string) bool {
 
 func isWSReadOp(op string) bool {
 	switch op {
-	case "ping", "info", "list_bots", "get_bot", "list_sessions", "get_session",
+	case "ping", "info", "list_bots", "get_bot", "list_secrets", "list_sessions", "get_session",
 		"list_queue", "subscribe", "unsubscribe", "list_schedules", "get_schedule",
 		"list_runs", "get_run", "validate_trigger":
 		return true
@@ -390,9 +408,9 @@ func isWSReadOp(op string) bool {
 
 func isWSBotScopedOp(op string) bool {
 	switch op {
-	case "get_bot", "list_sessions", "create_session", "get_session", "rename_session",
-		"delete_session", "send", "cancel", "answer", "list_queue", "remove_queue_item",
-		"clear_queue", "create_schedule":
+	case "get_bot", "list_secrets", "set_secret", "delete_secret", "list_sessions", "create_session",
+		"get_session", "rename_session", "delete_session", "send", "cancel", "answer", "list_queue",
+		"remove_queue_item", "clear_queue", "create_schedule":
 		return true
 	}
 	return false

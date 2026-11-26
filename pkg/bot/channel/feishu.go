@@ -462,6 +462,30 @@ func (f *FeishuAdapter) EditText(ctx context.Context, _ Destination, msgID, text
 	return nil
 }
 
+func (f *FeishuAdapter) DeleteMessage(ctx context.Context, _ Destination, msgID string) error {
+	if strings.TrimSpace(msgID) == "" {
+		return fmt.Errorf("empty feishu message_id")
+	}
+	tok, err := f.tenantToken(ctx)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, f.baseURL+"/open-apis/im/v1/messages/"+url.PathEscape(msgID), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("feishu delete message status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (f *FeishuAdapter) SendQuestion(ctx context.Context, dst Destination, q bot.Question) (string, error) {
 	actions := make([]map[string]any, 0, len(q.Options))
 	for _, opt := range q.Options {
@@ -474,14 +498,15 @@ func (f *FeishuAdapter) SendQuestion(ctx context.Context, dst Destination, q bot
 			},
 		})
 	}
+	elements := []any{map[string]any{"tag": "markdown", "content": q.Text}}
+	if len(actions) > 0 {
+		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
+	}
 	card := map[string]any{
 		"header": map[string]any{
 			"title": map[string]string{"tag": "plain_text", "content": "DeepAI 需要确认"},
 		},
-		"elements": []any{
-			map[string]any{"tag": "markdown", "content": q.Text},
-			map[string]any{"tag": "action", "actions": actions},
-		},
+		"elements": elements,
 	}
 	rawCard, _ := json.Marshal(card)
 	return f.sendMessage(ctx, dst.ChatID, "interactive", string(rawCard))

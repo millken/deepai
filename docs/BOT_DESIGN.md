@@ -214,15 +214,17 @@ bot 能执行 bash、改文件，等同于把一个 shell 暴露出去，所以�
 ```bash
 make build-bot                      # ./bin/deepai-bot
 deepai-bot                          # 前台运行（= serve）
-deepai-bot start -w ~/code/myproj   # 后台守护：日志 ~/.deepai/bot/bot.log，状态 ~/.deepai/bot/bot.json
-deepai-bot status [--json]
-deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落盘、再退出
+deepai-bot start -w ~/code/myproj   # 后台守护：日志 ~/.deepai/bot/bot.log，实例状态 ~/.deepai/bot/instances/<hash>.json
+deepai-bot status [-w ~/code/myproj] [--json]
+deepai-bot stop [-w ~/code/myproj]  # SIGTERM → 取消运行中的 turn、落盘、再退出
+deepai-bot token [create|list|revoke]
+deepai-bot secret [set|list|delete] --bot <id>
 ```
 
-- `start` 以 `setsid` 方式（Windows 为 `DETACHED_PROCESS`）重新拉起自身的 `serve`，等待 `/healthz` 通过才返回。
-- `bot.json` 记录 pid、地址、版本、工作目录，`status/stop` 和 GUI 启动器据此找到实例，无需记住参数。
+- `start` 以独立进程组方式重新拉起自身的 `serve`（并发回收子进程避免启动异常时残留僵尸进程），等待 `/healthz` 通过才返回。
+- 每个工作目录实例的状态写入 `~/.deepai/bot/instances/<hash>.json`（无活跃主实例时同步镜像至 `bot.json`），支持同机启动多个不同 `-w` 的守护实例并按 `-w` 精准 `status` / `stop`。
 - 生产环境建议交给 systemd / launchd / Docker 管理 `deepai-bot serve`（前台模式），见 `cmd/deepai-bot/README.md` 中的 unit 示例。
-- 优雅退出顺序：停止接收新连接 → `Manager.Close` 取消所有 turn 并等待落盘（30s）→ 连接上的客户端收到 `turn_end` → 关闭流 → 关闭 MCP 与数据库。
+- 优雅退出顺序：停止 IM 网关与调度器接收新任务 → `Manager.Close` 取消所有 turn 并等待落盘（30s）→ 等待调度回调收尾 → 连接上的客户端收到 `turn_end` → 关闭流 → 关闭 MCP 与数据库。
 
 ---
 
@@ -231,7 +233,7 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 决策 | 理由 |
 |------|------|
 | 每 turn 新建 `agent.Agent`，跨 turn 只带 `SessionCarry` | 与 REPL 完全一致的语义（技能、熔断器、压缩锚点跨轮保留），不引入第二套 agent 生命周期 |
-| 每会话单 turn，冲突返回 409 而非排队 | 语义最清晰；排队/插话（follow-up queue）留作后续 |
+| 默认每会话单 turn，支持显式 `mode=queue\|steer` | 默认 `reject`(409) 保持确定性；显式 `queue` 排队或 `steer` 在 ReAct 安全检查点无缝纠偏 |
 | turn 与请求解耦 | "常驻 bot"的核心：手机锁屏、网页刷新都不影响任务；任何客户端都能接管 |
 | 自带 seq + 回放缓冲，而不是只靠 transcript | transcript 只有完整消息；流式增量、工具进度、提问需要可续传的事件流 |
 | 慢订阅者直接断开 + `gap` | 发布端永不阻塞，一个卡住的客户端不会拖慢 agent |
@@ -240,29 +242,23 @@ deepai-bot stop                     # SIGTERM → 取消运行中的 turn、落�
 | 独立 `bot.db`，复用 CLI 会话库的表结构与实现 | bot 与 CLI 的历史、记忆互不干扰；表结构、迁移和会话锁直接沿用 `pkg/chat`；多 `bot_id` 见 BOT_MULTI_DESIGN |
 | 内嵌单文件控制台 | 开箱可用，也是协议的活文档；正式 GUI/App 可独立开发 |
 
-### 7.1 已识别的运行时优化项
+### 7.1 运行时关键保障（已落地）
 
-1. **Prompt 前缀缓存保护（高优）**：当前 `AgentRuntime` 通过 `SystemPromptSuffix` 将动态时间（`当前时间：YYYY-MM-DD HH:MM`）拼进 `a.systemPrompt`，导致每分钟都破坏 LLM 提供商的自动前缀缓存；而 `pkg/agent`（M4-2）已将易变内容统一移至尾部 `turnInjection`。后续应把 `SystemPromptSuffix` 迁入 `turnInjection` 附加段，保持 `systemPrompt` 跨轮字节稳定（详见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §1.2）。
-2. **多 Workdir 共用 `bot.db` 时的调度隔离（高优）**：当前 `schedule_lease` 为全局单行，同一机器启动多个不同 `--workdir` 的 `deepai-bot` 时会导致租约互抢与跨目录触发，需随多 Bot 设计一并改为按 `work_dir` 分桶（详见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §5.4）。
+1. **Prompt 前缀缓存保护**：`AgentRuntime` 已将 `SystemPromptSuffix`（动态当前时间）接入 `AgentConfig.TurnInjectionExtra`（尾部注入），使静态 `SystemPrompt`、Bot `Instructions` 与连接器能力摘要跨轮字节稳定，充分命中 LLM 前缀缓存（详见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §1.2）。
+2. **多 Workdir 共用 `bot.db` 调度与守护隔离**：`schedule_leases` 与 `schedule_metas` 已按 `work_dir` 分桶，守护进程状态文件按 `instances/<hash>.json` 隔离，同机多项目并行互不抢租约（详见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) §4.2）。
 
 ---
 
 ## 8. 演进路线与设计文档索引
 
-### 8.1 已落地
+### 8.1 已落地能力全景
 
-- **核心常驻服务（PR #40）**：本文件 §1–§7（REST / SSE / NDJSON / WebSocket、事件总线与断线续传、`ask_clarification`、独立 `bot.db` 与 `cwd` 隔离、会话锁、守护进程、内置 Web 控制台）。
-- **定时任务 P1 + P2（PR #43 / PR #49）**：`once` / `interval` / 自写 5 字段 `cron`、`misfire=run_once` 补跑、可暂停 `turnClock`、`waiting_input` 与 `answer_timeout(assume/fail)`、`messages.metadata` 持久化、Web 控制台「任务」页签；详见 [`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md)。
-- **Outbound Hooks（PR #49）**：`pkg/hook` 已接入 `deepai-bot`，支持 `turn_end` / `ask` / `schedule_run_end` / `schedule_ask` / `schedule_approval` 出站通知。
+- **核心常驻服务（PR #40）**：本文件 §1–§7（REST / SSE / NDJSON / WebSocket、事件总线与断线续传、`ask_clarification`、独立 `bot.db` 与 `cwd` 隔离、会话锁、多实例守护进程、内置 Web 控制台）。
+- **定时任务引擎 P1–P3（PR #43 / #49 / M4）**：`once` / `interval` / 5 字段 `cron` / Inbound `webhook`（HMAC 签名校验 + 模板 + 幂等） / 任务链 `chain`（A → B + 环检测）、可暂停 `turnClock`、单任务 `tool_allowlist`、条件通知 `notify_if` 与 `pkg/hook` 出站通知；详见 [`BOT_SCHEDULER_DESIGN.md`](BOT_SCHEDULER_DESIGN.md) 与 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §4。
+- **多 Bot 人格、对话自训练与受控第三方业务 API 连接器（M1 / M6）**：「出生一致、后天对话训练分化」架构——共享 `ModelRegistry`/`AgentRuntime`，按 `bot_id` 隔离会话、调度、长期记忆（`bot:<id>`）、硬件绑定密钥仓（`bot_secrets`）与专属技能目录（`~/.deepai/bot/bots/<id>/skills/`），内置 `http_request`、`save_bot_skill` 与 `update_bot_persona`；详见 [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md)。
+- **消息排队、运行中插话与多模态附件（M2 / M3）**：会话 FIFO 队列（`mode=queue`）、ReAct 检查点插话（`mode=steer`）、沙箱附件上传 `/attachments` 与产出物安全下载 `/files/{path}`；详见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §2–§3。
+- **IM 渠道网关与生产治理（M5）**：`pkg/bot/channel` 统一网关（Telegram Long Polling + 飞书长连接/交互卡片、默认白名单拒绝、私聊 `/secret` 脱敏管理）、多角色 Scoped Tokens（`admin`/`user`/`readonly`）、OpenAI `/v1/chat/completions` 兼容端点、Prometheus `/metrics` 与 `audit.jsonl` 审计日志；详见 [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §5–§6。
 
-### 8.2 后续演进（设计已定稿）
+### 8.2 远期备选
 
-| 阶段 | 能力 | 详细设计文档 |
-|------|------|--------------|
-| **Phase A（优先）** | **多 Bot 人格 + 多 Workdir 调度隔离 + 工具白名单**：同进程 N 个 Bot、`TurnInput` 注入 `BotProfile`（替代 `RuntimeFactory`）、`schedule_lease` 按 `work_dir` 分桶、级联清理与 Web Bot 切换器 | [`BOT_MULTI_DESIGN.md`](BOT_MULTI_DESIGN.md) |
-| **Phase B** | **消息排队（Follow-up Queue）与运行中插话（Mid-turn Steer）**：消除长 turn 期间的 `409 busy`，支持队列编辑与 ReAct 循环内无缝纠偏（同时覆盖 Scheduler P3 steer） | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §2 |
-| **Phase C** | **多模态附件与产出物工作流**：图片/文件上传至会话沙箱、`models.MessageImage` 接入、bot 产出物安全预览与下载 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §3 |
-| **Phase D** | **自动化引擎升级（Scheduler P3）**：Inbound Webhook 触发器（HMAC + 模板 + 幂等）、任务链（A → B + `{{prev.output}}`）、条件通知 `notify_if`、单任务工具白名单 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §4 |
-| **Phase E** | **IM 渠道适配器网关**：`pkg/bot/channel` 统一抽象，首批支持 Telegram（Long Polling）与飞书（WebSocket 长连接），零公网域名自部署 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §5 |
-| **Phase F** | **生产治理与生态接入**：多 Token / 作用域权限（RBAC）、OpenAI `/v1/chat/completions` 兼容端点、Prometheus `/metrics` 与审计日志 | [`BOT_NEXT_DESIGN.md`](BOT_NEXT_DESIGN.md) §6 |
-| **远期备选** | 会话级多工作目录、REPL `/plan` 与 `/mission` API 化 | 视实际需求立项 |
+- 会话级多工作目录绑定、内置 Web 控制台可视化编辑连接器与密钥面板、REPL `/plan` 与 `/mission` API 化。

@@ -51,9 +51,11 @@ type botOptions struct {
 // skills, plugins, MCP servers and DEEPAI.md instructions. Sessions and
 // memory live in botDB, not in the CLI's database.
 type botRuntime struct {
-	Runtime *bot.AgentRuntime
-	Store   bot.Store
-	WorkDir string
+	Runtime    *bot.AgentRuntime
+	Store      bot.Store
+	Secrets    bot.SecretStore
+	BotDataDir string
+	WorkDir    string
 	// DB is the database path, empty when ephemeral.
 	DB string
 	// DBConn is the shared SQLite handle over bot.db (nil when ephemeral).
@@ -231,6 +233,8 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		Models:                 modelRegistry,
 		Tools:                  registry,
 		SystemPrompt:           systemPrompt,
+		BaseSkills:             skillReg,
+		GlobalInstructions:     instructions,
 		WorkDir:                workDir,
 		SandboxBaseDir:         filepath.Join(botHome(), "sandbox"),
 		ContextWindow:          cfg.ContextWindow,
@@ -248,15 +252,32 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 	}
 
 	var store bot.Store
+	var secretStore bot.SecretStore
+	var botDataDir string
 	var dbPath string
 	var db *sql.DB
 	if opts.Ephemeral {
-		store = bot.NewMemoryStore()
+		ephemeralBotsDir, err := os.MkdirTemp("", "deepai-bot-ephemeral-bots-*")
+		if err != nil {
+			return nil, fmt.Errorf("create ephemeral bot data dir: %w", err)
+		}
+		closers = append(closers, func() { _ = os.RemoveAll(ephemeralBotsDir) })
+		memStore := bot.NewMemoryStore()
+		store = memStore
+		secretStore = bot.NewMemorySecretStore()
+		botDataDir = ephemeralBotsDir
+		rtCfg.BotDataDir = botDataDir
+		rtCfg.Bots = memStore
+		rtCfg.Secrets = secretStore
 	} else {
 		if err := commands.EnsureHome(); err != nil {
 			return nil, err
 		}
 		if err := os.MkdirAll(botHome(), 0o700); err != nil {
+			return nil, err
+		}
+		botDataDir = filepath.Join(botHome(), "bots")
+		if err := os.MkdirAll(botDataDir, 0o700); err != nil {
 			return nil, err
 		}
 		// Every deepai-bot process (one per workdir) shares bot.db, so
@@ -272,7 +293,15 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		if err := sessStore.Migrate(); err != nil {
 			return nil, fmt.Errorf("migrate session schema: %w", err)
 		}
+		secStore, err := bot.NewSQLiteSecretStore(db)
+		if err != nil {
+			return nil, fmt.Errorf("init secret store: %w", err)
+		}
 		store = sessStore
+		secretStore = secStore
+		rtCfg.BotDataDir = botDataDir
+		rtCfg.Bots = sessStore
+		rtCfg.Secrets = secStore
 
 		memService := memory.NewService(slog.Default(), memory.NewSQLiteStoreFromDB(db), nil)
 		if err := memService.AutoMigrate(ctx); err != nil {
@@ -310,7 +339,8 @@ func newBotRuntime(ctx context.Context, opts botOptions) (_ *botRuntime, err err
 		return nil, err
 	}
 	return &botRuntime{
-		Runtime: rt, Store: store, WorkDir: workDir, DB: dbPath, DBConn: db, Close: closeAll,
+		Runtime: rt, Store: store, Secrets: secretStore, BotDataDir: botDataDir,
+		WorkDir: workDir, DB: dbPath, DBConn: db, Close: closeAll,
 		Schedule: schedSvc, ScheduleStore: schedStore, ScheduleConfig: schedCfg,
 		Hook: hookDisp,
 	}, nil

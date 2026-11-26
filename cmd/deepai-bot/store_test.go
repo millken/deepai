@@ -324,3 +324,67 @@ func TestBotSessionStoreExternalLockAndDeleteCascade(t *testing.T) {
 		t.Fatalf("default user-scope memory was unexpectedly deleted")
 	}
 }
+
+func TestBotSessionStoreExtensionsRoundTripAndSecretCascade(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dbPath := filepath.Join(t.TempDir(), "bot.db")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store := newBotSessionStore(db)
+	if err := store.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	secStore, err := bot.NewSQLiteSecretStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	ext := bot.BotExtensions{
+		IsolatedPrompt:   true,
+		DisableSelfTrain: true,
+		Connectors: []bot.APIConnector{{
+			Name:         "notion",
+			BaseURL:      "https://api.notion.com/v1",
+			AllowedHosts: []string{"api.notion.com"},
+			Headers:      map[string]string{"Authorization": "Bearer {{secret:NOTION_TOKEN}}"},
+			TimeoutSec:   20,
+		}},
+	}
+	_, err = store.CreateBot(ctx, bot.BotProfile{
+		ID:         "ops",
+		Name:       "Ops",
+		Enabled:    true,
+		Extensions: ext,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("CreateBot with Extensions: %v", err)
+	}
+
+	got, err := store.GetBot(ctx, "ops")
+	if err != nil {
+		t.Fatalf("GetBot(ops): %v", err)
+	}
+	if !got.Extensions.IsolatedPrompt || !got.Extensions.DisableSelfTrain || len(got.Extensions.Connectors) != 1 || got.Extensions.Connectors[0].Name != "notion" {
+		t.Fatalf("reloaded Extensions = %+v", got.Extensions)
+	}
+
+	_, _ = secStore.SetSecret(ctx, "ops", "NOTION_TOKEN", "ntn_ops_1")
+	_, _ = secStore.SetSecret(ctx, bot.DefaultBotID, "DEFAULT_TOKEN", "ntn_def_1")
+
+	if err := store.DeleteBotCascade("ops"); err != nil {
+		t.Fatalf("DeleteBotCascade(ops): %v", err)
+	}
+	if rem, _ := secStore.ListSecrets(ctx, "ops"); len(rem) != 0 {
+		t.Fatalf("ops secrets remained after DeleteBotCascade: %+v", rem)
+	}
+	if defRem, _ := secStore.ListSecrets(ctx, bot.DefaultBotID); len(defRem) != 1 {
+		t.Fatalf("default bot secrets affected by DeleteBotCascade: %+v", defRem)
+	}
+}

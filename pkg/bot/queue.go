@@ -37,12 +37,13 @@ var (
 // QueuedMessage is one pending follow-up message waiting in a session's FIFO
 // queue (docs/BOT_NEXT_DESIGN.md §2.2).
 type QueuedMessage struct {
-	ID        string                `json:"id"`
-	Content   string                `json:"content"`
-	Model     string                `json:"model,omitempty"`
-	Images    []models.MessageImage `json:"images,omitempty"`
-	Metadata  map[string]string     `json:"metadata,omitempty"`
-	CreatedAt time.Time             `json:"created_at"`
+	ID               string                `json:"id"`
+	Content          string                `json:"content"`
+	Model            string                `json:"model,omitempty"`
+	Images           []models.MessageImage `json:"images,omitempty"`
+	Metadata         map[string]string     `json:"metadata,omitempty"`
+	DisableSelfTrain bool                  `json:"-"`
+	CreatedAt        time.Time             `json:"created_at"`
 }
 
 // SendResult describes the outcome of Submit / SubmitForBot across reject,
@@ -245,12 +246,13 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 				return nil, ErrQueueFull
 			}
 			item := QueuedMessage{
-				ID:        "q_" + randomHex(6),
-				Content:   resolvedContent,
-				Model:     model,
-				Images:    resolvedImages,
-				Metadata:  attMeta,
-				CreatedAt: time.Now().UTC(),
+				ID:               "q_" + randomHex(6),
+				Content:          resolvedContent,
+				Model:            model,
+				Images:           resolvedImages,
+				Metadata:         attMeta,
+				DisableSelfTrain: opts.DisableSelfTrain,
+				CreatedAt:        time.Now().UTC(),
 			}
 			s.queue = append(s.queue, item)
 			pos := len(s.queue)
@@ -278,12 +280,13 @@ func (m *Manager) SubmitForBot(botID, id string, req SendRequest, opts SendOptio
 				return nil, ErrQueueFull
 			}
 			item := QueuedMessage{
-				ID:        "q_" + randomHex(6),
-				Content:   resolvedContent,
-				Model:     model,
-				Images:    resolvedImages,
-				Metadata:  attMeta,
-				CreatedAt: time.Now().UTC(),
+				ID:               "q_" + randomHex(6),
+				Content:          resolvedContent,
+				Model:            model,
+				Images:           resolvedImages,
+				Metadata:         attMeta,
+				DisableSelfTrain: opts.DisableSelfTrain,
+				CreatedAt:        time.Now().UTC(),
 			}
 			s.queue = append(s.queue, item)
 			pos := len(s.queue)
@@ -459,7 +462,7 @@ func (m *Manager) startNextQueued(s *session) {
 	}
 	item := s.queue[0]
 	s.queue = s.queue[1:]
-	launch, err := m.prepareTurnLocked(s, profile, item.Content, item.Model, item.Images, item.Metadata, SendOptions{})
+	launch, err := m.prepareTurnLocked(s, profile, item.Content, item.Model, item.Images, item.Metadata, SendOptions{DisableSelfTrain: item.DisableSelfTrain})
 	if err != nil {
 		// Re-queue at front so user input isn't silently dropped on transient lock/conv error.
 		s.queue = append([]QueuedMessage{item}, s.queue...)

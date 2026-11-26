@@ -638,3 +638,23 @@ func (r *Registry) Count() int {
 	defer r.mu.RUnlock()
 	return len(r.skills)
 }
+
+// Clone returns an independent shallow copy of the Registry's skill map so
+// callers (such as per-bot turn overlays in deepai-bot) can layer additional
+// directories on top without mutating the shared base registry.
+func (r *Registry) Clone() *Registry {
+	out := NewRegistry()
+	if r == nil {
+		return out
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out.descRefreshInterval = r.descRefreshInterval
+	out.nestedExpiry = r.nestedExpiry
+	out.lastDescRefresh = r.lastDescRefresh
+	for name, sk := range r.skills {
+		cp := *sk
+		out.skills[name] = &cp
+	}
+	return out
+}

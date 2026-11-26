@@ -14,11 +14,13 @@ make install-bot        # 安装到 ~/.local/bin
 ## 运行
 
 ```bash
-deepai-bot                         # 前台运行（等同 deepai-bot serve）
-deepai-bot start -w ~/code/proj    # 后台守护运行
-deepai-bot status                  # 查看状态（--json 供脚本/GUI 使用）
-deepai-bot stop                    # 优雅停止：取消运行中的任务并保存
-deepai-bot token [--rotate]        # 查看/轮换访问令牌
+deepai-bot                                      # 前台运行（等同 deepai-bot serve）
+deepai-bot start -w ~/code/proj                 # 后台守护运行（支持同机多 workdir 并行）
+deepai-bot status [-w ~/code/proj] [--json]     # 查看状态
+deepai-bot stop [-w ~/code/proj]                # 优雅停止：取消运行中的任务并保存
+deepai-bot token [--rotate]                     # 查看/轮换主访问令牌
+deepai-bot token create --name app --role user  # 签发受限令牌（admin | user | readonly）
+deepai-bot secret set <NAME> <VAL> [--bot <id>] # 为指定 Bot 加密保存第三方 API 密钥
 ```
 
 启动后打印 Web 控制台地址（`http://127.0.0.1:8787/#token=…`），浏览器打开即可使用。
@@ -33,12 +35,12 @@ deepai-bot token [--rotate]        # 查看/轮换访问令牌
 | `--max-tool-calls` | 0（不限） | 每轮工具调用上限 |
 | `--turn-timeout` | 0（不限） | 单轮超时；超时的 turn 以 `turn_end` status `timed_out` 结束 |
 | `--idle-timeout` | 30m | 空闲会话卸载（释放沙箱） |
-| `--ephemeral` | off | 会话只存内存，不写 `bot.db`、不用长期记忆 |
+| `--ephemeral` | off | 会话、Bot 配置与专属技能只存内存/进程临时目录（退出自动清理），不写 `bot.db`、不用长期记忆 |
 | `--cors-origin` | — | 允许跨域访问的前端 origin（可重复，`*` 为任意） |
 | `--no-web` | off | 不提供内置 Web 控制台 |
 | `--no-schedule` | off | 关闭定时任务（不注册 `schedule` 工具、不启动调度器，接口返回 404） |
 
-文件位置：`~/.deepai/bot/bot.db`（会话、长期记忆和定时任务）、`bot.json`（运行状态）、`bot.log`（`start` 模式日志）、`token`、`sandbox/`。
+文件位置：`~/.deepai/bot/bot.db`（多 Bot 配置、加密密钥 `bot_secrets`、会话、长期记忆、定时任务、渠道绑定与受限令牌）、`bots/<bot_id>/skills/`（各 Bot 对话沉淀的专属技能）、`instances/` 与 `bot.json`（运行实例状态）、`bot.log`（守护日志）、`audit.jsonl`（安全审计日志）、`token`、`sandbox/`。
 
 ## 快速调用
 
@@ -98,6 +100,29 @@ WS ops 为 `list_schedules` / `create_schedule` / `pause_schedule` / `run_schedu
 
 `turn_end` 现在带 `cancel_source`（`client` / `shutdown` / `scheduler`），调度器据此区分主动取消、bot 关闭与超时失败。
 
+## 多 Bot 对话训练与接入第三方业务 API
+
+所有 Bot 共享同一套模型与运行时（「出生一致」），通过对话逐步演化出独立的长期记忆（`bot:<id>`）、专属技能与外部业务 API 连接器（完整设计见 [`docs/BOT_MULTI_DESIGN.md`](../../docs/BOT_MULTI_DESIGN.md)）：
+
+```bash
+# 1. 创建一个仅允许受控 API/技能与定时任务（剥离 bash）的自定义业务 Bot
+curl -s -H "$H" -H 'Content-Type: application/json' \
+  -d '{"id":"assistant","name":"业务助手","tool_allowlist":["http_request","skill","save_bot_skill","update_bot_persona","schedule","ask_clarification"]}' \
+  $B/v1/bots | jq .
+
+# 2. 推荐通过本机 CLI 加密录入第三方 API 密钥（机器指纹 AES-GCM 落库，明文不进上下文与聊天记录）
+deepai-bot secret set NOTION_TOKEN "ntn_xxx" --bot assistant
+
+# 3. 创建会话后直接在对话中训练它：
+#    Bot 会调用 update_bot_persona（开启 isolated_prompt 并绑定带 {{secret:NOTION_TOKEN}} 的具名连接器）
+#    与 save_bot_skill（沉淀专属 ~/.deepai/bot/bots/assistant/skills/<name>/SKILL.md），同轮即可通过 http_request 安全调用该连接器
+```
+
+## IM 渠道与 OpenAI 兼容接口
+
+- **Telegram / 飞书网关**：在 `~/.deepai/config.yaml` 中配置 `channels.telegram` 或 `channels.feishu`（默认白名单拒绝一切未授权用户；默认 `allow_self_train: false` 禁用渠道内自训练，仅显式开启后对私聊 `allow_users` 放开；支持 `/new`、`/steer`、`/cancel`、`/bot`、`/model`、`/approve` 与私聊应急 `/secret`）；详见 [`docs/BOT_NEXT_DESIGN.md`](../../docs/BOT_NEXT_DESIGN.md) §5。
+- **OpenAI 兼容接口**：`POST /v1/chat/completions` 支持 `model: "bot:<bot_id>"` 或 `"bot:<bot_id>/<model_alias>"` 及 `X-DeepAI-Session` 会话复用，可直接接入 Open WebUI、Cherry Studio、Raycast 等客户端。
+
 ## 交给 systemd 管理
 
 ```ini
@@ -119,4 +144,4 @@ systemctl --user enable --now deepai-bot
 
 ## 安全提示
 
-bot 能执行 shell 命令和修改文件。默认只监听本机并强制 token；需要远程访问时请放在 TLS 反向代理、SSH 隧道或 Tailscale 之后，不要直接暴露 `0.0.0.0`。
+bot 能执行 shell 命令和修改文件。默认只监听本机并强制 token；需要远程访问时请放在 TLS 反向代理、SSH 隧道或 Tailscale 之后，不要直接暴露 `0.0.0.0`。对于面向业务或外部 IM 渠道的自定义 Bot，建议通过 `tool_allowlist` 移除 `bash`，改用受控的 `http_request` + `{{secret:NAME}}` 访问第三方 API。
